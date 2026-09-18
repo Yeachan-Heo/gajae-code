@@ -142,6 +142,9 @@ describe("SDK session CLI", () => {
 	// Retained transcript rows served by `transcript.list`. Non-empty rows make
 	// the checkpoint advertise a cursor so the CLI actually drains the page.
 	let transcriptRows: Record<string, unknown>[] = [];
+	let freshMints = 0;
+	const freshTokens = new Set<string>();
+	const transcriptListCursors: string[] = [];
 	let checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
 	let checkpointInputToken: unknown;
 	let transcriptCursor: unknown;
@@ -165,6 +168,9 @@ describe("SDK session CLI", () => {
 		preCheckpointLiveEvents = [];
 		wireLog = [];
 		transcriptRows = [];
+		freshMints = 0;
+		freshTokens.clear();
+		transcriptListCursors.length = 0;
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
 		checkpointInputToken = undefined;
 		transcriptCursor = undefined;
@@ -355,6 +361,14 @@ describe("SDK session CLI", () => {
 								socket.send(JSON.stringify(event));
 								wireLog.push(`pre_checkpoint_live_sent:${event.kind}:${event.seq}`);
 							}
+							// A resumed tail exchanges its token once, then mints FRESH cursorless
+							// checkpoints (to page the current snapshot, and to hand back). Mint a
+							// distinct token for each so the test can tell them apart.
+							const minted =
+								inputToken !== undefined
+									? (signedExchange?.replacement ?? "transcript-page-1")
+									: `fresh-${++freshMints}`;
+							if (transcriptRows.length > 0 && inputToken === undefined) freshTokens.add(minted);
 							socket.send(
 								JSON.stringify({
 									type: "query_response",
@@ -362,9 +376,7 @@ describe("SDK session CLI", () => {
 									ok: true,
 									result: {
 										checkpoint: checkpointRecord,
-										...(transcriptRows.length > 0
-											? { checkpointToken: signedExchange?.replacement ?? "transcript-page-1" }
-											: {}),
+										...(transcriptRows.length > 0 ? { checkpointToken: minted } : {}),
 										...(signedExchange === undefined ? {} : { cursor: "legacy-must-not-win" }),
 									},
 								}),
@@ -373,11 +385,10 @@ describe("SDK session CLI", () => {
 						}
 						if (frame.query === "transcript.list") {
 							transcriptCursor = frame.cursor;
-							if (
-								signedExchange !== undefined &&
-								(frame.cursor !== signedExchange.replacement ||
-									verifyCursor(String(frame.cursor), "tail-e2e-key") === undefined)
-							) {
+							transcriptListCursors.push(String(frame.cursor));
+							// Under a staged exchange, only a FRESH mint may page (never the
+							// exchanged replacement - that would replay the old snapshot).
+							if (signedExchange !== undefined && !freshTokens.has(String(frame.cursor))) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -680,9 +691,13 @@ describe("SDK session CLI", () => {
 		}, 90_000);
 	}
 
-	it("a resumed tail exchanges its token but never re-walks the transcript", async () => {
+	it("a resumed tail pages a fresh snapshot, drops rows up to --after-transcript-id, and returns a fresh cursor", async () => {
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
-		transcriptRows = [{ id: "assistant-1", role: "assistant", content: "saved" }];
+		transcriptRows = [
+			{ id: "assistant-1", role: "assistant", content: "saved" },
+			{ id: "user-2", role: "user", content: "next" },
+			{ id: "assistant-3", role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+		];
 		const sourceEnvelope: CursorEnvelope = {
 			cursorVersion: 1,
 			protocolMajor: 3,
@@ -704,6 +719,8 @@ describe("SDK session CLI", () => {
 			"live",
 			"--cursor",
 			source,
+			"--after-transcript-id",
+			"assistant-1",
 			"--until-idle",
 			"--timeout-ms",
 			"1000",
@@ -711,18 +728,70 @@ describe("SDK session CLI", () => {
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(verifyCursor(String(checkpointInputToken), "tail-e2e-key")).toBeDefined();
 		expect(checkpointInputToken).toBe(source);
-		// The exchanged replacement is pinned to the OLD snapshot: paging it back
-		// would replay every row the caller already processed (a gateway polling a
-		// live session saw ~300 items per poll and rejected 614 frames per turn).
-		// A resume is event_replay since the checkpoint plus live frames only.
-		expect(transcriptCursor).toBeUndefined();
-		const result = JSON.parse(tail.stdout).result as Record<string, unknown>;
+		// The exchanged replacement is pinned to the OLD snapshot at offset 0:
+		// paging it would replay every row the caller already processed (a
+		// gateway polling a live session saw ~300 items per poll and rejected 614
+		// frames per turn). The resume pages a FRESH mint instead.
+		expect(transcriptListCursors).toEqual(["fresh-1"]);
+		expect(transcriptCursor).not.toBe(replacement);
+		const result = JSON.parse(tail.stdout).result as {
+			items: Array<{ kind: string; id?: string }>;
+			cursor?: unknown;
+			terminal: boolean;
+			gap?: unknown;
+		};
 		expect(result.terminal).toBe(true);
 		expect(result.gap).toBeUndefined();
-		// And the caller gets a resumable cursor back - the fresh mint, never the
-		// consumed one, and never under a name the output redactor strips.
-		expect(typeof result.cursor).toBe("string");
+		// Only the rows AFTER the caller's boundary come back - the tool-call row included.
+		expect(result.items.filter(item => item.kind === "transcript").map(item => item.id)).toEqual([
+			"user-2",
+			"assistant-3",
+		]);
+		// And a resumable cursor: the second fresh mint (the first was spent paging),
+		// never the consumed one, and never under a name the output redactor strips.
+		expect(result.cursor).toBe("fresh-2");
 		expect("checkpointToken" in result).toBe(false);
+	}, 60_000);
+
+	it("a resumed tail with an unknown --after-transcript-id keeps every row (a duplicate is recoverable, a missing row is not)", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [
+			{ id: "assistant-1", role: "assistant", content: "saved" },
+			{ id: "user-2", role: "user", content: "next" },
+		];
+		const sourceEnvelope: CursorEnvelope = {
+			cursorVersion: 1,
+			protocolMajor: 3,
+			sessionId: "live",
+			resource: "transcript",
+			revision: "revision-1",
+			highWatermark: checkpointRecord,
+			issuedAt: 1,
+			expiresAt: Number.MAX_SAFE_INTEGER,
+			position: { offset: 0, selector: { queryId: "Q01" } },
+			direction: "forward",
+			pageShape: { targetBytes: 256 * 1024 },
+		};
+		const source = signCursor({ ...sourceEnvelope, nonce: "source" }, "tail-e2e-key");
+		const replacement = signCursor({ ...sourceEnvelope, nonce: "replacement" }, "tail-e2e-key");
+		signedExchange = { source, replacement };
+		const tail = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			source,
+			"--after-transcript-id",
+			"rotated-out-of-retention",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { items: Array<{ kind: string; id?: string }> };
+		expect(result.items.filter(item => item.kind === "transcript").map(item => item.id)).toEqual([
+			"assistant-1",
+			"user-2",
+		]);
 	}, 60_000);
 
 	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {

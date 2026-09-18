@@ -86,6 +86,8 @@ export interface SdkSessionCliArgs {
 	strict?: boolean;
 	untilIdle?: boolean;
 	allEvents?: boolean;
+	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
+	afterTranscriptId?: string;
 	page?: boolean;
 	repo?: string;
 	scope?: string;
@@ -1585,12 +1587,30 @@ async function runLiveTail(
 					gap,
 				);
 
-			// A resumed tail (`--cursor`) does not re-walk the transcript: the caller
-			// holds everything up to that checkpoint, and every transcript row it
-			// would get back is a replay of history it already processed. Resume is
-			// event_replay since the checkpoint, plus whatever is live. Only a fresh
-			// (cursorless) tail backfills the transcript.
-			let cursor = args.cursor === undefined ? extraction.cursor : undefined;
+			// Which snapshot to page. A fresh tail pages the checkpoint it was just
+			// handed. A resumed tail (`--cursor`) must NOT page the exchanged cursor:
+			// that one is pinned to the OLD snapshot at offset 0, so it would replay
+			// every row the caller already processed. It pages a fresh snapshot
+			// instead and drops rows up to the caller's `--after-transcript-id`, so
+			// the result is exactly the transcript delta since the last tail - the
+			// rows that carry tool calls and interim assistant text.
+			let cursor = extraction.cursor;
+			if (args.cursor !== undefined) {
+				cursor = undefined;
+				try {
+					const fresh = await router.request(
+						sessionId,
+						{ type: "query_request", query: "session.checkpoint", input: {} },
+						attachment.generation,
+						attachment,
+						args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+					);
+					cursor = extractCheckpoint(fresh).cursor;
+				} catch {
+					cursor = undefined;
+				}
+			}
+			const transcriptStart = transcriptItems.length;
 			while (cursor !== undefined) {
 				const response = await router.request(
 					sessionId,
@@ -1617,6 +1637,15 @@ async function runLiveTail(
 				);
 				if (page.complete || page.cursor === undefined) break;
 				cursor = page.cursor;
+			}
+			if (args.cursor !== undefined && args.afterTranscriptId !== undefined) {
+				// Drop the rows the caller already has. Unknown boundary (row rotated
+				// out, or a different session) → keep everything: a duplicate is
+				// recoverable downstream, a silently missing row is not.
+				const boundary = transcriptItems.findIndex(
+					(item, index) => index >= transcriptStart && item.id === args.afterTranscriptId,
+				);
+				if (boundary >= 0) transcriptItems.splice(transcriptStart, boundary + 1 - transcriptStart);
 			}
 
 			// The checkpoint's own token was just spent walking the transcript
