@@ -13,6 +13,7 @@ import type {
 } from "openai/resources/responses/responses";
 import { modelSupportsReasoningControl } from "../model-thinking";
 import { calculateCost } from "../models";
+import { applyServiceTierCostMultiplier, getOpenAIServedTierMultiplier } from "../service-tier-pricing";
 import {
 	type Api,
 	type AssistantMessage,
@@ -973,6 +974,12 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage);
+			// `response.service_tier` is the tier actually served, which may differ
+			// from the requested one (a ramp-rate downgrade reports `"default"`).
+			applyServiceTierCostMultiplier(
+				output.usage,
+				getOpenAIServedTierMultiplier(model.id, (response as { service_tier?: unknown } | undefined)?.service_tier),
+			);
 			// A `response.incomplete` frame is terminal because the response was cut
 			// short, so the event type itself proves truncation. Deriving `length`
 			// from the event rather than trusting `response.status` stops a relay that

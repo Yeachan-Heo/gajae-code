@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+- Fixed OpenAI service tiers being costed at standard catalog rates. Model catalogs price the standard tier only, so a request served at Fast mode/priority under-reported its cost by 2x (2.5x on `gpt-5.5`), and a flex request — billed at Batch API rates — over-reported by 2x. `openai-codex-responses` already corrected for this; `openai-completions` and the shared Responses path (`openai-responses`, `azure-openai-responses`) sent `service_tier` on the wire and never adjusted the price. Both now share one multiplier table in `service-tier-pricing.ts`, and the Codex adapter's private copy was removed in favor of it.
+- OpenAI service-tier cost correction is keyed on the tier the response reports it *served*, never on the requested tier. The ramp rate limit downgrades a Fast request to standard speed, charges standard rates, and reports `service_tier: "default"`, which the SDK documents on the response field itself ("This response value may be different from the value set in the parameter"). An absent or unrecognized served tier also prices at catalog rates rather than inferring one from request intent.
 
 ## [0.17.2] - 2026-09-18
 

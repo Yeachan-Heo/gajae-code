@@ -23,6 +23,7 @@ import type {
 import packageJson from "../../package.json" with { type: "json" };
 import { codexToolCanonicalName, codexToolWireName } from "../codex-tools";
 import { calculateCost } from "../models";
+import { applyServiceTierCostMultiplier, getOpenAIServedTierMultiplier } from "../service-tier-pricing";
 import { getEnvApiKey } from "../stream";
 import {
 	type Api,
@@ -601,20 +602,6 @@ function getCodexUserAgent(): string {
 	return formatCodexUserAgent(os.platform(), os.release(), os.arch());
 }
 
-function getCodexServiceTierCostMultiplier(
-	model: Pick<Model<"openai-codex-responses">, "id">,
-	serviceTier: ServiceTier | "default" | undefined,
-): number {
-	switch (serviceTier) {
-		case "flex":
-			return 0.5;
-		case "priority":
-			return model.id === "gpt-5.5" ? 2.5 : 2;
-		default:
-			return 1;
-	}
-}
-
 function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier | "default" | undefined {
 	switch (res) {
 		case "auto":
@@ -631,6 +618,13 @@ function resolveCodexCostServiceTier(res: unknown, req?: unknown): ServiceTier |
 	}
 }
 
+/**
+ * Unlike the API-key paths, Codex falls back to the *requested* tier when the
+ * response does not name a recognized one: ChatGPT-authenticated Codex routes
+ * Fast server-side and a final `service_tier` of `"default"` is not evidence of
+ * a downgrade. {@link resolveCodexCostServiceTier} encodes that exception; the
+ * multiplier table itself is shared with every other provider.
+ */
 function applyCodexServiceTierPricing(
 	model: Pick<Model<"openai-codex-responses">, "id">,
 	usage: AssistantMessage["usage"],
@@ -638,13 +632,7 @@ function applyCodexServiceTierPricing(
 	reqTier: unknown,
 ): void {
 	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier);
-	const multiplier = getCodexServiceTierCostMultiplier(model, resolvedTier);
-	if (multiplier === 1) return;
-	usage.cost.input *= multiplier;
-	usage.cost.output *= multiplier;
-	usage.cost.cacheRead *= multiplier;
-	usage.cost.cacheWrite *= multiplier;
-	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	applyServiceTierCostMultiplier(usage, getOpenAIServedTierMultiplier(model.id, resolvedTier));
 }
 
 function createAssistantOutput(model: Model<"openai-codex-responses">): AssistantMessage {

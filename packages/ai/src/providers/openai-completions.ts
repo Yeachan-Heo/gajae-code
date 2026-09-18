@@ -24,6 +24,7 @@ import {
 	modelSupportsReasoningControl,
 } from "../model-thinking";
 import { calculateCost } from "../models";
+import { applyServiceTierCostMultiplier, getOpenAIServedTierMultiplier } from "../service-tier-pricing";
 import { getEnvApiKey } from "../stream";
 import {
 	type AssistantMessage,
@@ -1147,8 +1148,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let providerSafetyStop = false;
 			let hasExplicitUsageReport = false;
 			let hasNonzeroUsageEvidence = false;
-			const applyUsage = (rawUsage: object): void => {
-				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal);
+			const applyUsage = (rawUsage: object, servedTier?: unknown): void => {
+				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal, servedTier);
 				const hasExplicitTotal = getOptionalNumberProperty(rawUsage, "total_tokens") !== undefined;
 				const hasExplicitComponents =
 					getOptionalNumberProperty(rawUsage, "prompt_tokens") !== undefined &&
@@ -1191,7 +1192,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					output.responseId ||= chunk.id;
 
 					if (chunk.usage) {
-						applyUsage(chunk.usage);
+						applyUsage(chunk.usage, chunk.service_tier);
 					}
 
 					const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -1199,7 +1200,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 						if (!chunk.usage) {
 							const choiceUsage = getChoiceUsage(choice);
 							if (choiceUsage) {
-								applyUsage(choiceUsage);
+								applyUsage(choiceUsage, chunk.service_tier);
 							}
 						}
 
@@ -1959,6 +1960,12 @@ export function parseChunkUsage(
 	rawUsage: object,
 	model: Model<"openai-completions">,
 	premiumRequests: number | undefined,
+	/**
+	 * `service_tier` as reported on the chunk — the tier OpenAI actually served,
+	 * which may differ from the requested one (a ramp-rate downgrade reports
+	 * `"default"`). Omitted/unknown prices at standard rates.
+	 */
+	servedTier?: unknown,
 ): AssistantMessage["usage"] {
 	const promptTokenDetails = getOptionalObjectProperty(rawUsage, "prompt_tokens_details");
 	const completionTokenDetails = getOptionalObjectProperty(rawUsage, "completion_tokens_details");
@@ -1997,6 +2004,7 @@ export function parseChunkUsage(
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
 	};
 	calculateCost(model, usage);
+	applyServiceTierCostMultiplier(usage, getOpenAIServedTierMultiplier(model.id, servedTier));
 	return usage;
 }
 
