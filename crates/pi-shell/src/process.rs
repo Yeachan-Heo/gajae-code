@@ -2681,28 +2681,56 @@ mod tests {
 	#[cfg(target_os = "macos")]
 	#[test]
 	fn from_pid_opens_entitled_child() {
-		use std::process::{Command, Stdio};
+		use std::process::{Child, Command, Stdio};
 
-		let mut child = Command::new("/usr/bin/top")
-			.args(["-l", "0", "-s", "1", "-n", "0"])
-			.stdout(Stdio::null())
-			.stderr(Stdio::null())
-			.spawn()
-			.expect("spawn top");
-		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		struct ChildGuard(Child);
+
+		impl Drop for ChildGuard {
+			fn drop(&mut self) {
+				let _ = self.0.kill();
+				let _ = self.0.wait();
+			}
+		}
+
+		let mut child = ChildGuard(
+			Command::new("/usr/bin/top")
+				.args(["-l", "0", "-s", "1", "-n", "0"])
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("spawn top"),
+		);
+		let pid = i32::try_from(child.0.id()).expect("child pid fits in i32");
 		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
-		let process = Process::from_pid(pid);
-		let ppid = process.as_ref().and_then(Process::ppid);
-		let pgid = process
-			.as_ref()
-			.and_then(|process| process.inner.group_id());
-		let _ = child.kill();
-		let _ = child.wait();
-		let process = process.expect("stable reference to an entitlement-restricted child");
+		let process =
+			Process::from_pid(pid).expect("stable reference to an entitlement-restricted child");
+		let ppid = process.ppid();
+		let pgid = process.inner.group_id();
 		assert_eq!(process.pid(), pid);
 		assert!(process.incarnation().starts_with("darwin:"));
+		assert!(process.darwin_unique_id().is_some());
 		assert_eq!(ppid, Some(self_pid));
 		assert!(pgid.is_some_and(|pgid| pgid > 0));
+
+		let _ = process.kill_tree(Some(KILL_SIGNAL));
+		child
+			.0
+			.wait()
+			.expect("reap entitled child killed through Process");
+
+		let mut observation = Process::observe(pid);
+		for _ in 0..100 {
+			if matches!(observation, ProcessObservation::Absent) {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(20));
+			observation = Process::observe(pid);
+		}
+		assert_eq!(
+			observation,
+			ProcessObservation::Absent,
+			"entitled child killed through Process must observe as absent after reaping",
+		);
 	}
 
 	/// `Process::observe` on the current live process must report `Present`

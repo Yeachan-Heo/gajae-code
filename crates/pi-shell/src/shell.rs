@@ -2290,6 +2290,123 @@ mod tests {
 		panic!("descendant {pid} did not become visible to process discovery");
 	}
 
+	/// Regression coverage for macOS binaries whose process information is
+	/// entitlement-restricted. The helper re-executes this exact test because a
+	/// failed ledger publication exits the process with status 70.
+	#[cfg(target_os = "macos")]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn ownership_ledger_opens_entitled_child_and_reuses_session() {
+		const HELPER_ENV: &str = "PI_SHELL_OWNERSHIP_LEDGER_REGRESSION_HELPER";
+		const TEST_NAME: &str =
+			"shell::tests::ownership_ledger_opens_entitled_child_and_reuses_session";
+
+		if std::env::var_os(HELPER_ENV).is_none() {
+			let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+				.args(["--exact", TEST_NAME, "--nocapture"])
+				.env(HELPER_ENV, "1")
+				.output()
+				.expect("run ownership-ledger helper");
+			assert_ne!(
+				output.status.code(),
+				Some(70),
+				"ownership-ledger helper exited 70: {}",
+				String::from_utf8_lossy(&output.stderr),
+			);
+			assert!(
+				output.status.success(),
+				"ownership-ledger helper failed: status={:?}, stderr={}",
+				output.status,
+				String::from_utf8_lossy(&output.stderr),
+			);
+			return;
+		}
+
+		struct LedgerGuard(std::path::PathBuf);
+
+		impl Drop for LedgerGuard {
+			fn drop(&mut self) {
+				let _ = fs::remove_file(&self.0);
+			}
+		}
+
+		let ledger_name = format!("pi-shell-macos-ownership-ledger-{}.jsonl", std::process::id());
+		let ledger = LedgerGuard(std::env::temp_dir().join(ledger_name));
+		let _ = fs::remove_file(&ledger.0);
+		let shell = Shell::new(Some(ShellOptions {
+			ownership_ledger_path: Some(ledger.0.to_string_lossy().into_owned()),
+			ownership_ledger_token: Some("macos-ownership-ledger-regression".to_string()),
+			..Default::default()
+		}));
+
+		let (first_tx, mut first_rx) = mpsc::unbounded_channel::<String>();
+		let first = shell
+			.run(
+				ShellRunOptions {
+					command: "printf '__ledger_before__\\n'; /bin/ps -p $$ -o pid= >/dev/null; printf \
+					          '__ledger_after__\\n'"
+						.to_string(),
+					..Default::default()
+				},
+				Some(first_tx),
+				CancelToken::default(),
+			)
+			.await
+			.expect("run entitlement-restricted command");
+		assert_eq!(first.exit_code, Some(0));
+
+		let mut first_output = String::new();
+		while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(50), first_rx.recv()).await {
+			first_output.push_str(&chunk);
+		}
+		assert!(
+			first_output.contains("__ledger_before__") && first_output.contains("__ledger_after__"),
+			"entitlement-restricted command must preserve both output markers: {first_output:?}",
+		);
+
+		let records = fs::read_to_string(&ledger.0)
+			.expect("read ownership ledger")
+			.lines()
+			.map(serde_json::from_str::<serde_json::Value>)
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.expect("parse ownership ledger records");
+		assert!(
+			records.iter().any(|record| {
+				record
+					.get("incarnation")
+					.and_then(serde_json::Value::as_str)
+					.is_some_and(|incarnation| incarnation.starts_with("darwin:"))
+					&& record
+						.get("darwinUniqueId")
+						.and_then(serde_json::Value::as_str)
+						.is_some_and(|unique_id| !unique_id.is_empty())
+			}),
+			"ledger must publish a Darwin incarnation and non-null Darwin unique ID: {records:?}",
+		);
+
+		let (second_tx, mut second_rx) = mpsc::unbounded_channel::<String>();
+		let second = shell
+			.run(
+				ShellRunOptions {
+					command: "printf '__ledger_reused__\\n'".to_string(),
+					..Default::default()
+				},
+				Some(second_tx),
+				CancelToken::default(),
+			)
+			.await
+			.expect("reuse shell session after entitlement-restricted command");
+		assert_eq!(second.exit_code, Some(0));
+
+		let mut second_output = String::new();
+		while let Ok(Some(chunk)) = time::timeout(Duration::from_millis(50), second_rx.recv()).await {
+			second_output.push_str(&chunk);
+		}
+		assert!(
+			second_output.contains("__ledger_reused__"),
+			"second command must run in the same shell session: {second_output:?}",
+		);
+	}
+
 	/// Truth-table coverage for `brush_core::commands::child_session_action`.
 	///
 	/// Lives in `pi-natives` because the brush-core crate is excluded from the
@@ -2985,7 +3102,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3022,6 +3139,8 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.kill();
+		let _ = sibling.wait();
 		assert!(sibling_alive, "timeout killed unrelated sibling {sibling_pid}; output={output:?}");
 
 		// SIGKILL delivery to the reparented grandchild can lag under CI load, so
@@ -3049,7 +3168,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn contained_timeout_freezes_group_before_term_handler_can_escape() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3104,6 +3223,8 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.kill();
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"contained timeout killed unrelated sibling {sibling_pid}; output={output:?}"
@@ -3114,7 +3235,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3141,10 +3262,10 @@ mod tests {
 				// Wait for BOTH markers: the grandchild and parent lines race on the
 				// pipe, so returning as soon as `grandchild=` appears can leave the
 				// not-yet-read `parent=` chunk pending and flake the parent assertion.
-				if let Some(pid) = parse_marker_pid(&output, "grandchild=") {
-					if parse_marker_pid(&output, "parent=").is_some() {
-						return pid;
-					}
+				if let Some(pid) = parse_marker_pid(&output, "grandchild=")
+					&& parse_marker_pid(&output, "parent=").is_some()
+				{
+					return pid;
 				}
 			}
 		})
@@ -3197,6 +3318,8 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.kill();
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"cancellation killed unrelated sibling {sibling_pid}; output={output:?}"
