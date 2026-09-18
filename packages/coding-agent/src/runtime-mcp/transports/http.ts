@@ -8,7 +8,7 @@
  * no sessions, no standalone stream, no replay. See ../protocol.ts.
  */
 import { logger, readSseJson, Snowflake } from "@gajae-code/utils";
-import { registerResourceOwner } from "../../runtime/process-lifecycle";
+import { isResourceOwnerDisposalActive, registerResourceOwner } from "../../runtime/process-lifecycle";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -61,11 +61,13 @@ function untrackHttpTransport(transport: HttpTransport): void {
 
 async function closeLiveHttpTransports(): Promise<void> {
 	await Promise.all(
-		[...liveHttpTransports].map(transport =>
-			Promise.race([transport.releaseForPostmortem(), Bun.sleep(POSTMORTEM_CLOSE_TIMEOUT_MS)]).catch(error =>
-				logger.debug("MCP HTTP postmortem release failed", { error }),
-			),
-		),
+		[...liveHttpTransports].map(async transport => {
+			try {
+				await transport.releaseForPostmortem(AbortSignal.timeout(POSTMORTEM_CLOSE_TIMEOUT_MS));
+			} catch (error) {
+				logger.debug("MCP HTTP postmortem release failed", { error });
+			}
+		}),
 	);
 }
 
@@ -145,6 +147,9 @@ export class HttpTransport implements MCPTransport {
 	 */
 	async connect(): Promise<void> {
 		if (this.#connected) return;
+		if (isResourceOwnerDisposalActive()) {
+			throw new Error("Cannot connect MCP HTTP transport during process resource disposal");
+		}
 		this.#connected = true;
 		trackHttpTransport(this);
 	}
@@ -662,7 +667,7 @@ export class HttpTransport implements MCPTransport {
 	 * session to terminate). This DELETE is the only signal an already-running
 	 * HTTP/SSE server gets that its session may be dropped.
 	 */
-	async #terminateSession(): Promise<void> {
+	async #terminateSession(signal?: AbortSignal): Promise<void> {
 		if (this.#era === "modern") return;
 		const sessionId = this.#sessionId;
 		if (!sessionId) return;
@@ -677,10 +682,11 @@ export class HttpTransport implements MCPTransport {
 				"Mcp-Session-Id": sessionId,
 			};
 
+			const timeoutSignal = AbortSignal.timeout(timeout);
 			await this.#fetch({
 				method: "DELETE",
 				headers,
-				signal: AbortSignal.timeout(timeout),
+				signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
 			});
 		} catch {
 			// Ignore termination errors
@@ -695,11 +701,11 @@ export class HttpTransport implements MCPTransport {
 	 * deliberately not fired - the manager reacts to it by reconnecting, which
 	 * would open a fresh server session on the way out.
 	 */
-	async releaseForPostmortem(): Promise<void> {
+	async releaseForPostmortem(signal: AbortSignal): Promise<void> {
 		untrackHttpTransport(this);
 		this.#connected = false;
 		this.#abortStreams();
-		await this.#terminateSession();
+		await this.#terminateSession(signal);
 	}
 
 	async close(): Promise<void> {
