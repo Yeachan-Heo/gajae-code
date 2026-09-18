@@ -1088,6 +1088,64 @@ describe("SDK serve CLI and discovery", () => {
 		expect(calls).toEqual(["session.list"]);
 	});
 
+	test("does not resume an indexed terminal session", async () => {
+		const sessionId = "terminal-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal: true, locator }],
+							// Recovery authority is present, so the only thing keeping this row from
+							// being resumed is that it has already reached a terminal state.
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "d".repeat(64) },
+							},
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
+		expect(calls).toEqual(["session.list"]);
+	});
+
+	test("reports a post-recovery stale endpoint as endpoint_stale rather than serve_failed", async () => {
+		const sessionId = "stale-after-recovery";
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				// A row with no locator cannot carry recovery authority, so the recovery path
+				// raises the stale-endpoint error itself. That error has to stay typed: an
+				// untyped throw here is rewritten to `serve_failed` and the caller loses the
+				// one code that says recovery ran and the endpoint is still not live.
+				if (operation === "session.list")
+					return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false }] } };
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
+	});
+
 	test("surfaces a recovery failure without retrying or selecting an endpoint", async () => {
 		const sessionId = "resume-fails";
 		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };

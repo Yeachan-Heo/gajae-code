@@ -165,6 +165,7 @@ type BrokerSessionRow = {
 	sessionId: string;
 	live: boolean;
 	ambiguous: boolean;
+	terminal?: boolean;
 	terminalUncertain?: boolean;
 	locator?: BrokerSessionLocator;
 	savedSession?: BrokerSavedSession;
@@ -234,6 +235,7 @@ function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown)
 				sessionId: item.sessionId,
 				live: item.live === true,
 				ambiguous: item.ambiguous === true,
+				...(item.terminal === true ? { terminal: true } : {}),
 				...(terminalUncertain ? { terminalUncertain: true } : {}),
 				...(locator === undefined ? {} : { locator }),
 				...(saved === undefined ? {} : { savedSession: saved }),
@@ -270,7 +272,10 @@ export async function listBrokerSessions(
 }
 
 function endpointStaleError(sessionId: string): Error {
-	return new Error(`endpoint_stale: session ${sessionId} endpoint is not live`);
+	// A typed error, because `toServeError` only passes `SdkServeError` through: a plain
+	// Error here is rewritten to `serve_failed`, which hides the one code that tells a
+	// caller recovery was attempted and the endpoint is still not live.
+	return new SdkServeError("endpoint_stale", `session ${sessionId} endpoint is not live`, 1);
 }
 
 async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, sessionId: string): Promise<void> {
@@ -308,7 +313,11 @@ export async function resolveServeSession(broker: SdkClient, explicitSessionId?:
 		// self-reap case (#5633). Every other targeting outcome — unindexed,
 		// ambiguous, no explicit id — stays the selector's to report, so this
 		// decision does not depend on the selector's error text.
-		if (row !== undefined && !row.ambiguous && !row.terminalUncertain && !row.live) {
+		// `terminal` is its own projected field and is one of the reasons `live` is false, so
+		// `!row.live` alone treats a session that has already stopped as recoverable. A stopped
+		// row is not a stale endpoint; resuming it would restart finished work. Only rows whose
+		// liveness failed for a non-terminal reason are recovery candidates.
+		if (row !== undefined && !row.ambiguous && !row.terminal && !row.terminalUncertain && !row.live) {
 			await recoverBrokerSession(broker, row, explicitSessionId);
 			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
 		}
