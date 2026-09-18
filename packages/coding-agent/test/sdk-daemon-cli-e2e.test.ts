@@ -331,8 +331,16 @@ describe("SDK session CLI", () => {
 							return;
 						}
 						if (frame.query === "session.checkpoint") {
-							checkpointInputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
-							if (signedExchange !== undefined && checkpointInputToken !== signedExchange.source) {
+							const inputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
+							// Only the FIRST checkpoint of a resumed tail carries the caller's token;
+							// the CLI mints a fresh (cursorless) checkpoint afterwards for the
+							// caller to resume from, exactly like the real host allows.
+							if (inputToken !== undefined) checkpointInputToken = inputToken;
+							if (
+								signedExchange !== undefined &&
+								inputToken !== undefined &&
+								inputToken !== signedExchange.source
+							) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -672,7 +680,7 @@ describe("SDK session CLI", () => {
 		}, 90_000);
 	}
 
-	it("forwards the exchanged checkpoint token to transcript.list", async () => {
+	it("a resumed tail exchanges its token but never re-walks the transcript", async () => {
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
 		transcriptRows = [{ id: "assistant-1", role: "assistant", content: "saved" }];
 		const sourceEnvelope: CursorEnvelope = {
@@ -703,11 +711,18 @@ describe("SDK session CLI", () => {
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(verifyCursor(String(checkpointInputToken), "tail-e2e-key")).toBeDefined();
 		expect(checkpointInputToken).toBe(source);
-		expect(transcriptCursor).toBe(replacement);
-		expect(transcriptCursor).not.toBe("legacy-must-not-win");
+		// The exchanged replacement is pinned to the OLD snapshot: paging it back
+		// would replay every row the caller already processed (a gateway polling a
+		// live session saw ~300 items per poll and rejected 614 frames per turn).
+		// A resume is event_replay since the checkpoint plus live frames only.
+		expect(transcriptCursor).toBeUndefined();
 		const result = JSON.parse(tail.stdout).result as Record<string, unknown>;
 		expect(result.terminal).toBe(true);
 		expect(result.gap).toBeUndefined();
+		// And the caller gets a resumable cursor back - the fresh mint, never the
+		// consumed one, and never under a name the output redactor strips.
+		expect(typeof result.cursor).toBe("string");
+		expect("checkpointToken" in result).toBe(false);
 	}, 60_000);
 
 	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {
