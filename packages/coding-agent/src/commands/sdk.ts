@@ -911,12 +911,12 @@ class SdkServeHelp extends Command {
 
 class SdkSessionHelp extends Command {
 	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
+		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|close|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
 	static args = {
 		verb: Args.string({
 			description: "Session verb",
 			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "retire", "raw"],
+			options: ["list", "inspect", "send", "status", "tail", "close", "retire", "raw"],
 		}),
 		target: Args.string({
 			description: "Session id (or the raw kind control|query|global for `raw`)",
@@ -1103,7 +1103,7 @@ class SdkGuidesCommand extends Command {
 
 export default class Sdk extends Command {
 	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
+		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail|close|retire; gjc sdk guides refresh|list|show|status|trust";
 	static hidden = false;
 	static delegateHelp = true;
 	static args = {

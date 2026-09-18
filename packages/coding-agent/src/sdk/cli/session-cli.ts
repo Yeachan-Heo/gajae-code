@@ -1879,6 +1879,7 @@ export async function runSdkSessionCli(
 			action !== "send" &&
 			action !== "status" &&
 			action !== "tail" &&
+			action !== "close" &&
 			action !== "retire" &&
 			action !== "raw" &&
 			action !== "control" &&
@@ -1887,7 +1888,7 @@ export async function runSdkSessionCli(
 		)
 			throw new SdkSessionCliError(
 				"usage",
-				"Expected one of: list, inspect, send, status, tail, retire, raw (control|query|global).",
+				"Expected one of: list, inspect, send, status, tail, close, retire, raw (control|query|global).",
 				2,
 			);
 		const agentDir = path.resolve(args.agentDir ?? getAgentDir());
@@ -1926,6 +1927,40 @@ export async function runSdkSessionCli(
 			writeOutput(
 				stripSecretFields(
 					await runTail(args.repo ?? process.cwd(), agentDir, requireValue(args.sessionId, "<sessionId>"), args),
+				),
+			);
+			return;
+		}
+		if (action === "close") {
+			const sessionId = requireValue(args.sessionId, "<sessionId>");
+			const input = await inputFromArgs(args);
+			if (input.sessionId !== undefined && input.sessionId !== sessionId)
+				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
+			const secretError = validateAdapterSecretFields("session.close", input);
+			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
+			// Closing never attaches: a Router attachment registers this process as a
+			// live client and renews the host's abandonment window, which is the
+			// opposite of what a close is for. The Broker answers the lifecycle
+			// mutation over its own client.
+			//
+			// The default request key is DERIVED from the session, not random: a close
+			// is one terminal intent per session, so a retried invocation must replay
+			// the same lifecycle request and be deduplicated by the Broker instead of
+			// issuing a second close against a host that may already be gone. An
+			// explicit --idempotency-key still wins for callers that key by attempt.
+			writeOutput(
+				stripSecretFields(
+					await runRawGlobal(
+						agentDir,
+						"session.close",
+						{ ...input, sessionId },
+						{
+							...args,
+							idempotencyKey:
+								args.idempotencyKey ??
+								`${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}`,
+						},
+					),
 				),
 			);
 			return;
