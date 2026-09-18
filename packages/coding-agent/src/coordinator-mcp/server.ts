@@ -3859,7 +3859,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// every other session. Only the explicitly scoped session may propagate,
 			// otherwise one bad WAL record makes namespace-wide reads permanently
 			// unavailable instead of degrading to the sessions that are still sound.
-			let transaction: Awaited<ReturnType<typeof readSessionTransaction>>;
+			let transaction: CoordinatorSessionTransactionV1 | null;
 			try {
 				transaction = await readSessionTransaction(questionPaths, sessionId);
 			} catch (error) {
@@ -7531,15 +7531,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			} catch (error) {
 				// Degrade per session instead of aborting the namespace sweep: one
 				// unreadable record must not make every coordination read fail.
+				// Log before classifying so the skipped session is always nameable
+				// from the outside — state_corrupt is precisely the shape the two
+				// WAL defects surface as, and silencing it hides the cause.
+				logger.warn("Coordinator projection recovery skipped session", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
 				if (
 					!(error instanceof Error) ||
 					(error.message !== "state_corrupt" && (scopedSessionId !== null || !isSessionAuthorityError(error)))
 				) {
 					if (scopedSessionId === sessionId) throw error;
-					logger.warn("Coordinator projection recovery skipped session", {
-						sessionId,
-						error: error instanceof Error ? error.message : String(error),
-					});
 				}
 			}
 		}
