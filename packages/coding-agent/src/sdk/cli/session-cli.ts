@@ -99,7 +99,8 @@ export interface SdkSessionCliArgs {
 
 type JsonRecord = Record<string, unknown>;
 type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
-type TailExitReason = "idle" | "close";
+/** Why a tail call returned: the turn went idle, the session closed, or the caller's wait window closed (non-terminal). */
+type TailExitReason = "idle" | "close" | "timeout";
 export interface RetainedTranscriptTailReader {
 	readonly size: number;
 	readRange(start: number, end: number): Promise<Uint8Array>;
@@ -1754,18 +1755,14 @@ async function runLiveTail(
 				resolveLive = completion.resolve;
 				rejectLive = completion.reject;
 				const timeoutMs = args.timeoutMs ?? 10_000;
-				const timer = setTimeout(
-					() =>
-						completion.reject(
-							new SdkSessionCliError(
-								"tail_timeout",
-								"Tail did not reach an exit condition within the wait window.",
-								1,
-								{ sessionId, timeoutMs },
-							),
-						),
-					timeoutMs,
-				);
+				// The wait window closing is not a failure: it is the caller's bound on
+				// one tail call, and everything collected inside it (transcript rows,
+				// replayed and live events) is a valid, non-terminal observation.
+				// Throwing here discarded that observation, so a poller watching a
+				// running turn with `--until-idle` saw nothing until the turn ended -
+				// every mid-turn tool call and interim line was lost, and the poll
+				// itself blocked for the whole window. `terminal: false` says the rest.
+				const timer = setTimeout(() => completion.resolve("timeout"), timeoutMs);
 				try {
 					liveReason = await completion.promise;
 				} finally {
