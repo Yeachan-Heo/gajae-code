@@ -164,6 +164,15 @@ export class OAuthSelectorComponent extends Container {
 				{ kind: "auto", selectable: true },
 				{ kind: "add", selectable: this.#onAddAccount !== undefined },
 			);
+			const firstAccount = this.#accountEntries.find(entry => entry.kind === "account");
+			if (firstAccount && !firstAccount.selectable) {
+				const addAccountIndex =
+					firstAccount.row.disabled && this.#onAddAccount !== undefined
+						? this.#accountEntries.findIndex(entry => entry.kind === "add" && entry.selectable)
+						: -1;
+				this.#selectedIndex =
+					addAccountIndex >= 0 ? addAccountIndex : this.#accountEntries.findIndex(entry => entry.selectable);
+			}
 		} else if (this.#accountEntries.some(entry => entry.kind === "account" && entry.selectable)) {
 			this.#accountEntries.push({ kind: "all", selectable: this.#onAccountRemove !== undefined });
 		}
