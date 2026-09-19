@@ -3986,18 +3986,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-b" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
 
-		const rowB = brokerSessions.find(session => session.sessionId === "created-task-b");
-		if (!rowB) throw new Error("missing task-b broker row");
-		rowB.endpointMtimeMs = Number(rowB.endpointMtimeMs) + 1;
-		await expect(
-			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-a" }),
-		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
-		await expect(
-			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-b" }),
-		).resolves.toMatchObject({
-			ok: true,
-			status: { authority: "sdk_broker", live: false, reason: "not_indexed" },
-		});
+		const sessionListScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(sessionListScopes).toContain(worktrees.get("task-a"));
+		expect(sessionListScopes).toContain(worktrees.get("task-b"));
 	}, 30_000);
 	it("does not index a managed-worktree endpoint after its authority changes", async () => {
 		const root = await tempRoot();
