@@ -1927,6 +1927,15 @@ function buildParams(
 			string,
 			unknown
 		>;
+		// The same discipline applies to tool_choice: an endpoint whose
+		// tool_choice default is "none" (IO Intelligence) injects
+		// {tool_choice:"auto"} here so ordinary agent turns can still call
+		// tools, but turns that deliberately carry no tools strip their
+		// tool_choice above — re-adding it would emit tool_choice with an
+		// empty tools list, exactly the shape strict backends reject.
+		if (!Array.isArray(params.tools) || params.tools.length === 0) {
+			delete (restExtra as Record<string, unknown>).tool_choice;
+		}
 		Object.assign(params, restExtra);
 	}
 	applyOpenAIRequestTransformBody(params, model.requestTransform);

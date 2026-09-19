@@ -896,6 +896,73 @@ describe("openai-completions compatibility", () => {
 		);
 	});
 
+	it("does not re-add extraBody tool_choice on deliberate no-tools turns", async () => {
+		// An endpoint whose tool_choice default is "none" (IO Intelligence)
+		// injects {tool_choice:"auto"} via extraBody so ordinary agent turns
+		// can still call tools. Side-channel turns that deliberately opt out
+		// of tools (context.tools = [] with toolChoice "none") strip their
+		// tool_choice; the extraBody merge must not resurrect it, or the
+		// payload carries tool_choice with an empty tools list — the exact
+		// shape strict backends reject.
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			toolChoice: "none",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload).not.toHaveProperty("tool_choice");
+	});
+
+	it("keeps extraBody tool_choice when tools are offered", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "get_weather",
+			description: "Get the weather",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		const tools = payload.tools as { type: string; function: { name: string } }[];
+		expect(tools).toHaveLength(1);
+		expect(tools[0]).toMatchObject({ type: "function", function: { name: "get_weather" } });
+		expect(payload.tool_choice).toBe("auto");
+	});
+
 	it("preserves the streamed reasoning field name when replay requires reasoning content", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
