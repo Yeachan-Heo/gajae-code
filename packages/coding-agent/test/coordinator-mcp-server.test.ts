@@ -2531,6 +2531,37 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(queries).toEqual([]);
 	});
 
+	it("surfaces distinct spawn causes instead of collapsing them to a bare spawn_failed", async () => {
+		const root = await tempRoot();
+		const causes = [
+			"Unable to spawn session: spawn ENOENT (binary not found)",
+			"Session created-session-1 exited before registering readiness. (exit=23; stderr=child startup failed)",
+		];
+		for (const [index, cause] of causes.entries()) {
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+				globalResult: operation =>
+					operation === "session.create"
+						? { ok: false, error: { code: "spawn_failed", message: cause } }
+						: undefined,
+			});
+			await expect(
+				server.callTool("gjc_coordinator_start_session", {
+					cwd: root,
+					idempotency_key: `spawn-cause-${index}`,
+					allow_mutation: true,
+				}),
+			).resolves.toEqual({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: `Session host could not be spawned. Cause: ${cause}`,
+					diagnostic: cause,
+				},
+			});
+		}
+	});
+
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

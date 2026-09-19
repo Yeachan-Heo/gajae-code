@@ -32,6 +32,7 @@ import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
+import { sanitizeSdkStartupMessage } from "../sdk/startup-capability";
 import { type SessionAttachment, SessionRouter, type SessionRouterDeps, SessionRouterError } from "../sdk/router";
 import {
 	type ActivatedPreparedSession,
@@ -516,6 +517,11 @@ const OBSERVED_BROKER_FAILURE_CODES = new Set([
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
+function coordinatorKnownSecrets(): string[] {
+	return Object.entries(process.env)
+		.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
+		.map(([, value]) => value!);
+}
 /**
  * Pagination window for `readCompleteQ12Snapshot`: it stops starting pages once
  * this much time has passed and gives each page only the remainder as its reply
@@ -1394,7 +1400,24 @@ function boundedPublicValue(value: unknown, budget: { remaining: number }, depth
 					: undefined;
 			const code =
 				typeof rawCode === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, rawCode) ? rawCode : "unavailable";
-			output[key] = { code, message: PUBLIC_ERROR_MESSAGES[code] };
+			const rawDiagnostic =
+				field && typeof field === "object" && !Array.isArray(field)
+					? (field as Record<string, unknown>).diagnostic
+					: undefined;
+			const boundedDiagnostic =
+				typeof rawDiagnostic === "string" ? boundedPublicValue(rawDiagnostic, budget, depth + 1) : undefined;
+			const rawMessage =
+				field && typeof field === "object" && !Array.isArray(field)
+					? (field as Record<string, unknown>).message
+					: undefined;
+			output[key] = {
+				code,
+				message:
+					code === "spawn_failed" && typeof rawMessage === "string" && boundedDiagnostic !== undefined
+						? boundedPublicValue(rawMessage, budget, depth + 1)
+						: PUBLIC_ERROR_MESSAGES[code],
+				...(boundedDiagnostic === undefined ? {} : { diagnostic: boundedDiagnostic }),
+			};
 		} else {
 			output[key] = sensitivePublicField(key) ? "[redacted]" : boundedPublicValue(field, budget, depth + 1);
 		}
@@ -5148,7 +5171,22 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const messageCode =
 			error instanceof Error && Object.hasOwn(PUBLIC_ERROR_MESSAGES, error.message) ? error.message : undefined;
 		const code = publicErrorCode(directCode ?? messageCode);
-		return { ok: false, error: { code, message: PUBLIC_ERROR_MESSAGES[code] } };
+		const diagnostic =
+			error instanceof SdkClientError && code === "spawn_failed"
+				? sanitizeSdkStartupMessage(error.message, coordinatorKnownSecrets())
+				: undefined;
+		const message =
+			diagnostic && diagnostic !== PUBLIC_ERROR_MESSAGES[code]
+				? `${PUBLIC_ERROR_MESSAGES[code]} Cause: ${diagnostic}`
+				: PUBLIC_ERROR_MESSAGES[code];
+		return {
+			ok: false,
+			error: {
+				code,
+				message,
+				...(diagnostic && diagnostic !== PUBLIC_ERROR_MESSAGES[code] ? { diagnostic } : {}),
+			},
+		};
 	}
 	function sdkError(error: unknown): Record<string, unknown> {
 		return publicError(error);
