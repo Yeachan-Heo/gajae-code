@@ -481,12 +481,50 @@ export async function saveBashOriginalArtifactForTests(
 	return result.status === "saved" ? result.artifactId : undefined;
 }
 
+/**
+ * Model-declared activity metadata for the browser-backend routing contract
+ * (`browser.backend: aside`). When that contract routes a browser task through
+ * Bash, it requires the call to declare the activity structurally so consumers
+ * can project it without parsing the command text. The declaration is
+ * model-declared and schema-validated only: nothing here verifies that the
+ * command actually invokes Aside, and the executor never inspects `command`.
+ */
+export type BashActivityProvider = "aside";
+export type BashActivityMode = "repl" | "exec";
+export interface BashActivityDeclaration {
+	kind: "browser";
+	provider: BashActivityProvider;
+	mode: BashActivityMode;
+}
+
+const bashActivityDeclarationSchema = z
+	.object({
+		kind: z.literal("browser"),
+		provider: z.literal("aside"),
+		mode: z.enum(["repl", "exec"]),
+	})
+	.strict();
+
+/**
+ * Optional activity declaration. Anything that is not the exact supported
+ * shape is dropped rather than failing the call: the declaration is routing
+ * metadata, and a malformed value must never make an otherwise valid command
+ * unusable. Values are never coerced — `mode: "EXEC"` is dropped, not guessed.
+ */
+const optionalBashActivity = z
+	.preprocess(
+		value => (bashActivityDeclarationSchema.safeParse(value).success ? value : undefined),
+		bashActivityDeclarationSchema.optional(),
+	)
+	.describe("declare browser activity for the aside browser backend: repl or exec");
+
 const bashSchemaBase = z.object({
 	command: z.string().describe("command to execute"),
 	env: z.record(z.string().regex(BASH_ENV_NAME_PATTERN), z.string()).optional().describe("extra env vars"),
 	timeout: z.number().default(300).describe("timeout in seconds, NOT milliseconds (30 = 30s)").optional(),
 	cwd: z.string().describe("working directory").optional(),
 	pty: z.boolean().describe("run in pty mode").optional(),
+	activity: optionalBashActivity,
 });
 
 const bashSchemaWithAsync = bashSchemaBase.extend({
@@ -503,6 +541,8 @@ export interface BashToolInput {
 
 	async?: boolean;
 	pty?: boolean;
+	/** Accepted activity declaration, mirrored into {@link BashToolDetails.activity}. */
+	activity?: BashActivityDeclaration;
 }
 
 export interface BashToolDetails {
@@ -512,6 +552,8 @@ export interface BashToolDetails {
 	terminalId?: string;
 	/** Why the foreground wait was folded, when this result is a background-start after a fold. */
 	foldReason?: FoldReason;
+	/** The accepted model-declared activity declaration, when the call carried one. */
+	activity?: BashActivityDeclaration;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -924,6 +966,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices?: readonly string[];
 			terminalId?: string;
 			artifactReferenceInBody?: boolean;
+			activity?: BashActivityDeclaration;
 		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const shortArtifactInBody = !result.truncated && result.artifactId !== undefined;
@@ -947,6 +990,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.terminalId !== undefined) {
 			details.terminalId = options.terminalId;
 		}
+		if (options.activity !== undefined) {
+			details.activity = options.activity;
+		}
 		const resultBuilder = toolResult(details)
 			.text(outputText)
 			.truncationFromSummary(result, {
@@ -967,6 +1013,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices?: readonly string[];
 			terminalId?: string;
 			foldReason?: FoldReason;
+			activity?: BashActivityDeclaration;
 		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
@@ -980,6 +1027,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
 		if (options.foldReason !== undefined) details.foldReason = options.foldReason;
+		if (options.activity !== undefined) details.activity = options.activity;
 		const lines: string[] = [];
 		const trimmedPreview = previewText.trimEnd();
 		if (trimmedPreview.length > 0) {
@@ -1019,6 +1067,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		onCompletion?: () => void;
 		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
 		toolCallId?: string;
+		/** Accepted activity declaration, mirrored into job progress and result details. */
+		activity?: BashActivityDeclaration;
 	}): ManagedBashJobHandle {
 		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
@@ -1032,12 +1082,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
+		const activityDetails = options.activity === undefined ? {} : { activity: options.activity };
 		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "running", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "running", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const completedDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "completed", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const failedDetails = (jobId: string): Record<string, unknown> | undefined =>
-			backgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined;
+			backgrounded ? { async: { state: "failed", jobId, type: "bash" }, ...activityDetails } : undefined;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
 		const jobId = manager.register(
@@ -1088,6 +1139,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						requestedTimeoutSec: options.requestedTimeoutSec,
 						notices: options.notices,
 						artifactReferenceInBody: true,
+						activity: options.activity,
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -1110,7 +1162,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					latestText = text;
 					await options.onUpdate?.({
 						content: [{ type: "text", text }],
-						details: backgrounded ? ((details ?? {}) as BashToolDetails) : {},
+						// Backgrounded frames carry the job details verbatim; a foreground
+						// frame has no job facts, but the activity declaration is per-call
+						// metadata and stays attached so partial results are self-describing.
+						details: backgrounded ? ((details ?? {}) as BashToolDetails) : (activityDetails as BashToolDetails),
 					});
 				},
 			},
@@ -1571,9 +1626,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices: readonly string[],
 		signal: AbortSignal | undefined,
 		resolvedEnv: Record<string, string>,
+		activity: BashActivityDeclaration | undefined,
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const result = await this.#runDirectMasterSpawn(command, commandCwd, timeoutMs, signal, resolvedEnv);
-		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices });
+		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices, activity });
 	}
 
 	/**
@@ -1723,6 +1779,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 			async: asyncRequested = false,
 			pty = false,
+			activity,
 		}: BashToolInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
@@ -1767,6 +1824,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				pendingNotices,
 				signal,
 				resolvedEnv,
+				activity,
 			);
 		}
 
@@ -1792,6 +1850,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				startBackgrounded: true,
 				toolCallId,
+				activity,
 			});
 			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
 			job.setBackgrounded(true);
@@ -1799,6 +1858,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				activity,
 			});
 		}
 
@@ -1845,6 +1905,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					managedForegroundSettled = true;
 				},
 				toolCallId,
+				activity,
 			});
 			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			if (startBackgrounded) {
@@ -1853,6 +1914,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
+					activity,
 				});
 			}
 			const backgroundRequest = Promise.withResolvers<FoldReason>();
@@ -1948,6 +2010,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				requestedTimeoutSec,
 				notices: pendingNotices,
 				foldReason: waitResult.reason,
+				activity,
 			});
 		}
 
@@ -2246,6 +2309,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								requestedTimeoutSec,
 								notices: timeoutNotices,
 								terminalId: handle.terminalId,
+								activity,
 							});
 						}
 
@@ -2378,6 +2442,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					terminalId: handle.terminalId,
+					activity,
 				});
 			};
 
@@ -2419,7 +2484,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							bridgeCompletion.resolve({ kind: "completed", result });
 							await reportProgress(
 								finalText,
-								bridgeBackgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined,
+								bridgeBackgrounded
+									? {
+											async: { state: "completed", jobId, type: "bash" },
+											...(activity === undefined ? {} : { activity }),
+										}
+									: undefined,
 							);
 							return finalText;
 						} catch (error) {
@@ -2429,7 +2499,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							bridgeCompletion.resolve({ kind: "failed", error });
 							await reportProgress(
 								message,
-								bridgeBackgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined,
+								bridgeBackgrounded
+									? {
+											async: { state: "failed", jobId, type: "bash" },
+											...(activity === undefined ? {} : { activity }),
+										}
+									: undefined,
 							);
 							throw error;
 						} finally {
@@ -2556,6 +2631,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 				terminalId: handle.terminalId,
 				foldReason: bridgeWait.reason,
+				activity,
 			});
 		}
 
@@ -2640,6 +2716,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 										outcome = await controls.terminalCompletion;
 										const completed = this.#buildCompletedResult(outcome, timeoutSec, {
 											requestedTimeoutSec,
+											activity,
 										});
 										return this.#extractTextResult(completed);
 									} finally {
@@ -2707,6 +2784,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									requestedTimeoutSec,
 									notices: pendingNotices,
 									foldReason: receipt.reason,
+									activity,
 								});
 								const outcome = controls.detachObserver(
 									interactiveResultFromText(this.#extractTextResult(started)),
@@ -2790,6 +2868,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return this.#buildCompletedResult(result, timeoutSec, {
 			requestedTimeoutSec,
 			notices: pendingNotices,
+			activity,
 		});
 	}
 }

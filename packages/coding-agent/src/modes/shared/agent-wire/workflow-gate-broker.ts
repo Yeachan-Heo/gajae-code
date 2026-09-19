@@ -1147,6 +1147,8 @@ export type GateAuditEvent =
 	| { event: "gate_response_accepted"; gate_id: string; answer_hash: string }
 	| { event: "gate_response_rejected"; gate_id: string; answer_hash: string }
 	| { event: "gate_response_idempotent_replay"; gate_id: string }
+	/** An idempotent replay refused because this runtime cannot prove the continuation ran. */
+	| { event: "gate_response_replay_unproven"; gate_id: string }
 	| { event: "gate_response_idempotency_conflict"; gate_id: string }
 	| { event: "gate_response_already_resolved"; gate_id: string }
 	| { event: "gate_response_unknown_gate"; gate_id: string }
@@ -1552,6 +1554,17 @@ export class WorkflowGateBroker {
 			const sameBody = record.responseHash === responseHash;
 			const sameKey = record.idempotencyKey === response.idempotency_key;
 			if (response.idempotency_key !== undefined && sameKey && sameBody) {
+				// Same provenance rule as `lookupCompletedResolution`: an idempotent replay must
+				// not hand back an accepted resolution for a continuation this runtime cannot
+				// prove was resolved. Without this, a direct `resolveGate()` retry bypassed the
+				// lookup entirely and reproduced the original false success (#5599 review).
+				if (this.#continuationLost.has(response.gate_id) || record.ownerInstanceId !== this.instanceId) {
+					this.hooks.audit?.({ event: "gate_response_replay_unproven", gate_id: response.gate_id });
+					throw new WorkflowGateBrokerError(
+						"unknown_gate",
+						`accepted gate ${response.gate_id} cannot be replayed: this runtime cannot prove its continuation was resolved`,
+					);
+				}
 				this.hooks.audit?.({ event: "gate_response_idempotent_replay", gate_id: response.gate_id });
 				return record.resolution as WorkflowGateResolution;
 			}

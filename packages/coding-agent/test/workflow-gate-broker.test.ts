@@ -656,4 +656,32 @@ describe("WorkflowGateBroker", () => {
 		//    rather than same-process only (#5599 review).
 		expect(afterRestart.lookupCompletedResolution(response).kind).toBe("accepted_incomplete");
 	});
+	it("refuses a direct resolveGate replay the runtime cannot prove resolved (#5599 review)", async () => {
+		// `lookupCompletedResolution` is not the only way back in: `resolve()` has its own
+		// accepted-record idempotency branch that returned `record.resolution` directly. A
+		// caller retrying through the broker API rather than the SDK lookup bypassed the
+		// provenance check entirely and got the same false success.
+		const file = path.join(mkdtempSync(path.join(tmpdir(), "gate-5599-replay-")), "gates.json");
+		const broker = new WorkflowGateBroker("run-replay", new FileGateStore(file), {
+			advance: () => {},
+			terminalizeAccepted: () => "not_published",
+			completeAccepted: record => {
+				throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
+			},
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["approve"] } },
+			liveContinuation(),
+		);
+		const response = { gate_id: gate.gate_id, answer: "approve", idempotency_key: "idem-replay" };
+		await expect(broker.resolve(response)).rejects.toThrow(/lost its continuation owner/);
+
+		// Same runtime: the loss is remembered, so the replay is refused rather than served.
+		await expect(broker.resolve(response)).rejects.toThrow(/cannot prove its continuation was resolved/);
+
+		// New runtime over the same store: the in-memory loss set is empty, so provenance is
+		// the only thing left that can refuse it.
+		const afterRestart = new WorkflowGateBroker("run-replay", new FileGateStore(file), { advance: () => {} });
+		await expect(afterRestart.resolve(response)).rejects.toThrow(/cannot prove its continuation was resolved/);
+	});
 });

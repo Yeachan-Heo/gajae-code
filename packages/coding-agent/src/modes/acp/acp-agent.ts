@@ -60,7 +60,11 @@ import {
 	promptFailureRetryability,
 	rephaseFailedOutcome,
 } from "../../sdk/prompt-failure";
-import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
+import type {
+	SdkPromptFailureCategory,
+	SdkPromptFailurePhase,
+	SdkPromptTerminalOutcome,
+} from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
@@ -655,12 +659,71 @@ export class AcpPromptFailureError extends AcpSdkAdapterError {
  * dropped instead of becoming a leak of provider text (the redaction contract in
  * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
  */
+export const OPERATOR_UPSTREAM_LABEL = "Upstream provider failure";
+export const OPERATOR_UPSTREAM_SUFFIX = ": the model provider ended this turn.";
+/**
+ * `post_start` proves execution began, so tools may already have run and had effects before the
+ * provider died. The wording therefore qualifies the turn rather than absolving the task: saying
+ * the task was unaffected would assert something the bounded classifiers do not establish.
+ */
+export const OPERATOR_PARTIAL_WORK_NOTE =
+	" Work this turn had already performed may have taken effect; check before retrying.";
+
+/**
+ * Operator-facing wording for a post-start terminal, assembled ONLY from bounded safe tokens: the
+ * classifier `phase`, the `category`, and a `providerCode` that passes `isSafePromptFailureCode`.
+ * Raw provider text never reaches this function and must never reach it.
+ *
+ * Gated on BOTH `phase === "post_start"` and `category === "provider_transport"`. A submission-phase
+ * provider failure is rejected by the phase gate: nothing executed, so wording about a turn the
+ * provider ended would describe an event that never occurred.
+ *
+ * It claims only what those tokens prove — that the upstream provider ended the turn — and says
+ * nothing about whether the operator's work survived. `post_start` proves execution began, so the
+ * wording qualifies that earlier work may already have taken effect instead of absolving the task.
+ *
+ * This is additive. The wire `code`/`details` pair and every `PROMPT_FAILURE_MESSAGE_*` constant
+ * stay exactly as they are — pinned ACP core-v1 conformance asserts on them — so this wording
+ * travels alongside the redacted message instead of repurposing it.
+ *
+ * It says NOTHING about the worktree, deliberately. Nothing on this path inspects the worktree, so
+ * any sentence about uncommitted work would assert a check that never ran — reporting an
+ * uninspected tree as clean is the absence-of-evidence-as-evidence-of-absence error, and an
+ * operator who believed it would sweep work away. Silence is the only honest option until something
+ * actually looks.
+ *
+ * Returns `undefined` for every other category: `phase` and `category` are already on the wire, so
+ * restating them in prose tells an operator nothing they do not already have.
+ */
+export function postStartOperatorMessage(input: {
+	phase: SdkPromptFailurePhase;
+	category: SdkPromptFailureCategory;
+	providerCode?: string;
+}): string | undefined {
+	// Phase first: a submission-phase provider failure never started executing, so wording about a
+	// turn that ended mid-flight would describe something that did not happen. `phase` is a bounded
+	// classifier already on the wire, so gating on it widens nothing.
+	if (input.phase !== "post_start") return undefined;
+	if (input.category !== "provider_transport") return undefined;
+	const code = isSafePromptFailureCode(input.providerCode) ? ` (${input.providerCode})` : "";
+	return `${OPERATOR_UPSTREAM_LABEL}${code}${OPERATOR_UPSTREAM_SUFFIX}${OPERATOR_PARTIAL_WORK_NOTE}`;
+}
+
 function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+	// `operatorMessage` says, in words, what the classifier tokens already say in codes: that the
+	// cause was an upstream provider problem rather than a failure of the operator's task. Built
+	// only from those same bounded tokens, so it widens nothing that reaches the wire.
+	const operatorMessage = postStartOperatorMessage({
+		phase: failure.phase,
+		category: failure.category,
+		...(failure.providerCode === undefined ? {} : { providerCode: failure.providerCode }),
+	});
 	return {
 		phase: failure.phase,
 		category: failure.category,
 		retryability: promptFailureRetryability(failure.category),
 		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+		...(operatorMessage === undefined ? {} : { operatorMessage }),
 	};
 }
 

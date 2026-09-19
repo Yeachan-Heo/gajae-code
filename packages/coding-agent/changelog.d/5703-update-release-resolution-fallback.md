@@ -1,0 +1,3 @@
+### Fixed
+
+- `gjc update` no longer fails outright when `api.github.com` has exhausted its 60 requests/hour unauthenticated budget: a rate-limited stable lookup now resolves the latest tag through the `github.com/<repo>/releases/latest` redirect, which is the same origin the release binaries already download from and is not API-rate-limited. The redirect is accepted only from that exact origin and release-tag route, the existing stable-tag and checksum verification are unchanged, and the rate-limit failure (including the nightly channel, which has no web listing to fall back to) now names `GITHUB_TOKEN`/`GH_TOKEN` as the workaround. `scripts/install.sh` gained the same fallback (#5703).
