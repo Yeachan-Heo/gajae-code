@@ -1,7 +1,7 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
-import { decideLogDirIsolation } from "./test-log-dir-isolation";
+import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -110,11 +110,12 @@ if (isolation.action === "isolate") {
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so that is honored untouched — but only when the pin is
-// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
-// `cwd/.env` into `process.env` before any module runs, so a checkout that
-// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
-// happen. The decision (including that distrust rule) lives in
+// on log content), so that is honored untouched — but only when that pin is
+// trusted and does not resolve to the canonical shared user sink. A nonblank
+// value is not evidence of intent on its own: Bun overlays `cwd/.env` into
+// `process.env` before any module runs, so a checkout that declares GJC_LOG_DIR
+// would otherwise be honored here and isolation would never happen. The
+// decision (including that distrust rule and the shared-sink guard) lives in
 // ./test-log-dir-isolation.ts so it is unit-testable without importing this
 // preload's side effects.
 //
@@ -124,8 +125,23 @@ if (isolation.action === "isolate") {
 // run the suite against the operator's live log sink, which is the regression
 // this exists to prevent.
 const logIsolation = decideLogDirIsolation({
-	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
+	env: {
+		GJC_LOG_DIR: process.env.GJC_LOG_DIR,
+		GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+		XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+	},
 	projectEnv,
+	sharedLogDir: defaultLogDirFor({
+		home: os.homedir(),
+		env: {
+			GJC_LOG_DIR: process.env.GJC_LOG_DIR,
+			GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+			PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+			XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+		},
+		projectEnv,
+	}),
 });
 if (logIsolation.action === "fail") {
 	throw new Error(

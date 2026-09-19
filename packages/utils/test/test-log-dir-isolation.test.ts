@@ -139,6 +139,33 @@ describe("test log-dir isolation decision", () => {
 		});
 	});
 
+	test("isolates a trusted pin that resolves to the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: shared }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("isolates a symlink alias of the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: "/tmp/operator-logs" },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+				realpath: target => (target === "/tmp/operator-logs" ? shared : target),
+			}),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("still honors a trusted pin outside the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		const pinned = "/tmp/pinned-logs";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: pinned }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "honor", logDir: pinned });
+	});
+
 	test("isolates a key declared with an empty value", () => {
 		// `Object.hasOwn`, not truthiness: `GJC_LOG_DIR=` in a dotenv file is still
 		// a declaration, and the checkout still authored it.
@@ -327,6 +354,26 @@ describe("preload log-sink behavior (real preload path)", () => {
 			expect(probe.stdout.toString().trim()).toBe(pinned);
 		} finally {
 			await fs.promises.rm(pinned, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("replaces an inherited canonical log pin with a fresh isolated sink", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-shared-home-"));
+		const shared = path.join(home, ".gjc", "logs");
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, "-e", printLogDir],
+				env: childEnv({ HOME: home, GJC_LOG_DIR: shared }),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const adopted = probe.stdout.toString().trim();
+			expect(probe.exitCode, probe.stderr.toString()).toBe(0);
+			expect(adopted).not.toBe(shared);
+			expect(path.basename(adopted).startsWith("gjc-test-logs-")).toBe(true);
+			await fs.promises.rm(adopted, { recursive: true, force: true });
+		} finally {
+			await fs.promises.rm(home, { recursive: true, force: true });
 		}
 	}, 30_000);
 });
