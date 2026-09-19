@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
@@ -88,6 +88,7 @@ export interface WorkflowTransactionJournal {
 	callee?: CanonicalGjcWorkflowSkill;
 	paths: string[];
 	steps: string[];
+	approval_audit_offset?: number;
 }
 
 export type StateWritePolicy = "source" | "cache";
@@ -176,7 +177,7 @@ export interface GenericHardPruneTarget {
 export interface GenericHardPruneSelectorContext {
 	path: string;
 	category: WriterCategory | string;
-	stat: Stats;
+	stat: nodeFs.Stats;
 	readJson: () => Promise<unknown>;
 }
 
@@ -238,6 +239,30 @@ function resolveGjcTarget(targetPath: string, cwd = process.cwd()): string {
 
 function tempPathFor(filePath: string): string {
 	return `${filePath}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+}
+
+const PRIVATE_DIRECTORY_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
+async function ensurePrivateDirectory(directory: string): Promise<void> {
+	await fs.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+	await fs.chmod(directory, PRIVATE_DIRECTORY_MODE);
+}
+
+async function appendPrivate(filePath: string, content: string): Promise<void> {
+	const flags =
+		nodeFs.constants.O_WRONLY |
+		nodeFs.constants.O_APPEND |
+		nodeFs.constants.O_CREAT |
+		(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
+		await handle.chmod(PRIVATE_FILE_MODE);
+		await handle.writeFile(content, "utf-8");
+	} finally {
+		await handle?.close();
+	}
 }
 
 function jsonText(value: unknown): string {
@@ -516,10 +541,11 @@ async function maybeAudit(mutatedPath: string, options?: StateWriterOptions): Pr
 }
 
 async function atomicWrite(filePath: string, content: string): Promise<string> {
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensurePrivateDirectory(path.dirname(filePath));
 	const tmpPath = tempPathFor(filePath);
 	try {
-		await fs.writeFile(tmpPath, content, "utf-8");
+		await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: PRIVATE_FILE_MODE, flag: "wx" });
+		await fs.chmod(tmpPath, PRIVATE_FILE_MODE);
 		await fs.rename(tmpPath, filePath);
 	} catch (error) {
 		await fs.rm(tmpPath, { force: true }).catch(() => undefined);
@@ -808,7 +834,7 @@ async function lockResolvedWorkflowTarget<T>(
 ): Promise<T> {
 	// `withFileLock` creates the lock dir next to the target with a non-recursive
 	// mkdir, so the parent directory must exist before the lock is acquired.
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensurePrivateDirectory(path.dirname(filePath));
 	return withFileLock(filePath, fn, lockOptions);
 }
 
@@ -833,8 +859,8 @@ export async function updateJsonAtomic<T = unknown>(
 
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	await ensurePrivateDirectory(path.dirname(filePath));
+	await appendPrivate(filePath, `${JSON.stringify(entry)}\n`);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -937,7 +963,7 @@ export async function appendJsonlIdempotent(
 			if (duplicate !== undefined) {
 				return { path: filePath, appended: false, duplicate };
 			}
-			await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+			await appendPrivate(filePath, `${JSON.stringify(entry)}\n`);
 			await maybeAudit(filePath, options);
 			return { path: filePath, appended: true };
 		},
@@ -947,8 +973,8 @@ export async function appendJsonlIdempotent(
 
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, text, "utf-8");
+	await ensurePrivateDirectory(path.dirname(filePath));
+	await appendPrivate(filePath, text);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -959,10 +985,11 @@ export async function createJsonNoClobber(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await ensurePrivateDirectory(path.dirname(filePath));
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, "wx");
+		handle = await fs.open(filePath, "wx", PRIVATE_FILE_MODE);
+		await handle.chmod(PRIVATE_FILE_MODE);
 		await handle.writeFile(jsonText(withWorkflowReceipt(value, buildReceipt(options))), "utf-8");
 	} catch (error) {
 		if (isErrno(error, "EEXIST")) throw new AlreadyExistsError(filePath);
@@ -1183,7 +1210,7 @@ export async function hardPrune(
 	const removed: string[] = [];
 	for (const target of targets) {
 		const filePath = resolveGjcTarget(target.path, cwd);
-		let stat: Stats;
+		let stat: nodeFs.Stats;
 		try {
 			stat = await fs.stat(filePath);
 		} catch (error) {
@@ -1248,6 +1275,7 @@ export async function appendAuditEntry(
 	cwd: string,
 	sessionIdOrEntry: string | AuditEntry,
 	maybeEntry?: AuditEntry,
+	options: { lockHeld?: boolean; beforeAppend?: (offset: number) => Promise<unknown> } = {},
 ): Promise<string> {
 	const sessionId =
 		typeof sessionIdOrEntry === "string"
@@ -1257,8 +1285,51 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+	const append = async () => {
+		await ensurePrivateDirectory(path.dirname(filePath));
+		let initialStat: nodeFs.BigIntStats | undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+			if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new Error("audit path is not a regular file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		const flags = initialStat
+			? nodeFs.constants.O_WRONLY |
+				nodeFs.constants.O_APPEND |
+				(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
+			: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
+			const openedStat = await handle.stat({ bigint: true });
+			const pathStat = await fs.lstat(filePath, { bigint: true });
+			const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+				left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+			if (
+				openedStat.isSymbolicLink() ||
+				!openedStat.isFile() ||
+				pathStat.isSymbolicLink() ||
+				!pathStat.isFile() ||
+				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+				!sameObject(openedStat, pathStat)
+			)
+				throw new Error("audit path identity changed before append");
+			if (openedStat.size > BigInt(Number.MAX_SAFE_INTEGER))
+				throw new Error("audit path is too large to append safely");
+			await handle.chmod(PRIVATE_FILE_MODE);
+			await options.beforeAppend?.(Number(openedStat.size));
+			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
+			await handle.sync();
+			const afterPathStat = await fs.lstat(filePath, { bigint: true });
+			if (afterPathStat.isSymbolicLink() || !sameObject(openedStat, afterPathStat))
+				throw new Error("audit path identity changed during append");
+		} finally {
+			await handle?.close();
+		}
+	};
+	if (options.lockHeld) await append();
+	else await withWorkflowStateLock(filePath, append, { cwd });
 	return filePath;
 }
 
