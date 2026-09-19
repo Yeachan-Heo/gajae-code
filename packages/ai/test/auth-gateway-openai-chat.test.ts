@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { buildAuthGatewayStreamOptionsForTest } from "../src/auth-gateway/server";
+import {
+	buildAuthGatewayStreamOptionsForTest,
+	classifyGatewayMessageFailure,
+	redactGatewayStream,
+} from "../src/auth-gateway/server";
 import { encodeResponse, encodeStream, parseRequest } from "../src/providers/openai-chat-server";
 import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "../src/types";
 
@@ -612,5 +616,111 @@ describe("auth-gateway openai-chat: encodeStream", () => {
 		expect(lines).toHaveLength(2); // role chunk + error envelope
 		const payloads = lines.map(parseSseLine) as Array<Record<string, unknown>>;
 		expect(payloads[1]).toEqual({ error: { message: "upstream went away", type: "upstream_error" } });
+	});
+});
+
+describe("auth-gateway: non-streaming failure envelopes (#5627)", () => {
+	function failed(overrides: Partial<AssistantMessage>): AssistantMessage {
+		return { ...emptyAssistant(), ...overrides };
+	}
+
+	// The guard's diagnostic quotes raw model output. Routing that through the
+	// keyword classifier would let the sample pick the status, so the envelope
+	// message has to be a fixed literal.
+	const GUARD_DIAGNOSTIC =
+		'Stopped the turn: the model repeated the same thinking output 12 times ("quota invalid forbidden").';
+
+	it("reports a repetition-guard stop as an upstream error, not a client cancellation", () => {
+		const classified = classifyGatewayMessageFailure(
+			failed({ stopReason: "error", errorCode: "repetition_guard_tripped" }),
+			GUARD_DIAGNOSTIC,
+		);
+
+		expect(classified.status).toBe(502);
+		expect(classified.type).toBe("upstream_error");
+		expect(classified.status).not.toBe(499);
+		expect(classified.type).not.toBe("request_aborted");
+	});
+
+	it("never lets the repeated sample reach the keyword classifier", () => {
+		const classified = classifyGatewayMessageFailure(
+			failed({ stopReason: "error", errorCode: "repetition_guard_tripped" }),
+			GUARD_DIAGNOSTIC,
+		);
+
+		// "quota"/"invalid"/"forbidden" in the sample would otherwise route this
+		// to 429 / 400 / 401.
+		expect(classified.message).not.toContain("quota");
+		expect(classified.message).not.toContain("invalid");
+		expect(classified.message).not.toContain("forbidden");
+	});
+
+	it("keeps 499 for a real caller abort", () => {
+		const classified = classifyGatewayMessageFailure(failed({ stopReason: "aborted" }), "Request was aborted");
+
+		expect(classified.status).toBe(499);
+		expect(classified.type).toBe("request_aborted");
+	});
+
+	it("still classifies an ordinary upstream error by message", () => {
+		const classified = classifyGatewayMessageFailure(failed({ stopReason: "error" }), "429 rate limit exceeded");
+
+		expect(classified.status).toBe(429);
+		expect(classified.type).toBe("rate_limit_error");
+	});
+});
+/**
+ * The non-streaming envelope is covered above. This is the streaming half: the
+ * provider pushes a terminal error event, `redactGatewayStream` scrubs it, and
+ * the chat-completions encoder writes `errorMessage` straight onto the wire. A
+ * repetition sample reaching that wire is the #5627 r5 finding.
+ */
+describe("auth-gateway openai-chat: streaming repetition-guard redaction (#5627)", () => {
+	const SENTINEL = "quota invalid forbidden zzsentinelzz";
+
+	function guardStop(errorCode: string | undefined): AssistantMessage {
+		return {
+			...emptyAssistant(),
+			stopReason: "error",
+			...(errorCode ? { errorCode } : {}),
+			errorMessage: `Stopped the turn: the model repeated the same thinking output 12 times ("${SENTINEL}").`,
+		};
+	}
+
+	async function encodeThroughGateway(message: AssistantMessage): Promise<string[]> {
+		const events: AssistantMessageEvent[] = [{ type: "error", reason: "error", error: message }];
+		const redacted = redactGatewayStream(makeEventStream(events, message));
+		return collectStream(encodeStream(redacted, "gpt-test"));
+	}
+
+	it("never writes the repeated sample onto the SSE wire", async () => {
+		const lines = await encodeThroughGateway(guardStop("repetition_guard_tripped"));
+		const wire = lines.join("\n");
+
+		expect(wire).not.toContain(SENTINEL);
+		expect(wire).not.toContain("zzsentinelzz");
+		expect(wire).not.toContain("quota");
+		expect(wire).not.toContain("invalid");
+		expect(wire).not.toContain("forbidden");
+		// Non-vacuity: an error envelope really was emitted.
+		expect(wire).toContain("upstream_error");
+	});
+
+	it("substitutes the same fixed envelope the non-streaming path returns", async () => {
+		const lines = await encodeThroughGateway(guardStop("repetition_guard_tripped"));
+		const expected = classifyGatewayMessageFailure(
+			{ stopReason: "error", errorCode: "repetition_guard_tripped" },
+			"ignored",
+		).message;
+
+		expect(lines.join("\n")).toContain(expected);
+	});
+
+	// Pins the delta: without the guard's error code the same text is only
+	// credential-scrubbed, so ordinary prose still passes through.
+	it("leaves an ordinary upstream error message alone", async () => {
+		const wire = (await encodeThroughGateway(guardStop(undefined))).join("\n");
+
+		expect(wire).toContain(SENTINEL);
 	});
 });
