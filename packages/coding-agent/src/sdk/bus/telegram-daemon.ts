@@ -5261,6 +5261,7 @@ export class TelegramNotificationDaemon {
 		this.#frameRouter = this.#createFrameRouter();
 		this.#attachmentRouter = new SessionRouter({
 			agentDir: opts.settings.getAgentDir(),
+			observer: true,
 			deps: {
 				...opts.routerDeps,
 				onNotificationSubscription: subscription => this.#onAttachment(subscription),

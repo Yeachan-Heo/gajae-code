@@ -35,7 +35,6 @@ describe("GJC utility extensibility quarantine", () => {
 			"share",
 			"todo",
 			"branch",
-			"fork",
 			"force",
 			// `quit` stays a non-standalone command: `/quit` is a TUI alias of
 			// `/exit`, verified in slash-command-builtin-registry.test.ts.
@@ -55,6 +54,14 @@ describe("GJC utility extensibility quarantine", () => {
 		// (generate a handoff document and continue in a new session), so it is
 		// intentionally no longer in the removed set above.
 		expect(registry).toContain(`name: "handoff"`);
+		// `/fork` was restored as a first-class built-in (#5515: choose an earlier
+		// prompt and continue it in a new session), so it is intentionally no longer
+		// in the removed set above. It stays TUI-only: restoring it must not
+		// reintroduce a headless or standalone utility surface.
+		const fork = registry.match(/\{\s*name: "fork",([\s\S]*?)\n\t\},/);
+		expect(fork?.[1]).toContain("handleTui:");
+		expect(fork?.[1]).not.toContain("handle:");
+		expect(fork?.[1]).not.toContain("localHeadless:");
 		expect(registry).toContain(`name: "ssh"`);
 		expect(registry).toContain(`name: "provider"`);
 		expect(await Bun.file(srcPath("slash-commands", "helpers", "marketplace-manager.ts")).exists()).toBe(false);

@@ -52,6 +52,7 @@ import {
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
+	type TerminalReadBack,
 } from "./lifecycle-ledger";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { sdkInternalRuntimeImage } from "./runtime";
@@ -725,9 +726,45 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+
+type TerminalPersistenceVerification =
+	| { kind: "unverified" }
+	| { kind: "verified" }
+	| { kind: "uncertain"; mismatches: readonly string[] };
+
+function verifyTerminalPersistence(
+	readBack: TerminalReadBack,
+	storedResponse: BrokerResponse,
+	durableEffects: LifecycleDurableEffectsReceipt | undefined,
+	startupFailure: LifecycleStartupFailureReceipt | undefined,
+): TerminalPersistenceVerification {
+	// An absent read-back is a verification failure, not evidence that the
+	// operation itself is ambiguous. The terminal transition was already synced
+	// before this read, so preserve its settled outcome and let a later reader
+	// reconcile the durable row.
+	if (readBack.kind === "absent") return { kind: "unverified" };
+	// A *rejected* row is the opposite: the ledger holds something for this request
+	// and refused it. That is damaged durable state, which previously fenced the
+	// session and must keep fencing it — treating it as "not yet written" would let
+	// a corrupt row clear the fence it exists to raise.
+	if (readBack.kind === "rejected") return { kind: "uncertain", mismatches: [`readBack:${readBack.reason}`] };
+	const persisted = readBack.entry;
+	const optionalReceiptJson = (value: unknown): string | undefined =>
+		value === undefined || value === null ? undefined : canonicalJson(value);
+	// The field name is always present; only the two compared receipt renderings are
+	// optional. Naming that shape keeps the mismatch list a plain string list.
+	const comparisons: readonly (readonly [string, string | undefined, string | undefined])[] = [
+		["response", canonicalJson(persisted.response), canonicalJson(storedResponse)],
+		["durableEffects", optionalReceiptJson(persisted.durableEffects), optionalReceiptJson(durableEffects)],
+		["startupFailure", optionalReceiptJson(persisted.startupFailure), optionalReceiptJson(startupFailure)],
+	];
+	const mismatches = comparisons.filter(([, actual, expected]) => actual !== expected).map(([field]) => field);
+	return mismatches.length === 0 ? { kind: "verified" } : { kind: "uncertain", mismatches };
 }
 
 function credentialFreeLifecycleResponse(value: unknown): unknown {
@@ -990,10 +1027,11 @@ function isBrokerLockArtifactName(name: string): boolean {
  * Decide whether one candidate directory is provably abandoned.
  *
  * Fail-closed by construction: every branch that cannot prove abandonment
- * returns a retention reason. A tombstone is only abandoned when its owner
- * record parses and names a dead PID — an unreadable, permission-denied, or
- * absent record keeps it forever. Backup directories carry no owner contract,
- * so an absent record there is not ambiguity and age alone governs.
+ * returns a retention reason. A tombstone with an owner record is only
+ * abandoned when that record names a dead PID. A missing record is abandoned
+ * only when the aged tombstone is empty; non-empty tombstones remain retained
+ * as ambiguous evidence. Backup directories carry no owner contract, so an
+ * absent record there is not ambiguity and age alone governs.
  */
 async function classifyBrokerLockArtifact(
 	directory: string,
@@ -1014,7 +1052,14 @@ async function classifyBrokerLockArtifact(
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code !== "ENOENT" && code !== "ENOTDIR") return "owner-record-unreadable";
-		return name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ? "owner-record-missing" : "abandoned";
+		if (!name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX)) return "abandoned";
+		try {
+			const entries = await fs.readdir(target);
+			return entries.length === 0 ? "abandoned" : "owner-record-missing";
+		} catch (readError) {
+			if ((readError as NodeJS.ErrnoException).code === "ENOENT") throw readError;
+			return "owner-record-unreadable";
+		}
 	}
 	let pid: unknown;
 	try {
@@ -1034,7 +1079,8 @@ async function classifyBrokerLockArtifact(
  * of the lock's dev+ino, so a machine accrues one directory per dead owner and
  * nothing ever removed them (54 on the install in #3963). Reaping is
  * best-effort and fail-closed: anything live, unreadable, permission-denied, or
- * otherwise ambiguous is kept and the reason is logged.
+ * otherwise ambiguous is kept. Retained paths are logged at debug level and
+ * summarized in one warning per reap pass.
  */
 export async function reapStaleBrokerLockArtifacts(input: {
 	agentDir: string;
@@ -1048,6 +1094,7 @@ export async function reapStaleBrokerLockArtifacts(input: {
 	const pidAlive = input.pidAlive ?? isPidAlive;
 	const removed: string[] = [];
 	const retained: BrokerLockArtifactRetention[] = [];
+	const retainedByReason = new Map<BrokerLockArtifactRetentionReason, number>();
 	let names: string[];
 	try {
 		names = await fs.readdir(directory);
@@ -1069,7 +1116,10 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		}
 		if (verdict !== "abandoned") {
 			retained.push({ path: target, reason: verdict });
-			if (verdict !== "within-grace") logger.warn(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+			if (verdict !== "within-grace") {
+				logger.debug(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+				retainedByReason.set(verdict, (retainedByReason.get(verdict) ?? 0) + 1);
+			}
 			continue;
 		}
 		try {
@@ -1078,8 +1128,17 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 			retained.push({ path: target, reason: "removal-failed" });
-			logger.warn(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			logger.debug(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			retainedByReason.set("removal-failed", (retainedByReason.get("removal-failed") ?? 0) + 1);
 		}
+	}
+	if (retainedByReason.size > 0) {
+		const details = [...retainedByReason.entries()]
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([reason, count]) => `${reason}: ${count}`)
+			.join(", ");
+		const retainedCount = [...retainedByReason.values()].reduce((total, count) => total + count, 0);
+		logger.warn(`sdk broker: retained ${retainedCount} stale lock artifact(s) (${details})`);
 	}
 	if (removed.length > 0) logger.info(`sdk broker: reaped ${removed.length} stale lock artifact(s)`);
 	return { removed, retained };
@@ -3710,12 +3769,21 @@ export class Broker {
 			});
 			if (isCleanupPending(response)) return response;
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
-			const persistenceVerified =
-				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
-				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
-				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
-			if (!persistenceVerified) {
+			const persistenceVerification = verifyTerminalPersistence(
+				persisted,
+				storedResponse,
+				outcome.durableEffects,
+				outcome.startupFailure,
+			);
+			if (persistenceVerification.kind === "unverified") {
+				logger.warn("sdk broker terminal persistence read-back was unavailable; preserving settled outcome", {
+					identity,
+				});
+			} else if (persistenceVerification.kind === "uncertain") {
+				logger.warn("sdk broker terminal persistence verification found conflicting evidence", {
+					identity,
+					mismatches: persistenceVerification.mismatches,
+				});
 				const uncertain = error(
 					"terminal_uncertain",
 					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",

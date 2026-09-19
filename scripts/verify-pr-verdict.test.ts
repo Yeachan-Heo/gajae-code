@@ -54,6 +54,8 @@ describe("authenticated approval API evidence", () => {
 			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -62,10 +64,11 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			// Every case now also reads the head commit date; the permission call only
+			// Reviews, then the head commit, then the PR timeline whose force-push events
+			// are the server-observed freshness authority; the permission call only
 			// follows a surviving approval.
 			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
-			expect(requests.length).toBe(expectsPermission ? 3 : 2);
+			expect(requests.length).toBe(expectsPermission ? 4 : 3);
 		} finally {
 			spy.mockRestore();
 		}
@@ -1029,6 +1032,8 @@ async function runSelfReviewPushPreflight(options: {
 	/** Emit the comments as JSONL that is cut off mid-record while gh still exits 0. */
 	commentsTruncated?: boolean;
 	reviews?: (context: PushPreflightContext) => unknown[];
+	/** Server-observed force-push times, newline separated, as the timeline --jq emits them. */
+	forcePushedAt?: string;
 	reviewsUnavailable?: boolean;
 	permission?: string;
 	permissionUnavailable?: boolean;
@@ -1070,17 +1075,39 @@ async function runSelfReviewPushPreflight(options: {
 		const reviews = options.reviews?.(context) ?? [];
 		const pullsPath = path.join(temp, "pulls.json");
 		const commentsPath = path.join(temp, "comments.jsonl");
+		// Raw ARRAY-shaped page data, exactly as the timeline endpoint returns it, so the
+		// stub evaluates the real `--jq` against the real shape. Injecting already-projected
+		// stdout is what let a filter missing its `.[]` iterator pass every test (#5692).
+		const timelinePath = path.join(temp, "timeline.json");
+		await Bun.write(
+			timelinePath,
+			JSON.stringify(
+				(options.forcePushedAt ?? "")
+					.split("\n")
+					.map(line => line.trim())
+					.filter(line => line.length > 0)
+					.map(created_at => ({ event: "head_ref_force_pushed", created_at: created_at === "null" ? null : created_at })),
+			),
+		);
 		const reviewsPath = path.join(temp, "reviews.jsonl");
 		const permissionPath = path.join(temp, "permission.txt");
 		const callsPath = path.join(temp, "gh-calls.log");
 		await Bun.write(pullsPath, JSON.stringify([{ number: 123, body, base: { ref: "dev" }, user: { login: "owner" }, head: { ref: "feature", repo: { owner: { login: "owner" } } } }]));
-		const commentsJsonl = comments.map(comment => JSON.stringify(comment)).join("\n");
-		await Bun.write(commentsPath, options.commentsTruncated ? `${commentsJsonl}\n{"user":{"login":"owner"` : commentsJsonl);
-		await Bun.write(reviewsPath, reviews.map(review => JSON.stringify(review)).join("\n"));
+		// RAW array-shaped payloads, exactly as the endpoints return them, so the stub can
+		// run the real `--jq` instead of echoing an already-projected string. A canned
+		// projection validates nothing about the query that produced it (#5692 review).
+		const commentsJson = JSON.stringify(comments);
+		await Bun.write(
+			commentsPath,
+			// Truncation must corrupt the RAW payload now, so `jq` fails on the array the
+			// way a cut-short HTTP response would, not on an already-projected line.
+			options.commentsTruncated ? commentsJson.slice(0, Math.max(1, commentsJson.length - 12)) : commentsJson,
+		);
+		await Bun.write(reviewsPath, JSON.stringify(reviews));
 		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
 		await Bun.write(callsPath, "");
 		const ghPath = path.join(bin, "gh");
-		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  jq -c "\${args#*--jq }" "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  jq_filter="\${args#*--jq }"\n  jq -r "$jq_filter" "$GH_TIMELINE_RAW"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  jq -c "\${args#*--jq }" "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
 		await fs.chmod(ghPath, 0o755);
 		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
 			cwd: work,
@@ -1091,6 +1118,7 @@ async function runSelfReviewPushPreflight(options: {
 				GH_PULLS: pullsPath,
 				GH_COMMENTS: commentsPath,
 				GH_REVIEWS: reviewsPath,
+				GH_TIMELINE_RAW: timelinePath,
 				GH_PERMISSION: permissionPath,
 				...options.commentsUnavailable ? { GH_COMMENTS_UNAVAILABLE: "1" } : {},
 				...options.reviewsUnavailable ? { GH_REVIEWS_UNAVAILABLE: "1" } : {},
@@ -1182,7 +1210,10 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		context: PushPreflightContext,
 		state = "APPROVED",
 		submittedAt = "2099-01-01T00:00:00Z",
-	) => [{ author: { login: "review-bot" }, state, commit: { oid: context.headSha }, submittedAt }];
+		// RAW API shape — the stub now runs the real `--jq`, so the fixture must look like
+		// what GitHub returns, not like the projection. Writing the projected shape here is
+		// precisely the mistake that let a broken query pass every test (#5692 review).
+	) => [{ user: { login: "review-bot" }, state, commit_id: context.headSha, submitted_at: submittedAt }];
 
 	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
 		const result = await runSelfReviewPushPreflight({
@@ -1250,6 +1281,95 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
 		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
 	});
+
+	test("a backdated head commit cannot revive a stale approval (#5692 review)", async () => {
+		// `GIT_COMMITTER_DATE` is contributor-controlled, so comparing against the commit's
+		// own date was a fail-open: backdate the head far enough and any older approval
+		// looks fresh. The PR timeline's force-push `created_at` is written by GitHub, so
+		// it survives the backdate and still proves when this head appeared.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			// Submitted AFTER the harness's real head commit, so the contributor-controlled
+			// committer date alone would admit it. Only the server-observed force-push,
+			// which is later still, proves the approval predates this head.
+			reviews: context => reviewerApproval(context, "APPROVED", "2027-01-01T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+	});
+
+	test("a same-second approval is refused, not admitted on a tie (#5692 review)", async () => {
+		// GitHub serializes both values at second granularity, so a review submitted at
+		// 12:00:00.9 and a force-push recorded at 12:00:00.1 arrive identical. The review
+		// predates the head it claims, and a strict `<` would have let it through.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2030-01-01T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+	});
+
+	test("a future-dated commit cannot override server-observed force-push evidence (#5692 review)", async () => {
+		// `GIT_COMMITTER_DATE` is contributor-controlled in BOTH directions. Backdating was
+		// the original hole; forward-dating raised the freshness floor above what GitHub
+		// observed and refused every legitimate approval on the author's own PR.
+		//
+		// The harness commits with a real date, so the force-push below is the server
+		// evidence and the approval postdates it. A blended max would still have admitted
+		// this one; the case that matters is that the SERVER value is what decides.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2030-01-02T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.stderr).not.toContain("submitted BEFORE that head commit existed");
+		expect(result.stdout).not.toContain("gjc-merge-authorized=false");
+	});
+
+	test("a genuine approval still authorizes when the PR was never force-pushed (#5692 review)", async () => {
+		// The freshness checks are only useful if they still let real approvals through.
+		// With no force-push there is nothing that could have re-bound `commit_id`, so the
+		// committer date alone is an adequate floor and the approval must be ADMITTED.
+		// Without this, a gate that refused everything would look identical to a correct one.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2099-01-01T00:00:00Z"),
+			forcePushedAt: "",
+			permission: "write",
+		});
+		expect(result.stderr).not.toContain("is not satisfied");
+		expect(result.stderr).not.toContain("submitted BEFORE that head commit existed");
+	});
+
+	test("a force-push event with a null created_at refuses in the preflight too (#5692 review)", async () => {
+		// The projection's `// "unreadable"` fallback only matters if the harness actually
+		// evaluates it. Now that the stub runs the real jq over array-shaped page data, a
+		// null timestamp reaches `latestKnownHeadTime` as an unparseable entry and must
+		// refuse rather than collapsing into "no force-push happened".
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "2099-01-01T00:00:00Z"),
+			forcePushedAt: "null\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		// Prove the thing CI actually consumes, not just the internal decision: both
+		// `pr-validation.yml` and `dev-ci.yml` gate on this printed line, so a correct
+		// refusal that still printed `true` would authorize the merge anyway.
+		expect(result.stdout).toContain("gjc-merge-authorized=false");
+		expect(result.stdout).not.toContain("gjc-merge-authorized=true");
+	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
 			body: riskClassifiedBody,
@@ -1303,13 +1423,13 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			name: "approval re-bound onto this head by a force-push does not count",
 			reviews: [review("review-bot", "APPROVED", head, beforeHead)],
 			approved: false,
-			rebound: true,
+			refused: "rebound",
 		},
 		{
 			name: "an approval with no submission time fails closed",
 			reviews: [{ state: "APPROVED", commit_id: head, user: { login: "review-bot" } }],
 			approved: false,
-			rebound: true,
+			refused: "unreadable",
 		},
 	]) ("$name", async scenario => {
 		const originalFetch = globalThis.fetch;
@@ -1320,6 +1440,8 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -1330,11 +1452,193 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 				permission: "write",
 				approvedHead: scenario.approved,
 				approvedLogin: "review-bot",
-				...(scenario.approved ? {} : { reboundStaleApproval: scenario.rebound === true }),
+				...(scenario.refused ? { refusedApproval: scenario.refused } : {}),
 			});
 		} finally {
 			spy.mockRestore();
 			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test.each([
+		{ name: "commits API failure", commits: () => new Response("nope", { status: 500 }) },
+		{ name: "missing committer date", commits: () => Response.json({ commit: { committer: {} } }) },
+		{ name: "unparseable committer date", commits: () => Response.json({ commit: { committer: { date: "not-a-date" } } }) },
+	])("an unreadable head commit date refuses the approval rather than admitting it: $name", async scenario => {
+		// The first cut of #5692 skipped the precedence test entirely when the head date was
+		// absent, so a failed commit lookup ADMITTED the approval — a fail-open in the guard
+		// that exists to fail closed (#5692 review).
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+			// Refused, but NOT claimed re-bound: precedence was never proven.
+			expect(evidence.refusedApproval).toBe("unreadable");
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("an unreadable PR timeline refuses rather than falling back to commit time (#5692 review)", async () => {
+		// The timeline is the only server-written freshness evidence. If it cannot be read,
+		// the sole remaining candidate is the contributor-settable committer date, so
+		// admitting here would reinstate exactly the backdate hole that replaced it.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return new Response("unavailable", { status: 503 });
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("an unreadable later withdrawal cannot resurrect an earlier approval (#5692 review)", async () => {
+		// The freshness filter used to run BEFORE selecting the last review, so a later
+		// CHANGES_REQUESTED with an unreadable time was dropped from the list and the
+		// earlier valid APPROVED was promoted back to "last word" — authorizing a merge
+		// the reviewer had explicitly withdrawn.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([
+					review("review-bot", "APPROVED"),
+					{ state: "CHANGES_REQUESTED", commit_id: head, user: { login: "review-bot" } },
+				]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test.each([
+		{ name: "unparseable string", createdAt: "not-a-date" },
+		// `created_at: null` was silently DROPPED rather than refused, so the backdated
+		// committer date survived as the answer — the same fail-open through a different
+		// input shape (#5692 review).
+		{ name: "null", createdAt: null },
+		{ name: "absent", createdAt: undefined },
+		{ name: "blank", createdAt: "   " },
+	])("a force-push event with an unreadable time refuses, not falls back: $name (#5692 review)", async scenario => {
+		// A force-push DID happen; we simply cannot read when. Dropping it and using the
+		// contributor's committer date would reinstate the backdate hole, so "could not
+		// read the authority" must not collapse into "no authority exists".
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([{ event: "head_ref_force_pushed", created_at: scenario.createdAt }]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+			expect(evidence.refusedApproval).toBe("unreadable");
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("the refusal reason and the approval decision agree on which review counts (#5483, #5692)", async () => {
+		// The two functions kept their own copies of the selection, and when only one was
+		// reordered to select before judging freshness they diverged: the approval path
+		// correctly refused a withdrawn review while the reason path still described the
+		// earlier approval. They now share `lastExactHeadReview`; this pins that they cannot
+		// disagree again by asserting the pair, not either half alone.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([
+					// A re-bound approval, then a valid later withdrawal on the same head.
+					review("review-bot", "APPROVED", head, beforeHead),
+					review("review-bot", "CHANGES_REQUESTED"),
+				]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			// The withdrawal is the last word, so there is no approval AND no re-bound
+			// approval to describe — reporting "rebound" here would point the author at the
+			// wrong remedy.
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: undefined,
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
 		}
 	});
 });
@@ -1402,8 +1706,114 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
 	// instead of failing the job on the 404.
 	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
-	// A trusted base that predates self-review validation can never authorize.
-	expect(workflow).toContain("predates self-review validation");
+	// A trusted base missing ANY required validator capability can never authorize.
+	// One marker was not enough: `main` carried the self-review validator but not the
+	// approval freshness rule, so a comment-triggered re-validation ran the old
+	// `commit_id`-only logic and published a green "Merge approval" behind a guard that
+	// reported the base as current (#5692 review).
+	expect(workflow).toContain('|| stale_base="self-review validation"');
+	expect(workflow).toContain('|| stale_base="${stale_base:+$stale_base and }approval freshness binding"');
+	// BOTH markers must be code-only tokens. `gajae.pr-self-review.v1` and
+	// `head_ref_force_pushed` each also appear in prose, so a base that kept the
+	// comments while losing the implementation would have passed.
+	expect(workflow).toContain('grep -q "selfReviewSatisfiesPolicy("');
+	expect(workflow).toContain('grep -q "reviewPrecedesHead("');
+	expect(workflow).toContain('if [[ -n "$stale_base" ]]; then');
+	// Both published names must go red together, never just the contract one.
+	expect(workflow).toContain('approval_summary="$summary"');
+
+	// The approval authority must be REVOKED before any fallible work, then raised only
+	// after the contract publication succeeds.
+	//
+	// Assert JOB TOPOLOGY, not position within one step. Revoking inside the publication
+	// step still left the entire validation phase uncovered: a failure during checkout,
+	// Bun setup, or the validator never reached the revocation, so a previously-green
+	// "Merge approval" survived as the authoritative required check (#5692 review).
+	const stepOf = (needle: string): number => {
+		const at = workflow.indexOf(needle);
+		expect({ needle, found: at > -1 }).toEqual({ needle, found: true });
+		return workflow.lastIndexOf("      - ", at);
+	};
+	const resolvePr = stepOf("name: Resolve PR head/base from the event or the comment's PR");
+	const revoke = stepOf("name: Revoke any prior approval for this head before re-validating");
+	// EVERY fallible step must follow the revoke, not just the first of each kind. The
+	// job has two checkouts; asserting only the first would miss a second one inserted
+	// ahead of the revoke. Same instances-versus-property mistake as the earlier pins.
+	const allStepsMatching = (needle: string): number[] => {
+		const found: number[] = [];
+		for (let at = workflow.indexOf(needle); at > -1; at = workflow.indexOf(needle, at + 1)) {
+			found.push(workflow.lastIndexOf("      - ", at));
+		}
+		expect({ needle, count: found.length }).toEqual({ needle, count: found.length });
+		expect(found.length).toBeGreaterThan(0);
+		return found;
+	};
+	const fallible: Array<[string, number[]]> = [
+		["checkout", allStepsMatching("uses: actions/checkout@")],
+		["setup-bun", allStepsMatching("uses: oven-sh/setup-bun@")],
+		["validate", allStepsMatching("name: Validate body, exact head, immutable base, reviewer, and fast gate")],
+		["publish", allStepsMatching("name: Publish head-bound check results for comment-triggered validation")],
+	];
+	// Resolution may precede the revoke because the head SHA is needed to address the
+	// check run, and it needs no checkout. Nothing fallible may.
+	expect(resolvePr).toBeLessThan(revoke);
+	for (const [label, positions] of fallible) {
+		for (const [index, at] of positions.entries()) {
+			expect({ step: `${label}[${index}]`, afterRevoke: at > revoke }).toEqual({
+				step: `${label}[${index}]`,
+				afterRevoke: true,
+			});
+		}
+	}
+	// The job has exactly two checkouts today; if that changes, the loop above still
+	// covers the new one, but pin the count so a silent restructure is visible.
+	expect(fallible[0]?.[1].length).toBe(2);
+	// A failure after the head SHA is known but before the approval is raised must still
+	// leave the approval revoked. Gated on failure() so it cannot fire on the happy path.
+	expect(workflow).toContain("name: Keep the approval revoked when revalidation does not complete");
+	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}");
+	expect(workflow).toContain('-f \'output[title]="Merge approval (re-validation failed)"\'');
+	// Within the publication step the contract result is written before the approval is
+	// raised, so a failed contract write cannot leave a green approval.
+	const publishContract = workflow.indexOf('"output[summary]=$summary"');
+	const raiseApproval = workflow.indexOf('-f "output[summary]=$approval_summary"');
+	expect(publishContract).toBeLessThan(raiseApproval);
+	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
+	// so it would replace a stale green with something that still permits the merge.
+	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
+});
+
+test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
+	// The guard's whole job is to prove BEHAVIOUR exists in the trusted base. A marker
+	// a comment can satisfy proves only that someone once wrote about the behaviour.
+	//
+	// Simulate the two drift directions against the real validator source rather than a
+	// hand-written fixture: strip every comment (behaviour intact -> must still pass),
+	// then strip executable code while KEEPING the comments (behaviour gone -> must fail).
+	const source = await Bun.file(new URL("../scripts/verify-pr-verdict.ts", import.meta.url)).text();
+	const markers = ["selfReviewSatisfiesPolicy(", "reviewPrecedesHead("];
+
+	const codeOnly = source
+		.replaceAll(/\/\*[\s\S]*?\*\//g, "")
+		.split("\n")
+		.filter(line => !line.trimStart().startsWith("//"))
+		.join("\n");
+	for (const marker of markers) {
+		expect({ marker, presentInCode: codeOnly.includes(marker) }).toEqual({ marker, presentInCode: true });
+	}
+
+	// Comments and string literals only: what a base would look like if the
+	// implementation were reverted but the documentation left behind.
+	const proseOnly = [
+		...(source.match(/\/\*[\s\S]*?\*\//g) ?? []),
+		...source.split("\n").filter(line => line.trimStart().startsWith("//")),
+	].join("\n");
+	for (const marker of markers) {
+		expect({ marker, satisfiableByProse: proseOnly.includes(marker) }).toEqual({
+			marker,
+			satisfiableByProse: false,
+		});
+	}
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {

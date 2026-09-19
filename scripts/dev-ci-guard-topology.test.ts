@@ -399,4 +399,22 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
 	});
+	test("the merge-approval bootstrap binds approval freshness to server-observed evidence (#5692)", async () => {
+		// This job reimplements the approval rule instead of invoking
+		// `scripts/verify-pr-verdict.ts`, which is why the original re-bound-approval hole
+		// survived three rounds of fixes to the script alone. Until the duplication is
+		// removed, pin the invariant here so the workflow copy cannot silently regress.
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		// `commit_id` is re-pointed by a force-push, so it cannot be the only binding.
+		expect(source).toContain("head_ref_force_pushed");
+		// Ties refuse: GitHub serializes both sides to whole seconds.
+		expect(source).toContain("return submitted <= known;");
+		// A present-but-unparseable force-push time refuses rather than falling back to the
+		// contributor-settable committer date.
+		expect(source).toContain("if (present.some(value => !Number.isFinite(Date.parse(value)))) return undefined;");
+		// Selection precedes freshness, so an unreadable later withdrawal cannot be filtered
+		// out and let an earlier approval become the reviewer's last word.
+		const decision = source.slice(source.indexOf('} else if (verdict === "merge-approved")'));
+		expect(decision.indexOf(".at(-1);")).toBeLessThan(decision.indexOf("reviewPrecedesHead(latest.submitted_at"));
+	});
 });

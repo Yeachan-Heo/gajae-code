@@ -78,6 +78,19 @@ import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-author
 // native primitives; point them at a working implementation.
 installExactIdentityNatives();
 
+/**
+ * Resolution time for the stubbed workflow gate. It MUST stay inside the
+ * coordinator's compaction retention window and therefore MUST NOT be a literal.
+ *
+ * The product stamps this remote-supplied value onto the answer request's
+ * `updated_at`, and `compactTransaction` deletes a `completed` request whose
+ * `updated_at` is older than `RETENTION_MS` (30 days). A hardcoded date silently
+ * turns these cases red exactly 30 days after the day it names, with no code
+ * change and nothing in git history to point at: the previous literal
+ * `2026-08-20T00:00:00.000Z` expired at `2026-09-19T00:00:00Z`.
+ */
+const GATE_RESOLVED_AT = new Date(Date.now() - 60_000).toISOString();
+
 const tempDirs: string[] = [];
 
 async function tempRoot(): Promise<string> {
@@ -3694,6 +3707,75 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			.map(control => control.input.cwd);
 		expect(listScopes).toContain(worktree);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+	}, 15_000);
+	it("does not index a managed-worktree endpoint after its authority changes", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const sessions: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			sessions,
+			"gjc --worktree hermes",
+		);
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status-mismatch",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await patchSessionState(server, root, "created-session-1", { live: true });
+		sessions[0]!.endpointMtimeMs = Number(sessions[0]!.endpointMtimeMs) + 1;
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: false, reason: "not_indexed" } });
+	}, 15_000);
+	it.each([
+		"endpoint_generation",
+		"endpoint_incarnation",
+	] as const)("recovers %s from canonical authority when a session projection is partial", async droppedField => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			// Keep the projection revisions caught up so read_status observes the
+			// partial write instead of repairing it first.
+			const nextRevision = transaction.revision + 1;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+		const recordPath = path.join(coordinatorNamespace(root), "sessions", "visible-session.json");
+		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+		delete record[droppedField];
+		await Bun.write(recordPath, JSON.stringify(record));
+
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
 	});
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
@@ -8944,7 +9026,7 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			{
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);
@@ -10530,7 +10612,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 					answerCalls += 1;
 					return answerCalls === 1
 						? { ok: true, result: { status: "rejected" } }
-						: { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } };
+						: { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } };
 				},
 			},
 		);
@@ -10610,7 +10692,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				},
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);

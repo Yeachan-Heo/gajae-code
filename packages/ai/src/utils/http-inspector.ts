@@ -43,6 +43,7 @@ const TRANSPORT_FAILURE_CODES: ReadonlySet<string> = new Set([
 	"ConnectionReset",
 	"ConnectionTimeout",
 	"FailedToOpenSocket",
+	"HTTP2StreamReset",
 	"HTTP2Unsupported",
 	"EAI_AGAIN",
 	"ECONNREFUSED",

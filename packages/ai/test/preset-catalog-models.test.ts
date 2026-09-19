@@ -3,6 +3,7 @@ import { isRetiredModelKey } from "../src/model-retirements";
 import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
+import modelsJson from "../src/models.json" with { type: "json" };
 
 function gemini37SiblingId(modelId: string): string {
 	return modelId.replaceAll("gemini-3.6-flash", "gemini-3.7-flash").replaceAll("gemini-3-6-flash", "gemini-3-7-flash");
@@ -212,6 +213,26 @@ describe("preset catalog model entries", () => {
 			expect(model.thinking, `${provider}/${id}`).toEqual({
 				mode: "google-level",
 				minLevel: Effort.Low,
+				maxLevel: Effort.High,
+			});
+		}
+	});
+
+	test("pins first-party MiniMax-M3 thinking in the bundled catalog source", () => {
+		const sourceCatalog = modelsJson as Record<string, Record<string, { thinking?: unknown }>>;
+		const selectors = [
+			["minimax", "MiniMax-M3"],
+			["minimax", "MiniMax-M3[1m]"],
+			["minimax-cn", "MiniMax-M3"],
+			["minimax-cn", "MiniMax-M3[1m]"],
+			["minimax-code", "MiniMax-M3"],
+			["minimax-code-cn", "MiniMax-M3"],
+		] as const;
+
+		for (const [provider, id] of selectors) {
+			expect(sourceCatalog[provider]?.[id]?.thinking, `${provider}/${id}`).toEqual({
+				mode: "effort",
+				minLevel: Effort.High,
 				maxLevel: Effort.High,
 			});
 		}

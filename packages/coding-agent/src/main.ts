@@ -59,6 +59,9 @@ import type { SubmittedUserInput } from "./modes/types";
 import { applyCliRuntimeApiKeyOverride } from "./runtime-api-key";
 import { type CliCredentialSelector, parseCliCredentialSelector } from "./runtime-credential-selector";
 import type { MCPManager } from "./runtime-mcp";
+// Leaf path, not the barrel: the capability registry must stay out of the
+// runtime-mcp import graph that every root command would otherwise load.
+import { attachExactMcpControls } from "./runtime-mcp/redaction";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -2075,6 +2078,18 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
+
+		// Exact MCP capability attaches at the root interactive entry point.
+		// Granted by creation path, not by call order:
+		// only a session this root command built for an interactive run with an
+		// explicit --mcp-config gets one. Sessions built through createAgentSession
+		// directly, sub-sessions, ACP, and print/text/json runs never reach here.
+		if (isInteractive && sessionOptions.mcpConfigPath) {
+			attachExactMcpControls(session, {
+				grantSource: "root-interactive-exact-config",
+				configPath: sessionOptions.mcpConfigPath,
+			});
+		}
 
 		let startDeferredModelProfiles: DeferredModelProfileStartup | undefined;
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {
