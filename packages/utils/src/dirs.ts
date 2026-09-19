@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { resolveCanonicalLogsDir } from "./canonical-log-dir";
 import { canonicalEnvKey, type ProjectEnvSnapshot, projectEnvSnapshot } from "./env-file";
 
 // The provenance snapshot and its key fold live in the leaf `env-file` module so
@@ -701,7 +702,17 @@ export function getReportsDir(): string {
 
 /** Get the logs directory (~/.gjc/logs). */
 export function getLogsDir(): string {
-	return dirs.rootSubdir("logs", "state");
+	return resolveCanonicalLogsDir({
+		home: dirs.trustedHome,
+		env: {
+			GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+			PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+			XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+		},
+		projectEnv: dirs.trustSnapshot,
+		xdgEligible: dirs.profileAuthority === "default",
+		pathExists: fs.existsSync,
+	});
 }
 
 /** Dated log file name, shared by the canonical and effective log paths so they cannot drift. */

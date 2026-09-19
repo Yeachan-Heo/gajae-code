@@ -14,6 +14,8 @@ import * as path from "node:path";
  */
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../../..");
+const PRELOAD = path.join(REPO_ROOT, "scripts", "test-preload.ts");
+const PROBE = path.join(import.meta.dir, "fixtures", "log-dir-trust-probe.ts");
 const WATCHDOG_TEST = "packages/coding-agent/test/acp-prompt-watchdog.test.ts";
 const WATCHDOG_CASE = "a prompt awaiting the model past the inference bound is rejected instead of hanging";
 const MARKER = "acp_prompt_watchdog_expired";
@@ -36,6 +38,55 @@ async function countMarkerRecords(home: string): Promise<number> {
 	}
 	return count;
 }
+
+async function countMarkersInDir(logsDir: string): Promise<number> {
+	const entries = await fs.readdir(logsDir).catch(() => [] as string[]);
+	let count = 0;
+	for (const entry of entries) {
+		if (!entry.startsWith("gjc.") || !entry.endsWith(".log")) continue;
+		const content = await fs.readFile(path.join(logsDir, entry), "utf8").catch(() => "");
+		count += content.split("\n").filter(line => line.includes("gjc_log_dir_trust_probe_marker")).length;
+	}
+	return count;
+}
+
+test("test logger resolves and writes errors to an isolated sink", async () => {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-path-"));
+	try {
+		const canonical = path.join(home, ".gjc", "logs");
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			GJC_LOG_DIR: canonical,
+			GJC_PROBE_WRITE: "1",
+		};
+
+		const proc = Bun.spawn([process.execPath, "--preload", PRELOAD, PROBE], {
+			cwd: REPO_ROOT,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, `log probe failed:\n${stdout}\n${stderr}`).toBe(0);
+
+		const result = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+			effectiveLogsDir: string | null;
+			markerDir: string | null;
+		};
+		expect(result.effectiveLogsDir).not.toBe(canonical);
+		expect(path.basename(result.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
+		expect(result.markerDir).toBe(result.effectiveLogsDir);
+		expect(await countMarkersInDir(result.effectiveLogsDir ?? "")).toBeGreaterThan(0);
+		expect(await countMarkerRecords(home)).toBe(0);
+	} finally {
+		await fs.rm(home, { recursive: true, force: true });
+	}
+}, 30_000);
 
 test("a test process does not write watchdog errors into the operator log sink", async () => {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-guard-"));
