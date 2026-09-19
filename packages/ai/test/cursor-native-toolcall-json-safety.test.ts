@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { buildNativeToolCallBlock, cursorJsonSafeValueForTest } from "../src/providers/cursor";
+import {
+	buildNativeToolCallBlock,
+	cursorJsonSafeStringifyForTest,
+	cursorJsonSafeValueForTest,
+} from "../src/providers/cursor";
 
 /**
  * Cursor native tool calls arrive as protobuf-es payloads carrying
@@ -9,6 +13,16 @@ import { buildNativeToolCallBlock, cursorJsonSafeValueForTest } from "../src/pro
  * plain `JSON.stringify`-safe data (issue #4578 producer boundary).
  */
 describe("cursor native toolCall JSON safety", () => {
+	it("serializes bigint payload fields without losing them at the provider boundary", () => {
+		const serialized = cursorJsonSafeStringifyForTest({
+			fileIdentity: { dev: 16_777_234n, ino: BigInt(Number.MAX_SAFE_INTEGER) + 1n },
+		});
+
+		expect(JSON.parse(serialized)).toEqual({
+			fileIdentity: { dev: 16_777_234, ino: "9007199254740992" },
+		});
+	});
+
 	it("converts protobuf payload values into plain JSON-safe data", () => {
 		const converted = cursorJsonSafeValueForTest({
 			$typeName: "agent.v1.ShellToolCallArgs",
