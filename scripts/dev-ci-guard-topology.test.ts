@@ -107,7 +107,18 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 			expect({ scenario: scenario.name, group: evaluate(document.concurrency.group) }).toEqual({
 				scenario: scenario.name, group: headOnlyDispatch ? "dev-ci-dispatch-34300623114" : `Dev CI-refs/pull/5367/merge${scenario.skip ? "-metadata-edit" : ""}`,
 			});
-			expect(Boolean(evaluate(document.concurrency["cancel-in-progress"]))).toBe(!scenario.skip && !headOnlyDispatch);
+			// Only a superseding pull_request run may cancel its predecessor: a new
+			// push to the same PR head supersedes the previous validation of that
+			// head. A `push` to `dev` is a distinct integration state, not a
+			// superseded one, and `dev` has a single ref, so cancelling there meant
+			// every push run killed its predecessor and `dev` was never verified as
+			// a whole (#5709). An ordinary `workflow_dispatch` is likewise removed
+			// from the cancelling set so a manual validation cannot kill the
+			// integration run already in flight.
+			expect({ scenario: scenario.name, cancel: Boolean(evaluate(document.concurrency["cancel-in-progress"])) }).toEqual({
+				scenario: scenario.name,
+				cancel: scenario.event === "pull_request" && !scenario.skip,
+			});
 			// GitHub publishes contexts even for skipped jobs: evaluate their names
 			// independently of scheduling so metadata cannot forge code evidence.
 			for (const [id, canonical, nonCode] of [
@@ -398,5 +409,27 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const workflowConcurrency = source.match(/group:\s*>-\s*\n\s*\$\{\{[\s\S]*?cancel-in-progress:/)?.[0] ?? "";
 		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
 		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
+	});
+	test("the merge-approval bootstrap binds approval freshness to server-observed evidence (#5692)", async () => {
+		// This job reimplements the approval rule instead of invoking
+		// `scripts/verify-pr-verdict.ts`, which is why the original re-bound-approval hole
+		// survived three rounds of fixes to the script alone. Until the duplication is
+		// removed, pin the invariant here so the workflow copy cannot silently regress.
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		// `commit_id` is re-pointed by a force-push, so it cannot be the only binding.
+		expect(source).toContain("head_ref_force_pushed");
+		// Ties refuse: GitHub serializes both sides to whole seconds.
+		expect(source).toContain("return submitted <= known;");
+		// No force-push on record means no re-binding vector, so the check must not fall
+		// back to the contributor-settable committer date in either direction (#5692).
+		expect(source).toContain('if (appearance.kind === "unconstrained") return false;');
+		expect(source).toContain('return { kind: "unconstrained" };');
+		// A present-but-unparseable force-push time refuses rather than falling back to the
+		// contributor-settable committer date.
+		expect(source).toContain('if (present.some(value => !Number.isFinite(Date.parse(value)))) return { kind: "unreadable" };');
+		// Selection precedes freshness, so an unreadable later withdrawal cannot be filtered
+		// out and let an earlier approval become the reviewer's last word.
+		const decision = source.slice(source.indexOf('} else if (verdict === "merge-approved")'));
+		expect(decision.indexOf(".at(-1);")).toBeLessThan(decision.indexOf("reviewPrecedesHead(latest.submitted_at"));
 	});
 });

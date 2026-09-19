@@ -3249,7 +3249,7 @@ export class ModelRegistry {
 			);
 			if (
 				evidence !== undefined &&
-				state?.status === "ok" &&
+				(state?.status === "ok" || state?.status === "empty") &&
 				discovery.fetched &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
@@ -3288,18 +3288,28 @@ export class ModelRegistry {
 
 	#profileAvailabilityEvidenceFingerprint(): string {
 		return JSON.stringify(
-			[...this.#descriptorDiscoveryEvidence.entries()]
-				.sort(([left], [right]) => left.localeCompare(right))
-				.map(([provider, evidence]) => [
-					provider,
-					evidence.fresh,
-					evidence.profileFresh,
-					evidence.authGeneration,
-					evidence.endpoint,
-					evidence.profileEndpoint,
-					[...evidence.modelIds].sort(),
-					evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
-				]),
+			{
+				descriptor: [...this.#descriptorDiscoveryEvidence.entries()]
+					.sort(([left], [right]) => left.localeCompare(right))
+					.map(([provider, evidence]) => [
+						provider,
+						evidence.fresh,
+						evidence.profileFresh,
+						evidence.authGeneration,
+						evidence.endpoint,
+						evidence.profileEndpoint,
+						[...evidence.modelIds].sort(),
+						evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
+					]),
+				configured: [...this.#configuredDiscoveryEvidence.entries()]
+					.sort(([left], [right]) => left.localeCompare(right))
+					.map(([provider, evidence]) => [
+						provider,
+						evidence.authGeneration,
+						evidence.endpoint,
+						[...evidence.modelIds].sort(),
+					]),
+			},
 		);
 	}
 
@@ -5226,8 +5236,10 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Get only models that have auth configured.
-	 * This is a fast check that doesn't refresh OAuth tokens.
+	 * Get selectable models with auth configured.
+	 * This is a fast check that doesn't refresh OAuth tokens. A current,
+	 * authoritative live catalog also limits each provider to its enrolled ids;
+	 * bundled entries remain the fallback until that evidence exists.
 	 */
 	getAvailable(): Model<Api>[] {
 		this.#synchronizeEnvironmentCredentials();
@@ -5241,10 +5253,80 @@ export class ModelRegistry {
 		) {
 			return this.#availableModelsCache;
 		}
-		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
+		const authoritativeDiscoveryIds = new Map<string, ReadonlySet<string> | undefined>();
+		const bundledIdsByProvider = new Map<string, Set<string>>();
+		this.#availableModelsCache = this.#models.filter(model => {
+			if (!this.#isModelAvailable(model, disabledProviders)) return false;
+
+			let liveIds = authoritativeDiscoveryIds.get(model.provider);
+			if (!authoritativeDiscoveryIds.has(model.provider)) {
+				liveIds = this.#getAuthoritativeDiscoveredModelIds(model.provider);
+				authoritativeDiscoveryIds.set(model.provider, liveIds);
+			}
+			// Undefined means discovery has not run successfully for the current
+			// provider context. Keep the bundled catalog as the explicit fallback.
+			if (liveIds === undefined) return true;
+			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
+
+			const activity = this.#providerActivity.get(model.provider);
+			if (!activity?.staticModelIds.has(model.id)) return liveIds.has(model.id);
+
+			let bundledIds = bundledIdsByProvider.get(model.provider);
+			if (!bundledIds) {
+				bundledIds = new Set(
+					(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+						candidate => candidate.id,
+					),
+				);
+				bundledIdsByProvider.set(model.provider, bundledIds);
+			}
+			return !bundledIds.has(model.id) || liveIds.has(model.id);
+		});
 		this.#availableModelsDisabledProviders = disabledProviderKey;
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
+	}
+
+	/**
+	 * Return the current live model ids only when discovery produced an
+	 * authoritative catalog for the provider and endpoint. An unavailable or
+	 * failed discovery returns undefined so callers retain the bundled fallback.
+	 */
+	#getAuthoritativeDiscoveredModelIds(provider: string): ReadonlySet<string> | undefined {
+		const descriptorEvidence = this.#descriptorDiscoveryEvidence.get(provider);
+		if (descriptorEvidence?.profileFresh && descriptorEvidence.profileModelIds !== undefined) {
+			try {
+				if (
+					descriptorEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
+					descriptorEvidence.profileEndpoint ===
+						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
+				) {
+					return descriptorEvidence.profileModelIds;
+				}
+			} catch {
+				// A provider context that can no longer be verified must use its fallback.
+			}
+		}
+
+		const configuredEvidence = this.#configuredDiscoveryEvidence.get(provider);
+		if (!configuredEvidence) return undefined;
+		const discoveryState = this.#discoveryManager.getState(provider);
+		if (
+			discoveryState?.status !== "ok" &&
+			discoveryState?.status !== "cached" &&
+			discoveryState?.status !== "empty"
+		) {
+			return undefined;
+		}
+		try {
+			return configuredEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
+				configuredEvidence.endpoint ===
+					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
+				? configuredEvidence.modelIds
+				: undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	#synchronizeEnvironmentCredentials(): void {

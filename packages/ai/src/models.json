@@ -46125,9 +46125,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		},
 		"MiniMax-M3[1m]": {
@@ -46150,9 +46150,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		}
 	},
@@ -46345,9 +46345,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		},
 		"MiniMax-M3[1m]": {
@@ -46370,9 +46370,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		}
 	},
@@ -46644,7 +46644,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "high",
 				"maxLevel": "high"
 			}
 		}
@@ -46917,7 +46917,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "high",
 				"maxLevel": "high"
 			}
 		}

@@ -35,6 +35,11 @@ async function temporaryDirectory(): Promise<string> {
 	return directory;
 }
 
+async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
+	await fs.writeFile(filePath, content, { mode });
+	await fs.chmod(filePath, mode);
+}
+
 afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
@@ -66,8 +71,8 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload-bytes");
-		await fs.writeFile(destination, "old-payload-bytes");
+		await writeFixtureFile(source, "new-payload-bytes");
+		await writeFixtureFile(destination, "old-payload-bytes");
 		const expectedSource = await identityOf(source, "new-payload-bytes");
 		const expectedDestination = await identityOf(destination, "old-payload-bytes");
 
@@ -92,11 +97,11 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "authorized-new");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "authorized-new");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "authorized-new");
 		const expectedDestination = await identityOf(destination, "old-payload");
-		await fs.writeFile(source, "attacker-substituted");
+		await writeFixtureFile(source, "attacker-substituted");
 
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
@@ -113,11 +118,11 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "authorized-old");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "authorized-old");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "authorized-old");
-		await fs.writeFile(destination, "attacker-substituted");
+		await writeFixtureFile(destination, "attacker-substituted");
 
 		const result = exactReplaceRetained(source, destination, "app.bin.backup", expectedSource, expectedDestination);
 
@@ -132,8 +137,8 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 		// Corrupt the captured parent identity so it can never match the real
@@ -153,9 +158,9 @@ describe("exactReplaceRetained", () => {
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
 		const backupPath = path.join(root, "app.bin.backup");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
-		await fs.writeFile(backupPath, "foreign-occupant");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
+		await writeFixtureFile(backupPath, "foreign-occupant", 0o644);
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 
@@ -176,9 +181,9 @@ describe("exactReplaceRetained", () => {
 		const source = path.join(root, "staged.bin");
 		const sourceAlias = path.join(root, "staged-alias.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
+		await writeFixtureFile(source, "new-payload");
 		await fs.link(source, sourceAlias);
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 
@@ -196,8 +201,8 @@ describe("exactReplaceRetained", () => {
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
 		const destinationAlias = path.join(root, "app-alias.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
 		await fs.link(destination, destinationAlias);
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
@@ -216,9 +221,9 @@ describe("exactReplaceRetained", () => {
 		const outside = path.join(root, "outside.bin");
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(outside, "outside-payload");
+		await writeFixtureFile(outside, "outside-payload");
 		await fs.symlink(outside, source);
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const outsideStat = await fs.stat(outside, { bigint: true });
 		const outsideParent = await fs.stat(root, { bigint: true });
 		const expectedSource = {
@@ -246,8 +251,8 @@ describe("exactReplaceRetained", () => {
 		const outside = path.join(root, "outside.bin");
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(outside, "outside-old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(outside, "outside-old-payload");
 		await fs.symlink(outside, destination);
 		const expectedSource = await identityOf(source, "new-payload");
 		const outsideStat = await fs.stat(outside, { bigint: true });
@@ -275,8 +280,8 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 
@@ -294,8 +299,8 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 
@@ -309,8 +314,8 @@ describe("exactReplaceRetained", () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.bin");
 		const destination = path.join(root, "app.bin");
-		await fs.writeFile(source, "new-payload");
-		await fs.writeFile(destination, "old-payload");
+		await writeFixtureFile(source, "new-payload");
+		await writeFixtureFile(destination, "old-payload");
 		const expectedSource = await identityOf(source, "new-payload");
 		const expectedDestination = await identityOf(destination, "old-payload");
 
@@ -349,8 +354,8 @@ describe("exactReplaceRetained", () => {
 			const root = await temporaryDirectory();
 			const source = path.join(root, "staged.bin");
 			const destination = path.join(root, "app.bin");
-			await fs.writeFile(source, "new-payload");
-			await fs.writeFile(destination, "old-payload");
+			await writeFixtureFile(source, "new-payload");
+			await writeFixtureFile(destination, "old-payload");
 			const expectedSource = await identityOf(source, "new-payload");
 			const expectedDestination = await identityOf(destination, "old-payload");
 

@@ -674,3 +674,65 @@ describe("builtin /aside slash command", () => {
 		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "aside")).toBe(true);
 	});
 });
+
+describe("builtin /mcp slash command", () => {
+	it("sanitizes project-controlled server names in status output", async () => {
+		const showStatus = vi.fn();
+		const session = {
+			hasExactMcpControls: true,
+			getExactMcpStatusSnapshot: async () => ({
+				startup: "settled" as const,
+				servers: [
+					{
+						name: "\u001b[2Jspoofed\nserver\tname",
+						transport: "stdio" as const,
+						state: "connected" as const,
+						toolCount: 1,
+					},
+				],
+			}),
+		};
+		const ctx = {
+			session,
+			showStatus,
+			showError: vi.fn(),
+			showWarning: vi.fn(),
+			editor: { setText: vi.fn() },
+		} as unknown as InteractiveModeContext;
+
+		expect(await executeBuiltinSlashCommand("/mcp status", { ctx, handleBackgroundCommand: () => undefined })).toBe(
+			true,
+		);
+		const rendered = String(showStatus.mock.calls[0]?.[0]);
+		expect(rendered).toContain("spoofed server");
+		expect(rendered.split("\n")).toHaveLength(2);
+		expect(rendered).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u);
+	});
+
+	it("sanitizes server names in control results", async () => {
+		const showStatus = vi.fn();
+		const session = {
+			hasExactMcpControls: true,
+			controlExactMcpServer: async () => ({
+				action: "suspend" as const,
+				name: "\u001b[2Jspoofed",
+				status: "suspended" as const,
+				toolCount: 0,
+			}),
+		};
+		const ctx = {
+			session,
+			showStatus,
+			showError: vi.fn(),
+			showWarning: vi.fn(),
+			editor: { setText: vi.fn() },
+		} as unknown as InteractiveModeContext;
+
+		expect(
+			await executeBuiltinSlashCommand("/mcp suspend exact", { ctx, handleBackgroundCommand: () => undefined }),
+		).toBe(true);
+		const rendered = String(showStatus.mock.calls[0]?.[0]);
+		expect(rendered).toContain('MCP server "spoofed" suspended');
+		expect(rendered).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+	});
+});

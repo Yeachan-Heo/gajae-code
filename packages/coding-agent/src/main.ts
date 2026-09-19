@@ -59,6 +59,9 @@ import type { SubmittedUserInput } from "./modes/types";
 import { applyCliRuntimeApiKeyOverride } from "./runtime-api-key";
 import { type CliCredentialSelector, parseCliCredentialSelector } from "./runtime-credential-selector";
 import type { MCPManager } from "./runtime-mcp";
+// Leaf path, not the barrel: the capability registry must stay out of the
+// runtime-mcp import graph that every root command would otherwise load.
+import { attachExactMcpControls } from "./runtime-mcp/redaction";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -1405,6 +1408,80 @@ export interface RunRootCommandDependencies {
 	loadSettingsForScope?: typeof Settings.loadForScope;
 }
 
+type DirectSessionManager = Pick<SessionManager, "getCwd" | "getSessionFile" | "getSessionId">;
+
+/**
+ * Direct CLI liveness is meaningful only for sessions with a durable transcript.
+ * An in-memory manager has no artifacts for GC to fence and must not touch the
+ * shared SDK session-index lock.
+ */
+export function directSessionRegistrationId(
+	sessionManager: DirectSessionManager | undefined,
+	lifecycleRequestId: string | undefined,
+): string | undefined {
+	if (lifecycleRequestId || sessionManager?.getSessionFile() === undefined) return undefined;
+	return sessionManager.getSessionId();
+}
+
+interface DirectSessionRegistrationDependencies {
+	createIndex?: (agentDir: string) => SessionIndex;
+	processIncarnation?: typeof processIncarnation;
+	registerPostmortem?: typeof postmortem.register;
+	masterRole?: { ownerSessionId: string; attestationEpoch: string };
+}
+
+/** Register a durable direct CLI session while leaving ephemeral sessions lock-free. */
+export async function registerDirectSession(
+	sessionManager: DirectSessionManager | undefined,
+	agentDir: string,
+	lifecycleRequestId: string | undefined,
+	dependencies: DirectSessionRegistrationDependencies = {},
+): Promise<void> {
+	const directSessionId = directSessionRegistrationId(sessionManager, lifecycleRequestId);
+	if (!directSessionId || !sessionManager) return;
+	const sessionIndex = dependencies.createIndex?.(agentDir) ?? new SessionIndex(agentDir);
+	const locator = await resolveSessionLocator(sessionManager.getCwd(), agentDir);
+	const directSessionIncarnation = (dependencies.processIncarnation ?? processIncarnation)(process.pid);
+	await sessionIndex.append({
+		type: "host_registered",
+		sessionId: directSessionId,
+		locator,
+		endpointGeneration: 0,
+		pid: process.pid,
+		...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+		...(dependencies.masterRole && directSessionIncarnation
+			? {
+					masterRole: {
+						version: 2 as const,
+						ownerSessionId: dependencies.masterRole.ownerSessionId,
+						launchPid: process.pid,
+						launchProcessIncarnation: directSessionIncarnation,
+						role: "master" as const,
+						attestationEpoch: dependencies.masterRole.attestationEpoch,
+					},
+				}
+			: {}),
+	});
+	if (locator.worktreeRoot !== null) {
+		try {
+			await releaseLaunchWorktreeReservationAfterRegistration(agentDir, locator.worktreeRoot);
+		} catch (error) {
+			logger.warn("Failed to release launch worktree reservation after host registration", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	(dependencies.registerPostmortem ?? postmortem.register)("direct-session-index", async _reason => {
+		await sessionIndex.append({
+			type: "host_unregistered",
+			sessionId: directSessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+	});
+}
+
 export interface ModelRoleOverrides {
 	smol?: string;
 	slow?: string;
@@ -1987,55 +2064,15 @@ export async function runRootCommand(
 	}
 	// Register a resumed direct session before constructing the agent: GC holds the
 	// same index lock while deleting artifacts, so startup and deletion are fenced.
-	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
-	if (directSessionId) {
-		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
-		const locator = await resolveSessionLocator(sessionManager?.getCwd() ?? cwd, settingsInstance.getAgentDir());
-		// A pid is reusable, so the broker's teardown fence needs this session's OS
-		// start incarnation recorded alongside the pid it publishes.
-		const directSessionIncarnation = processIncarnation(process.pid);
-		await sessionIndex.append({
-			type: "host_registered",
-			sessionId: directSessionId,
-			locator,
-			endpointGeneration: 0,
-			pid: process.pid,
-			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
-			...(masterModeContext && directSessionIncarnation
-				? {
-						masterRole: {
-							version: 2,
-							ownerSessionId: masterModeContext.ownerSessionId,
-							launchPid: process.pid,
-							launchProcessIncarnation: directSessionIncarnation,
-							role: "master" as const,
-							attestationEpoch: masterModeContext.attestationEpoch,
-						},
-					}
-				: {}),
-		});
-		if (locator.worktreeRoot !== null) {
-			try {
-				await releaseLaunchWorktreeReservationAfterRegistration(
-					settingsInstance.getAgentDir(),
-					locator.worktreeRoot,
-				);
-			} catch (error) {
-				logger.warn("Failed to release launch worktree reservation after host registration", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
-		postmortem.register("direct-session-index", async () => {
-			await sessionIndex.append({
-				type: "host_unregistered",
-				sessionId: directSessionId,
-				locator,
-				endpointGeneration: 0,
-				pid: process.pid,
-			});
-		});
-	}
+	// Ephemeral sessions have no durable artifacts or liveness authority to fence.
+	await registerDirectSession(sessionManager, settingsInstance.getAgentDir(), process.env.GJC_LIFECYCLE_REQUEST_ID, {
+		masterRole: masterModeContext
+			? {
+					ownerSessionId: masterModeContext.ownerSessionId,
+					attestationEpoch: masterModeContext.attestationEpoch,
+				}
+			: undefined,
+	});
 
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
@@ -2075,6 +2112,18 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
+
+		// Exact MCP capability attaches at the root interactive entry point.
+		// Granted by creation path, not by call order:
+		// only a session this root command built for an interactive run with an
+		// explicit --mcp-config gets one. Sessions built through createAgentSession
+		// directly, sub-sessions, ACP, and print/text/json runs never reach here.
+		if (isInteractive && sessionOptions.mcpConfigPath) {
+			attachExactMcpControls(session, {
+				grantSource: "root-interactive-exact-config",
+				configPath: sessionOptions.mcpConfigPath,
+			});
+		}
 
 		let startDeferredModelProfiles: DeferredModelProfileStartup | undefined;
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {

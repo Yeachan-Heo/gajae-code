@@ -23,6 +23,8 @@ export type SpawnClaimV2 = {
 	failure?: SpawnSubstrateFailure;
 	preSendLease?: { epoch: string; status: "owned" | "consumed" };
 	childId?: string;
+	/** Launch proof retained while registration is still unbound so a later retry can re-prove or close it. */
+	substrateProof?: SpawnSubstrateProof;
 	seed?: SeedDeliveryV2;
 	authorityRef?: string;
 	createdAt: number;
@@ -139,6 +141,8 @@ export type SpawnClaimTransition = {
 	leaseEpoch?: string;
 	/** The fresh child ID is committed before substrate launch. */
 	childId?: string;
+	/** Launch proof may be appended to the pre-registration state for later reconciliation. */
+	substrateProof?: SpawnSubstrateProof;
 	/** Required for seed and terminal state transitions that carry Q26 facts. */
 	seed?: SeedDeliveryV2;
 	failure?: SpawnSubstrateFailure;
@@ -225,6 +229,7 @@ const CLAIM_KEYS = new Set([
 	"failure",
 	"preSendLease",
 	"childId",
+	"substrateProof",
 	"seed",
 	"authorityRef",
 	"createdAt",
@@ -272,13 +277,13 @@ const FORBIDDEN_FIELD =
 	/(?:task|prompt|capability|idempotency|fingerprint|requesthash|digest|credential|token|secret|password|stderr)/i;
 const TRANSITION_EDGES: Readonly<Record<SpawnClaimV2["state"], readonly SpawnClaimV2["state"][]>> = {
 	prepared: ["substrate_starting", "pre_send_rejected", "uncertain", "closed"],
-	substrate_starting: ["authority_active", "pre_send_rejected", "uncertain", "closed"],
+	substrate_starting: ["substrate_starting", "authority_active", "pre_send_rejected", "uncertain", "closed"],
 	authority_active: ["seed_prepared", "pre_send_rejected", "uncertain", "closed"],
 	seed_prepared: ["dispatching", "pre_send_rejected", "uncertain", "closed"],
 	dispatching: ["accepted", "pre_send_rejected", "uncertain", "closed"],
 	accepted: ["uncertain", "closed"],
 	pre_send_rejected: ["uncertain", "closed"],
-	uncertain: ["closed"],
+	uncertain: ["pre_send_rejected", "closed"],
 	closed: [],
 };
 
@@ -476,6 +481,7 @@ export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 				((lease as { status?: unknown }).status === "owned" ||
 					(lease as { status?: unknown }).status === "consumed"))) &&
 		(claim.childId === undefined || isOpaque(claim.childId)) &&
+		(claim.substrateProof === undefined || isSpawnSubstrateProof(claim.substrateProof)) &&
 		(claim.seed === undefined || isSeed(claim.seed)) &&
 		(claim.authorityRef === undefined || isOpaque(claim.authorityRef)) &&
 		(claim.failure === undefined || isSpawnSubstrateFailure(claim.failure)) &&
@@ -698,10 +704,19 @@ export class SpawnAuthorityStore {
 						!isOpaque(transition.childId) ||
 						transition.seed !== undefined ||
 						transition.authority !== undefined ||
-						transition.failure !== undefined
+						transition.failure !== undefined ||
+						(transition.substrateProof !== undefined && !isSpawnSubstrateProof(transition.substrateProof)) ||
+						(current.state === "prepared" && transition.substrateProof !== undefined) ||
+						(current.state === "substrate_starting" && transition.substrateProof === undefined) ||
+						(current.state === "substrate_starting" && transition.childId !== current.childId)
 					)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
-					next = { ...current, state: "substrate_starting", childId: transition.childId };
+					next = {
+						...current,
+						state: "substrate_starting",
+						childId: transition.childId,
+						...(transition.substrateProof === undefined ? {} : { substrateProof: transition.substrateProof }),
+					};
 					break;
 				}
 				case "authority_active": {
@@ -804,7 +819,11 @@ export class SpawnAuthorityStore {
 					break;
 				}
 				case "uncertain": {
-					if (transition.childId !== undefined || transition.authority !== undefined)
+					if (
+						transition.childId !== undefined ||
+						transition.authority !== undefined ||
+						(transition.failure !== undefined && !isSpawnSubstrateFailure(transition.failure))
+					)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
 					if (current.seed) {
 						if (
@@ -813,10 +832,19 @@ export class SpawnAuthorityStore {
 							!sameSeedIdentity(current.seed, transition.seed)
 						)
 							throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "uncertain", seed: transition.seed };
+						next = {
+							...current,
+							state: "uncertain",
+							seed: transition.seed,
+							...(transition.failure === undefined ? {} : { failure: transition.failure }),
+						};
 					} else {
 						if (transition.seed !== undefined) throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "uncertain" };
+						next = {
+							...current,
+							state: "uncertain",
+							...(transition.failure === undefined ? {} : { failure: transition.failure }),
+						};
 					}
 					break;
 				}

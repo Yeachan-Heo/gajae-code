@@ -218,10 +218,13 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				await manager.dispose({ timeoutMs: 1_000 });
 				await chainSessionManager.close();
 			} else {
-				// Stop the block-owned manager before joining coordinator persistence.
-				// A completion callback can enqueue persistence work, so waiting for
-				// that queue first would leave teardown waiting on the manager that
-				// teardown itself is responsible for settling.
+				// Abort active runs and cancel producers before stopping the manager. A
+				// terminal abort can rearm a preserved steer after the body returns, so
+				// wait for the session's idle signal and every canceled job promise first.
+				session.agent.abort();
+				manager.cancelAll();
+				await session.waitForIdle();
+				await manager.waitForAll();
 				await manager.dispose({ timeoutMs: 3_000 });
 				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 				await session.dispose();

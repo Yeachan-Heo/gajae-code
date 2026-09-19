@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { commands } from "../src/cli-main";
 import {
 	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionNearLimitAppendError,
+	SessionNearLimitRewriteError,
 } from "../src/session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 import { BUILTIN_SLASH_COMMAND_DEFS } from "../src/slash-commands/builtin-registry";
@@ -12,12 +15,17 @@ import { BUILTIN_SLASH_COMMAND_DEFS } from "../src/slash-commands/builtin-regist
  * Recovery guidance must only name commands a user can actually run, on every
  * surface that renders the message.
  *
- * Both limit messages told users to run `gjc export <session-file>`. There is no
- * `export` subcommand (`cli-main.ts` registers none), so the shell started a
+ * The near-limit messages told users to run `gjc export <session-file>`. There is
+ * no `export` subcommand (`cli-main.ts` registers none), so the shell started a
  * fresh interactive agent that read "export" as a prompt: the operator lost the
  * recovery they were told to perform and still held an unwritable session. The
  * root `--export` flag is unrelated — it renders HTML and exits, which never
  * produces a resumable session.
+ *
+ * It came back once already. `#5691` added a third near-limit error class with its
+ * own hardcoded copy of the advice, and this matrix — which then enumerated only
+ * the two append messages — could not see it. Cover the error FAMILY, not the
+ * instances that happened to exist when the guard was written (#5732).
  *
  * Existence alone is not enough. `AgentSession` renders the near-limit guidance
  * to ACP/text consumers too, and `ACP_BUILTIN_SLASH_COMMANDS` is filtered to
@@ -57,10 +65,21 @@ function nearLimitMessage(entryRetained: boolean): string {
 	}).message;
 }
 
-/** Messages rendered by `AgentSession`, which reaches TUI and ACP/text alike. */
+/**
+ * Messages rendered by `AgentSession`, which reaches TUI and ACP/text alike.
+ *
+ * Every near-limit error class belongs here, not just the append one. `#5691` added
+ * `SessionNearLimitRewriteError` with its own hardcoded copy of the advice and
+ * reintroduced `gjc export <session-file>` — the exact command #5621 removed — because
+ * this matrix only covered the append class and nothing failed.
+ */
 const inSessionMessages: Array<[string, string]> = [
 	["near-limit append (entry retained)", nearLimitMessage(true)],
 	["near-limit append (entry rolled back)", nearLimitMessage(false)],
+	[
+		"near-limit managed rewrite",
+		new SessionNearLimitRewriteError({ transcriptBytes: 128 * 1024 * 1024 + 1, capBytes: 128 * 1024 * 1024 }).message,
+	],
 ];
 
 const allGuidanceMessages: Array<[string, string]> = [
@@ -95,6 +114,115 @@ describe("session recovery guidance references runnable commands", () => {
 		// entirely would pass every assertion above.
 		expect(referencedCliCommands("Use `gjc export <session-file>` to recover.")).toEqual(["export"]);
 		expect(cliCommandNames).not.toContain("export");
+	});
+
+	/**
+	 * Every file that can render session-limit guidance, not just the one that regressed.
+	 *
+	 * Discovered RECURSIVELY: `src/session/internal/` exists, and a non-recursive read
+	 * silently excluded it, so a class placed there was unguarded by construction — the
+	 * same instances-not-family mistake one directory level down (#5732).
+	 */
+	async function sessionSurfaceSources(): Promise<Array<[string, string]>> {
+		const root = new URL("../src/session/", import.meta.url);
+		const entries = await fs.readdir(root, { recursive: true, withFileTypes: true });
+		const files = entries.filter(
+			entry => entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts"),
+		);
+		return Promise.all(
+			files.map(async entry => {
+				const full = path.join(entry.parentPath, entry.name);
+				return [path.relative(new URL(".", root).pathname, full), await Bun.file(full).text()] as [string, string];
+			}),
+		);
+	}
+
+	/** Source with block and line comments removed, so prose cannot satisfy or trip a check. */
+	function withoutComments(source: string): string {
+		return source
+			.replaceAll(/\/\*[\s\S]*?\*\//g, "")
+			.split("\n")
+			.filter(line => !line.trimStart().startsWith("//"))
+			.join("\n");
+	}
+
+	test("every near-limit error class interpolates the shared advice (#5732)", async () => {
+		// The family matrix above only covers classes someone remembered to add, and a
+		// substring check only catches verbatim copies. `#5691` wrote its own PARAPHRASE
+		// of the advice, which both of those miss, and that is how `gjc export` returned.
+		//
+		// Close the shape structurally: scan every session source file for near-limit
+		// error declarations, in any declaration form and over any base class, and
+		// require each to interpolate SESSION_LIMIT_RECOVERY_ACTIONS.
+		const declaration =
+			/(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w*NearLimit\w*)\b|(?:const|let|var)\s+(\w*NearLimit\w*)\s*=\s*class\b/g;
+		let found = 0;
+		for (const [name, source] of await sessionSurfaceSources()) {
+			for (const match of source.matchAll(declaration)) {
+				const identifier = match[1] ?? match[2];
+				const start = match.index ?? 0;
+				const end = source.indexOf("\n}", start);
+				const body = source.slice(start, end === -1 ? source.length : end);
+				found++;
+				expect({
+					file: name,
+					class: identifier,
+					// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the literal interpolation token in source text is the point of this check.
+					interpolatesSharedAdvice: body.includes("${SESSION_LIMIT_RECOVERY_ACTIONS}"),
+				}).toEqual({ file: name, class: identifier, interpolatesSharedAdvice: true });
+			}
+		}
+		// Fail loudly rather than vacuously if the classes are renamed out of the pattern.
+		expect(found).toBeGreaterThanOrEqual(2);
+	});
+
+	test("no session source names the nonexistent export command (#5732)", async () => {
+		// Scoped to the whole session directory, not just the file that regressed:
+		// `agent-session.ts` renders this guidance too, and a hardcoded paraphrase there
+		// would have been invisible to a session-manager-only scan.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			expect({ file: name, namesExport: withoutComments(source).includes("gjc export") }).toEqual({
+				file: name,
+				namesExport: false,
+			});
+		}
+	});
+
+	test("every gjc command advised anywhere in session source is registered (#5732)", async () => {
+		// The two checks above are still name-shaped: they key off `NearLimit` in an
+		// identifier. `SessionTranscriptOversizedError` and `SessionContextTooLargeError`
+		// do not match that pattern, and a class added tomorrow need not either. The
+		// residual gap is an error that advises some OTHER nonexistent command.
+		//
+		// This closes the defect CLASS instead of the classes: whatever the surrounding
+		// code is called, a `gjc <verb>` named in session source must resolve to a real
+		// registered command. That is the invariant #5621 actually violated.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			const advised = [...withoutComments(source).matchAll(/`gjc ([a-z][a-z0-9-]*)/g)].map(match => match[1]);
+			for (const verb of new Set(advised)) {
+				expect({ file: name, verb, registered: cliCommandNames.has(verb) }).toEqual({
+					file: name,
+					verb,
+					registered: true,
+				});
+			}
+		}
+	});
+
+	test("every slash command advised in session source is ACP-dispatchable (#5732)", async () => {
+		// `gjc <verb>` was only half the surface. The original #5621 fix also had to reject
+		// `/new`, which is a real builtin but not ACP-dispatchable, so guidance naming it is
+		// a dead end for ACP/text consumers. Same invariant, other command namespace.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			const advised = [...withoutComments(source).matchAll(/`\/([a-z][a-z0-9-]*)`/g)].map(match => match[1]);
+			for (const slash of new Set(advised)) {
+				expect({ file: name, slash, dispatchable: acpSlashNames.has(slash) }).toEqual({
+					file: name,
+					slash,
+					dispatchable: true,
+				});
+			}
+		}
 	});
 
 	test("the slash detector catches un-backticked mentions", () => {
