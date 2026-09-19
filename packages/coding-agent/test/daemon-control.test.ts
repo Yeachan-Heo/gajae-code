@@ -2852,7 +2852,7 @@ describe("runDaemonCommand", () => {
 		expect(parsed[0].ownerId).toBe("o1");
 	});
 
-	test("status preserves healthy rows when another target fails", async () => {
+	test("status keeps healthy rows inside the failure envelope when another target fails", async () => {
 		const healthy: DaemonStatus = {
 			kind: "telegram",
 			configured: true,
@@ -2876,27 +2876,27 @@ describe("runDaemonCommand", () => {
 			},
 		];
 		let failure: unknown;
-		const out = await captureStdout(async () => {
-			try {
-				await runDaemonCommand(
-					{ action: "status", kinds: [], all: true, json: true, force: false },
-					{ controllers },
-				);
-			} catch (error) {
-				failure = error;
-			}
-		});
-		expect(out).toBe("");
-		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		for (const json of [true, false]) {
+			failure = undefined;
+			const out = await captureStdout(async () => {
+				try {
+					await runDaemonCommand({ action: "status", kinds: [], all: true, json, force: false }, { controllers });
+				} catch (error) {
+					failure = error;
+				}
+			});
+			expect(out).toBe("");
+			expect(failure).toBeInstanceOf(PublicCommandFailure);
+			const rendered = await renderPublicCommandFailure(failure, { command: ["daemon", "status"], json });
+			expect(json ? rendered.stderr : rendered.stdout).toBe("");
+			expect(json ? rendered.stdout : rendered.stderr).toContain('"partialStatuses":[');
+			expect(rendered.envelope.error.partialStatuses).toEqual([healthy]);
+		}
 		expect((failure as PublicCommandFailure).input).toMatchObject({
 			kind: "daemon_mixed",
 			targets: [{ kind: "discord", outcome: "unknown" }],
 			partialStatuses: [healthy],
 		});
-		const rendered = await renderPublicCommandFailure(failure, { command: ["daemon", "status"], json: true });
-		expect(rendered.stderr).toBe("");
-		expect(JSON.parse(rendered.stdout)).toEqual(rendered.envelope);
-		expect(rendered.envelope.error.partialStatuses).toEqual([healthy]);
 		const oversized = await renderPublicCommandFailure(
 			new PublicCommandFailure({
 				kind: "daemon_mixed",

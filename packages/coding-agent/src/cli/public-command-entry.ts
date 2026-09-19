@@ -95,6 +95,12 @@ export function scanPublicCommand(family: PublicCommandFamily, argv: readonly st
 		if (!issues.some(item => item.code === code && item.field === field))
 			issues.push({ code, message, ...(field ? { field } : {}) });
 	};
+	if (
+		family === "daemon" &&
+		(argv[0] === "discord-internal" || argv[0] === "slack-internal") &&
+		!isDaemonInternalArgv(argv)
+	)
+		issue("unknown-path", "Private daemon worker arguments are invalid.");
 	const consumeFlag = (name: string, flag: PublicFlagDescriptor, value: string | undefined, inline: boolean): void => {
 		if (seen.has(name) && (flag.boundary || descriptor.command.join(" ") === "sdk serve") && !flag.multiple)
 			issue("duplicate-flag", "Option must occur only once.", name);
@@ -289,6 +295,24 @@ export function isSdkInternalArgv(argv: readonly string[]): boolean {
 	);
 }
 
+/** Mirrors the exact private argv emitted by chat-daemon controller spawns. */
+export function isDaemonInternalArgv(argv: readonly string[]): boolean {
+	const ownerId = argv[2];
+	return (
+		argv.length === 5 &&
+		(argv[0] === "discord-internal" || argv[0] === "slack-internal") &&
+		argv[1] === "--owner-id" &&
+		typeof ownerId === "string" &&
+		ownerId.length > 0 &&
+		ownerId.length <= 1024 &&
+		!ownerId.startsWith("-") &&
+		!/[\x00-\x1f\x7f-\x9f\u2028\u2029]/u.test(ownerId) &&
+		argv[3] === "--agent-dir" &&
+		typeof argv[4] === "string" &&
+		isSafeSdkInternalAgentDir(argv[4])
+	);
+}
+
 function evidencePageOutput(page: EvidencePage, json: boolean): string {
 	if (json) return `${JSON.stringify(page)}\n`;
 	// JSON-quoted fields keep control characters out of terminal output and preserve exact locators.
@@ -313,6 +337,15 @@ export async function dispatchPublicCommand(
 		await context.setup?.(diagnostic => {
 			process.stderr.write(diagnostic.successStderr);
 		});
+		const Cmd = await context.load();
+		await new Cmd([...argv], {
+			bin: context.bin,
+			version: context.version,
+			commands: new Map([[context.command, Cmd]]),
+		}).run();
+		return;
+	}
+	if (context.command === "daemon" && isDaemonInternalArgv(argv)) {
 		const Cmd = await context.load();
 		await new Cmd([...argv], {
 			bin: context.bin,

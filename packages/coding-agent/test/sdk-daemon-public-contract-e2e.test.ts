@@ -237,6 +237,19 @@ await runCli(${JSON.stringify(["sdk", ...argv])});`);
 		}
 	});
 
+	it("preserves exact chat-daemon worker argv through registered bootstrap hooks", async () => {
+		for (const action of ["discord-internal", "slack-internal"]) {
+			const argv = [action, "--owner-id", "1234-worker", "--agent-dir", "/safe-fixture"];
+			const result = await child(`import {commands,runCli} from ${JSON.stringify(cli)};
+import {Command} from "@gajae-code/utils/cli";
+commands.find(entry=>entry.name==="daemon").load=async()=>class extends Command {async run(){process.stdout.write(JSON.stringify({workerArgv:this.argv}))}};
+await runCli(${JSON.stringify(["daemon", ...argv])});`);
+			expect(result.code).toBe(0);
+			expect(JSON.parse(result.stdout)).toEqual({ workerArgv: argv });
+			expect(result.stderr).toBe("");
+		}
+	});
+
 	it("does not grant runtime bypass to malformed or decorated private worker tokens", async () => {
 		for (const argv of [
 			["broker-internal"],
@@ -262,6 +275,27 @@ await runCli(${JSON.stringify(["sdk", ...argv])});`);
 			expect(result.stdout).toBe("");
 			expect(result.stderr).toContain('"category":"usage"');
 			expect(result.stderr).not.toContain("private-secret-worker");
+		}
+	});
+
+	it("does not grant runtime bypass to malformed chat-daemon worker tokens", async () => {
+		for (const argv of [
+			["discord-internal"],
+			["slack-internal", "--owner-id", "1234-worker"],
+			["discord-internal", "--owner-id", "1234-worker", "--agent-dir", "relative-agent"],
+			["slack-internal", "--owner-id", "-bad", "--agent-dir", "/safe-fixture"],
+			["discord-internal", "--owner-id", "1234-worker", "--agent-dir", "/safe-fixture", "--help"],
+		]) {
+			const result = await child(
+				dispatchSource(
+					"daemon",
+					argv,
+					`setup:async()=>{throw new Error("runtime must remain inert")},load:async()=>{throw new Error("worker must not load")}`,
+				),
+			);
+			expect(result.code).toBe(2);
+			expect(result.stdout).toBe("");
+			expect(result.stderr).toContain('"category":"usage"');
 		}
 	});
 	it("keeps valid help and usage failures out of setup and command loading", async () => {

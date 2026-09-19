@@ -153,8 +153,6 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 			else failedTargets.push({ kind: controllers[index]!.kind, outcome: "unknown" });
 		}
 		if (failedTargets.length > 0) {
-			if (!cmd.json && statuses.length > 0)
-				process.stdout.write(`${statuses.map(s => formatDaemonStatus(s, { verbose: cmd.verbose })).join("\n")}\n`);
 			throw new PublicCommandFailure({
 				kind: "daemon_mixed",
 				proof: "pre-effect",
