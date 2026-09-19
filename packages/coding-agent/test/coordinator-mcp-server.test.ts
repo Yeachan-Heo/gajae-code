@@ -66,6 +66,7 @@ import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import { resolveSdkHostModel, type SdkHostModelRegistryLoader } from "../src/sdk/host/model-pin";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import { writeDurableCoordinatorSession } from "./helpers/coordinator-session-fixture";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
@@ -3708,6 +3709,211 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(listScopes).toContain(worktree);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
+	it("reuses a delegate session through its persisted managed-worktree authority", async () => {
+		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktree = path.join(root, "hermes-worktree");
+		await Bun.$`git worktree add -q -b hermes ${worktree}`.cwd(root);
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		const first = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			worktree: "hermes",
+			task: "first managed-worktree task",
+			idempotency_key: "managed-worktree-delegate-first",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const persistedSessionPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const persistedSession = JSON.parse(await fs.readFile(persistedSessionPath, "utf8")) as Record<string, unknown>;
+		const symlinkedWorktree = path.join(root, "hermes-link");
+		await fs.symlink(worktree, symlinkedWorktree, "dir");
+		await Bun.write(
+			persistedSessionPath,
+			JSON.stringify({ ...persistedSession, broker_workspace: `${symlinkedWorktree}${path.sep}` }),
+		);
+
+		const second = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "second managed-worktree task",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-second",
+			allow_mutation: true,
+		});
+		expect(second).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		if (process.platform !== "win32") {
+			await Bun.write(
+				persistedSessionPath,
+				JSON.stringify({ ...persistedSession, broker_workspace: worktree.toUpperCase() }),
+			);
+			await expect(
+				server.callTool("gjc_delegate_plan", {
+					cwd: root,
+					session_id: "created-session-1",
+					task: "case-mismatched worktree must not bind",
+					queue: true,
+					idempotency_key: "managed-worktree-delegate-case-mismatch",
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		}
+	}, 20_000);
+	it("does not seal transient managed-worktree canonicalization failures", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		await fs.mkdir(worktree, { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let failCanonicalization = false;
+		const canonicalizePath = async (value: string): Promise<string> => {
+			if (failCanonicalization && value === worktree)
+				throw Object.assign(new Error("temporary canonicalization failure"), { code: "EACCES" });
+			return fs.realpath(value);
+		};
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{ canonicalizePath },
+		);
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-transient",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after transient canonicalization failure",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-transient",
+			allow_mutation: true,
+		};
+		failCanonicalization = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
+		const receipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(receipt.state).toBe("in_progress");
+		expect(receipt.response).toBeUndefined();
+		failCanonicalization = false;
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				...retryArgs,
+				idempotency_key: "managed-worktree-delegate-transient-fresh",
+			}),
+		).resolves.toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1" },
+		});
+	}, 20_000);
+	it("keeps endpoint authority separated across two actual managed worktrees", async () => {
+		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktrees = new Map<string, string>();
+		for (const name of ["task-a", "task-b"]) {
+			const worktree = path.join(root, name);
+			await Bun.$`git worktree add -q -b ${name} ${worktree}`.cwd(root);
+			worktrees.set(name, worktree);
+		}
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			...(["task-a", "task-b"] as const).map(name => {
+				const sessionCwd = worktrees.get(name)!;
+				return {
+					sessionId: `created-${name}`,
+					locator: {
+						cwd: sessionCwd,
+						worktreeRoot: sessionCwd,
+						stateRoot: path.join(sessionCwd, ".gjc", "state"),
+					},
+					live: true,
+					endpointGeneration: 1,
+					pid: process.pid,
+					endpointMtimeMs: 0,
+				};
+			}),
+		];
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({
+					sessionId: session.sessionId,
+					pid: process.pid,
+					url: "ws://sdk.example.test",
+					token: "test-token",
+				}),
+			);
+			// The durable fixture helper uses mtime=1 in its deterministic authority
+			// digest; the endpoint file itself still exists in the real worktree.
+			session.endpointMtimeMs = 1;
+		}
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			brokerSessions,
+			undefined,
+			undefined,
+			{ preserveEndpointAuthority: true },
+		);
+		const env = {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		};
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			await writeDurableCoordinatorSession({ sessionId: session.sessionId as string, cwd: sessionCwd, env });
+		}
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-a" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-b" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+
+		const sessionListScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(sessionListScopes).toContain(worktrees.get("task-a"));
+		expect(sessionListScopes).toContain(worktrees.get("task-b"));
+	}, 30_000);
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
