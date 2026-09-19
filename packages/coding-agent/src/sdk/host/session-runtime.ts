@@ -1980,6 +1980,7 @@ function createQuerySurface(
 					...gate,
 					id: `pending:${gate.gate_id}`,
 					tag: "pending" as const,
+					answer_recorded: false as const,
 				})) ??
 				[]
 			);
@@ -6263,6 +6264,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			failureDiagnosticCodes: new Map(),
 			lifecycleTasks: new Set(),
 		};
+		// Capture the SDK turn that owns a headless workflow gate before it is
+		// persisted. Q12 can then explain both sides of a stalled turn: the gate
+		// identity and whether an answer was recorded for that originating turn.
+		ctx.workflowGate?.setRuntimeTurnProvider?.(() => active?.activeInvocation?.correlation.turnId);
 		lifecycleOwnerHolder.state = runtimeOwner;
 		active = runtimeOwner;
 		try {
