@@ -60,6 +60,7 @@ async function makeTempDir(): Promise<string> {
 
 async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
 	await fs.writeFile(filePath, content, { mode });
+	await fs.chmod(filePath, mode);
 }
 
 afterEach(async () => {

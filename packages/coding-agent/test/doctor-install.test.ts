@@ -27,6 +27,7 @@ const ELF_HEADER = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00])
 
 async function writeFixtureFile(filePath: string, content: Uint8Array | string, mode = 0o755): Promise<void> {
 	await fs.writeFile(filePath, content, { mode });
+	await fs.chmod(filePath, mode);
 }
 
 function digestOf(content: Buffer): string {
