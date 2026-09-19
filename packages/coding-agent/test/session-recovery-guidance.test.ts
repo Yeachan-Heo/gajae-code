@@ -4,6 +4,7 @@ import {
 	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SESSION_OVERSIZED_RECOVERY_MESSAGE,
 	SessionNearLimitAppendError,
+	SessionNearLimitRewriteError,
 } from "../src/session/session-manager";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 import { BUILTIN_SLASH_COMMAND_DEFS } from "../src/slash-commands/builtin-registry";
@@ -57,10 +58,21 @@ function nearLimitMessage(entryRetained: boolean): string {
 	}).message;
 }
 
-/** Messages rendered by `AgentSession`, which reaches TUI and ACP/text alike. */
+/**
+ * Messages rendered by `AgentSession`, which reaches TUI and ACP/text alike.
+ *
+ * Every near-limit error class belongs here, not just the append one. `#5691` added
+ * `SessionNearLimitRewriteError` with its own hardcoded copy of the advice and
+ * reintroduced `gjc export <session-file>` — the exact command #5621 removed — because
+ * this matrix only covered the append class and nothing failed.
+ */
 const inSessionMessages: Array<[string, string]> = [
 	["near-limit append (entry retained)", nearLimitMessage(true)],
 	["near-limit append (entry rolled back)", nearLimitMessage(false)],
+	[
+		"near-limit managed rewrite",
+		new SessionNearLimitRewriteError({ transcriptBytes: 128 * 1024 * 1024 + 1, capBytes: 128 * 1024 * 1024 }).message,
+	],
 ];
 
 const allGuidanceMessages: Array<[string, string]> = [

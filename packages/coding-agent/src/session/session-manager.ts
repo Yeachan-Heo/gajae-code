@@ -2279,7 +2279,10 @@ export class SessionNearLimitRewriteError extends Error {
 		super(
 			[
 				`near_limit_rewrite: live transcript (${details.transcriptBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
-				"The rewrite was rejected and the resident entries are retained in memory; the transcript persists again after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+				// Must reuse SESSION_LIMIT_RECOVERY_ACTIONS rather than restate the advice:
+				// this error class reintroduced `gjc export <session-file>` (#5691) after
+				// #5621 removed it, because it hardcoded its own copy of the guidance.
+				`The rewrite was rejected and the resident entries are retained in memory; the transcript persists again once you ${SESSION_LIMIT_RECOVERY_ACTIONS}.`,
 			].join(" "),
 		);
 		this.name = "SessionNearLimitRewriteError";
