@@ -218,6 +218,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				await manager.dispose({ timeoutMs: 1_000 });
 				await chainSessionManager.close();
 			} else {
+				session.agent.abort();
 				// Stop the block-owned manager before joining coordinator persistence.
 				// A completion callback can enqueue persistence work, so waiting for
 				// that queue first would leave teardown waiting on the manager that
@@ -983,6 +984,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// admission sequence) and the rearm consumes it.
 		await waitFor(() => !session.agent.hasQueuedSteering(), "requester steer consumed");
 		await promptPromise;
+		// The rearmed continuation is admitted asynchronously after the aborted
+		// run settles; join it before shared teardown disposes its manager.
+		await session.waitForIdle();
 	}, 30_000);
 
 	it("terminal abort discards snapshots captured by replay-only admissions", async () => {

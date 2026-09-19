@@ -385,6 +385,45 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		await session.dispose();
 	});
 
+	test("rechecks a recovered saved chain after startup extensions register its model", async () => {
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const sessionManager = SessionManager.inMemory(tempDir);
+		sessionManager.appendModelChange("late-provider/late-model", "default");
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, sessionManager),
+			settings,
+			extensions: [
+				api => {
+					api.registerProvider("late-provider", {
+						baseUrl: "http://127.0.0.1:9/v1",
+						apiKey: "LATE_KEY",
+						api: "openai-completions",
+						models: [
+							{
+								id: "late-model",
+								name: "Late Model",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 128000,
+								maxTokens: 8192,
+							},
+						],
+					});
+				},
+			],
+		});
+
+		expect(session.model).toMatchObject({ provider: "late-provider", id: "late-model" });
+		expect(modelFallbackMessage).toBeUndefined();
+		await session.dispose();
+	});
+
 	test("resolves explicit modelPattern after runtime providers are available", async () => {
 		const { session, modelFallbackMessage } = await createAgentSession(
 			buildSessionOptions("runtime-provider/runtime-model"),

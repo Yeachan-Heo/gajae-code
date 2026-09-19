@@ -83,6 +83,7 @@ function fakeSession(initial = model("initial-provider", "initial")) {
 			session.thinkingLevel = thinkingLevel;
 		},
 		getConfiguredModelChain: () => undefined,
+		hasRecoveredDefaultFallbackChain: () => false,
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			session.configuredModelChains.push({ role, entries });
 		},
