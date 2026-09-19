@@ -102,6 +102,7 @@ interface HostHarness {
 	clearFrames(): void;
 	readonly sent: Array<{ connectionId: string; frame: SdkFrame }>;
 	readonly broadcasts: SdkFrame[];
+	readonly observerFrames: SdkFrame[];
 	stop(): Promise<void>;
 }
 
@@ -136,6 +137,7 @@ async function createHostHarness(
 	const waiters = new Map<string, (frame: ControlResponse) => void>();
 	const sent: Array<{ connectionId: string; frame: SdkFrame }> = [];
 	const broadcasts: SdkFrame[] = [];
+	const observerFrames: SdkFrame[] = [];
 	let receive: ((connectionId: string, frame: SdkFrame) => void) | undefined;
 	let nextId = 0;
 	let idle = true;
@@ -195,6 +197,9 @@ async function createHostHarness(
 			broadcastFrame(frame) {
 				broadcasts.push(frame);
 			},
+			broadcastUnpositionedFrame(frame, excludedConnectionIds = []) {
+				if (excludedConnectionIds.includes("client")) observerFrames.push(frame);
+			},
 			start: async () => ({ url: "ws://127.0.0.1:1" }),
 			stop: async () => {},
 		}),
@@ -236,6 +241,7 @@ async function createHostHarness(
 		clearFrames: () => {
 			sent.length = 0;
 			broadcasts.length = 0;
+			observerFrames.length = 0;
 		},
 		setIdle: value => {
 			idle = value;
@@ -245,6 +251,7 @@ async function createHostHarness(
 		},
 		sent,
 		broadcasts,
+		observerFrames,
 		stop: async () => {
 			await handlers.get("session_shutdown")?.({}, ctx);
 		},
@@ -779,6 +786,31 @@ describe("SDK host turn streaming", () => {
 				},
 			]);
 			expect(harness.broadcasts.filter(frame => frame.kind === "message_update")).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("relays mid-turn content to attached observers without duplicating the owner frame", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-observer-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			const accepted = await harness.control("turn.prompt", { text: "observe this" });
+			expect(accepted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await waitForStartOnWire(harness);
+			harness.clearFrames();
+
+			await harness.emit("tool_execution_start", toolStart());
+
+			expect(harness.sent).toHaveLength(1);
+			expect(harness.sent[0]).toMatchObject({
+				connectionId: "client",
+				frame: { type: "event", kind: "tool_execution_start", commandId: accepted.result?.commandId },
+			});
+			expect(harness.observerFrames).toEqual([
+				expect.objectContaining({ type: "event", kind: "tool_execution_start" }),
+			]);
 		} finally {
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });

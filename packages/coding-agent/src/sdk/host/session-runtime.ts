@@ -250,6 +250,8 @@ export interface SessionSdkTransport {
 	start(): Promise<{ url: string }>;
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
+	/** Broadcast high-frequency turn content without retaining it in the replay ring. */
+	broadcastUnpositionedFrame?(frame: SdkFrame, excludedConnectionIds?: readonly string[]): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
@@ -472,6 +474,19 @@ export class SessionSdkSessionRuntime {
 			if (result instanceof Promise) result.catch(() => undefined);
 		} catch {
 			// A dead connection is reaped by the transport's own close handling.
+		}
+	}
+
+	/**
+	 * Deliver non-replayable turn content to attached observers while keeping the
+	 * invocation owner's correlated copy on its directed leg. Owners are excluded
+	 * by the caller so they do not receive duplicate content frames.
+	 */
+	broadcastUnpositionedFrame(frame: SdkFrame, excludedConnectionIds: readonly string[] = []): void {
+		try {
+			this.transport.broadcastUnpositionedFrame?.(frame, excludedConnectionIds);
+		} catch {
+			// A disconnected observer must never disturb the turn producing content.
 		}
 	}
 
@@ -4496,10 +4511,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		return task;
 	};
 	/**
-	 * Publish one content frame per owning invocation, each carrying its own
-	 * correlation, so a shared run lets every submitter attribute the content to
-	 * its own prompt. Content is best-effort and bypasses the lifecycle replay
-	 * ring; the turn producing it is authoritative.
+	 * Publish one correlated content frame per owning invocation, plus one
+	 * unpositioned copy for attached observers. A shared run therefore lets every
+	 * submitter attribute the content to its own prompt without dropping it for a
+	 * relay that did not submit the turn. Content is best-effort and bypasses the
+	 * lifecycle replay ring; the turn producing it is authoritative.
 	 */
 	const publishContentFrames = (
 		current: RuntimeState,
@@ -4508,6 +4524,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	): void => {
 		try {
 			const payload = toAgentWireEventPayload(event);
+			const ownerConnectionIds = new Set<string>();
+			for (const invocation of invocations)
+				if (invocation.connectionId !== undefined) ownerConnectionIds.add(invocation.connectionId);
+			if (ownerConnectionIds.size > 0)
+				current.runtime.broadcastUnpositionedFrame(
+					{
+						type: "event",
+						kind: event.type,
+						payload,
+					},
+					[...ownerConnectionIds],
+				);
 			for (const invocation of invocations) {
 				if (invocation.connectionId === undefined) continue;
 				current.runtime.sendFrameTo(invocation.connectionId, {
