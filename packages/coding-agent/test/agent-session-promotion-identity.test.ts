@@ -1430,10 +1430,12 @@ describe("queued promotion run identity (#4668)", () => {
 		await expect(submission.execution).resolves.toMatchObject({
 			submissionId: submission.submissionId,
 			disposition: "removed",
+			reason: "cancelled",
 		});
 		await expect(submission.terminal).resolves.toMatchObject({
 			submissionId: submission.submissionId,
 			disposition: "removed",
+			reason: "cancelled",
 		});
 		expect(session.agent.snapshotSteering()).toHaveLength(0);
 		gate.resolve();

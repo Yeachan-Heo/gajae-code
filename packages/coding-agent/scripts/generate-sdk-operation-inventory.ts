@@ -961,6 +961,7 @@ function validateRegistry(records: InventoryRecord[]): string[] {
 	const errors: string[] = [];
 	const ids = new Set<string>();
 	const sdkIds = new Set<string>();
+	const sourceIds = new Set<string>();
 	for (const operation of OPERATIONS) {
 		if (ids.has(operation.id)) errors.push(`Duplicate operation ID: ${operation.id}`);
 		ids.add(operation.id);
@@ -972,6 +973,8 @@ function validateRegistry(records: InventoryRecord[]): string[] {
 		if (operation.testIds.length === 0) errors.push(`${operation.id} is missing test IDs.`);
 	}
 	for (const record of records) {
+		if (sourceIds.has(record.sourceId)) errors.push(`Duplicate source seam: ${record.sourceId}`);
+		sourceIds.add(record.sourceId);
 		if (record.decision === "exclude") {
 			if (!record.rationale) errors.push(`${record.sourceId} exclusion lacks a locked rationale.`);
 			if (

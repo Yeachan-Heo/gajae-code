@@ -2142,6 +2142,7 @@ type TrackedQueuedInput = {
 	queuePolicy: QueuedInputQueuePolicy;
 	message?: AgentMessage;
 	cancelQueued?: () => boolean;
+	removePreflightAbortListener?: () => void;
 	attemptScope?: AttemptScope;
 	logicalRunId?: AttemptRunHandle["logicalRunId"];
 	executionSettled: boolean;
@@ -2813,6 +2814,11 @@ export class AgentSession {
 	#deferredSdkFollowUps: AgentMessage[] = [];
 	/** Per-message delivery policy for deferred follow-ups; WeakSet metadata survives array snapshots. */
 	#deferredFollowUpForceOneAtATime = new WeakSet<AgentMessage>();
+	/** Atomic all-mode cohorts that must be released together from the deferred queue. */
+	#deferredFollowUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
+	/** Admission order for externally submitted queued messages across both queue stores. */
+	#queuedAdmissionSequence = 0;
+	readonly #queuedAdmissionSeq = new WeakMap<AgentMessage, number>();
 	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
 	// explicit turn.steer) is an independent root-turn request ONLY when it is
 	// admitted AFTER the terminal abort snapshot: a terminal abort admitted
@@ -2908,6 +2914,13 @@ export class AgentSession {
 		}
 	}
 
+	#clearTrackedQueuedInputQueueOwnership(state: TrackedQueuedInput): void {
+		state.removePreflightAbortListener?.();
+		state.removePreflightAbortListener = undefined;
+		state.cancelQueued = undefined;
+		state.message = undefined;
+	}
+
 	#admitTrackedQueuedInput(state: TrackedQueuedInput, message: AgentMessage, cancelQueued: () => boolean): void {
 		if (state.message !== undefined || state.terminalSettled) return;
 		state.message = message;
@@ -2931,6 +2944,7 @@ export class AgentSession {
 	): void {
 		if (state.executionSettled || state.terminalSettled) return;
 		state.executionSettled = true;
+		this.#clearTrackedQueuedInputQueueOwnership(state);
 		state.attemptScope = scope;
 		const owningLogicalRunId =
 			logicalRunId ?? this.#logicalRunIdByAttemptScope.get(scope) ?? this.#activeLogicalRunId;
@@ -2982,6 +2996,7 @@ export class AgentSession {
 		}
 		if (state.terminalSettled) return;
 		state.terminalSettled = true;
+		this.#clearTrackedQueuedInputQueueOwnership(state);
 		state.terminal.resolve({
 			submissionId: state.submission.submissionId,
 			delivery: state.delivery,
@@ -3023,6 +3038,7 @@ export class AgentSession {
 		for (const state of [...states]) {
 			if (state.terminalSettled) continue;
 			state.terminalSettled = true;
+			this.#clearTrackedQueuedInputQueueOwnership(state);
 			state.terminal.resolve({
 				submissionId: state.submission.submissionId,
 				delivery: state.delivery,
@@ -3193,7 +3209,14 @@ export class AgentSession {
 			for (const message of rearmed) {
 				if (this.#sequentialSteerMessages.has(message)) this.#deferredFollowUpForceOneAtATime.add(message);
 			}
-			this.#deferredSdkFollowUps.push(...rearmed);
+			const combined = [...this.#deferredSdkFollowUps, ...rearmed];
+			combined.sort((left, right) => {
+				const leftSequence = this.#queuedAdmissionSeq.get(left);
+				const rightSequence = this.#queuedAdmissionSeq.get(right);
+				if (leftSequence === undefined || rightSequence === undefined) return 0;
+				return leftSequence - rightSequence;
+			});
+			this.#deferredSdkFollowUps = combined;
 			this.#followUpMessages = [...this.#followUpMessages, ...rearmedDisplays];
 		} else {
 			this.agent.restoreFollowUp(rearmed);
@@ -3218,7 +3241,10 @@ export class AgentSession {
 	#markSteeringAsFollowUpPolicy(messages: readonly AgentMessage[]): void {
 		let batch: AgentMessage[] = [];
 		const flushBatch = () => {
-			if (batch.length > 1) this.agent.markFollowUpBatch(batch);
+			if (batch.length > 1) {
+				this.agent.markFollowUpBatch(batch);
+				for (const message of batch) this.#deferredFollowUpBatches.set(message, batch.slice());
+			}
 			batch = [];
 		};
 		for (const message of messages) {
@@ -3295,10 +3321,11 @@ export class AgentSession {
 			}
 		}
 	}
-	#reconcileCompactionSteeringDisplay(snapshot: readonly QueuedDisplayEntry[]): void {
-		const queued = this.agent.snapshotSteering();
+	#reconcileCompactionQueueDisplay(snapshot: readonly QueuedDisplayEntry[], mode: "steering" | "followUp"): void {
+		const queued = mode === "steering" ? this.agent.snapshotSteering() : this.agent.snapshotFollowUp();
+		const displayEntries = mode === "steering" ? this.#steeringMessages : this.#followUpMessages;
 		const currentByMessage = new Map<AgentMessage, QueuedDisplayEntry>();
-		for (const entry of this.#steeringMessages) {
+		for (const entry of displayEntries) {
 			if (entry.message !== undefined && !currentByMessage.has(entry.message)) {
 				currentByMessage.set(entry.message, entry);
 			}
@@ -3324,14 +3351,15 @@ export class AgentSession {
 				return tag === undefined ? [] : [tag];
 			}),
 		);
-		for (const entry of this.#steeringMessages) {
+		for (const entry of displayEntries) {
 			if (entry.message !== undefined || selected.has(entry)) continue;
 			if (entry.tag !== undefined && queuedTags.has(entry.tag)) {
 				selected.add(entry);
 				next.push(entry);
 			}
 		}
-		this.#steeringMessages = next;
+		if (mode === "steering") this.#steeringMessages = next;
+		else this.#followUpMessages = next;
 	}
 	/** Drop queued SDK work when the session identity is replaced. The old
 	 * promotion hooks belong to the predecessor runtime; retaining the message
@@ -4021,10 +4049,7 @@ export class AgentSession {
 	 * is checked by the caller and is intentionally narrower than the general
 	 * successor-hook context.
 	 */
-	#assertExternalSessionIngress(options?: {
-		allowTrackedSuccessor?: boolean;
-		allowCancelAndSubmit?: boolean;
-	}): void {
+	#assertExternalSessionIngress(options?: { allowTrackedSuccessor?: boolean; allowCancelAndSubmit?: boolean }): void {
 		this.#assertSessionAdmissionOpen();
 		if (this.#cancelAndSubmitInProgress && options?.allowCancelAndSubmit !== true) {
 			throw Object.assign(new AgentBusyError("Cannot submit work while cancel-and-submit is in progress."), {
@@ -4139,7 +4164,9 @@ export class AgentSession {
 		}
 		if (this.#sessionTransitionKind !== undefined) {
 			throw Object.assign(
-				new AgentBusyError(`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`),
+				new AgentBusyError(
+					`Cannot start ${kind} while a ${this.#sessionTransitionKind} transition is in progress.`,
+				),
 				{ code: "busy" },
 			);
 		}
@@ -8310,7 +8337,9 @@ export class AgentSession {
 										return false;
 									}
 									if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
-									skip("handoff_in_progress");
+										if (this.agent.hasQueuedMessages() || this.#deferredSdkFollowUps.length > 0)
+											this.#queuedDeliveryPendingWhileTransition = true;
+										skip("handoff_in_progress");
 										return false;
 									}
 									if (options?.shouldContinue && !options.shouldContinue()) {
@@ -9825,6 +9854,7 @@ export class AgentSession {
 	}
 
 	#bindAttemptScopeToActiveRun(scope: AttemptScope): void {
+		this.#activeAttemptScope = scope;
 		if (this.#activeLogicalRunId !== undefined) {
 			this.#logicalRunIdByAttemptScope.set(scope, this.#activeLogicalRunId);
 		}
@@ -14363,7 +14393,7 @@ export class AgentSession {
 					options?.onQueued?.(message);
 				},
 				onQueuedAfterAdmission: options?.onQueuedAfterAdmission,
-					allowDuringSessionTransition: options?.allowDuringSessionTransition,
+				allowDuringSessionTransition: options?.allowDuringSessionTransition,
 				allowCancelAndSubmit: options?.allowCancelAndSubmit,
 			});
 			this.#scheduleNonAdmittedQueuedContinuation();
@@ -14374,6 +14404,7 @@ export class AgentSession {
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
+			this.#queuedAdmissionSeq.set(message, ++this.#queuedAdmissionSequence);
 			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
 		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
@@ -14406,9 +14437,18 @@ export class AgentSession {
 	 * steer) share this helper so their cancellation semantics cannot diverge
 	 * (exact-head review P1).
 	 */
-	#bindPreflightAbortCancellation(signal: AbortSignal | undefined, owner: QueuedFollowUpOwner): void {
+	#bindPreflightAbortCancellation(
+		signal: AbortSignal | undefined,
+		owner: QueuedFollowUpOwner,
+		state?: TrackedQueuedInput,
+	): void {
 		if (!signal) return;
-		const cancelQueued = () => owner.cancel();
+		const cancelQueued = () => {
+			if (state) state.submission.cancel();
+			else owner.cancel();
+		};
+		const removeListener = () => signal.removeEventListener("abort", cancelQueued);
+		if (state) state.removePreflightAbortListener = removeListener;
 		signal.addEventListener("abort", cancelQueued, { once: true });
 		if (signal.aborted) cancelQueued();
 	}
@@ -14500,10 +14540,15 @@ export class AgentSession {
 		const queueWasEmpty = !this.agent.hasQueuedMessages();
 		options?.onQueued?.(message);
 		const displayEntry =
-			options?.createDisplayEntry === false ? undefined : this.#createQueuedDisplayEntry(displayText, undefined, message);
+			options?.createDisplayEntry === false
+				? undefined
+				: this.#createQueuedDisplayEntry(displayText, undefined, message);
 		if (displayEntry) this.#followUpMessages.push(displayEntry);
 		if (options?.trackExternalFollowUp !== false) this.#externalFollowUps.add(message);
 		if (options?.onPromoted) this.#followUpPromotionHooks.set(message, options.onPromoted);
+		if (options?.sdkRunToken || options?.onQueuedAfterAdmission) {
+			this.#queuedAdmissionSeq.set(message, ++this.#queuedAdmissionSequence);
+		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -14521,7 +14566,7 @@ export class AgentSession {
 				let removed = false;
 				if (deferredIndex !== -1) {
 					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
-					this.#deferredFollowUpForceOneAtATime.delete(message);
+					this.#forgetDeferredFollowUpMetadata(message);
 					removed = true;
 				} else {
 					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
@@ -14563,6 +14608,15 @@ export class AgentSession {
 			if (options?.scheduleNonAdmittedWake !== false) this.#scheduleNonAdmittedQueuedContinuation();
 		}
 		return owner;
+	}
+
+	#forgetDeferredFollowUpMetadata(message: AgentMessage): void {
+		this.#deferredFollowUpForceOneAtATime.delete(message);
+		const batch = this.#deferredFollowUpBatches.get(message);
+		if (!batch) return;
+		const remaining = batch.filter(candidate => this.#deferredSdkFollowUps.includes(candidate));
+		for (const member of batch) this.#deferredFollowUpBatches.delete(member);
+		if (remaining.length > 1) for (const member of remaining) this.#deferredFollowUpBatches.set(member, remaining);
 	}
 
 	async #queueFollowUpAfterReservation(
@@ -14607,10 +14661,22 @@ export class AgentSession {
 		// behind still-queued work reproduces the token-less mid-run consumption
 		// hazard, so wait for the queue to drain; the next agent_end retries.
 		if (this.agent.state.isStreaming || this.agent.hasQueuedMessages()) return false;
-		const message = this.#deferredSdkFollowUps.shift();
+		const message = this.#deferredSdkFollowUps[0];
 		if (!message) return false;
-		const forceOneAtATime = this.#deferredFollowUpForceOneAtATime.delete(message);
-		this.agent.followUp(message, forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		const batch = this.#deferredFollowUpBatches.get(message);
+		const released =
+			batch && batch.length > 1 && batch.every((candidate, index) => this.#deferredSdkFollowUps[index] === candidate)
+				? [...batch]
+				: [message];
+		const forceOneAtATime = this.#deferredFollowUpForceOneAtATime.has(message);
+		this.#deferredSdkFollowUps.splice(0, released.length);
+		for (const candidate of released) this.#forgetDeferredFollowUpMetadata(candidate);
+		if (released.length > 1) {
+			this.agent.markFollowUpBatch(released);
+			this.agent.restoreFollowUp(released);
+		} else {
+			this.agent.followUp(message, forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		}
 		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
 			this.#queuedDeliveryPendingWhileTransition = true;
 			return true;
@@ -15185,13 +15251,22 @@ export class AgentSession {
 	purgeQueuedCustomMessages(predicate: (message: CustomMessage) => boolean): PurgeQueuedCustomMessagesResult {
 		const isMatch = (m: AgentMessage): boolean => m.role === "custom" && predicate(m as CustomMessage);
 		const removedTags = new Set<string>();
-		for (const m of [...this.agent.snapshotSteering(), ...this.agent.snapshotFollowUp()]) {
+		const steeringBefore = this.agent.snapshotSteering();
+		const followUpBefore = this.agent.snapshotFollowUp();
+		const deferredBefore = [...this.#deferredSdkFollowUps];
+		for (const m of [...steeringBefore, ...followUpBefore, ...deferredBefore]) {
 			if (isMatch(m)) {
 				const tag = readPendingDisplayTag((m as CustomMessage).details);
 				if (tag) removedTags.add(tag);
 			}
 		}
 		const agentRemoved = this.agent.removeQueuedMessages(isMatch);
+		const removedAgentMessages = [...steeringBefore, ...followUpBefore].filter(isMatch);
+		const removedDeferred = deferredBefore.filter(isMatch);
+		if (removedDeferred.length > 0) {
+			this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(message => !isMatch(message));
+			for (const message of removedDeferred) this.#forgetDeferredFollowUpMetadata(message);
+		}
 		const beforeNext = this.#pendingNextTurnMessages.length;
 		for (const entry of this.#pendingNextTurnMessages) {
 			if (predicate(entry.message)) {
@@ -15201,6 +15276,7 @@ export class AgentSession {
 		}
 		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(entry => !predicate(entry.message));
 		const pendingNextTurn = beforeNext - this.#pendingNextTurnMessages.length;
+		this.#fireQueuedRemovalHooks([...removedAgentMessages, ...removedDeferred]);
 		let displaySteering = 0;
 		let displayFollowUp = 0;
 		if (removedTags.size > 0) {
@@ -15211,7 +15287,7 @@ export class AgentSession {
 			this.#followUpMessages = this.#followUpMessages.filter(e => !(e.tag && removedTags.has(e.tag)));
 			displayFollowUp = beforeF - this.#followUpMessages.length;
 		}
-		if (agentRemoved.total > 0) this.#releaseDeferredSdkFollowUps();
+		if (agentRemoved.total > 0 || removedDeferred.length > 0) this.#releaseDeferredSdkFollowUps();
 		return {
 			agentSteering: agentRemoved.steering,
 			agentFollowUp: agentRemoved.followUp,
@@ -15421,24 +15497,19 @@ export class AgentSession {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				if (options?.trackSubmission === true) {
-					trackedQueuedInput = this.#createTrackedQueuedInput(
-						deliverAs,
-						options.queuePolicy ?? "respect-mode",
-					);
+					trackedQueuedInput = this.#createTrackedQueuedInput(deliverAs, options.queuePolicy ?? "respect-mode");
 					onTrackedQueued = (message: AgentMessage, cancelQueued: () => boolean) =>
 						this.#admitTrackedQueuedInput(trackedQueuedInput!, message, cancelQueued);
 				}
 				const queuedFollowUp = await this.#queueFollowUp(text, images, {
 					claimsGenuineUserIntent: true,
-					forceOneAtATime: Boolean(
-						options?.preflightSignal || options?.queuedAtDispatch || options?.queuePolicy === "sequential",
-					),
+					forceOneAtATime: Boolean(options?.queuedAtDispatch || options?.queuePolicy === "sequential"),
 					onPromoted: onQueuedPromoted,
 					sdkRunToken: internalOptions?.sdkRunToken,
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),
 				});
-				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp);
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedFollowUp, trackedQueuedInput);
 				try {
 					assertPreflightStillOpen();
 					options?.onPreflightAccepted?.();
@@ -15454,10 +15525,7 @@ export class AgentSession {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				if (options?.trackSubmission === true) {
-					trackedQueuedInput = this.#createTrackedQueuedInput(
-						deliverAs,
-						options.queuePolicy ?? "respect-mode",
-					);
+					trackedQueuedInput = this.#createTrackedQueuedInput(deliverAs, options.queuePolicy ?? "respect-mode");
 					onTrackedQueued = (message: AgentMessage, cancelQueued: () => boolean) =>
 						this.#admitTrackedQueuedInput(trackedQueuedInput!, message, cancelQueued);
 				}
@@ -15474,7 +15542,7 @@ export class AgentSession {
 				// aborted invocation must cancel the exact submission it admitted:
 				// otherwise the steer stays executable after its caller gave up
 				// (exact-head review P1).
-				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer);
+				this.#bindPreflightAbortCancellation(options?.preflightSignal, queuedSteer, trackedQueuedInput);
 				try {
 					assertPreflightStillOpen();
 					options?.onPreflightAccepted?.();
@@ -15672,7 +15740,7 @@ export class AgentSession {
 			const deferredIndex = this.#deferredSdkFollowUps.indexOf(removedMessage);
 			if (deferredIndex !== -1) {
 				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
-				this.#deferredFollowUpForceOneAtATime.delete(removedMessage);
+				this.#forgetDeferredFollowUpMetadata(removedMessage);
 			} else {
 				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
 			}
@@ -16809,7 +16877,8 @@ export class AgentSession {
 				const revalidateSelected = (): void => {
 					if (selected === undefined || selected.message === undefined) return;
 					const stillDisplayed =
-						this.#steeringMessages.includes(selected.display) || this.#followUpMessages.includes(selected.display);
+						this.#steeringMessages.includes(selected.display) ||
+						this.#followUpMessages.includes(selected.display);
 					// An abort temporarily removes steering from Agent's live queue and
 					// returns it in the agent_end disowned batch; the display mirror is the
 					// stable ownership marker across that boundary. A successful external
@@ -16851,11 +16920,15 @@ export class AgentSession {
 					];
 					this.#steeringMessages = [
 						...steeringDisplaySnapshot.filter(entry => entry !== cancelledDisplay),
-						...additionsSince(this.#steeringMessages, displayBaseline).filter(entry => entry !== cancelledDisplay),
+						...additionsSince(this.#steeringMessages, displayBaseline).filter(
+							entry => entry !== cancelledDisplay,
+						),
 					];
 					this.#followUpMessages = [
 						...followUpDisplaySnapshot.filter(entry => entry !== cancelledDisplay),
-						...additionsSince(this.#followUpMessages, displayBaseline).filter(entry => entry !== cancelledDisplay),
+						...additionsSince(this.#followUpMessages, displayBaseline).filter(
+							entry => entry !== cancelledDisplay,
+						),
 					];
 				};
 				try {
@@ -16927,9 +17000,9 @@ export class AgentSession {
 						followUp: committedSelection
 							? queuedDuringWindow.followUp.filter(message => message !== selectedMessage)
 							: [
-								...queueSnapshot.followUp.filter(message => message !== cancelledMessage),
-								...queuedDuringWindow.followUp.filter(message => message !== cancelledMessage),
-							],
+									...queueSnapshot.followUp.filter(message => message !== cancelledMessage),
+									...queuedDuringWindow.followUp.filter(message => message !== cancelledMessage),
+								],
 					});
 					this.#steeringMessages = steeringDisplaysDuringWindow;
 					// With a selected entry the held (unselected) messages are re-queued
@@ -16951,7 +17024,8 @@ export class AgentSession {
 						);
 					}
 					if (selectedMessage !== undefined && selectedPromotionHook !== undefined) {
-						if (committedSelection?.mode === "steer") this.#steerPromotionHooks.set(selectedMessage, selectedPromotionHook);
+						if (committedSelection?.mode === "steer")
+							this.#steerPromotionHooks.set(selectedMessage, selectedPromotionHook);
 						else this.#followUpPromotionHooks.set(selectedMessage, selectedPromotionHook);
 					}
 					const message = selectedMessage ?? {
@@ -17396,9 +17470,6 @@ export class AgentSession {
 		// it with handoff and the other transitions via the shared lease.
 		this.#beginSessionTransition("fork");
 		try {
-			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
-			this.#disconnectFromAgent();
-			await this.#settleActivePromptForHistoryTransition();
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
@@ -17425,6 +17496,10 @@ export class AgentSession {
 					return false;
 				}
 			}
+
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
 
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
@@ -19536,6 +19611,13 @@ export class AgentSession {
 			this.#compactionAbortController = compactionAbortController;
 			const steeringBeforeCompaction = this.agent.snapshotSteering();
 			const steeringDisplaysBeforeCompaction = [...this.#steeringMessages];
+			const followUpBeforeCompaction = this.agent.snapshotFollowUp();
+			const followUpDisplaysBeforeCompaction = [...this.#followUpMessages];
+			const trackedFollowUpsBeforeCompaction = new Map(
+				[...this.#trackedQueuedInputs.values()]
+					.filter(state => state.message !== undefined && followUpBeforeCompaction.includes(state.message))
+					.map(state => [state.message as AgentMessage, state] as const),
+			);
 			// Compaction intentionally preserves still-queued inputs, but it drops the
 			// Agent event bridge before aborting the active run. Settle submissions that
 			// already crossed the queue boundary now; they cannot receive agent_end later.
@@ -19548,7 +19630,21 @@ export class AgentSession {
 					const steeringAfterAbort = new Set(this.agent.snapshotSteering());
 					const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
 					if (missingSteering.length > 0) this.agent.restoreSteering(missingSteering);
-					this.#reconcileCompactionSteeringDisplay(steeringDisplaysBeforeCompaction);
+					this.#reconcileCompactionQueueDisplay(steeringDisplaysBeforeCompaction, "steering");
+					const followUpAfterAbort = new Set(this.agent.snapshotFollowUp());
+					const missingFollowUp = followUpBeforeCompaction.filter(message => !followUpAfterAbort.has(message));
+					const restorableFollowUp: AgentMessage[] = [];
+					for (const message of missingFollowUp) {
+						const trackedState = trackedFollowUpsBeforeCompaction.get(message);
+						if (trackedState) {
+							const state = trackedState;
+							if (state && !state.terminalSettled) this.#settleTrackedQueuedInputRemoved(state, "removed");
+							continue;
+						}
+						restorableFollowUp.push(message);
+					}
+					if (restorableFollowUp.length > 0) this.agent.restoreFollowUp(restorableFollowUp);
+					this.#reconcileCompactionQueueDisplay(followUpDisplaysBeforeCompaction, "followUp");
 					// The disconnected bridge cannot run finishAttempt for the aborted
 					// predecessor. Do not let its SDK token or attempt identity bleed into
 					// the first ordinary successor prompt.
@@ -26007,9 +26103,6 @@ export class AgentSession {
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 				throw new Error("Invalid entry ID for branching");
 			}
-			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
-			this.#disconnectFromAgent();
-			await this.#settleActivePromptForHistoryTransition();
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
@@ -26034,6 +26127,10 @@ export class AgentSession {
 				}
 				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
+
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
 
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
@@ -26150,10 +26247,6 @@ export class AgentSession {
 			if (!targetEntry) {
 				throw new Error(`Entry ${targetId} not found`);
 			}
-			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
-			this.#disconnectFromAgent();
-			await this.#settleActivePromptForHistoryTransition();
-
 			// Collect entries to summarize (from old leaf to common ancestor).
 			const { entries: collectedEntriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
 				this.sessionManager,
@@ -26193,6 +26286,10 @@ export class AgentSession {
 					fromExtension = true;
 				}
 			}
+
+			this.#settleTrackedQueuedInputsBeforeAgentDisconnect();
+			this.#disconnectFromAgent();
+			await this.#settleActivePromptForHistoryTransition();
 
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
