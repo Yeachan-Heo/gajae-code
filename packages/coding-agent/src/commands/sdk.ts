@@ -46,7 +46,7 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
+import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
@@ -1123,10 +1123,10 @@ export default class Sdk extends Command {
 			const scan = scanPublicCommand("sdk", this.argv);
 			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 			const { args, flags } = scan;
-			const action = scan.descriptor.command[1];
+			const operation = scan.descriptor.command[1];
 			const stringFlag = (name: string): string | undefined => flags[name] as string | undefined;
 			const timeoutMs = flags["timeout-ms"] === undefined ? undefined : Number(flags["timeout-ms"]);
-			if (action === "spawn") {
+			if (operation === "spawn") {
 				const spawn = await runSdkSpawn({
 					cwd: stringFlag("cwd"),
 					prompt: stringFlag("prompt"),
@@ -1138,7 +1138,7 @@ export default class Sdk extends Command {
 				process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
 				return;
 			}
-			if (action === "search") {
+			if (operation === "search") {
 				const search = await runSdkSearch({
 					agentDir: stringFlag("agent-dir"),
 					repo: stringFlag("repo"),
@@ -1151,7 +1151,7 @@ export default class Sdk extends Command {
 				);
 				return;
 			}
-			if (action === "session") {
+			if (operation === "session") {
 				await runSdkSessionCli({
 					action: scan.descriptor.command[2],
 					rawAction: scan.descriptor.command[3],
@@ -1180,7 +1180,7 @@ export default class Sdk extends Command {
 				});
 				return;
 			}
-			if (action === "guides") {
+			if (operation === "guides") {
 				await runSdkGuidesCli({
 					action: scan.descriptor.command[2],
 					guideId: args.guideId as string | undefined,
@@ -1190,8 +1190,28 @@ export default class Sdk extends Command {
 				});
 				return;
 			}
-			if (action === "serve") {
-				await runSdkServe(scan.operationArgv.slice(1));
+			if (operation === "serve") {
+				try {
+					await runSdkServe(scan.operationArgv.slice(1));
+				} catch (error) {
+					if (!(error instanceof SdkServeError)) throw error;
+					// A command invoked outside the public family dispatcher still owns its
+					// stderr envelope. The dispatcher itself keeps the typed failure for the
+					// shared JSON/text boundary so it can render the full contract.
+					if (this.config?.commands instanceof Map && this.config.commands.has("sdk")) throw error;
+					process.stderr.write(
+						`${JSON.stringify({
+							ok: false,
+							error: {
+								code: error.code,
+								message: error.message,
+								...(error.details === undefined ? {} : { details: error.details }),
+								...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
+							},
+						})}\n`,
+					);
+					process.exitCode = error.exitCode;
+				}
 				return;
 			}
 			throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
