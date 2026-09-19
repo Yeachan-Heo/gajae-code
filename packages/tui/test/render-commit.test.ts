@@ -439,36 +439,39 @@ describe("generation-scoped render commits", () => {
 			erase: { type: "raster-erase", bytes: new TextEncoder().encode("COALESCED_ERASE") },
 		});
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
-		const ingressGate = Promise.withResolvers<void>();
-		const ingressStarted = Promise.withResolvers<void>();
+		const flushGate = Promise.withResolvers<void>();
+		const flushStarted = Promise.withResolvers<void>();
+		terminal.flush = async () => {
+			flushStarted.resolve();
+			await flushGate.promise;
+			return true;
+		};
 		const held = tui.submitTerminalOutput({
 			token: lease.token,
 			operation: {
 				type: "raster-multipart-batch",
 				prefix: new TextEncoder().encode("COALESCED_PREFIX"),
-				afterPrefix: async () => {
-					ingressStarted.resolve();
-					await ingressGate.promise;
-					return true;
-				},
+				afterPrefix: async () => true,
 				records: [new TextEncoder().encode("COALESCED_RASTER")],
 				abortSuffix: new TextEncoder().encode("COALESCED_ABORT"),
 			},
 		});
 		try {
-			await ingressStarted.promise;
+			await flushStarted.promise;
 			text.setText("COALESCED_FINAL_FRAME");
 			const first = tui.requestRenderWithGeneration(true, "test.coalesced-force.first");
 			const second = tui.requestRenderWithGeneration(true, "test.coalesced-force.second");
 			const firstCommit = tui.waitForRenderCommit(first);
 			const secondCommit = tui.waitForRenderCommit(second);
-			await new Promise<void>(resolve => process.nextTick(resolve));
-			ingressGate.resolve();
+			const renderQueued = Promise.withResolvers<void>();
+			process.nextTick(renderQueued.resolve);
+			await renderQueued.promise;
+			flushGate.resolve();
 			expect((await held).status).toBe("written");
 			expect(await Promise.all([firstCommit, secondCommit])).toEqual([true, true]);
 			expect(terminal.getWriteLog().join("")).toContain("FINAL_FRAME");
 		} finally {
-			ingressGate.resolve();
+			flushGate.resolve();
 			await held;
 			tui.stop();
 		}

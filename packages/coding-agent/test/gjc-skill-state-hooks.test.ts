@@ -2012,6 +2012,43 @@ disabledExtensions:
 		expect(entry?.handoff_from).toBe("deep-interview");
 	});
 
+	it("persists an explicit empty active-subskill list", async () => {
+		const root = await cwd();
+		const sessionId = "session-clear-subskills";
+		const activeSubskills = [
+			{
+				plugin: "gjc",
+				subskillName: "ralplan",
+				parent: "deep-interview",
+				bindsTo: "session",
+				phase: "planner",
+				activationArg: "",
+			},
+		];
+
+		await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+			activeSubskills,
+		});
+		const cleared = await ensureWorkflowSkillActivationSeed({
+			cwd: root,
+			skill: "deep-interview",
+			sessionId,
+			activeSubskills: [],
+		});
+
+		expect(cleared.seeded).toBe(true);
+		expect(cleared.state?.active_skills?.find(entry => entry.skill === "deep-interview")?.active_subskills).toEqual(
+			[],
+		);
+		expect(
+			(await readActiveEntries(root, { sessionId })).find(entry => entry.skill === "deep-interview")
+				?.active_subskills,
+		).toEqual([]);
+	});
+
 	it("activation rollback preserves successor mode, entry, and rebuilt snapshot state", async () => {
 		const root = await cwd();
 		const sessionId = "session-seed-owned";

@@ -1672,6 +1672,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 	it("blocks tool execution when beforeToolCall returns block", async () => {
 		const toolSchema = z.object({ value: z.string() });
 		const executed: string[] = [];
+		let afterCalls = 0;
 		const tool: AgentTool<typeof toolSchema, { value: string }> = {
 			name: "echo",
 			label: "Echo",
@@ -1698,6 +1699,9 @@ describe("agentLoopContinue with AgentMessage", () => {
 			model: mock.model,
 			convertToLlm: identityConverter,
 			beforeToolCall: async () => ({ block: true, reason: "policy: blocked" }),
+			afterToolCall: async () => {
+				afterCalls++;
+			},
 		};
 
 		const events: AgentEvent[] = [];
@@ -1707,6 +1711,7 @@ describe("agentLoopContinue with AgentMessage", () => {
 		}
 
 		expect(executed).toEqual([]);
+		expect(afterCalls).toBe(0);
 		const toolEnd = events.find(e => e.type === "tool_execution_end");
 		expect(toolEnd).toBeDefined();
 		if (toolEnd?.type === "tool_execution_end") {
