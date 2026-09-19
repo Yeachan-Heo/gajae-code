@@ -22,6 +22,20 @@ class SessionBackedTool implements Tool {
 }
 
 describe("Cursor usage-context tool identity", () => {
+	it("hashes projected schemas containing bigint values deterministically", () => {
+		const tool = {
+			name: "ast_grep",
+			description: "Search code with AST patterns",
+			parameters: {
+				type: "object",
+				properties: { fileIdentity: { type: "integer", default: 16_777_234n } },
+			},
+		} as unknown as Tool;
+
+		expect(() => buildCursorUsageToolsKeyForTest([tool])).not.toThrow();
+		expect(buildCursorUsageToolsKeyForTest([tool])).toBe(buildCursorUsageToolsKeyForTest([tool]));
+	});
+
 	it("hashes the wire tool definition without traversing session-backed runtime state", () => {
 		const sessionBackedTool = new SessionBackedTool({
 			fileIdentity: {

@@ -4235,6 +4235,16 @@ export function cursorJsonSafeValueForTest(value: unknown): unknown {
 	return cursorJsonSafeValue(value);
 }
 
+/** Serialize a Cursor payload after normalizing values that JSON cannot encode. */
+function cursorJsonSafeStringify(value: unknown): string {
+	return JSON.stringify(cursorJsonSafeValue(value)) ?? "";
+}
+
+/** Exported for direct regression coverage of the Cursor serialization boundary. */
+export function cursorJsonSafeStringifyForTest(value: unknown): string {
+	return cursorJsonSafeStringify(value);
+}
+
 function selectMcpToolCall(toolCall: any): any {
 	return toolCall?.tool?.case === "mcpToolCall" ? toolCall.tool.value : toolCall?.mcpToolCall;
 }
@@ -4610,7 +4620,7 @@ function buildCursorWireToolIdentities(tools: Tool[] | undefined): CursorWireToo
 	return tools
 		.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name))
 		.map(tool => {
-			const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
+			const jsonSchema = cursorJsonSafeValue(flattenToolRootCombinators(toolWireSchema(tool)));
 			return {
 				name: tool.name,
 				description: tool.description || "",
@@ -4763,12 +4773,12 @@ export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | u
 	const systemPrompts = normalizeSystemPrompts(systemPrompt);
 	const jsons =
 		systemPrompts.length === 0
-			? [JSON.stringify({ role: "system", content: "You are a helpful assistant." })]
-			: systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+			? [cursorJsonSafeStringify({ role: "system", content: "You are a helpful assistant." })]
+			: systemPrompts.map(content => cursorJsonSafeStringify({ role: "system", content }));
 	// Composer-harness models need anchor/edit discipline pinned ahead of any
 	// host/default prompt (see composer-discipline.ts for the observed failure modes).
 	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
-		jsons.unshift(JSON.stringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+		jsons.unshift(cursorJsonSafeStringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
 	}
 	return jsons;
 }
@@ -4782,7 +4792,7 @@ function buildRootPromptMessagesJson(
 	const lastUserIdx = findLastUserMessageIndex(messages);
 
 	const pushJson = (obj: unknown) => {
-		const bytes = new TextEncoder().encode(JSON.stringify(obj));
+		const bytes = new TextEncoder().encode(cursorJsonSafeStringify(obj));
 		entries.push(storeCursorBlob(blobStore, bytes));
 	};
 
@@ -4999,7 +5009,7 @@ function hashCursorConversationMessage(message: { role: string; content: unknown
 
 function hashCursorConversationValue(value: unknown): string {
 	return createHash("sha256")
-		.update(JSON.stringify(value) ?? "")
+		.update(cursorJsonSafeStringify(value))
 		.digest("hex");
 }
 
