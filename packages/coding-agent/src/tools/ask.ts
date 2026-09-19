@@ -926,7 +926,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			cwd: this.session.cwd,
 			sessionId,
 			questionId: q.id,
-			gateId: executionGateId ?? q.id,
+			gateId: executionGateId ?? `interactive-${randomUUID()}`,
 			toolCallId,
 			target,
 			selectedOptions,
@@ -1283,14 +1283,15 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				details: {},
 			};
 		}
-		if (
-			params.questions.filter(
-				question =>
-					(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
-					(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
-			).length > 1
-		)
+		const executionAuthorizingQuestions = params.questions.filter(
+			question =>
+				(question.workflowGate?.stage === "deep-interview" && question.workflowGate.kind === "execution") ||
+				(question.workflowGate?.stage === "ralplan" && question.workflowGate.kind === "approval"),
+		);
+		if (executionAuthorizingQuestions.length > 1)
 			throw new ToolError("Ask accepts at most one execution-authorizing workflow gate per invocation");
+		if (executionAuthorizingQuestions.length === 1 && params.questions.length !== 1)
+			throw new ToolError("Execution-authorizing workflow gates must be the only Ask question in an invocation");
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],

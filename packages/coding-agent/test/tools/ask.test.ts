@@ -3105,7 +3105,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(record).not.toHaveBeenCalled();
 	});
 
-	it("does not mint execution approval after a multi-question choice is revised", async () => {
+	it("rejects an execution gate mixed with another Ask question", async () => {
 		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
 			state_path: "/tmp/revised-state.json",
 			state_revision: 1,
@@ -3135,25 +3135,25 @@ describe("AskTool deep-interview recorder persistence", () => {
 				return "Done";
 			},
 		});
-		await new AskTool(
-			createSession({ cwd: "/tmp/approval-revised", getSessionId: () => "approval-revised" }),
-		).execute(
-			"revised-execution-choice",
-			{
-				questions: [
-					{
-						id: "deep-interview-execution-revised",
-						question: "Choose the execution path",
-						options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
-						workflowGate: { stage: "deep-interview", kind: "execution" },
-					},
-					{ id: "confirmation", question: "Confirm?", options: [{ label: "Done" }] },
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
+		await expect(
+			new AskTool(createSession({ cwd: "/tmp/approval-revised", getSessionId: () => "approval-revised" })).execute(
+				"revised-execution-choice",
+				{
+					questions: [
+						{
+							id: "deep-interview-execution-revised",
+							question: "Choose the execution path",
+							options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+							workflowGate: { stage: "deep-interview", kind: "execution" },
+						},
+						{ id: "confirmation", question: "Confirm?", options: [{ label: "Done" }] },
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("must be the only Ask question");
 		expect(record).not.toHaveBeenCalled();
 	});
 
