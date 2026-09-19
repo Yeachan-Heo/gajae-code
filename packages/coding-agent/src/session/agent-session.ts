@@ -16887,13 +16887,19 @@ export class AgentSession {
 		identity: string | undefined,
 		activeIndex: number,
 		skips: Array<{ selector: string; reason: string }>,
+		options?: { emitResolutionEvent?: boolean },
 	): void {
 		this.#defaultFallbackController = new FallbackChainController(
 			{ role: "default", entries: [...entries], origin: "runtime", identity, explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
 		this.#defaultFallbackExhaustedLastTurn = false;
-		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackController, activeIndex, skips);
+		this.#seedDefaultFallbackResolutionForController(
+			this.#defaultFallbackController,
+			activeIndex,
+			skips,
+			options?.emitResolutionEvent ?? true,
+		);
 	}
 
 	markStartupRecoveryBindingsRequired(): void {
@@ -16917,9 +16923,10 @@ export class AgentSession {
 		controller: FallbackChainController,
 		activeIndex: number,
 		skips: Array<{ selector: string; reason: string }>,
+		emitResolutionEvent = true,
 	): void {
 		controller.seedResolution(activeIndex, skips);
-		this.#emitResolutionFallbackSwitch(controller);
+		if (emitResolutionEvent) this.#emitResolutionFallbackSwitch(controller);
 	}
 
 	getDefaultFallbackRuntimeState(): DefaultFallbackRuntimeState {
@@ -24411,7 +24418,19 @@ export class AgentSession {
 									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 								});
 								if (recovery?.model) {
-									if (switchingToDifferentSession) {
+									const installedProfileKeys =
+										this.#activeProfileInstalledRoles.size > 0 ||
+										this.#activeProfileInstalledAgentOverrides.size > 0;
+									const recoveryNeedsBindings =
+										switchingToDifferentSession ||
+										targetActiveModelProfile !== recovery.profileName ||
+										!installedProfileKeys;
+									if (recoveryNeedsBindings) {
+										if (!switchingToDifferentSession)
+											this.#resetSessionScopedModelProfileState({
+												preserveDefaultConfiguredChain: true,
+												force: true,
+											});
 										await applyModelProfileRuntimeBindings({
 											session: this,
 											modelRegistry: this.#modelRegistry,
@@ -24426,6 +24445,7 @@ export class AgentSession {
 										recovery.profileName,
 										recovery.activeIndex,
 										recovery.skips,
+										{ emitResolutionEvent: false },
 									);
 									controller = this.#defaultFallbackChain(false);
 									resolvedModel = recovery.model;
@@ -24460,7 +24480,6 @@ export class AgentSession {
 					// would append a stray thinking_level_change entry that flips
 					// hasThinkingEntry and changes what the recompute restores.
 				}
-
 				// The saved chain may need its profile identity for alias resolution, but
 				// a cross-file transition must not advertise that profile after its
 				// runtime role layer was removed. Otherwise delegation prompt state and
@@ -24474,12 +24493,17 @@ export class AgentSession {
 					.getBranch()
 					.some(entry => entry.type === "service_tier_change");
 				const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
+				const hasExplicitDefaultThinkingLevel = this.settings.has("defaultThinkingLevel");
 				const configuredServiceTier = this.settings.get("serviceTier");
 				const sessionThinkingLevel = sessionContext.thinkingLevel as ThinkingLevel | undefined;
+				const recoveredModelThinkingLevel =
+					recoveredDefaultChainMessage && !hasExplicitDefaultThinkingLevel
+						? this.model?.thinking?.defaultLevel
+						: undefined;
 				const persistedThinkingLevel =
 					hasThinkingEntry && sessionThinkingLevel !== ThinkingLevel.Inherit
 						? sessionThinkingLevel
-						: (recoveredThinkingLevel ?? defaultThinkingLevel);
+						: (recoveredThinkingLevel ?? recoveredModelThinkingLevel ?? defaultThinkingLevel);
 				const nextThinkingLevel = resolveThinkingLevelForModel(
 					this.model,
 					persistedThinkingLevel === ThinkingLevel.Inherit
@@ -24587,6 +24611,7 @@ export class AgentSession {
 					...previousDeferredSdkFollowUps,
 				]);
 				this.#deferredSdkFollowUps = [];
+				if (recoveredDefaultChainMessage) this.#emitResolutionFallbackSwitch(this.#defaultFallbackChain(false));
 				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
 				return true;
 			} catch (error) {

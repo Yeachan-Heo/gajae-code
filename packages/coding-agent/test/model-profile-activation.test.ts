@@ -440,6 +440,65 @@ describe("model profile activation", () => {
 		).rejects.toThrow(/executor selectors do not match any catalog model/);
 	});
 
+	test("durable default recovery rejects unknown required providers before credential probing", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unknown-recovery-provider",
+			requiredProviders: ["future-provider"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async () => "key-provider-a");
+		const registry = {
+			...baseRegistry,
+			getConfiguredProviderIds: () => ["provider-a"],
+			isKnownProvider: (provider: string) => provider === "provider-a",
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery accepts a credentialless OpenCodex proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credentialless-opencodex-recovery",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "registry",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const proxyModel = model("opencodex", "provider-a/default");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), proxyModel],
+			getAvailable: () => [proxyModel],
+			getAvailableForProfileActivation: () => [proxyModel],
+			getConfiguredProviderIds: () => [],
+			isKnownProvider: (provider: string) => provider === "provider-a" || provider === "opencodex",
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : "key-provider-a"),
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated({
+				"modelProfile.proxyProvider": "opencodex",
+				"modelProfile.proxyMode": "always",
+			}),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.model).toMatchObject({ provider: "opencodex", id: "provider-a/default" });
+	});
+
 	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "optional-mapped-provider",

@@ -733,6 +733,25 @@ export async function resolveModelProfileDefaultChain(options: {
 	const requiredProviderSet = new Set(requiredProviders);
 	const authenticatedProviders = new Set<string>();
 	const missingProviders: string[] = [];
+	const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
+	if (configuredProviderIds !== undefined || options.modelRegistry.isKnownProvider !== undefined) {
+		const isProviderKnown = (provider: string): boolean =>
+			(options.modelRegistry.isKnownProvider?.(provider) ?? false) ||
+			isKnownProvider(provider) ||
+			configuredProviderIds?.includes(provider) === true;
+		const unknownProviderIds = new Set<string>();
+		for (const provider of requiredProviders) {
+			if (!alternativeSet.has(provider) && !isProviderKnown(provider)) unknownProviderIds.add(provider);
+		}
+		for (const group of alternativeGroups) {
+			if (group.some(isProviderKnown)) continue;
+			for (const provider of group) {
+				if (!isProviderKnown(provider)) unknownProviderIds.add(provider);
+			}
+		}
+		const unknownProviders = [...unknownProviderIds].sort();
+		if (unknownProviders.length > 0) throw new ModelProfileUnknownProviderError(profileLabel, unknownProviders);
+	}
 	for (const provider of new Set([
 		...requiredProviders,
 		...alternativeSet,
@@ -762,15 +781,18 @@ export async function resolveModelProfileDefaultChain(options: {
 				: PROXY_ROUTABLE_PROVIDER_IDS;
 	if (proxyMode === "always" && proxyProvider === undefined)
 		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
-	if (proxyProvider !== undefined && !options.modelRegistry.getConfiguredProviderIds?.().includes(proxyProvider)) {
-		throw new Error(
-			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
-		);
-	}
 	const proxyApiKey =
 		proxyProvider === undefined
 			? undefined
 			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+	if (
+		proxyProvider !== undefined &&
+		!isModelProfileProxyConfigured(proxyProvider, configuredProviderIds, proxyApiKey === kNoAuth)
+	) {
+		throw new Error(
+			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+		);
+	}
 	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
 	if (proxyMode === "always" && !proxyAuthenticated)
 		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);

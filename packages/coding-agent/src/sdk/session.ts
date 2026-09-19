@@ -3804,6 +3804,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 				modelFallbackMessage = undefined;
 			} else if (deferredMissingSessionRecovery) {
+				const hadProvisionalRecovery = recoveredSessionDefault !== undefined;
+				let lateRecoveryAccepted = false;
 				try {
 					const recovery = await resolveMissingSessionModelRecovery({
 						modelRegistry,
@@ -3837,9 +3839,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						startupActiveModelProfile = undefined;
 						modelFallbackMessage =
 							"Saved session model is no longer registered; restored the durable default preset instead.";
+						lateRecoveryAccepted = true;
 					}
 				} catch (error) {
 					if (!(error instanceof ModelProfileCredentialError)) throw error;
+				}
+				// A completed extension catalog can make the saved selector registered
+				// again without making it callable. Do not retain the provisional durable
+				// fallback in that case: the saved model remains authoritative for the
+				// normal unavailable-model path below.
+				if (!lateRecoveryAccepted && hadProvisionalRecovery) {
+					model = undefined;
+					recoveredSessionDefault = undefined;
+					startupActiveModelProfile = undefined;
+					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 				}
 			}
 		}
