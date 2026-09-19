@@ -19,10 +19,10 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { isCurrentWorkflowGateContinuation } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
-import { isCurrentWorkflowGateContinuation } from "../src/session/agent-session";
 import { getSkillActiveStatePaths, syncSkillActiveState } from "../src/skill-state/active-state";
 import { registerWorkflowGateEmitterListener } from "../src/tools/ask-answer-registry";
 
