@@ -366,7 +366,10 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:login": "auth.login",
 	"slash_command:clear": "context.clear",
 	"slash_command:new": "session.new",
-	"slash_command:fork": "session.fork",
+	// `/fork` opens the user-prompt selector, which commits via
+	// `session.branch(entryId)` (selector-controller.ts). Despite the command and
+	// keybinding name, it is NOT the exact-state `session.fork` operation.
+	"slash_command:fork": "session.branch",
 	"slash_command:compact": "compaction.run",
 	"slash_command:handoff": "session.handoff",
 	"slash_command:resume": "session.resume",
