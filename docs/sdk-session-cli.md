@@ -154,17 +154,26 @@ transcript entries.
   specific prompt operation, `status <sessionId> <opRef>` remains the lossless
   authority.
 - `--all-events` widens the emitted set to every event-ring kind.
-- `--cursor` resumes from a saved signed checkpoint claim. `session.checkpoint`
-  verifies the unexpired claim and exchanges it for a fresh connection-owned
-  cursor pinned to the exact prior revision; direct cross-connection cursor
-  consumption remains rejected, so reconnect never echoes or rewinds a cursor.
+- `--cursor <cursor> --after-transcript-id <id>` resumes from a saved signed
+  checkpoint claim. The companion transcript id is required so a caller cannot
+  accidentally replay the entire retained transcript; rows through that id are
+  omitted (an unknown id keeps the bounded history because a duplicate is
+  recoverable while a missing row is not). `session.checkpoint` verifies the
+  unexpired signed claim and exchanges it for a fresh connection-owned cursor
+  pinned to the exact prior revision, so the claim is safe to pass to a new CLI
+  invocation even though direct cross-connection continuation-cursor consumption
+  remains rejected.
 - `--timeout-ms` bounds live follow; a session whose lifecycle already ended
   (terminal or `terminalUncertain`) replays retained history and exits instead
-  of hanging.
+  of hanging. A live wait that reaches this bound returns the observations
+  collected so far with `terminal: false` and exits `0`; it is not the same as
+  `send --wait`, whose `wait_timeout` remains an operational failure.
 
 A deleted session has no tail (`session_deleted`). A stopped session replays
 its retained transcript without an endpoint (offline source), bounded to the
-most recent retained entries.
+most recent retained entries. If `--after-transcript-id` names a row older than
+that bounded window, the command fails closed with `retention_gap` instead of
+silently omitting unprocessed rows.
 
 ### retire
 
@@ -285,9 +294,11 @@ direct discovery-file reads, and output is versioned and credential-free.
 
 Verbs exit `0` on success and write JSON to stdout. Failures write a JSON error
 envelope to stdout with a non-zero exit: usage errors exit `2`, operational
-failures (broker unavailable, session unavailable, retention gap, wait
-timeout) exit `1`. Error details are recursively redacted of secret-shaped
-fields before rendering.
+failures (broker unavailable, session unavailable, retention gap, and
+`send --wait` timeout) exit `1`. A live `session tail` wait window is a bounded
+observation rather than an operational failure: it exits `0` with
+`terminal: false` and all items observed before the deadline. Error details are
+recursively redacted of secret-shaped fields before rendering.
 
 ## Scoped search (`gjc sdk search`)
 

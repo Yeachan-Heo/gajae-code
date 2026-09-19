@@ -943,7 +943,8 @@ class SdkSessionHelp extends Command {
 		}),
 		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
 		cursor: Flags.string({
-			description: "Raw query continuation cursor, saved checkpoint token, or search continuation cursor",
+			description:
+				"Raw query continuation/search cursor, or session tail checkpoint claim (tail also requires --after-transcript-id)",
 		}),
 		scope: Flags.string({
 			description:
@@ -962,7 +963,7 @@ class SdkSessionHelp extends Command {
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
 		"after-transcript-id": Flags.string({
 			description:
-				"tail --cursor: omit transcript rows up to and including this row id (the caller already has them)",
+				"tail --cursor (required): omit transcript rows up to and including this row id (the caller already has them)",
 		}),
 		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
 	};

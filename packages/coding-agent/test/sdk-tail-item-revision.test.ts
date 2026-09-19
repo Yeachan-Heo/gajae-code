@@ -101,3 +101,19 @@ test("ordinary live events read the authoritative revision at emission time", ()
 	expect(turnTwo.revision).toBe(4);
 	expect(explicit.revision).toBe(9);
 });
+
+test("an explicit revision observed before checkpoint resolution remains authoritative", () => {
+	const buffer = new TailRevisionBuffer();
+	const start = buffer.push(
+		toTailItemV1({ kind: "turn_start", revision: 9, generation: 1, seq: 1, payload: {} }, { kind: "event" }),
+	);
+	expect(start[0]?.revision).toBe(9);
+
+	// A stale checkpoint response must not downgrade the revision already carried
+	// by the live frame, nor any unrevisioned frame that follows it.
+	expect(buffer.resolve(7)).toEqual([]);
+	const terminal = buffer.push(
+		toTailItemV1({ kind: "turn_end", generation: 1, seq: 2, payload: {} }, { kind: "event" }),
+	);
+	expect(terminal[0]?.revision).toBe(9);
+});

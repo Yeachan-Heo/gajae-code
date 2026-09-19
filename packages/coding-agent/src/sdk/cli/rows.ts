@@ -115,7 +115,7 @@ export class TailRevisionBuffer {
 
 	push(item: SdkTailItemV1): SdkTailItemV1[] {
 		if (item.revision !== undefined) {
-			if (this.#revision !== undefined && item.revision > this.#revision) this.#revision = item.revision;
+			if (this.#revision === undefined || item.revision > this.#revision) this.#revision = item.revision;
 			return [item];
 		}
 		if (item.generation === undefined || item.seq === undefined) return [item];
@@ -130,10 +130,10 @@ export class TailRevisionBuffer {
 	resolve(revision: number): SdkTailItemV1[] {
 		if (!Number.isSafeInteger(revision) || revision < 0)
 			throw new Error("Tail revision must be a non-negative integer.");
-		this.#revision = revision;
+		if (this.#revision === undefined || revision > this.#revision) this.#revision = revision;
 		const pending = this.#pending;
 		this.#pending = [];
-		for (const item of pending) item.revision = revision;
+		for (const item of pending) item.revision = this.#revision;
 		return pending;
 	}
 }
