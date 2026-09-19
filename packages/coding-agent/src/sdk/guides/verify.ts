@@ -136,8 +136,7 @@ export function verifyGuideManifest(params: {
 		return guideFailure("invalid_signature", "Detached signature verification failed.");
 	}
 	if (!valid)
-		if (!valid)
-			return guideFailure("invalid_signature", "Detached signature does not match the canonical manifest bytes.");
+		return guideFailure("invalid_signature", "Detached signature does not match the canonical manifest bytes.");
 	if (pinned.validUntil !== undefined && now > pinned.validUntil)
 		return guideFailure("expired", `Guide signer ${pinned.keyId} expired before this manifest was read.`);
 	if (!Number.isSafeInteger(now) || now < manifest.issuedAt)
