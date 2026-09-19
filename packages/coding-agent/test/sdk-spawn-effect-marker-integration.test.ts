@@ -233,3 +233,93 @@ test("real session.spawn publishes lifecycle authority and registers a live chil
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 30_000);
+
+test("managed task.dag advance still publishes lifecycle authority before seed delivery", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-marker-"));
+	const agentDir = path.join(root, "agent");
+	let childId = "";
+	let effectMarker = "";
+	const layer: SpawnPromptLayer = {
+		awaitRegistration: async () => ({ ok: false }),
+		dispatch: async () => {
+			throw new Error("Seed must not be sent before registration");
+		},
+		reconcile: async () => ({ status: "unknown" }),
+	};
+	const broker = new Broker({
+		agentDir,
+		masterCapabilityVerifier: verifier,
+		spawnPromptLayer: layer,
+		spawnSubstrateProvider: {
+			launch: async spec => {
+				childId = spec.childSessionId;
+				effectMarker = spec.env?.GJC_LIFECYCLE_REQUEST_ID ?? "";
+				return {
+					ok: true,
+					proof: { ...proof },
+				};
+			},
+			verify: async () => "verified",
+			close: async () => ({ ok: true }),
+		},
+	});
+	await broker.start();
+	try {
+		await attest(broker, root);
+		await fs.mkdir(path.join(root, "a"), { recursive: true });
+		const { managedIdentity } = await import("../src/sdk/broker/managed-task-dag");
+		const define = await broker.handleRequest("task.dag", {
+			action: "define",
+			controlRoot: root,
+			enrollmentId: "enrollment",
+			graphId: "g",
+			expectedRevision: 0,
+			ownerSessionId: ownerId,
+			attestationEpoch: epoch,
+			masterCapability: "fixture-grant",
+			worktrees: [root],
+			nodes: [
+				{
+					id: "a",
+					task,
+					workspace: path.join(root, "a"),
+					predecessors: [],
+					criteriaIdentity: managedIdentity("criteria"),
+					validations: [{ name: "check", command: "true" }],
+					resources: [{ kind: "integration", identity: "marker-a", mode: "write" }],
+					artifacts: [],
+				},
+			],
+		});
+		expect(define).toMatchObject({ ok: true });
+		const advance = await broker.handleRequest(
+			"task.dag",
+			{
+				action: "advance",
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				graphId: "g",
+				nodeId: "a",
+				expectedRevision: 1,
+				cwd: path.join(root, "a"),
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: "fixture-grant",
+				worktrees: [root],
+			},
+			"managed-marker-key",
+		);
+		expect(advance.ok).toBe(false);
+		expect(childId.length).toBeGreaterThan(0);
+		expect(effectMarker.length).toBeGreaterThan(0);
+		const store = new SpawnAuthorityStore(
+			broker.settings.agentDir,
+			await getBrokerIdentityKey(broker.settings.agentDir),
+		);
+		await store.open();
+		expect(store.claims().some(claim => claim.childId === childId)).toBe(true);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
