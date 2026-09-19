@@ -54,6 +54,8 @@ describe("authenticated approval API evidence", () => {
 			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -62,10 +64,11 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			// Every case now also reads the head commit date; the permission call only
+			// Reviews, then the head commit, then the PR timeline whose force-push events
+			// are the server-observed freshness authority; the permission call only
 			// follows a surviving approval.
 			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
-			expect(requests.length).toBe(expectsPermission ? 3 : 2);
+			expect(requests.length).toBe(expectsPermission ? 4 : 3);
 		} finally {
 			spy.mockRestore();
 		}
@@ -1029,6 +1032,8 @@ async function runSelfReviewPushPreflight(options: {
 	/** Emit the comments as JSONL that is cut off mid-record while gh still exits 0. */
 	commentsTruncated?: boolean;
 	reviews?: (context: PushPreflightContext) => unknown[];
+	/** Server-observed force-push times, newline separated, as the timeline --jq emits them. */
+	forcePushedAt?: string;
 	reviewsUnavailable?: boolean;
 	permission?: string;
 	permissionUnavailable?: boolean;
@@ -1080,7 +1085,7 @@ async function runSelfReviewPushPreflight(options: {
 		await Bun.write(permissionPath, `${options.permission ?? "write"}\n`);
 		await Bun.write(callsPath, "");
 		const ghPath = path.join(bin, "gh");
-		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
+		await Bun.write(ghPath, `#!/usr/bin/env bash\nset -euo pipefail\nargs="$*"\nprintf '%s\\n' "$args" >> "$GH_CALLS"\nif [[ "$args" == "repo view owner/repo --json isFork,parent" ]]; then\n  printf '{"isFork":false}\\n'\nelif [[ "$args" == *"/pulls?state=open"* ]]; then\n  cat "$GH_PULLS"\nelif [[ "$args" == *"/pulls/123/reviews"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh reviews read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"commit_id"* ]] || { echo "gh reviews read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_REVIEWS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: reviews unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_REVIEWS"\nelif [[ "$args" == *"/issues/123/timeline"* ]]; then\n  printf '%s' "\${GH_TIMELINE:-}"\nelif [[ "$args" == *"/collaborators/"* ]]; then\n  [[ "$args" == *"--jq .permission"* ]] || { echo "gh permission read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_PERMISSION_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 404: Not Found" >&2\n    exit 1\n  fi\n  cat "$GH_PERMISSION"\nelif [[ "$args" == *"/issues/123/comments"* ]]; then\n  [[ "$args" == *"--paginate"* ]] || { echo "gh comments read is missing --paginate" >&2; exit 1; }\n  [[ "$args" == *"author_association"* ]] || { echo "gh comments read lost its --jq projection" >&2; exit 1; }\n  if [[ -n "\${GH_COMMENTS_UNAVAILABLE:-}" ]]; then\n    echo "HTTP 503: service unavailable" >&2\n    exit 1\n  fi\n  cat "$GH_COMMENTS"\nelse\n  echo "unexpected gh invocation: $args" >&2\n  exit 1\nfi\n`);
 		await fs.chmod(ghPath, 0o755);
 		const child = Bun.spawn([process.execPath, script, "--push-preflight", "feature", headSha, "--push-url", "https://github.com/owner/repo.git", "--repo", work, "--trusted-root", repoRoot], {
 			cwd: work,
@@ -1091,6 +1096,7 @@ async function runSelfReviewPushPreflight(options: {
 				GH_PULLS: pullsPath,
 				GH_COMMENTS: commentsPath,
 				GH_REVIEWS: reviewsPath,
+				GH_TIMELINE: options.forcePushedAt ?? "",
 				GH_PERMISSION: permissionPath,
 				...options.commentsUnavailable ? { GH_COMMENTS_UNAVAILABLE: "1" } : {},
 				...options.reviewsUnavailable ? { GH_REVIEWS_UNAVAILABLE: "1" } : {},
@@ -1250,6 +1256,25 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
 		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
 	});
+
+	test("a backdated head commit cannot revive a stale approval (#5692 review)", async () => {
+		// `GIT_COMMITTER_DATE` is contributor-controlled, so comparing against the commit's
+		// own date was a fail-open: backdate the head far enough and any older approval
+		// looks fresh. The PR timeline's force-push `created_at` is written by GitHub, so
+		// it survives the backdate and still proves when this head appeared.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			// Submitted AFTER the harness's real head commit, so the contributor-controlled
+			// committer date alone would admit it. Only the server-observed force-push,
+			// which is later still, proves the approval predates this head.
+			reviews: context => reviewerApproval(context, "APPROVED", "2027-01-01T00:00:00Z"),
+			forcePushedAt: "2030-01-01T00:00:00Z\n",
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
 			body: riskClassifiedBody,
@@ -1320,6 +1345,8 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -1354,6 +1381,8 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
 				return Response.json([review("review-bot", "APPROVED")]);
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
 				return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);

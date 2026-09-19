@@ -106,16 +106,41 @@ interface EffectiveReview {
  * approval into an apparent exact-head approval. Two live cases: an approval submitted
  * 4h24m before its attributed head existed, and another two days before (#5692).
  *
- * A review cannot review a commit that does not exist yet, so a submission earlier than the
- * head's committer date proves re-binding. Both timestamps must be readable and parseable —
- * an unknown time is never treated as fresh.
+ * `headKnownAt` is the earliest time this head is PROVEN to have existed. A review submitted
+ * before that cannot have reviewed it.
+ *
+ * It must come from a server-observed source. The head's committer date is NOT one: the
+ * contributor sets it, so `GIT_COMMITTER_DATE` backdating would make a stale approval look
+ * fresh — a fail-open in the guard that exists to fail closed (#5692 review). The caller
+ * therefore derives it from the PR timeline's force-push events, whose `created_at` GitHub
+ * writes and the contributor cannot.
+ *
+ * Both timestamps must be readable and parseable; an unknown time is never treated as fresh.
  */
-function reviewPrecedesHead(submittedAt: string | undefined, headCommittedAt: string | undefined): boolean {
-	if (submittedAt === undefined || headCommittedAt === undefined) return true;
+function reviewPrecedesHead(submittedAt: string | undefined, headKnownAt: string | undefined): boolean {
+	if (submittedAt === undefined || headKnownAt === undefined) return true;
 	const submitted = Date.parse(submittedAt);
-	const committed = Date.parse(headCommittedAt);
-	if (!Number.isFinite(submitted) || !Number.isFinite(committed)) return true;
-	return submitted < committed;
+	const known = Date.parse(headKnownAt);
+	if (!Number.isFinite(submitted) || !Number.isFinite(known)) return true;
+	return submitted < known;
+}
+
+/**
+ * Latest readable timestamp among a contributor-supplied floor and server-observed events.
+ *
+ * A force-push strictly postdates the head it created, so when both are present the later
+ * value is the stronger proof. Unparseable entries are ignored rather than trusted, and an
+ * all-unreadable set yields `undefined` so the caller fails closed (#5692 review).
+ */
+function latestKnownHeadTime(
+	committedAt: string | undefined,
+	serverObserved: Array<string | undefined>,
+): string | undefined {
+	const candidates = [committedAt, ...serverObserved]
+		.map(value => value?.trim())
+		.filter((value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)));
+	if (candidates.length === 0) return undefined;
+	return candidates.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
 }
 
 /**
@@ -674,11 +699,19 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 		oid: review.commit?.oid,
 		submittedAt: review.submittedAt ?? undefined,
 	}));
-	// Locally the head commit is already in the object store, so read its committer date
-	// straight from git rather than spending another API call (#5692).
+	// The head's committer date is contributor-controlled (`GIT_COMMITTER_DATE`), so it is
+	// a floor, not authority. The authority is the PR timeline's force-push events, whose
+	// `created_at` GitHub writes (#5692 review).
 	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
-	const headCommittedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
-	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
+	const committedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
+	const forcePushedAt = await gh(
+		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", 'select(.event=="head_ref_force_pushed") | .created_at'],
+		cwd,
+	);
+	if (forcePushedAt.exitCode !== 0)
+		return { evidence: null, error: forcePushedAt.stderr || `gh exited ${forcePushedAt.exitCode}` };
+	const headKnownAt = latestKnownHeadTime(committedAt, forcePushedAt.stdout.split("\n"));
+	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
 	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
 	return {
@@ -686,7 +719,7 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 			permission: permission.stdout.trim(),
 			approvedHead,
 			approvedLogin: login,
-			...(approvedHead ? {} : refusedApprovalField(normalized, login, headSha, headCommittedAt)),
+			...(approvedHead ? {} : refusedApprovalField(normalized, login, headSha, headKnownAt)),
 		},
 		error: null,
 	};
@@ -723,8 +756,8 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		Authorization: `Bearer ${token}`,
 		"X-GitHub-Api-Version": "2022-11-28",
 	};
-	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
-	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headCommittedAt);
+	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headKnownAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
 		headers: {
@@ -747,21 +780,41 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
  * verdict (issue #4703 hardening, extended after the push preflight mirrored this lookup).
  */
 /**
- * Committer date of the PR head, used to discard reviews that predate it (#5692).
+ * Earliest time the PR head is PROVEN to have existed, from server-observed data.
  *
- * Returns `undefined` when the commit cannot be read, and every caller treats that as
- * "cannot prove freshness" rather than "fresh": an unreadable head date makes
- * `reviewPrecedesHead` refuse the review instead of admitting it.
+ * The commit's committer date is contributor-controlled (`GIT_COMMITTER_DATE`), so on its
+ * own it is not authority: backdating it would make a stale approval look fresh. GitHub
+ * writes the PR timeline's `head_ref_force_pushed.created_at`, and a force-push is exactly
+ * what re-points `commit_id` onto a new head, so the latest one is a trustworthy floor.
+ *
+ * Returns the later of the two, and `undefined` when neither can be read — which every
+ * caller treats as "cannot prove freshness" and therefore refuses (#5692 review).
  */
-async function fetchHeadCommittedAt(
+async function fetchHeadKnownAt(
 	repository: string,
+	number: number,
 	headSha: string,
 	headers: Record<string, string>,
 ): Promise<string | undefined> {
-	const response = await fetch(`https://api.github.com/repos/${repository}/commits/${headSha}`, { headers });
-	if (!response.ok) return undefined;
-	const commit = await response.json() as { commit?: { committer?: { date?: string } } };
-	return commit.commit?.committer?.date;
+	const commit = await fetch(`https://api.github.com/repos/${repository}/commits/${headSha}`, { headers });
+	const committedAt = commit.ok
+		? ((await commit.json()) as { commit?: { committer?: { date?: string } } }).commit?.committer?.date
+		: undefined;
+	// Paginate: timeline events are returned oldest-first, so reading only the first page
+	// would miss the MOST RECENT force-push on a busy PR — exactly the one that re-bound
+	// the review. A page that cannot be read refuses rather than truncating the evidence.
+	const forcePushes: Array<string | undefined> = [];
+	for (let page = 1; ; page++) {
+		const timeline = await fetch(
+			`https://api.github.com/repos/${repository}/issues/${number}/timeline?per_page=100&page=${page}`,
+			{ headers },
+		);
+		if (!timeline.ok) return undefined;
+		const events = (await timeline.json()) as Array<{ event?: string; created_at?: string }>;
+		for (const entry of events) if (entry.event === "head_ref_force_pushed") forcePushes.push(entry.created_at);
+		if (events.length < 100) break;
+	}
+	return latestKnownHeadTime(committedAt, forcePushes);
 }
 
 export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
@@ -788,8 +841,8 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		oid: review.commit_id,
 		submittedAt: review.submitted_at,
 	}));
-	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
-	const approved = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
+	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	const approved = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
 	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
@@ -797,7 +850,7 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		permission: collaborator.permission ?? "none",
 		approvedHead: approved,
 		approvedLogin: login,
-		...(approved ? {} : refusedApprovalField(normalized, login, headSha, headCommittedAt)),
+		...(approved ? {} : refusedApprovalField(normalized, login, headSha, headKnownAt)),
 	};
 }
 
