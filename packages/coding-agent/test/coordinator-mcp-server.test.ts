@@ -11655,11 +11655,20 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(answerCalls).toBe(2);
 	});
 
-	it("does not age a fresh answer receipt from a remote resolved_at", async () => {
+	it.each([
+		["an old", "old"],
+		["a future", "future"],
+		["a malformed", "malformed"],
+	] as const)("does not age a fresh answer receipt from %s remote resolved_at", async (_description, timestampKind) => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "";
-		const remoteResolvedAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+		const remoteResolvedAt =
+			timestampKind === "old"
+				? new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString()
+				: timestampKind === "future"
+					? new Date(Date.now() + 31 * 24 * 60 * 60 * 1000).toISOString()
+					: "not-a-timestamp";
 		const server = await createSdkControlServer(
 			root,
 			controls,
@@ -11708,14 +11717,20 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			ok: true,
 			operation: "workflow.gate_answer",
 			status: "accepted",
-			resolved_at: remoteResolvedAt,
+			resolved_at: timestampKind === "malformed" ? expect.not.stringMatching(/not-a-timestamp/) : remoteResolvedAt,
 		});
 
 		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
 		const persisted = await withSessionTransaction(paths, "visible-session", async current => current);
 		const request = Object.values(persisted.requests.answers).find(candidate => candidate.phase === "completed");
 		expect(request).toBeDefined();
-		expect(request?.safe_receipt).toMatchObject({ status: "accepted", resolved_at: remoteResolvedAt });
+		expect(request?.safe_receipt).toMatchObject({ status: "accepted" });
+		if (timestampKind === "malformed") {
+			expect(request?.safe_receipt?.resolved_at).not.toBe(remoteResolvedAt);
+			expect(Date.parse(request?.safe_receipt?.resolved_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
+		} else {
+			expect(request?.safe_receipt).toMatchObject({ resolved_at: remoteResolvedAt });
+		}
 		expect(Date.parse(request?.updated_at ?? "")).toBeGreaterThan(Date.now() - 5_000);
 		expect(Date.parse(persisted.canonical.questions["remote-old-answer"]?.updated_at ?? "")).toBeGreaterThan(
 			Date.now() - 5_000,
