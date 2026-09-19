@@ -92,14 +92,14 @@ import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication }
 import { processIncarnation } from "../broker/process-incarnation";
 import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import {
-	CAP_GATED_FRAME_KINDS,
+	canDeliverSdkEvent,
 	createSdkSurfaceFactory,
 	masterAttestationForEffectiveHost,
 	reattestMasterSessionIdentity,
+	SESSION_HOST_OBSERVER_CAPABILITY,
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
-	TOOL_ACTIVITY_CAPABILITY,
 	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
@@ -4758,7 +4758,48 @@ export function createNotificationsExtension(
 			}
 		};
 
-		const hostCapCache = new Map<string, ReadonlySet<string>>();
+		type HostConnectionIncarnation = { generation: number; closed: boolean };
+		type HostCapabilityCacheEntry = { generation: number; capabilities: ReadonlySet<string> };
+		const hostCapCache = new Map<string, HostCapabilityCacheEntry>();
+		const hostConnectionIncarnations = new Map<string, HostConnectionIncarnation>();
+		const hostAttachedConnections = new Set<string>();
+		let nextHostConnectionGeneration = 0;
+		const liveHostConnection = (connectionId: string): HostConnectionIncarnation | undefined => {
+			if (!connectionId) return undefined;
+			const current = hostConnectionIncarnations.get(connectionId);
+			if (current?.closed) return undefined;
+			if (current) return current;
+			const incarnation = { generation: ++nextHostConnectionGeneration, closed: false };
+			hostConnectionIncarnations.set(connectionId, incarnation);
+			return incarnation;
+		};
+		const rememberHostCapabilities = (connectionId: string, capabilities: readonly string[]): void => {
+			const incarnation = liveHostConnection(connectionId);
+			if (!incarnation) return;
+			hostCapCache.set(connectionId, {
+				generation: incarnation.generation,
+				capabilities: new Set(capabilities),
+			});
+		};
+		const liveHostCapabilities = (connectionId: string): ReadonlySet<string> | undefined => {
+			const incarnation = hostConnectionIncarnations.get(connectionId);
+			const entry = hostCapCache.get(connectionId);
+			return incarnation && !incarnation.closed && entry?.generation === incarnation.generation
+				? entry.capabilities
+				: undefined;
+		};
+		const closeHostConnection = (connectionId: string): void => {
+			const current = hostConnectionIncarnations.get(connectionId);
+			if (current) current.closed = true;
+			else {
+				hostConnectionIncarnations.set(connectionId, {
+					generation: ++nextHostConnectionGeneration,
+					closed: true,
+				});
+			}
+			hostCapCache.delete(connectionId);
+			hostAttachedConnections.delete(connectionId);
+		};
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -4849,15 +4890,17 @@ export function createNotificationsExtension(
 		 * ordinary direct SDK subscribers retain both public surfaces from #4570.
 		 */
 		const broadcastEventFrame = (event: SdkFrame): string[] => {
-			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const recipients: string[] = [];
-			for (const [connectionId, capabilities] of hostCapCache) {
+			for (const connectionId of hostAttachedConnections) {
+				const incarnation = hostConnectionIncarnations.get(connectionId);
+				if (!incarnation || incarnation.closed) continue;
+				const capabilities = liveHostCapabilities(connectionId);
 				if (fencedConnections.has(connectionId)) continue;
-				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				if (!canDeliverSdkEvent(String(event.kind), capabilities)) continue;
 				try {
 					server.sendTo(connectionId, json);
-					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
+					if (capabilities?.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
 				} catch {
 					// Broadcasts are best effort; directed responses surface send failures.
 				}
@@ -4865,15 +4908,17 @@ export function createNotificationsExtension(
 			return recipients;
 		};
 		const broadcastEventFrameWithReceipts = (event: SdkFrame): string[] => {
-			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
 			const receipts: string[] = [];
-			for (const [connectionId, capabilities] of hostCapCache) {
+			for (const connectionId of hostAttachedConnections) {
+				const incarnation = hostConnectionIncarnations.get(connectionId);
+				if (!incarnation || incarnation.closed) continue;
+				const capabilities = liveHostCapabilities(connectionId);
 				if (fencedConnections.has(connectionId)) continue;
-				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				if (!canDeliverSdkEvent(String(event.kind), capabilities)) continue;
 				try {
 					const receipt = server.sendToWithReceipt(connectionId, json);
-					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
+					if (capabilities?.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) receipts.push(receipt);
 				} catch {
 					// Rejected positioned sends remain eligible for the atomic raw fallback.
 				}
@@ -6867,7 +6912,7 @@ export function createNotificationsExtension(
 					expectedEpoch: options.masterAttestationEpoch,
 					replay: consumedMasterNonces,
 				}),
-			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
+			connectionCapabilities: liveHostCapabilities,
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
@@ -7393,14 +7438,10 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
-					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					if (typedFrame.type === "event_replay") {
-						const capabilities = Array.isArray(typedFrame.capabilities) ? typedFrame.capabilities : [];
-						hostCapCache.set(
-							inbound.connectionId,
-							new Set(capabilities.filter((capability): capability is string => typeof capability === "string")),
-						);
+						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
 					}
+					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
 				} catch (error) {
 					sendMalformed(
@@ -7433,15 +7474,26 @@ export function createNotificationsExtension(
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
-				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+				// ThreadsafeFunction currently delivers its tuple payload as the second
+				// callback argument at runtime, while older generated declarations expose
+				// the tuple members as separate parameters. Accept both shapes without
+				// allowing an unvalidated payload to become authority.
+				const tuple = Array.isArray(connectionId) ? (connectionId as unknown[]) : undefined;
+				const id = tuple?.[0] ?? connectionId;
+				const negotiated = tuple?.[1] ?? capabilities;
+				if (typeof id === "string" && Array.isArray(negotiated))
+					rememberHostCapabilities(
+						id,
+						negotiated.filter((capability): capability is string => typeof capability === "string"),
+					);
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
+				closeHostConnection(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)
 					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
 				host.handleDisconnect(connectionId);
-				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
 				// entry keeps the set bounded by live connections instead of growing forever.
 				fencedConnections.delete(connectionId);
@@ -7707,7 +7759,7 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound(async (err, inbound) => {
 				if (err || !inbound) return;
-				const notificationOrigin = hostCapCache.get(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
+				const notificationOrigin = liveHostCapabilities(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
 				const admission = notificationInboundAdmission({
 					inboundFenced: initializedRuntime.inboundFenced,
 					policySuspended: runtime?.policySuspended ?? false,
@@ -7958,15 +8010,24 @@ export function createNotificationsExtension(
 			}
 
 			// The native server owns the only authoritative view of this host's live
-			// SDK client sockets; publish it so a detached session host can bound its
-			// own lifetime without probing the OS (#4010). The handle is this
-			// runtime's alone, so only this runtime's teardown can retract it.
+			// SDK client sockets; publish it with observer-only sockets separated so a
+			// detached session host can bound its own lifetime without probing the OS
+			// (#4010). The handle is this runtime's alone, so only this runtime's teardown
+			// can retract it.
+			const readWorkInFlight = (): boolean =>
+				initializedRuntime.busy ||
+				initializedRuntime.pendingPromptCorrelations.length > 0 ||
+				initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0;
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
-				workInFlight: () =>
-					initializedRuntime.busy ||
-					initializedRuntime.pendingPromptCorrelations.length > 0 ||
-					initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0,
+				observerClients: () => {
+					if (readWorkInFlight()) return 0;
+					const observers = [...hostCapCache.keys()].filter(connectionId =>
+						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
+					).length;
+					return Math.min(server.clientCount(), observers);
+				},
+				workInFlight: readWorkInFlight,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -8068,6 +8129,32 @@ export function createNotificationsExtension(
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
+						heartbeat: async input => {
+							const expected = registration;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.append({
+								type: "host_heartbeat",
+								sessionId: expected.sessionId,
+								locator: expected.locator,
+								endpointGeneration: expected.endpointGeneration,
+								pid: expected.pid,
+								...(expected.processIncarnation === undefined
+									? {}
+									: { processIncarnation: expected.processIncarnation }),
+								...(expected.hostIncarnation === undefined
+									? {}
+									: { hostIncarnation: expected.hostIncarnation }),
+								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+								activity: input.activity,
+								ts: input.activity.at,
+							});
+						},
 						unregister: async input => {
 							const expected = registration;
 							if (
@@ -8083,8 +8170,8 @@ export function createNotificationsExtension(
 					});
 					throwIfLifecycleStopped();
 					initializedRuntime.brokerRegistrationActive = true;
-					// Host liveness is derived from alive(pid) when the index is read; heartbeats
-					// are deliberately not appended to the durable session index.
+					// Host liveness is derived from alive(pid) and the coalesced heartbeats;
+					// activity transitions are appended by the host through this registration.
 				} catch (brokerError) {
 					if (lifecycleRequired) throw brokerError;
 					logger.warn(`sdk broker registration skipped: ${String(brokerError)}`);
@@ -8904,6 +8991,9 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		void rt.host
+			.reportActivity("active")
+			.catch(error => logger.warn(`notifications: active activity checkpoint failed: ${String(error)}`));
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
@@ -8991,6 +9081,9 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		void rt.host
+			.reportActivity("idle")
+			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
 		// Clear the streaming flag for SDK consumers even when notifications are off.
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
