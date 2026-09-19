@@ -5596,7 +5596,11 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
-			if (afterToolCall && !record.started && !record.cleanupClaimed) {
+			// A pre-dispatch cleanup hook is only part of the cancellation contract.
+			// Validation failures and beforeToolCall blocks still have a real result
+			// that must flow through the normal tool-result path without invoking the
+			// post-execution hook before execution ever started.
+			if (afterToolCall && preDispatchCancellationResult && !record.started && !record.cleanupClaimed) {
 				record.cleanupClaimed = true;
 				try {
 					await afterToolCall(
