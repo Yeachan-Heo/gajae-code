@@ -3130,11 +3130,11 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
 		await fs.writeFile(pathname, "", { mode: 0o600 });
 		await fs.utimes(pathname, aged, aged);
-		const unlinkSync = syncFs.unlinkSync;
-		const unlink = vi.spyOn(syncFs, "unlinkSync").mockImplementation(((file: syncFs.PathLike) => {
+		const exactUnlinkDirect = native.exactUnlinkDirect;
+		const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
 			if (file === pathname) throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
-			return unlinkSync(file);
-		}) as typeof syncFs.unlinkSync);
+			return exactUnlinkDirect(file, identity);
+		});
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
