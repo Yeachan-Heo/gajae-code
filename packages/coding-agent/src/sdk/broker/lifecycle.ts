@@ -115,16 +115,18 @@ const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
-const LIFECYCLE_STDERR_TAIL_BYTES = 4_096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
-function lifecycleKnownSecrets(): string[] {
-	return Object.entries(process.env)
-		.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
-		.map(([, value]) => value!);
+function lifecycleKnownSecrets(extraSecrets: Iterable<unknown> = []): string[] {
+	return [
+		...Object.entries(process.env)
+			.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
+			.map(([, value]) => value),
+		...extraSecrets,
+	].filter((secret): secret is string => typeof secret === "string" && secret.length > 0);
 }
 
 function validateLifecycleExecutable(file: string): void {
@@ -139,68 +141,22 @@ function validateLifecycleExecutable(file: string): void {
 	fsSync.accessSync(file, fsSync.constants.X_OK);
 }
 
-type LifecycleStderrCapture = {
-	path: string;
-	handle: fs.FileHandle;
-};
-
-async function openLifecycleStderrCapture(root: string, id: string, effectMarker: string): Promise<LifecycleStderrCapture | undefined> {
-	try {
-		const directory = path.join(root, "sdk");
-		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const file = path.join(directory, `${id}.lifecycle.stderr.${effectMarker}.log`);
-		return {
-			path: file,
-			handle: await fs.open(file, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY, 0o600),
-		};
-	} catch {
-		// Diagnostics must never prevent a lifecycle child from being launched.
-		return undefined;
-}
-}
-
-async function readLifecycleStderrTail(file: string | undefined): Promise<string | undefined> {
-	if (!file) return undefined;
-	try {
-		const source = Bun.file(file);
-		const size = source.size;
-		if (!Number.isFinite(size) || size <= 0) return undefined;
-		const tail = size > LIFECYCLE_STDERR_TAIL_BYTES ? source.slice(size - LIFECYCLE_STDERR_TAIL_BYTES) : source;
-		const text = (await tail.text()).trim();
-		if (!text) return undefined;
-		return sanitizeSdkStartupMessage(text, lifecycleKnownSecrets());
-	} catch {
-		return undefined;
-}
-}
-
-async function removeLifecycleStderrCapture(file: string | undefined): Promise<void> {
-	if (!file) return;
-	try {
-		await fs.rm(file, { force: true });
-	} catch {
-		// Diagnostics are best-effort and must not alter lifecycle ownership.
-}
-}
-
 function lifecycleChildExitDiagnostic(child?: ChildProcess): string | undefined {
 	if (!child) return undefined;
 	const parts: string[] = [];
-	if (child.exitCode !== null) parts.push(`exit=${child.exitCode}`);
+	if (child.exitCode !== null && child.exitCode !== 0) parts.push(`exit=${child.exitCode}`);
 	if (child.signalCode) parts.push(`signal=${child.signalCode}`);
 	return parts.length > 0 ? parts.join(", ") : undefined;
 }
 
-export function lifecycleFailureMessage(message: string, child?: ChildProcess, stderr?: string): string {
-	const details = [lifecycleChildExitDiagnostic(child), stderr ? `stderr=${stderr}` : undefined].filter(
-		(value): value is string => value !== undefined,
-	);
+export function lifecycleFailureMessage(message: string, child?: ChildProcess): string {
+	const details = [lifecycleChildExitDiagnostic(child)].filter((value): value is string => value !== undefined);
 	return details.length > 0 ? `${message} (${details.join("; ")})` : message;
 }
 
-function readyThenExitedResponse(id: string, child?: ChildProcess, stderr?: string): BrokerResponse {
+function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
 	const parts = [`Session ${id} ${READY_THEN_EXIT_MESSAGE}.`];
-	const diagnostic = lifecycleFailureMessage("", child, stderr).trim();
+	const diagnostic = lifecycleFailureMessage("", child).trim();
 	if (diagnostic) parts.push(diagnostic);
 	return fail("ready_then_exited", parts.join(" "));
 }
@@ -3803,6 +3759,12 @@ async function terminateSpawnedChild(
 			failure.artifact.rollback.brokerRegistrationReleased;
 		if (!rollbackComplete) {
 			if (!readyThenExitToleranceEnabled()) {
+				// A child that exited with a non-zero status before publishing any
+				// lifecycle receipt has no durable rollback to wait for. Prove the
+				// owned artifacts are gone and release its registration, but retain
+				// terminal uncertainty for timeouts, clean exits, and child-authored
+				// startup receipts whose rollback is incomplete.
+				if (failure || child.exitCode === null || child.exitCode === 0) return failClosed();
 				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 				const publishedReady = (await probePublishedReadyAuthority(root, id, expected)).kind === "matched";
 				if (publishedReady) return failClosed();
@@ -3832,7 +3794,8 @@ async function terminateSpawnedChild(
 						registrationReleased || !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker);
 				}
 				const stillExited =
-					observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) === "exited";
+					observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
+					"exited";
 				const endpointGone = await endpointRemoved(root, id);
 				if (
 					stillExited &&
@@ -4360,11 +4323,10 @@ async function waitForReady(
 			return { kind: "startup_failed", failure: startupFailure };
 		}
 		const childExited = child !== undefined && (child.exitCode !== null || child.signalCode !== null);
-		const processObservation = observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value));
-		if (
-			childExited ||
-			processObservation === "exited"
-		) {
+		const processObservation = observeProcess(expected.pid, expected.incarnation, value =>
+			processIncarnationForBroker(broker, value),
+		);
+		if (childExited || processObservation === "exited") {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			if (finalStartupFailure) {
 				const afterReady = await classifyExitedAfterReady();
@@ -5545,31 +5507,18 @@ async function executeLifecycleResponse(
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		let childSpawned = false;
-		let stderrCapture: LifecycleStderrCapture | undefined;
-		let stderrCaptureClosed = false;
-		const closeStderrCapture = async (): Promise<void> => {
-			if (!stderrCapture || stderrCaptureClosed) return;
-			stderrCaptureClosed = true;
-			await stderrCapture.handle.close().catch(() => undefined);
-		};
-		const finishStderrCapture = async (remove: boolean): Promise<string | undefined> => {
-			await closeStderrCapture();
-			const stderr = await readLifecycleStderrTail(stderrCapture?.path);
-			if (remove) await removeLifecycleStderrCapture(stderrCapture?.path);
-			return stderr;
-		};
+		const launchSecrets = launch.coordinatorSidecarSigningKey ? [launch.coordinatorSidecarSigningKey] : [];
 		try {
-			stderrCapture = await openLifecycleStderrCapture(launch.root, launch.id, effectMarker);
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
 				validateLifecycleExecutable(cmd.file);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					// Keep stderr on an unshared, mode-0600 file so a detached host can
-					// outlive this broker without retaining a parent-owned pipe. The
-					// broker reads and sanitizes the bounded tail only when startup fails.
-					stdio: ["ignore", "ignore", stderrCapture?.handle.fd ?? "ignore"],
+					// A detached host can outlive this broker. Keep all stdio ignored so
+					// child output cannot cross the lifecycle response boundary or grow an
+					// unbounded capture artifact after startup.
+					stdio: "ignore",
 					env: {
 						// Master capability is process-local to direct Bash children and must
 						// never cross a broker lifecycle launch boundary.
@@ -5614,9 +5563,7 @@ async function executeLifecycleResponse(
 					},
 				});
 			});
-			await closeStderrCapture();
 			if (!authorizedSpawn.authorized) {
-				await finishStderrCapture(true);
 				return fail(
 					"startup_admission_refused",
 					"SDK host startup was refused because the broker no longer owns the session root.",
@@ -5637,7 +5584,6 @@ async function executeLifecycleResponse(
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
-			await closeStderrCapture();
 			const terminated =
 				child && childSpawned
 					? await terminateSpawnedChild(
@@ -5651,28 +5597,24 @@ async function executeLifecycleResponse(
 							timing,
 						)
 					: true;
-			const stderr = await finishStderrCapture(terminated);
 
 			return terminated
 				? fail(
 						"spawn_failed",
 						lifecycleFailureMessage(
-							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets())}`,
+							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets(launchSecrets))}`,
 							child,
-							stderr,
 						),
 					)
 				: fail(
 						"terminal_uncertain",
 						lifecycleFailureMessage(
-							`Unable to establish spawned-session ownership and could not prove the child dead: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets())}`,
+							`Unable to establish spawned-session ownership and could not prove the child dead: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets(launchSecrets))}`,
 							child,
-							stderr,
 						),
 					);
 		}
 		if (!child || !spawnedAuthority) {
-			await finishStderrCapture(true);
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		}
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
@@ -5698,7 +5640,6 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
-			const stderr = await finishStderrCapture(terminated);
 
 			if (!terminated)
 				return readiness.kind === "ready_probe_failed"
@@ -5710,18 +5651,15 @@ async function executeLifecycleResponse(
 							"terminal_uncertain",
 							`Session ${launch.id} did not become ready and its spawned process could not be verified dead; cleanup could not be proven.`,
 						);
-			// Host stderr is never returned verbatim: the detached
-			// host handles launch configuration and inherited credentials, so only a
-			// bounded, sanitized tail is included in a lifecycle failure diagnostic.
 			return readiness.kind === "startup_failed"
 				? fail(
 						readiness.failure.code ?? "spawn_failed",
-						lifecycleFailureMessage(readiness.failure.message, child, stderr),
+						lifecycleFailureMessage(readiness.failure.message, child),
 						undefined,
 						readiness.failure.details,
 					)
 				: readiness.kind === "ready_then_exited"
-					? readyThenExitedResponse(launch.id, child, stderr)
+					? readyThenExitedResponse(launch.id, child)
 					: readiness.kind === "ready_probe_failed"
 						? fail(
 								"endpoint_unreadable",
@@ -5730,7 +5668,7 @@ async function executeLifecycleResponse(
 						: readiness.kind === "child_exited"
 							? fail(
 									"spawn_failed",
-									lifecycleFailureMessage(`Session ${launch.id} exited before registering readiness.`, child, stderr),
+									lifecycleFailureMessage(`Session ${launch.id} exited before registering readiness.`, child),
 								)
 							: fail(
 									"readiness_timeout",
@@ -5755,17 +5693,12 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
-			const stderr = await finishStderrCapture(terminated);
 			if (exited && readyThenExitToleranceEnabled())
 				return terminated
-					? readyThenExitedResponse(launch.id, child, stderr)
+					? readyThenExitedResponse(launch.id, child)
 					: fail(
 							"terminal_uncertain",
-							lifecycleFailureMessage(
-								`Session ${launch.id} ${READY_THEN_EXIT_MESSAGE} and cleanup could not be proven.`,
-								child,
-								stderr,
-							),
+							`Session ${launch.id} ${READY_THEN_EXIT_MESSAGE} and cleanup could not be proven.`,
 						);
 			return terminated
 				? fail("endpoint_stale", "Session endpoint changed while lifecycle readiness was being verified.")
@@ -5774,10 +5707,7 @@ async function executeLifecycleResponse(
 						"Session readiness authority changed and its spawned process could not be verified dead.",
 					);
 		}
-		if (!spawnedAuthority) {
-			await finishStderrCapture(true);
-			return fail("endpoint_stale", "Session endpoint authority is unavailable.");
-		}
+		if (!spawnedAuthority) return fail("endpoint_stale", "Session endpoint authority is unavailable.");
 		const replayIncarnation = endpointIncarnation(
 			{
 				endpointGeneration: verified.endpointGeneration,
@@ -5787,11 +5717,8 @@ async function executeLifecycleResponse(
 			},
 			launch.id,
 		);
-		if (!replayIncarnation) {
-			await finishStderrCapture(true);
-			return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
-		}
-		const response: BrokerResponse = {
+		if (!replayIncarnation) return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
+		return {
 			ok: true,
 			result: {
 				sessionId: launch.id,
@@ -5808,8 +5735,6 @@ async function executeLifecycleResponse(
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
 			},
 		};
-		await finishStderrCapture(true);
-		return response;
 	}
 
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
@@ -6991,16 +6916,13 @@ export async function executeLifecycle(
 									error: startupFailure.code
 										? {
 												code: startupFailure.code,
-												// Keep the broker's launch diagnostic (including a
-												// sanitized child-stderr tail) instead of replacing
-												// it with the durable artifact's base message.
-												message: response.error.message,
+												message: startupFailure.message,
 												details: startupFailure.details!,
 												endpoint: "unavailable" as const,
 											}
 										: {
 												code: "spawn_failed",
-											message: response.error.message,
+												message: startupFailure.message,
 												endpoint: "unavailable" as const,
 											},
 									...(durableEffects ? { durableEffects } : {}),
