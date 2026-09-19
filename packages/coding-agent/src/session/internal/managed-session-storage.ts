@@ -771,11 +771,17 @@ async function hashReaperFile(pathname: string, expected: fs.BigIntStats): Promi
 		);
 		const opened = await handle.stat({ bigint: true });
 		if (!isRegularReaperFile(opened) || !sameReaperFileIdentity(opened, expected)) return undefined;
-		const bytes = await handle.readFile();
+		const digest = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		let offset = 0;
+		for (;;) {
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+			if (bytesRead === 0) break;
+			digest.update(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
 		const after = await handle.stat({ bigint: true });
-		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected)
-			? createHash("sha256").update(bytes).digest("hex")
-			: undefined;
+		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected) ? digest.digest("hex") : undefined;
 	} catch (error) {
 		if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
 		throw error;
@@ -802,7 +808,7 @@ function exactReaperUnlinkSync(
 		mtimeNs: stat.mtimeNs,
 		sha256,
 		quarantineName: remnantReapQuarantineName(pathname),
-		...(allowHardLink ? { allowHardLink: true } : {}),
+		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
 	};
 	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
 }
@@ -825,7 +831,7 @@ async function exactReaperUnlink(
 		mtimeNs: stat.mtimeNs,
 		sha256,
 		quarantineName: remnantReapQuarantineName(pathname),
-		...(allowHardLink ? { allowHardLink: true } : {}),
+		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
 	};
 	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
 }

@@ -425,45 +425,50 @@ pub struct NativePermissionRepairResult {
 
 #[napi(object)]
 pub struct NativeExactFileIdentity {
-	pub dev:             BigInt,
-	pub ino:             BigInt,
-	pub nlink:           Option<BigInt>,
-	pub parent_dev:      Option<BigInt>,
-	pub parent_ino:      Option<BigInt>,
-	pub size:            BigInt,
-	pub mtime_ns:        BigInt,
+	pub dev:               BigInt,
+	pub ino:               BigInt,
+	pub nlink:             Option<BigInt>,
+	pub parent_dev:        Option<BigInt>,
+	pub parent_ino:        Option<BigInt>,
+	pub size:              BigInt,
+	pub mtime_ns:          BigInt,
 	/// When true, atomically detach a directory rather than deleting a regular
 	/// file.
-	pub directory:       Option<bool>,
+	pub directory:         Option<bool>,
 	/// Keep a regular file in quarantine after its identity has been verified
 	/// instead of unlinking it. This makes cross-device retirement recoverable.
-	pub detach_only:     Option<bool>,
+	pub detach_only:       Option<bool>,
 	/// A caller-persisted, single-component no-replace quarantine destination.
 	/// Required for every exact deletion so authority survives a post-detach
 	/// crash.
-	pub quarantine_name: Option<String>,
+	pub quarantine_name:   Option<String>,
 	/// SHA-256 of regular-file bytes. Required for regular-file deletion and
 	/// verified from the detached object before unlinking it.
-	pub sha256:          Option<String>,
+	pub sha256:            Option<String>,
 	/// Permit removing exactly this authorized pathname when the inode has other
 	/// hard links. Remaining links are retained after exact quarantine cleanup.
-	pub allow_hard_link: Option<bool>,
+	pub allow_hard_link:   Option<bool>,
+	/// Require the authorized regular file to retain at least two hard links at
+	/// every identity check. This is used by cleanup paths that remove only a
+	/// surplus alias while preserving the live transcript link.
+	pub require_hard_link: Option<bool>,
 }
 
 #[derive(Clone)]
 struct ExactFileIdentity {
-	dev:             u64,
-	ino:             u64,
-	nlink:           Option<u64>,
-	parent_dev:      Option<u64>,
-	parent_ino:      Option<u64>,
-	size:            u64,
-	mtime_ns:        i64,
-	directory:       bool,
-	detach_only:     bool,
-	quarantine_name: Option<String>,
-	sha256:          Option<[u8; 32]>,
-	allow_hard_link: bool,
+	dev:               u64,
+	ino:               u64,
+	nlink:             Option<u64>,
+	parent_dev:        Option<u64>,
+	parent_ino:        Option<u64>,
+	size:              u64,
+	mtime_ns:          i64,
+	directory:         bool,
+	detach_only:       bool,
+	quarantine_name:   Option<String>,
+	sha256:            Option<[u8; 32]>,
+	allow_hard_link:   bool,
+	require_hard_link: bool,
 }
 /// Typed result of an identity-bound regular-file deletion or directory detach.
 #[napi(object)]
@@ -1112,6 +1117,7 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 		quarantine_name,
 		sha256,
 		allow_hard_link: identity.allow_hard_link.unwrap_or(false),
+		require_hard_link: identity.require_hard_link.unwrap_or(false),
 	})
 }
 
@@ -5127,6 +5133,12 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
+			&& identity.require_hard_link
+			&& (named.st_nlink < 2 || identity.nlink.is_some_and(|nlink| nlink < 2))
+		{
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if !identity.directory
 			&& digest_openat(parent_fd, &name).ok().as_ref() != identity.sha256.as_ref()
 		{
 			return NativeExactUnlinkResult::failure("identity_mismatch");
@@ -5536,23 +5548,24 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure("parent_mismatch");
 		}
 		let identity = ExactFileIdentity {
-			dev:             current.st_dev as u64,
-			ino:             current.st_ino as u64,
-			nlink:           Some(current.st_nlink as u64),
-			parent_dev:      Some(parent.st_dev as u64),
-			parent_ino:      Some(parent.st_ino as u64),
-			size:            current.st_size as u64,
-			mtime_ns:        stat_mtime_ns(&current) as i64,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(format!(
+			dev:               current.st_dev as u64,
+			ino:               current.st_ino as u64,
+			nlink:             Some(current.st_nlink as u64),
+			parent_dev:        Some(parent.st_dev as u64),
+			parent_ino:        Some(parent.st_ino as u64),
+			size:              current.st_size as u64,
+			mtime_ns:          stat_mtime_ns(&current) as i64,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(format!(
 				".gjc-substitution-cleanup-{:x}-{:x}-{:x}",
 				current.st_dev,
 				current.st_ino,
 				std::process::id(),
 			)),
-			sha256:          Some(digest),
-			allow_hard_link: true,
+			sha256:            Some(digest),
+			allow_hard_link:   true,
+			require_hard_link: false,
 		};
 		exact_unlink_at(parent_fd, name.clone(), path, &identity)
 	}
@@ -5949,17 +5962,13 @@ pub(crate) mod platform {
 				&& opened.st_ino as u64 == identity.ino
 				&& opened.st_size as u64 == identity.size
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
-				&& if identity.allow_hard_link {
-					opened.st_nlink >= 2
+				&& if identity.require_hard_link {
+					opened.st_nlink >= 2 && identity.nlink.is_none_or(|nlink| nlink >= 2)
+				} else if identity.allow_hard_link {
+					true
 				} else {
 					opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)
-				} && if identity.allow_hard_link {
-				identity.nlink.is_none_or(|nlink| nlink >= 2)
-			} else {
-				identity
-					.nlink
-					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
-			} && identity.sha256.as_ref() == Some(&digest)
+				} && identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
 				&& named.st_ino == opened.st_ino)
@@ -9093,6 +9102,12 @@ mod platform {
 			return NativeExactUnlinkResult::failure("hard_link_unsupported");
 		}
 		if !identity.directory
+			&& identity.require_hard_link
+			&& (information.nNumberOfLinks < 2 || identity.nlink.is_some_and(|nlink| nlink < 2))
+		{
+			return NativeExactUnlinkResult::failure("hard_link_unsupported");
+		}
+		if !identity.directory
 			&& digest_handle(handle.target).ok().as_ref() != identity.sha256.as_ref()
 		{
 			return NativeExactUnlinkResult::failure("identity_mismatch");
@@ -9153,6 +9168,18 @@ mod platform {
 				detached_path,
 				identity,
 			);
+		}
+		if !identity.directory && identity.require_hard_link {
+			let mut revalidated: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(handle.target, &mut revalidated) } == 0 {
+				return NativeExactUnlinkResult::failure(last_error_code());
+			}
+			if !handle_identity_matches(&revalidated, identity) {
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+			if revalidated.nNumberOfLinks < 2 || identity.nlink.is_some_and(|nlink| nlink < 2) {
+				return NativeExactUnlinkResult::failure("hard_link_unsupported");
+			}
 		}
 		match delete_handle(handle.target) {
 			Ok(()) => NativeExactUnlinkResult::success(),
@@ -10535,18 +10562,19 @@ mod platform {
 			// non-zero mtime (and zeroing the size would too), which would turn
 			// every filter-hosted detach into a spurious identity mismatch.
 			let identity = ExactFileIdentity {
-				dev:             root_entry.dev.parse().unwrap_or_default(),
-				ino:             root_entry.ino.parse().unwrap_or_default(),
-				nlink:           None,
-				parent_dev:      expected_parent.map(|value| value.0),
-				parent_ino:      expected_parent.map(|value| value.1),
-				size:            root_entry.size.parse().unwrap_or_default(),
-				mtime_ns:        root_entry.mtime_ns.parse().unwrap_or_default(),
-				directory:       true,
-				detach_only:     true,
-				quarantine_name: Some(quarantine_name.clone()),
-				sha256:          None,
-				allow_hard_link: false,
+				dev:               root_entry.dev.parse().unwrap_or_default(),
+				ino:               root_entry.ino.parse().unwrap_or_default(),
+				nlink:             None,
+				parent_dev:        expected_parent.map(|value| value.0),
+				parent_ino:        expected_parent.map(|value| value.1),
+				size:              root_entry.size.parse().unwrap_or_default(),
+				mtime_ns:          root_entry.mtime_ns.parse().unwrap_or_default(),
+				directory:         true,
+				detach_only:       true,
+				quarantine_name:   Some(quarantine_name.clone()),
+				sha256:            None,
+				allow_hard_link:   false,
+				require_hard_link: false,
 			};
 			return detach_directory(
 				root.target,
@@ -11147,18 +11175,19 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&successor, b"live successor").expect("write successor");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          Some(sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            Some(sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11217,18 +11246,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11294,18 +11324,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11375,18 +11406,19 @@ mod exact_unlink_placeholder_tests {
 		}
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       target_is_directory,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          (!target_is_directory).then(|| sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         target_is_directory,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            (!target_is_directory).then(|| sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (resume_tx, resume_rx) = mpsc::channel();
@@ -11467,6 +11499,7 @@ mod exact_unlink_placeholder_tests {
 			quarantine_name: Some(".quarantine".to_owned()),
 			sha256: Some(sha256(b"stale")),
 			allow_hard_link: false,
+			require_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -11555,18 +11588,19 @@ mod exact_unlink_placeholder_tests {
 		fs::write(&target, b"stale").expect("write stale target");
 		let metadata = fs::metadata(&target).expect("stat target");
 		let identity = ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      None,
-			parent_ino:      None,
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: Some(".quarantine".to_owned()),
-			sha256:          Some(sha256(b"stale")),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        None,
+			parent_ino:        None,
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   Some(".quarantine".to_owned()),
+			sha256:            Some(sha256(b"stale")),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		};
 		let (exchange_entered_tx, exchange_entered_rx) = mpsc::channel();
 		let (exchange_resume_tx, exchange_resume_rx) = mpsc::channel();
@@ -12461,18 +12495,19 @@ mod exact_replace_path_tests {
 		let metadata = fs::metadata(path).expect("stat exact replace file");
 		let parent = fs::metadata(parent).expect("stat exact replace parent");
 		ExactFileIdentity {
-			dev:             metadata.dev(),
-			ino:             metadata.ino(),
-			nlink:           Some(metadata.nlink()),
-			parent_dev:      Some(parent.dev()),
-			parent_ino:      Some(parent.ino()),
-			size:            metadata.size(),
-			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
-			directory:       false,
-			detach_only:     false,
-			quarantine_name: None,
-			sha256:          Some(sha256(bytes)),
-			allow_hard_link: false,
+			dev:               metadata.dev(),
+			ino:               metadata.ino(),
+			nlink:             Some(metadata.nlink()),
+			parent_dev:        Some(parent.dev()),
+			parent_ino:        Some(parent.ino()),
+			size:              metadata.size(),
+			mtime_ns:          metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:         false,
+			detach_only:       false,
+			quarantine_name:   None,
+			sha256:            Some(sha256(bytes)),
+			allow_hard_link:   false,
+			require_hard_link: false,
 		}
 	}
 

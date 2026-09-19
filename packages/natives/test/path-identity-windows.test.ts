@@ -727,6 +727,34 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		await expect(fs.stat(path.join(root, directQuarantine))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("enforces requireHardLink without breaking one-link allowHardLink cleanup", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "single-link.tmp");
+		await fs.writeFile(file, "authorized");
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await parentIdentity(file);
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.parentDev,
+			parentIno: parent.parentIno,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("authorized"),
+			quarantineName: ".single-link.cleanup",
+			allowHardLink: true,
+		};
+
+		expect(exactUnlinkDirect(file, { ...identity, requireHardLink: true })).toEqual({
+			ok: false,
+			code: "hard_link_unsupported",
+		});
+		expect(await fs.readFile(file, "utf8")).toBe("authorized");
+		expect(exactUnlinkDirect(file, identity)).toEqual({ ok: true });
+		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("retains a regular file when direct cleanup parent authority changes", async () => {
 		const root = await temporaryDirectory();
 		const file = path.join(root, "parent-bound-debris");
