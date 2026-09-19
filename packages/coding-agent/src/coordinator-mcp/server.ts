@@ -5728,6 +5728,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 	}
 
+	async function findPersistedBrokerAuthority(
+		sessions: Array<Record<string, unknown>>,
+		expected: {
+			sessionId: string;
+			workspace: string;
+			endpointGeneration: number | null;
+			endpointIncarnation: string | null;
+		},
+	): Promise<Record<string, unknown> | undefined> {
+		if (expected.endpointGeneration === null || expected.endpointIncarnation === null) return undefined;
+		let canonicalExpectedWorkspace: string;
+		try {
+			canonicalExpectedWorkspace = await canonicalBrokerWorkspace(expected.workspace);
+		} catch {
+			return undefined;
+		}
+		for (const session of sessions) {
+			if (brokerSessionId(session) !== expected.sessionId) continue;
+			if (
+				brokerEndpointGeneration(session) !== expected.endpointGeneration ||
+				brokerEndpointIncarnation(session, expected.sessionId) !== expected.endpointIncarnation
+			)
+				continue;
+			const declaredWorkspace = brokerSessionScope(session);
+			if (declaredWorkspace === null) continue;
+			try {
+				const canonicalDeclaredWorkspace = await canonicalBrokerWorkspace(declaredWorkspace);
+				if (sameCanonicalPath(canonicalDeclaredWorkspace, canonicalExpectedWorkspace, platform)) return session;
+			} catch {
+				// A missing or unreadable locator is not authority for this session.
+			}
+		}
+		return undefined;
+	}
+
 	type BrokerSessionAuthority = {
 		workspace: string;
 		endpointGeneration: number;
@@ -8295,17 +8330,35 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					await reconcileSessionRuntime(canonicalSessionId, { observeQuestions: false });
 					try {
 						const brokerWorkspace = optionalString(session.broker_workspace) ?? cwd;
-						let indexedSession = (await listSessions(brokerWorkspace)).find(
-							candidate => brokerSessionId(candidate) === canonicalSessionId,
+						const persistedEndpointGeneration =
+							typeof session.endpoint_generation === "number" &&
+							Number.isSafeInteger(session.endpoint_generation) &&
+							session.endpoint_generation > 0
+								? session.endpoint_generation
+								: null;
+						const persistedEndpointIncarnation = optionalString(session.endpoint_incarnation);
+						const expectedAuthority = {
+							sessionId: canonicalSessionId,
+							workspace: brokerWorkspace,
+							endpointGeneration: persistedEndpointGeneration,
+							endpointIncarnation: persistedEndpointIncarnation,
+						};
+						// A matching session id is not enough: the broker row must still
+						// prove the projection's exact worktree endpoint authority.
+						let indexedSession = await findPersistedBrokerAuthority(
+							await listSessions(brokerWorkspace),
+							expectedAuthority,
 						);
-						// Windows broker locators may differ in drive-letter casing or separator
-						// spelling even after the injected canonical workspace seam has resolved
-						// the coordinator path. The scoped listing request is still authoritative;
-						// only its local path filter is relaxed for the exact requested session.
-						if (!indexedSession && platform === "win32") {
+						// A broker locator can retain a valid worktree under a spelling that
+						// the platform-local scope filter cannot normalize (for example a
+						// symlinked worktree or a Windows alias). Retry the unfiltered page,
+						// but keep canonical workspace and endpoint authority checks so this
+						// cannot turn a foreign or rotated row into an indexed session.
+						if (!indexedSession) {
 							const listing = await paginatedBrokerSessionList(brokerWorkspace, { cwd: brokerWorkspace });
-							indexedSession = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).find(
-								candidate => brokerSessionId(candidate) === canonicalSessionId,
+							indexedSession = await findPersistedBrokerAuthority(
+								jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []),
+								expectedAuthority,
 							);
 						}
 						const sessionState = publicCoordinatorSessionState(
@@ -8314,7 +8367,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return {
 							ok: true,
 							session: publicCoordinatorStatusSession(session),
-							status: { ...brokerLiveness(indexedSession ?? null), ...(sessionState ?? {}) },
+							// Broker indexing is the authority for endpoint liveness. A runtime
+							// sidecar can retain a stale `live:true` projection after its
+							// endpoint incarnation rotates, so it must not mask `not_indexed`.
+							status: { ...(sessionState ?? {}), ...brokerLiveness(indexedSession ?? null) },
 							session_state: sessionState,
 						};
 					} catch (error) {

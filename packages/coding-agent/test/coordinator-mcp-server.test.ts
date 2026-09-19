@@ -3708,6 +3708,46 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(listScopes).toContain(worktree);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
+	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+	}, 15_000);
+	it("does not index a managed-worktree endpoint after its authority changes", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const sessions: Array<Record<string, unknown>> = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			sessions,
+			"gjc --worktree hermes",
+		);
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status-mismatch",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await patchSessionState(server, root, "created-session-1", { live: true });
+		sessions[0]!.endpointMtimeMs = Number(sessions[0]!.endpointMtimeMs) + 1;
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: false, reason: "not_indexed" } });
+	}, 15_000);
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
