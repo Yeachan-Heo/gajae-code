@@ -15,6 +15,7 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../src/coordinator/contract";
+import { coordinatorNamespaceIdentity } from "../src/coordinator-mcp/policy";
 import {
 	assertCloseAdmission,
 	type CanonicalSessionSnapshotV1,
@@ -1013,6 +1014,8 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 			const file = transactionPath(paths, sessionId);
 			const raw = JSON.parse(await fs.readFile(file, "utf8")) as {
 				canonical: { reports: Record<string, unknown> };
+				requests: { operations: Record<string, Record<string, unknown>> };
+				outbox: Record<string, Record<string, unknown>>;
 			};
 			raw.canonical.reports[legacyReportId] = {
 				schema_version: 1,
@@ -1027,15 +1030,142 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 				evidence_paths: [],
 				created_at: "2026-08-18T13:19:54.844Z",
 			};
+			raw.requests.operations["report-operation"] = {
+				operation_id: "report-operation",
+				tool: "gjc_coordinator_report_status",
+				key_digest: sha256("report-operation-key"),
+				request_digest: sha256("report-operation-request"),
+				local_id: legacyReportId,
+				phase: "completed",
+				intent: { session_id: sessionId },
+				created_at: "2026-08-18T13:19:54.844Z",
+				updated_at: "2026-08-18T13:19:54.844Z",
+			};
+			raw.outbox["legacy-report-event"] = {
+				id: "legacy-report-event",
+				transaction_revision: 1,
+				kind: "report.written",
+				entity: "report",
+				entity_id: legacyReportId,
+				payload: { session_id: sessionId, report_id: legacyReportId, status: "probe" },
+				emitted: false,
+				public_event_id: "legacy-report-event",
+				public_delivery: {
+					public_event_id: "legacy-report-event",
+					state: "pending",
+					claim_fence: null,
+					claim_expires_at: null,
+					journal_seq: null,
+					acknowledged_at: null,
+				},
+			};
 			await fs.writeFile(file, JSON.stringify(raw));
 			// Before the fix this read threw state_corrupt instead of returning.
 			const reloaded = await readSessionTransaction(paths, sessionId);
+			if (!reloaded) throw new Error("legacy transaction did not reload");
 			expect(reloaded?.canonical.reports[legacyReportId]).toBeUndefined();
-			const migrated = Object.entries(reloaded?.canonical.reports ?? {}).find(
+			const migrated = Object.entries(reloaded.canonical.reports).find(
 				([, report]) => report.operation_id === "report:i50-rp4",
 			);
-			expect(migrated?.[0]).toMatch(/^report-[a-f0-9]{64}$/);
-			expect(migrated?.[1]).toMatchObject({ report_id: migrated?.[0], status: "probe" });
+			if (!migrated) throw new Error("legacy report did not migrate");
+			const [migratedReportId, migratedReport] = migrated;
+			expect(migratedReportId).toMatch(/^report-[a-f0-9]{64}$/);
+			expect(migratedReport).toMatchObject({ report_id: migratedReportId, status: "probe" });
+			expect(migratedReportId).toBe(reloaded.requests.operations["report-operation"]?.local_id);
+			const reportEvent = reloaded.outbox["legacy-report-event"];
+			expect(reportEvent.entity_id).toBe(migratedReportId);
+			expect(reportEvent.payload.report_id).toBe(migratedReportId);
+			const persisted = JSON.parse(await fs.readFile(file, "utf8")) as CoordinatorSessionTransactionV1;
+			expect(persisted.canonical.reports[legacyReportId]).toBeUndefined();
+			expect(persisted.requests.operations["report-operation"]?.local_id).toBe(migratedReportId);
+		});
+	});
+
+	it("recovers namespace event reads with a legacy-id WAL beside a corrupt peer", async () => {
+		await withTempRoot(async root => {
+			const stateRoot = path.join(root, "state");
+			const env = {
+				GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_PROFILE: "coordinator-wal-test",
+				GJC_COORDINATOR_MCP_REPO: "namespace-recovery",
+			};
+			const namespaceId = coordinatorNamespaceIdentity(env);
+			const paths = coordinatorStatePaths(stateRoot, namespaceId);
+			const healthySessionId = "session-healthy";
+			const legacySessionId = "session-legacy";
+			const corruptSessionId = "session-corrupt";
+			await initializeCoordinatorNamespace(paths);
+			for (const [sessionId, eventKind] of [
+				[healthySessionId, "healthy.session.registered"],
+				[legacySessionId, "legacy.session.registered"],
+				[corruptSessionId, "corrupt.session.registered"],
+			] as const) {
+				await createSessionTransaction(paths, {
+					kind: "register",
+					session: capacitySessionSnapshot(namespaceId, sessionId, root),
+					initial_state: "ready_for_input",
+					initial_events: [
+						{
+							kind: eventKind,
+							entity: "session",
+							entity_id: sessionId,
+							created_at: "2026-08-22T00:00:00.000Z",
+						},
+					],
+				});
+			}
+			const legacyReportId = "report-9ae9a2fd-3939-46c7-8178-185e2d9a84b1";
+			const legacyFile = transactionPath(paths, legacySessionId);
+			const legacyRaw = JSON.parse(await fs.readFile(legacyFile, "utf8")) as {
+				canonical: { reports: Record<string, unknown> };
+			};
+			legacyRaw.canonical.reports[legacyReportId] = {
+				schema_version: 1,
+				report_id: legacyReportId,
+				operation_id: "namespace-recovery-report",
+				session_id: legacySessionId,
+				turn_id: "",
+				status: "probe",
+				summary: "legacy report",
+				blocker: null,
+				pr_url: null,
+				evidence_paths: [],
+				created_at: "2026-08-18T13:19:54.844Z",
+			};
+			await fs.writeFile(legacyFile, JSON.stringify(legacyRaw));
+			const projections = path.join(stateRoot, "v1", namespaceId, "projections", "reports");
+			await fs.mkdir(projections, { recursive: true });
+			await fs.writeFile(
+				path.join(projections, `${legacyReportId}.json`),
+				JSON.stringify(legacyRaw.canonical.reports[legacyReportId]),
+			);
+			await fs.writeFile(transactionPath(paths, corruptSessionId), '{"schema_version":1');
+
+			const server = createCoordinatorMcpServer({ env });
+			try {
+				const watch = await server.callTool("gjc_coordinator_watch_events", {
+					timeout_ms: 0,
+					after_seq: 0,
+					limit: 50,
+				});
+				expect(watch.ok).toBe(true);
+				expect(JSON.stringify(watch)).toContain(healthySessionId);
+				expect(JSON.stringify(watch)).toContain(legacySessionId);
+				expect(await fs.stat(path.join(projections, `${legacyReportId}.json`)).catch(() => null)).toBeNull();
+				const migratedFiles = await fs.readdir(projections);
+				expect(migratedFiles.some(file => /^report-[a-f0-9]{64}\.json$/.test(file))).toBe(true);
+
+				const scopedCorrupt = await server.callTool("gjc_coordinator_watch_events", {
+					session_id: corruptSessionId,
+					timeout_ms: 0,
+					after_seq: 0,
+					limit: 50,
+				});
+				expect(scopedCorrupt).toMatchObject({ ok: false, error: { code: "unavailable" } });
+			} finally {
+				await server.close();
+			}
 		});
 	});
 });

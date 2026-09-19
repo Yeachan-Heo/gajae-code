@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import { ensureCoordinatorDirectory, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
@@ -567,7 +568,7 @@ async function readTransactionJson<T>(file: string): Promise<T | null> {
 		source = await fs.readFile(file, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	try {
 		const value: unknown = JSON.parse(source);
@@ -610,20 +611,64 @@ function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1
 	// historical report bricks every coordination read. Rekey legacy reports onto
 	// the canonical digest form instead of leaving the WAL permanently unreadable.
 	const reports = canonical.reports;
+	const migratedReportIds = new Map<string, string>();
 	if (reports && typeof reports === "object" && !Array.isArray(reports)) {
 		const table = reports as Record<string, Record<string, unknown>>;
 		for (const [reportId, report] of Object.entries(table)) {
 			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId)) continue;
 			if (!report || typeof report !== "object" || Array.isArray(report)) continue;
 			const operationId = typeof report.operation_id === "string" ? report.operation_id : reportId;
-			const migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}`)}`;
+			let migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}`)}`;
+			const existing = table[migratedId];
+			if (existing) {
+				const existingOperationId = typeof existing.operation_id === "string" ? existing.operation_id : null;
+				if (existingOperationId !== operationId) {
+					// A malformed legacy WAL can collide with the operation-derived digest.
+					// Preserve both records under distinct canonical ids rather than silently
+					// discarding an unrelated report.
+					migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}\0${reportId}`)}`;
+				}
+			}
 			if (table[migratedId]) {
+				// The canonical report already wins this deterministic collision. The
+				// operation/outbox rewrites below keep every surviving reference coherent.
+				logger.warn("Coordinator legacy report id collision resolved", {
+					sessionId: record.session_id,
+					legacyReportId: reportId,
+					canonicalReportId: migratedId,
+					operationId,
+				});
+				migratedReportIds.set(reportId, migratedId);
 				delete table[reportId];
 				continue;
 			}
 			report.report_id = migratedId;
 			table[migratedId] = report;
+			migratedReportIds.set(reportId, migratedId);
 			delete table[reportId];
+		}
+	}
+	if (migratedReportIds.size > 0) {
+		const requests = record.requests as Record<string, unknown>;
+		const operations = requests.operations;
+		if (operations && typeof operations === "object" && !Array.isArray(operations)) {
+			for (const operation of Object.values(operations as Record<string, Record<string, unknown>>)) {
+				if (!operation || typeof operation !== "object" || Array.isArray(operation)) continue;
+				if (typeof operation.local_id === "string")
+					operation.local_id = migratedReportIds.get(operation.local_id) ?? operation.local_id;
+			}
+		}
+		const outbox = record.outbox as Record<string, Record<string, unknown>>;
+		for (const event of Object.values(outbox)) {
+			if (!event || typeof event !== "object" || Array.isArray(event) || event.entity !== "report") continue;
+			if (typeof event.entity_id === "string")
+				event.entity_id = migratedReportIds.get(event.entity_id) ?? event.entity_id;
+			const payload = event.payload;
+			if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+				const reportId = (payload as Record<string, unknown>).report_id;
+				if (typeof reportId === "string")
+					(payload as Record<string, unknown>).report_id = migratedReportIds.get(reportId) ?? reportId;
+			}
 		}
 	}
 	if (authorities && typeof authorities === "object" && !Array.isArray(authorities)) {
@@ -1343,9 +1388,16 @@ export async function listCanonicalActiveSessions(
 	const active: string[] = [];
 	for (const sessionId of sessionIds) {
 		if (options.signal?.aborted) throw options.signal.reason ?? new Error("aborted");
-		const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
-		if (!transaction) continue;
-		assertTransaction(transaction, path.basename(paths.root), sessionId);
+		let transaction: CoordinatorSessionTransactionV1 | null;
+		try {
+			transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+			if (!transaction) continue;
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "state_corrupt") throw error;
+			logger.warn("Coordinator active-session scan skipped corrupt WAL", { sessionId });
+			continue;
+		}
 		const hasActiveTurn = Object.values(transaction.canonical.turns).some(turn =>
 			["queued", "delivering", "active", "waiting_for_answer", "completing"].includes(turn.status),
 		);
@@ -1440,11 +1492,32 @@ export async function readSessionTransaction(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
 ): Promise<CoordinatorSessionTransactionV1 | null> {
-	const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
-	if (!transaction) return null;
-	assertTransaction(transaction, path.basename(paths.root), sessionId);
-	normalizeOutbox(transaction);
-	return transaction;
+	const file = transactionPath(paths, sessionId);
+	return await withFileLock(transactionLockPath(paths, sessionId), async () => {
+		const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+		if (!transaction) return null;
+		const beforeMigration = digest(JSON.stringify(transaction));
+		assertTransaction(transaction, path.basename(paths.root), sessionId);
+		normalizeOutbox(transaction);
+		if (digest(JSON.stringify(transaction)) !== beforeMigration) {
+			// Legacy report ids and their references are repaired as one durable WAL
+			// transaction. Bump the revision so scheduler/projection consumers cannot
+			// mistake the repaired image for the pre-migration one.
+			transaction.revision += 1;
+			transaction.projection.scheduler_pending_revision = transaction.revision;
+			transaction.projection.scheduler_digest = digest(
+				JSON.stringify({
+					session_id: transaction.session_id,
+					revision: transaction.revision,
+					active: transaction.canonical.queue.active_turn_id !== null,
+					state: transaction.canonical.desired_session_state,
+				}),
+			);
+			assertTransaction(transaction, path.basename(paths.root), sessionId);
+			await writeAtomic(file, transaction);
+		}
+		return transaction;
+	});
 }
 
 export async function withSessionTransaction<T>(
@@ -2324,10 +2397,19 @@ export async function enumeratePublicDeliveries(
 					after_order_key: afterOrderKey,
 				});
 			} catch (error) {
-				if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
+				if (error instanceof Error && (error.message === "resource_gone" || error.message === "state_corrupt")) {
+					if (error.message === "state_corrupt")
+						logger.warn("Coordinator delivery scan skipped corrupt WAL", { sessionId });
+				} else throw error;
 			}
-			const endpointIncarnation = (await readSessionTransaction(paths, sessionId))?.canonical.session.broker
-				.endpoint_incarnation;
+			let endpointIncarnation: string | undefined;
+			try {
+				endpointIncarnation = (await readSessionTransaction(paths, sessionId))?.canonical.session.broker
+					.endpoint_incarnation;
+			} catch (error) {
+				if (!(error instanceof Error) || error.message !== "state_corrupt") throw error;
+				logger.warn("Coordinator delivery scan skipped corrupt WAL", { sessionId });
+			}
 			for (const claim of batch)
 				claims.push({
 					...claim,
