@@ -10573,16 +10573,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							}
 							if (status !== "accepted")
 								throw new SdkClientError("terminal_uncertain", "Workflow gate answer was not accepted.");
-							const resolvedAt =
-								typeof resolution?.resolved_at === "string" ? resolution.resolved_at : new Date().toISOString();
+							const reportedResolvedAt =
+								typeof resolution?.resolved_at === "string" ? resolution.resolved_at : undefined;
+							// The gate timestamp is remote metadata; retention must age the local receipt from
+							// the coordinator's own persistence time so a skewed or replayed response cannot
+							// delete a fresh answer.
+							const persistedAt = new Date().toISOString();
+							const resolvedAt = reportedResolvedAt ?? persistedAt;
 							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 								const question = transaction.canonical.questions[questionId];
 								if (!question || question.claim_fence_epoch !== (claimed as { fence: number }).fence)
 									throw new Error("terminal_uncertain");
 								question.status = "answered";
-								question.answered_at = resolvedAt;
-								question.updated_at = resolvedAt;
-								question.history.push({ at: resolvedAt, status: "answered", reason: null });
+								question.answered_at = persistedAt;
+								question.updated_at = persistedAt;
+								question.history.push({ at: persistedAt, status: "answered", reason: null });
 								const authority = transaction.canonical.gate_authorities[question.authority_id];
 								if (authority)
 									authority.outcome = { state: "answered", turn_id: turnId, question_id: questionId };
@@ -10600,7 +10605,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									resolved_at: resolvedAt,
 								};
 								request.phase = "completed";
-								request.updated_at = resolvedAt;
+								request.updated_at = persistedAt;
 							});
 							return {
 								ok: true,
