@@ -19,12 +19,12 @@ import {
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
+	lifecycleFailureMessage,
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 	reapDeadLifecycleMarkers,
 	reapDeadSessionRegistrations,
-	lifecycleFailureMessage,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
 	setLifecycleTimingForTest,
@@ -67,8 +67,8 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 
 test("formats cause-bearing diagnostics for children that started and exited", () => {
 	const child = { exitCode: 23, signalCode: null } as never;
-	expect(lifecycleFailureMessage("Session exited before readiness.", child, "native addon missing")).toBe(
-		"Session exited before readiness. (exit=23; stderr=native addon missing)",
+	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
+		"Session exited before readiness. (exit=23)",
 	);
 });
 
@@ -2616,13 +2616,13 @@ test("broker preserves spawn_failed when the ChildProcess emits an error before 
 	}
 });
 
-test("broker includes child stderr and exit status when a started child exits before readiness", async () => {
+test("broker reports child exit status without publishing detached-host stderr", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-diagnostic-"));
 	const broker = new Broker({ agentDir: path.join(root, "agent") });
 	try {
 		setLifecycleCommandResolverForTest(broker, () => ({
-			file: "/bin/sh",
-			args: ["-c", "printf child-startup-failed >&2; exit 23"],
+			file: process.execPath,
+			args: ["-e", "process.stderr.write('child-startup-failed' + 'x'.repeat(64 * 1024)); process.exit(23)"],
 		}));
 		await broker.start();
 		await expect(
@@ -2645,8 +2645,12 @@ test("broker includes child stderr and exit status when a started child exits be
 		);
 		expect(response).toMatchObject({
 			ok: false,
-			error: { message: expect.stringContaining("stderr=child-startup-failed") },
+			error: { message: expect.stringContaining("exit=23") },
 		});
+		expect(JSON.stringify(response)).not.toContain("child-startup-failed");
+		const sdkDirectory = path.join(root, ".gjc", "state", "sdk");
+		const names = await fs.readdir(sdkDirectory).catch(() => [] as string[]);
+		expect(names.some(name => name.includes(".lifecycle.stderr.") && name.endsWith(".log"))).toBe(false);
 	} finally {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();

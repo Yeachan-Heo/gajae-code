@@ -2535,7 +2535,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const causes = [
 			"Unable to spawn session: spawn ENOENT (binary not found)",
-			"Session created-session-1 exited before registering readiness. (exit=23; stderr=child startup failed)",
+			"Session created-session-1 exited before registering readiness. (exit=23)",
 		];
 		for (const [index, cause] of causes.entries()) {
 			const controls: SdkControl[] = [];

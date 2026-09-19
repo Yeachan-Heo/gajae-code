@@ -32,7 +32,6 @@ import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
-import { sanitizeSdkStartupMessage } from "../sdk/startup-capability";
 import { type SessionAttachment, SessionRouter, type SessionRouterDeps, SessionRouterError } from "../sdk/router";
 import {
 	type ActivatedPreparedSession,
@@ -40,6 +39,7 @@ import {
 	SessionActivationError,
 } from "../sdk/session-activation";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../sdk/session-list";
+import { sanitizeSdkStartupMessage } from "../sdk/startup-capability";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
