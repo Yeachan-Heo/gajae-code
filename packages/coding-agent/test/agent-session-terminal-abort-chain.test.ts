@@ -986,6 +986,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// admission sequence) and the rearm consumes it.
 		await waitFor(() => !session.agent.hasQueuedSteering(), "requester steer consumed");
 		await promptPromise;
+		// The rearmed continuation is admitted asynchronously after the aborted
+		// run settles; join it before shared teardown disposes its manager.
+		await session.waitForIdle();
 	}, 30_000);
 
 	it("terminal abort discards snapshots captured by replay-only admissions", async () => {
