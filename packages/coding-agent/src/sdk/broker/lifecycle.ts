@@ -6854,8 +6854,9 @@ export async function executeLifecycle(
 }
 
 /**
- * The live client/socket subscription count of the SDK session endpoint this
- * process serves, or `undefined` while this process serves no endpoint.
+ * The live SDK demand count of the session endpoint this process serves, or
+ * `undefined` while this process serves no endpoint. Observer-only sockets are
+ * excluded by {@link SessionHostRuntimeEvidence.observerClients}.
  *
  * Only the SDK session runtime owns the real socket table, so it publishes a
  * reader here instead of every consumer re-deriving attachment from the OS.
@@ -6867,6 +6868,8 @@ export type SessionHostAttachmentReader = () => number;
 export interface SessionHostRuntimeEvidence {
 	/** This runtime's own live SDK client/socket subscription count. */
 	attachedClients: SessionHostAttachmentReader;
+	/** Optional subset of attached sockets that only observes the host. */
+	observerClients?: SessionHostAttachmentReader;
 	/** Whether this runtime currently has agent work in flight. */
 	workInFlight: () => boolean;
 }
@@ -6907,14 +6910,14 @@ export function publishSessionHostRuntimeEvidence(evidence: SessionHostRuntimeEv
 }
 
 /**
- * This process's currently attached SDK client count, summed across every
+ * This process's currently demanding SDK client count, summed across every
  * serving runtime, or `undefined` when no runtime publishes a readable count
  * (before startup, after teardown, or when every reader itself fails). Never
  * guesses: absence of a reader is absence of evidence.
  */
 export function sessionHostAttachedClients(): number | undefined {
 	let total: number | undefined;
-	for (const { attachedClients } of sessionHostRuntimes) {
+	for (const { attachedClients, observerClients } of sessionHostRuntimes) {
 		let count: number;
 		try {
 			count = attachedClients();
@@ -6922,7 +6925,17 @@ export function sessionHostAttachedClients(): number | undefined {
 			continue;
 		}
 		if (!Number.isSafeInteger(count) || count < 0) continue;
-		total = (total ?? 0) + count;
+		let observers = 0;
+		if (observerClients) {
+			try {
+				const observed = observerClients();
+				if (Number.isSafeInteger(observed) && observed >= 0) observers = Math.min(count, observed);
+			} catch {
+				// If the observer subset is unavailable, retain the full attachment
+				// count. Losing positive demand evidence is fail-closed.
+			}
+		}
+		total = (total ?? 0) + count - observers;
 	}
 	return total;
 }
