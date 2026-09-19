@@ -371,9 +371,9 @@ async function expectWorkLeaseKeepsHostAliveUntilReleased(): Promise<void> {
 			now: () => nowMs,
 			sleep: async ms => {
 				nowMs += ms;
-			polls += 1;
-			if (polls === 1) firstPoll.resolve();
-			await Promise.resolve();
+				polls += 1;
+				if (polls === 1) firstPoll.resolve();
+				await Promise.resolve();
 			},
 			idleGraceMs: 20,
 			firstAttachGraceMs: 40,

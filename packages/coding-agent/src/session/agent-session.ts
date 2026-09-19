@@ -143,11 +143,7 @@ import {
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
-import {
-	createSessionWorkLease,
-	type SessionWorkLease,
-	type SessionWorkLeaseHandle,
-} from "./session-work-lease";
+import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ForkContextSeedMetadata {
