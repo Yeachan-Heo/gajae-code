@@ -275,6 +275,31 @@ describe("gjc mcp CLI helpers", () => {
 		expect(byName.alpha.path).toBe(configPath);
 	});
 
+	it("diagnoses every untimed autoload registration before startup can drop it", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		const configPath = getMCPConfigPath("user", projectDir);
+		const mcpServers = Object.fromEntries(
+			Array.from({ length: 22 }, (_, index) => [
+				`server-${String(index + 1).padStart(2, "0")}`,
+				{ type: "stdio", command: `server-${index + 1}` },
+			]),
+		);
+		await fs.mkdir(path.dirname(configPath), { recursive: true });
+		await fs.writeFile(configPath, JSON.stringify({ mcpServers }));
+
+		await runMCPCommand({ action: "list", flags: { json: true }, cwd: projectDir });
+
+		const parsed = JSON.parse(stdoutText(stdout)) as {
+			servers: Array<{ name: string; runtimeStatus: string; startupDiagnostic?: string }>;
+		};
+		expect(parsed.servers).toHaveLength(22);
+		for (const entry of parsed.servers) {
+			expect(entry.runtimeStatus).toBe("autoload");
+			expect(entry.startupDiagnostic).toContain("250ms");
+			expect(entry.startupDiagnostic).toContain("--timeout");
+		}
+	});
+
 	it("never points autoload-off servers at a connect surface the CLI does not expose", async () => {
 		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 		const configPath = getMCPConfigPath("user", projectDir);

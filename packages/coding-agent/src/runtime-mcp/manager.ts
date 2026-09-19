@@ -35,6 +35,7 @@ import {
 	MCPPoolLeaseReleaseError,
 } from "./pool";
 import type { MCPProtocolObservation } from "./protocol";
+import { DEFAULT_MCP_STARTUP_WAIT_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -101,7 +102,7 @@ type RetiredLeaseRelease = {
 	promise: Promise<void>;
 };
 
-const STARTUP_TIMEOUT_MS = 250;
+const STARTUP_TIMEOUT_MS = DEFAULT_MCP_STARTUP_WAIT_MS;
 const STARTUP_TIMEOUT_GRACE_MS = 500;
 /**
  * Default ceiling on how long `discoverAndConnect` waits for a server batch to
@@ -1337,6 +1338,12 @@ export class MCPManager {
 							continue;
 						}
 						const message = `MCP server connection timed out during startup: ${task.name}`;
+						logger.warn("MCP server connection timed out during startup", {
+							path: `mcp:${task.name}`,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+							remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
+						});
 						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
 						task.connectionAbort.abort(new Error(message));
@@ -1384,6 +1391,14 @@ export class MCPManager {
 					const reason = task.tracked.reason;
 					this.#retainConnectionCleanupFailure(name, reason);
 					const message = reason instanceof Error ? reason.message : String(reason);
+					if (!(this.#toolsOnly && reason instanceof MCPExpectedFailure)) {
+						logger.warn("MCP server connection failed during startup", {
+							path: `mcp:${name}`,
+							error: message,
+							remediation:
+								"Check the server command and set --timeout <ms> when startup is expected to be slow.",
+						});
+					}
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
 					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {

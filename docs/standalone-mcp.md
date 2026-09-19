@@ -28,6 +28,22 @@ A server is loaded at startup when all of the following hold:
 
 Malformed or unparseable definitions are skipped fail-closed: they are never partially loaded, a warning is emitted, and the session continues with the remaining valid servers. A server that fails to connect reports an error entry and the session continues.
 
+Ordinary startup waits up to 250ms for the initial MCP batch. A registration
+without a positive `timeout` is disconnected when that wait expires, so slow
+stdio or remote servers can be absent from the first session even though the
+registration is valid. `gjc mcp list` reports a `startupDiagnostic` for these
+entries (and the runtime log records the server name and timeout reason). Add a
+per-server window when registering a slow server, for example:
+
+```bash
+gjc mcp add <name> --command <cmd> --timeout 10000
+```
+
+With a positive `timeout`, startup stops blocking at the ordinary wait but the
+server continues connecting in the background until its declared window ends.
+The connection result and log retain a per-server error if that window is also
+exhausted.
+
 ### Opt out
 
 Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCPs and exact-file `--mcp-config` remain governed by their own surfaces). `--no-mcp` and `--mcp-config` are mutually exclusive.
