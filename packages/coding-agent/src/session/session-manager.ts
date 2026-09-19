@@ -2179,14 +2179,19 @@ const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
  *    registry is filtered to definitions carrying `handle`
  *    (`slash-commands/acp-builtins.ts`), so a `handleTui`-only command such as
  *    `/new` is a different dead end rather than a fix.
- * 3. **It must not drop the retained near-limit entry.** The failed append is
- *    kept in memory with a full rewrite armed, and the message promises it
+ * 3. **It must not drop the retained near-limit entries.** A failed append is
+ *    kept in memory with a full rewrite armed, and a rejected managed rewrite
+ *    likewise retains its resident entries; both messages promise the work
  *    persists on the next successful write. `/compact` and `/clear` keep the
  *    manager — and therefore that pending debt — alive; a session switch closes
  *    the writer without paying it.
  *
- * `session-recovery-guidance.test.ts` pins all three against the CLI, builtin,
- * and ACP registries.
+ * Every near-limit error class MUST interpolate this constant rather than
+ * restate the advice. `SessionNearLimitRewriteError` restated it and thereby
+ * reintroduced `gjc export <session-file>` after #5621 removed it (#5691).
+ *
+ * `session-recovery-guidance.test.ts` pins all three constraints against the
+ * CLI, builtin, and ACP registries, for every near-limit error class.
  */
 export const SESSION_LIMIT_RECOVERY_ACTIONS =
 	"compact the session (`/compact`), or clear its context (`/clear`) if compaction cannot reclaim enough";
@@ -2279,7 +2284,10 @@ export class SessionNearLimitRewriteError extends Error {
 		super(
 			[
 				`near_limit_rewrite: live transcript (${details.transcriptBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
-				"The rewrite was rejected and the resident entries are retained in memory; the transcript persists again after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+				// Must reuse SESSION_LIMIT_RECOVERY_ACTIONS rather than restate the advice:
+				// this error class reintroduced `gjc export <session-file>` (#5691) after
+				// #5621 removed it, because it hardcoded its own copy of the guidance.
+				`The rewrite was rejected and the resident entries are retained in memory; the transcript persists again once you ${SESSION_LIMIT_RECOVERY_ACTIONS}.`,
 			].join(" "),
 		);
 		this.name = "SessionNearLimitRewriteError";
@@ -15750,8 +15758,10 @@ export class SessionManager {
 					// a typed near-limit outcome, not an unclassified abort: surface a
 					// rewrite-scoped error instead of leaking a raw `content_too_large`
 					// rejection to callers with no entry context. Resident entries stay
-					// in memory, so the transcript persists again after `/compact` or
-					// export.
+					// in memory, so the transcript persists again once the user runs one
+					// of the actions in SESSION_LIMIT_RECOVERY_ACTIONS. Do not name the
+					// commands here — a second copy of the advice is how `gjc export`
+					// came back (#5732).
 					if (err instanceof Error && err.message === "content_too_large") {
 						throw new SessionNearLimitRewriteError({
 							transcriptBytes: bytes.byteLength,
