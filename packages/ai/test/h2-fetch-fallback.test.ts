@@ -187,24 +187,27 @@ describe("h2-fetch wrapper (issue #5178)", () => {
 		patched.restore();
 	});
 
-	it("falls back to h1 for an idempotent GET after an h2 stream reset", async () => {
+	it("does not replay a GET after an h2 stream reset without refusal proof", async () => {
 		const streamReset = Object.assign(new Error("HTTP/2 stream reset"), { code: "HTTP2StreamReset" });
 
 		const patched = withPatchedFetch((_input, init) => {
 			if ((init as { protocol?: string } | undefined)?.protocol === "http2") throw streamReset;
-			return Promise.resolve(new Response("ok-h1", { status: 200 }));
+			throw new Error("unexpected h1 retry");
 		});
 		installH2Fetch();
 
-		const response = await fetch("https://chatgpt.com/backend-api/codex/responses");
-		expect(response.status).toBe(200);
-		expect(await response.text()).toBe("ok-h1");
+		let caught: unknown;
+		try {
+			await fetch("https://chatgpt.com/backend-api/codex/responses");
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBe(streamReset);
 
 		const h1Attempts = patched.calls.filter(
 			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
 		);
-		expect(h1Attempts).toHaveLength(1);
-		expect(h1Attempts[0]?.init?.method).toBeUndefined();
+		expect(h1Attempts).toHaveLength(0);
 		patched.restore();
 	});
 
@@ -298,18 +301,44 @@ describe("h2-fetch wrapper (issue #5178)", () => {
 		});
 	}
 
-	it("still falls back to h1 for a replay-safe GET after ConnectionReset", async () => {
+	it("does not replay a GET after ConnectionReset without refusal proof", async () => {
 		const transportFailure = Object.assign(new TypeError("connection reset"), { code: "ConnectionReset" });
 
 		const patched = withPatchedFetch((_input, init) => {
 			if ((init as { protocol?: string } | undefined)?.protocol === "http2") {
 				throw transportFailure;
 			}
+			throw new Error("unexpected h1 retry");
+		});
+		installH2Fetch();
+
+		let caught: unknown;
+		try {
+			await fetch(BROKER_TOKEN_URL, { method: "GET" });
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBe(transportFailure);
+
+		const h1Attempts = patched.calls.filter(
+			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+		);
+		expect(h1Attempts).toHaveLength(0);
+		patched.restore();
+	});
+
+	it("retries a body-bearing POST after HTTP2RefusedStream proves the peer never processed it", async () => {
+		const refusedStream = Object.assign(new TypeError("h2 stream refused"), {
+			code: "HTTP2RefusedStream",
+		});
+
+		const patched = withPatchedFetch((_input, init) => {
+			if ((init as { protocol?: string } | undefined)?.protocol === "http2") throw refusedStream;
 			return Promise.resolve(new Response("ok-h1", { status: 200 }));
 		});
 		installH2Fetch();
 
-		const response = await fetch(BROKER_TOKEN_URL, { method: "GET" });
+		const response = await fetch(BROKER_TOKEN_URL, brokerExchangeInit());
 		expect(response.status).toBe(200);
 		expect(await response.text()).toBe("ok-h1");
 
@@ -317,6 +346,8 @@ describe("h2-fetch wrapper (issue #5178)", () => {
 			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
 		);
 		expect(h1Attempts).toHaveLength(1);
+		expect(h1Attempts[0]?.init?.method).toBe("POST");
+		expect(h1Attempts[0]?.init?.body).toBe(JSON.stringify(brokerBody()));
 		patched.restore();
 	});
 
