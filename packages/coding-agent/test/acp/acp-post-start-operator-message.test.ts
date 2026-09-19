@@ -61,7 +61,10 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 		const operator = String(data.operatorMessage);
 		expect(operator).toContain("Upstream provider failure");
 		expect(operator).toContain("server_is_overloaded");
-		expect(operator).toContain("not your task");
+		expect(operator).toContain("the model provider ended this turn");
+		// Finding 2: `post_start` proves execution began, so the wording must NOT absolve the task.
+		expect(operator).not.toContain("not your task");
+		expect(operator).toContain("may have taken effect");
 	});
 
 	it("says nothing for a post-start failure that is not a provider transport failure", () => {
@@ -105,5 +108,33 @@ describe("post-start terminal wording names the upstream provider (issue #5664)"
 			category: "agent_runtime",
 			retryability: "terminal",
 		});
+	});
+
+	it("says nothing for a SUBMISSION-phase provider transport failure (review finding 1)", () => {
+		// A submission-phase rejection never started executing. Selecting the wording on `category`
+		// alone gave this case "the model provider ended this turn", describing a turn that never ran.
+		// The phase gate is what makes the claim true of the case it is attached to.
+		const data = wireData(promptFailure({ providerCode: "server_is_overloaded", phase: "submission" }));
+
+		expect(data).toMatchObject({
+			phase: "submission",
+			category: "provider_transport",
+			retryability: "transient",
+			providerCode: "server_is_overloaded",
+		});
+		expect(data).not.toHaveProperty("operatorMessage");
+	});
+
+	it("does not claim the operator's work is unaffected by a post-start failure (review finding 2)", () => {
+		// `post_start` proves execution began: tools may have run and had effects before the provider
+		// died. The wording must attribute the failure upstream WITHOUT asserting the task was
+		// untouched, because neither `phase` nor `category` establishes that.
+		const data = wireData(promptFailure({ providerCode: "server_is_overloaded", phase: "post_start" }));
+		const operator = String(data.operatorMessage);
+
+		expect(operator).toContain("Upstream provider failure");
+		expect(operator).not.toContain("not your task");
+		expect(operator).toMatch(/already performed may have taken effect/);
+		expect(operator).toContain("check before retrying");
 	});
 });
