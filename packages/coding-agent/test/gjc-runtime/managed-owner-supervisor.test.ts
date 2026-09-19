@@ -437,6 +437,32 @@ describe("managed owner supervisor", () => {
 		}
 	});
 
+	it("forwards an early SIGTERM while child provenance is transiently unavailable", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const forcedMissingChildStart = path.join(stateDir, "forced-missing-child-start.marker");
+		const forwardedSignal = path.join(stateDir, "forwarded-sigterm.marker");
+		try {
+			const childScript = [
+				`const { appendFileSync } = await import("node:fs");`,
+				`process.on("SIGTERM", () => { appendFileSync(${JSON.stringify(forwardedSignal)}, "forwarded\\n"); process.exit(0); });`,
+				'process.kill(process.ppid, "SIGTERM");',
+				"setTimeout(() => process.exit(0), 1_000);",
+			].join(" ");
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", childScript],
+				{},
+				{ forceMissingChildStartMarker: forcedMissingChildStart },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			expect(await fs.readFile(forcedMissingChildStart, "utf8")).toMatch(/^forced-missing-child-start:\d+\n$/);
+			expect(await fs.readFile(forwardedSignal, "utf8")).toBe("forwarded\n");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not mint a SIGABRT receipt for a normally exiting child", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {

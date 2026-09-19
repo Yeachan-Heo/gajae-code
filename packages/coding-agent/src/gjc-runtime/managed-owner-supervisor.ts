@@ -349,6 +349,69 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		stderr: "inherit",
 		env: childEnvironment,
 	});
+	let childExited = false;
+	const childExitPromise = child.exited.then(exitCode => {
+		childExited = true;
+		return exitCode;
+	});
+	let sigtermRelayed = false;
+	let relayedIntent: OwnerIntent | null = null;
+	let relayedAt: string | null = null;
+	const relayAuthorizedSigterm = (deliver: () => boolean): void => {
+		// Latch the first successful delivery and the intent snapshot that authorized it.
+		// A later intent cannot retroactively authorize an already-delivered signal. When
+		// delivery is not proven, a later signal may retry.
+		if (childExited || sigtermRelayed) return;
+		let candidateIntent: OwnerIntent | null = null;
+		let intentEvidencePresent = false;
+		let expiredIntent = false;
+		try {
+			const intentFile = lifecyclePaths(stateDir, sessionId, generation).intentFile;
+			try {
+				fsSync.lstatSync(intentFile);
+				intentEvidencePresent = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
+				else throw error;
+			}
+			const candidate: unknown = intentEvidencePresent ? readNoFollowJsonSync(intentFile) : null;
+			if (
+				isValidOwnerIntent(candidate) &&
+				candidate.session_id === sessionId &&
+				candidate.generation === generation
+			) {
+				const now = Date.now();
+				const active = Date.parse(candidate.created_at) <= now && Date.parse(candidate.expires_at) > now;
+				if (!active && Date.parse(candidate.expires_at) <= now) expiredIntent = true;
+				else if (active && candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV])
+					candidateIntent = candidate;
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+			intentEvidencePresent = false;
+			candidateIntent = null;
+		}
+		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
+		try {
+			if (!deliver()) return;
+		} catch {
+			// The child exited between intent capture and delivery.
+			return;
+		}
+		sigtermRelayed = true;
+		relayedIntent = candidateIntent;
+		relayedAt = new Date().toISOString();
+	};
+	const relayUnprovenSigterm = () => {
+		sigtermPending = true;
+		relayAuthorizedSigterm(() => {
+			child.kill("SIGTERM");
+			return true;
+		});
+	};
+	process.removeListener("SIGTERM", captureEarlySigterm);
+	process.on("SIGTERM", relayUnprovenSigterm);
+	if (sigtermPending) relayUnprovenSigterm();
 	const publishRedactedTerminal = async (exitCode: number): Promise<boolean> => {
 		if (!redactCommand) return false;
 		try {
@@ -371,9 +434,39 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 			return false;
 		}
 	};
-	const childStartTime = await managedOwnerProcessProvenance(child.pid);
+	const publishRelayedTerminal = async (exitCode: number): Promise<boolean> => {
+		const terminalIntent = relayedIntent as OwnerIntent | null;
+		if (child.signalCode === "SIGABRT" || !sigtermRelayed || !terminalIntent) return false;
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
+				observer: "raw_monitor",
+				observed_at: relayedAt ?? new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: exitCode,
+				exit_kind: "supervisor_child_exit",
+				reason: "managed_owner_supervisor_exit",
+				operator_dispatch_id: terminalIntent.dispatch_id,
+				operator_intent_id: terminalIntent.intent_id,
+			});
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	let childStartTime = await managedOwnerProcessProvenance(child.pid);
+	while (!childStartTime && !childExited) {
+		await Promise.race([childExitPromise, Bun.sleep(20)]);
+		if (!childExited && sigtermPending) childStartTime = await managedOwnerProcessProvenance(child.pid);
+	}
+	process.removeListener("SIGTERM", relayUnprovenSigterm);
 	if (!childStartTime) {
-		const exitCode = await child.exited;
+		const exitCode = await childExitPromise;
 		const stagedJournal = await recordStagedTerminal(
 			stateDir,
 			sessionId,
@@ -386,6 +479,10 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		);
 		if (stagedJournal === "failed" || stagedJournal === "recorded") {
 			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
+		if (await publishRelayedTerminal(exitCode)) {
+			process.exitCode = exitCode;
 			return;
 		}
 		if (child.signalCode === "SIGABRT" && (await publishRedactedTerminal(exitCode))) {
@@ -420,6 +517,10 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		);
 		if (stagedJournal === "failed" || stagedJournal === "recorded") {
 			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
+		if (await publishRelayedTerminal(exitCode)) {
+			process.exitCode = exitCode;
 			return;
 		}
 		if (child.signalCode === "SIGABRT") {
@@ -465,62 +566,14 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 	}
 	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
 		throw new Error("managed_owner_child_incarnation_mismatch");
-	let childExited = false;
-	let sigtermRelayed = false;
-	let relayedIntent: OwnerIntent | null = null;
-	let relayedAt: string | null = null;
 	const relaySigterm = () => {
-		// Latch the first successful delivery and the intent snapshot that authorized it.
-		// A later intent cannot retroactively authorize an already-delivered signal. When
-		// signalRoot returns false, delivery was not proven and a later signal may retry.
-		if (childExited || sigtermRelayed) return;
-		let candidateIntent: OwnerIntent | null = null;
-		let intentEvidencePresent = false;
-		let expiredIntent = false;
-		try {
-			const intentFile = lifecyclePaths(stateDir, sessionId, generation).intentFile;
-			try {
-				fsSync.lstatSync(intentFile);
-				intentEvidencePresent = true;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
-				else throw error;
-			}
-			const candidate: unknown = intentEvidencePresent ? readNoFollowJsonSync(intentFile) : null;
-			if (
-				isValidOwnerIntent(candidate) &&
-				candidate.session_id === sessionId &&
-				candidate.generation === generation
-			) {
-				const now = Date.now();
-				const active = Date.parse(candidate.created_at) <= now && Date.parse(candidate.expires_at) > now;
-				if (!active && Date.parse(candidate.expires_at) <= now) expiredIntent = true;
-				else if (active && candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV])
-					candidateIntent = candidate;
-			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
-			intentEvidencePresent = false;
-			candidateIntent = null;
-		}
-		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
-		try {
-			if (!childProcess.signalRoot(15)) return;
-		} catch {
-			// The child exited between intent capture and delivery.
-			return;
-		}
-		sigtermRelayed = true;
-		relayedIntent = candidateIntent;
-		relayedAt = new Date().toISOString();
+		relayAuthorizedSigterm(() => childProcess.signalRoot(15));
 	};
 	sigtermPending ||= bootstrapSigtermPending;
 	process.removeListener("SIGTERM", captureBootstrapSigterm);
-	process.removeListener("SIGTERM", captureEarlySigterm);
 	process.on("SIGTERM", relaySigterm);
 	if (sigtermPending) relaySigterm();
-	const exitCode = await child.exited;
-	childExited = true;
+	const exitCode = await childExitPromise;
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = new Date().toISOString();
