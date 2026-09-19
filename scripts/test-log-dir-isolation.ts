@@ -16,12 +16,7 @@ import type { ProjectEnvSnapshot } from "../packages/utils/src/env-file";
 import { canonicalEnvKey } from "../packages/utils/src/env-file";
 
 /** Environment inputs the decision reads. Injectable for tests. */
-export interface LogDirIsolationEnv {
-	GJC_LOG_DIR?: string | undefined;
-	GJC_CONFIG_DIR?: string | undefined;
-	PI_CONFIG_DIR?: string | undefined;
-	XDG_STATE_HOME?: string | undefined;
-}
+export type LogDirIsolationEnv = Record<string, string | undefined>;
 
 export type LogDirIsolationDecision =
 	/** Replace the ambient value with a fresh isolated log sink. */
@@ -36,11 +31,9 @@ export function defaultLogDirFor(input: {
 	home: string;
 	env: LogDirIsolationEnv;
 	projectEnv: ProjectEnvSnapshot;
+	xdgEligible: boolean;
 }): string {
-	// The preload has already replaced the default agent profile with a fresh
-	// custom temp directory, so the canonical log sink stays under the config
-	// root rather than following XDG shared state.
-	return resolveCanonicalLogsDir({ ...input, xdgEligible: false, pathExists: fs.existsSync });
+	return resolveCanonicalLogsDir({ ...input, pathExists: fs.existsSync });
 }
 
 function normalizePath(target: string): string {
@@ -53,20 +46,34 @@ function isPathWithin(root: string, candidate: string): boolean {
 	return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
 }
 
+function resolveThroughExistingAncestor(target: string, realpath: (target: string) => string): string | undefined {
+	let current = path.resolve(target);
+	const missing: string[] = [];
+	for (;;) {
+		try {
+			const resolved = realpath(current);
+			return normalizePath(path.join(resolved, ...missing.reverse()));
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			missing.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
 function pathsWithinOrEqual(left: string, right: string, realpath: (target: string) => string): boolean {
 	const normalizedLeft = normalizePath(left);
 	const normalizedRight = normalizePath(right);
-	try {
-		const resolvedLeft = normalizePath(realpath(left));
-		const resolvedRight = normalizePath(realpath(right));
+	const resolvedLeft = resolveThroughExistingAncestor(left, realpath);
+	const resolvedRight = resolveThroughExistingAncestor(right, realpath);
+	if (resolvedLeft !== undefined && resolvedRight !== undefined) {
 		return resolvedLeft === resolvedRight || isPathWithin(resolvedRight, resolvedLeft);
-	} catch {
-		// A nested target may not exist yet; lexical containment still prevents a
-		// later logger write from creating it below the shared sink. When both
-		// paths exist, the realpath branch above keeps a symlinked path outside
-		// the sink from being rejected merely for its lexical spelling.
-		return normalizedLeft === normalizedRight || isPathWithin(normalizedRight, normalizedLeft);
 	}
+	// If no existing ancestor can be resolved, fail closed only for lexical
+	// descendants. Existing ancestors are resolved above so a symlinked parent
+	// cannot make a missing child appear outside the shared sink.
+	return normalizedLeft === normalizedRight || isPathWithin(normalizedRight, normalizedLeft);
 }
 
 /**

@@ -702,8 +702,9 @@ export function getReportsDir(): string {
 
 /** Get the logs directory (~/.gjc/logs). */
 export function getLogsDir(): string {
+	const home = getTrustedHomeDir();
 	return resolveCanonicalLogsDir({
-		home: dirs.trustedHome,
+		home,
 		env: {
 			GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
 			PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
