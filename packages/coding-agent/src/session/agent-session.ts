@@ -9825,6 +9825,11 @@ export class AgentSession {
 
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
+		// A terminal abort can schedule a preserved follow-up as a fresh turn after
+		// the aborted run settles. Join that continuation before observing the
+		// sidecar queue; otherwise teardown can race a rearmed run and wait on its
+		// persistence while the test's manager is already being disposed.
+		await this.waitForIdle();
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
 	}
