@@ -34,6 +34,8 @@ export interface SessionActivity {
 /** Events persisted without an OS process incarnation (v1/v2 era) are legacy provenance. */
 export type SessionIdentityProvenance = "composite" | "legacy";
 export type SessionTombstoneRule = "retain" | "expire";
+/** Why the broker, rather than the host, retired a registration. */
+export type HostUnregisteredReason = "process_exited";
 /**
  * Injected retention policy (C3). The broker schedules compaction independently of
  * rotation; settings apply at the next scheduled compaction. `clock` drives both
@@ -141,6 +143,7 @@ export interface SessionIndexEvent {
 	/** Immutable endpoint file identity captured by the broker at registration. */
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
+	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/**
 	 * Distinguishes the terminal-uncertain claim written by a forced stop of a
@@ -170,6 +173,7 @@ export interface IndexedSession {
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
+	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
 	forcedStaleRelease?: boolean;
@@ -606,6 +610,9 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
+		...(latest.hostUnregisteredReason === "process_exited"
+			? { hostUnregisteredReason: latest.hostUnregisteredReason }
+			: {}),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
 		indexSeq: latest.indexSeq,
@@ -1701,6 +1708,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 		>,
+		reason?: HostUnregisteredReason,
 	): Promise<boolean> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
@@ -1781,6 +1789,7 @@ export class SessionIndex {
 					...(expected.lifecycleRequestId === undefined
 						? {}
 						: { lifecycleRequestId: expected.lifecycleRequestId }),
+					...(reason === undefined ? {} : { hostUnregisteredReason: reason }),
 				};
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));

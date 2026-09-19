@@ -9,6 +9,8 @@ import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
+import { reapDeadSessionRegistrations } from "../src/sdk/broker/lifecycle.js";
+import { SessionIndex } from "../src/sdk/broker/session-index.js";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
@@ -805,7 +807,7 @@ describe("SDK serve CLI and discovery", () => {
 		const calls: {
 			operation: string;
 			input: Record<string, unknown>;
-			options?: { idempotencyKey?: string };
+			options?: { idempotencyKey?: string; timeoutMs?: number };
 		}[] = [];
 		let resumed = false;
 		const broker = {
@@ -850,7 +852,103 @@ describe("SDK serve CLI and discovery", () => {
 		});
 		expect(calls[2]?.options?.idempotencyKey).toEqual(expect.any(String));
 		expect(calls[2]?.options?.idempotencyKey?.length).toBeLessThanOrEqual(128);
+		expect(calls[2]?.options?.timeoutMs).toBe(21_000);
 		expect(calls.filter(call => call.operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("recovers a session registration retired by the broker dead-process reaper", async () => {
+		const agentDir = await tempDir();
+		const index = await new SessionIndex(agentDir).open();
+		const sessionId = "reaped-session";
+		const deadPid = 4_194_304;
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "e".repeat(64),
+		};
+		await index.append({ sessionId, locator, endpointGeneration: 1, pid: deadPid, type: "host_registered" });
+		expect(await reapDeadSessionRegistrations({ index })).toEqual([
+			{ sessionId, pid: deadPid, endpointGeneration: 1 },
+		]);
+		const reaped = index.listSessions().sessions.find(row => row.sessionId === sessionId);
+		if (!reaped) throw new Error("reaped session row was not retained");
+
+		let resumed = false;
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ ...reaped, live: resumed }],
+							savedSession: { id: sessionId, path: path.join(agentDir, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls).toEqual(["session.list", "session.resume", "session.list"]);
+	});
+
+	test("normalizes a symlinked state root through broker lifecycle input rules", async () => {
+		const agentDir = await tempDir();
+		const cwd = path.join(agentDir, "workspace");
+		const symlinkedCwd = path.join(agentDir, "workspace-link");
+		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.symlink(cwd, symlinkedCwd, "dir");
+		const sessionId = "symlinked-state-root";
+		const locator = {
+			cwd,
+			worktreeRoot: null,
+			stateRoot: path.join(symlinkedCwd, ".gjc", "state"),
+		};
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "f".repeat(64),
+		};
+		let resumed = false;
+		let resumeInput: Record<string, unknown> | undefined;
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				if (operation === "session.resume") {
+					resumeInput = input;
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: resumed, ambiguous: false, locator }],
+							savedSession: { id: sessionId, path: path.join(cwd, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(resumeInput).toMatchObject({
+			sessionId,
+			cwd,
+			stateRoot: path.join(cwd, ".gjc", "state"),
+		});
 	});
 
 	test("wires recovery through session.get_endpoint and relay startup", async () => {

@@ -383,6 +383,7 @@ test("the broker drops registrations whose host process is gone, keeps live ones
 		expect(afterFirstSweep.find(session => session.sessionId === "leaked")).toMatchObject({
 			terminal: true,
 			live: false,
+			hostUnregisteredReason: "process_exited",
 		});
 		expect(afterFirstSweep.find(session => session.sessionId === "live")?.terminal).toBe(false);
 		expect(afterFirstSweep.find(session => session.sessionId === "uncertain")?.terminalUncertain).toBe(true);

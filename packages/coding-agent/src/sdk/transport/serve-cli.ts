@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
+import { normalizeBrokerInput } from "../broker/broker";
 import type { BrokerDiscovery } from "../broker/discovery";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError, SdkDiscoveryError } from "../client";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
@@ -166,6 +168,7 @@ type BrokerSessionRow = {
 	live: boolean;
 	ambiguous: boolean;
 	terminal?: boolean;
+	hostUnregisteredReason?: "process_exited";
 	terminalUncertain?: boolean;
 	locator?: BrokerSessionLocator;
 	savedSession?: BrokerSavedSession;
@@ -229,6 +232,7 @@ function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown)
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
 		const locator = brokerSessionLocator(item.locator);
 		const saved = pageSavedSession?.id === item.sessionId ? pageSavedSession : brokerSavedSession(item.savedSession);
+		const hostUnregisteredReason = item.hostUnregisteredReason === "process_exited" ? "process_exited" : undefined;
 		const terminalUncertain = item.terminalUncertain === true || item.terminal_uncertain === true;
 		return [
 			{
@@ -236,6 +240,7 @@ function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown)
 				live: item.live === true,
 				ambiguous: item.ambiguous === true,
 				...(item.terminal === true ? { terminal: true } : {}),
+				...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 				...(terminalUncertain ? { terminalUncertain: true } : {}),
 				...(locator === undefined ? {} : { locator }),
 				...(saved === undefined ? {} : { savedSession: saved }),
@@ -289,18 +294,22 @@ async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, se
 						candidate => candidate.sessionId === sessionId,
 					)?.savedSession;
 	if (locator === undefined || authority?.id !== sessionId) throw endpointStaleError(sessionId);
+	const normalized = normalizeBrokerInput("session.resume", { sessionId, cwd: locator.cwd });
+	if (!("input" in normalized)) {
+		brokerResult(normalized);
+		throw endpointStaleError(sessionId);
+	}
+	const input = {
+		...normalized.input,
+		sessionPath: authority.path,
+		sessionIdentity: authority.identity,
+	};
+	const timeoutMs = lifecycleRequestTimeoutMs("session.resume", input);
 	brokerResult(
-		await broker.global(
-			"session.resume",
-			{
-				sessionId,
-				cwd: locator.cwd,
-				stateRoot: locator.stateRoot,
-				sessionPath: authority.path,
-				sessionIdentity: authority.identity,
-			},
-			{ idempotencyKey: randomUUID() },
-		),
+		await broker.global("session.resume", input, {
+			idempotencyKey: randomUUID(),
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+		}),
 	);
 }
 
@@ -317,7 +326,13 @@ export async function resolveServeSession(broker: SdkClient, explicitSessionId?:
 		// `!row.live` alone treats a session that has already stopped as recoverable. A stopped
 		// row is not a stale endpoint; resuming it would restart finished work. Only rows whose
 		// liveness failed for a non-terminal reason are recovery candidates.
-		if (row !== undefined && !row.ambiguous && !row.terminal && !row.terminalUncertain && !row.live) {
+		if (
+			row !== undefined &&
+			!row.ambiguous &&
+			!row.terminalUncertain &&
+			!row.live &&
+			(!row.terminal || row.hostUnregisteredReason === "process_exited")
+		) {
 			await recoverBrokerSession(broker, row, explicitSessionId);
 			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
 		}
