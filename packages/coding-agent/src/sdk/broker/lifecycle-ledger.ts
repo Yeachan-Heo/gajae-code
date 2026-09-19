@@ -101,17 +101,30 @@ export type BeginResult =
 	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
 	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
 
+type BoundedSourceReadRejection = "not-regular-file" | "oversized-by-stat" | "oversized-by-read" | "read-error";
+
 /**
  * Why a terminal read-back produced no entry. `absent` means nothing terminal is
- * recorded for the request; `rejected` means a row exists but was refused, which is
- * evidence of a damaged ledger rather than of an unpersisted operation. Collapsing
- * the two lets a corrupt row read as "not yet written" and unfence the session.
+ * recorded for the request; `rejected` means the source or a row was refused, which
+ * is evidence of a damaged ledger rather than of an unpersisted operation. Collapsing
+ * the two lets a corrupt source or row read as "not yet written" and unfence the session.
  */
-export type TerminalReadBackRejection = "bounds" | "shape" | "undecodable" | "row-not-attributable" | "partial-row";
+export type TerminalReadBackRejection =
+	| "bounds"
+	| "shape"
+	| "undecodable"
+	| "row-not-attributable"
+	| "partial-row"
+	| BoundedSourceReadRejection;
 export type TerminalReadBack =
 	| { kind: "terminal"; entry: LifecycleLedgerEntry }
 	| { kind: "absent" }
 	| { kind: "rejected"; reason: TerminalReadBackRejection };
+
+type BoundedSourceRead =
+	| { kind: "absent" }
+	| { kind: "source"; source: Buffer }
+	| { kind: "rejected"; reason: BoundedSourceReadRejection };
 
 const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
 const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
@@ -390,8 +403,10 @@ export class LifecycleLedger {
 	 * synced row as unpersisted and replace its true reason with a generic one.
 	 */
 	async readTerminal(identity: string, requestHash: string): Promise<TerminalReadBack> {
-		const source = await this.#readBoundedSourceReadOnly();
-		if (!source) return { kind: "absent" };
+		const sourceRead = await this.#readBoundedSourceReadOnly();
+		if (sourceRead.kind === "absent") return sourceRead;
+		if (sourceRead.kind === "rejected") return sourceRead;
+		const { source } = sourceRead;
 		let prior: LifecycleLedgerEntry | undefined;
 		let latest: LifecycleLedgerEntry | undefined;
 		let rows = 0;
@@ -528,19 +543,20 @@ export class LifecycleLedger {
 			if (handle) await handle.close();
 		}
 	}
-	async #readBoundedSourceReadOnly(): Promise<Buffer | undefined> {
+	async #readBoundedSourceReadOnly(): Promise<BoundedSourceRead> {
 		let handle: fs.FileHandle | undefined;
 		try {
 			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 			const stat = await handle.stat({ bigint: true });
-			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes)) return undefined;
+			if (!stat.isFile()) return { kind: "rejected", reason: "not-regular-file" };
+			if (stat.size > BigInt(this.#limits.maxBytes)) return { kind: "rejected", reason: "oversized-by-stat" };
 			const bytes = Buffer.alloc(Number(stat.size) + 1);
 			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-			if (bytesRead > this.#limits.maxBytes) return undefined;
-			return bytes.subarray(0, bytesRead);
+			if (bytesRead > this.#limits.maxBytes) return { kind: "rejected", reason: "oversized-by-read" };
+			return { kind: "source", source: bytes.subarray(0, bytesRead) };
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			return undefined;
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+			return { kind: "rejected", reason: "read-error" };
 		} finally {
 			if (handle) await handle.close();
 		}

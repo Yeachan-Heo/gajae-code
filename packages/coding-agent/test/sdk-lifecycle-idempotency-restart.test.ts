@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -193,6 +193,89 @@ describe("SDK lifecycle ledger", () => {
 			kind: "rejected",
 			reason: "row-not-attributable",
 		});
+	});
+
+	it("returns absent for a missing or empty regular ledger", async () => {
+		const absentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-absent-"));
+		const emptyDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-empty-"));
+		try {
+			await expect(new LifecycleLedger(absentDir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "absent",
+			});
+
+			const emptyPath = path.join(emptyDir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(emptyPath), { recursive: true });
+			await fs.writeFile(emptyPath, "");
+			await expect(new LifecycleLedger(emptyDir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "absent",
+			});
+		} finally {
+			await fs.rm(absentDir, { recursive: true, force: true });
+			await fs.rm(emptyDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-regular ledger path with a named source reason", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-nonregular-"));
+		try {
+			await fs.mkdir(path.join(dir, "sdk", "lifecycle-ledger.jsonl"), { recursive: true });
+			await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "not-regular-file",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stat-oversized ledger with oversized-by-stat", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-stat-"));
+		try {
+			const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+			await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
+			await fs.writeFile(ledgerPath, "12");
+			await expect(new LifecycleLedger(dir, { maxBytes: 1 }).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "oversized-by-stat",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a read-oversized ledger with oversized-by-read", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-read-"));
+		const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+		await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
+		await fs.writeFile(ledgerPath, "1");
+		const probe = await fs.open(ledgerPath, fs.constants.O_RDONLY);
+		const readSpy = spyOn(Object.getPrototypeOf(probe), "read").mockResolvedValue({
+			buffer: Buffer.alloc(2),
+			bytesRead: 2,
+		});
+		try {
+			await expect(new LifecycleLedger(dir, { maxBytes: 1 }).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "oversized-by-read",
+			});
+		} finally {
+			readSpy.mockRestore();
+			await probe.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-ENOENT ledger read failure with read-error", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-error-"));
+		try {
+			await fs.writeFile(path.join(dir, "sdk"), "not a directory");
+			await expect(new LifecycleLedger(dir).readTerminal("target", "request")).resolves.toEqual({
+				kind: "rejected",
+				reason: "read-error",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
