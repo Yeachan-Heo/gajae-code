@@ -351,6 +351,132 @@ describe("update-cli release lookup", () => {
 			"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest responded 503",
 		);
 	});
+
+	it.each([
+		403, 429,
+	])("resolves the stable tag through the github.com redirect when the API is rate limited (%i)", async status => {
+		const requested: string[] = [];
+
+		const release = await getLatestReleaseForTest({
+			...isolated,
+			fetchImpl: async url => {
+				requested.push(String(url));
+				if (String(url).startsWith("https://api.github.com/")) return new Response("limited", { status });
+				return new Response(null, {
+					status: 302,
+					headers: { location: "https://github.com/Yeachan-Heo/gajae-code/releases/tag/v9.9.9" },
+				});
+			},
+		});
+
+		expect(requested).toEqual([
+			"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest",
+			"https://github.com/Yeachan-Heo/gajae-code/releases/latest",
+		]);
+		expect(release.tag).toBe("v9.9.9");
+		expect(release.version).toBe("9.9.9");
+		expect(release.warnings.join("\n")).toContain(`responded ${status}`);
+		expect(release.warnings.join("\n")).toContain("GITHUB_TOKEN");
+	});
+
+	it("never reaches the web fallback for a non-rate-limit API failure", async () => {
+		const requested: string[] = [];
+
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url => {
+					requested.push(String(url));
+					return new Response("nope", { status: 500 });
+				},
+			}),
+		).rejects.toThrow("responded 500");
+
+		expect(requested).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest"]);
+	});
+
+	it("refuses a redirect target that is not a stable release tag", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url =>
+					String(url).startsWith("https://api.github.com/")
+						? new Response("limited", { status: 403 })
+						: new Response(null, {
+								status: 302,
+								headers: {
+									location: "https://github.com/Yeachan-Heo/gajae-code/releases/tag/v9.9.9-nightly.1.1.gabc",
+								},
+							}),
+			}),
+		).rejects.toThrow("is not a stable vX.Y.Z release");
+	});
+
+	it("refuses a redirect that points outside the release-tag route", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url =>
+					String(url).startsWith("https://api.github.com/")
+						? new Response("limited", { status: 403 })
+						: new Response(null, { status: 302, headers: { location: "https://evil.test/releases/tag/v9.9.9" } }),
+			}),
+		).rejects.toThrow("Refusing a GitHub release redirect outside");
+	});
+
+	it("refuses a same-origin redirect that escapes the release-tag route", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url =>
+					String(url).startsWith("https://api.github.com/")
+						? new Response("limited", { status: 403 })
+						: new Response(null, {
+								status: 302,
+								headers: { location: "https://github.com/attacker/repo/releases/tag/v9.9.9" },
+							}),
+			}),
+		).rejects.toThrow("Refusing a GitHub release redirect outside");
+	});
+
+	it("refuses a release-tag redirect whose tag is unsafe", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url =>
+					String(url).startsWith("https://api.github.com/")
+						? new Response("limited", { status: 403 })
+						: new Response(null, {
+								status: 302,
+								headers: {
+									location: "https://github.com/Yeachan-Heo/gajae-code/releases/tag/v9.9.9%2F..%2Fevil",
+								},
+							}),
+			}),
+		).rejects.toThrow("Refusing unsafe GitHub release tag");
+	});
+
+	it("reports both failures when the API is rate limited and the web route is unusable", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				fetchImpl: async url =>
+					String(url).startsWith("https://api.github.com/")
+						? new Response("limited", { status: 403 })
+						: new Response("nope", { status: 500 }),
+			}),
+		).rejects.toThrow("and the github.com fallback failed");
+	});
+
+	it("points a rate-limited nightly lookup at the token workaround", async () => {
+		await expect(
+			getLatestReleaseForTest({
+				...isolated,
+				channel: "nightly",
+				fetchImpl: async () => new Response("limited", { status: 403 }),
+			}),
+		).rejects.toThrow("GITHUB_TOKEN");
+	});
 });
 
 describe("update-cli install target detection", () => {
