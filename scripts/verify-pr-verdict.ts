@@ -77,12 +77,15 @@ export interface IndependentReviewerEvidence {
 	approvedHead: boolean;
 	approvedLogin?: string;
 	/**
-	 * True when this login DOES have an APPROVED review reporting the exact head, but it was
-	 * submitted before that head existed — a stale approval GitHub re-pointed after a
-	 * force-push. Distinguished from "no approval" so the diagnostic can say which it is,
-	 * because the remedies differ: one needs a reviewer, the other needs a re-review (#5692).
+	 * Why a commit-id-bound APPROVED review was refused, when one exists.
+	 *
+	 * `rebound` means precedence is PROVEN: a readable head date and a readable earlier
+	 * submission, i.e. GitHub re-pointed a stale review after a force-push. `unreadable`
+	 * means the review is refused but that claim cannot be made — typically a head commit
+	 * date that could not be read, which fails closed rather than admitting the approval.
+	 * Absent means this login has no approval bound to the head at all (#5692 review).
 	 */
-	reboundStaleApproval?: boolean;
+	refusedApproval?: "rebound" | "unreadable";
 }
 
 /** A review normalized from either API shape so one rule can decide the effective one. */
@@ -122,40 +125,78 @@ function reviewPrecedesHead(submittedAt: string | undefined, headCommittedAt: st
  * must never disagree about which review counts — the divergence that produced issue #5483
  * and later the withdrawn-approval gap the QA lane found.
  *
- * `headCommittedAt` additionally discards reviews that predate the head they claim, which is
- * how a force-push silently re-binds a stale approval onto new code (#5692). Omitting it
- * keeps the pre-#5692 behaviour and is only for callers with no head date at all.
+ * `headCommittedAt` also discards reviews that predate the head they claim, which is how a
+ * force-push silently re-binds a stale approval onto new code (#5692).
+ *
+ * It is REQUIRED, and `undefined` rejects every review rather than admitting them. An
+ * earlier version made the precedence test conditional on having a head date, which meant a
+ * failed commit lookup, an absent committer date, or an empty local `git show` skipped the
+ * check entirely and admitted the approval — a fail-OPEN in the very guard that exists to
+ * fail closed (#5692 review).
  */
 function effectiveExactHeadReview(
 	reviews: EffectiveReview[],
 	login: string,
 	headSha: string,
-	headCommittedAt?: string,
+	headCommittedAt: string | undefined,
 ): EffectiveReview | undefined {
 	return reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
 			&& review.state !== "COMMENTED"
 			&& review.oid === headSha
-			&& !(headCommittedAt !== undefined && reviewPrecedesHead(review.submittedAt, headCommittedAt)),
+			&& !reviewPrecedesHead(review.submittedAt, headCommittedAt),
 		)
 		.at(-1);
 }
 
-/** True when this identity has a review bound to the head but only by a re-pointed commit id. */
-function hasReboundStaleReview(
+/**
+ * Why this identity has no usable exact-head approval, when it has one bound by commit id.
+ *
+ * `rebound` is claimed ONLY when precedence is actually proven: a readable head date and a
+ * readable earlier submission. When either date is unreadable the answer is `unreadable`,
+ * not `rebound` — the review is still refused, but asserting it was re-bound would be a
+ * claim the evidence does not support (#5692 review).
+ */
+type RefusedApprovalKind = "rebound" | "unreadable" | undefined;
+
+function refusedApprovalKind(
 	reviews: EffectiveReview[],
 	login: string,
 	headSha: string,
 	headCommittedAt: string | undefined,
-): boolean {
-	if (headCommittedAt === undefined) return false;
-	return reviews.some(review =>
-		review.login?.toLowerCase() === login.toLowerCase()
-		&& review.state === "APPROVED"
-		&& review.oid === headSha
-		&& reviewPrecedesHead(review.submittedAt, headCommittedAt),
-	);
+): RefusedApprovalKind {
+	// Only reviews that are still the identity's LAST word count. A later
+	// CHANGES_REQUESTED on the same head is an ordinary withdrawal, not a freshness
+	// problem, and must keep reporting as "no approval" rather than as a refusal.
+	const lastOnHead = reviews
+		.filter(review =>
+			review.login?.toLowerCase() === login.toLowerCase()
+			&& review.state !== "COMMENTED"
+			&& review.oid === headSha,
+		)
+		.at(-1);
+	if (lastOnHead?.state !== "APPROVED") return undefined;
+	const bound = [lastOnHead];
+	const headMs = headCommittedAt === undefined ? Number.NaN : Date.parse(headCommittedAt);
+	if (!Number.isFinite(headMs)) return "unreadable";
+	if (bound.some(review => {
+		const submitted = review.submittedAt === undefined ? Number.NaN : Date.parse(review.submittedAt);
+		return Number.isFinite(submitted) && submitted < headMs;
+	}))
+		return "rebound";
+	return "unreadable";
+}
+
+/** Spreadable `refusedApproval` field, omitted entirely when there is nothing to report. */
+function refusedApprovalField(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt: string | undefined,
+): { refusedApproval?: "rebound" | "unreadable" } {
+	const kind = refusedApprovalKind(reviews, login, headSha, headCommittedAt);
+	return kind === undefined ? {} : { refusedApproval: kind };
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -448,13 +489,17 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
 	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null) && !input.independentReviewerUnavailable) {
-		// Name the re-bound case separately. "No approval" sends the author looking for a
-		// reviewer; a re-bound approval means the named reviewer already looked at DIFFERENT
-		// code and has to re-review this head. Collapsing the two is what let me tell two
-		// PR authors their only remaining step was flipping a verdict verb (#5692).
+		// Three distinct situations, three distinct remedies. "No approval" sends the author
+		// looking for a reviewer; a re-bound approval means the named reviewer already read
+		// DIFFERENT code and must re-review this head; unreadable evidence means the gate
+		// refused without being able to prove either. Collapsing the first two is what let me
+		// tell two PR authors their only remaining step was flipping a verdict verb (#5692).
 		const named = review.extra.kind === "independent" ? review.extra.login : review.extra.kind;
-		if (input.independentReviewer?.reboundStaleApproval === true) {
+		const refused = input.independentReviewer?.refusedApproval;
+		if (refused === "rebound") {
 			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub re-pointed a stale review after a force-push, so it is not an approval of this code; a review submitted after the current head is required.`);
+		} else if (refused === "unreadable") {
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, who has an APPROVED review bound to this head, but its freshness could not be established: the head commit date or the review submission time was unreadable. The approval is refused rather than assumed valid; re-run once the head commit is readable, or obtain a review submitted after the current head.`);
 		} else {
 			const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
 			diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${named}); the risk-classified gate is not satisfied.`);
@@ -641,7 +686,7 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 			permission: permission.stdout.trim(),
 			approvedHead,
 			approvedLogin: login,
-			...(approvedHead ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+			...(approvedHead ? {} : refusedApprovalField(normalized, login, headSha, headCommittedAt)),
 		},
 		error: null,
 	};
@@ -752,7 +797,7 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		permission: collaborator.permission ?? "none",
 		approvedHead: approved,
 		approvedLogin: login,
-		...(approved ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+		...(approved ? {} : refusedApprovalField(normalized, login, headSha, headCommittedAt)),
 	};
 }
 

@@ -28,6 +28,11 @@ export default class Skills extends Command {
 			options: ["all", "project", "user"],
 			default: "all",
 		}),
+		limit: Flags.integer({ description: "Max discover results, clamped to 1-50 (default 50)" }),
+		offset: Flags.integer({ description: "Zero-based offset into the discover results (default 0)" }),
+		query: Flags.string({
+			description: "Filter discover results by name, description, source, or use conditions",
+		}),
 	};
 
 	static examples = [
@@ -36,6 +41,9 @@ export default class Skills extends Command {
 		"# Machine-readable embedded skill content\n  gjc skills read ralplan --json",
 		"# Show filesystem-discovered skills (project and user) with diagnostics\n  gjc skills discover",
 		"# Show only project-scope skills (project .gjc/skills locations)\n  gjc skills discover --source project --json",
+		"# Narrow a truncated catalog to the skills you care about\n  gjc skills discover --query ego-browser",
+		"# Show only the first 10 discovered skills\n  gjc skills discover --limit 10",
+		"# Page past the first 50: discover prints the exact next-page command\n  gjc skills discover --offset 50",
 	];
 
 	async run(): Promise<void> {
@@ -51,6 +59,9 @@ export default class Skills extends Command {
 			flags: {
 				json: flags.json,
 				source: (flags.source as "all" | "project" | "user" | undefined) ?? "all",
+				limit: flags.limit,
+				offset: flags.offset,
+				query: flags.query,
 			},
 		};
 		await runSkillsCommand(cmd);

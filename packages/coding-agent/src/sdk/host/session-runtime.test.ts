@@ -26,6 +26,7 @@ import {
 	createSdkSurfaceFactory,
 	type SdkOnlyInvocationRecord,
 	type SdkOnlyReconciliationStore,
+	type SdkOnlyTerminalAbortSeams,
 	SessionSdkSessionRuntime,
 	type SessionSdkTransport,
 } from "./session-runtime";
@@ -3784,6 +3785,8 @@ async function invocationHarness(
 		agentFailedWriteFailures?: number;
 		branch?: unknown[];
 		onInvocationCompletionReconciled?: (kind: string, correlation: { commandId: string; turnId: string }) => void;
+		/** Override/extend the INTERNAL terminal-abort seams the runtime is threaded. */
+		terminalAbortSeams?: Partial<SdkOnlyTerminalAbortSeams>;
 	},
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
@@ -3812,14 +3815,15 @@ async function invocationHarness(
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
 		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
-		...(interceptorStore
+		...(interceptorStore || hooks.terminalAbortSeams
 			? {
 					terminalAbortSeams: {
-						getReconciliationStore: () => interceptorStore,
 						getTerminalTurnEpoch: () => undefined,
 						getActivePromptHandle: () => undefined,
 						cancelPendingPreflightForTerminalAbort: () => {},
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
+						...(interceptorStore ? { getReconciliationStore: () => interceptorStore } : {}),
+						...hooks.terminalAbortSeams,
 					},
 				}
 			: {}),
@@ -5799,6 +5803,113 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		const budgetEndsAt = Date.now() + 10_000;
 		while (Date.now() < budgetEndsAt && !ready(correlatedFrames(harness, correlation))) await Bun.sleep(5);
 	};
+
+	test("an SDK-only prompt deadline publishes its terminal frames without aborting the run", async () => {
+		// #5637 review finding 1. The bus route's deadline fences the run through
+		// `abortPromptAndWaitWithTerminal`, which aborts the cancellation domain
+		// BEFORE it waits for settlement — that is the mid-tool kill the boundary
+		// wait exists to prevent, and it is why the bus consumes the ledger seam.
+		//
+		// This route is architecturally different: its `PromptDeadlineManager.onExpired`
+		// publishes `agent_failed` + `agent_end` and cleans up lifecycle references,
+		// and aborts NOTHING. That is precisely why no boundary wait is required
+		// here, and it is the fact this case pins. If someone later wires an abort
+		// into this path, the `abortPromptAndWaitWithTerminal` assertion below fails
+		// loudly — and whoever does it must add a boundary wait, for which the
+		// `pendingToolExecutions` seam is now threaded (both hosts expose one
+		// contract; only the bus consumes it today).
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-only-deadline-no-abort-"));
+		const abortCalls: Array<{ handle: string; graceMs: number }> = [];
+		const pendingLedgerReads: string[] = [];
+		try {
+			const harness = await invocationHarness("sdk-only-deadline-no-abort", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				terminalAbortSeams: {
+					getActivePromptHandle: () => "sdk-only-deadline-handle",
+					abortPromptAndWaitWithTerminal: async (handle, seamOptions) => {
+						abortCalls.push({ handle, graceMs: seamOptions.graceMs });
+						return { status: "settled", terminalScope: {} };
+					},
+					// Threaded through `SdkOnlyTerminalAbortSeams` (change 1): the seam
+					// must type-check and the extension must construct with it present.
+					// Reads are recorded rather than asserted non-empty — nothing on this
+					// route consults it yet, which is the honest state of the contract.
+					pendingToolExecutions: handle => {
+						pendingLedgerReads.push(handle);
+						return ["sdk-only-mutating-tool"];
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "sdk-only deadline" });
+			expect(accepted.ok).toBe(true);
+			const correlation = {
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			};
+			await harness.emit("agent_start");
+			// A dispatched tool is running when the deadline expires: its start has
+			// been delivered and no end ever follows.
+			await harness.emit("tool_execution_start", {
+				type: "tool_execution_start",
+				toolCallId: "sdk-only-mutating-tool",
+				toolName: "apply_patch",
+				args: {},
+			});
+
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
+			});
+			await awaitCorrelatedFrames(
+				harness,
+				correlation,
+				frames =>
+					frames.some(frame => frame.kind === "agent_failed") && frames.some(frame => frame.kind === "agent_end"),
+			);
+			const frames = correlatedFrames(harness, correlation);
+			expect(frames.filter(frame => frame.kind === "agent_failed")).toEqual([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						error: expect.objectContaining({ code: "prompt_deadline_exceeded" }),
+					}),
+				}),
+			]);
+			expect(frames.filter(frame => frame.kind === "agent_end")).toEqual([
+				expect.objectContaining({
+					payload: expect.objectContaining({
+						outcome: expect.objectContaining({
+							kind: "failed",
+							code: "prompt_deadline_exceeded",
+							provenance: "deadline",
+						}),
+					}),
+				}),
+			]);
+
+			// THE point of the case: the terminal was published, and the run was never
+			// aborted — so there is no mid-tool kill to prevent on this route.
+			expect(abortCalls).toEqual([]);
+			// A late real boundary for the still-"running" tool changes nothing.
+			await harness.emit("tool_execution_end", {
+				type: "tool_execution_end",
+				toolCallId: "sdk-only-mutating-tool",
+				toolName: "apply_patch",
+				isError: false,
+			});
+			await Bun.sleep(50);
+			expect(abortCalls).toEqual([]);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 
 	test("the deadline/agent_end overlap publishes exactly one correlated terminal boundary", async () => {
 		// Review P1: the two terminal publishers genuinely overlap. The provider

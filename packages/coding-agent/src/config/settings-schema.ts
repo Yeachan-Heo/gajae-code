@@ -369,6 +369,24 @@ const AUTOROUTING_PROVENANCE_JSON_SCHEMA: JsonSchemaObject = {
 	required: ["schema", "source", "declarationFingerprint", "tiersFingerprint"],
 };
 
+// SDK prompt deadline defaults. The `sdk.promptDeadlineMs` /
+// `sdk.promptMaxRuntimeMs` schema entries below and the SDK bus/host lease
+// fallbacks read these same constants, so a Settings lookup that misses — no
+// settings object, an unwritten key, a non-finite value — cannot arm a deadline
+// that disagrees with the declared default (#5583).
+export const DEFAULT_SDK_PROMPT_DEADLINE_MS = 3_600_000;
+export const DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS = 21_600_000;
+
+/** Resolve a `sdk.promptDeadlineMs` lookup, falling back on any non-finite value. */
+export function resolveSdkPromptDeadlineMs(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_SDK_PROMPT_DEADLINE_MS;
+}
+
+/** Resolve a `sdk.promptMaxRuntimeMs` lookup, falling back on any non-finite value. */
+export function resolveSdkPromptMaxRuntimeMs(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS;
+}
+
 export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// General settings (no UI)
@@ -416,13 +434,13 @@ export const SETTINGS_SCHEMA = {
 	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
 	"sdk.promptDeadlineMs": {
 		type: "number",
-		default: 3_600_000,
+		default: DEFAULT_SDK_PROMPT_DEADLINE_MS,
 		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},
 	"sdk.promptMaxRuntimeMs": {
 		type: "number",
-		default: 21_600_000,
+		default: DEFAULT_SDK_PROMPT_MAX_RUNTIME_MS,
 		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},

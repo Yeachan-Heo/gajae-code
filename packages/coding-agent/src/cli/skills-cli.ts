@@ -8,7 +8,11 @@ import {
 	type EmbeddedDefaultGjcSkill,
 	getEmbeddedDefaultGjcSkills,
 } from "../defaults/gjc-defaults";
-import { discoverRuntimeSkills, type RuntimeSkillDiscoveryCandidate } from "../extensibility/runtime-skill-discovery";
+import {
+	discoverRuntimeSkills,
+	type RuntimeSkillDiscoveryCandidate,
+	SKILL_DISCOVERY_MAX_LIMIT,
+} from "../extensibility/runtime-skill-discovery";
 
 export type SkillsAction = "list" | "read" | "discover";
 
@@ -18,6 +22,11 @@ export interface SkillsCommandArgs {
 	flags?: {
 		json?: boolean;
 		source?: "all" | "project" | "user";
+		/** Max discover results; clamped to [1, SKILL_DISCOVERY_MAX_LIMIT] by the library. */
+		limit?: number;
+		/** Zero-based start of the discover page; normalized by the library. */
+		offset?: number;
+		query?: string;
 	};
 }
 
@@ -54,6 +63,25 @@ function formatCandidate(candidate: RuntimeSkillDiscoveryCandidate): string {
 	return `${candidate.name}\t${candidate.source}\t${candidate.description}\t${candidate.path}${useWhen}`;
 }
 
+/** Shell-quote only when needed, so a single-word query stays copy-pasteable as typed. */
+function quoteArg(value: string): string {
+	if (/^[\w.,:/@=+-]+$/.test(value)) return value;
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * The continuation command, echoing back the filters the invocation carried so
+ * the printed line is runnable verbatim rather than a hint the user has to
+ * reassemble.
+ */
+function formatNextPageCommand(flags: SkillsCommandArgs["flags"], nextOffset: number): string {
+	const parts = ["gjc skills discover", `--offset ${nextOffset}`];
+	if (flags?.limit !== undefined) parts.push(`--limit ${flags.limit}`);
+	if (flags?.query) parts.push(`--query ${quoteArg(flags.query)}`);
+	if (flags?.source && flags.source !== "all") parts.push(`--source ${flags.source}`);
+	return parts.join(" ");
+}
+
 export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 	if (cmd.action === "list") {
 		const skills = listEmbeddedSkills();
@@ -74,17 +102,33 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 			const result = await discoverRuntimeSkills({
 				cwd: process.cwd(),
 				source,
+				query: cmd.flags?.query,
+				// A human paging the catalog defaults to the widest page the library
+				// serves; the library default stays sized for the agent tool's context.
+				limit: cmd.flags?.limit ?? SKILL_DISCOVERY_MAX_LIMIT,
+				offset: cmd.flags?.offset,
 				policy: {
 					...settings.getGroup("skills"),
 					disabledExtensions: settings.get("disabledExtensions"),
 				},
 			});
 			if (cmd.flags?.json) {
-				writeJson({ candidates: result.candidates, diagnostics: result.diagnostics.messages });
+				writeJson({
+					candidates: result.candidates,
+					scanned: result.scanned,
+					matching: result.matching,
+					offset: result.offset,
+					// Omitted, not null: absence is how the final page is reported.
+					...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }),
+					diagnostics: result.diagnostics.messages,
+				});
 				return;
 			}
 			for (const candidate of result.candidates) {
 				process.stdout.write(`${formatCandidate(candidate)}\n`);
+			}
+			if (result.nextOffset !== undefined) {
+				process.stdout.write(`\nNext page: ${formatNextPageCommand(cmd.flags, result.nextOffset)}\n`);
 			}
 			if (result.diagnostics.messages.length > 0) {
 				process.stdout.write("\nDiagnostics:\n");

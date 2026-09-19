@@ -26,7 +26,12 @@ import {
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
-import { type Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	type Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
@@ -364,6 +369,17 @@ export interface SdkOnlyTerminalAbortSeams {
 			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
 		},
 	) => Promise<{ status: string; terminalScope?: unknown }>;
+	/**
+	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+	 * ledger holds for an execution handle (#5637). Strictly read-only: it
+	 * never claims, reserves, seals or quarantines ledger state. Declared here
+	 * so both hosts expose ONE seam contract — the bus route consumes it for its
+	 * deadline tool-boundary wait, and this route threads it so a future boundary
+	 * wait or deadline abort reads the ledger rather than silently falling back
+	 * to the event-derived set. Optional so an older host that does not thread it
+	 * degrades to that fallback instead of failing to construct.
+	 */
+	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
 	maxDurableTerminalReservationsForTests?: number;
 }
@@ -5353,14 +5369,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await steerReconciliation.hydrateFromStore();
 		const deadlineManager = new PromptDeadlineManager({
 			reconciliation,
-			getLeaseMs: () => {
-				const v = options.settings?.get("sdk.promptDeadlineMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 1_800_000;
-			},
-			getMaxMs: () => {
-				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
-			},
+			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
+			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {

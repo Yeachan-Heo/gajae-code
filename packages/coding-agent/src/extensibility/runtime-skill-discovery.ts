@@ -54,6 +54,16 @@ export interface RuntimeSkillDiscoveryResult {
 	candidates: RuntimeSkillDiscoveryCandidate[];
 	/** Deduped skill metadata the query filter ran against, including bundled entries; candidates.length <= scanned. */
 	scanned: number;
+	/**
+	 * Skills left after the query filter, before the page slice: the denominator
+	 * a page is a page *of*. `scanned` counts everything the filter ran against,
+	 * so it cannot serve this role.
+	 */
+	matching: number;
+	/** Normalized zero-based offset the returned page starts at. */
+	offset: number;
+	/** Offset of the next page, present only while one exists; omitted on the final page. */
+	nextOffset?: number;
 	diagnostics: RuntimeSkillDiscoveryDiagnostics;
 }
 
@@ -65,6 +75,8 @@ export interface DiscoverRuntimeSkillsOptions {
 	profileAuthority?: "default" | "custom";
 	query?: string;
 	limit?: number;
+	/** Zero-based index into the matching set the returned page starts at; defaults to 0. */
+	offset?: number;
 	source?: RuntimeSkillDiscoveryScope | "all";
 	policy?: SkillsSettings;
 }
@@ -74,11 +86,26 @@ function getRuntimeHome(): string {
 }
 
 const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 50;
+/**
+ * Upper bound every caller's `limit` clamps to. Exported so `gjc skills discover`
+ * can default a human to the widest page the library will serve instead of the
+ * model-context-sized `DEFAULT_LIMIT`.
+ */
+export const SKILL_DISCOVERY_MAX_LIMIT = 50;
 const MAX_DIAGNOSTICS = 10;
 function normalizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
-	return Math.max(1, Math.min(MAX_LIMIT, Math.trunc(limit)));
+	return Math.max(1, Math.min(SKILL_DISCOVERY_MAX_LIMIT, Math.trunc(limit)));
+}
+
+/**
+ * Offsets are clamped from below only. An offset past the end is a legitimate
+ * empty final page (the catalog shrank between pages), not an error, so it is
+ * reported rather than silently snapped back onto the last populated page.
+ */
+function normalizeOffset(offset: number | undefined): number {
+	if (offset === undefined || !Number.isFinite(offset) || offset < 0) return 0;
+	return Math.trunc(offset);
 }
 
 interface ProjectScanDir {
@@ -558,9 +585,40 @@ export async function discoverRuntimeSkills(
 		seenNames,
 		diagnostics,
 	);
+	const limit = normalizeLimit(options.limit);
+	const offset = normalizeOffset(options.offset);
+	const matching = candidates.length;
+	const page = candidates.slice(offset, offset + limit);
+	// Continuation is omitted on the final page, so "is there more" is the
+	// presence of the field rather than a value the caller has to compare.
+	const nextOffset = offset + page.length < matching ? offset + page.length : undefined;
+	// Appended directly instead of through pushDiagnostic: these are the only
+	// messages that explain why a skill the caller can see on disk is absent
+	// from the result, and the reported case (several stale
+	// skills.customDirectories entries, one "does not exist" message each)
+	// fills the MAX_DIAGNOSTICS budget before the slice is ever reached. A
+	// dropped paging notice makes the truncation invisible again.
+	if (page.length === 0) {
+		if (offset > 0 && matching > 0) {
+			diagnostics.push(
+				`no skills at offset ${offset}; ${matching} matching skill${matching === 1 ? "" : "s"} total, pass --offset 0 to start over`,
+			);
+		}
+	} else if (nextOffset !== undefined) {
+		diagnostics.push(
+			`showing ${offset + 1}-${offset + page.length} of ${matching} matching skills; pass --offset ${nextOffset} for the next page, or narrow the query`,
+		);
+	} else if (offset > 0) {
+		// Final page of a multi-page walk: no continuation to offer, but the
+		// caller still needs to know this page is not the whole matching set.
+		diagnostics.push(`showing ${offset + 1}-${offset + page.length} of ${matching} matching skills`);
+	}
 	return {
-		candidates: candidates.slice(0, normalizeLimit(options.limit)),
+		candidates: page,
 		scanned,
+		matching,
+		offset,
+		...(nextOffset === undefined ? {} : { nextOffset }),
 		diagnostics: { messages: diagnostics },
 	};
 }
