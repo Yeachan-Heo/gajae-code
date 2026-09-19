@@ -77,6 +77,7 @@ function upstream() {
 		websocket: {
 			open(ws) {
 				connections.push({ ws, messages: [] });
+				ws.send(JSON.stringify({ type: "hello", connectionId: "fixture" }));
 			},
 			message(ws, message) {
 				connections.find(connection => connection.ws === ws)?.messages.push(String(message));
@@ -273,6 +274,10 @@ class StalledWebSocket implements RelayWebSocket {
 		this.#emit("open");
 	}
 
+	message(data: string): void {
+		this.#emit("message", { data });
+	}
+
 	send(data: string): void {
 		this.messages.push(data);
 		this.#bufferedAmount += Buffer.byteLength(data);
@@ -340,6 +345,8 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 				validateDownstreamFrame,
 			});
 			await waitFor(() => fake.connections[0], "upstream connection");
+			await waitFor(() => received[0], "upstream hello");
+			received.length = 0;
 			expect(retryCount).toBeLessThanOrEqual(1);
 			return { fake, input, output, received, errors, pair };
 		} catch (error) {
@@ -400,7 +407,10 @@ describe("SDK serve raw relay", () => {
 		);
 		try {
 			const connection = await waitFor(() => connections[0], "stdio upstream connection");
-			const hello = await waitFor(() => connection.messages[0], "stdio relay capability hello");
+			input.write(
+				`${JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] })}\n`,
+			);
+			const hello = await waitFor(() => connection.messages[0], "stdio downstream capability hello");
 			expect(JSON.parse(hello)).toEqual({
 				type: "hello",
 				protocolVersion: 3,
@@ -427,7 +437,7 @@ describe("SDK serve raw relay", () => {
 		}
 	});
 
-	test("negotiates advertised capabilities on the upstream leg", async () => {
+	test("buffers downstream hello until the upstream hello and preserves its capabilities", async () => {
 		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
 		const server = Bun.serve<unknown>({
 			port: 0,
@@ -438,13 +448,6 @@ describe("SDK serve raw relay", () => {
 			websocket: {
 				open(ws) {
 					connections.push({ ws, messages: [] });
-					ws.send(
-						JSON.stringify({
-							type: "hello",
-							protocolVersion: 3,
-							capabilities: ["tool_activity_v2", "turn_stream"],
-						}),
-					);
 				},
 				message(ws, message) {
 					connections.find(connection => connection.ws === ws)?.messages.push(String(message));
@@ -453,6 +456,8 @@ describe("SDK serve raw relay", () => {
 		});
 		const input = new PassThrough();
 		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
 		const pair = await startRelayPair({
 			url: `ws://127.0.0.1:${server.port}`,
 			token,
@@ -463,12 +468,71 @@ describe("SDK serve raw relay", () => {
 		});
 		try {
 			const connection = await waitFor(() => connections[0], "upstream connection");
-			const hello = await waitFor(() => connection.messages[0], "relay capability hello");
-			expect(JSON.parse(hello)).toEqual({
+			const emptyHello = JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] });
+			const futureHello = JSON.stringify({
 				type: "hello",
 				protocolVersion: 3,
-				capabilities: ["tool_activity_v2", "turn_stream"],
+				capabilities: ["unrelated_future_capability"],
 			});
+			input.write(`${emptyHello}\n${futureHello}\n`);
+			await Bun.sleep(20);
+			expect(connection.messages).toEqual([]);
+			connection.ws.send(JSON.stringify({ type: "hello", connectionId: "session" }));
+			expect(await waitFor(() => connection.messages[0], "buffered downstream hello")).toBe(emptyHello);
+			expect(await waitFor(() => connection.messages[1], "buffered future hello")).toBe(futureHello);
+			expect(received.map(chunk => chunk.toString().trim())).toContain(
+				JSON.stringify({ type: "hello", connectionId: "session" }),
+			);
+		} finally {
+			await pair.close();
+			server.stop(true);
+		}
+	});
+
+	test("relays only an explicitly opted-in capability", async () => {
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+				},
+				message(ws, message) {
+					const connection = connections.find(candidate => candidate.ws === ws);
+					if (!connection) return;
+					const text = String(message);
+					connection.messages.push(text);
+					const frame = JSON.parse(text) as { type?: unknown; capabilities?: unknown };
+					if (
+						frame.type === "hello" &&
+						Array.isArray(frame.capabilities) &&
+						frame.capabilities.includes("tool_activity_v2")
+					)
+						ws.send(JSON.stringify({ type: "tool_activity", toolCallId: "call-opt-in", phase: "started" }));
+				},
+			},
+		});
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const pair = await startRelayPair({
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: () => {},
+		});
+		try {
+			await waitFor(() => connections[0], "upstream connection");
+			input.write(`${JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] })}\n`);
+			await Bun.sleep(20);
+			expect(received.some(chunk => chunk.toString().includes("tool_activity"))).toBe(false);
 		} finally {
 			await pair.close();
 			server.stop(true);
@@ -550,6 +614,8 @@ describe("SDK serve raw relay", () => {
 				onTransportError: error => errors.push(error),
 			});
 			const connection = await waitFor(() => fixture.fake.connections[1], "second upstream connection");
+			await Bun.sleep(20);
+			blocked.emit("drain");
 			connection.ws.send("a".repeat(8 * 1024 * 1024 + 1));
 			await Bun.sleep(20);
 			expect(errors).toEqual([]);
@@ -582,6 +648,7 @@ describe("SDK serve raw relay", () => {
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
+			ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 			const pair = await started;
 			try {
 				input.write('{"active":true}\n');
@@ -613,6 +680,7 @@ describe("SDK serve raw relay", () => {
 			});
 			const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
 			ws.open();
+			ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 			const pair = await started;
 			try {
 				const frame = "x".repeat(256 * 1024);
@@ -637,16 +705,17 @@ describe("SDK socket serve", () => {
 		try {
 			client.write(`gjc-sdk-transport/1 token=${token}\n`);
 			const connection = await waitFor(() => fake.connections[0], "socket upstream connection");
-			connection.ws.send(
-				JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
-			);
-			await readLine(client);
-			const hello = await waitFor(() => connection.messages[0], "socket relay capability hello");
-			expect(JSON.parse(hello)).toEqual({
+			const downstreamHello = JSON.stringify({
 				type: "hello",
 				protocolVersion: 3,
 				capabilities: ["tool_activity_v2", "turn_stream"],
 			});
+			client.write(`${downstreamHello}\n`);
+			connection.ws.send(JSON.stringify({ type: "hello", connectionId: "session" }));
+			await readLine(client);
+			expect(await waitFor(() => connection.messages[0], "socket downstream capability hello")).toBe(
+				downstreamHello,
+			);
 		} finally {
 			await closeSocket(client);
 			await handle.close();
@@ -698,6 +767,7 @@ describe("SDK socket serve", () => {
 				const ws = await waitFor(() => StalledWebSocket.latest, "upstream dial");
 				client.write('{"received":"during-dial"}\n');
 				ws.open();
+				ws.message(JSON.stringify({ type: "hello", connectionId: "stalled" }));
 				expect(await waitFor(() => ws.messages[0], "handed-off frame")).toBe('{"received":"during-dial"}');
 			} finally {
 				await closeSocket(client);

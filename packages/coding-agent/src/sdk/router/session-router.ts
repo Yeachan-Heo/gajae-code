@@ -25,7 +25,7 @@ import {
 	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
 } from "../client/discovery";
-import { SESSION_HOST_OBSERVER_CAPABILITY } from "../host/host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "../host/host";
 import {
 	type ActivatedPreparedSession,
 	type PreparedSessionActivationClient,
@@ -1526,7 +1526,7 @@ export class SessionRouter {
 		} else {
 			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {
 				...ACP_SESSION_RECONNECT,
-				...(this.#observer ? { capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] } : {}),
+				...(this.#observer ? { capabilities: [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY] } : {}),
 			});
 			transport = defaultClient;
 			connection = defaultClient.connect().then(() => defaultClient);

@@ -97,7 +97,12 @@ import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
-import { SessionSdkHost, type SessionSdkHostOptions, TOOL_ACTIVITY_CAPABILITY } from "./host";
+import {
+	SESSION_HOST_OBSERVER_CAPABILITY,
+	SessionSdkHost,
+	type SessionSdkHostOptions,
+	TURN_STREAM_CAPABILITY,
+} from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import { createSdkRunCapability } from "./sdk-run-capability";
@@ -476,19 +481,23 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
-	/** Deliver a non-replayable frame to every connection that negotiated a capability. */
-	sendFrameToCapability(capability: string, frame: SdkFrame, excluding = new Set<string>()): void {
-		for (const connectionId of this.connectionIdsWithCapability(capability)) {
+	/** Snapshot connections that negotiated every capability in the requirement set. */
+	connectionIdsWithCapabilities(required: readonly string[]): string[] {
+		return [...this.#connectionCapabilities].flatMap(([connectionId, capabilities]) =>
+			required.every(capability => capabilities.has(capability)) ? [connectionId] : [],
+		);
+	}
+
+	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */
+	sendFrameToCapabilities(
+		required: readonly string[],
+		frame: SdkFrame,
+		excluding: ReadonlySet<string> = new Set(),
+	): void {
+		for (const connectionId of this.connectionIdsWithCapabilities(required)) {
 			if (excluding.has(connectionId)) continue;
 			this.sendFrameTo(connectionId, frame);
 		}
-	}
-
-	/** Snapshot negotiated connection ids for one capability at the publication boundary. */
-	connectionIdsWithCapability(capability: string): string[] {
-		return [...this.#connectionCapabilities].flatMap(([connectionId, capabilities]) =>
-			capabilities.has(capability) ? [connectionId] : [],
-		);
 	}
 
 	publish(frame: SdkFrame): void {
@@ -4536,10 +4545,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 			}
 			// A relay or dashboard can observe a turn submitted by another client. It
-			// explicitly negotiates tool_activity_v2, so give it the same live content
-			// frames without inventing a submitter correlation for that observer.
-			current.runtime.sendFrameToCapability(
-				TOOL_ACTIVITY_CAPABILITY,
+			// explicitly negotiates both the stream and observer capabilities, so give it
+			// the same live content frames without inventing a submitter correlation.
+			current.runtime.sendFrameToCapabilities(
+				[TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY],
 				{ type: "event", kind: event.type, payload },
 				delivered,
 			);
@@ -5294,10 +5303,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * the session and see the turn settle but never receive a single word of the
 	 * answer.
 	 *
-	 * Scoped to the owning invocations of the batch that is actually running: a
-	 * turn nobody submitted over the SDK (an ordinary terminal prompt, an
-	 * autonomous continuation, cron, monitor) has no owner connection and streams
-	 * nothing at all, so a session with no attached client pays one map lookup.
+	 * Correlated content is scoped to the owning invocations of the batch that is
+	 * actually running. Explicit observer connections additionally receive the
+	 * uncorrelated copy, including for agent-owned runs with no SDK submitter.
+	 * A session with no owner or eligible observer pays one capability-map lookup.
 	 */
 	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
 		"message_update",
@@ -5310,7 +5319,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
-		const observerConnections = current.runtime.connectionIdsWithCapability(TOOL_ACTIVITY_CAPABILITY);
+		const observerConnections = current.runtime.connectionIdsWithCapabilities([
+			TURN_STREAM_CAPABILITY,
+			SESSION_HOST_OBSERVER_CAPABILITY,
+		]);
 		const batch = activeInvocation
 			? current.openLifecycleBatches.find(candidate =>
 					candidate.invocations.some(
