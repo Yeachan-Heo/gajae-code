@@ -76,6 +76,26 @@ test("close refuses a json input whose sessionId contradicts the selected sessio
 	expect(captured.listCalls).toBe(0);
 });
 
+test("close reports a missing session without issuing a lifecycle mutation", async () => {
+	const { outputs, exitCode } = await run({ action: "close", sessionId: "missing-session" });
+	expect(exitCode).toBe(1);
+	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "session_unavailable" } });
+	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(1);
+});
+
+test("close rejects malformed explicit endpoint authority before mutation", async () => {
+	const { outputs, exitCode } = await run({
+		action: "close",
+		sessionId: "sess-1",
+		jsonInput: JSON.stringify({ endpointGeneration: 3, endpointIncarnation: "not-an-incarnation" }),
+	});
+	expect(exitCode).toBe(2);
+	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(0);
+});
+
 test("close dispatches session.close with current endpoint authority in its request key", async () => {
 	const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-1" });
 	expect(exitCode).toBeUndefined();

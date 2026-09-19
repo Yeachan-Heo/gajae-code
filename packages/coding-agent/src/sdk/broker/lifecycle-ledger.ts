@@ -659,7 +659,7 @@ export class LifecycleLedger {
 		for (const [identity, latest] of compacted) {
 			const anchor = anchors.get(identity);
 			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(anchor);
+			snapshot.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
 			if (latest.state !== "accepted") snapshot.push(latest);
 		}
 		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
@@ -721,15 +721,32 @@ export class LifecycleLedger {
 		metadata: { operationKey: string; fingerprint: string },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
-			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const existing = this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
-			if (!entry) return undefined;
-			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
-			// Retire the legacy row so hasLegacyIdentity() returns false and future
-			// unrelated lifecycle requests are not globally blocked. The legacy
-			// identity gets a metadata-bearing replacement row in the append-only
-			// log, superseding the original metadata-free entry in #byIdentity.
-			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			if (!entry) return existing;
+			if (existing) {
+				if (entry.operationKey === undefined) {
+					await this.#compact({ ...entry, ...metadata, ts: Date.now() });
+				}
+				return existing;
+			}
+			// A migrated identity needs the same accepted anchor as a fresh request;
+			// appending only a terminal row would be quarantined on the next restart.
+			await this.#append({
+				version: SDK_STATE_VERSION,
+				identity: to,
+				requestHash: entry.requestHash,
+				...metadata,
+				state: "accepted",
+				ts: Date.now(),
+			});
+			const migrated =
+				entry.state === "accepted"
+					? this.#byIdentity.get(to)
+					: await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire metadata-free legacy rows by rewriting their latest row in place;
+			// appending a duplicate terminal row would violate the ledger history rules.
+			if (entry.operationKey === undefined) await this.#compact({ ...entry, ...metadata, ts: Date.now() });
 			return migrated;
 		});
 	}

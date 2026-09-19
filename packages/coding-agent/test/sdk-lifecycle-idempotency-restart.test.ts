@@ -2,13 +2,68 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { Broker } from "../src/sdk/broker/broker";
+import { deriveIdempotencyIdentity, deriveLegacyIdentity } from "../src/sdk/broker/identity";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
 
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
 describe("SDK lifecycle ledger", () => {
+	it("migrates a terminal v3 identity before replaying it after a broker restart", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-v3-replay-"));
+		const operation = "session.close";
+		const requestKey = "sdk:session-cli:session.close:legacy-session:1:legacy-incarnation";
+		const input = {
+			sessionId: "legacy-session",
+			endpointGeneration: 1,
+			endpointIncarnation: "a".repeat(64),
+		};
+		const fingerprint = lifecycleFingerprint(operation, input);
+		const requestHash = createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+		const targetHash = createHash("sha256").update(canonicalJson(input)).digest("hex");
+		const operationKey = `${operation}\0${requestKey}`;
+		const legacyIdentity = await deriveLegacyIdentity(dir, operation, requestKey);
+		const currentIdentity = await deriveIdempotencyIdentity(dir, operation, requestKey, targetHash);
+		const response = { ok: true as const, operation, result: { sessionId: input.sessionId } };
+		const first = new Broker({ agentDir: dir });
+		const second = new Broker({ agentDir: dir });
+		try {
+			await first.start();
+			await first.ledger.begin(legacyIdentity, requestHash, { operationKey, fingerprint });
+			await first.ledger.transition(legacyIdentity, "terminal_ok", { response });
+			await first.stop();
+
+			await second.start();
+			await expect(second.handleRequest(operation, input, requestKey)).resolves.toEqual(response);
+			await expect(second.handleRequest(operation, input, requestKey)).resolves.toEqual(response);
+			await second.stop();
+
+			const reopened = await new LifecycleLedger(dir).open();
+			expect(reopened.get(currentIdentity)).toMatchObject({
+				state: "terminal_ok",
+				operationKey,
+				fingerprint,
+			});
+		} finally {
+			await first.stop().catch(() => {});
+			await second.stop().catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("replays terminal responses and rejects conflicts across restarts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-"));
 		const ledger = await new LifecycleLedger(dir).open();

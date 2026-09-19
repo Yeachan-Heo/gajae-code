@@ -199,12 +199,12 @@ calling process as a live client and renews the host's abandonment window,
 which is the opposite of the intent, so the lifecycle mutation is answered by
 the broker over its own client.
 
-`--idempotency-key` is optional here, unlike the raw `session.close` global. A
-close is one terminal intent per session, so the default request key is derived
-from the session id: a retried invocation replays the same lifecycle request
-and is deduplicated by the broker instead of issuing a second close against a
-host that may already be gone. Pass `--idempotency-key` explicitly to key by
-attempt instead.
+`--idempotency-key` is optional here, unlike the raw `session.close` global. The
+default request key is derived from the session id and the current endpoint
+generation/incarnation. A retry against the same live host replays the same
+lifecycle request; a host resumed under the same session id receives a fresh
+request identity and is closed by a new lifecycle operation. Pass
+`--idempotency-key` explicitly to supply a caller-chosen attempt key.
 
 ### retire
 

@@ -37,7 +37,12 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
-import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	getBrokerIdentityKey,
+} from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
@@ -3775,6 +3780,38 @@ export class Broker {
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
 		const operationKey = `${operation}\0${idempotencyKey}`;
+		const requestedRequestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, operation, idempotencyKey);
+		const legacyTargetIdentity = await deriveLegacyTargetIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			target,
+		);
+		if (!this.ledger.get(identity)) {
+			const metadata = { operationKey, fingerprint };
+			const matchingLegacy = this.ledger.findByOperationKey(operationKey, fingerprint);
+			if (matchingLegacy) {
+				if (matchingLegacy.requestHash !== requestedRequestHash)
+					return error("idempotency_conflict", "idempotency key was used with a different request");
+				if (matchingLegacy.identity === legacyIdentity || matchingLegacy.identity === legacyTargetIdentity)
+					await this.ledger.migrateIdentity(matchingLegacy.identity, identity, metadata);
+			} else if (this.ledger.get(legacyIdentity)) {
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			} else {
+				const legacyTargetEntry = this.ledger.get(legacyTargetIdentity);
+				if (legacyTargetEntry) {
+					if (legacyTargetEntry.requestHash !== requestedRequestHash)
+						return error("idempotency_conflict", "idempotency key was used with a different request");
+					await this.ledger.migrateIdentity(legacyTargetIdentity, identity, metadata);
+					// Exact target-derived legacy identity migrated without granting new authority.
+				} else if (this.ledger.hasLegacyIdentity()) {
+					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
+				}
+			}
+		}
 
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {

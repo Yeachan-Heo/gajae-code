@@ -2179,12 +2179,14 @@ export async function runSdkSessionCli(
 					? { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation }
 					: undefined
 				: await resolveCloseAuthority(lifecycle, sessionId);
+			if (hasExplicitAuthority && authority === undefined)
+				throw new SdkSessionCliError(
+					"invalid_input",
+					"endpointGeneration and endpointIncarnation must identify a valid endpoint authority.",
+					2,
+				);
 			const target = { ...input, sessionId, ...(authority ?? {}) };
-			const requestKey =
-				args.idempotencyKey ??
-				(authority === undefined
-					? `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}`
-					: sessionCloseRequestKey(sessionId, authority));
+			const requestKey = args.idempotencyKey ?? sessionCloseRequestKey(sessionId, authority!);
 			// Closing never attaches: a Router attachment registers this process as a
 			// live client and renews the host's abandonment window, which is the
 			// opposite of what a close is for. The Broker answers the lifecycle
