@@ -605,6 +605,27 @@ function migrateLegacyTransactionV1(transaction: CoordinatorSessionTransactionV1
 	}
 	const authorities = canonical.gate_authorities;
 	const endpointIncarnation = typeof broker?.endpoint_incarnation === "string" ? broker.endpoint_incarnation : null;
+	// Report ids predate COORDINATOR_REPORT_ID_PATTERN. A legacy id is rejected by
+	// the reader forever, and because the reader is the namespace-wide scan, one
+	// historical report bricks every coordination read. Rekey legacy reports onto
+	// the canonical digest form instead of leaving the WAL permanently unreadable.
+	const reports = canonical.reports;
+	if (reports && typeof reports === "object" && !Array.isArray(reports)) {
+		const table = reports as Record<string, Record<string, unknown>>;
+		for (const [reportId, report] of Object.entries(table)) {
+			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId)) continue;
+			if (!report || typeof report !== "object" || Array.isArray(report)) continue;
+			const operationId = typeof report.operation_id === "string" ? report.operation_id : reportId;
+			const migratedId = `report-${digest(`legacy-report\0${record.session_id}\0${operationId}`)}`;
+			if (table[migratedId]) {
+				delete table[reportId];
+				continue;
+			}
+			report.report_id = migratedId;
+			table[migratedId] = report;
+			delete table[reportId];
+		}
+	}
 	if (authorities && typeof authorities === "object" && !Array.isArray(authorities)) {
 		for (const authority of Object.values(authorities as Record<string, unknown>)) {
 			if (!authority || typeof authority !== "object" || Array.isArray(authority)) continue;
@@ -2349,6 +2370,30 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 	);
 	const pinnedRequests = new Set<object>(pinnedPrompts);
 	const pinnedTurns = new Set(pinnedPrompts.map(request => request.coordinator_turn_id));
+	// An active acknowledged turn proves its runtime receipt through the prompt
+	// request that carries it. Dropping that request on retention leaves the WAL
+	// failing its own `assertTransaction` receipt invariant on the next read, so
+	// the session — and every namespace-wide scan that touches it — is corrupt
+	// forever. Retention must never outrank an invariant the reader enforces.
+	const activeTurnStatuses = new Set(["delivering", "active", "waiting_for_answer", "completing"]);
+	const receiptBearingPromptIds = new Set(
+		Object.entries(transaction.requests.prompts)
+			.filter(([, request]) => {
+				const turn = request.coordinator_turn_id
+					? transaction.canonical.turns[request.coordinator_turn_id]
+					: undefined;
+				if (!turn || !activeTurnStatuses.has(turn.status)) return false;
+				const delivery = turn.delivery as Record<string, unknown>;
+				if (delivery.prompt_acknowledged !== true) return false;
+				return (
+					["accepted", "linked", "terminal", "completed"].includes(request.phase) &&
+					request.runtime_receipt?.accepted === true &&
+					request.runtime_receipt.command_id === delivery.runtime_command_id &&
+					request.runtime_receipt.turn_id === delivery.runtime_turn_id
+				);
+			})
+			.map(([id]) => id),
+	);
 	for (const [id, event] of Object.entries(transaction.outbox))
 		if (
 			event.emitted &&
@@ -2362,6 +2407,7 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 			if (
 				request.phase === "completed" &&
 				!pinnedRequests.has(request) &&
+				!receiptBearingPromptIds.has(id) &&
 				old(request.updated_at) &&
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)

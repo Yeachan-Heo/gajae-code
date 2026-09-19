@@ -942,4 +942,100 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 			expect(archive.turns["old-1"]).toMatchObject({ turn_id: "old-1", status: "completed" });
 		});
 	});
+
+	it("keeps the prompt request that proves an active turn's runtime receipt", async () => {
+		await withTempRoot(async root => {
+			const namespaceId = "namespace-capacity-receipt";
+			const paths = coordinatorStatePaths(path.join(root, "state"), namespaceId);
+			const sessionId = await seedCapacitySession(paths, namespaceId, root);
+			const promptKey = sha256("receipt-prompt-key");
+			// Timestamps must predate RETENTION_MS so the retention sweep actually
+			// considers this request; a recent request is never a regression subject.
+			const retired = "2026-01-01T00:00:00.000Z";
+			// An acknowledged active turn proves its runtime receipt only through the
+			// prompt request that carries it. Retention used to drop that request once
+			// it was completed and old, which left the WAL failing its own receipt
+			// invariant on the very next read — permanently, for the whole namespace.
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				const source = transaction.canonical.turns["turn-source"];
+				source.prompt = { ...source.prompt, created_at: retired };
+				source.created_at = retired;
+				source.updated_at = retired;
+				source.started_at = retired;
+				source.delivery = {
+					...source.delivery,
+					delivered: true,
+					prompt_acknowledged: true,
+					state: "acknowledged",
+					runtime_command_id: "command-receipt",
+					runtime_turn_id: "runtime-turn-receipt",
+				} as typeof source.delivery;
+				transaction.requests.prompts[promptKey] = {
+					request_id: "request-receipt",
+					key_digest: promptKey,
+					request_digest: sha256("receipt-request"),
+					operation: "turn.prompt",
+					coordinator_turn_id: "turn-source",
+					phase: "completed",
+					canonical_prompt: { text: "prompt-turn-source" },
+					sdk_idempotency_key: "idempotency-receipt",
+					runtime_receipt: {
+						accepted: true,
+						command_id: "command-receipt",
+						turn_id: "runtime-turn-receipt",
+					},
+					created_at: retired,
+					updated_at: retired,
+				} as (typeof transaction.requests.prompts)[string];
+			});
+			// Any later write runs compaction, which is where retention used to
+			// delete the receipt-bearing request and corrupt the WAL.
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				transaction.canonical.session.updated_at = "2026-09-30T00:00:00.000Z";
+			});
+			// Before the fix this read threw state_corrupt instead of returning.
+			const reloaded = await readSessionTransaction(paths, sessionId);
+			expect(reloaded?.requests.prompts[promptKey]?.runtime_receipt?.accepted).toBe(true);
+			expect(reloaded?.canonical.turns["turn-source"]?.status).toBe("active");
+		});
+	});
+
+	it("migrates legacy report ids onto the canonical digest form", async () => {
+		await withTempRoot(async root => {
+			const namespaceId = "namespace-legacy-report";
+			const paths = coordinatorStatePaths(path.join(root, "state"), namespaceId);
+			const sessionId = await seedCapacitySession(paths, namespaceId, root);
+			// Reports minted before COORDINATOR_REPORT_ID_PATTERN carry a uuid-shaped
+			// id. The reader rejects that shape, and because the reader backs the
+			// namespace-wide scan, one historical report bricked every coordination
+			// read rather than only its own session.
+			const legacyReportId = "report-9ae9a2fd-3939-46c7-8178-185e2d9a84b1";
+			const file = transactionPath(paths, sessionId);
+			const raw = JSON.parse(await fs.readFile(file, "utf8")) as {
+				canonical: { reports: Record<string, unknown> };
+			};
+			raw.canonical.reports[legacyReportId] = {
+				schema_version: 1,
+				report_id: legacyReportId,
+				operation_id: "report:i50-rp4",
+				session_id: sessionId,
+				turn_id: "",
+				status: "probe",
+				summary: "",
+				blocker: null,
+				pr_url: null,
+				evidence_paths: [],
+				created_at: "2026-08-18T13:19:54.844Z",
+			};
+			await fs.writeFile(file, JSON.stringify(raw));
+			// Before the fix this read threw state_corrupt instead of returning.
+			const reloaded = await readSessionTransaction(paths, sessionId);
+			expect(reloaded?.canonical.reports[legacyReportId]).toBeUndefined();
+			const migrated = Object.entries(reloaded?.canonical.reports ?? {}).find(
+				([, report]) => report.operation_id === "report:i50-rp4",
+			);
+			expect(migrated?.[0]).toMatch(/^report-[a-f0-9]{64}$/);
+			expect(migrated?.[1]).toMatchObject({ report_id: migrated?.[0], status: "probe" });
+		});
+	});
 });
