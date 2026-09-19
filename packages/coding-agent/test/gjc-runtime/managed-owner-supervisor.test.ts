@@ -452,13 +452,13 @@ describe("managed owner supervisor", () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {
 			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
-			const result = await runSupervisor(
-				stateDir,
-				[process.execPath, "-e", "process.exit(75)"],
-				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
-			);
+			const result = await runSupervisor(stateDir, [process.execPath, "-e", "process.exit(75)"], {
+				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+			});
 			expect(result.exitCode).toBe(75);
-			expect(await Bun.file(lifecyclePaths(stateDir, "session-2681", "generation-2681").verdictFile).json()).toMatchObject({
+			expect(
+				await Bun.file(lifecyclePaths(stateDir, "session-2681", "generation-2681").verdictFile).json(),
+			).toMatchObject({
 				signal: "EXIT",
 				exit_code: 75,
 				result: "unknown_terminal",

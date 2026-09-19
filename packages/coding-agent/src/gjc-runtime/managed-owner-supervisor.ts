@@ -556,10 +556,7 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		} catch {
 			terminalPublicationFailed = true;
 		}
-	} else if (
-		child.signalCode !== "SIGABRT" &&
-		(sigtermRelayed || child.signalCode || exitCode !== 0)
-	) {
+	} else if (child.signalCode !== "SIGABRT" && (sigtermRelayed || child.signalCode || exitCode !== 0)) {
 		try {
 			await observeOwnerTerminal({
 				schema_version: 1,
