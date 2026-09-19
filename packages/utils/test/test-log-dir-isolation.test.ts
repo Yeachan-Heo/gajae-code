@@ -158,6 +158,25 @@ describe("test log-dir isolation decision", () => {
 		).toEqual({ action: "isolate", reason: "shared" });
 	});
 
+	test("isolates a trusted pin nested under the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: `${shared}/sub` },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+			}),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("honors a trusted pin with a shared-log prefix but outside the shared directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		const sibling = "/home/operator/.gjc/logs-custom";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: sibling }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "honor", logDir: sibling });
+	});
+
 	test("still honors a trusted pin outside the shared user log directory", () => {
 		const shared = "/home/operator/.gjc/logs";
 		const pinned = "/tmp/pinned-logs";

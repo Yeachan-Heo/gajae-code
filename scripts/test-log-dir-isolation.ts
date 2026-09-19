@@ -43,16 +43,29 @@ export function defaultLogDirFor(input: {
 	return resolveCanonicalLogsDir({ ...input, xdgEligible: false, pathExists: fs.existsSync });
 }
 
-function pathsEquivalent(left: string, right: string, realpath: (target: string) => string): boolean {
-	const normalize = (target: string): string => {
-		const resolved = path.normalize(path.resolve(target));
-		return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-	};
-	if (normalize(left) === normalize(right)) return true;
+function normalizePath(target: string): string {
+	const resolved = path.normalize(path.resolve(target));
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+function pathsWithinOrEqual(left: string, right: string, realpath: (target: string) => string): boolean {
+	const normalizedLeft = normalizePath(left);
+	const normalizedRight = normalizePath(right);
 	try {
-		return normalize(realpath(left)) === normalize(realpath(right));
+		const resolvedLeft = normalizePath(realpath(left));
+		const resolvedRight = normalizePath(realpath(right));
+		return resolvedLeft === resolvedRight || isPathWithin(resolvedRight, resolvedLeft);
 	} catch {
-		return false;
+		// A nested target may not exist yet; lexical containment still prevents a
+		// later logger write from creating it below the shared sink. When both
+		// paths exist, the realpath branch above keeps a symlinked path outside
+		// the sink from being rejected merely for its lexical spelling.
+		return normalizedLeft === normalizedRight || isPathWithin(normalizedRight, normalizedLeft);
 	}
 }
 
@@ -109,7 +122,7 @@ export function decideLogDirIsolation(input: {
 	if (!configured) return { action: "isolate", reason: "absent" };
 	if (
 		input.sharedLogDir !== undefined &&
-		pathsEquivalent(configured, input.sharedLogDir, input.realpath ?? ((target: string) => fs.realpathSync(target)))
+		pathsWithinOrEqual(configured, input.sharedLogDir, input.realpath ?? ((target: string) => fs.realpathSync(target)))
 	)
 		return { action: "isolate", reason: "shared" };
 	if (declared) return { action: "isolate", reason: "untrusted" };
