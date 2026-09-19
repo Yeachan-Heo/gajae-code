@@ -3209,6 +3209,7 @@ export class AgentSession {
 	#disposeCallerPromise: Promise<void> | undefined;
 	#disposeCompleted = false;
 	#disposeTerminalError: unknown;
+	#sessionShutdownReason: "detached_idle" | undefined;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
@@ -9295,12 +9296,13 @@ export class AgentSession {
 	 * Remove all listeners, flush pending writes, and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): Promise<void> {
+	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
 		this.#evalExecutionDisposing = true;
 		if (this.#disposeCompleted) return Promise.resolve();
 		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
 		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
 		if (!this.#disposeRunPromise) {
+			this.#sessionShutdownReason = options.sessionShutdownReason;
 			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
 			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
 			this.#disposeDeadlineTimer = setTimeout(() => this.#disposeDeadlineExpired?.resolve(), this.#disposeTimeoutMs);
@@ -9474,7 +9476,10 @@ export class AgentSession {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await awaitDisposeStep(
 					"session shutdown handlers",
-					this.#extensionRunner.emit({ type: "session_shutdown" }),
+					this.#extensionRunner.emit({
+						type: "session_shutdown",
+						...(this.#sessionShutdownReason === undefined ? {} : { reason: this.#sessionShutdownReason }),
+					}),
 				);
 			}
 		} catch (error) {

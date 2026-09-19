@@ -528,7 +528,7 @@ export class SessionSdkSessionRuntime {
 		}
 	}
 
-	async stop(options: { allowLockContention?: boolean } = {}): Promise<void> {
+	async stop(options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {}): Promise<void> {
 		this.#connectionDisposer?.();
 		this.#capabilitiesDisposer?.();
 		this.#malformedDisposer?.();
@@ -6184,7 +6184,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							)
 								return;
 							// Use the successful publication's proof, never a teardown-time file read.
-							await index.unregisterIfCurrent(expected);
+							await index.unregisterIfCurrent(expected, input.reason);
 							if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
 						},
 					});
@@ -6317,7 +6317,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			throw error;
 		}
 	};
-	const stopActive = async (cancelSkillRecovery = false): Promise<void> => {
+	const stopActive = async (cancelSkillRecovery = false, unregisterReason?: "detached_idle"): Promise<void> => {
 		const current = active;
 		if (!current) return;
 		if (cancelSkillRecovery) {
@@ -6375,7 +6375,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				retiredLifecycleOwnerTimers.set(current, timer);
 			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
-			await current.runtime.stop({ allowLockContention: cancelSkillRecovery });
+			await current.runtime.stop({
+				allowLockContention: cancelSkillRecovery,
+				...(unregisterReason === undefined ? {} : { unregisterReason }),
+			});
 		} catch (error) {
 			// Keep the immutable owner available for a retry when transport teardown
 			// fails after quiescing. Clearing `active` before stop prevents a second
@@ -6398,7 +6401,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await stopActive();
 		await startRuntime(ctx);
 	});
-	api.on("session_shutdown", async () => {
-		await stopActive(true);
+	api.on("session_shutdown", async event => {
+		await stopActive(true, event.reason);
 	});
 }

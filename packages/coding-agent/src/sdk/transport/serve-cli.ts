@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { normalizeBrokerInput } from "../broker/broker";
@@ -168,7 +168,7 @@ type BrokerSessionRow = {
 	live: boolean;
 	ambiguous: boolean;
 	terminal?: boolean;
-	hostUnregisteredReason?: "process_exited";
+	hostUnregisteredReason?: "process_exited" | "detached_idle";
 	terminalUncertain?: boolean;
 	locator?: BrokerSessionLocator;
 	savedSession?: BrokerSavedSession;
@@ -232,7 +232,10 @@ function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown)
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
 		const locator = brokerSessionLocator(item.locator);
 		const saved = pageSavedSession?.id === item.sessionId ? pageSavedSession : brokerSavedSession(item.savedSession);
-		const hostUnregisteredReason = item.hostUnregisteredReason === "process_exited" ? "process_exited" : undefined;
+		const hostUnregisteredReason =
+			item.hostUnregisteredReason === "process_exited" || item.hostUnregisteredReason === "detached_idle"
+				? item.hostUnregisteredReason
+				: undefined;
 		const terminalUncertain = item.terminalUncertain === true || item.terminal_uncertain === true;
 		return [
 			{
@@ -307,7 +310,7 @@ async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, se
 	const timeoutMs = lifecycleRequestTimeoutMs("session.resume", input);
 	brokerResult(
 		await broker.global("session.resume", input, {
-			idempotencyKey: randomUUID(),
+			idempotencyKey: crypto.randomUUID(),
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		}),
 	);
@@ -322,18 +325,16 @@ export async function resolveServeSession(broker: SdkClient, explicitSessionId?:
 		// self-reap case (#5633). Every other targeting outcome — unindexed,
 		// ambiguous, no explicit id — stays the selector's to report, so this
 		// decision does not depend on the selector's error text.
-		// `terminal` is its own projected field and is one of the reasons `live` is false, so
-		// `!row.live` alone treats a session that has already stopped as recoverable. The broker
-		// dead-process reaper is the deliberate exception: it appends a process_exited provenance
-		// marker to its host_unregistered row, so that terminal-looking row is recoverable. An
-		// intentional host_unregistered or session_closed row has no marker and stays terminal;
-		// resuming it would restart finished work.
+		// Recovery requires durable retirement provenance. A non-live row without a terminal
+		// retirement event may only have stale heartbeat evidence, which does not prove that the
+		// previous host exited and must not authorize a second host for the same transcript.
 		if (
 			row !== undefined &&
 			!row.ambiguous &&
 			!row.terminalUncertain &&
 			!row.live &&
-			(!row.terminal || row.hostUnregisteredReason === "process_exited")
+			row.terminal === true &&
+			(row.hostUnregisteredReason === "process_exited" || row.hostUnregisteredReason === "detached_idle")
 		) {
 			await recoverBrokerSession(broker, row, explicitSessionId);
 			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);

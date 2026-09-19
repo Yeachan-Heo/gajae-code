@@ -7,7 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
-import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import Sdk, { parseSdkInternalArgv, watchSessionHostClientAttachment } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
 import { reapDeadSessionRegistrations } from "../src/sdk/broker/lifecycle.js";
 import { SessionIndex } from "../src/sdk/broker/session-index.js";
@@ -818,13 +818,33 @@ describe("SDK serve CLI and discovery", () => {
 						return {
 							ok: true,
 							result: {
-								sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+								sessions: [
+									{
+										sessionId,
+										live: false,
+										ambiguous: false,
+										terminal: true,
+										hostUnregisteredReason: "detached_idle",
+										locator,
+									},
+								],
 								savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity },
 							},
 						};
 					return {
 						ok: true,
-						result: { sessions: [{ sessionId, live: resumed, ambiguous: false, locator }], warnings: [] },
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: resumed,
+									ambiguous: false,
+									...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+									locator,
+								},
+							],
+							warnings: [],
+						},
 					};
 				}
 				if (operation === "session.resume") {
@@ -902,6 +922,73 @@ describe("SDK serve CLI and discovery", () => {
 		expect(calls).toEqual(["session.list", "session.resume", "session.list"]);
 	});
 
+	test("drives detached-idle self-reap into broker recovery", async () => {
+		const agentDir = await tempDir();
+		const index = await new SessionIndex(agentDir).open();
+		const sessionId = "detached-idle-session";
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const registered = await index.append({
+			sessionId,
+			locator,
+			endpointGeneration: 1,
+			pid: process.pid,
+			type: "host_registered",
+		});
+		let nowMs = 0;
+		let reads = 0;
+		const reapReason = await watchSessionHostClientAttachment({
+			readAttachedClients: () => {
+				reads += 1;
+				return reads === 1 ? 1 : 0;
+			},
+			now: () => nowMs,
+			sleep: async ms => {
+				nowMs += ms;
+			},
+			idleGraceMs: 20,
+			firstAttachGraceMs: 40,
+			pollMs: 10,
+		});
+		expect(reapReason).toBe("detached_idle");
+		expect(await index.unregisterIfCurrent(registered, reapReason)).toBe(true);
+		const reaped = index.listSessions().sessions.find(row => row.sessionId === sessionId);
+		if (!reaped) throw new Error("detached-idle row was not retained");
+		expect(reaped.terminal).toBe(true);
+		expect(reaped.hostUnregisteredReason).toBe("detached_idle");
+
+		let resumed = false;
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ ...reaped, live: resumed, ...(resumed ? { terminal: false } : {}) }],
+							savedSession: { id: sessionId, path: path.join(agentDir, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls).toEqual(["session.list", "session.resume", "session.list"]);
+	});
+
 	test("normalizes a symlinked state root through broker lifecycle input rules", async () => {
 		const agentDir = await tempDir();
 		const cwd = path.join(agentDir, "workspace");
@@ -935,7 +1022,15 @@ describe("SDK serve CLI and discovery", () => {
 					return {
 						ok: true,
 						result: {
-							sessions: [{ sessionId, live: resumed, ambiguous: false, locator }],
+							sessions: [
+								{
+									sessionId,
+									live: resumed,
+									ambiguous: false,
+									...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+									locator,
+								},
+							],
 							savedSession: { id: sessionId, path: path.join(cwd, "session.jsonl"), identity },
 						},
 					};
@@ -995,7 +1090,15 @@ describe("SDK serve CLI and discovery", () => {
 							ok: true,
 							result: {
 								indexSeq: 1,
-								sessions: [{ sessionId, live: resumed, ambiguous: false, locator }],
+								sessions: [
+									{
+										sessionId,
+										live: resumed,
+										ambiguous: false,
+										...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+										locator,
+									},
+								],
 								...(resumed ? {} : { savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity } }),
 								warnings: [],
 							},
@@ -1120,7 +1223,16 @@ describe("SDK serve CLI and discovery", () => {
 					return {
 						ok: true,
 						result: {
-							sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
 							savedSession: {
 								id: sessionId,
 								path: "/workspace/session.jsonl",
@@ -1137,7 +1249,21 @@ describe("SDK serve CLI and discovery", () => {
 					};
 				if (operation === "session.resume") return { ok: true, result: { sessionId } };
 				if (operation === "session.list")
-					return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false, locator }] } };
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
+						},
+					};
 				return { ok: false, error: { code: "unexpected_operation", message: operation } };
 			},
 		} as never;
@@ -1181,6 +1307,37 @@ describe("SDK serve CLI and discovery", () => {
 		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
 			typed: true,
 			code: "terminal_uncertain",
+			exitCode: 1,
+		});
+		expect(calls).toEqual(["session.list"]);
+	});
+
+	test("does not recover a nonterminal stale row without retirement proof", async () => {
+		const sessionId = "heartbeat-stale-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal: false, locator }],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "e".repeat(64) },
+							},
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
 			exitCode: 1,
 		});
 		expect(calls).toEqual(["session.list"]);
@@ -1255,7 +1412,16 @@ describe("SDK serve CLI and discovery", () => {
 					return {
 						ok: true,
 						result: {
-							sessions: [{ sessionId, live: false, ambiguous: false, locator }],
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
 							savedSession: {
 								id: sessionId,
 								path: "/workspace/session.jsonl",
@@ -1272,7 +1438,21 @@ describe("SDK serve CLI and discovery", () => {
 					};
 				if (operation === "session.resume")
 					return { ok: false, error: { code: "resume_failed", message: "resume failed" } };
-				return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false, locator }] } };
+				return {
+					ok: true,
+					result: {
+						sessions: [
+							{
+								sessionId,
+								live: false,
+								ambiguous: false,
+								terminal: true,
+								hostUnregisteredReason: "detached_idle",
+								locator,
+							},
+						],
+					},
+				};
 			},
 		} as never;
 

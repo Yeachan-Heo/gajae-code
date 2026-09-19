@@ -34,8 +34,8 @@ export interface SessionActivity {
 /** Events persisted without an OS process incarnation (v1/v2 era) are legacy provenance. */
 export type SessionIdentityProvenance = "composite" | "legacy";
 export type SessionTombstoneRule = "retain" | "expire";
-/** Why the broker, rather than the host, retired a registration. */
-export type HostUnregisteredReason = "process_exited";
+/** Durable provenance for a retired host registration. */
+export type HostUnregisteredReason = "process_exited" | "detached_idle";
 /**
  * Injected retention policy (C3). The broker schedules compaction independently of
  * rotation; settings apply at the next scheduled compaction. `clock` drives both
@@ -575,6 +575,10 @@ function projectIdentity(
 	const { latest, heartbeat } = state;
 	const terminal = isTerminalEvent(latest);
 	const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
+	const hostUnregisteredReason =
+		latest.hostUnregisteredReason === "process_exited" || latest.hostUnregisteredReason === "detached_idle"
+			? latest.hostUnregisteredReason
+			: undefined;
 	const pidAlive = alive(latest.pid);
 	// Liveness evidence is host-written: a checkpointed heartbeat, or the
 	// `host_registered` event the host appended itself. Counting registration
@@ -610,9 +614,7 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
-		...(latest.hostUnregisteredReason === "process_exited"
-			? { hostUnregisteredReason: latest.hostUnregisteredReason }
-			: {}),
+		...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
 		indexSeq: latest.indexSeq,
