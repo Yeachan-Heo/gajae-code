@@ -1229,6 +1229,83 @@ describe("deleted forum-topic adoption updates", () => {
 		});
 	}
 });
+
+test("standalone Telegram command polling survives a zero-session idle window until explicit stop", async () => {
+	const agentDir = tempAgentDir();
+	const nowState = { value: 0 };
+	const timers = new Map<number, { callback: () => void; ms: number }>();
+	let nextTimerId = 1;
+	const firstPollEntered = Promise.withResolvers<void>();
+	const secondPollEntered = Promise.withResolvers<void>();
+	const releaseFirstPoll = Promise.withResolvers<void>();
+	let pollCount = 0;
+	const pid = process.pid;
+	const incarnation = "linux:4241";
+	await writeDaemonOwner(agentDir, {
+		pid,
+		incarnation,
+		ownerId: "standalone-owner",
+		acquisitionId: "standalone-owner",
+		ownershipPhase: "ready",
+		tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+		chatId: "42",
+		startedAt: 0,
+		heartbeatAt: 0,
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION,
+		servingEpoch: SERVING_EPOCH,
+	});
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "standalone-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		idleTimeoutMs: 1,
+		keepAliveWithoutAttachments: true,
+		now: () => nowState.value,
+		pid,
+		pidIncarnation: () => incarnation,
+		setIntervalImpl: ((callback: () => void, ms: number) => {
+			const timer = nextTimerId++;
+			timers.set(timer, { callback, ms });
+			return timer as unknown as NodeJS.Timeout;
+		}) as typeof setInterval,
+		clearIntervalImpl: ((timer: NodeJS.Timeout) => {
+			timers.delete(timer as unknown as number);
+		}) as typeof clearInterval,
+		botApi: {
+			async call(method: string): Promise<unknown> {
+				if (method === "getUpdates") {
+					pollCount++;
+					if (pollCount === 1) {
+						firstPollEntered.resolve();
+						await releaseFirstPoll.promise;
+					}
+					if (pollCount === 2) secondPollEntered.resolve();
+					return { ok: true, result: [] };
+				}
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				return { ok: true, result: true };
+			},
+		},
+	});
+	try {
+		const runPromise = daemon.run();
+		await firstPollEntered.promise;
+		nowState.value = 100;
+		releaseFirstPoll.resolve();
+		await secondPollEntered.promise;
+		expect(pollCount).toBeGreaterThan(1);
+
+		daemon.requestStop();
+		await runPromise;
+		expect(timers.size).toBe(0);
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("a throwing run-loop heartbeat renewal is contained and the daemon keeps serving (#4200)", async () => {
 	const runScenario = async (throwPath: "state" | "lock"): Promise<void> => {
 		const agentDir = tempAgentDir();
