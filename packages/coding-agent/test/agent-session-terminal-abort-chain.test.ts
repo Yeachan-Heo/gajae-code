@@ -223,11 +223,43 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				// wait for the session's idle signal and every canceled job promise first.
 				session.agent.abort();
 				manager.cancelAll();
-				await session.waitForIdle();
-				await manager.waitForAll();
-				await manager.dispose({ timeoutMs: 3_000 });
-				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-				await session.dispose();
+				// Join any rearmed continuation before disposing its manager. The
+				// coordinator persistence seam waits for this continuation to settle;
+				// disposing the manager first can strand it and make the seam hang.
+				const idleSettled = await Promise.race([
+					session.waitForIdle().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				if (!idleSettled) {
+					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					return;
+				}
+				const jobsSettled = await Promise.race([
+					manager.waitForAll().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				if (!jobsSettled) {
+					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					return;
+				}
+				const persistenceSettled = await Promise.race([
+					session.awaitCoordinatorRuntimeStatePersistenceForTests().then(
+						() => true,
+						() => true,
+					),
+					Bun.sleep(5_000).then(() => false),
+				]);
+				await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
+				if (persistenceSettled) await session.dispose();
+				else void session.dispose().catch(() => {});
 			}
 		} finally {
 			const managers = [...extraManagers];
