@@ -14202,7 +14202,7 @@ export class AgentSession {
 		// acceptance so its run token is bound to the agent_start. Releasing it
 		// behind still-queued work reproduces the token-less mid-run consumption
 		// hazard, so wait for the queue to drain; the next agent_end retries.
-		if (this.agent.hasQueuedMessages()) return false;
+		if (this.agent.state.isStreaming || this.agent.hasQueuedMessages()) return false;
 		const message = this.#deferredSdkFollowUps.shift();
 		if (!message) return false;
 		const forceOneAtATime = this.#deferredFollowUpForceOneAtATime.delete(message);
@@ -16342,7 +16342,7 @@ export class AgentSession {
 						return false;
 					});
 				};
-				const selected = (() => {
+				let selected = (() => {
 					if (options?.queuedEntryId === undefined) return undefined;
 					const [mode, sequenceText] = options.queuedEntryId.split(":");
 					const sequence = Number(sequenceText);
@@ -16367,21 +16367,45 @@ export class AgentSession {
 						deferred,
 					};
 				})();
+				let cancelledSelection: typeof selected;
 				const selectedPromotionHook = selected?.message
 					? (this.#followUpPromotionHooks.get(selected.message) ?? this.#steerPromotionHooks.get(selected.message))
 					: undefined;
 				if (selected?.deferred && selected.message !== undefined) {
 					const selectedDeferredIndex = this.#deferredSdkFollowUps.indexOf(selected.message);
-					if (selectedDeferredIndex !== -1) this.#deferredSdkFollowUps.splice(selectedDeferredIndex, 1);
+					if (selectedDeferredIndex !== -1) {
+						this.#deferredSdkFollowUps.splice(selectedDeferredIndex, 1);
+					}
 				}
+				const revalidateSelected = (): void => {
+					if (selected === undefined || selected.message === undefined) return;
+					const stillDisplayed =
+						this.#steeringMessages.includes(selected.display) || this.#followUpMessages.includes(selected.display);
+					// An abort temporarily removes steering from Agent's live queue and
+					// returns it in the agent_end disowned batch; the display mirror is the
+					// stable ownership marker across that boundary. A successful external
+					// cancellation removes the display entry as part of the same operation.
+					if (!stillDisplayed) {
+						cancelledSelection = selected;
+						selected = undefined;
+					}
+				};
 				let runAccepted = false;
 				const restore = () => {
 					const queues = this.agent.snapshotQueues();
 					const queueBaseline = [...queueSnapshot.steering, ...queueSnapshot.followUp];
 					const displayBaseline = [...steeringDisplaySnapshot, ...followUpDisplaySnapshot];
+					const cancelledMessage = cancelledSelection?.message;
+					const cancelledDisplay = cancelledSelection?.display;
 					this.agent.restoreQueues({
-						steering: [...queueSnapshot.steering, ...additionsSince(queues.steering, queueBaseline)],
-						followUp: [...queueSnapshot.followUp, ...additionsSince(queues.followUp, queueBaseline)],
+						steering: [
+							...queueSnapshot.steering.filter(message => message !== cancelledMessage),
+							...additionsSince(queues.steering, queueBaseline).filter(message => message !== cancelledMessage),
+						],
+						followUp: [
+							...queueSnapshot.followUp.filter(message => message !== cancelledMessage),
+							...additionsSince(queues.followUp, queueBaseline).filter(message => message !== cancelledMessage),
+						],
 					});
 					this.#pendingNextTurnMessages = [
 						...pendingNextTurnSnapshot,
@@ -16391,16 +16415,18 @@ export class AgentSession {
 						),
 					];
 					this.#deferredSdkFollowUps = [
-						...deferredFollowUpSnapshot,
-						...additionsSince(this.#deferredSdkFollowUps, deferredFollowUpSnapshot),
+						...deferredFollowUpSnapshot.filter(message => message !== cancelledMessage),
+						...additionsSince(this.#deferredSdkFollowUps, deferredFollowUpSnapshot).filter(
+							message => message !== cancelledMessage,
+						),
 					];
 					this.#steeringMessages = [
-						...steeringDisplaySnapshot,
-						...additionsSince(this.#steeringMessages, displayBaseline),
+						...steeringDisplaySnapshot.filter(entry => entry !== cancelledDisplay),
+						...additionsSince(this.#steeringMessages, displayBaseline).filter(entry => entry !== cancelledDisplay),
 					];
 					this.#followUpMessages = [
-						...followUpDisplaySnapshot,
-						...additionsSince(this.#followUpMessages, displayBaseline),
+						...followUpDisplaySnapshot.filter(entry => entry !== cancelledDisplay),
+						...additionsSince(this.#followUpMessages, displayBaseline).filter(entry => entry !== cancelledDisplay),
 					];
 				};
 				try {
@@ -16412,6 +16438,7 @@ export class AgentSession {
 						? await this.#cancelAndSubmitAbortOutcomeProviderForTests()
 						: await this.#abortWithOutcome({ cause: "user_interrupt", timeoutMs: 5_000 });
 					this.#disownedSteeringDisposition = undefined;
+					revalidateSelected();
 					if (outcome.kind !== "settled") {
 						restore();
 						if (outcome.kind === "error") {
@@ -16432,16 +16459,17 @@ export class AgentSession {
 					};
 					const steeringDisplaysDuringWindow = additionsSince(this.#steeringMessages, steeringDisplaySnapshot);
 					const followUpDisplaysDuringWindow = additionsSince(this.#followUpMessages, followUpDisplaySnapshot);
-					const selectedMessage = selected?.message;
-					const reclassifiedSteering = selected
+					const committedSelection = selected;
+					const selectedMessage = committedSelection?.message;
+					const reclassifiedSteering = committedSelection
 						? queueSnapshot.steering.filter(message => message !== selectedMessage)
 						: [];
-					const heldFollowUp = selected
+					const heldFollowUp = committedSelection
 						? [...reclassifiedSteering, ...queueSnapshot.followUp.filter(message => message !== selectedMessage)]
 						: [];
 					let heldQueueRestored = false;
 					const restoreHeldQueue = () => {
-						if (!selected || heldQueueRestored) return;
+						if (!committedSelection || heldQueueRestored) return;
 						heldQueueRestored = true;
 						const current = this.agent.snapshotQueues();
 						this.#markSteeringAsFollowUpPolicy(reclassifiedSteering);
@@ -16455,32 +16483,46 @@ export class AgentSession {
 					// restored once the new run is accepted (below), so the Agent
 					// admits them into a live run instead of re-labelling them as
 					// follow-ups drained turn after turn. Follow-ups keep their queue.
-					const heldSteering = selected ? [] : queueSnapshot.steering;
-					const heldSteeringDisplays = selected ? [] : steeringDisplaySnapshot;
+					const cancelledMessage = cancelledSelection?.message;
+					const cancelledDisplay = cancelledSelection?.display;
+					const heldSteering = committedSelection
+						? []
+						: queueSnapshot.steering.filter(message => message !== cancelledMessage);
+					const heldSteeringDisplays = committedSelection
+						? []
+						: steeringDisplaySnapshot.filter(entry => entry !== cancelledDisplay);
 					this.agent.restoreQueues({
-						steering: queuedDuringWindow.steering.filter(message => message !== selectedMessage),
-						followUp: selected
+						steering: queuedDuringWindow.steering.filter(
+							message => message !== selectedMessage && message !== cancelledMessage,
+						),
+						followUp: committedSelection
 							? queuedDuringWindow.followUp.filter(message => message !== selectedMessage)
-							: [...queueSnapshot.followUp, ...queuedDuringWindow.followUp],
+							: [
+								...queueSnapshot.followUp.filter(message => message !== cancelledMessage),
+								...queuedDuringWindow.followUp.filter(message => message !== cancelledMessage),
+							],
 					});
 					this.#steeringMessages = steeringDisplaysDuringWindow;
 					// With a selected entry the held (unselected) messages are re-queued
 					// as follow-ups by restoreHeldQueue once the new run is accepted;
 					// mirror them in the display in the same order.
-					this.#followUpMessages = selected
+					this.#followUpMessages = committedSelection
 						? [
-								...steeringDisplaySnapshot.filter(entry => entry !== selected.display),
-								...followUpDisplaySnapshot.filter(entry => entry !== selected.display),
+								...steeringDisplaySnapshot.filter(entry => entry !== committedSelection.display),
+								...followUpDisplaySnapshot.filter(entry => entry !== committedSelection.display),
 								...followUpDisplaysDuringWindow,
 							]
-						: [...followUpDisplaySnapshot, ...followUpDisplaysDuringWindow];
-					if (selected?.deferred && selectedMessage !== undefined) {
+						: [
+								...followUpDisplaySnapshot.filter(entry => entry !== cancelledDisplay),
+								...followUpDisplaysDuringWindow.filter(entry => entry !== cancelledDisplay),
+							];
+					if (committedSelection?.deferred && selectedMessage !== undefined) {
 						this.#deferredSdkFollowUps = this.#deferredSdkFollowUps.filter(
 							message => message !== selectedMessage,
 						);
 					}
 					if (selectedMessage !== undefined && selectedPromotionHook !== undefined) {
-						if (selected?.mode === "steer") this.#steerPromotionHooks.set(selectedMessage, selectedPromotionHook);
+						if (committedSelection?.mode === "steer") this.#steerPromotionHooks.set(selectedMessage, selectedPromotionHook);
 						else this.#followUpPromotionHooks.set(selectedMessage, selectedPromotionHook);
 					}
 					const message = selectedMessage ?? {
@@ -16500,7 +16542,7 @@ export class AgentSession {
 								: text;
 					await this.refreshGjcSubskillTools();
 					if (message.role === "custom") await this.#syncSkillPromptActiveStateSafely(message, true);
-					if (selected) {
+					if (committedSelection) {
 						const displayTag = message.role === "custom" ? readPendingDisplayTag(message.details) : undefined;
 						if (displayTag) this.#displayDequeueAlreadyHandled = { role: "custom", tag: displayTag };
 						else if (message.role === "user")
@@ -16524,13 +16566,17 @@ export class AgentSession {
 									this.agent.restoreSteering(heldSteering);
 									this.#steeringMessages = [...heldSteeringDisplays, ...this.#steeringMessages];
 								}
-								if (selected) {
+								if (committedSelection) {
 									this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
 									this.#settleTrackedOwnRunPromotions(handle);
 								}
-								if (selected) {
-									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
-									this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== selected.display);
+								if (committedSelection) {
+									this.#steeringMessages = this.#steeringMessages.filter(
+										entry => entry !== committedSelection.display,
+									);
+									this.#followUpMessages = this.#followUpMessages.filter(
+										entry => entry !== committedSelection.display,
+									);
 								}
 							},
 						});
@@ -16545,6 +16591,7 @@ export class AgentSession {
 					if (runAccepted) {
 						return { kind: "submitted" };
 					}
+					revalidateSelected();
 					this.#displayDequeueAlreadyHandled = undefined;
 					restore();
 					logger.error("Cancel-and-submit prompt failed before run acceptance", { cause });

@@ -854,6 +854,7 @@ describe("queued promotion run identity (#4668)", () => {
 		);
 		const promptDone = session.prompt("first task");
 		await toolStarted.promise;
+		const promotions: boolean[] = [];
 		// A streaming run plus an SDK run token parks both follow-ups in the
 		// DEFERRED store, outside the Agent live queue.
 		const first = await session.submitUserMessage("deferred one", {
@@ -868,14 +869,17 @@ describe("queued promotion run identity (#4668)", () => {
 			deliverAs: "followUp",
 			trackSubmission: true,
 			sdkRunCapability: createSdkRunCapability("deferred-two-token"),
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) =>
+				promotions.push(promotion.startsOwnRun === true),
 		} as never);
 		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
 
 		expect(first.cancel()).toBe(true);
-		// The live queue was already empty, so the successor must be released into
-		// it immediately — not left waiting for an agent_end that a still-streaming
-		// run has not produced yet.
-		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+		// The predecessor is still streaming, so its successor must remain deferred
+		// until the predecessor emits agent_end. Releasing it into the live queue here
+		// would let the current run consume it as an in-run follow-up and bind the
+		// successor SDK token to the wrong run.
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
 		await expect(first.execution).resolves.toMatchObject({
 			submissionId: first.submissionId,
 			disposition: "removed",
@@ -889,7 +893,8 @@ describe("queued promotion run identity (#4668)", () => {
 			Bun.sleep(5_000).then(() => "timeout" as const),
 		]);
 		expect(settled).toBe("settled");
-		expect((await second.execution).disposition).not.toBe("removed");
+		expect((await second.execution).disposition).toBe("promoted-to-run");
+		expect(promotions).toEqual([true]);
 		await expect(second.terminal).resolves.toMatchObject({
 			submissionId: second.submissionId,
 			disposition: "completed",
@@ -924,6 +929,7 @@ describe("queued promotion run identity (#4668)", () => {
 		);
 		const promptDone = session.prompt("first task");
 		await toolStarted.promise;
+		const promotions: boolean[] = [];
 		const first = await session.submitUserMessage("deferred one", {
 			deliverAs: "followUp",
 			trackSubmission: true,
@@ -933,15 +939,19 @@ describe("queued promotion run identity (#4668)", () => {
 			deliverAs: "followUp",
 			trackSubmission: true,
 			sdkRunCapability: createSdkRunCapability("deferred-two-token"),
+			onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) =>
+				promotions.push(promotion.startsOwnRun === true),
 		} as never);
 		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
 
 		const firstRow = session.getQueuedMessageEntries().find(entry => entry.text === "deferred one");
 		expect(firstRow).toBeDefined();
 		expect(session.removeQueuedMessageForEditing(firstRow?.id ?? "")).toBe("deferred one");
-		// The successor must be released immediately: the run is still streaming, so
-		// no agent_end will fire to rescue it before the caller observes the state.
-		expect(session.agent.snapshotFollowUp()).toHaveLength(1);
+		// The predecessor is still streaming, so its successor must remain deferred
+		// until the predecessor emits agent_end. Releasing it into the live queue here
+		// would let the current run consume it as an in-run follow-up and bind the
+		// successor SDK token to the wrong run.
+		expect(session.agent.snapshotFollowUp()).toHaveLength(0);
 		await expect(first.execution).resolves.toMatchObject({
 			submissionId: first.submissionId,
 			disposition: "removed",
@@ -954,7 +964,8 @@ describe("queued promotion run identity (#4668)", () => {
 			Bun.sleep(5_000).then(() => "timeout" as const),
 		]);
 		expect(settled).toBe("settled");
-		expect((await second.execution).disposition).not.toBe("removed");
+		expect((await second.execution).disposition).toBe("promoted-to-run");
+		expect(promotions).toEqual([true]);
 		await expect(second.terminal).resolves.toMatchObject({
 			submissionId: second.submissionId,
 			disposition: "completed",

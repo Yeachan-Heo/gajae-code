@@ -259,6 +259,43 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(requestUserTexts().flat()).not.toContain("replacement");
 	});
 
+	it("does not execute a selected queued input cancelled while abort settles", async () => {
+		const { session: s, requestUserTexts } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		const submission = await s.submitUserMessage("selected queued input", {
+			deliverAs: "followUp",
+			trackSubmission: true,
+		});
+		const queuedEntry = s.getQueuedMessageEntries().find(entry => entry.text === "selected queued input");
+		if (!queuedEntry) throw new Error("Expected a selected queued entry");
+
+		const abortEntered = Promise.withResolvers<void>();
+		const releaseAbort = Promise.withResolvers<void>();
+		s.setCancelAndSubmitAbortOutcomeProviderForTests(async () => {
+			expect(submission.cancel()).toBe(true);
+			abortEntered.resolve();
+			await releaseAbort.promise;
+			await s.abort({ cause: "user_interrupt" });
+			return { kind: "settled" };
+		});
+
+		const cancelAndSubmit = s.cancelAndSubmit("replacement", { queuedEntryId: queuedEntry.id });
+		await abortEntered.promise;
+		releaseAbort.resolve();
+
+		expect(await cancelAndSubmit).toEqual({ kind: "submitted" });
+		await expect(submission.execution).resolves.toMatchObject({
+			submissionId: submission.submissionId,
+			disposition: "removed",
+			reason: "cancelled",
+		});
+		await activePrompt;
+		await s.waitForIdle();
+		expect(requestUserTexts().flat()).toContain("replacement");
+		expect(requestUserTexts().flat()).not.toContain("selected queued input");
+	});
+
 	it("keeps live-run steers as steers of the replacement turn, applied after its response", async () => {
 		// R6: the aborted turn's admitted steers must stay STEERING of the
 		// replacement run (re-admitted after the replacement is answered), not be
