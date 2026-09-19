@@ -148,6 +148,38 @@ Docs-only remains the smallest safe outcome for the search/context sidecar in is
 
 There is no fallback to the native browser. When the Aside CLI is unavailable, the direct CLI command fails in the Bash tool result and the session has no browser tool.
 
+### Structured activity declaration on Bash
+
+Aside execution is still ordinary Bash: GJC spawns or supervises no Aside
+process, and the Bash executor never inspects the command. What the routing
+contract adds is one optional, model-declared field on the Bash tool call:
+
+```json
+{ "kind": "browser", "provider": "aside", "mode": "repl" | "exec" }
+```
+
+- The `<browser-backend>` prompt block requires the declaration on every Bash
+  invocation that runs Aside — `mode: "repl"` for `aside repl`, `mode: "exec"`
+  for `aside exec` including `--session` follow-ups — and requires omitting it
+  on Bash calls that do not invoke Aside. The declaration names the operation,
+  not the command spelling, so wrappers, env prefixes, absolute CLI paths,
+  quoting, and multiline commands do not change it.
+- The schema is shape-validated only (`BashToolInput.activity` in
+  `src/tools/bash.ts`). A malformed or unsupported declaration is dropped, never
+  coerced, and never fails an otherwise valid command; a call without one is
+  ordinary Bash with unchanged semantics. GJC does **not** verify that the
+  command actually invokes Aside — the declaration is authoritative as part of
+  the model-facing routing contract, not as OS-level process verification.
+- The accepted value is mirrored into `BashToolDetails.activity` on foreground
+  results, background/folded starts, and background job progress/terminal
+  details, so the existing tool-call lifecycle (`tool_execution_start`/`_update`/`_end`
+  with `toolCallId`) transports it with no new event, id, persistence, or state
+  store.
+- Consumers (such as embedding apps) may use the declaration for UI/activity
+  projection. Consumers must not fall back to parsing the command string:
+  quoting, wrappers, variables, aliases, and future CLI or prompt changes make
+  any string match a heuristic, not a contract.
+
 ```sh
 gjc config set browser.backend aside
 ```
