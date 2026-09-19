@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { generateMuPdfAsset, resetMuPdfAsset } from "../scripts/embed-mupdf";
 import { convertFileWithMarkit } from "../src/utils/markit";
 import { ensureMupdfWasmResolution } from "../src/utils/mupdf-wasm";
 
@@ -102,6 +103,12 @@ describe("mupdf wasm embedding in a compiled binary (#5433)", () => {
 		const fixtureEntry = path.resolve(import.meta.dirname, "fixtures/mupdf-compiled-convert-entry.ts");
 		const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mupdf-compiled-"));
 		const executable = path.join(outDir, "mupdf-convert-fixture");
+		// A compiled binary carries the WASM only if the embedding step ran first.
+		// scripts/ci-release-build-binaries.ts does exactly this around the release
+		// compile, so the test has to reproduce it or it asserts against a binary
+		// that no release ever ships. Reset afterwards: the generated module is
+		// checked in as the source-install (undefined) form.
+		await generateMuPdfAsset();
 		try {
 			const compile = Bun.spawn(
 				[process.execPath, "build", fixtureEntry, "--compile", "--minify", "--keep-names", "--outfile", executable],
@@ -120,6 +127,7 @@ describe("mupdf wasm embedding in a compiled binary (#5433)", () => {
 			expect(runExit, stderr.slice(0, 2000) || stdout).toBe(0);
 			expect(stdout).toContain("CONVERTED:Dummy PDF file");
 		} finally {
+			await resetMuPdfAsset();
 			fs.rmSync(outDir, { recursive: true, force: true });
 		}
 	}, 240_000);
