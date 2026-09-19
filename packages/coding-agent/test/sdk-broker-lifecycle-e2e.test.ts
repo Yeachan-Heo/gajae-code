@@ -19,6 +19,7 @@ import {
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
+	lifecycleFailureMessage,
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
@@ -63,6 +64,14 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 }
+
+test("formats cause-bearing diagnostics for children that started and exited", () => {
+	const child = { exitCode: 23, signalCode: null } as never;
+	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
+		"Session exited before readiness. (exit=23)",
+	);
+});
+
 async function incarnation(pid: number): Promise<string> {
 	const value = processIncarnation(pid);
 	if (!value) throw new Error(`Process ${pid} has no readable incarnation.`);
@@ -2598,8 +2607,50 @@ test("broker preserves spawn_failed when the ChildProcess emits an error before 
 			broker.handleRequest("session.create", { cwd: root }, "child-error-before-pid"),
 		).resolves.toMatchObject({
 			ok: false,
-			error: { code: "spawn_failed" },
+			error: { code: "spawn_failed", message: expect.stringContaining("ENOENT") },
 		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker reports child exit status without publishing detached-host stderr", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-diagnostic-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: ["-e", "process.stderr.write('child-startup-failed' + 'x'.repeat(64 * 1024)); process.exit(23)"],
+		}));
+		await broker.start();
+		await expect(
+			broker.handleRequest(
+				"session.create",
+				{ cwd: root, readinessTimeoutMs: 4_000 },
+				"child-diagnostic-before-readiness",
+			),
+		).resolves.toMatchObject({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				message: expect.stringContaining("exit=23"),
+			},
+		});
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"child-diagnostic-before-readiness",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { message: expect.stringContaining("exit=23") },
+		});
+		expect(JSON.stringify(response)).not.toContain("child-startup-failed");
+		const sdkDirectory = path.join(root, ".gjc", "state", "sdk");
+		const names = await fs.readdir(sdkDirectory).catch(() => [] as string[]);
+		expect(names.some(name => name.includes(".lifecycle.stderr.") && name.endsWith(".log"))).toBe(false);
 	} finally {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
