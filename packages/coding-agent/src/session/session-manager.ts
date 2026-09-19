@@ -2179,14 +2179,19 @@ const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
  *    registry is filtered to definitions carrying `handle`
  *    (`slash-commands/acp-builtins.ts`), so a `handleTui`-only command such as
  *    `/new` is a different dead end rather than a fix.
- * 3. **It must not drop the retained near-limit entry.** The failed append is
- *    kept in memory with a full rewrite armed, and the message promises it
+ * 3. **It must not drop the retained near-limit entries.** A failed append is
+ *    kept in memory with a full rewrite armed, and a rejected managed rewrite
+ *    likewise retains its resident entries; both messages promise the work
  *    persists on the next successful write. `/compact` and `/clear` keep the
  *    manager — and therefore that pending debt — alive; a session switch closes
  *    the writer without paying it.
  *
- * `session-recovery-guidance.test.ts` pins all three against the CLI, builtin,
- * and ACP registries.
+ * Every near-limit error class MUST interpolate this constant rather than
+ * restate the advice. `SessionNearLimitRewriteError` restated it and thereby
+ * reintroduced `gjc export <session-file>` after #5621 removed it (#5691).
+ *
+ * `session-recovery-guidance.test.ts` pins all three constraints against the
+ * CLI, builtin, and ACP registries, for every near-limit error class.
  */
 export const SESSION_LIMIT_RECOVERY_ACTIONS =
 	"compact the session (`/compact`), or clear its context (`/clear`) if compaction cannot reclaim enough";

@@ -13,12 +13,17 @@ import { BUILTIN_SLASH_COMMAND_DEFS } from "../src/slash-commands/builtin-regist
  * Recovery guidance must only name commands a user can actually run, on every
  * surface that renders the message.
  *
- * Both limit messages told users to run `gjc export <session-file>`. There is no
- * `export` subcommand (`cli-main.ts` registers none), so the shell started a
+ * The near-limit messages told users to run `gjc export <session-file>`. There is
+ * no `export` subcommand (`cli-main.ts` registers none), so the shell started a
  * fresh interactive agent that read "export" as a prompt: the operator lost the
  * recovery they were told to perform and still held an unwritable session. The
  * root `--export` flag is unrelated — it renders HTML and exits, which never
  * produces a resumable session.
+ *
+ * It came back once already. `#5691` added a third near-limit error class with its
+ * own hardcoded copy of the advice, and this matrix — which then enumerated only
+ * the two append messages — could not see it. Cover the error FAMILY, not the
+ * instances that happened to exist when the guard was written (#5732).
  *
  * Existence alone is not enough. `AgentSession` renders the near-limit guidance
  * to ACP/text consumers too, and `ACP_BUILTIN_SLASH_COMMANDS` is filtered to
