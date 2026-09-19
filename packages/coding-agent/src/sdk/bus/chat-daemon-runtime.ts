@@ -317,6 +317,7 @@ export class ChatDaemonRuntime {
 	) {
 		this.#router = new SessionRouter({
 			agentDir: input.agentDir,
+			observer: true,
 			correlateFrame,
 			deps: {
 				...deps.routerDeps,

@@ -38,7 +38,16 @@ import { replaceTabs } from "../../tools/render-utils";
 import { getDisplayChangelogEntries } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
-import { setSessionTerminalTitle } from "../../utils/title-generator";
+import {
+	beginSessionTitleGeneration,
+	invalidateSessionTitleGeneration,
+	isSessionTitleGenerationCurrent,
+} from "../../utils/session-title-generation";
+import {
+	buildConversationTitleInput,
+	generateSessionTitle,
+	setSessionTerminalTitle,
+} from "../../utils/title-generator";
 import { addChatChild, prepareTranscriptRebuild, syncPendingExecutionComponents } from "../utils/ui-helpers";
 
 type HindsightModule = typeof import("../../hindsight");
@@ -84,6 +93,7 @@ export function buildHelpMarkdown(keybindings: Pick<KeybindingsManager, "getAcce
 		"| Resume another session | `/resume` |",
 		"| Show session details | `/session info` |",
 		"| Delete current session transcript/artifacts | `/session delete` |",
+		"| Fork from an earlier prompt into a new session | `/fork` |",
 		`| Select a model | \`/model\` or ${selectModelKey} |`,
 		`| Queue a message for the next turn | ${queueMessageKey} |`,
 		`| Select or edit a queued message | ${dequeueMessageKey} |`,
@@ -1109,31 +1119,7 @@ export class CommandController {
 	}
 
 	async handleForkCommand(): Promise<void> {
-		if (this.ctx.session.isStreaming) {
-			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
-			return;
-		}
-
-		const success = await this.ctx.session.fork();
-		if (this.ctx.isStopped?.()) return;
-		if (!success) {
-			this.ctx.showError("Fork failed (session not persisted or cancelled)");
-			return;
-		}
-		clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
-		this.ctx.resetIrcSidebarSession();
-
-		this.ctx.statusLine.invalidate();
-		this.ctx.updateEditorTopBorder();
-
-		const sessionFile = this.ctx.session.sessionFile;
-		const shortPath = sessionFile ? sessionFile.split("/").pop() : "new session";
-		this.ctx.chatContainer.addChild(new Spacer(1));
-		this.ctx.chatContainer.addChild(
-			new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${shortPath}`)}`, 1, 1),
-		);
-		this.ctx.ui.requestRender();
+		this.ctx.showUserMessageSelector();
 	}
 
 	async handleMoveCommand(targetPath: string): Promise<void> {
@@ -1186,21 +1172,61 @@ export class CommandController {
 		}
 	}
 
-	async handleRenameCommand(title: string): Promise<void> {
+	async handleRenameCommand(title?: string): Promise<void> {
 		try {
+			if (!title?.trim()) {
+				const generation = beginSessionTitleGeneration(this.ctx.sessionManager);
+				const input = buildConversationTitleInput(this.ctx.session.messages);
+				if (!input) {
+					this.ctx.showError("Nothing to summarize yet — pass a title: /rename <title>");
+					return;
+				}
+
+				const generated = await generateSessionTitle(
+					input,
+					this.ctx.session.modelRegistry,
+					this.ctx.settings,
+					this.ctx.session.credentialSessionId,
+					this.ctx.session.model,
+					provider => this.ctx.session.agent.metadataForProvider(provider),
+				);
+				if (
+					!isSessionTitleGenerationCurrent(this.ctx.sessionManager, generation) ||
+					buildConversationTitleInput(this.ctx.session.messages) !== input
+				)
+					return;
+				if (!generated) {
+					this.ctx.showError("Could not generate a session title — pass one: /rename <title>");
+					return;
+				}
+
+				const stored = await this.ctx.sessionManager.setSessionName(generated, "user");
+				if (!stored) {
+					this.ctx.showError("Session name cannot be empty.");
+					return;
+				}
+				this.#finishRename();
+				return;
+			}
+
+			invalidateSessionTitleGeneration(this.ctx.sessionManager);
 			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");
 				return;
 			}
-			const name = this.ctx.sessionManager.getSessionName()!;
-			setSessionTerminalTitle(name, this.ctx.sessionManager.getCwd());
-			this.ctx.statusLine.invalidate();
-			this.ctx.updateEditorBorderColor();
-			this.ctx.showStatus(`Session renamed to "${name}".`);
+			this.#finishRename();
 		} catch (err) {
 			this.ctx.showError(`Rename failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
+	}
+
+	#finishRename(): void {
+		const name = this.ctx.sessionManager.getSessionName()!;
+		setSessionTerminalTitle(name, this.ctx.sessionManager.getCwd());
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		this.ctx.showStatus(`Session renamed to "${name}".`);
 	}
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {

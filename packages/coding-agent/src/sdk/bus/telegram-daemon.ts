@@ -4087,6 +4087,11 @@ export interface TelegramDaemonOptions {
 	clearIntervalImpl?: typeof clearInterval;
 	btw?: { enabled: boolean };
 	idleTimeoutMs?: number;
+	/**
+	 * Standalone daemon owners keep Telegram command ingress alive while no SDK
+	 * endpoints are attached. Embedded/test daemons retain finite-idle behavior.
+	 */
+	keepAliveWithoutAttachments?: boolean;
 	/** TTL for durable topic-adoption intents (default 10 minutes). Observed, not a fixed contract. */
 	adoptionIntentTtlMs?: number;
 	pid?: number;
@@ -5256,6 +5261,7 @@ export class TelegramNotificationDaemon {
 		this.#frameRouter = this.#createFrameRouter();
 		this.#attachmentRouter = new SessionRouter({
 			agentDir: opts.settings.getAgentDir(),
+			observer: true,
 			deps: {
 				...opts.routerDeps,
 				onNotificationSubscription: subscription => this.#onAttachment(subscription),
@@ -12963,9 +12969,10 @@ export class TelegramNotificationDaemon {
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
 					idleSince = this.runtime.now();
-				} else if (idleElapsed) {
-					// Zero sessions past the idle window: exit so the owner does not run
-					// forever. An active session resets the idle window above.
+				} else if (!this.opts.keepAliveWithoutAttachments && idleElapsed) {
+					// Zero sessions past the idle window: embedded/test owners exit so
+					// they do not run forever. Standalone owners keep this command
+					// receiver alive until control or owner fencing asks them to stop.
 					this.requestStop("idle_timeout");
 					break;
 				}

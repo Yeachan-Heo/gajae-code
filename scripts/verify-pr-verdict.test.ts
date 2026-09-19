@@ -26,7 +26,15 @@ const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} rev
 
 describe("authenticated approval API evidence", () => {
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
-	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+	// Reviews are submitted after the head commit; a submission that predates the head is a
+	// force-push re-bind and is covered by its own case below (#5692).
+	const headCommittedAt = "2026-09-18T06:00:00Z";
+	const review = (state: string, commit = head, submitted = "2026-09-18T07:00:00Z") => ({
+		state,
+		commit_id: commit,
+		user: { login: "review-agent" },
+		submitted_at: submitted,
+	});
 
 	test.each([
 		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
@@ -34,6 +42,8 @@ describe("authenticated approval API evidence", () => {
 		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
 		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
 		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+		// #5692: reports this exact head, but submitted before the head commit existed.
+		{ name: "approval re-bound by a force-push", reviews: [review("APPROVED", head, "2026-09-18T02:00:00Z")], permission: "write", approved: false },
 	])("$name", async scenario => {
 		const requests: string[] = [];
 		const originalFetch = globalThis.fetch;
@@ -42,6 +52,8 @@ describe("authenticated approval API evidence", () => {
 			requests.push(endpoint);
 			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
 			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -50,7 +62,10 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+			// Every case now also reads the head commit date; the permission call only
+			// follows a surviving approval.
+			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
+			expect(requests.length).toBe(expectsPermission ? 3 : 2);
 		} finally {
 			spy.mockRestore();
 		}
@@ -1160,9 +1175,14 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		author_association: "OWNER",
 		body: selfReviewRecord({ ...context, risk: "regression-risk", extra: "independent:review-bot" }),
 	}];
-	const reviewerApproval = (context: PushPreflightContext, state = "APPROVED") => [
-		{ author: { login: "review-bot" }, state, commit: { oid: context.headSha } },
-	];
+	// Submitted well after any commit this harness creates, so a genuine approval is never
+	// mistaken for one GitHub re-bound onto a new head by a force-push (#5692). The re-bound
+	// case below uses an epoch-old submission instead.
+	const reviewerApproval = (
+		context: PushPreflightContext,
+		state = "APPROVED",
+		submittedAt = "2099-01-01T00:00:00Z",
+	) => [{ author: { login: "review-bot" }, state, commit: { oid: context.headSha }, submittedAt }];
 
 	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
 		const result = await runSelfReviewPushPreflight({
@@ -1206,7 +1226,8 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 			comments: riskClassifiedComments,
 			reviews: context => [
 				...reviewerApproval(context),
-				{ author: { login: "review-bot" }, state: "CHANGES_REQUESTED", commit: { oid: context.headSha } },
+				// Later than the approval above, so it supersedes it; both postdate the head.
+				...reviewerApproval(context, "CHANGES_REQUESTED", "2099-01-02T00:00:00Z"),
 			],
 			permission: "write",
 		});
@@ -1214,6 +1235,21 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.stderr).toContain("is not satisfied");
 	});
 
+	test("an approval GitHub re-bound onto the new head after a force-push does not authorize (#5692)", async () => {
+		// The review reports the exact head, but was submitted long before that commit could
+		// have existed. `commit_id` tracks the branch tip across a force-push, so this is the
+		// shape a rebase leaves behind on an unprotected base with no stale-review dismissal.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "1970-01-01T00:00:00Z"),
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		// Must read as a re-bound stale approval, NOT as a missing one: the remedies differ.
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
+	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
 			body: riskClassifiedBody,
@@ -1241,7 +1277,17 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 
 describe("server independent-reviewer evidence (issue #5483 review)", () => {
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
-	const review = (login: string, state: string, commit = head) => ({ state, commit_id: commit, user: { login } });
+	// The head commit's committer date; every genuine review below is submitted after it.
+	const headCommittedAt = "2026-09-18T06:00:00Z";
+	const afterHead = "2026-09-18T07:00:00Z";
+	/** Submitted BEFORE the head existed — only reachable via a force-push re-bind (#5692). */
+	const beforeHead = "2026-09-18T02:00:00Z";
+	const review = (login: string, state: string, commit = head, submitted = afterHead) => ({
+		state,
+		commit_id: commit,
+		user: { login },
+		submitted_at: submitted,
+	});
 
 	test.each([
 		{ name: "approval only", reviews: [review("review-bot", "APPROVED")], approved: true },
@@ -1250,6 +1296,21 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		{ name: "commented review never counts", reviews: [review("review-bot", "COMMENTED")], approved: false },
 		{ name: "approval on another head", reviews: [review("review-bot", "APPROVED", "d".repeat(40))], approved: false },
 		{ name: "another identity's approval", reviews: [review("someone-else", "APPROVED")], approved: false },
+		// #5692: GitHub re-points commit_id onto the new tip after a force-push, so an
+		// approval of older code arrives reporting this exact head. It must not count, and it
+		// must be distinguishable from having no approval at all.
+		{
+			name: "approval re-bound onto this head by a force-push does not count",
+			reviews: [review("review-bot", "APPROVED", head, beforeHead)],
+			approved: false,
+			refused: "rebound",
+		},
+		{
+			name: "an approval with no submission time fails closed",
+			reviews: [{ state: "APPROVED", commit_id: head, user: { login: "review-bot" } }],
+			approved: false,
+			refused: "unreadable",
+		},
 	]) ("$name", async scenario => {
 		const originalFetch = globalThis.fetch;
 		const previousToken = Bun.env.GITHUB_TOKEN;
@@ -1257,13 +1318,52 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
 			const endpoint = String(input);
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
 		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
-			expect(evidence).toEqual({ permission: "write", approvedHead: scenario.approved, approvedLogin: "review-bot" });
+			expect(evidence).toEqual({
+				permission: "write",
+				approvedHead: scenario.approved,
+				approvedLogin: "review-bot",
+				...(scenario.refused ? { refusedApproval: scenario.refused } : {}),
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test.each([
+		{ name: "commits API failure", commits: () => new Response("nope", { status: 500 }) },
+		{ name: "missing committer date", commits: () => Response.json({ commit: { committer: {} } }) },
+		{ name: "unparseable committer date", commits: () => Response.json({ commit: { committer: { date: "not-a-date" } } }) },
+	])("an unreadable head commit date refuses the approval rather than admitting it: $name", async scenario => {
+		// The first cut of #5692 skipped the precedence test entirely when the head date was
+		// absent, so a failed commit lookup ADMITTED the approval — a fail-open in the guard
+		// that exists to fail closed (#5692 review).
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+			// Refused, but NOT claimed re-bound: precedence was never proven.
+			expect(evidence.refusedApproval).toBe("unreadable");
 		} finally {
 			spy.mockRestore();
 			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;

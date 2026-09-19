@@ -1,0 +1,3 @@
+### Added
+
+- Bash accepts an optional model-declared activity declaration (`activity: { kind: "browser", provider: "aside", mode: "repl" | "exec" }`) and mirrors the accepted value into `BashToolDetails.activity` on foreground results, background/folded starts, and background job progress/terminal details. The `browser.backend: aside` routing prompt now requires the declaration on every Bash invocation that runs Aside, so embedding consumers can project Aside browser activity from the existing tool-call lifecycle instead of parsing command text. The declaration is schema-validated only: malformed values are dropped (never coerced, never fatal), calls without one are ordinary unchanged Bash, and GJC still neither spawns nor supervises Aside nor inspects the command.

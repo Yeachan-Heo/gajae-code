@@ -1,11 +1,12 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
-import { closeModelCache, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
@@ -14,6 +15,7 @@ import { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import type {
+	AgentEndEvent,
 	ExtensionActions,
 	ExtensionAPI,
 	ExtensionContextActions,
@@ -66,15 +68,16 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { sessionHostAttachedClients, sessionHostWorkInFlight } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
-import { SessionSdkHost } from "../src/sdk/host";
+import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
-import type { SessionAttachment } from "../src/sdk/router/session-router";
+import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -765,6 +768,175 @@ test("production SDK host starts exactly one instrumented server (no duplicate a
 	} finally {
 		serverStart.mockRestore();
 		await host?.stop();
+	}
+}, 60_000);
+
+test("observer daemon demand covers hello-before-replay, replay-after, and disconnect-before-replay while live work promotes demand", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-observer-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const observer = new SdkClient(host.endpoint.url, host.endpoint.token, {
+		capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+		reconnectAttempts: 0,
+	});
+	try {
+		await observer.connect();
+		// The authenticated hello is authoritative; replay is not required to
+		// establish the observer role.
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand, "observer hello negotiation");
+		await observer.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 });
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		await host.session.extensionRunner?.emit({ type: "agent_start" });
+		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+		await host.session.extensionRunner?.emit({
+			type: "agent_end",
+			stopReason: "completed",
+			messages: [{ role: "assistant", stopReason: "stop" }],
+		} as never);
+		await Bun.sleep(20);
+		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+
+		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {
+			capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			reconnectAttempts: 0,
+		});
+		await disconnectedBeforeReplay.connect();
+		await disconnectedBeforeReplay.close();
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand);
+	} finally {
+		await observer.close();
+		await host.stop();
+	}
+}, 60_000);
+
+test("replay capability claims cannot turn a demanding connection into an observer", async () => {
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-replay-capability-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	const demanding = new WebSocket(`${host.endpoint.url}/?token=${encodeURIComponent(host.endpoint.token)}`);
+	sockets.push(demanding);
+	let connectionId: string | undefined;
+	demanding.addEventListener("message", event => {
+		const frame = JSON.parse(String((event as MessageEvent).data)) as { type?: unknown; connectionId?: unknown };
+		if (frame.type === "hello" && typeof frame.connectionId === "string") connectionId = frame.connectionId;
+	});
+	try {
+		await new Promise<void>((resolve, reject) => {
+			demanding.addEventListener("open", () => resolve(), { once: true });
+			demanding.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		await waitFor(() => sdkFrame !== undefined && connectionId !== undefined, "SDK callback wiring");
+		sdkFrame!(null, {
+			connectionId: connectionId!,
+			json: JSON.stringify({
+				type: "event_replay",
+				id: "forged-observer",
+				sinceGeneration: 1,
+				sinceSeq: 0,
+				capabilities: [SESSION_HOST_OBSERVER_CAPABILITY],
+			}),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		demanding.close();
+		await host.stop();
+		sdkFrameHook.mockRestore();
+	}
+}, 60_000);
+
+test("a default ACP-shaped SessionRouter client remains demanding", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-default-router-demand-"));
+	dirs.push(cwd);
+	const host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+	const baseDemand = sessionHostAttachedClients() ?? 0;
+	// ACP constructs the default router without notification-daemon observer role.
+	const router = new SessionRouter({ agentDir: path.join(cwd, ".gjc", "agent") });
+	try {
+		await router.start();
+		await waitFor(
+			() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1,
+			"default SessionRouter demand attachment",
+		);
+		await Bun.sleep(100);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await router.stop();
+		await host.stop();
+	}
+}, 60_000);
+
+test("late capability and replay callbacks after close cannot erase a live demanding client", async () => {
+	let negotiated: Parameters<NotificationServer["onNegotiatedCapabilities"]>[0] | undefined;
+	let closed: Parameters<NotificationServer["onConnectionClose"]>[0] | undefined;
+	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
+	const negotiatedImpl = NotificationServer.prototype.onNegotiatedCapabilities;
+	const closedImpl = NotificationServer.prototype.onConnectionClose;
+	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;
+	const negotiatedHook = spyOn(NotificationServer.prototype, "onNegotiatedCapabilities").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		negotiated = callback;
+		return negotiatedImpl.call(this, callback);
+	});
+	const closedHook = spyOn(NotificationServer.prototype, "onConnectionClose").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		closed = callback;
+		return closedImpl.call(this, callback);
+	});
+	const sdkFrameHook = spyOn(NotificationServer.prototype, "onSdkFrame").mockImplementation(function (
+		this: NotificationServer,
+		callback,
+	) {
+		sdkFrame = callback;
+		return sdkFrameImpl.call(this, callback);
+	});
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-late-capability-close-"));
+	dirs.push(cwd);
+	let host: Awaited<ReturnType<typeof startProductionSdkHost>> | undefined;
+	let demanding: SdkClient | undefined;
+	try {
+		host = await startProductionSdkHost(cwd, { acceptPromptPreflightWithoutExecution: true });
+		const baseDemand = sessionHostAttachedClients() ?? 0;
+		demanding = new SdkClient(host.endpoint.url, host.endpoint.token, { reconnectAttempts: 0 });
+		await demanding.connect();
+		await waitFor(() => (sessionHostAttachedClients() ?? 0) === baseDemand + 1, "demanding client attachment");
+		if (!negotiated || !closed || !sdkFrame) throw new Error("native callback capture failed");
+
+		closed(null, "closed-before-late-callback");
+		negotiated(null, "closed-before-late-callback", [SESSION_HOST_OBSERVER_CAPABILITY]);
+		sdkFrame(null, {
+			connectionId: "closed-before-late-callback",
+			json: JSON.stringify({ type: "event_replay", capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] }),
+		});
+		await Bun.sleep(20);
+		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
+	} finally {
+		await demanding?.close();
+		await host?.stop();
+		negotiatedHook.mockRestore();
+		closedHook.mockRestore();
+		sdkFrameHook.mockRestore();
 	}
 }, 60_000);
 
@@ -2765,6 +2937,295 @@ test("SDK host waits for accepted handleless skill settlement before publishing 
 	expect(executionStarted).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+
+function assistantEndEvent(text: string): AgentEndEvent {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-completions",
+		provider: "fixture-provider",
+		model: "reasoning-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	return { type: "agent_end", messages: [message], stopReason: "completed" };
+}
+
+function acceptedCorrelation(frame: Record<string, unknown> | undefined): { commandId: string; turnId: string } {
+	const result = (frame as { result?: { commandId?: unknown; turnId?: unknown } } | undefined)?.result;
+	if (typeof result?.commandId !== "string" || typeof result.turnId !== "string")
+		throw new Error(`acceptance frame carries no correlation: ${JSON.stringify(frame)}`);
+	return { commandId: result.commandId, turnId: result.turnId };
+}
+
+test("SDK host retains the final assistant text for a skill whose invocation settles before its terminal is finalized", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-result-text-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-result-text-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	// The invocation promise settles only when the test releases it, so the
+	// runtime order (durable claim enqueued, invocation resolves, finalize) is
+	// reproduced deterministically instead of depending on the agent loop.
+	let release = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		await release.promise;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (frame: Record<string, unknown>): Promise<Record<string, unknown> | undefined> => {
+		socket.send(JSON.stringify(frame));
+		await waitFor(() => frames.some(candidate => candidate.id === frame.id), `${String(frame.id)} response`);
+		return frames.find(candidate => candidate.id === frame.id);
+	};
+	const terminalFrame = (correlation: { commandId: string; turnId: string }): Record<string, unknown> | undefined =>
+		frames.find(
+			frame =>
+				frame.type === "agent_end" &&
+				frame.commandId === correlation.commandId &&
+				frame.turnId === correlation.turnId,
+		);
+	const skillText = "skill final answer";
+	const directText = "direct final answer";
+	try {
+		const skill = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "skill-text",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "keep text", clientRef: "skill-text-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const skillEnding = handlers.get("agent_end")?.(assistantEndEvent(skillText), sessionContext);
+		release.resolve();
+		await skillEnding;
+		await waitFor(() => terminalFrame(skill) !== undefined, "correlated skill terminal");
+		const skillByClientRef = await request({
+			type: "query_request",
+			id: "skill-text-by-client-ref",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-text-ref" },
+		});
+		const skillByPair = await request({
+			type: "query_request",
+			id: "skill-text-by-pair",
+			query: "turn.result",
+			input: { kind: "skill", ...skill },
+		});
+
+		const direct = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "direct-text",
+				operation: "turn.prompt",
+				input: { text: "direct", clientRef: "direct-text-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(assistantEndEvent(directText), sessionContext);
+		await waitFor(() => terminalFrame(direct) !== undefined, "correlated direct prompt terminal");
+		const directByClientRef = await request({
+			type: "query_request",
+			id: "direct-text-by-client-ref",
+			query: "turn.result",
+			input: { kind: "prompt", clientRef: "direct-text-ref" },
+		});
+
+		release = Promise.withResolvers<void>();
+		const blank = acceptedCorrelation(
+			await request({
+				type: "control_request",
+				id: "skill-blank",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "blank text", clientRef: "skill-blank-ref" },
+			}),
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const blankEnding = handlers.get("agent_end")?.(assistantEndEvent(" "), sessionContext);
+		release.resolve();
+		await blankEnding;
+		await waitFor(() => terminalFrame(blank) !== undefined, "correlated blank skill terminal");
+		const blankByClientRef = await request({
+			type: "query_request",
+			id: "skill-blank-by-client-ref",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-blank-ref" },
+		});
+
+		// Event association is intact in both states: the correlated terminal
+		// carries the skill's final text on the wire.
+		expect(terminalFrame(skill)).toMatchObject({
+			finalText: skillText,
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		// Direct-prompt parity guard: the single-owner prompt path keeps its text.
+		expect(directByClientRef).toMatchObject({
+			ok: true,
+			result: {
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { text: directText, byteLength: new TextEncoder().encode(directText).length, truncated: false },
+			},
+		});
+		// Blank final text keeps the existing missing-receipt semantics.
+		expect(blankByClientRef).toMatchObject({ ok: true, result: { status: "terminal_ok", receiptState: "missing" } });
+		expect((blankByClientRef?.result as { content?: unknown } | undefined)?.content).toBeUndefined();
+		// The durable skill result must carry the bounded final text through both
+		// public selectors.
+		const expectedSkillContent = {
+			text: skillText,
+			byteLength: new TextEncoder().encode(skillText).length,
+			truncated: false,
+		};
+		expect(skillByClientRef).toMatchObject({
+			ok: true,
+			result: { status: "terminal_ok", receiptState: "present", content: expectedSkillContent },
+		});
+		expect(skillByPair).toMatchObject({
+			ok: true,
+			result: { status: "terminal_ok", receiptState: "present", content: expectedSkillContent },
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+});
+test("SDK host retains final text for an ownerless durable skill invocation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ownerless-skill-result-text-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-ownerless-skill-result-text-${Date.now()}`;
+	const ownerlessText = "ownerless durable skill result ✓";
+	const sessionContext = context(cwd, sessionId);
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	sessionContext.invokeSkill = async (
+		name: string,
+		_args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
+		await options?.onPreflightAcceptCommit?.();
+		return ownerlessText;
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
+	const requesterConnectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
+	let ownerlessControlRequested = false;
+	const asyncLocalStoragePrototype = AsyncLocalStorage.prototype as unknown as {
+		run: (store: unknown, callback: (...args: unknown[]) => unknown, ...args: unknown[]) => unknown;
+	};
+	const nativeAsyncLocalStorageRun = asyncLocalStoragePrototype.run;
+	asyncLocalStoragePrototype.run = function (store, callback, ...args) {
+		if (
+			ownerlessControlRequested &&
+			store === requesterConnectionId &&
+			String(callback).includes("dispatchControl")
+		) {
+			ownerlessControlRequested = false;
+			return callback(...args);
+		}
+		return Reflect.apply(nativeAsyncLocalStorageRun, this, [store, callback, ...args]);
+	};
+	const requestQuery = async (id: string): Promise<Record<string, unknown> | undefined> => {
+		socket.send(
+			JSON.stringify({
+				type: "query_request",
+				id,
+				query: "turn.result",
+				input: { kind: "skill", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === id), `${id} response`);
+		return frames.find(frame => frame.id === id);
+	};
+	try {
+		ownerlessControlRequested = true;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "ownerless-skill",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "ownerless", clientRef: "ownerless-skill-ref" },
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.id === "ownerless-skill"), "ownerless skill response");
+		expect(ownerlessControlRequested).toBe(false);
+		expect(frames.find(frame => frame.id === "ownerless-skill")).toMatchObject({
+			type: "control_response",
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+
+		let resultResponse: Record<string, unknown> | undefined;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			resultResponse = await requestQuery(`ownerless-skill-result-${attempt}`);
+			const result = resultResponse?.result as { status?: string } | undefined;
+			if (result?.status === "terminal_ok" || result?.status === "failed") break;
+			await Bun.sleep(10);
+		}
+		const byteLength = new TextEncoder().encode(ownerlessText).byteLength;
+		expect(resultResponse).toMatchObject({
+			ok: true,
+			result: {
+				status: "terminal_ok",
+				receiptState: "present",
+				content: { version: 1, type: "text", text: ownerlessText, byteLength, truncated: false },
+			},
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		asyncLocalStoragePrototype.run = nativeAsyncLocalStorageRun;
+	}
+}, 60_000);
 test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
 	dirs.push(cwd);
@@ -3168,10 +3629,14 @@ test("session_shutdown awaits a late reconciliation publication before teardown 
 	expect(
 		frames.find(frame => frame.type === "control_response" && frame.id === "skill-late-publication"),
 	).toMatchObject({ ok: true, result: { accepted: true } });
-	// The acceptance publication has settled; the next commit to this store file
-	// is the late fire-and-forget agent_end transition. Arm the pause, then let
-	// the run resolve so that publication starts and is held mid-rename.
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The acceptance and agent_start publications have settled; the next commit
+	// to this store file is the correlated agent_end terminal claim, the sole
+	// terminal owner of a lifecycle-owned skill. Arm the pause, deliver the
+	// terminal, then let the run resolve so that publication starts and is
+	// held mid-rename.
 	pausedCommit.arm();
+	void handlers.get("agent_end")?.(assistantEndEvent("held"), sessionContext);
 	resumeExecution.resolve();
 	await pausedCommit.started;
 	// Teardown must not report the session stopped while a durable publication it
@@ -3339,9 +3804,11 @@ test("session_shutdown bounds a hung reconciliation publication and reports the 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-drain-deadline"),
 			"accepted skill response",
 		);
-		// The publication is armed and held mid-rename; shutdown begins with the
-		// rename still never released.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// The correlated agent_end terminal claim is armed and held mid-rename;
+		// shutdown begins with the rename still never released.
 		pausedCommit.arm();
+		void handlers.get("agent_end")?.(assistantEndEvent("held"), sessionContext);
 		resumeExecution.resolve();
 		await pausedCommit.started;
 		const shutdownStarted = Date.now();
@@ -3428,11 +3895,15 @@ test("session_shutdown propagates a rejected reconciliation publication without 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-publish-failure"),
 			"accepted skill response",
 		);
-		// The acceptance write has committed; the NEXT commit is the terminal
-		// agent_end publication, and it is made to fail at its atomic rename.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		// The acceptance and agent_start writes have committed; the NEXT commit is
+		// the correlated agent_end terminal claim, and it is made to fail at its
+		// atomic rename.
 		failedCommit.arm();
+		const ending = handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
 		resumeExecution.resolve();
 		await failedCommit.failed;
+		await ending;
 		const shutdownFailure = await Promise.resolve(
 			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
 		).then(
@@ -3521,13 +3992,26 @@ test("a recovered reconciliation publication lets a later teardown drain report 
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-first"),
 			"first accepted skill response",
 		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 		failedCommit.arm();
+		const firstEnding = handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
 		resumeFirst.resolve();
 		await failedCommit.failed;
+		await firstEnding;
+		// The failed terminal claim fenced its requester connection (fail closed,
+		// as for prompts), so the later publication comes from a fresh connection.
 		// The failure window closes with the failing publication; the store is
 		// writable again, so a subsequent publication persists and the teardown
 		// drain reports quiescence rather than staying poisoned by the past failure.
-		socket.send(
+		const secondFrames: Record<string, unknown>[] = [];
+		const secondSocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(secondSocket);
+		secondSocket.addEventListener("message", event => secondFrames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			secondSocket.addEventListener("open", () => resolve(), { once: true });
+			secondSocket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		secondSocket.send(
 			JSON.stringify({
 				type: "control_request",
 				id: "skill-recovery-second",
@@ -3536,9 +4020,14 @@ test("a recovered reconciliation publication lets a later teardown drain report 
 			}),
 		);
 		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
+			() => secondFrames.some(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
 			"second accepted skill response",
 		);
+		expect(
+			secondFrames.find(frame => frame.type === "control_response" && frame.id === "skill-recovery-second"),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.(assistantEndEvent("recovered"), sessionContext);
 		// The first teardown still reports the earlier lost write: a publication that
 		// never reached disk is state loss even though a later one succeeded, and
 		// evidence is retained until an owner is actually told about it.

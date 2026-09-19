@@ -131,6 +131,7 @@ import {
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -432,6 +433,7 @@ import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
+import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
@@ -508,6 +510,7 @@ import {
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
+	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
@@ -6701,7 +6704,7 @@ export class AgentSession {
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										"Continue by compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`); re-verify the edited file before relying on it.",
+										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`,
 									].join("\n"),
 								},
 							];
@@ -12061,6 +12064,8 @@ export class AgentSession {
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		if (options?.synthetic !== true && options?.attribution !== "agent")
+			invalidateSessionTitleGeneration(this.sessionManager);
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalPromptOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
@@ -13169,6 +13174,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
@@ -13193,6 +13199,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
@@ -15104,6 +15111,31 @@ export class AgentSession {
 	#ownedRegistrationEndpoint(): string {
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		return AsyncJobManager.endpointIdOf(manager) ?? this.sessionManager.getSessionId() ?? "local";
+	}
+	/**
+	 * Tool call ids the run resource ledger currently holds for `handle` (#5637).
+	 *
+	 * The authoritative answer to "is a tool running?": AgentLoop reserves the
+	 * `kind: "tool"` lease SYNCHRONOUSLY inside its dispatch loop, before the
+	 * tool's `execute` is invoked, and the lease settles when the call really
+	 * ends — whereas `tool_execution_start` only reaches an extension after an
+	 * asynchronous fanout. Strictly read-only: it takes a snapshot and never
+	 * claims, reserves, seals or quarantines. An unknown run reads as empty,
+	 * matching `RunResourceLedger.pending`.
+	 */
+	pendingToolExecutions(handle: string): readonly string[] {
+		const ids = new Set<string>();
+		for (const entry of this.agent.resourceLedger.pending(handle)) {
+			if (entry.kind !== "tool") continue;
+			// AgentLoop labels a tool reservation `<toolName>:<toolCallId>`, and
+			// registers the reservation and its tracked task under the SAME label, so
+			// the set also collapses that pair to one id. A label without a separator
+			// is passed through rather than dropped: over-reporting a running tool
+			// only costs a bounded wait, under-reporting kills it mid-write.
+			const separator = entry.label.indexOf(":");
+			ids.add(separator < 0 ? entry.label : entry.label.slice(separator + 1));
+		}
+		return [...ids];
 	}
 	async abortPromptAndWait(
 		handle: string,
@@ -20911,6 +20943,11 @@ export class AgentSession {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return "terminal";
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		// A decode loop is deterministic for the submitted context: replaying the
+		// identical conversation re-trips the guard and re-bills the full context.
+		// Without this the message carries no transport facts and would fall
+		// through to "unknown", which is admitted for bounded retry (#5627).
+		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
@@ -21459,6 +21496,10 @@ export class AgentSession {
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
+		// HTTP/2 observations explain a terminal failure; they do not authorize replay.
+		if (transportFailure?.http2RstCode !== undefined || transportFailure?.nativeErrorCode !== undefined) {
+			return undefined;
+		}
 		// Managed fallback receives authoritative transport facts from the request
 		// boundary. Once those facts classify as other, error prose must not upgrade
 		// the failure into an unbounded transient or quota retry.
@@ -24159,10 +24200,6 @@ export class AgentSession {
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
-				// Branch commits a successor endpoint identity; re-register the
-				// manager under it (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
@@ -24190,8 +24227,6 @@ export class AgentSession {
 			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
 
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
 			if (!skipConversationRestore) {
 				this.agent.replaceMessages(sessionContext.messages, {
 					historyRewrite: { reason: "session-branch", preserveSeededPrefix: true },
@@ -24201,6 +24236,12 @@ export class AgentSession {
 			}
 
 			this.#resetIrcRosterDeliveryState();
+			// Once committed, establish the successor's identity and prompt boundary
+			// before fallible post-commit integrations. A cleanup or MCP failure must
+			// not leave the next turn running with the parent's messages/session id.
+			this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+			await this.#runToolSessionTransitionCleanups();
+			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {
