@@ -63,6 +63,7 @@ import {
 	resolveManagedSessionScope,
 } from "../session-directory";
 import {
+	lifecycleKnownSecrets,
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
@@ -119,52 +120,99 @@ const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
-/** Keep detached host stderr diagnostic-only and bounded in memory. */
-const CHILD_STDERR_TAIL_BYTES = 4 * 1024;
+/** Keep detached host stderr diagnostic-only and bounded on disk. */
+const CHILD_STDERR_TAIL_BYTES = 512;
+const LIFECYCLE_DIAGNOSTIC_MARKER = "[lifecycle-diagnostic-v1]";
 
 type ChildStderrCapture = {
 	tail(): string;
 	exitCode(): number | null | undefined;
 	signalCode(): NodeJS.Signals | null | undefined;
+	cleanup(): Promise<void>;
+};
+
+type ChildStderrSink = {
+	path: string;
+	fd: number;
 };
 
 /**
- * Drain a detached host's stderr without keeping the broker alive after the
- * lifecycle request settles.  The tail is only surfaced through
- * `sanitizeSdkStartupMessage`, and never becomes durable lifecycle state.
+ * Detached hosts outlive the broker, so stderr must not use a parent-owned
+ * pipe.  A private file descriptor keeps the child alive if the broker exits;
+ * the broker only reads and removes the bounded tail while it is available.
  */
-function captureChildStderr(child: ChildProcess): ChildStderrCapture {
-	let tail = "";
+function openChildStderrSink(agentDir: string): ChildStderrSink | undefined {
+	try {
+		const directory = path.join(agentDir, "sdk");
+		fsSync.mkdirSync(directory, { recursive: true, mode: 0o700 });
+		const logPath = path.join(directory, `lifecycle-spawn.${randomUUID()}.log`);
+		return { path: logPath, fd: fsSync.openSync(logPath, "w", 0o600) };
+	} catch {
+		return undefined;
+	}
+}
+
+function closeChildStderrSink(sink: ChildStderrSink | undefined): void {
+	if (!sink) return;
+	try {
+		fsSync.closeSync(sink.fd);
+	} catch {
+		// Diagnostics must never mask the spawn result.
+	}
+}
+
+function readChildStderrTail(logPath: string): string {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fsSync.openSync(logPath, fsSync.constants.O_RDONLY);
+		const stat = fsSync.fstatSync(descriptor);
+		if (!stat.isFile() || stat.size <= 0) return "";
+		const length = Math.min(CHILD_STDERR_TAIL_BYTES, stat.size);
+		const buffer = Buffer.alloc(length);
+		fsSync.readSync(descriptor, buffer, 0, length, stat.size - length);
+		return buffer.toString("utf8");
+	} catch {
+		return "";
+	} finally {
+		if (descriptor !== undefined) {
+			try {
+				fsSync.closeSync(descriptor);
+			} catch {
+				// Best effort diagnostic read.
+			}
+		}
+	}
+}
+
+function captureChildStderr(child: ChildProcess, sink: ChildStderrSink | undefined): ChildStderrCapture {
 	let observedExitCode: number | null | undefined;
 	let observedSignalCode: NodeJS.Signals | null | undefined;
 	child.once("exit", (code, signal) => {
 		observedExitCode = code;
 		observedSignalCode = signal;
 	});
-	const stream = child.stderr;
-	if (!stream)
-		return {
-			tail: () => tail,
-			exitCode: () => observedExitCode,
-			signalCode: () => observedSignalCode,
-		};
-	stream.setEncoding("utf8");
-	stream.on("data", (chunk: string) => {
-		const bytes = Buffer.from(`${tail}${chunk}`, "utf8");
-		tail = bytes.length > CHILD_STDERR_TAIL_BYTES
-			? bytes.subarray(bytes.length - CHILD_STDERR_TAIL_BYTES).toString("utf8")
-			: bytes.toString("utf8");
-	});
-	stream.on("error", () => undefined);
-	// `ChildProcess.unref()` does not unref an active stdio pipe.  Unref the
-	// readable handle explicitly so a healthy detached host never keeps the
-	// broker alive solely because diagnostics are being drained.
-	(stream as unknown as { unref?: () => void }).unref?.();
 	return {
-		tail: () => tail,
+		tail: () => (sink ? readChildStderrTail(sink.path) : ""),
 		exitCode: () => observedExitCode,
 		signalCode: () => observedSignalCode,
+		cleanup: async () => {
+			if (!sink) return;
+			await fs.unlink(sink.path).catch(() => undefined);
+		},
 	};
+}
+
+async function settleChildExitObservation(child: ChildProcess, stderr?: ChildStderrCapture): Promise<void> {
+	const exitCode = stderr?.exitCode();
+	const signalCode = stderr?.signalCode();
+	if (
+		child.exitCode !== null ||
+		child.signalCode !== null ||
+		(exitCode !== null && exitCode !== undefined) ||
+		(signalCode !== null && signalCode !== undefined)
+	)
+		return;
+	await Promise.race([new Promise<void>(resolve => child.once("exit", () => resolve())), Bun.sleep(100)]);
 }
 
 type ChildLifecycleStatus = {
@@ -209,8 +257,9 @@ function lifecycleChildDiagnostic(
 	status: ChildLifecycleStatus,
 	stderr: ChildStderrCapture | undefined,
 	cause?: string,
+	knownSecrets: Iterable<unknown> = lifecycleKnownSecrets(),
 ): string {
-	const parts = [`stage=${stage}`, `waiting_for=${waitingFor}`, `child=${status.state}`];
+	const parts = [LIFECYCLE_DIAGNOSTIC_MARKER, `stage=${stage}`, `waiting_for=${waitingFor}`, `child=${status.state}`];
 	if (status.pid !== undefined) parts.push(`pid=${status.pid}`);
 	if (status.state === "exited") {
 		parts.push(`exit=${status.exitCode ?? "null"}`, `signal=${status.signalCode ?? "none"}`);
@@ -218,9 +267,9 @@ function lifecycleChildDiagnostic(
 		parts.push("exit=not_observed", "signal=not_observed");
 	}
 	const rawStderr = stderr?.tail().trim() ?? "";
-	if (rawStderr) parts.push(`stderr=${JSON.stringify(sanitizeSdkStartupMessage(rawStderr, Object.values(process.env)))}`);
+	if (rawStderr) parts.push(`stderr=${JSON.stringify(sanitizeSdkStartupMessage(rawStderr, knownSecrets))}`);
 	else parts.push("stderr=none");
-	if (cause) parts.push(`cause=${sanitizeSdkStartupMessage(cause, Object.values(process.env))}`);
+	if (cause) parts.push(`cause=${sanitizeSdkStartupMessage(cause, knownSecrets)}`);
 	return parts.join(" ");
 }
 
@@ -243,7 +292,7 @@ export function terminalUncertainStartupMessage(response: BrokerResponse): strin
 	// path-free fallback for those. Lifecycle diagnostics are deliberately
 	// recognizable and already bounded/redacted, so preserve their stage/cause
 	// fields even when cleanup proof is the part that failed.
-	const original = response.error.message.includes("stage=")
+	const original = response.error.message.includes(LIFECYCLE_DIAGNOSTIC_MARKER)
 		? sanitizeSdkStartupMessage(response.error.message)
 		: "SDK internal process could not be started.";
 	logger.warn("sdk broker retained a sanitized launch failure after uncertain startup cleanup", {
@@ -727,6 +776,20 @@ type SessionLaunch = {
 	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
 };
+
+function lifecycleLaunchKnownSecrets(launch: SessionLaunch): string[] {
+	const secrets = [
+		...lifecycleKnownSecrets(),
+		...(launch.coordinatorSidecarSigningKey ? [launch.coordinatorSidecarSigningKey] : []),
+		...(launch.mcpServers ?? []).flatMap(server => {
+			if (!("env" in server) || !server.env) return [];
+			return Object.entries(server.env)
+				.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
+				.map(([, value]) => value);
+		}),
+	];
+	return [...new Set(secrets.filter(secret => typeof secret === "string" && secret.length > 0))];
+}
 
 type CleanupEvidence = BrokerCleanupEvidence;
 type CleanupIdentity = {
@@ -5545,16 +5608,21 @@ async function executeLifecycleResponse(
 		let childStderr: ChildStderrCapture | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		let childSpawned = false;
+		const childStderrSink = openChildStderrSink(broker.settings.agentDir);
+		const cleanupChildStderr = async (): Promise<void> => {
+			if (childStderr) await childStderr.cleanup();
+			else if (childStderrSink) await fs.unlink(childStderrSink.path).catch(() => undefined);
+		};
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					// The stderr reader is explicitly unref'ed by captureChildStderr;
-					// unlike a retained file descriptor, it cannot accumulate detached
-					// host output after this request has settled.
-					stdio: ["ignore", "ignore", "pipe"],
+					// Detached hosts must not inherit a parent-owned pipe: the pipe breaks
+					// when the broker exits while the host is still alive. A file-backed
+					// sink keeps the diagnostic channel independent of broker lifetime.
+					stdio: ["ignore", "ignore", childStderrSink?.fd ?? "ignore"],
 					env: {
 						// Master capability is process-local to direct Bash children and must
 						// never cross a broker lifecycle launch boundary.
@@ -5600,6 +5668,8 @@ async function executeLifecycleResponse(
 				});
 			});
 			if (!authorizedSpawn.authorized) {
+				closeChildStderrSink(childStderrSink);
+				await cleanupChildStderr();
 				return fail(
 					"startup_admission_refused",
 					"SDK host startup was refused because the broker no longer owns the session root.",
@@ -5607,7 +5677,8 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
-			childStderr = captureChildStderr(spawned);
+			childStderr = captureChildStderr(spawned, childStderrSink);
+			closeChildStderrSink(childStderrSink);
 			await waitForChildSpawn(spawned);
 			childSpawned = true;
 			const pid = spawned.pid;
@@ -5621,6 +5692,7 @@ async function executeLifecycleResponse(
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
+			closeChildStderrSink(childStderrSink);
 			const terminated =
 				child && childSpawned
 					? await terminateSpawnedChild(
@@ -5635,16 +5707,20 @@ async function executeLifecycleResponse(
 						)
 					: true;
 
-			return terminated
+			const response = terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
 				: fail(
 						"terminal_uncertain",
 						`Unable to establish spawned-session ownership and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
 					);
+			await cleanupChildStderr();
+			return response;
 		}
 		if (!child || !spawnedAuthority) {
+			await cleanupChildStderr();
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		}
+		const knownSecrets = lifecycleLaunchKnownSecrets(launch);
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
 		const readiness = await waitForReady(
 			broker,
@@ -5657,6 +5733,7 @@ async function executeLifecycleResponse(
 		);
 
 		if (readiness.kind !== "ready") {
+			if (readiness.kind !== "timeout") await settleChildExitObservation(child, childStderr);
 			const statusAtFailure = childLifecycleStatus(broker, child, spawnedAuthority, childStderr);
 			const diagnostic =
 				readiness.kind === "startup_failed"
@@ -5666,6 +5743,7 @@ async function executeLifecycleResponse(
 							statusAtFailure,
 							childStderr,
 							readiness.failure.message,
+							knownSecrets,
 						)
 					: readiness.kind === "timeout"
 						? lifecycleChildDiagnostic(
@@ -5673,11 +5751,27 @@ async function executeLifecycleResponse(
 								readiness.waitingFor,
 								statusAtFailure,
 								childStderr,
+								undefined,
+								knownSecrets,
 							)
 						: readiness.kind === "ready_probe_failed"
-							? lifecycleChildDiagnostic("readiness", "session_ready", statusAtFailure, childStderr)
+							? lifecycleChildDiagnostic(
+									"readiness",
+									"session_ready",
+									statusAtFailure,
+									childStderr,
+									undefined,
+									knownSecrets,
+								)
 							: readiness.kind === "child_exited"
-								? lifecycleChildDiagnostic("readiness", "session_ready", statusAtFailure, childStderr)
+								? lifecycleChildDiagnostic(
+										"readiness",
+										"session_ready",
+										statusAtFailure,
+										childStderr,
+										undefined,
+										knownSecrets,
+									)
 								: undefined;
 			const terminated = await terminateSpawnedChild(
 				child,
@@ -5689,6 +5783,7 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
+			await cleanupChildStderr();
 
 			if (!terminated)
 				return readiness.kind === "ready_probe_failed"
@@ -5715,10 +5810,7 @@ async function executeLifecycleResponse(
 								`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)} ${diagnostic}.`,
 							)
 						: readiness.kind === "child_exited"
-							? fail(
-									"spawn_failed",
-									`Session ${launch.id} exited before registering readiness. ${diagnostic}.`,
-								)
+							? fail("spawn_failed", `Session ${launch.id} exited before registering readiness. ${diagnostic}.`)
 							: fail(
 									"readiness_timeout",
 									`Session ${launch.id} did not register an endpoint before the readiness timeout. ${diagnostic}.`,
@@ -5742,6 +5834,7 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
+			await cleanupChildStderr();
 			if (exited && readyThenExitToleranceEnabled())
 				return terminated
 					? readyThenExitedResponse(launch.id, child)
@@ -5756,7 +5849,10 @@ async function executeLifecycleResponse(
 						"Session readiness authority changed and its spawned process could not be verified dead.",
 					);
 		}
-		if (!spawnedAuthority) return fail("endpoint_stale", "Session endpoint authority is unavailable.");
+		if (!spawnedAuthority) {
+			await cleanupChildStderr();
+			return fail("endpoint_stale", "Session endpoint authority is unavailable.");
+		}
 		const replayIncarnation = endpointIncarnation(
 			{
 				endpointGeneration: verified.endpointGeneration,
@@ -5766,7 +5862,11 @@ async function executeLifecycleResponse(
 			},
 			launch.id,
 		);
-		if (!replayIncarnation) return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
+		if (!replayIncarnation) {
+			await cleanupChildStderr();
+			return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
+		}
+		await cleanupChildStderr();
 		return {
 			ok: true,
 			result: {

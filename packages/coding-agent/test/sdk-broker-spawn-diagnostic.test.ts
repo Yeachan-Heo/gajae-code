@@ -2,7 +2,8 @@ import { expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
-import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import { setLifecycleCommandResolverForTest, terminalUncertainStartupMessage } from "../src/sdk/broker/lifecycle";
+import { lifecycleKnownSecrets, sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 
 async function tempRoot(label: string): Promise<string> {
 	return await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-${label}-`));
@@ -52,7 +53,10 @@ setInterval(() => {}, 1000);`,
 			{ cwd: root, readinessTimeoutMs: 10_000 },
 			"spawn-diagnostic",
 		);
-		expect(response).toMatchObject({ ok: false, error: { code: expect.stringMatching(/readiness_timeout|terminal_uncertain/) } });
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: expect.stringMatching(/readiness_timeout|terminal_uncertain/) },
+		});
 		if (response.ok) throw new Error("Expected readiness timeout.");
 		expect(response.error.message).toContain("stage=readiness");
 		expect(response.error.message).toContain("waiting_for=session_ready");
@@ -120,7 +124,10 @@ process.exit(7);`,
 			{ cwd: root, readinessTimeoutMs: 6_000 },
 			"spawn-exit-diagnostic",
 		);
-		expect(response).toMatchObject({ ok: false, error: { code: expect.stringMatching(/spawn_failed|terminal_uncertain/) } });
+		expect(response).toMatchObject({
+			ok: false,
+			error: { code: expect.stringMatching(/spawn_failed|terminal_uncertain/) },
+		});
 		if (response.ok) throw new Error("Expected startup failure.");
 		expect(response.error.message).toContain("stage=startup");
 		expect(response.error.message).toContain("waiting_for=startup completion");
@@ -133,3 +140,75 @@ process.exit(7);`,
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 15_000);
+
+test("startup diagnostics redact launch credentials without mangling ordinary environment values", async () => {
+	const root = await tempRoot("spawn-diagnostic-secrets");
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "exit.ts");
+	const lifecycleModule = JSON.stringify(path.resolve(import.meta.dir, "../src/sdk/broker/lifecycle.ts"));
+	const launchSecret = "launch-only-secret-5739";
+	const plainEnvName = "GJC_DIAGNOSTIC_PLAINTEXT_5739";
+	const secretEnvName = "GJC_DIAGNOSTIC_API_KEY_5739";
+	const previousPlain = process.env[plainEnvName];
+	const previousSecret = process.env[secretEnvName];
+	process.env[plainEnvName] = "ordinary-value-5739";
+	process.env[secretEnvName] = "process-secret-5739";
+	const broker = new Broker({ agentDir });
+	try {
+		await fs.writeFile(
+			fixture,
+			`import { writeSessionLifecycleFailure } from ${lifecycleModule};
+const request = JSON.parse(process.env.GJC_SDK_LIFECYCLE_REQUEST!);
+process.stderr.write(\`line 12 path=/app/host.ts key=${launchSecret} ordinary=ordinary-value-5739\`);
+await writeSessionLifecycleFailure(request.stateRoot, request.sessionId, request.effectMarker, { phase: "startup", reason: "failed", message: "fixture startup failure" }, { endpointGeneration: null, fenced: false, runtimeRemoved: true, hostStopped: false, brokerRegistrationReleased: true });
+process.exit(7);`,
+		);
+		setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+		await broker.start();
+
+		const response = await broker.handleRequest(
+			"session.create",
+			{
+				cwd: root,
+				readinessTimeoutMs: 6_000,
+				coordinatorStateDir: path.join(root, "coordinator"),
+				coordinatorSidecarSigningKey: launchSecret,
+				coordinatorSidecarKeyId: "a".repeat(64),
+			},
+			"spawn-diagnostic-secrets",
+		);
+		if (response.ok) throw new Error("Expected startup failure.");
+		expect(response.error.message).toContain("[lifecycle-diagnostic-v1]");
+		expect(response.error.message).toContain("line 12");
+		expect(response.error.message).toContain("/app/host.ts");
+		expect(response.error.message).not.toContain(launchSecret);
+		expect(response.error.message).toContain("[redacted-secret]");
+		expect(response.error.message).toContain("ordinary-value-5739");
+
+		expect(lifecycleKnownSecrets()).toContain("process-secret-5739");
+		expect(lifecycleKnownSecrets()).not.toContain("ordinary-value-5739");
+		expect(sanitizeSdkStartupMessage("ordinary-value-5739", lifecycleKnownSecrets())).toBe("ordinary-value-5739");
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+		if (previousPlain === undefined) delete process.env[plainEnvName];
+		else process.env[plainEnvName] = previousPlain;
+		if (previousSecret === undefined) delete process.env[secretEnvName];
+		else process.env[secretEnvName] = previousSecret;
+	}
+}, 15_000);
+
+test("uncertain cleanup preserves only explicitly marked lifecycle diagnostics", () => {
+	const ordinary = terminalUncertainStartupMessage({
+		ok: false,
+		error: { code: "spawn_failed", message: "tool stage=/tmp/private-host.ts" },
+	});
+	const marked = terminalUncertainStartupMessage({
+		ok: false,
+		error: { code: "spawn_failed", message: "[lifecycle-diagnostic-v1] stage=readiness waiting_for=session_ready" },
+	});
+	expect(ordinary).toContain("SDK internal process could not be started.");
+	expect(ordinary).not.toContain("/tmp/private-host.ts");
+	expect(marked).toContain("Original launch failure: [lifecycle-diagnostic-v1]");
+});
