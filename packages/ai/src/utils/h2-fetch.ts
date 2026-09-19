@@ -56,11 +56,7 @@ export function installH2Fetch(): void {
 		"UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
 	]);
 	/** Fallback codes that may fire *after* the peer consumed the body — replay only when safe. */
-	const replayGatedCodes: ReadonlySet<string> = new Set([
-		"ConnectionReset",
-		"ConnectionClosed",
-		"HTTP2StreamReset",
-	]);
+	const replayGatedCodes: ReadonlySet<string> = new Set(["ConnectionReset", "ConnectionClosed", "HTTP2StreamReset"]);
 	const wrapper = async function h2fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (!isHttps(input)) return original(input, init);
 		try {
