@@ -52,6 +52,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"interactive session credential selector; not a credential-free public SDK operation or independent control seam",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:tutorial": "visual/local-only onboarding selector, not a user-facing SDK control seam",
+	"slash_command:fork":
+		"visual/local-only TUI prompt-fork selector (handleTui only); no ACP or headless dispatch surface, not a user-facing SDK control seam",
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"slash_command:star":

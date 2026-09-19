@@ -2189,6 +2189,17 @@
 		}
 	},
 	{
+		"sourceId": "slash_command:fork",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "visual/local-only TUI prompt-fork selector (handleTui only); no ACP or headless dispatch surface, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:provider",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
