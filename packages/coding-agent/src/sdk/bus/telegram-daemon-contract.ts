@@ -292,8 +292,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * replaced across this upgrade.
  * Generation 190 acknowledges the protected prompt-deadline boundary change,
  * so generation-189 owners are replaced instead of retaining the old path.
+ * Generation 192 makes session-host liveness a reference-counted work lease,
+ * so generation-191 owners cannot reap hosts with queued or promoted work.
+ * Generation 193 gates streamed content on negotiated observer capabilities,
+ * so existing owners are replaced before exposing the new observer path.
  */
-export const DAEMON_GENERATION = 192;
+export const DAEMON_GENERATION = 193;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

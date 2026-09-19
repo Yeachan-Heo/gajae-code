@@ -256,8 +256,6 @@ export interface SessionSdkTransport {
 	start(): Promise<{ url: string }>;
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
-	/** Broadcast high-frequency turn content without retaining it in the replay ring. */
-	broadcastUnpositionedFrame?(frame: SdkFrame, excludedConnectionIds?: readonly string[]): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
@@ -459,6 +457,13 @@ export class SessionSdkSessionRuntime {
 		return this.host.getProviderDefinitions(capability);
 	}
 
+	/** Snapshot connections that negotiated every capability in the requirement set. */
+	connectionIdsWithCapabilities(required: readonly string[]): string[] {
+		return [...this.#connectionCapabilities].flatMap(([connectionId, capabilities]) =>
+			required.every(capability => capabilities.has(capability)) ? [connectionId] : [],
+		);
+	}
+
 	/** Persist the host's current observable activity for broker/session-list consumers. */
 	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
 		await this.host.reportActivity(state, at);
@@ -502,7 +507,6 @@ export class SessionSdkSessionRuntime {
 				: [];
 		});
 	}
-
 	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */
 	sendFrameToCapabilities(
 		required: readonly string[],
@@ -4538,10 +4542,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	/**
 	 * Publish one correlated content frame per owning invocation, plus one
-	 * unpositioned copy for attached observers. A shared run therefore lets every
-	 * submitter attribute the content to its own prompt without dropping it for a
-	 * relay that did not submit the turn. Content is best-effort and bypasses the
-	 * lifecycle replay ring; the turn producing it is authoritative.
+	 * unpositioned copy for connections that explicitly negotiated observer
+	 * streaming. A shared run therefore lets every submitter attribute the content
+	 * to its own prompt without exposing it to ordinary attached clients.
+	 * Content is best-effort and bypasses the lifecycle replay ring; the turn
+	 * producing it is authoritative.
 	 */
 	const publishContentFrames = (
 		current: RuntimeState,

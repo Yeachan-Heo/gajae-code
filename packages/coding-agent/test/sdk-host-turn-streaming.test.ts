@@ -247,6 +247,7 @@ async function createHostHarness(
 			sent.length = 0;
 			broadcasts.length = 0;
 		},
+		setCapabilities: (connectionId, capabilities) => negotiatedCapabilities?.(connectionId, capabilities),
 		setIdle: value => {
 			idle = value;
 		},
@@ -867,6 +868,28 @@ describe("SDK host turn streaming", () => {
 
 			expect(harness.sent).toHaveLength(0);
 			expect(harness.broadcasts).toHaveLength(0);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("streams an SDK-unowned turn only to an explicit observer", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-unowned-observer-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
+			harness.setCapabilities("ordinary", [TURN_STREAM_CAPABILITY]);
+			await harness.emit("agent_start");
+			await waitForStartOnWire(harness);
+			harness.clearFrames();
+
+			await harness.emit("message_update", textDelta("observer-only"));
+
+			expect(harness.sent).toHaveLength(1);
+			expect(harness.sent[0]).toMatchObject({
+				connectionId: "observer",
+				frame: { type: "event", kind: "message_update" },
+			});
 		} finally {
 			await harness.stop();
 			await rm(cwd, { recursive: true, force: true });
