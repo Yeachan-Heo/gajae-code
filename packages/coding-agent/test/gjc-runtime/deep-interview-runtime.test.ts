@@ -147,6 +147,8 @@ describe("native gjc deep-interview runtime", () => {
 		const root = await tempDir();
 		const initial = await crystallizeBoundedTranscript(root, 200);
 		expect(initial.status, initial.stderr).toBe(0);
+		const initialPayload = JSON.parse(initial.stdout ?? "{}");
+		const initialSpec = await fs.readFile(initialPayload.spec_path, "utf8");
 		const result = await crystallizeBoundedTranscript(root, 400, 200);
 		expect(result.status, result.stderr).toBe(0);
 		const payload = JSON.parse(result.stdout ?? "{}");
@@ -155,6 +157,7 @@ describe("native gjc deep-interview runtime", () => {
 		expect(payload.crystal.source.start).toBe(200);
 		expect(payload.crystal.source.end).toBe(399);
 		const spec = await fs.readFile(payload.spec_path, "utf8");
+		expect(await fs.readFile(initialPayload.spec_path, "utf8")).toBe(initialSpec);
 		expect(spec).toContain("Build a report.");
 		expect(spec).toContain("Encrypt backups.");
 		expect(spec).toContain("Export reports.");
@@ -604,6 +607,21 @@ describe("native gjc deep-interview runtime", () => {
 		);
 		expect(crystallized.status, crystallized.stderr).toBe(0);
 		const deepEvidence = await assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true);
+		await fs.appendFile(
+			sessionPath,
+			`${JSON.stringify({
+				type: "message",
+				message: {
+					role: "toolResult",
+					toolName: "ask",
+					toolCallId: "pre-approval-ask",
+					content: "Also encrypt backups.",
+				},
+			})}\n`,
+		);
+		await expect(assertDeepInterviewCrystalCoversLiveTranscript(root, TEST_SESSION_ID, true)).rejects.toThrow(
+			"Ask results changed",
+		);
 		await fs.appendFile(
 			sessionPath,
 			`${JSON.stringify({ type: "message", message: { role: "user", content: "Also encrypt backups." } })}\n`,
