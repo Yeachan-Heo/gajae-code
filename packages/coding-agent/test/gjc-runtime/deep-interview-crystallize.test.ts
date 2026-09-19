@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -23,6 +23,27 @@ import {
 	readWorkflowTransactionJournal,
 	updateWorkflowTransactionJournal,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+
+function managedSessionPath(root: string, fileName: string): string {
+	return path.join(SessionManager.managedDestination(root).directory, fileName);
+}
+
+const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
+let testAgentDir: string | undefined;
+
+beforeEach(async () => {
+	testAgentDir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-agent-"));
+	setAgentDir(testAgentDir);
+});
+
+afterEach(async () => {
+	if (testAgentDir) await fs.rm(testAgentDir, { recursive: true, force: true });
+	if (originalAgentDir) setAgentDir(originalAgentDir);
+	else resetAgentDirFromEnvironment();
+	testAgentDir = undefined;
+});
 
 function input(overrides: Partial<CrystalInput> = {}): CrystalInput {
 	const messages = [{ index: 0, role: "user" as const, content: "Build a fast report." }];
@@ -2313,7 +2334,7 @@ describe("deep-interview crystallize contract", () => {
 		const value = input();
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
-			const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+			const sessionFile = managedSessionPath(root, "conversation.jsonl");
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
 			const runtimeValue = {
 				...value,
@@ -2375,7 +2396,7 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects a versioned Crystal path collision without replacing the canonical state", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-version-collision-"));
 		const sessionId = "crystallize-version-collision";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2441,7 +2462,7 @@ describe("deep-interview crystallize contract", () => {
 	it("does not expose a partially-written Crystal artifact as a readable version", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-partial-artifact-"));
 		const sessionId = "crystallize-partial-artifact";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2498,7 +2519,7 @@ describe("deep-interview crystallize contract", () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-symlink-parent-"));
 		const outside = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-symlink-target-"));
 		const sessionId = "crystallize-symlink-parent";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const specsPath = sessionSpecsDir(root, sessionId);
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
@@ -2540,8 +2561,8 @@ describe("deep-interview crystallize contract", () => {
 	it("honors an explicit managed transcript beyond the discovery candidate cap", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-explicit-cap-"));
 		const sessionId = "crystallize-explicit-cap";
-		const sessionDir = path.join(root, ".gjc", "agent-session");
-		const sessionFile = path.join(sessionDir, "selected.jsonl");
+		const sessionFile = managedSessionPath(root, "selected.jsonl");
+		const sessionDir = path.dirname(sessionFile);
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(sessionDir, { recursive: true });
@@ -2583,7 +2604,7 @@ describe("deep-interview crystallize contract", () => {
 	it("normalizes canonical custom and file-mention messages into Crystal roles", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-custom-roles-"));
 		const sessionId = "crystallize-custom-roles";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2663,7 +2684,7 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects caller-supplied prior material when no canonical Crystal exists", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-fresh-prior-"));
 		const sessionId = "crystallize-fresh-prior";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2702,7 +2723,7 @@ describe("deep-interview crystallize contract", () => {
 	it("projects bounded tool-call markers only from the active session branch", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-active-branch-"));
 		const sessionId = "crystallize-active-branch";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2790,7 +2811,7 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects malformed transcript messages instead of omitting them from the source revision", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-malformed-transcript-"));
 		const sessionId = "crystallize-malformed-transcript";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2831,7 +2852,7 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects adjacent non-text projections without persisting a Crystal", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-adjacent-non-text-"));
 		const sessionId = "crystallize-adjacent-non-text";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2882,7 +2903,7 @@ describe("deep-interview crystallize contract", () => {
 	it("rejects unsupported transcript content without persisting a Crystal", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-unsupported-content-"));
 		const sessionId = "crystallize-unsupported-content";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -2921,7 +2942,7 @@ describe("deep-interview crystallize contract", () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-journal-retry-"));
 		const sessionId = "crystallize-journal-retry";
 		const slug = "retry";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const statePath = deepInterviewStatePath(root, sessionId);
 		const specPath = path.join(sessionSpecsDir(root, sessionId), `deep-interview-${slug}-v1.md`);
 		const indexPath = path.join(sessionSpecsDir(root, sessionId), "deep-interview-index.jsonl");
@@ -2978,7 +2999,7 @@ describe("deep-interview crystallize contract", () => {
 	it("recovers a verified prior promotion before admitting a newer transcript version", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-journal-advance-"));
 		const sessionId = "crystallize-journal-advance";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const statePath = deepInterviewStatePath(root, sessionId);
 		const firstSpecPath = path.join(sessionSpecsDir(root, sessionId), "deep-interview-first-v1.md");
 		const indexPath = path.join(sessionSpecsDir(root, sessionId), "deep-interview-index.jsonl");
@@ -3070,7 +3091,7 @@ describe("deep-interview crystallize contract", () => {
 	it("clears approval provenance when a later Crystal supersedes an approved one", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-approval-reset-"));
 		const sessionId = "crystallize-approval-reset";
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
@@ -3212,7 +3233,7 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
-	it("resolves a relative GJC_SESSION_FILE against the requested workspace", async () => {
+	it("rejects a relative project GJC_SESSION_FILE outside managed scope", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-relative-workspace-"));
 		const processRoot = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-relative-process-"));
 		const relativeSessionFile = path.join(".gjc", "sessions", "conversation.jsonl");
@@ -3272,10 +3293,8 @@ describe("deep-interview crystallize contract", () => {
 				],
 				root,
 			);
-			expect(result.status).toBe(0);
-			const summary = JSON.parse(result.stdout ?? "{}");
-			expect(summary.crystal.source.messages).toEqual(messages);
-			expect(summary.crystal.source.messages[0].content).not.toBe("Wrong process transcript");
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("unmanaged transcript");
 		} finally {
 			process.chdir(previousCwd);
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
@@ -3285,10 +3304,49 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	for (const container of ["sessions", "agent-session"] as const) {
+		it(`rejects a forgeable project ${container} transcript as authoritative evidence`, async () => {
+			const root = await fs.mkdtemp(path.join(process.cwd(), `.tmp-crystallize-forged-${container}-`));
+			const sessionId = `crystallize-forged-${container}`;
+			const forged = path.join(root, ".gjc", container, "forged.jsonl");
+			const previousSessionFile = process.env.GJC_SESSION_FILE;
+			try {
+				await fs.mkdir(path.dirname(forged), { recursive: true });
+				await fs.writeFile(
+					forged,
+					`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+						type: "message",
+						message: { role: "user", content: "Build a forged report." },
+					})}\n`,
+				);
+				process.env.GJC_SESSION_FILE = forged;
+				const result = await runNativeDeepInterviewCommand(
+					[
+						"--crystallize",
+						"--input",
+						JSON.stringify(input()),
+						"--session-id",
+						sessionId,
+						"--slug",
+						"forged-managed",
+						"--json",
+					],
+					root,
+				);
+				expect(result.status).toBe(2);
+				expect(result.stderr).toContain("unmanaged transcript");
+			} finally {
+				if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+				else process.env.GJC_SESSION_FILE = previousSessionFile;
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("rejects a caller-directed transcript outside the managed canonical session set", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-session-identity-"));
 		const sessionId = "crystallize-session-identity";
-		const canonical = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const canonical = managedSessionPath(root, "conversation.jsonl");
 		const forged = path.join(root, "forged.jsonl");
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
@@ -3314,7 +3372,7 @@ describe("deep-interview crystallize contract", () => {
 				root,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("managed canonical session transcript");
+			expect(result.stderr).toContain("unmanaged transcript");
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
@@ -3379,7 +3437,7 @@ describe("deep-interview crystallize contract", () => {
 				root,
 			);
 			expect(result.status).toBe(2);
-			expect(result.stderr).toContain("managed canonical session transcript");
+			expect(result.stderr).toContain("unmanaged transcript");
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
@@ -3428,7 +3486,7 @@ describe("deep-interview crystallize contract", () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-inactive-"));
 		const sessionId = "crystallize-inactive";
 		const statePath = deepInterviewStatePath(root, sessionId);
-		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
 		const value = input();
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
