@@ -58,6 +58,10 @@ async function makeTempDir(): Promise<string> {
 	return dir;
 }
 
+async function writeFixtureFile(filePath: string, content: string | Uint8Array, mode = 0o755): Promise<void> {
+	await fs.writeFile(filePath, content, { mode });
+}
+
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -1811,8 +1815,8 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(targetPath, "old binary");
-		await Bun.write(tempPath, "new binary");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
 		const old = (await snapshotRegularFile(targetPath))!;
 		const parent = (await snapshotDirectory(dir))!;
 		await createActivationRecordFile({
@@ -1843,8 +1847,8 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(targetPath, "old binary");
-		await Bun.write(tempPath, "broken binary");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "broken binary");
 
 		await expect(
 			replaceBinaryFixture({
@@ -1865,7 +1869,7 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(tempPath, "new binary");
+		await writeFixtureFile(tempPath, "new binary");
 
 		const result = await replaceBinaryFixture({
 			targetPath,
@@ -1886,9 +1890,9 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(realPath, "managed");
+		await writeFixtureFile(realPath, "managed");
 		await fs.symlink(realPath, targetPath);
-		await Bun.write(tempPath, "new binary");
+		await writeFixtureFile(tempPath, "new binary");
 		await expect(
 			replaceBinaryFixture({
 				targetPath,
@@ -1906,9 +1910,9 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(targetPath, "old binary");
-		await Bun.write(tempPath, "new binary");
-		await Bun.write(backupPath, "foreign-backup");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
+		await writeFixtureFile(backupPath, "foreign-backup", 0o644);
 		await expect(
 			replaceBinaryFixture({
 				targetPath,
@@ -1928,8 +1932,8 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc.cmd");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(targetPath, "old binary");
-		await Bun.write(tempPath, "new binary");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
 		const result = await replaceBinaryFixture({
 			targetPath,
 			tempPath,
@@ -1949,8 +1953,8 @@ describe("update-cli binary replacement", () => {
 		const targetPath = path.join(dir, "gjc");
 		const tempPath = `${targetPath}.new`;
 		const backupPath = `${targetPath}.bak`;
-		await Bun.write(targetPath, "old binary");
-		await Bun.write(tempPath, "new binary");
+		await writeFixtureFile(targetPath, "old binary");
+		await writeFixtureFile(tempPath, "new binary");
 
 		await replaceBinaryFixture({
 			targetPath,
