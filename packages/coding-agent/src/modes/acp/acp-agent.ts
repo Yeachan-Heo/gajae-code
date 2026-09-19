@@ -645,6 +645,46 @@ export class AcpPromptFailureError extends AcpSdkAdapterError {
 }
 
 /**
+ * Recover the shared prompt-failure projection for a direct SDK rejection.
+ *
+ * A terminal frame normally reaches {@link AcpPromptFailureError} through
+ * `#settlePrompt`, but a host may reject the `turn.prompt` control request
+ * itself with `code: "prompt_failed"`. That path never has a terminal outcome
+ * to retain, so translating the raw adapter error used to bypass
+ * `promptFailureWireData` and publish only the bare `code`/`details` pair.
+ * Keep the fallback deliberately narrow: only the two prompt terminal codes
+ * are upgraded, and any optional provider classifier is re-validated before
+ * it enters the existing classifier/projection seam.
+ */
+function promptFailureFromDirectError(error: unknown): SdkPromptFailedOutcome | undefined {
+	if (error instanceof AcpPromptFailureError) return error.failure;
+	let code: unknown;
+	let providerCode: unknown;
+	let phase: unknown;
+	try {
+		const candidate = error as {
+			code?: unknown;
+			providerCode?: unknown;
+			transportFailure?: { providerCode?: unknown };
+			phase?: unknown;
+		};
+		code = candidate?.code;
+		providerCode = candidate?.providerCode ?? candidate?.transportFailure?.providerCode;
+		phase = candidate?.phase;
+	} catch {
+		return undefined;
+	}
+	if (code !== "prompt_failed" && code !== "prompt_deadline_exceeded") return undefined;
+	return failedPromptOutcome({
+		code,
+		provenance: code === "prompt_deadline_exceeded" ? "deadline" : "agent_failed",
+		...(isSafePromptFailureCode(providerCode) ? { providerCode } : {}),
+		...(isSdkPromptFailurePhase(phase) ? { phase } : {}),
+		evidence: {},
+	});
+}
+
+/**
  * The wire projection of a prompt terminal's classification (issue #5615).
  *
  * `super(failure.code, failure.message)` above narrows the error to the generic
@@ -1429,9 +1469,10 @@ export function acpRequestFailure(error: unknown): unknown {
 	// spread is empty for every other error, so their payloads are byte-identical to
 	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
 	// this enriches `data`, it does not restate the redacted message.
+	const promptFailure = promptFailureFromDirectError(error);
 	const data =
-		error instanceof AcpPromptFailureError
-			? { code, details: message, ...promptFailureWireData(error.failure) }
+		promptFailure !== undefined
+			? { code, details: message, ...promptFailureWireData(promptFailure) }
 			: { code, details: message };
 	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
 	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon

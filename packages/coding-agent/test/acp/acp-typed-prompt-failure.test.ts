@@ -94,6 +94,36 @@ describe("acpRequestFailure carries the prompt terminal's classification (issue 
 		expect(data).not.toHaveProperty("providerCode");
 	});
 
+	it("projects a direct prompt_failed adapter rejection through the same classifier seam", () => {
+		// A host can reject the turn.prompt control request itself instead of sending a
+		// terminal outcome frame. Before this fallback, that AcpSdkAdapterError bypassed
+		// promptFailureWireData and reached ACP as the reported bare code/details pair.
+		const failure = acpRequestFailure(new AcpSdkAdapterError("prompt_failed", "Prompt submission failed."));
+		expect(failure).toBeInstanceOf(RequestError);
+		expect((failure as RequestError).code).toBe(-32603);
+		expect((failure as RequestError).data).toMatchObject({
+			code: "prompt_failed",
+			details: "Prompt submission failed.",
+			phase: "submission",
+			category: "agent_runtime",
+			retryability: "terminal",
+		});
+	});
+
+	it("keeps a safe provider classifier when a direct rejection carries one", () => {
+		const error = Object.assign(new AcpSdkAdapterError("prompt_failed", "Prompt submission failed."), {
+			providerCode: "upstream_stream_interrupted",
+		});
+		const data = wireData(error);
+
+		expect(data).toMatchObject({
+			phase: "submission",
+			category: "provider_transport",
+			retryability: "transient",
+			providerCode: "upstream_stream_interrupted",
+		});
+	});
+
 	it("drops a providerCode that is not a bounded safe token", () => {
 		// `terminalOutcome` admits the host's `providerCode` on a `typeof` check alone, and
 		// this is the first path that puts it on the wire. Provider prose must not ride out
