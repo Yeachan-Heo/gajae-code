@@ -825,6 +825,35 @@ describe("SDK host turn streaming", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("relays mid-turn content to attached observers without duplicating the owner frame", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-observer-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			harness.setCapabilities("observer", [SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY]);
+			harness.setCapabilities("ordinary", [TURN_STREAM_CAPABILITY]);
+			const accepted = await harness.control("turn.prompt", { text: "observe this" });
+			expect(accepted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await waitForStartOnWire(harness);
+			harness.clearFrames();
+
+			await harness.emit("tool_execution_start", toolStart());
+
+			expect(harness.sent).toHaveLength(2);
+			expect(harness.sent[0]).toMatchObject({
+				connectionId: "client",
+				frame: { type: "event", kind: "tool_execution_start", commandId: accepted.result?.commandId },
+			});
+			expect(harness.sent[1]).toMatchObject({
+				connectionId: "observer",
+				frame: { type: "event", kind: "tool_execution_start" },
+			});
+			expect(harness.sent.some(entry => entry.connectionId === "ordinary")).toBe(false);
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 
 	test("does not stream an SDK-unowned turn", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-unowned-"));

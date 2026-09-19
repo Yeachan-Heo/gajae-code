@@ -423,7 +423,15 @@ describe("SDK serve raw relay", () => {
 						Array.isArray(frame.capabilities) &&
 						frame.capabilities.includes("tool_activity_v2")
 					)
-						ws.send(JSON.stringify({ type: "tool_activity", toolCallId: "call-stdio", phase: "started" }));
+						ws.send(
+							JSON.stringify({
+								type: "tool_activity",
+								sessionId: "session",
+								toolCallId: "call-stdio",
+								toolName: "read",
+								phase: "started",
+							}),
+						);
 				},
 			},
 		});

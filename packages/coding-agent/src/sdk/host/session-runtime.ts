@@ -256,6 +256,8 @@ export interface SessionSdkTransport {
 	start(): Promise<{ url: string }>;
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
+	/** Broadcast high-frequency turn content without retaining it in the replay ring. */
+	broadcastUnpositionedFrame?(frame: SdkFrame, excludedConnectionIds?: readonly string[]): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
@@ -4535,10 +4537,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		return task;
 	};
 	/**
-	 * Publish one content frame per owning invocation, each carrying its own
-	 * correlation, so a shared run lets every submitter attribute the content to
-	 * its own prompt. Content is best-effort and bypasses the lifecycle replay
-	 * ring; the turn producing it is authoritative.
+	 * Publish one correlated content frame per owning invocation, plus one
+	 * unpositioned copy for attached observers. A shared run therefore lets every
+	 * submitter attribute the content to its own prompt without dropping it for a
+	 * relay that did not submit the turn. Content is best-effort and bypasses the
+	 * lifecycle replay ring; the turn producing it is authoritative.
 	 */
 	const publishContentFrames = (
 		current: RuntimeState,
