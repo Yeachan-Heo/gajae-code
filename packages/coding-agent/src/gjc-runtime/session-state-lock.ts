@@ -563,7 +563,7 @@ export type SessionStateLockUnavailableReason =
 /**
  * Why a stale-transition reclaim refused, as a bounded classifier.
  *
- * `transition_claim_timeout` collapsed six structurally different refusals into
+ * `transition_claim_timeout` collapsed several structurally different refusals into
  * one message, so an operator could not tell a foreign-host tombstone from a
  * live owner from a directory an external process was stamping — the gap #5606
  * asked for. Every member is a fixed enum: never a path, token, host id, pid or
@@ -780,7 +780,7 @@ function lockUnavailable(
 /**
  * `transition_claim_timeout` with the reclaim refusal that kept repeating.
  *
- * The bare classifier could not distinguish six structurally different
+ * The bare classifier could not distinguish several structurally different
  * refusals, so an operator had no way to tell which action would help (#5606).
  * The suffix is a fixed enum member and nothing else — this string reaches user
  * reports, so it must never carry a path, token, host id, pid or errno.
@@ -1903,6 +1903,7 @@ async function releaseTransitionClaim(
  */
 interface TransitionReclaimOutcome {
 	reclaimed: boolean;
+	reclaimReason?: "released_handoff" | "dead_owner";
 	refusal?: TransitionReclaimRefusal;
 }
 
@@ -1928,7 +1929,10 @@ async function reclaimStaleTransitionClaim(
 			},
 			quarantineName,
 		);
-		return { reclaimed: reclaimed === "owner_removed" };
+		return {
+			reclaimed: reclaimed === "owner_removed",
+			...(reclaimed === "owner_removed" ? { reclaimReason: "dead_owner" as const } : {}),
+		};
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
@@ -1979,7 +1983,10 @@ async function reclaimStaleTransitionClaim(
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: removed.ok };
+		return {
+			reclaimed: removed.ok,
+			...(removed.ok ? { reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" } : {}),
+		};
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -1996,7 +2003,7 @@ async function reclaimStaleTransitionClaim(
 		// successor populated the detached path.
 		await removeTransitionDir(removed.detachedPath);
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: true };
+		return { reclaimed: true, reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" };
 	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
@@ -2410,8 +2417,17 @@ async function runLockPathTransition<T>(
 			// succession of contenders. A later maintenance pass can take the freed claim.
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 			if (outcome.reclaimed) {
-				if (lockRetryExhausted(budget))
-					throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				if (lockRetryExhausted(budget)) {
+					// Only a released tombstone is the previous holder's explicit handoff.
+					// Ordinary dead-owner reclaims remain bounded by the original deadline,
+					// even though both reclaim paths unlink their owner sidecar.
+					const ownerStillPresent = await fs.lstat(`${transitionDir}.owner`).then(
+						() => true,
+						error => (error as NodeJS.ErrnoException).code !== "ENOENT",
+					);
+					if (outcome.reclaimReason !== "released_handoff" || ownerStillPresent)
+						throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				}
 				continue;
 			}
 			if (!(await waitForLockRetry(budget)))

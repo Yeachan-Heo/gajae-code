@@ -554,6 +554,10 @@ impl NativeNoReplaceResult {
 				// filesystem: rename()/renameat2()/renameatx_np() are not partially
 				// observable on EINTR for local filesystems, unlike e.g. close().
 				Some("interrupted") => ("not_committed", "not_attempted", "interrupted"),
+				// Windows reports STATUS_SHARING_VIOLATION before a no-replace
+				// rename commits its namespace change. The caller may safely retry
+				// the same staged source while the conflicting handle drains.
+				Some("sharing_violation") => ("not_committed", "not_attempted", "sharing_violation"),
 				// Unclassified failures leave the syscall's namespace effect
 				// ambiguous. Never authorize staging cleanup from them.
 				_ => ("unknown", "not_provable", "unknown"),
