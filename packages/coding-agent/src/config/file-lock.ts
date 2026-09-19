@@ -232,6 +232,7 @@ type LockInfoFileState = {
 	size: bigint;
 	mtimeNs: bigint;
 	ctimeNs: bigint;
+	birthtimeNs: bigint;
 	nlink: bigint;
 };
 
@@ -246,6 +247,8 @@ type LockInfoPathState = {
 
 function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	if (stats.isSymbolicLink() || !stats.isFile()) return null;
+	if (typeof stats.birthtimeNs !== "bigint" || stats.birthtimeNs <= 0n)
+		throw new Error("File lock identity birthtime is unavailable.");
 	return {
 		dev: stats.dev,
 		ino: stats.ino,
@@ -253,6 +256,7 @@ function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 		size: stats.size,
 		mtimeNs: stats.mtimeNs,
 		ctimeNs: stats.ctimeNs,
+		birthtimeNs: stats.birthtimeNs,
 		nlink: stats.nlink,
 	};
 }
@@ -264,7 +268,7 @@ function sameLockInfoFileState(left: LockInfoFileState, right: LockInfoFileState
 		left.mode === right.mode &&
 		left.size === right.size &&
 		left.mtimeNs === right.mtimeNs &&
-		left.ctimeNs === right.ctimeNs &&
+		left.birthtimeNs === right.birthtimeNs &&
 		left.nlink === right.nlink
 	);
 }
@@ -313,6 +317,7 @@ function fileLockDirIdentityFromPathState(state: LockInfoPathState, bytes: strin
 		infoSize: String(state.file.size),
 		infoMtimeNs: String(state.file.mtimeNs),
 		infoCtimeNs: String(state.file.ctimeNs),
+		infoBirthtimeNs: String(state.file.birthtimeNs),
 		infoSha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 	};
 }
@@ -695,7 +700,6 @@ function sameFileLockTreeAfterPublication(
 				entry.nlink === current.nlink &&
 				entry.size === current.size &&
 				entry.mtimeNs === current.mtimeNs &&
-				(entry.relativePath === "" || entry.ctimeNs === current.ctimeNs) &&
 				entry.sha256 === current.sha256
 			);
 		})
@@ -1034,7 +1038,14 @@ type LockStaleSnapshot =
 	| { stale: false }
 	| { stale: true; owner: FileLockOwnerToken; identity: GenericFileLockDirIdentity };
 
-/** Identity evidence carried by the generic stale verdict into a later removal. */
+/**
+ * Identity evidence carried by the generic stale verdict into a later removal.
+ *
+ * `ctimeNs` is a mutable metadata-change time on every supported filesystem, so
+ * it is retained for diagnostics/legacy consumers but is not part of the lock
+ * identity predicate. `infoBirthtimeNs` is the creation time that stays bound
+ * to the file object.
+ */
 export interface GenericFileLockDirIdentity {
 	rootDev: string;
 	rootIno: string;
@@ -1044,21 +1055,32 @@ export interface GenericFileLockDirIdentity {
 	infoSize: string;
 	infoMtimeNs: string;
 	infoCtimeNs: string;
+	infoBirthtimeNs: string;
 	infoSha256: string;
 }
 
-function sameGenericFileLockDirIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
+function sameStableFileLockIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
 	return (
 		left.rootDev === right.rootDev &&
 		left.rootIno === right.rootIno &&
 		left.infoDev === right.infoDev &&
 		left.infoIno === right.infoIno &&
+		left.infoBirthtimeNs === right.infoBirthtimeNs
+	);
+}
+
+/** Content/topology evidence kept separate from the stable file identity. */
+function sameFileLockContentEvidence(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
+	return (
 		left.infoNlink === right.infoNlink &&
 		left.infoSize === right.infoSize &&
 		left.infoMtimeNs === right.infoMtimeNs &&
-		left.infoCtimeNs === right.infoCtimeNs &&
 		left.infoSha256 === right.infoSha256
 	);
+}
+
+function sameGenericFileLockDirIdentity(left: GenericFileLockDirIdentity, right: GenericFileLockDirIdentity): boolean {
+	return sameStableFileLockIdentity(left, right) && sameFileLockContentEvidence(left, right);
 }
 
 let nativeExactRemovalUsable: boolean | undefined;
@@ -1171,24 +1193,47 @@ async function removeVerifiedOwnedLockDirWithoutNative(
 		return "cleanup_failed";
 	}
 	const current = await captureFileLockDirIdentity(lockDir);
-	if (!current || !sameGenericFileLockDirIdentity(current, expected)) return "owner_changed";
+	if (!current || !sameStableFileLockIdentity(current, expected)) return "owner_changed";
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(lockDir);
 	if (!captured.ok || !captured.snapshot) return "owner_changed";
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (
-		captured.snapshot.rootDev !== expected.rootDev ||
-		captured.snapshot.rootIno !== expected.rootIno ||
 		!infoEntry ||
-		infoEntry.dev !== expected.infoDev ||
-		infoEntry.ino !== expected.infoIno ||
-		infoEntry.nlink !== expected.infoNlink ||
-		infoEntry.size !== expected.infoSize ||
-		infoEntry.mtimeNs !== expected.infoMtimeNs ||
-		infoEntry.ctimeNs !== expected.infoCtimeNs ||
-		infoEntry.sha256 !== expected.infoSha256
+		!nativeFileLockInfoMatchesStableIdentity(captured.snapshot.rootDev, captured.snapshot.rootIno, infoEntry, expected) ||
+		!nativeFileLockInfoMatchesContentEvidence(infoEntry, expected)
 	)
 		return "owner_changed";
 	return await removeVerifiedLockDirWithoutNative(lockDir, captured.snapshot, owner);
+}
+
+function nativeFileLockInfoMatchesStableIdentity(
+	rootDev: string,
+	rootIno: string,
+	infoEntry: NativeDirectoryTreeSnapshot["entries"][number],
+	expected: GenericFileLockDirIdentity,
+): boolean {
+	return (
+		rootDev === expected.rootDev &&
+		rootIno === expected.rootIno &&
+		infoEntry.dev === expected.infoDev &&
+		infoEntry.ino === expected.infoIno
+	);
+}
+
+function nativeFileLockInfoMatchesContentEvidence(
+	infoEntry: NativeDirectoryTreeSnapshot["entries"][number],
+	expected: GenericFileLockDirIdentity,
+): boolean {
+	// Native snapshots expose a ctime-shaped field, but ctime is a mutable
+	// metadata-change timestamp on every supported filesystem. The stable file
+	// identity is checked separately; requiring ctime here would reject a
+	// legitimate lock after chmod/ACL/indexer activity.
+	return (
+		infoEntry.nlink === expected.infoNlink &&
+		infoEntry.size === expected.infoSize &&
+		infoEntry.mtimeNs === expected.infoMtimeNs &&
+		infoEntry.sha256 === expected.infoSha256
+	);
 }
 
 export type GenericFileLockDirStaleVerdict = { stale: false } | { stale: true; identity: GenericFileLockDirIdentity };
@@ -1254,17 +1299,17 @@ export async function removeFileLockDirForGc(
 	if (!infoEntry?.sha256) return "owner_changed";
 	const judgedDigest = crypto.createHash("sha256").update(onDiskBytes).digest("hex");
 	if (infoEntry.sha256 !== judgedDigest) return "owner_changed";
+	const currentIdentity = await captureFileLockDirIdentity(nativeCapturePath);
+	if (!currentIdentity || !sameStableFileLockIdentity(currentIdentity, expectedIdentity)) return "owner_changed";
 	if (
 		!captured.snapshot.rootDev ||
-		captured.snapshot.rootDev !== expectedIdentity.rootDev ||
-		captured.snapshot.rootIno !== expectedIdentity.rootIno ||
-		infoEntry.dev !== expectedIdentity.infoDev ||
-		infoEntry.ino !== expectedIdentity.infoIno ||
-		infoEntry.nlink !== expectedIdentity.infoNlink ||
-		infoEntry.size !== expectedIdentity.infoSize ||
-		infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
-		infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
-		infoEntry.sha256 !== expectedIdentity.infoSha256
+		!nativeFileLockInfoMatchesStableIdentity(
+			captured.snapshot.rootDev,
+			captured.snapshot.rootIno,
+			infoEntry,
+			expectedIdentity,
+		) ||
+		!nativeFileLockInfoMatchesContentEvidence(infoEntry, expectedIdentity)
 	)
 		return "owner_changed";
 	let removed: NativeExactUnlinkResult;
@@ -1800,16 +1845,16 @@ async function quarantineReleasedLock(
 	if (!captured.ok || !captured.snapshot) return false;
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (!infoEntry?.sha256) return false;
+	const currentIdentity = await captureFileLockDirIdentity(nativeCapturePath);
+	if (!currentIdentity || !sameStableFileLockIdentity(currentIdentity, expectedIdentity)) return false;
 	if (
-		captured.snapshot.rootDev !== expectedIdentity.rootDev ||
-		captured.snapshot.rootIno !== expectedIdentity.rootIno ||
-		infoEntry.dev !== expectedIdentity.infoDev ||
-		infoEntry.ino !== expectedIdentity.infoIno ||
-		infoEntry.nlink !== expectedIdentity.infoNlink ||
-		infoEntry.size !== expectedIdentity.infoSize ||
-		infoEntry.mtimeNs !== expectedIdentity.infoMtimeNs ||
-		infoEntry.ctimeNs !== expectedIdentity.infoCtimeNs ||
-		infoEntry.sha256 !== expectedIdentity.infoSha256
+		!nativeFileLockInfoMatchesStableIdentity(
+			captured.snapshot.rootDev,
+			captured.snapshot.rootIno,
+			infoEntry,
+			expectedIdentity,
+		) ||
+		!nativeFileLockInfoMatchesContentEvidence(infoEntry, expectedIdentity)
 	)
 		return false;
 	// Bind the owner generation to the snapshot before exact removal. A successor
