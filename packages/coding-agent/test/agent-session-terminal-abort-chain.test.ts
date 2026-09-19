@@ -218,6 +218,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				await manager.dispose({ timeoutMs: 1_000 });
 				await chainSessionManager.close();
 			} else {
+				session.agent.abort();
 				// Stop the block-owned manager before joining coordinator persistence.
 				// A completion callback can enqueue persistence work, so waiting for
 				// that queue first would leave teardown waiting on the manager that
