@@ -336,11 +336,59 @@ function canonicalPublicationPath(cwd: string, sessionId: string, value: string)
 	return canonical;
 }
 
+/**
+ * Lexical containment is not enough when a publication parent can be replaced
+ * with a symlink.  Revalidate every existing ancestor and pin the immediate
+ * parent with a no-follow directory descriptor before a Crystal read/write.
+ * Missing descendants are allowed so the atomic writer can create them; the
+ * caller repeats this check after creation/publication.
+ */
+async function assertCrystalPublicationAncestors(cwd: string, sessionId: string, value: string): Promise<string> {
+	const canonical = canonicalPublicationPath(cwd, sessionId, value);
+	const parent = path.dirname(canonical);
+	const parsed = path.parse(parent);
+	let current = parsed.root;
+	for (const segment of parent.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		let stat: Stats;
+		try {
+			stat = await fs.lstat(current);
+		} catch (error) {
+			if (isErrnoCode(error, "ENOENT")) break;
+			throw new DeepInterviewCommandError(2, "Crystal publication parent cannot be inspected safely");
+		}
+		if (!stat.isDirectory() || stat.isSymbolicLink())
+			throw new DeepInterviewCommandError(2, "Crystal publication parent must not be a symlink");
+		try {
+			if ((await fs.realpath(current)) !== current)
+				throw new DeepInterviewCommandError(2, "Crystal publication parent is not canonical");
+			const handle = await fs.open(
+				current,
+				fs.constants.O_RDONLY |
+					(typeof fs.constants.O_DIRECTORY === "number" ? fs.constants.O_DIRECTORY : 0) |
+					(typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0),
+			);
+			try {
+				const opened = await handle.stat();
+				if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.mode !== stat.mode)
+					throw new DeepInterviewCommandError(2, "Crystal publication parent changed during validation");
+			} finally {
+				await handle.close();
+			}
+		} catch (error) {
+			if (error instanceof DeepInterviewCommandError) throw error;
+			throw new DeepInterviewCommandError(2, "Crystal publication parent cannot be opened safely");
+		}
+	}
+	return canonical;
+}
+
 async function readCrystalIndexCatalog(
 	cwd: string,
 	sessionId: string,
 	indexPath: string,
 ): Promise<CrystalIndexCatalog> {
+	await assertCrystalPublicationAncestors(cwd, sessionId, indexPath);
 	const bytes = await readBoundedFileBytes(indexPath, CRYSTAL_INDEX_RECOVERY_BYTES, "Crystal index", {
 		allowMissing: true,
 	});
@@ -421,6 +469,7 @@ async function appendCrystalIndexRow(
 	await withWorkflowStateLock(
 		indexPath,
 		async () => {
+			await assertCrystalPublicationAncestors(cwd, sessionId, indexPath);
 			const catalog = await readCrystalIndexCatalog(cwd, sessionId, indexPath);
 			const canonicalRow: CrystalIndexRow = {
 				...row,
@@ -468,6 +517,8 @@ async function verifyPublishedArtifactIndex(options: {
 }): Promise<CrystalIndexCatalog> {
 	if (!/^[a-f0-9]{64}$/.test(options.specHash))
 		throw new DeepInterviewCommandError(2, "published Crystal hash is invalid");
+	await assertCrystalPublicationAncestors(options.cwd, options.sessionId, options.indexPath);
+	await assertCrystalPublicationAncestors(options.cwd, options.sessionId, options.specPath);
 	const canonicalSpecPath = canonicalPublicationPath(options.cwd, options.sessionId, options.specPath);
 	const catalog = await readCrystalIndexCatalog(options.cwd, options.sessionId, options.indexPath);
 	const matchingRows = indexRowsForPath(catalog, canonicalSpecPath);
@@ -641,6 +692,8 @@ export async function authoritativeConversationSnapshot(
 ): Promise<{
 	revision: number;
 	messages: CrystalSnapshot["messages"];
+	/** Message indexes occupied by user-bearing Ask results in the live branch. */
+	askToolResultIndices: number[];
 	transcriptPath: string;
 	transcriptSha256: string;
 }> {
@@ -772,6 +825,7 @@ export async function authoritativeConversationSnapshot(
 		)
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
 		const messages: CrystalSnapshot["messages"] = [];
+		const askToolResultIndices: number[] = [];
 		for (const entry of activeSessionEntries(entries)) {
 			if (entry.type !== "message") continue;
 			const index = messages.length;
@@ -789,6 +843,7 @@ export async function authoritativeConversationSnapshot(
 			if (!["user", "assistant", "system", "developer", "tool", "toolResult"].includes(role))
 				throw new DeepInterviewCommandError(2, "live session transcript contains an unsupported message role");
 			let projectedContent: string;
+			if (role === "toolResult" && message.toolName === "ask") askToolResultIndices.push(index);
 			if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
 				projectedContent = `[${message.role} sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}]`;
 			} else if (typeof message.content === "string") {
@@ -828,6 +883,7 @@ export async function authoritativeConversationSnapshot(
 		return {
 			revision: messages.length,
 			messages,
+			askToolResultIndices,
 			transcriptPath: path.resolve(sessionFile),
 			transcriptSha256: createHash("sha256").update(bytes).digest("hex"),
 		};
@@ -1168,9 +1224,15 @@ export async function assertDeepInterviewCrystalCoversLiveTranscript(
 	const source = verifyCrystalSourceAgainstLive(crystal, liveSnapshot);
 	if (
 		requireCrystalTail &&
-		liveSnapshot.messages.slice(source.end + 1).some(message => !["assistant", "toolResult"].includes(message.role))
+		(liveSnapshot.messages
+			.slice(source.end + 1)
+			.some(message => !["assistant", "toolResult"].includes(message.role)) ||
+			liveSnapshot.askToolResultIndices.some(index => index > source.end))
 	)
-		throw new DeepInterviewCommandError(2, "execution approval requires re-crystallization after transcript changes");
+		throw new DeepInterviewCommandError(
+			2,
+			"execution approval requires re-crystallization after user evidence or Ask results changed the transcript",
+		);
 	return { transcriptPath: liveSnapshot.transcriptPath, transcriptSha256: liveSnapshot.transcriptSha256 };
 }
 
@@ -1362,6 +1424,8 @@ async function handleCrystallizeUnlocked(
 	if (specContent && [...specContent].length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
 		throw new DeepInterviewCommandError(2, "crystallized specification exceeds the structured response limit");
 	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
+	if (specPath) await assertCrystalPublicationAncestors(cwd, sessionId, specPath);
+	await assertCrystalPublicationAncestors(cwd, sessionId, indexPath);
 	const mutationId =
 		specPath && specHash
 			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}`).digest("hex")}`
@@ -1411,6 +1475,7 @@ async function handleCrystallizeUnlocked(
 				cwd,
 				audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 			});
+		await assertCrystalPublicationAncestors(cwd, sessionId, specPath);
 		if (journal || mutationId)
 			await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, {
 				steps: ["artifact"],
