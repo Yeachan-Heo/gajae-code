@@ -6,7 +6,16 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkProfile } from "@gajae-code/natives";
-import { APP_NAME, getLogPath, getLogsDir, getReportsDir, isEnoent } from "@gajae-code/utils";
+import {
+	APP_NAME,
+	getEffectiveLogPath,
+	getEffectiveLogsDir,
+	getLogPath,
+	getLogsDir,
+	getReportsDir,
+	isEnoent,
+	resolveEquivalentPath,
+} from "@gajae-code/utils";
 import type { CpuProfile, HeapSnapshot } from "./profiler";
 import { collectSystemInfo, sanitizeEnv } from "./system-info";
 
@@ -32,6 +41,70 @@ async function readLastLines(filePath: string, n: number, maxBytes = MAX_LOG_BYT
 		if (isEnoent(err)) return "";
 		throw err;
 	}
+}
+
+/**
+ * Both log directories can legitimately hold dated `gjc.<date>.log` files, and a
+ * reader that consults only one of them is wrong in one direction or the other.
+ *
+ * The *effective* directory is where this process writes — a trusted
+ * `GJC_LOG_DIR` pin, which the test preload sets to a per-process temp sink
+ * (issue #5618). The *canonical* directory is the config root, which carries
+ * history: previous runs, other processes, and anything written through
+ * `getLogsDir()` before this process pinned anything.
+ *
+ * Deduplicated by equivalent path, effective first. In production — and in any
+ * process that never pinned `GJC_LOG_DIR` — the two resolve to the same
+ * directory and this collapses to the single entry these readers have always
+ * used, so nothing is listed twice and no ordering changes.
+ */
+function logSearchDirs(): string[] {
+	const dirs: string[] = [];
+	for (const resolve of [getEffectiveLogsDir, getLogsDir]) {
+		const resolved = attemptPath(resolve);
+		if (resolved !== undefined && !dirs.includes(resolved)) dirs.push(resolved);
+	}
+	return dirs;
+}
+
+/**
+ * Resolve a log path, or `undefined` when it is unavailable.
+ *
+ * `getLogsDir()`/`getLogPath()` throw when there is no trustworthy home. That
+ * must not deny the caller the *other* directory, which a pinned `GJC_LOG_DIR`
+ * can still supply.
+ */
+function attemptPath(resolve: () => string): string | undefined {
+	try {
+		return resolveEquivalentPath(resolve());
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Today's log text, oldest content first.
+ *
+ * Concatenated canonical-then-effective so the tail stays chronological, and the
+ * line cap is applied to the COMBINED result: capping per file would let a large
+ * history file push this process's own entries out of a bundle that still looks
+ * complete. When the two paths are the same file — production, and any process
+ * without a `GJC_LOG_DIR` pin — this is a single read of exactly the bytes the
+ * previous single-path implementation returned.
+ */
+async function readTodayLogText(maxLines: number): Promise<string> {
+	const parts: string[] = [];
+	const seen = new Set<string>();
+	for (const resolve of [getLogPath, getEffectiveLogPath]) {
+		const candidate = attemptPath(resolve);
+		if (candidate === undefined || seen.has(candidate)) continue;
+		seen.add(candidate);
+		const text = await readLastLines(candidate, maxLines);
+		if (text.length > 0) parts.push(text);
+	}
+	const combined = parts.join("\n");
+	const lines = combined.split("\n");
+	return lines.length > maxLines ? lines.slice(-maxLines).join("\n") : combined;
 }
 
 export interface ReportBundleOptions {
@@ -101,9 +174,8 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 		files.push("config.json");
 	}
 
-	// Recent logs (last 1000 lines)
-	const logPath = getLogPath();
-	const logs = await readLastLines(logPath, 1000);
+	// Recent logs (last 1000 lines, across both log directories)
+	const logs = await readTodayLogText(1000);
 	if (logs) {
 		data["logs.txt"] = logs;
 		files.push("logs.txt");
@@ -228,31 +300,50 @@ async function addSubagentSessions(
 
 /** Get recent log entries for display (tail-limited to avoid OOM on large files). */
 export async function getLogText(): Promise<string> {
-	return readLastLines(getLogPath(), MAX_LOG_LINES);
+	return readTodayLogText(MAX_LOG_LINES);
 }
 
 const LOG_FILE_PATTERN = new RegExp(`^${APP_NAME}\\.(\\d{4}-\\d{2}-\\d{2})\\.log$`);
 
+/**
+ * Today's log file: the one this process is writing when it exists, else the
+ * canonical one. Both spellings share a basename, so the "is this today's file"
+ * filter below is unaffected by which is chosen.
+ */
+async function resolveTodayLogPath(): Promise<string> {
+	const effective = getEffectiveLogPath();
+	if (await Bun.file(effective).exists()) return effective;
+	const canonical = attemptPath(getLogPath);
+	if (canonical !== undefined && (await Bun.file(canonical).exists())) return canonical;
+	return effective;
+}
+
 export async function createDebugLogSource(): Promise<DebugLogSource> {
-	const logsDir = getLogsDir();
-	const todayPath = getLogPath();
+	const todayPath = await resolveTodayLogPath();
 	const todayName = path.basename(todayPath);
-	let olderFiles: string[] = [];
-	try {
-		const entries = await fs.readdir(logsDir, { withFileTypes: true });
-		const datedFiles = entries
-			.filter(entry => entry.isFile())
-			.map(entry => {
-				const match = LOG_FILE_PATTERN.exec(entry.name);
-				return match ? { name: entry.name, date: match[1] } : undefined;
-			})
-			.filter((entry): entry is { name: string; date: string } => entry !== undefined)
-			.filter(entry => entry.name !== todayName)
-			.sort((a, b) => b.date.localeCompare(a.date));
-		olderFiles = datedFiles.map(entry => entry.name);
-	} catch {
-		olderFiles = [];
+	// Absolute paths, not bare names: entries can come from either log directory
+	// (see {@link logSearchDirs}), so the name alone no longer locates the file.
+	const olderFiles: string[] = [];
+	const dated: { path: string; date: string }[] = [];
+	const seen = new Set<string>();
+	for (const dir of logSearchDirs()) {
+		// A missing directory contributes nothing; the other one may still exist.
+		const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+		for (const entry of entries) {
+			if (!entry.isFile()) continue;
+			const match = LOG_FILE_PATTERN.exec(entry.name);
+			if (!match || entry.name === todayName) continue;
+			const filePath = path.join(dir, entry.name);
+			if (seen.has(filePath)) continue;
+			seen.add(filePath);
+			dated.push({ path: filePath, date: match[1]! });
+		}
 	}
+	// Newest first. `sort` is stable, so same-date files keep the directory order
+	// above (effective before canonical) and the single-directory case is ordered
+	// exactly as it was before the second directory was added.
+	dated.sort((a, b) => b.date.localeCompare(a.date));
+	olderFiles.push(...dated.map(entry => entry.path));
 
 	let cursor = 0;
 
@@ -270,8 +361,7 @@ export async function createDebugLogSource(): Promise<DebugLogSource> {
 		const slice = olderFiles.slice(cursor, cursor + count);
 		cursor += slice.length;
 		const chunks: string[] = [];
-		for (const filename of slice.reverse()) {
-			const filePath = path.join(logsDir, filename);
+		for (const filePath of slice.reverse()) {
 			try {
 				const content = await readLastLines(filePath, MAX_LOG_LINES);
 				if (content.length > 0) {

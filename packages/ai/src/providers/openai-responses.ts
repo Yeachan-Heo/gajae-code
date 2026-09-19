@@ -92,6 +92,8 @@ import {
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
 	repairOrphanResponsesToolOutputs,
+	responsesStreamFailureCode,
+	unexpectedResponsesStreamEndError,
 } from "./openai-responses-shared";
 import {
 	applyOpenCodeGoSessionHeader,
@@ -468,7 +470,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			stream.push({ type: "start", partial: output });
 
 			const nativeOutputItems: Array<Record<string, unknown>> = [];
-			await processResponsesStream(
+			const sawTerminalEvent = await processResponsesStream(
 				iterateWithIdleTimeout(openaiStream, {
 					idleTimeoutMs,
 					firstItemTimeoutMs: firstEventTimeoutMs,
@@ -505,6 +507,11 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 				throw new Error(output.errorMessage ?? "An unknown error occurred");
 			}
 
+			// The Responses SSE contract always ends with a terminal event. A stream
+			// that closes without one is an interrupted upstream, not a completed
+			// turn, and must not surface as a content-free success.
+			if (!sawTerminalEvent) throw unexpectedResponsesStreamEndError();
+
 			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
 			if (isOpenCodeGoEmptyCompletedResponse(model, output, nativeOutputItems.length)) {
 				output.stopReason = "error";
@@ -534,6 +541,8 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? normalizedError);
 			output.transportFailure = transportFailureFacts(localAbortReason ?? normalizedError);
+			const streamFailureCode = responsesStreamFailureCode(localAbortReason ?? normalizedError);
+			if (streamFailureCode !== undefined) output.errorCode = streamFailureCode;
 			output.errorMessage =
 				localAbortReason?.message ?? (await finalizeErrorMessage(normalizedError, rawRequestDump));
 			output.errorMessage = rewriteCopilotError(output.errorMessage, normalizedError, model.provider);

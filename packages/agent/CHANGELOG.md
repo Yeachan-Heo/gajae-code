@@ -2,9 +2,24 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
+### Added
+
+- Maintenance LLM calls (compaction, handoff, branch summaries) forward a `maintenanceCall: true` marker to the provider. Agent-level providers such as Devin over ACP use it to refuse work they cannot serve instead of forwarding a summarization prompt to a billed upstream agent.
+
 ### Fixed
 
+- Lossless, managed, abort-path, and safety-stop assistant-message rebuilds now carry the in-process provider-resolved tool-call marker across the boundary. The marker is a symbol, so a deep snapshot silently dropped it, and the loop would then dispatch a provider-executed tool call to a local tool of the same display name — or, on an aborted turn, fabricate a failed tool result for it. This affected Cursor's exec-owned calls and the new Devin ACP provider alike. The marker is registered with `Symbol.for` and restoration is fail-closed on ambiguous identity.
+
 - Publish reasoning summaries, thinking, and tool-call updates during ordinary unmanaged streaming instead of holding them until text, response completion, or interruption. Tool execution still waits for terminal validation; already-published legacy guarded calls receive explicit rejection instead of silent resampling. Managed fallback attempts remain atomic.
+- Provisional streaming consumers can reject an escaped-non-ASCII tool-call turn after earlier updates without publishing its terminal message, allowing AgentSession to resample the turn without persisting defective provider metadata.
+
+## [0.16.7] - 2026-09-13
 
 ## [0.16.6] - 2026-09-07
 

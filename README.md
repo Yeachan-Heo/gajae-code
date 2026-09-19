@@ -293,7 +293,7 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 </details>
 
 Long prompts are safe to leave running: the SDK prompt deadline is a progress-aware inactivity lease
-(`sdk.promptDeadlineMs`, 30 min default) bounded by `sdk.promptMaxRuntimeMs` (6 h default), renewed only
+(`sdk.promptDeadlineMs`, 60 min default) bounded by `sdk.promptMaxRuntimeMs` (6 h default), renewed only
 by attributable tool execution for the accepted turn — not by heartbeats or streaming text.
 
 Need event-driven fan-out across many worktrees instead of one session at a time? The native

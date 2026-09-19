@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "bun:test";
+import { rmSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
 	SessionIndex,
@@ -31,7 +33,263 @@ const event = (sessionId: string) => ({
 function deferred<T = void>() {
 	return Promise.withResolvers<T>();
 }
+
+/**
+ * Faking `process.platform` to exercise a Windows code path also selects the lock
+ * layer's Windows release branch, which replays detached cleanup through the native
+ * addon. A test run only ever loads the host addon, so pin the bindings to a
+ * deterministic single-phase removal: without this, the POSIX addon's two-phase
+ * "cleanup_pending" result is read as a release failure by the Windows branch.
+ */
+function pinWindowsLockRemoval(): void {
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			const result = await native.renameNoReplacePathAsync(source, destination);
+			return result.ok ? { ...result, primitive: "windows_rename_noreplace" } : result;
+		},
+		renameDirectoryNoReplacePathAsync: native.renameDirectoryNoReplacePathAsync,
+	});
+	FileLockTestHooks.nativeQuarantineBindings = () => ({
+		snapshotDirectoryTree: native.snapshotDirectoryTree,
+		exactRemoveDirectoryTree: target => {
+			rmSync(target, { recursive: true, force: true });
+			return { ok: true };
+		},
+	});
+}
 describe("SDK session index", () => {
+	it("keeps the fsynced append projection independent of caller-owned objects (#5438)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-append-copy-"));
+		try {
+			const index = new SessionIndex(dir);
+			const input = event("durable");
+			const appended = await index.append(input);
+			input.locator.cwd = "mutated-input";
+			appended.sessionId = "mutated-return";
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId: "durable",
+					locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
+				}),
+			]);
+			const reopened = await new SessionIndex(dir).open();
+			expect(index.listSessions()).toEqual(reopened.listSessions());
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	for (const race of [
+		"growth",
+		"rewrite-growth",
+		"truncate",
+		"replace",
+		"rotate",
+		"malformed",
+		"null",
+		"stale-sequence",
+	] as const) {
+		it(`revalidates prepared append history after ${race} before committing (#5438)`, async () => {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-prepared-race-"));
+			const sessionsDir = path.join(dir, "sdk", "sessions");
+			const log = path.join(sessionsDir, "index.jsonl");
+			const snapshot = path.join(sessionsDir, "index.snapshot.json");
+			const signed = (indexSeq: number, sessionId: string): SessionIndexEvent => {
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					...event(sessionId),
+					version: SESSION_INDEX_EVENT_VERSION,
+					indexSeq,
+					ts: 1,
+				};
+				return { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+			};
+			const first = signed(1, "original");
+			const second = signed(2, "concurrent");
+			await fs.mkdir(sessionsDir, { recursive: true });
+			await Bun.write(log, `${JSON.stringify(first)}\n`);
+			let raced = false;
+			const previousHook = FileLockTestHooks.afterParentMkdir;
+			FileLockTestHooks.afterParentMkdir = async () => {
+				if (raced) return;
+				raced = true;
+				switch (race) {
+					case "growth":
+						await fs.appendFile(log, `${JSON.stringify(second)}\n`);
+						break;
+					case "rewrite-growth":
+						// Same inode, larger file: size/identity alone must not bless
+						// the stale prepared prefix as current authority.
+						await fs.writeFile(log, `${JSON.stringify(signed(1, "rewritten"))}\n${JSON.stringify(second)}\n`);
+						break;
+					case "truncate":
+						await fs.writeFile(log, "");
+						break;
+					case "replace":
+						await Bun.write(`${log}.replacement`, `${JSON.stringify(signed(1, "replaced"))}\n`);
+						await fs.rename(`${log}.replacement`, log);
+						break;
+					case "rotate":
+						await Bun.write(
+							`${snapshot}.replacement`,
+							JSON.stringify({
+								version: SESSION_INDEX_SNAPSHOT_VERSION,
+								indexSeq: 2,
+								events: [first, second],
+							}),
+						);
+						await fs.rename(`${snapshot}.replacement`, snapshot);
+						await Bun.write(`${log}.replacement`, "");
+						await fs.rename(`${log}.replacement`, log);
+						break;
+					case "malformed":
+						await fs.appendFile(log, '{"partial":');
+						break;
+					case "null":
+						await fs.appendFile(log, "null\n");
+						break;
+					case "stale-sequence":
+						await fs.appendFile(log, `${JSON.stringify(signed(1, "stale"))}\n`);
+						break;
+				}
+			};
+			try {
+				const appended = await new SessionIndex(dir).append(event("accepted"));
+				expect(raced).toBe(true);
+				const expectedPrefix =
+					race === "truncate"
+						? []
+						: race === "rewrite-growth"
+							? ["rewritten", "concurrent"]
+							: race === "replace"
+								? ["replaced"]
+								: race === "growth" || race === "rotate"
+									? ["original", "concurrent"]
+									: ["original"];
+				expect(appended.indexSeq).toBe(expectedPrefix.length + 1);
+				const replay = await new SessionIndex(dir).open();
+				expect(replay.listSessions().sessions.map(row => row.sessionId)).toEqual([...expectedPrefix, "accepted"]);
+				expect((await replay.diagnose()).status).toBe("healthy");
+				if (race === "malformed" || race === "null" || race === "stale-sequence") {
+					const repairs = await fs.readdir(path.join(sessionsDir, "quarantine"));
+					expect(repairs).toHaveLength(1);
+					const evidence = await fs.readFile(
+						path.join(sessionsDir, "quarantine", repairs[0]!, "index.jsonl"),
+						"utf8",
+					);
+					const rejected =
+						race === "malformed" ? '{"partial":' : race === "null" ? "null\n" : '"sessionId":"stale"';
+					expect(evidence).toContain(rejected);
+				}
+			} finally {
+				FileLockTestHooks.afterParentMkdir = previousHook;
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		});
+	}
+	it("preserves separate ephemeral registrations and teardown over shared history (#5438)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ephemeral-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		const history = Array.from({ length: 1024 }, (_, i) => {
+			const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+				...event(`historical-${Math.floor(i / 2)}`),
+				type: i % 2 === 0 ? ("host_registered" as const) : ("host_unregistered" as const),
+				version: SESSION_INDEX_EVENT_VERSION,
+				indexSeq: i + 1,
+				ts: Date.now(),
+			};
+			return { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+		});
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await Bun.write(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({
+				version: SESSION_INDEX_SNAPSHOT_VERSION,
+				indexSeq: 512,
+				events: history.slice(0, 512),
+			}),
+		);
+		await Bun.write(
+			log,
+			`${history
+				.slice(512)
+				.map(row => JSON.stringify(row))
+				.join("\n")}\n`,
+		);
+		const modulePath = path.resolve(import.meta.dir, "../src/sdk/broker/session-index.ts");
+		const script = `
+			import { SessionIndex } from ${JSON.stringify(modulePath)};
+			const index = new SessionIndex(process.env.AGENT_DIR);
+			for (let round = 0; round < 4; round++) {
+				const registration = {
+					type: "host_registered", sessionId: process.env.WRITER_ID + "-" + round,
+					locator: { cwd: process.env.AGENT_DIR, worktreeRoot: null, stateRoot: process.env.AGENT_DIR },
+					endpointGeneration: 0, pid: process.pid,
+				};
+				await index.append(registration);
+				if (round === 0) {
+					process.stdout.write("registered\\n");
+					for (let attempt = 0; !(await Bun.file(process.env.RELEASE).exists()); attempt++) {
+						if (attempt > 1500) throw new Error("parent did not release registration barrier");
+						await Bun.sleep(10);
+					}
+				}
+				await index.append({ ...registration, type: "host_unregistered" });
+			}
+		`;
+		const release = path.join(dir, "release");
+		const children = Array.from({ length: 6 }, (_, writer) =>
+			Bun.spawn([process.execPath, "-e", script], {
+				env: { ...process.env, AGENT_DIR: dir, WRITER_ID: `ephemeral-${writer}`, RELEASE: release },
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const errors = children.map(child => new Response(child.stderr).text());
+		try {
+			await Promise.all(
+				children.map(async child => {
+					const reader = child.stdout.getReader();
+					try {
+						const decoder = new TextDecoder();
+						let message = "";
+						while (!message.includes("\n")) {
+							const chunk = await reader.read();
+							if (chunk.done) break;
+							message += decoder.decode(chunk.value, { stream: true });
+						}
+						expect(message).toBe("registered\n");
+					} finally {
+						reader.releaseLock();
+					}
+				}),
+			);
+			const liveIndex = await new SessionIndex(dir).open();
+			const live = liveIndex.listSessions().sessions.filter(row => row.sessionId.startsWith("ephemeral-"));
+			expect(live).toHaveLength(6);
+			for (const row of live) {
+				expect(row).toMatchObject({ live: true, terminal: false, ambiguous: false, endpointGeneration: 0 });
+				expect(row.hostIncarnation).toEqual(expect.any(String));
+			}
+			await Bun.write(release, "release");
+			for (const [i, child] of children.entries()) expect(await child.exited, await errors[i]).toBe(0);
+			const replay = await new SessionIndex(dir).open();
+			expect(replay.indexSeq).toBe(1072);
+			const ephemeral = replay.listSessions().sessions.filter(row => row.sessionId.startsWith("ephemeral-"));
+			expect(ephemeral).toHaveLength(24);
+			for (const row of ephemeral) expect(row).toMatchObject({ live: false, terminal: true, ambiguous: false });
+			const rows = (await fs.readFile(log, "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as SessionIndexEvent);
+			expect(rows.map(row => row.indexSeq)).toEqual(Array.from({ length: 560 }, (_, i) => i + 513));
+			for (const { checksum, ...unsigned } of rows) expect(checksum).toBe(sessionIndexChecksum(unsigned));
+			expect((await replay.diagnose()).status).toBe("healthy");
+		} finally {
+			await Bun.write(release, "release");
+			await Promise.all(children.map(child => child.exited));
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
 	it("diagnoses a missing index without creating session directories", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-missing-"));
 		expect(await new SessionIndex(dir).diagnose()).toEqual({
@@ -128,6 +386,7 @@ describe("SDK session index", () => {
 			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
 		}) as typeof process.kill;
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		try {
 			const index = await new SessionIndex(dir).open();
 			await index.append({
@@ -142,6 +401,8 @@ describe("SDK session index", () => {
 			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
 			process.kill = originalKill;
 			fromPid.mockRestore();
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
@@ -320,6 +581,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		const platform = Object.getOwnPropertyDescriptor(process, "platform");
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		try {
 			for (const [stage, code] of [
 				["open", "EPERM"],
@@ -346,6 +608,8 @@ describe("SDK session index", () => {
 				}
 			}
 		} finally {
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
@@ -356,6 +620,7 @@ describe("SDK session index", () => {
 		const platform = Object.getOwnPropertyDescriptor(process, "platform");
 		const open = fs.open.bind(fs);
 		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		pinWindowsLockRemoval();
 		const error = Object.assign(new Error("EIO"), { code: "EIO" });
 		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
 			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
@@ -369,6 +634,8 @@ describe("SDK session index", () => {
 			await expect(index.snapshot()).rejects.toBe(error);
 		} finally {
 			spy.mockRestore();
+			FileLockTestHooks.nativeQuarantineBindings = undefined;
+			FileLockTestHooks.nativePublicationBindings = undefined;
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
 	});
@@ -1085,6 +1352,94 @@ describe("SDK session index", () => {
 				terminal: true,
 			}),
 		]);
+	});
+	it("fences file-only replacements and retains the exact close identity through compaction and reopen", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-file-close-"));
+		try {
+			const index = await new SessionIndex(dir).open();
+			const predecessor = await index.append({
+				...event("session"),
+				endpointMtimeMs: 1234.5,
+				endpointFileId: "1:100",
+				lifecycleRequestId: "same-request",
+				ts: 1234,
+			});
+			const successor = await index.append({
+				...event("session"),
+				endpointMtimeMs: predecessor.endpointMtimeMs,
+				endpointFileId: "1:101",
+				lifecycleRequestId: predecessor.lifecycleRequestId,
+				ts: predecessor.ts,
+			});
+			const successorIncarnation = endpointIncarnation(successor, successor.sessionId);
+			expect(successorIncarnation).toBeDefined();
+			expect(successorIncarnation).not.toBe(endpointIncarnation(predecessor, predecessor.sessionId));
+			const before = index.indexSeq;
+			expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+			expect(await index.unregisterIfCurrent({ ...successor, endpointFileId: undefined })).toBe(false);
+			expect(index.indexSeq).toBe(before);
+			expect(index.listSessions().sessions[0]).toMatchObject({ terminal: false, endpointFileId: "1:101" });
+			expect(await index.unregisterIfCurrent(successor)).toBe(true);
+			const terminal = index.listSessions().sessions[0]!;
+			expect(terminal).toMatchObject({ terminal: true, live: false, endpointFileId: "1:101" });
+			expect(endpointIncarnation(terminal, terminal.sessionId)).toBe(successorIncarnation);
+			expect(index.hostUnregisteredAfter(predecessor)).toBeUndefined();
+			expect(index.hostUnregisteredAfter(successor)).toMatchObject({ indexSeq: terminal.indexSeq });
+			expect(index.findSessionTerminalEvidence(predecessor)).toBeUndefined();
+			expect(index.findSessionTerminalEvidence(successor)).toEqual({
+				type: "host_unregistered",
+				indexSeq: terminal.indexSeq,
+			});
+			const rows = (await fs.readFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as SessionIndexEvent);
+			expect(rows.at(-1)).toMatchObject({
+				type: "host_unregistered",
+				endpointFileId: successor.endpointFileId,
+				endpointMtimeMs: successor.endpointMtimeMs,
+				lifecycleRequestId: successor.lifecycleRequestId,
+			});
+			expect(rows.at(-1)?.hostIncarnation).toBe(successor.hostIncarnation);
+			expect(rows.at(-1)?.processIncarnation).toBe(successor.processIncarnation);
+			await index.snapshot();
+			await fs.writeFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "");
+			const reopened = await new SessionIndex(dir).open();
+			const retained = reopened.listSessions().sessions[0]!;
+			expect(retained).toMatchObject({ terminal: true, live: false, endpointFileId: "1:101" });
+			expect(endpointIncarnation(retained, retained.sessionId)).toBe(successorIncarnation);
+			const closedSeq = reopened.indexSeq;
+			expect(await reopened.unregisterIfCurrent(successor)).toBe(false);
+			expect(reopened.indexSeq).toBe(closedSeq);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not certify terminal evidence with a contradictory or stripped endpoint file identity", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-terminal-file-"));
+		try {
+			const index = await new SessionIndex(dir).open();
+			for (const type of ["host_unregistered", "session_closed", "session_deleted"] as const) {
+				for (const endpointFileId of [undefined, "1:101"]) {
+					const registration = await index.append({
+						...event(`${type}-${endpointFileId ?? "missing"}`),
+						endpointMtimeMs: 1234.5,
+						endpointFileId: "1:100",
+					});
+					await index.append({
+						...event(registration.sessionId),
+						type,
+						endpointMtimeMs: registration.endpointMtimeMs,
+						endpointFileId,
+					});
+					if (type === "host_unregistered") expect(index.hostUnregisteredAfter(registration)).toBeUndefined();
+					expect(index.findSessionTerminalEvidence(registration)).toBeUndefined();
+					if (type === "session_closed") expect(index.findSessionClosedEvidence(registration)).toBeUndefined();
+				}
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 	it("does not unregister a concurrent terminal-uncertain record", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));

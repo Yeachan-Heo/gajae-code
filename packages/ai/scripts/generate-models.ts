@@ -98,102 +98,123 @@ export function injectCodexAstraModel(models: Model[]): void {
 }
 
 /**
- * Inject dedicated image generation models into providers that support them.
- * gpt-image-2 is registered under openai and openai-codex so the image
- * generation tool can route through a dedicated model instead of the active
- * chat model. These entries are image-only and should be excluded from the
- * chat model browser UI.
+ * Dedicated image generation models registered under openai and openai-codex so
+ * the image generation tool can route through a dedicated model instead of the
+ * active chat model. These entries are image-only and should be excluded from
+ * the chat model browser UI.
  */
-export function injectImageGenerationModels(models: Model[]): void {
-	const imageModelBase = {
-		id: "gpt-image-2",
-		name: "GPT Image 2",
+const IMAGE_GENERATION_MODELS = [
+	{ id: "gpt-image-2", name: "GPT Image 2" },
+	{ id: "gpt-image-2.5-sunburst", name: "GPT Image 2.5 Sunburst" },
+	{ id: "gpt-image-2.5-flare", name: "GPT Image 2.5 Flare" },
+] as const;
+
+function imageGenerationModelBase(id: string, name: string): Omit<Model, "api" | "provider" | "baseUrl"> {
+	return {
+		id,
+		name,
 		reasoning: false,
 		input: ["text"],
 		output: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-	} satisfies Omit<Model, "api" | "provider" | "baseUrl">;
-	const hasOpenAI = models.some(m => m.provider === "openai" && m.id === "gpt-image-2");
-	if (!hasOpenAI) {
-		const openAIImageModel: Model<"openai-responses"> = {
-			...imageModelBase,
-			api: "openai-responses",
-			provider: "openai",
-			baseUrl: "",
-		};
-		models.push(openAIImageModel);
+	};
+}
+
+/**
+ * Inject dedicated image generation models into providers that support them.
+ */
+export function injectImageGenerationModels(models: Model[]): void {
+	for (const { id, name } of IMAGE_GENERATION_MODELS) {
+		if (!models.some(m => m.provider === "openai" && m.id === id)) {
+			const openAIImageModel: Model<"openai-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-responses",
+				provider: "openai",
+				baseUrl: "",
+			};
+			models.push(openAIImageModel);
+		}
 	}
-	const hasCodex = models.some(m => m.provider === "openai-codex" && m.id === "gpt-image-2");
-	if (!hasCodex) {
-		const codexImageModel: Model<"openai-codex-responses"> = {
-			...imageModelBase,
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: "",
-		};
-		models.push(codexImageModel);
+	for (const { id, name } of IMAGE_GENERATION_MODELS) {
+		if (!models.some(m => m.provider === "openai-codex" && m.id === id)) {
+			const codexImageModel: Model<"openai-codex-responses"> = {
+				...imageGenerationModelBase(id, name),
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "",
+			};
+			models.push(codexImageModel);
+		}
 	}
 }
 
 /**
- * Keep the Alibaba Token Plan DeepSeek V4 Flash executor and non-preview
- * Qwen3.8 Max models available when authenticated catalog discovery is
- * unavailable during generation.
+ * Keep the Alibaba Token Plan DeepSeek V4 Flash executor, V4.1 Flash,
+ * V4 Pro 0813, GLM-5.3, and non-preview Qwen3.8 Max models available when
+ * authenticated catalog discovery is unavailable during generation.
+ *
+ * Model IDs follow Alibaba Model Studio's published Token Plan names:
+ * `deepseek-v4.1-flash`, `deepseek-v4-pro-0813`, and `glm-5.3` (the Token
+ * Plan short id; Model Studio also lists `ZHIPU/GLM-5.3`). Context and
+ * output envelopes copy the already-reviewed sibling rows:
+ * DeepSeek V4 Flash/Pro 1M/384K, GLM-5.2 1M/128K.
+ * https://www.alibabacloud.com/help/en/model-studio/models
  */
 export function injectAlibabaTokenPlanModels(models: Model[]): void {
-	const deepseek: Model<"openai-completions"> = {
-		id: "deepseek-v4-flash-0731",
-		name: "DeepSeek V4 Flash 0731",
+	const alibabaBaseUrl = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+	const completions = (
+		id: string,
+		name: string,
+		contextWindow: number,
+		maxTokens: number,
+	): Model<"openai-completions"> => ({
+		id,
+		name,
 		api: "openai-completions",
 		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		baseUrl: alibabaBaseUrl,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1_000_000,
-		maxTokens: 384_000,
+		contextWindow,
+		maxTokens,
 		compat: { supportsDeveloperRole: false },
-	};
-	const qwen: Model<"openai-responses"> = {
-		id: "qwen3.8-max",
-		name: "Qwen3.8 Max",
+	});
+	const responses = (id: string, name: string): Model<"openai-responses"> => ({
+		id,
+		name,
 		api: "openai-responses",
 		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		baseUrl: alibabaBaseUrl,
 		reasoning: true,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 1_000_000,
 		maxTokens: 65_536,
 		compat: { supportsDeveloperRole: false },
-	};
-	const qwenPreview: Model<"openai-responses"> = {
-		id: "qwen3.8-max-preview",
-		name: "Qwen3.8 Max Preview",
-		api: "openai-responses",
-		provider: "alibaba-token-plan",
-		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1_000_000,
-		maxTokens: 65_536,
-		compat: { supportsDeveloperRole: false },
-	};
+	});
+	const metadata: Model[] = [
+		completions("deepseek-v4-flash-0731", "DeepSeek V4 Flash 0731", 1_000_000, 384_000),
+		completions("deepseek-v4-pro-0813", "DeepSeek V4 Pro 0813", 1_000_000, 384_000),
+		completions("deepseek-v4.1-flash", "DeepSeek V4.1 Flash", 1_000_000, 384_000),
+		completions("glm-5.3", "GLM-5.3", 1_000_000, 131_072),
+		responses("qwen3.8-max", "Qwen3.8 Max"),
+		responses("qwen3.8-max-preview", "Qwen3.8 Max Preview"),
+	];
 	for (let index = models.length - 1; index >= 0; index--) {
 		const model = models[index]!;
 		if (model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max") {
 			models.splice(index, 1);
 		}
 	}
-	for (const metadata of [deepseek, qwen, qwenPreview]) {
-		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
+	for (const entry of metadata) {
+		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === entry.id);
 		if (existing) {
-			Object.assign(existing, metadata);
+			Object.assign(existing, entry);
 		} else {
-			models.push(metadata);
+			models.push(entry);
 		}
 	}
 }

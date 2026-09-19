@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import { logger } from "@gajae-code/utils";
 import {
 	createSessionReaper,
+	MAX_REAP_FAILURES,
 	type ReapableSession,
 	selectReapableSessions,
 } from "../../src/coordinator-mcp/session-reaper";
@@ -45,6 +46,7 @@ describe("createSessionReaper.sweepOnce", () => {
 				reapSession: async id => {
 					reaped.push(id);
 				},
+				markSessionDead: async () => {},
 				now: () => NOW,
 			},
 			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -62,6 +64,7 @@ describe("createSessionReaper.sweepOnce", () => {
 					if (id === "bad") throw new Error("wedged");
 					reaped.push(id);
 				},
+				markSessionDead: async () => {},
 				now: () => NOW,
 			},
 			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -83,6 +86,7 @@ describe("createSessionReaper.sweepOnce", () => {
 					return [];
 				},
 				reapSession: async () => {},
+				markSessionDead: async () => {},
 				now: () => NOW,
 			},
 			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -98,7 +102,7 @@ describe("createSessionReaper.sweepOnce", () => {
 describe("createSessionReaper scheduler", () => {
 	it("start()/stop() flips running and is idempotent", () => {
 		const reaper = createSessionReaper(
-			{ listSessions: async () => [], reapSession: async () => {}, now: () => NOW },
+			{ listSessions: async () => [], reapSession: async () => {}, markSessionDead: async () => {}, now: () => NOW },
 			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
 		);
 		expect(reaper.running).toBe(false);
@@ -120,6 +124,7 @@ describe("createSessionReaper scheduler", () => {
 						return [];
 					},
 					reapSession: async () => {},
+					markSessionDead: async () => {},
 					now: () => NOW,
 				},
 				{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -144,6 +149,7 @@ describe("createSessionReaper scheduler", () => {
 						return [];
 					},
 					reapSession: async () => {},
+					markSessionDead: async () => {},
 					now: () => NOW,
 				},
 				{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -170,6 +176,7 @@ describe("createSessionReaper scheduler", () => {
 						return [];
 					},
 					reapSession: async () => {},
+					markSessionDead: async () => {},
 					now: () => NOW,
 				},
 				{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
@@ -188,5 +195,190 @@ describe("createSessionReaper scheduler", () => {
 			warning.mockRestore();
 			vi.useRealTimers();
 		}
+	});
+});
+// NEW TESTS — append to existing describe blocks or add new ones
+// These exercise the bounded-retry / eviction path (AC-1, AC-2, AC-3).
+
+describe("createSessionReaper.sweepOnce — bounded failure eviction", () => {
+	it("AC-1: reproduces infinite-retry: stale endpoint stub evicts after MAX_REAP_FAILURES sweeps", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const deadSessions: string[] = [];
+		// After eviction the session is gone; simulate by tracking evicted ids.
+		const evicted = new Set<string>();
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => (evicted.has("stale") ? [] : [sess("stale")]),
+				reapSession: async () => {
+					throw new Error("endpoint_stale");
+				},
+				markSessionDead: async id => {
+					evicted.add(id);
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// First MAX_REAP_FAILURES - 1 sweeps: warn but do NOT evict yet.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) {
+			await reaper.sweepOnce();
+		}
+		expect(deadSessions).toHaveLength(0);
+		// The (MAX_REAP_FAILURES)th sweep crosses the threshold -> evict.
+		await reaper.sweepOnce();
+		expect(deadSessions).toEqual(["stale"]);
+
+		// AC-3: subsequent sweeps do NOT call reapSession (listSessions returns []).
+		const warnsBefore = warning.mock.calls.length;
+		await reaper.sweepOnce();
+		await reaper.sweepOnce();
+		expect(warning.mock.calls.length).toBe(warnsBefore); // no new warns
+		expect(deadSessions).toHaveLength(1); // markSessionDead called exactly once
+
+		warning.mockRestore();
+	});
+
+	it("F1: a non-endpoint_stale failure retries forever and is never force-evicted", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const deadSessions: string[] = [];
+		let reapAttempts = 0;
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => [sess("wedged")],
+				reapSession: async () => {
+					reapAttempts += 1;
+					// close_failed / broker / filesystem errors are transient, not stale.
+					throw new Error("close_failed");
+				},
+				markSessionDead: async id => {
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Far more sweeps than MAX_REAP_FAILURES: a transient failure must keep
+		// retrying and never escalate to force eviction.
+		for (let i = 0; i < MAX_REAP_FAILURES + 5; i++) {
+			await reaper.sweepOnce();
+		}
+		expect(reapAttempts).toBe(MAX_REAP_FAILURES + 5);
+		expect(deadSessions).toHaveLength(0);
+		// Only the retry warn fires — never the "evicted after" warn.
+		expect(warning.mock.calls.some(([msg]) => String(msg).includes("evicted after"))).toBe(false);
+
+		warning.mockRestore();
+	});
+
+	it("F1: a non-stale failure resets the stale streak (consecutive contract)", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const deadSessions: string[] = [];
+		let mode: "stale" | "other" = "stale";
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => [sess("mixed")],
+				reapSession: async () => {
+					throw new Error(mode === "stale" ? "endpoint_stale" : "close_failed");
+				},
+				markSessionDead: async id => {
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Accumulate stale failures right up to the threshold boundary.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// A non-stale failure breaks the consecutive streak and resets the counter.
+		mode = "other";
+		await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// The counter was reset: a single further stale failure is only count=1, so it
+		// must NOT cross the threshold — the previous streak no longer counts.
+		mode = "stale";
+		await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+		// Only a fresh, fully-consecutive stale streak reaches eviction.
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) await reaper.sweepOnce();
+		expect(deadSessions).toEqual(["mixed"]);
+
+		warning.mockRestore();
+	});
+
+	it("AC-2: success resets the failure counter so the session gets MAX_REAP_FAILURES fresh chances", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		let shouldFail = true;
+		const deadSessions: string[] = [];
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => [sess("flaky")],
+				reapSession: async () => {
+					if (shouldFail) throw new Error("endpoint_stale");
+				},
+				markSessionDead: async id => {
+					deadSessions.push(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Fail once (count = 1).
+		await reaper.sweepOnce();
+		expect(deadSessions).toHaveLength(0);
+
+		// Succeed -- resets counter to 0.
+		shouldFail = false;
+		await reaper.sweepOnce();
+
+		// Now fail MAX_REAP_FAILURES times in a row -- should evict only after a fresh MAX streak.
+		shouldFail = true;
+		for (let i = 0; i < MAX_REAP_FAILURES - 1; i++) {
+			await reaper.sweepOnce();
+		}
+		expect(deadSessions).toHaveLength(0); // not yet
+		await reaper.sweepOnce();
+		expect(deadSessions).toEqual(["flaky"]);
+
+		warning.mockRestore();
+	});
+
+	it("AC-3: the eviction warn fires exactly once, not on subsequent sweeps", async () => {
+		const warnings: string[] = [];
+		vi.spyOn(logger, "warn").mockImplementation(msg => {
+			warnings.push(msg as string);
+		});
+		const evicted = new Set<string>();
+		const reaper = createSessionReaper(
+			{
+				listSessions: async () => (evicted.has("s") ? [] : [sess("s")]),
+				reapSession: async () => {
+					throw new Error("endpoint_stale");
+				},
+				markSessionDead: async id => {
+					evicted.add(id);
+				},
+				now: () => NOW,
+			},
+			{ idleTtlMs: TTL, sweepIntervalMs: 60_000 },
+		);
+
+		// Run enough sweeps to trigger eviction and several more after.
+		for (let i = 0; i < MAX_REAP_FAILURES + 5; i++) {
+			await reaper.sweepOnce();
+		}
+
+		const evictionWarns = warnings.filter(w => w.includes("evicted after"));
+		expect(evictionWarns).toHaveLength(1);
+		// Regular per-failure warns fire only for the first (MAX_REAP_FAILURES - 1) sweeps.
+		const failureWarns = warnings.filter(w => w.includes("failed to reap"));
+		expect(failureWarns.length).toBe(MAX_REAP_FAILURES - 1);
+
+		vi.restoreAllMocks();
 	});
 });

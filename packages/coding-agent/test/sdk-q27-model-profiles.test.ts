@@ -13,7 +13,7 @@ import {
 	validateModelProfileName,
 } from "../src/config/model-profile-contract";
 import { mergeModelProfiles } from "../src/config/model-profiles";
-import type { ModelRegistry } from "../src/config/model-registry";
+import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
@@ -290,6 +290,67 @@ describe("Q27 models.profiles.list", () => {
 		expect(item?.available).toBe(true);
 		expect(typeof item?.available).toBe("boolean");
 	});
+
+	for (const proxyMode of ["fallback", "always"] as const) {
+		for (const [provider, apiKey, available] of [
+			["opencodex", kNoAuth, true],
+			["opencodex", undefined, false],
+			["opencodex", "unconfigured-key", false],
+			["custom-proxy", kNoAuth, false],
+		] as const) {
+			it(`discovered proxy SDK availability: ${proxyMode}, ${provider}, ${apiKey}`, async () => {
+				const profile = {
+					name: "discovered-ocx",
+					requiredProviders: ["anthropic"],
+					modelMapping: { default: "anthropic/claude-opus-5" },
+					source: "registry" as const,
+				};
+				const proxyModel = {
+					provider,
+					id: "opencodex/claude-opus-5",
+					wireModelId: "claude-opus-5",
+					name: "Opus",
+					api: "openai-responses",
+					contextWindow: 1000,
+					maxTokens: 1000,
+				} as Model;
+				const registry = {
+					getModelProfiles: () => new Map([[profile.name, profile]]),
+					getError: () => undefined,
+					getConfiguredProviderIds: () => [],
+					getApiKeyForProvider: async (id: string) => (id === provider ? apiKey : undefined),
+					getAvailable: () => [proxyModel],
+					getAvailableForProfileActivation: () => [proxyModel],
+					resolveCanonicalModel: () => undefined,
+					getCanonicalVariants: () => [],
+					getCanonicalId: () => undefined,
+				} as unknown as ModelRegistry;
+				const settings = Settings.isolated({
+					"modelProfile.proxyProvider": provider,
+					"modelProfile.proxyMode": proxyMode,
+				});
+				const ctx = {
+					cwd: "/tmp",
+					sdkBindings: () => [],
+					sessionManager: {
+						getSessionId: () => "ocx-availability",
+						getSessionFile: () => "/tmp/ocx-availability.json",
+						getSessionName: () => undefined,
+						getBranch: () => [],
+					},
+					getGoalState: () => undefined,
+					modelRegistry: registry,
+					settings,
+				} as unknown as ExtensionContext;
+				const surface = createSdkSurfaceFactory({ ctx, id: "ocx-availability", api: {} as ExtensionAPI });
+				const profiles = await surface.query.getModelProfiles!();
+				const item = profiles.find(candidate => (candidate as { id: string }).id === profile.name) as
+					| { available: boolean }
+					| undefined;
+				expect(item?.available).toBe(available);
+			});
+		}
+	}
 
 	it("keeps fallback-mode availability when a configured proxy is not authenticated but direct auth works", async () => {
 		const model = (provider: string, id: string): Model =>

@@ -16,6 +16,7 @@ The SDK exposes a generic action/reply protocol without requiring integrations t
 External and managed integrations attach through SDK-core surfaces only:
 
 - lifecycle mutations use `SessionLifecycleService` and the Broker lifecycle ledger;
+- read-only uncertain-create reconciliation uses the public `session.lookup` lifecycle operation with the original request key and target;
 - live session controls use opaque `SessionAttachment` capabilities issued by `SessionRouter`;
 - endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
@@ -348,14 +349,16 @@ a new prompt while the old outcome remains unknown.
 receives `resource_gone`; it must not treat that result as cancellation of another
 prompt.
 
-`sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
+`sdk.promptDeadlineMs` defaults to `3_600_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
 when the prompt is durably accepted as the initial inactivity lease. Fresh
 **attributable** progress for the exact accepted `commandId`/`turnId` — `tool_execution_start` /
-`tool_execution_end` observed at the prompt/agent runtime boundary — renews the deadline to
+`tool_execution_update` / `tool_execution_end` observed at the prompt/agent runtime boundary — renews the deadline to
 `lastProgressAt + sdk.promptDeadlineMs`, bounded by the hard maximum `sdk.promptMaxRuntimeMs`
-(default `21_600_000`, same `60_000–86_400_000` range). Only tool-execution boundaries for the
-accepted turn count; heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
+(default `21_600_000`, same `60_000–86_400_000` range). Only tool-execution events for the
+accepted turn count — including a running tool's partial-result `tool_execution_update`, so a
+long-running tool that streams output (e.g. a multi-minute compile) keeps renewing the lease mid-run;
+heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
 unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
 hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
 wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms

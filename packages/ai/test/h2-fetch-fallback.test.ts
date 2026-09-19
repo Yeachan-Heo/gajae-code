@@ -156,6 +156,66 @@ describe("h2-fetch wrapper (issue #5178)", () => {
 		patched.restore();
 	});
 
+	/**
+	 * Issue #5649: a reset or a close can arrive after the peer already consumed
+	 * the request body, so replaying a non-idempotent method on h1 duplicates the
+	 * side effect. Those two codes must fall back only for replay-safe methods.
+	 */
+	for (const code of ["ConnectionReset", "ConnectionClosed"] as const) {
+		it(`does not replay a POST on h1 after ${code}`, async () => {
+			const transportFailure = Object.assign(new TypeError(`connection ${code}`), { code });
+
+			let processed = 0;
+			const patched = withPatchedFetch((_input, init) => {
+				// Model the peer consuming the body before the connection dies: the
+				// side effect has already landed by the time we see the failure.
+				processed += 1;
+				if ((init as { protocol?: string } | undefined)?.protocol === "http2") {
+					throw transportFailure;
+				}
+				return Promise.resolve(new Response("ok-h1", { status: 200 }));
+			});
+			installH2Fetch();
+
+			let caught: unknown;
+			try {
+				await fetch(BROKER_TOKEN_URL, brokerExchangeInit());
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBe(transportFailure);
+			expect(processed).toBe(1);
+			const h1Attempts = patched.calls.filter(
+				c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+			);
+			expect(h1Attempts).toHaveLength(0);
+			patched.restore();
+		});
+	}
+
+	it("still falls back to h1 for a replay-safe GET after ConnectionReset", async () => {
+		const transportFailure = Object.assign(new TypeError("connection reset"), { code: "ConnectionReset" });
+
+		const patched = withPatchedFetch((_input, init) => {
+			if ((init as { protocol?: string } | undefined)?.protocol === "http2") {
+				throw transportFailure;
+			}
+			return Promise.resolve(new Response("ok-h1", { status: 200 }));
+		});
+		installH2Fetch();
+
+		const response = await fetch(BROKER_TOKEN_URL, { method: "GET" });
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok-h1");
+
+		const h1Attempts = patched.calls.filter(
+			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+		);
+		expect(h1Attempts).toHaveLength(1);
+		patched.restore();
+	});
+
 	it("passes non-https requests through without the h2 hint", async () => {
 		const patched = withPatchedFetch(() => Promise.resolve(new Response("local", { status: 200 })));
 		installH2Fetch();

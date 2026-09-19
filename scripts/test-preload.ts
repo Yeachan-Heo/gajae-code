@@ -1,8 +1,21 @@
+import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
-import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
+import { decideLogDirIsolation } from "./test-log-dir-isolation";
+import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+// Fail fast in a fresh `git worktree add` checkout (issue #5484). Without
+// installed workspace dependencies every test file dies on a bare
+// `Cannot find module '@gajae-code/...'` error that names neither the cause nor
+// the fix. This runs before any test import and before the isolation guards
+// below, because there is nothing to isolate when the suite cannot even start.
+const workspaceDependencies = inspectWorkspaceDependencies({ repoRoot: path.join(import.meta.dir, "..") });
+if (workspaceDependencies.status !== "ready") {
+	throw new Error(formatWorkspaceDependencyFailure(workspaceDependencies));
+}
 
 // macOS `os.tmpdir()` resolves through the `/var -> /private/var` symlink, and the
 // native owner-only primitive plus the session-storage reparse guard intentionally
@@ -33,6 +46,19 @@ try {
 const e2eEnabled = /^(1|true|yes|on)$/i.test(process.env.E2E?.trim() ?? "");
 if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 
+// The checkout's dotenv declarations, resolved ONCE through the same layered
+// snapshot production uses (`.env`, `.env.$NODE_ENV`, `.env.local` — skipped
+// under NODE_ENV=test — and `.env.$NODE_ENV.local`). Both isolation decisions
+// below read it.
+//
+// The agent-dir call site previously had the identical narrowness the log-dir
+// one did (a bespoke `cwd/.env`-only reader), and leaving two different notions
+// of provenance in one preload is the same defect relocated. Widening it can
+// only move cases from `honor` to `isolate`, which is the fail-safe direction,
+// and the repository ships no dotenv files at its root, so no CI or dev-machine
+// behaviour changes.
+const projectEnv = projectEnvSnapshot(process.cwd());
+
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -57,7 +83,7 @@ const isolation = decideAgentDirIsolation({
 		GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
 		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
 	},
-	projectEnv: readProjectEnvFile(process.cwd()),
+	projectEnv: projectEnv.values,
 });
 if (isolation.action === "isolate") {
 	let agentDir: string;
@@ -70,6 +96,53 @@ if (isolation.action === "isolate") {
 	}
 	process.env.GJC_CODING_AGENT_DIR = agentDir;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
+}
+
+// Isolate the log sink for every test process (issue #5618). The agent-dir
+// isolation above does not cover logging: `getLogsDir()` resolves
+// `rootSubdir("logs", "state")` — the REAL config root — so fixtures that drive
+// production code paths append genuine `level:error` records to the operator's
+// shared `~/.gjc/logs/gjc.<date>.log`. In a measured 24h window 90% of the error
+// records in that sink were ACP prompt-watchdog fixture output, which makes the
+// operator's own log useless for diagnosing real failures.
+//
+// Setting this on `process.env` also reaches spawned child fixtures, which is
+// intended: they inherit the same isolated sink.
+//
+// A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
+// on log content), so that is honored untouched — but only when the pin is
+// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
+// `cwd/.env` into `process.env` before any module runs, so a checkout that
+// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
+// happen. The decision (including that distrust rule) lives in
+// ./test-log-dir-isolation.ts so it is unit-testable without importing this
+// preload's side effects.
+//
+// FAIL CLOSED, as with the agent dir: if the temp sink cannot be created — or if
+// the checkout declares GJC_LOG_DIR dynamically, where no pin this preload sets
+// can survive production's provenance check — throw. Continuing would silently
+// run the suite against the operator's live log sink, which is the regression
+// this exists to prevent.
+const logIsolation = decideLogDirIsolation({
+	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
+	projectEnv,
+});
+if (logIsolation.action === "fail") {
+	throw new Error(
+		"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
+			"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
+			"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
+			"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+	);
+}
+if (logIsolation.action === "isolate") {
+	try {
+		process.env.GJC_LOG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-logs-"));
+	} catch (error) {
+		throw new Error(
+			`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
+		);
+	}
 }
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was

@@ -316,6 +316,14 @@ gjc --mpreset opencodego --default
 
 ### Routing built-in presets through a proxy (`modelProfile.proxyProvider`)
 
+For a local OpenCodex pool, set `modelProfile.proxyProvider` to `opencodex` and
+`modelProfile.proxyMode` to `always`. With a persisted `modelProfile.default`, plain
+`gjc` applies that preset through the pool on startup, even when direct Anthropic
+and Codex credentials exist. GJC discovers the local proxy's public `/v1/models`
+catalog automatically; no management token or static `models.yml` roster is needed.
+Model IDs retain their GJC namespace, while preset matching uses the upstream wire
+ID. A missing proxy model still fails activation instead of silently bypassing the pool.
+
 Built-in preset selectors pin a direct provider endpoint (`xai/grok-4.3`, `xiaomi/mimo-v2.5-pro`, …). To serve those models through your own OpenAI-compatible gateway (LiteLLM, OpenRouter, or a custom proxy) instead of each vendor's endpoint, configure the proxy provider id and routing mode in `config.yml`:
 
 ```yaml
@@ -758,6 +766,23 @@ Extensions can register providers at runtime (`pi.registerProvider(...)`), inclu
 - model replacement/append for a provider
 - custom stream handler registration for new API IDs
 - custom OAuth provider registration
+
+### Agent-level providers (ACP)
+
+Some upstreams publish a complete agent instead of a model endpoint. Those are
+integrated as **agent-level providers**: the provider id is selectable like any
+other, but the upstream agent owns model choice, tool execution, conversation
+history, and usage accounting.
+
+`devin` (Devin CLI) is the first one. GJC spawns `devin acp` and speaks the
+Agent Client Protocol over stdio; `devin` models appear through the ordinary
+provider/model selection path once the CLI is installed and authenticated, and
+the provider is credentialless (`getApiKey*` returns `kNoAuth`) because
+authentication belongs to the CLI (`devin auth login`).
+
+See [Devin CLI provider (ACP)](./devin-provider.md) for the full boundary: which
+GJC surfaces apply to a Devin turn, the tool-call permission policy
+(`GJC_DEVIN_PERMISSION_MODE`), and billing.
 
 ## Auth and API key resolution order
 

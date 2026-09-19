@@ -856,44 +856,41 @@ export interface OpenCodeModelManagerConfig {
 }
 
 function openCodeModelManagerOptions(
-	providerId: "opencode-go" | "opencode-zen" | "commandcode-goat",
+	providerId: "opencode-go" | "opencode-zen",
 	defaultBaseUrl: string,
 	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+): ModelManagerOptions<Api> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? defaultBaseUrl;
-	const references =
-		providerId === "opencode-go" ? createBundledReferenceMap<"openai-completions">(providerId) : undefined;
+	const references = createBundledReferenceMap<Api>(providerId);
 	return {
 		providerId,
 		...(apiKey && {
 			fetchDynamicModels: () =>
-				fetchOpenAICompatibleModels({
+				fetchOpenAICompatibleModels<Api>({
 					api: "openai-completions",
 					provider: providerId,
 					baseUrl,
 					apiKey,
-					...(providerId === "opencode-go" && {
-						mapModel: (entry, defaults) => {
-							const reference = references?.get(defaults.id);
-							const model = mapWithBundledReference(entry, defaults, reference);
-							return applyOpenCodeGoOfficialMetadata(model);
-						},
-					}),
+					mapModel: (entry, defaults) => {
+						const model = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+						// Discovery uses /v1/models, but the Anthropic client appends
+						// /v1/messages itself. Preserve the configured origin, not /v1/v1.
+						if (model.api === "anthropic-messages") {
+							model.baseUrl = model.baseUrl.replace(/\/v1\/?$/u, "");
+						}
+						return providerId === "opencode-go" ? applyOpenCodeGoOfficialMetadata(model) : model;
+					},
 				}),
 		}),
 	};
 }
 
-export function opencodeZenModelManagerOptions(
-	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+export function opencodeZenModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
 	return openCodeModelManagerOptions("opencode-zen", "https://opencode.ai/zen/v1", config);
 }
 
-export function opencodeGoModelManagerOptions(
-	config?: OpenCodeModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+export function opencodeGoModelManagerOptions(config?: OpenCodeModelManagerConfig): ModelManagerOptions<Api> {
 	return openCodeModelManagerOptions("opencode-go", "https://opencode.ai/zen/go/v1", config);
 }
 
@@ -2378,7 +2375,9 @@ function createOpenCodeApiResolution(
 }
 
 const OPENCODE_GO_BASE_PATH = "https://opencode.ai/zen/go";
-const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
+const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen", {
+	"union-alpha": "anthropic-messages",
+});
 const OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS = [
 	"deepseek-v4-flash",
 	"deepseek-v4-flash-vision-exp",
@@ -2401,10 +2400,12 @@ const OPENCODE_GO_MESSAGES_MODEL_IDS = [
 	"qwen3.7-max",
 	"qwen3.7-plus",
 	"qwen3.8-flash",
+	"union-alpha",
 ] as const;
 const OPENCODE_GO_API_OVERRIDES: Readonly<Record<string, Api>> = {
 	...Object.fromEntries(OPENCODE_GO_CHAT_COMPLETIONS_MODEL_IDS.map(id => [id, "openai-completions"])),
 	...Object.fromEntries(OPENCODE_GO_MESSAGES_MODEL_IDS.map(id => [id, "anthropic-messages"])),
+	"muse-spark-1.3-contributor": "openai-responses",
 } as Record<string, Api>;
 // OpenCode Go has a provider-specific endpoint table at
 // https://opencode.ai/docs/go/#endpoints. Keep routing aligned with that table:
@@ -2657,6 +2658,14 @@ interface OpenCodeGoOfficialModelMetadata {
 }
 
 const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialModelMetadata>> = {
+	"union-alpha": {
+		name: "Union Alpha Free",
+		contextWindow: 262_144,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	},
 	"deepseek-v4-flash": {
 		name: "DeepSeek V4 Flash",
 		contextWindow: 1_000_000,
@@ -2867,6 +2876,19 @@ const OPENCODE_GO_OFFICIAL_MODELS: Readonly<Record<string, OpenCodeGoOfficialMod
 	},
 	"muse-spark-1.2-contributor": {
 		name: "Muse Spark 1.2 Contributor",
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		input: ["text", "image"],
+		reasoning: true,
+		cost: { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	},
+	// Provisional models.dev contract, not a published Meta 1.3 specification:
+	// providers/opencode-go/models/muse-spark-1.3-contributor.toml
+	// blob df9405a4823feeaa5705558807515bdd2d930da2 explicitly inherits 1.2 capabilities.
+	// Its minimal..xhigh efforts match existing Responses inference. Advertise
+	// only GJC's supported text/image inputs; pricing is from opencode.ai/docs/go.
+	"muse-spark-1.3-contributor": {
+		name: "Muse Spark 1.3 Contributor",
 		contextWindow: 1_048_576,
 		maxTokens: 131_072,
 		input: ["text", "image"],

@@ -153,8 +153,16 @@ export class IsolatedShell {
 			}
 			this.#pending.set(id, pending);
 			const { signal: _signal, ...workerOptions } = options;
+			try {
+				this.#send({ type: "run", token: this.#protocolToken, id, options: workerOptions });
+			} catch (error) {
+				// A failed send has no protocol response owner. Do not leave its
+				// unobserved deferred for close() to reject later.
+				this.#pending.delete(id);
+				pending.removeAbortListener?.();
+				throw error;
+			}
 			if (options.signal instanceof AbortSignal) this.#dispatchedRunSignals.add(options.signal);
-			this.#send({ type: "run", token: this.#protocolToken, id, options: workerOptions });
 			return await deferred.promise;
 		} finally {
 			if (options.signal instanceof AbortSignal) this.#activeRunSignals.delete(options.signal);
@@ -193,7 +201,12 @@ export class IsolatedShell {
 		const id = this.#nextId++;
 		const deferred = Promise.withResolvers<void>();
 		this.#pending.set(id, { kind: "void", resolve: deferred.resolve, reject: deferred.reject });
-		this.#send({ type, token: this.#protocolToken, id });
+		try {
+			this.#send({ type, token: this.#protocolToken, id });
+		} catch (error) {
+			this.#pending.delete(id);
+			throw error;
+		}
 		await deferred.promise;
 	}
 

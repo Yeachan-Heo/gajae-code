@@ -1182,6 +1182,28 @@ function raceUsageWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undef
 	});
 }
 
+/**
+ * Distinguish an internal deadline from a caller-owned cancellation.
+ *
+ * `AbortSignal.timeout(...)` (and `AbortSignal.any([...])` when the timeout leg
+ * fires) aborts with a `TimeoutError` reason, whereas a caller's
+ * `AbortController.abort()` surfaces an `AbortError` (or a custom reason). The
+ * probe callers (`#checkCredentialHealth`, `#fetchUsageUncached`) pass a
+ * timeout-derived signal: a refresh cut short by that internal deadline is a
+ * genuine failure — the rotating refresh token may already have been consumed
+ * upstream — and MUST update the replay guard. Only a true caller cancellation
+ * may skip the guard update.
+ */
+function isTimeoutAbort(signal: AbortSignal): boolean {
+	const reason: unknown = signal.reason;
+	return (
+		typeof reason === "object" &&
+		reason !== null &&
+		"name" in reason &&
+		(reason as { name?: unknown }).name === "TimeoutError"
+	);
+}
+
 function raceCredentialRefreshWithSignal<T>(
 	promise: Promise<T>,
 	signal: AbortSignal | undefined,
@@ -1197,6 +1219,17 @@ function raceCredentialRefreshWithSignal<T>(
 	});
 }
 
+function oauthNonTokenFieldsEqual(left: OAuthCredential, right: OAuthCredential): boolean {
+	return (
+		left.accountId === right.accountId &&
+		left.email === right.email &&
+		left.projectId === right.projectId &&
+		left.enterpriseUrl === right.enterpriseUrl &&
+		left.mcpBinding?.resourceOrigin === right.mcpBinding?.resourceOrigin &&
+		left.mcpBinding?.tokenEndpoint === right.mcpBinding?.tokenEndpoint
+	);
+}
+
 function authCredentialEquals(left: AuthCredential, right: AuthCredential): boolean {
 	if (left.type !== right.type) return false;
 	if (left.type === "api_key") {
@@ -1207,13 +1240,58 @@ function authCredentialEquals(left: AuthCredential, right: AuthCredential): bool
 		left.access === right.access &&
 		left.refresh === right.refresh &&
 		left.expires === right.expires &&
-		left.accountId === right.accountId &&
-		left.email === right.email &&
-		left.projectId === right.projectId &&
-		left.enterpriseUrl === right.enterpriseUrl &&
-		left.mcpBinding?.resourceOrigin === right.mcpBinding?.resourceOrigin &&
-		left.mcpBinding?.tokenEndpoint === right.mcpBinding?.tokenEndpoint
+		oauthNonTokenFieldsEqual(left, right)
 	);
+}
+
+function parseStructuredOAuthKey(apiKey: string): { token: string; projectId?: string } | undefined {
+	if (!apiKey.startsWith("{")) return undefined;
+	try {
+		const parsed = JSON.parse(apiKey) as { token?: unknown; projectId?: unknown };
+		if (typeof parsed.token !== "string") return undefined;
+		return { token: parsed.token, projectId: typeof parsed.projectId === "string" ? parsed.projectId : undefined };
+	} catch {
+		return undefined;
+	}
+}
+
+// Identity keys decode token claims and evidence is computed on hot catalog paths. Key the memo by every
+// field that can feed the identity so an in-place credential mutation can never reuse a stale result.
+const OAUTH_IDENTITY_MEMO_LIMIT = 256;
+const oauthIdentityMemo = new Map<string, string | null>();
+
+function resolveMemoizedOAuthIdentityKey(provider: string, credential: OAuthCredential): string | null {
+	const memoKey = [
+		provider,
+		credential.accountId ?? "",
+		credential.email ?? "",
+		credential.projectId ?? "",
+		credential.enterpriseUrl ?? "",
+		credential.access,
+		credential.refresh,
+	].join("\u0000");
+	const cached = oauthIdentityMemo.get(memoKey);
+	if (cached !== undefined) return cached;
+	const identityKey = resolveCredentialIdentityKey(provider, credential);
+	if (oauthIdentityMemo.size >= OAUTH_IDENTITY_MEMO_LIMIT) oauthIdentityMemo.clear();
+	oauthIdentityMemo.set(memoKey, identityKey);
+	return identityKey;
+}
+
+function isOAuthTokenRotationOnly(provider: string, left: StoredCredential[], right: StoredCredential[]): boolean {
+	if (left.length !== right.length || left.length === 0) return false;
+	for (let index = 0; index < left.length; index += 1) {
+		const leftEntry = left[index];
+		const rightEntry = right[index];
+		if (!leftEntry || !rightEntry || leftEntry.id !== rightEntry.id) return false;
+		if (authCredentialEquals(leftEntry.credential, rightEntry.credential)) continue;
+		const previous = leftEntry.credential;
+		const next = rightEntry.credential;
+		if (previous.type !== "oauth" || next.type !== "oauth" || !oauthNonTokenFieldsEqual(previous, next)) return false;
+		const identityKey = resolveMemoizedOAuthIdentityKey(provider, previous);
+		if (!identityKey || identityKey !== resolveMemoizedOAuthIdentityKey(provider, next)) return false;
+	}
+	return true;
 }
 
 function storedCredentialArraysEqual(left: StoredCredential[], right: StoredCredential[]): boolean {
@@ -1355,6 +1433,8 @@ export class AuthStorage {
 	#providerGenerations = new Map<string, number>();
 	#providerConfigurationGenerations = new Map<string, number>();
 	#providerOAuthRefreshGenerations = new Map<string, number>();
+	/** Recent access tokens replaced by same-account rotation, keyed by storage provider and row id. */
+	#rotatedOAuthAccessTokens = new Map<string, string[]>();
 	#generationListeners: Set<(generation: number) => void> = new Set();
 	#oauthRefreshInFlight: Map<number, Promise<AuthCredentialSnapshotEntry>> = new Map();
 	#oauthCredentialRefreshInFlight: Map<number, Promise<RefreshedOAuthCredentials>> = new Map();
@@ -1495,9 +1575,10 @@ export class AuthStorage {
 				.update(`${this.#getProviderGeneration(storageProvider)}\u0000unavailable-selector`)
 				.digest("hex");
 		}
-		const credentials = selectedCredential
-			? [selectedCredential.credential]
-			: this.#getCredentialsForProvider(provider);
+		const storedEntries: StoredCredential[] = selectedCredential
+			? [selectedCredential]
+			: this.#getStoredCredentials(provider);
+		const credentials = storedEntries.map(entry => entry.credential);
 		const hasApiKey = credentials.some(credential => credential.type === "api_key");
 		const hasUsableOAuth = credentials.some(
 			credential =>
@@ -1520,14 +1601,60 @@ export class AuthStorage {
 				}`;
 			})
 			.join("\u0001");
-		const storedOAuthFingerprint = credentials
-			.filter((credential): credential is Extract<AuthCredential, { type: "oauth" }> => credential.type === "oauth")
-			.map(credential => `${credential.expires}\u0000${credential.expires > Date.now() ? "usable" : "expired"}`)
+		// Account-backed OAuth rows fingerprint by row, identity, request metadata, and usability rather than token
+		// expiry, so a refresh keeps discovery evidence valid. Rows without a resolvable identity keep the expiry
+		// fingerprint.
+		const now = Date.now();
+		const oauthIdentityKeys = storedEntries.map(entry =>
+			entry.credential.type === "oauth" ? resolveMemoizedOAuthIdentityKey(storageProvider, entry.credential) : null,
+		);
+		const storedOAuthFingerprint = storedEntries
+			.map((entry, index) => {
+				const credential = entry.credential;
+				if (credential.type !== "oauth") return undefined;
+				const usability = credential.expires > now ? "usable" : "expired";
+				const identityKey = oauthIdentityKeys[index];
+				if (!identityKey) return `${credential.expires}\u0000${usability}`;
+				return [
+					entry.id,
+					identityKey,
+					usability,
+					credential.projectId ?? "",
+					credential.enterpriseUrl ?? "",
+					credential.mcpBinding?.resourceOrigin ?? "",
+					credential.mcpBinding?.tokenEndpoint ?? "",
+				].join("\u0000");
+			})
+			.filter(fingerprint => fingerprint !== undefined)
 			.join("\u0001");
+		// A key resolved from an account-backed OAuth row is covered by that row's fingerprint. Hashing the raw
+		// token, or a structured key carrying it, would make every refresh look like a different credential.
+		const identityBackedEntries = storedEntries.filter((_, index) => oauthIdentityKeys[index]);
+		let oauthKeyEntry: StoredCredential | undefined;
+		if (evidenceApiKey !== undefined && identityBackedEntries.length > 0) {
+			const structuredKey = parseStructuredOAuthKey(evidenceApiKey);
+			const keyToken = structuredKey ? structuredKey.token : evidenceApiKey;
+			// Callers may still hold the key they resolved before the row rotated, so the row's recently rotated
+			// tokens map to it as well. A structured key for another project stays distinct.
+			const matchesRow = (entry: StoredCredential, tokens: readonly string[] | undefined): boolean => {
+				const credential = entry.credential;
+				if (credential.type !== "oauth" || keyToken.length === 0 || !tokens?.includes(keyToken)) return false;
+				return structuredKey?.projectId === undefined || structuredKey.projectId === credential.projectId;
+			};
+			// Current tokens win over rotated ones so a row's old token can never shadow another row's live token.
+			oauthKeyEntry =
+				identityBackedEntries.find(
+					entry => entry.credential.type === "oauth" && matchesRow(entry, [entry.credential.access]),
+				) ??
+				identityBackedEntries.find(entry =>
+					matchesRow(entry, this.#rotatedOAuthAccessTokens.get(`${storageProvider}\u0000${entry.id}`)),
+				);
+		}
+		const evidenceKeyFingerprint = oauthKeyEntry ? `oauth-row:${oauthKeyEntry.id}` : (evidenceApiKey ?? "");
 		return crypto
 			.createHash("sha256")
 			.update(
-				`${this.#getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceApiKey ?? ""}`,
+				`${this.#getProviderGeneration(storageProvider)}\u0000${effectiveEnvKey ?? ""}\u0000${storedApiKeyFingerprint}\u0000${storedOAuthFingerprint}\u0000${evidenceKeyFingerprint}`,
 			)
 			.digest("hex");
 	}
@@ -2277,15 +2404,45 @@ export class AuthStorage {
 				(entry, index) =>
 					entry.id !== credentials[index]?.id || entry.credential.type !== credentials[index]?.credential.type,
 			);
-		this.#resolvedStoredApiKeyValues.delete(provider);
-		this.#storedApiKeyResolutionInFlight.delete(provider);
+		// Refreshing tokens for the same OAuth account is not a configuration change: keep the provider's
+		// evidence and configuration generations so catalogs discovered for that account stay current.
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const tokenRotationOnly =
+			!identityOrderChanged && isOAuthTokenRotationOnly(storageProvider, current, credentials);
+		if (tokenRotationOnly) {
+			this.#rememberRotatedAccessTokens(storageProvider, current, credentials);
+		} else {
+			this.#forgetRotatedAccessTokens(storageProvider);
+			this.#resolvedStoredApiKeyValues.delete(provider);
+			this.#storedApiKeyResolutionInFlight.delete(provider);
+		}
 		if (credentials.length === 0) {
 			this.#data.delete(provider);
 		} else {
 			this.#data.set(provider, credentials);
 		}
-		if (identityOrderChanged) this.#resetProviderAssignments(resolveOAuthStorageProvider(provider));
-		this.#bumpGeneration("credentials", provider);
+		if (identityOrderChanged) this.#resetProviderAssignments(storageProvider);
+		if (tokenRotationOnly) this.#bumpGeneration("oauth-token-rotation");
+		else this.#bumpGeneration("credentials", provider);
+	}
+
+	#rememberRotatedAccessTokens(storageProvider: string, previous: StoredCredential[], next: StoredCredential[]): void {
+		for (let index = 0; index < previous.length; index += 1) {
+			const before = previous[index];
+			const after = next[index];
+			if (before?.credential.type !== "oauth" || after?.credential.type !== "oauth") continue;
+			if (!before.credential.access || before.credential.access === after.credential.access) continue;
+			const key = `${storageProvider}\u0000${before.id}`;
+			const history = [before.credential.access, ...(this.#rotatedOAuthAccessTokens.get(key) ?? [])].slice(0, 4);
+			this.#rotatedOAuthAccessTokens.set(key, history);
+		}
+	}
+
+	#forgetRotatedAccessTokens(storageProvider: string): void {
+		const prefix = `${storageProvider}\u0000`;
+		for (const key of [...this.#rotatedOAuthAccessTokens.keys()]) {
+			if (key.startsWith(prefix)) this.#rotatedOAuthAccessTokens.delete(key);
+		}
 	}
 
 	#resolveOAuthDedupeIdentityKey(provider: string, credential: OAuthCredential): string | null {
@@ -2692,10 +2849,15 @@ export class AuthStorage {
 		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
+		const configurationGeneration = this.#getProviderConfigurationGeneration(provider);
 		this.#setStoredCredentials(provider, updated);
+		// Callers use the refresh generation to discount configuration bumps caused by a refresh, so it only
+		// advances when this refresh bumped configuration; token rotation for a known account does not.
 		if (
+			configurationGeneration !== this.#getProviderConfigurationGeneration(provider) &&
 			credential.type === "oauth" &&
 			target.credential.type === "oauth" &&
+			oauthNonTokenFieldsEqual(credential, target.credential) &&
 			(credential.access !== target.credential.access ||
 				credential.refresh !== target.credential.refresh ||
 				credential.expires !== target.credential.expires)
@@ -4565,45 +4727,51 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Marks the current session's credential as temporarily blocked due to usage limits.
-	 * Uses usage reports to determine accurate reset time when available.
-	 * Returns true if a credential was blocked, enabling automatic fallback to the next credential.
+	 * Marks the explicit stored row, or the session row captured at entry, as usage-limited.
+	 * Re-finds that same row after the usage lookup; a vanished row marks nothing.
+	 * Returns whether another credential of the same type remains unblocked.
 	 */
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object },
+		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
 	): Promise<boolean> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
 		if (ownerOverride && !ownerOverride.envSourced) return false;
+		const entries = this.#getStoredCredentials(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
-		if (!sessionCredential) return false;
-
-		const providerKey = this.#getProviderTypeKey(provider, sessionCredential.type);
+		const initial =
+			options?.rowId !== undefined
+				? entries.find(entry => entry.id === options.rowId)
+				: sessionCredential
+					? entries[sessionCredential.index]
+					: undefined;
+		if (!initial) return false;
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
-		if (sessionCredential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
-			const credential = this.#getCredentialsForProvider(provider)[sessionCredential.index];
-			if (credential?.type === "oauth") {
-				const report = await this.#getUsageReport(provider, credential, options);
-				if (report && this.#isUsageLimitReached(report)) {
-					const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
-					if (resetAtMs && resetAtMs > blockedUntil) {
-						blockedUntil = resetAtMs;
-					}
-				}
+		if (initial.credential.type === "oauth" && this.#rankingStrategyResolver?.(provider)) {
+			const report = await this.#getUsageReport(provider, initial.credential, options);
+			if (report && this.#isUsageLimitReached(report)) {
+				const resetAtMs = this.#getUsageResetAtMs(report, Date.now());
+				if (resetAtMs && resetAtMs > blockedUntil) blockedUntil = resetAtMs;
 			}
 		}
 
-		this.#markCredentialBlocked(providerKey, sessionCredential.index, blockedUntil);
+		// Never consult the possibly reassigned sticky pointer after the await.
+		const current = this.#getStoredCredentials(provider);
+		const targetIndex = current.findIndex(entry => entry.id === initial.id);
+		const target = current[targetIndex];
+		if (!target) return false;
+		const providerKey = this.#getProviderTypeKey(provider, target.credential.type);
+		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
 
 		const remainingCredentials = this.#getCredentialsForProvider(provider)
 			.map((credential, index) => ({ credential, index }))
 			.filter(
 				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === sessionCredential.type && entry.index !== sessionCredential.index,
+					entry.credential.type === target.credential.type && entry.index !== targetIndex,
 			);
 
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
@@ -5249,6 +5417,18 @@ export class AuthStorage {
 			}
 			return authority;
 		} catch (error) {
+			// A genuine caller cancellation (e.g. the agent's ESC) is not a refresh
+			// failure. Rethrow before any failure classification so it never poisons
+			// the replay guard (which would temp-block the credential on the next
+			// request) or otherwise mutate its health state. But an INTERNAL deadline
+			// is a real failure: an `AbortSignal.timeout(...)` from an internal probe
+			// (`#checkCredentialHealth` / `#fetchUsageUncached`) may have cut short a
+			// dial that already consumed the rotating refresh token upstream, so its
+			// failure must still be memoized — otherwise the same (credential, token)
+			// pair is immediately eligible for a second refresh, replaying the token
+			// and tripping provider reuse detection. Skip the guard update only for a
+			// caller-owned abort, never for an internal timeout.
+			if (signal?.aborted && !isTimeoutAbort(signal)) throw error;
 			if (localDial && credentialId !== undefined) {
 				for (const [key, entry] of this.#recentOAuthRefreshFailures) {
 					if (entry.expiresAt <= Date.now()) this.#recentOAuthRefreshFailures.delete(key);
@@ -5440,6 +5620,7 @@ export class AuthStorage {
 			this.#recordSessionCredential(provider, sessionId, "oauth", selection.index);
 			return { apiKey: result.apiKey, credential: updated };
 		} catch (error) {
+			if (options?.signal?.aborted) throw error;
 			if (isSqliteError(error)) throw error;
 			// Auth-broker errors retain the sanitized upstream body separately from
 			// their transport message. Include that body for failure classification

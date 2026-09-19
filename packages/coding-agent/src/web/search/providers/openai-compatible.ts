@@ -1,3 +1,4 @@
+import { readSseEvents } from "@gajae-code/utils";
 import type { ActiveSearchModelCredentials, SearchCitation, SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../types";
 import type { SearchParams } from "./base";
@@ -50,14 +51,173 @@ function normalizeResponseBody(value: unknown): JsonObject {
 	return { ...value, output, choices };
 }
 
-function parseResponseBody(text: string): JsonObject {
+function parseJsonObject(text: string): JsonObject {
 	let value: unknown;
 	try {
 		value = text ? JSON.parse(text) : {};
 	} catch {
 		throw new SearchProviderError("openai-compatible", "OpenAI-compatible web search returned invalid JSON", 502);
 	}
-	return normalizeResponseBody(value);
+	if (!isJsonObject(value)) malformedResponse("expected a JSON object");
+	return value;
+}
+
+function validateJsonSuccess(value: JsonObject, chat: boolean): JsonObject {
+	const json = normalizeResponseBody(value);
+	if (json.error != null) malformedResponse("unsuccessful response");
+	if (chat) {
+		const firstChoice = optionalArray(json.choices, "choices must be an array").find(
+			(choice, index) => isJsonObject(choice) && (choice.index === 0 || (choice.index === undefined && index === 0)),
+		);
+		if (
+			isJsonObject(firstChoice) &&
+			firstChoice.finish_reason !== undefined &&
+			firstChoice.finish_reason !== "stop"
+		) {
+			malformedResponse("unsuccessful choice completion");
+		}
+		return json;
+	}
+	if ((json.status !== undefined && json.status !== "completed") || json.incomplete_details != null) {
+		malformedResponse("unsuccessful response");
+	}
+	for (const item of optionalArray(json.output, "output must be an array")) {
+		if (isJsonObject(item) && item.status !== undefined && item.status !== "completed") {
+			malformedResponse("unsuccessful output item");
+		}
+	}
+	return json;
+}
+
+function failedStreamEvent(type: unknown): boolean {
+	return type === "error" || type === "response.failed" || type === "response.incomplete";
+}
+
+async function readStreamBody(response: Response, chat: boolean, signal: AbortSignal): Promise<JsonObject> {
+	if (!response.body) malformedResponse("missing event stream");
+	const outputItems = new Map<number, JsonObject>();
+	const chunks: string[] = [];
+	const annotations: unknown[] = [];
+	let id: string | undefined;
+	let toolUsage: unknown;
+	let completed = false;
+	try {
+		for await (const event of readSseEvents(response.body, signal)) {
+			signal.throwIfAborted();
+			if (failedStreamEvent(event.event)) malformedResponse("unsuccessful stream event");
+			if (event.data === "[DONE]") break;
+			if (!event.data) continue;
+			const json = parseJsonObject(event.data);
+			if (failedStreamEvent(json.type) || json.error != null) malformedResponse("unsuccessful stream event");
+			if (!chat) {
+				const type = json.type ?? event.event;
+				if (type === "response.output_item.done") {
+					const index = json.output_index;
+					const item = json.item;
+					if (
+						typeof index !== "number" ||
+						!Number.isInteger(index) ||
+						index < 0 ||
+						!isJsonObject(item) ||
+						typeof item.type !== "string"
+					) {
+						malformedResponse("invalid completed output item");
+					}
+					if (
+						(item.status !== undefined && item.status !== "completed") ||
+						((item.type === "message" || item.type === "web_search_call") && item.status !== "completed")
+					) {
+						malformedResponse("unsuccessful output item");
+					}
+					normalizeResponseBody({ output: [item] });
+					outputItems.set(index, item);
+					continue;
+				}
+				if (type !== "response.completed" && type !== "response.done") continue;
+				const snapshot = json.response;
+				if (
+					!isJsonObject(snapshot) ||
+					snapshot.status !== "completed" ||
+					snapshot.error != null ||
+					snapshot.incomplete_details != null
+				) {
+					malformedResponse("missing successful response snapshot");
+				}
+				// Nonempty terminal output is canonical. Streaming gateways can omit
+				// it after sending completed items; reconstruct only that sparse case,
+				// never from token deltas or before a successful response terminal.
+				const output = optionalArray(snapshot.output, "output must be an array");
+				for (const item of output) {
+					if (isJsonObject(item) && item.status !== undefined && item.status !== "completed") {
+						malformedResponse("unsuccessful output item");
+					}
+				}
+				return normalizeResponseBody({
+					...snapshot,
+					output: output.length > 0 ? output : [...outputItems].sort(([a], [b]) => a - b).map(([, item]) => item),
+				});
+			}
+			if (typeof json.id === "string") id = json.id;
+			if (webSearchPerformed({ tool_usage: json.tool_usage })) toolUsage = json.tool_usage;
+			const choice = optionalArray(json.choices, "choices must be an array").find(
+				(value, index) => isJsonObject(value) && (value.index === 0 || (value.index === undefined && index === 0)),
+			);
+			if (!isJsonObject(choice)) continue;
+			if (choice.delta !== undefined && !isJsonObject(choice.delta)) malformedResponse("invalid choice delta");
+			const delta = isJsonObject(choice.delta) ? choice.delta : undefined;
+			if (delta?.content != null) {
+				if (typeof delta.content !== "string") malformedResponse("invalid choice content");
+				if (completed && delta.content) malformedResponse("content after completion");
+				chunks.push(delta.content);
+			}
+			for (const annotation of optionalArray(delta?.annotations, "choice annotations must be an array")) {
+				annotations.push(annotation);
+			}
+			if (choice.finish_reason != null) {
+				if (choice.finish_reason !== "stop") malformedResponse("unsuccessful choice completion");
+				completed = true;
+			}
+		}
+		// readSseEvents intentionally swallows aborts. Never turn one into an
+		// EOF error, or return a partial answer after a successful choice chunk.
+		signal.throwIfAborted();
+		if (!chat || !completed) malformedResponse("stream ended before successful completion");
+		// Usage-only chunks may follow finish_reason, so consume through DONE/EOF.
+		return { id, tool_usage: toolUsage, choices: [{ message: { content: chunks.join(""), annotations } }] };
+	} catch (error) {
+		signal.throwIfAborted();
+		if (
+			error instanceof SearchProviderError ||
+			(error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"))
+		) {
+			throw error;
+		}
+		malformedResponse("invalid event stream");
+	}
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+	// readSseEvents cancels its iterator on early return/error, propagating
+	// cancellation through its abortable pipe. Cancel bodies not owned by it too.
+	if (!response.body || response.body.locked) return;
+	try {
+		await response.body.cancel();
+	} catch {
+		// Cleanup must not replace the provider error or caller's abort reason.
+	}
+}
+
+async function readResponseText(response: Response, signal: AbortSignal): Promise<string> {
+	try {
+		signal.throwIfAborted();
+		const body = response.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal });
+		const text = await (body ? new Response(body).text() : response.text());
+		signal.throwIfAborted();
+		return text;
+	} catch (error) {
+		signal.throwIfAborted();
+		throw error;
+	}
 }
 
 /**
@@ -184,6 +344,7 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 		];
 		const responsesBody = {
 			model,
+			stream: true,
 			input: messages,
 			tools: [{ type: "web_search" }],
 			temperature: params.temperature,
@@ -191,18 +352,20 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 		};
 		const chatBody = {
 			model,
+			stream: true,
 			messages,
 			web_search_options: {},
 			temperature: params.temperature,
 			max_tokens: params.maxOutputTokens,
 		};
 
+		const signal = withHardTimeout(params.signal, "llm");
 		const post = (api: "openai-responses" | "openai-completions", payload: unknown) =>
 			fetch(endpoint(baseUrl, api), {
 				method: "POST",
 				headers,
 				body: JSON.stringify(payload),
-				signal: withHardTimeout(params.signal, "llm"),
+				signal,
 			});
 
 		// Web search is a Responses-API capability: many OpenAI-compatible
@@ -211,20 +374,34 @@ export class OpenAICompatibleSearchProvider extends SearchProvider {
 		// stale knowledge. Prefer `/responses` regardless of the model's chat wire,
 		// and fall back to `/chat/completions` only when `/responses` is absent.
 		let response = await post("openai-responses", responsesBody);
-		if (response.status === 404 || response.status === 405) {
+		const chat = response.status === 404 || response.status === 405;
+		if (chat) {
+			await cancelResponseBody(response);
+			signal.throwIfAborted();
 			response = await post("openai-completions", chatBody);
 		}
-		const text = await response.text();
-		if (!response.ok) {
-			const classified = classifyProviderHttpError(this.id, response.status, text);
-			if (classified) throw classified;
-			throw new SearchProviderError(
-				this.id,
-				`OpenAI-compatible web search error (${response.status}): ${text}`,
-				response.status,
-			);
+		let json: JsonObject;
+		try {
+			signal.throwIfAborted();
+			if (!response.ok) {
+				const text = await readResponseText(response, signal);
+				const classified = classifyProviderHttpError(this.id, response.status, text);
+				if (classified) throw classified;
+				throw new SearchProviderError(
+					this.id,
+					`OpenAI-compatible web search error (${response.status}): ${text}`,
+					response.status,
+				);
+			}
+			const streaming =
+				response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === "text/event-stream";
+			json = streaming
+				? await readStreamBody(response, chat, signal)
+				: validateJsonSuccess(parseJsonObject(await readResponseText(response, signal)), chat);
+			signal.throwIfAborted();
+		} finally {
+			await cancelResponseBody(response);
 		}
-		const json = parseResponseBody(text);
 		const citations = parseCitations(json);
 		const answer = textFromResponse(json);
 		const limit = params.limit ?? params.numSearchResults ?? 10;

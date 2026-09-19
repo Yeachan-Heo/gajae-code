@@ -50,6 +50,8 @@ import {
 	isOpenAIResponsesProgressEvent,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
+	responsesStreamFailureCode,
+	unexpectedResponsesStreamEndError,
 } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 
@@ -177,7 +179,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(
+			const sawTerminalEvent = await processResponsesStream(
 				iterateWithIdleTimeout(openaiStream, {
 					firstItemTimeoutMs: firstEventTimeoutMs,
 					firstItemErrorMessage: AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
@@ -210,6 +212,11 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				throw new Error(output.errorMessage ?? "An unknown error occurred");
 			}
 
+			// The Responses SSE contract always ends with a terminal event. A stream
+			// that closes without one is an interrupted upstream, not a completed
+			// turn, and must not surface as a content-free success.
+			if (!sawTerminalEvent) throw unexpectedResponsesStreamEndError();
+
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -224,6 +231,8 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(firstEventTimeoutError ?? normalizedError);
 			output.transportFailure = transportFailureFacts(firstEventTimeoutError ?? normalizedError);
+			const streamFailureCode = responsesStreamFailureCode(firstEventTimeoutError ?? normalizedError);
+			if (streamFailureCode !== undefined) output.errorCode = streamFailureCode;
 			output.errorMessage =
 				firstEventTimeoutError?.message ?? (await finalizeErrorMessage(normalizedError, rawRequestDump));
 			output.duration = Date.now() - startTime;

@@ -1,6 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, Container, Editor, Text, TUI } from "@gajae-code/tui";
-import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
+import { Loader } from "@gajae-code/tui/components/loader";
+import {
+	encodeKittyPlacement,
+	encodeKittyPlacementDelete,
+	ImageProtocol,
+	setTerminalImageProtocol,
+	TERMINAL,
+} from "@gajae-code/tui/terminal-capabilities";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { defaultEditorTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -33,19 +40,34 @@ function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
 
+const RENDER_ENV_KEYS = [
+	"PI_DEBUG_REDRAW",
+	"TMUX",
+	"TMUX_PANE",
+	"STY",
+	"ZELLIJ",
+	"GJC_TMUX_LAUNCHED",
+	"PI_TUI_LEGACY_MULTIPLEXER_FULL_RENDER",
+	"TERM",
+	"TERM_PROGRAM",
+	"WT_SESSION",
+	"PI_TUI_VIRTUAL_VIEWPORT",
+	"GJC_TUI_IME_CURSOR",
+] as const;
+
 describe("TUI render helper counters", () => {
-	let previousDebugRedraw: string | undefined;
+	const previousEnv = new Map<string, string | undefined>();
 	let monotonicNow = 0;
-	const previousEnvironment = new Map<string, string | undefined>();
 	const behaviorTraces: Array<{ scenario: string; frames: unknown[] }> = [];
 
 	beforeEach(() => {
-		previousDebugRedraw = Bun.env.PI_DEBUG_REDRAW;
-		delete Bun.env.PI_DEBUG_REDRAW;
-		for (const key of ["TMUX", "STY", "WT_SESSION", "PI_TUI_VIRTUAL_VIEWPORT", "GJC_TUI_IME_CURSOR"]) {
-			previousEnvironment.set(key, Bun.env[key]);
+		// VirtualTerminal's process-terminal flag does not override host detection.
+		// Start each case on a plain host even when the test runner is inside tmux.
+		for (const key of RENDER_ENV_KEYS) {
+			previousEnv.set(key, Bun.env[key]);
 			delete Bun.env[key];
 		}
+		Bun.env.TERM = "xterm-256color";
 		Bun.env.GJC_TUI_IME_CURSOR = "0";
 		monotonicNow = 0;
 		TUI.resetRenderCountersForTest();
@@ -58,16 +80,11 @@ describe("TUI render helper counters", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		TUI.resetRenderCountersForTest();
-		for (const [key, value] of previousEnvironment) {
+		for (const [key, value] of previousEnv) {
 			if (value === undefined) delete Bun.env[key];
 			else Bun.env[key] = value;
 		}
-		previousEnvironment.clear();
-		if (previousDebugRedraw === undefined) {
-			delete Bun.env.PI_DEBUG_REDRAW;
-		} else {
-			Bun.env.PI_DEBUG_REDRAW = previousDebugRedraw;
-		}
+		previousEnv.clear();
 	});
 
 	afterAll(async () => {
@@ -143,6 +160,66 @@ describe("TUI render helper counters", () => {
 			expect(TUI.getRenderCountersForTest().differentialGuardVisibleWidthCalls).toBe(0);
 		} finally {
 			tui.stop();
+		}
+	});
+
+	it.each(["process terminal", "tmux"])("preserves wrapped CJK viewport and settled scrollback on %s", async host => {
+		if (host === "tmux") Bun.env.TMUX = "/tmp/gjc-render-helper-tmux";
+		const term = new VirtualTerminal(100, 12, { isProcessTerminal: host === "process terminal" });
+		const tui = new TUI(term, false, { widthSettleMs: 100 });
+		const prefixes = Array.from({ length: 24 }, (_, i) => `M${String(i).padStart(2, "0")}:`);
+		for (const prefix of prefixes) tui.addChild(new Text(`\x1b[36m${prefix}${"漢".repeat(30)}\x1b[0m`, 0, 0));
+		const wrapped = prefixes.flatMap(prefix => [prefix + "漢".repeat(18), "漢".repeat(12)]);
+		const settledCommit = Promise.withResolvers<boolean>();
+		const requestRender = tui.requestRenderWithGeneration.bind(tui);
+		vi.spyOn(tui, "requestRenderWithGeneration").mockImplementation((force, source) => {
+			const generation = requestRender(force, source);
+			if (source === "resize.width-settled") {
+				void tui.waitForRenderCommit(generation, 1_000).then(settledCommit.resolve);
+			}
+			return generation;
+		});
+		const settleTimeout = setTimeout(() => settledCommit.resolve(false), 1_000);
+		try {
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(Boolean),
+			).toEqual(prefixes.map(prefix => prefix + "漢".repeat(30)));
+			TUI.resetRenderCountersForTest();
+			term.clearWriteLog();
+			term.resize(40, 12);
+			await committedFrame(tui, term, "resize");
+			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+			expect(TUI.getRenderCountersForTest().widthReflowScanRows).toBe(0);
+			expect(visible(term).filter(Boolean)).toEqual(wrapped.slice(-12));
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			// Immediate viewport repaint retains durable history. The scheduled
+			// repair must still replay every newly wrapped row once the width settles.
+			const redraws = tui.fullRedraws;
+			// An unrelated request can consume the next generation (and may coalesce
+			// with repair). Wait for the actual settle request, not generation + 1.
+			tui.requestRenderWithGeneration(false, "intermediate-layout");
+			expect(await settledCommit.promise).toBe(true);
+			await term.flush();
+			expect(tui.fullRedraws).toBe(redraws + 1);
+			expect(
+				term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(Boolean),
+			).toEqual(wrapped);
+			expect(visible(term).filter(Boolean)).toEqual(wrapped.slice(-12));
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			for (const line of term.getScrollBuffer()) expect(visibleWidth(line)).toBeLessThanOrEqual(40);
+		} finally {
+			clearTimeout(settleTimeout);
+			tui.stop();
+			tui.dispose();
+			term.reset();
 		}
 	});
 
@@ -256,12 +333,15 @@ describe("TUI render helper counters", () => {
 					}
 					for (const resizeFirst of [true, false]) {
 						const marker = resizeFirst ? "once-resize-first" : "once-mutation-first";
+						TUI.resetRenderCountersForTest();
 						if (resizeFirst) term.resize(30, 10);
 						lines.push(marker);
 						component.setLines(lines);
 						tui.requestRender(false, "mutation");
 						if (!resizeFirst) term.resize(40, 10);
 						await capture(marker);
+						expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+						expect(TUI.getRenderCountersForTest().widthReflowScanRows).toBe(0);
 						expect(term.getScrollBuffer().filter(line => line.trimEnd() === marker)).toHaveLength(1);
 					}
 					lines[0] = "界".repeat(30);
@@ -333,12 +413,140 @@ describe("TUI render helper counters", () => {
 			term.reset();
 		}
 	});
+
+	it("updates the loader over a long transcript without measuring same-width reflow", async () => {
+		const term = new VirtualTerminal(48, 12);
+		const lines = Array.from({ length: 2_000 }, (_, i) => `\x1b[36m履歴 ${i} 漢字\x1b[0m`);
+		const component = new MutableLinesComponent(lines);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Working",
+			["⠋"],
+			{ renderScope: "layout" },
+		);
+		loader.stop();
+		tui.addChild(component);
+		tui.addChild(loader);
+		tui.setBottomPinnedComponent(loader);
+
+		try {
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			TUI.resetRenderCountersForTest();
+
+			for (let frame = 0; frame < 8; frame++) {
+				loader.setMessage(`Working ${frame}`);
+				await committedFrame(tui, term, "loader");
+				expect(visible(term).join("\n")).toContain(`⠋ Working ${frame}`);
+				expect(visible(term).join("\n")).toContain("履歴 1999 漢字");
+			}
+
+			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+		} finally {
+			loader.stop();
+			tui.stop();
+			tui.dispose();
+			term.reset();
+		}
+	});
+
+	it.each(
+		[
+			{ host: "plain terminal", isProcessTerminal: false, repaint: "full", tmux: undefined },
+			{ host: "process terminal", isProcessTerminal: true, repaint: "viewport", tmux: undefined },
+			{ host: "tmux", isProcessTerminal: false, repaint: "viewport", tmux: "/tmp/gjc-render-helper-tmux" },
+		].flatMap(host =>
+			[
+				{ columns: 44, text: "漢".repeat(8), visibleText: "漢".repeat(8) },
+				{ columns: 12, text: "漢".repeat(20), visibleText: "漢".repeat(6) },
+			].map(scenario => ({ ...scenario, ...host })),
+		),
+	)("preserves $repaint resize output on $host at $columns columns", async ({
+		columns,
+		text,
+		visibleText,
+		isProcessTerminal,
+		repaint,
+		tmux,
+	}) => {
+		if (tmux !== undefined) Bun.env.TMUX = tmux;
+		const term = new VirtualTerminal(48, 12, { isProcessTerminal });
+		const component = new MutableLinesComponent(Array.from({ length: 80 }, () => `\x1b[36m${text}\x1b[0m`));
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		tui.addChild(component);
+
+		try {
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			TUI.resetRenderCountersForTest();
+			term.resize(columns, 12);
+			await committedFrame(tui, term, "resize");
+
+			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			// Viewport repaints skip the decision; plain hosts still consume the
+			// scan, including the overwide CJK fixture at 12 columns.
+			if (repaint === "viewport") expect(measurements).toBe(0);
+			else expect(measurements).toBe(columns === 44 ? 80 : 1);
+			expect(visible(term).filter(Boolean)).toContain(visibleText);
+			expect(term.getViewportAnsi()).toContain("\x1b[36m");
+			for (const line of visible(term)) expect(visibleWidth(line)).toBeLessThanOrEqual(columns);
+		} finally {
+			tui.stop();
+			tui.dispose();
+			term.reset();
+		}
+	});
+
+	it.each([
+		["none", null, false],
+		["iterm2", ImageProtocol.Iterm2, false],
+		["sixel", ImageProtocol.Sixel, false],
+		["kitty", ImageProtocol.Kitty, true],
+	] as const)("scans rendered rows for kitty placements only under protocol=%s", async (_label, protocol, scans) => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		const placement = encodeKittyPlacement({ imageId: 7, placementId: 1, columns: 4, rows: 3 });
+		const lines = [placement, "row-0", "row-1"];
+		const component = new MutableLinesComponent(lines);
+		const term = new VirtualTerminal(20, 6);
+		const tui = new TUI(term, false, { widthSettleMs: 0 });
+		try {
+			setTerminalImageProtocol(protocol);
+			tui.addChild(component);
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			TUI.resetRenderCountersForTest();
+			component.setLines(lines.map((line, index) => (index === 1 ? "row-changed" : line)));
+			await committedFrame(tui, term, "steady");
+			const scanned = TUI.getRenderCountersForTest().kittyPlacementScanRows;
+			if (scans) {
+				expect(scanned).toBeGreaterThanOrEqual(lines.length);
+				// The guard must skip the scan, not break what it returns.
+				expect(term.getWriteLog().join("")).toContain(
+					encodeKittyPlacementDelete({ imageId: 7, placementId: 1, rows: 3 }),
+				);
+			} else {
+				expect(scanned).toBe(0);
+			}
+		} finally {
+			try {
+				tui.stop();
+				tui.dispose();
+				term.reset();
+			} finally {
+				setTerminalImageProtocol(previousProtocol);
+			}
+		}
+	});
 });
 
-async function committedFrame(tui: TUI, term: VirtualTerminal, source: string, force = false): Promise<void> {
+async function committedFrame(tui: TUI, term: VirtualTerminal, source: string, force = false): Promise<number> {
 	const generation = tui.requestRenderWithGeneration(force, source);
 	expect(await tui.waitForRenderCommit(generation, 1_000)).toBe(true);
 	await term.flush();
+	return generation;
 }
 
 function frameObservation(label: string, tui: TUI, term: VirtualTerminal) {

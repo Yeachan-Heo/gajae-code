@@ -1,0 +1,22 @@
+{
+  "pb_workflow_crop.png": {
+    "inputs": {
+      "pb_workflow.png": "7442d68358b2bb1c0501032bcb37047c59ffb4658cd1bc5bd235914db06e1291"
+    },
+    "self": "463d69c8a24aebb6a0628f7ef5c8773f7c59fc738d15c090d5bd563d5de1bd60"
+  },
+  "pb_workflow_en_crop.png": {
+    "inputs": {
+      "pb_workflow_crop.png": "463d69c8a24aebb6a0628f7ef5c8773f7c59fc738d15c090d5bd563d5de1bd60",
+      "pb_workflow_en.png": "391fbf586f9949a621a972ad88d450d8571549a485f9d5b41198144bfcc46954"
+    },
+    "self": "37a83ae057fe008b325e2f92726cae06641e8cf7b91f8c93a34802c72b288e25"
+  },
+  "pb_workflow_ko_crop.png": {
+    "inputs": {
+      "pb_workflow_crop.png": "463d69c8a24aebb6a0628f7ef5c8773f7c59fc738d15c090d5bd563d5de1bd60",
+      "pb_workflow_ko.png": "48abc2d187095ad7c587d9c98761b0c9d43d507596259f1d02268a5b697b2585"
+    },
+    "self": "3402339ba9bdd04a22d574b7a941080bcb97ec77b5a70bbd2092415b57991c63"
+  }
+}

@@ -7,6 +7,7 @@ import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import { processStartTime, removeFileLockDirForGc } from "../src/config/file-lock";
 import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
 import {
+	isRetryableSessionStateLockContention,
 	reclaimStaleSessionStateLock,
 	resetPersistFailureWarnWindows,
 	SessionStateLockTestHooks,
@@ -80,6 +81,23 @@ async function tempRoot(): Promise<string> {
 
 async function readJson(file: string): Promise<Record<string, unknown>> {
 	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
+}
+
+async function waitForPath(
+	pathname: string,
+	predicate: (stat: fsSync.BigIntStats) => boolean,
+	label: string,
+): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		try {
+			if (predicate(fsSync.lstatSync(pathname, { bigint: true }))) return;
+		} catch {
+			// The owner may not have published the path yet.
+		}
+		await Bun.sleep(25);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
 }
 
 async function seededRunningSession(name: string): Promise<{ root: string; stateFile: string }> {
@@ -2694,15 +2712,15 @@ describe("coordinator session state lock", () => {
 		// only window where the outer lock is observable on disk.
 		const release = Promise.withResolvers<void>();
 		const holder = withSessionStateFileLock(stateFile, () => release.promise);
-		await Bun.sleep(20);
+		await waitForPath(`${stateFile}.lock`, stat => stat.isFile(), "state-file owner lock");
 		const persist = persistCoordinatorRuntimeStateFromEvent(
 			{ type: "tool_execution_start", toolCallId: "call-1" },
 			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
 			{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
 		);
-		await Bun.sleep(40);
 
 		const mutationLock = path.join(root, "locks", "mutation.lock.lock");
+		await waitForPath(mutationLock, stat => stat.isDirectory(), "namespace mutation lock");
 		expect(fsSync.statSync(mutationLock).isDirectory()).toBe(true);
 		expect(fsSync.existsSync(path.join(mutationLock, "info"))).toBe(true);
 		expect(fsSync.statSync(`${stateFile}.lock`).isFile()).toBe(true);
@@ -2905,6 +2923,39 @@ describe("session state lock failure diagnostics", () => {
 		});
 	});
 
+	it("treats only pure-contention refusals as worth retrying", () => {
+		const refusal = (reason: string) => new SessionStateLockUnavailableError({ lockPath: "/tmp/a.lock", reason });
+
+		// Contention verdicts learn nothing about the document, so the same write can
+		// still succeed later.
+		expect(isRetryableSessionStateLockContention(refusal("acquire_timeout"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_live_or_unverifiable"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_record_fresh"))).toBe(true);
+		expect(isRetryableSessionStateLockContention(refusal("transition_claim_timeout"))).toBe(true);
+
+		// Standing conditions a retry would only repeat.
+		expect(isRetryableSessionStateLockContention(refusal("unsafe_lock_path_type"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_owner_record_unprovenanced"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("legacy_directory_owner_unprovenanced"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_initialization_failed"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_inspection_failed"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(refusal("lock_release_failed"))).toBe(false);
+
+		// Non-lock failures carry no contention verdict at all.
+		expect(isRetryableSessionStateLockContention(new Error("disk full"))).toBe(false);
+		expect(isRetryableSessionStateLockContention(undefined)).toBe(false);
+
+		// A refusal buried under wrapping errors is still the same verdict.
+		expect(
+			isRetryableSessionStateLockContention(
+				new AggregateError([
+					new Error("unrelated"),
+					new Error("wrapped", { cause: refusal("transition_claim_timeout") }),
+				]),
+			),
+		).toBe(true);
+	});
+
 	it("partitions warn windows by document and stable failure class", () => {
 		const timeout = new SessionStateLockUnavailableError({
 			lockPath: "/tmp/a.lock.transition",
@@ -2932,5 +2983,82 @@ describe("session state lock failure diagnostics", () => {
 		expect(shouldWarnPersistFailure("current", diskFull, 29_999)).toBe(true);
 		expect(shouldWarnPersistFailure("old", diskFullAgain, 30_000)).toBe(true);
 		expect(shouldWarnPersistFailure("current", diskFullAgain, 30_000)).toBe(false);
+	});
+	describe("transition reclaim refusal classifier (#5606)", () => {
+		const claimWith = async (name: string, owner: Record<string, unknown>) => {
+			const { stateFile } = await seededRunningSession(name);
+			const transitionDir = `${stateFile}.lock.transition`;
+			await fs.mkdir(transitionDir, { recursive: true, mode: 0o700 });
+			await Bun.write(`${transitionDir}.owner`, JSON.stringify(owner));
+			return transitionDir;
+		};
+
+		it("names a released tombstone from another installation", async () => {
+			const dir = await claimWith("reclaim-foreign", {
+				pid: 1,
+				start_time: "unknown",
+				token: "foreign-token",
+				owner_host_id: "0".repeat(64),
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_foreign_host",
+			});
+		});
+
+		it("names a released tombstone with no installation identity at all", async () => {
+			const dir = await claimWith("reclaim-unprovenanced", {
+				pid: 1,
+				start_time: "unknown",
+				token: "no-host-token",
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_unprovenanced",
+			});
+		});
+
+		it("names a live owner rather than reporting a bare timeout", async () => {
+			// This process is unambiguously alive, so liveness cannot be disproven.
+			const dir = await claimWith("reclaim-live", {
+				pid: process.pid,
+				start_time: "unknown",
+				token: "live-owner-token",
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "owner_live_or_unverifiable",
+			});
+		});
+
+		it("names an unreadable owner sidecar", async () => {
+			const { stateFile } = await seededRunningSession("reclaim-unreadable");
+			const dir = `${stateFile}.lock.transition`;
+			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+			await Bun.write(`${dir}.owner`, "{ not json");
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "claim_or_owner_unreadable",
+			});
+		});
+
+		it("carries the refusal onto the timeout message as a bounded enum only", () => {
+			const error = sessionStateLock.transitionClaimTimeoutForTests(
+				"/tmp/runtime-state.json.lock.transition",
+				"claim_generation_changed",
+			);
+			expect(error.reason).toBe("transition_claim_timeout");
+			expect(error.message).toContain("(reclaim refused: claim_generation_changed)");
+			// The suffix must never widen into a path, token, host id, pid or errno.
+			expect(error.message.split("(reclaim refused: ")[1]).toBe("claim_generation_changed).");
+		});
+
+		it("leaves the message unchanged when no refusal was ever recorded", () => {
+			const error = sessionStateLock.transitionClaimTimeoutForTests("/tmp/a.lock.transition", undefined);
+			expect(error.message).not.toContain("reclaim refused");
+			expect(error.reason).toBe("transition_claim_timeout");
+		});
 	});
 });

@@ -78,6 +78,7 @@ describe("notify health stale-lock diagnostic (#5227 secondary)", () => {
 		expect(daemonCheck).toBeDefined();
 		expect(daemonCheck!.detail).not.toContain("run recovery to clear the stale lock");
 		expect(daemonCheck!.detail).toContain("no lock present");
+		expect(daemonCheck!.detail).not.toContain("exited cleanly");
 	});
 
 	test("advises recovery when dead owner has a lock", async () => {

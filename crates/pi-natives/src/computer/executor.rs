@@ -664,9 +664,7 @@ mod tests {
 				.log
 				.borrow_mut()
 				.push(if down { "down" } else { "release-panic" });
-			if !down {
-				panic!("injected release panic");
-			}
+			assert!(down, "injected release panic");
 		}
 
 		fn scroll(&mut self, _dx: f64, _dy: f64) {}

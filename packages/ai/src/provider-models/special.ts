@@ -5,6 +5,7 @@ import type { ModelManagerOptions } from "../model-manager";
 import { buildZCodeSourceHeaders, resolveGlmZcodeAnthropicBaseUrl } from "../providers/anthropic";
 import { fetchKiroApiModels, isKiroApiKey, kiroApiStaticModels } from "../providers/kiro-api-key";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
+import type { Model } from "../types";
 import { fetchCodexModels } from "../utils/discovery/codex";
 import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
 import { createBundledReferenceMap } from "./bundled-references";
@@ -13,6 +14,44 @@ export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-resp
 		providerId: "opencodex",
 		cacheTtlMs: OPENCODEX_MODEL_CACHE_TTL_MS,
 		fetchDynamicModels: fetchOpenCodexModels,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Devin CLI (ACP)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy handle to the ACP provider module. The ACP SDK must stay out of the
+ * catalog/startup import graph, so it is only required when Devin model
+ * discovery actually runs.
+ */
+interface DevinAcpDiscoveryModule {
+	fetchDevinAcpModels: (config?: {
+		cliPath?: string;
+		cliArgs?: readonly string[];
+		cwd?: string;
+	}) => Promise<Model<"devin-acp">[] | null>;
+}
+
+const devinAcpDiscovery = once(() => require("../providers/devin-acp") as DevinAcpDiscoveryModule);
+
+export interface DevinModelManagerConfig {
+	cliPath?: string;
+	cliArgs?: readonly string[];
+	cwd?: string;
+}
+
+/**
+ * Devin models come from the ACP session's own `model` config option: the
+ * account and enterprise allowlists are authoritative there, and ACP is the
+ * documented programmatic surface (`devin acp`). Discovery fails closed to "no
+ * models" when the CLI is missing or unauthenticated.
+ */
+export function devinModelManagerOptions(config: DevinModelManagerConfig = {}): ModelManagerOptions<"devin-acp"> {
+	return {
+		providerId: "devin",
+		fetchDynamicModels: () => devinAcpDiscovery().fetchDevinAcpModels(config),
 	};
 }
 

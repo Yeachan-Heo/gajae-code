@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { getRuntimeResourceCounts } from "@gajae-code/coding-agent/debug/runtime-gauges";
 import {
@@ -588,6 +591,179 @@ describe("executeBash", () => {
 		const startedAt = Date.now();
 		await shell.close();
 		expect(Date.now() - startedAt).toBeLessThan(2_000);
+	});
+
+	it.each([
+		"run",
+		"abort",
+		"close",
+		"close-before-ready",
+	] as const)("retires an unsent isolated %s request before terminal cleanup", async operation => {
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const child = Object.assign(new EventEmitter(), {
+			stdin,
+			stdout,
+			stderr,
+			exitCode: null,
+			signalCode: null,
+			kill: vi.fn((): boolean => {
+				queueMicrotask(() => child.emit("close", 0, null));
+				return true;
+			}),
+		});
+		// A live child whose input has closed deterministically exercises the
+		// gap between request registration and successful protocol dispatch.
+		vi.spyOn(childProcess, "spawn").mockReturnValue(child as unknown as childProcess.ChildProcessWithoutNullStreams);
+		let token: string | undefined;
+		stdin.once("data", chunk => {
+			token = JSON.parse(String(chunk)).token;
+		});
+		const onTerminal = vi.fn();
+		const shell = new IsolatedShell(undefined, { onTerminal });
+		const controller = new AbortController();
+		const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+		try {
+			const closing = operation === "close-before-ready" ? shell.close() : undefined;
+			stdin.end();
+			expect(stdin.writable).toBe(false);
+			stdout.write(`${JSON.stringify({ type: "ready", token })}\n`);
+			await shell.ready();
+			if (operation === "run") {
+				await expect(shell.run({ command: "echo unsent", signal: controller.signal })).rejects.toThrow(
+					"Isolated shell worker input is closed.",
+				);
+				expect(shell.isRunSignalActive(controller.signal)).toBe(false);
+				expect(shell.wasRunSignalDispatched(controller.signal)).toBe(false);
+				expect(removeListener).toHaveBeenCalledTimes(1);
+				const abort = vi.spyOn(shell, "abort");
+				controller.abort();
+				expect(abort).not.toHaveBeenCalled();
+			} else if (operation === "abort") {
+				await expect(shell.abort()).rejects.toThrow("Isolated shell worker input is closed.");
+			}
+			await (closing ?? shell.close());
+			// Let Bun's ordinary unhandled-rejection check run. Before the fix,
+			// close rejected the abandoned deferred even though its caller had
+			// already observed the send error (also for close's own request).
+			await Bun.sleep(0);
+			expect(shell.isTerminal()).toBe(true);
+			expect(onTerminal).toHaveBeenCalledTimes(1);
+			expect(child.kill).toHaveBeenCalledTimes(1);
+		} finally {
+			await shell.close();
+			stdin.destroy();
+			stdout.destroy();
+			stderr.destroy();
+		}
+	});
+
+	it("observes an abort rejection while the run is still settling", async () => {
+		const started = Promise.withResolvers<void>();
+		const run = Promise.withResolvers<{ exitCode: number; cancelled: boolean; timedOut: boolean }>();
+		const abortError = new Error("abort acknowledgement failed");
+		const abort = vi.fn(async () => {
+			throw abortError;
+		});
+		setShellFactoryForTests(() => ({
+			run: () => {
+				started.resolve();
+				return run.promise;
+			},
+			abort,
+			close: async () => undefined,
+		}));
+		const controller = new AbortController();
+		const execution = executeBash("unused", {
+			cwd: tempDir,
+			oneShot: true,
+			timeout: null,
+			disableShellSnapshot: true,
+			signal: controller.signal,
+		});
+		try {
+			await started.promise;
+			controller.abort();
+			// Cross a real event-loop boundary with the run deliberately pending.
+			// Delaying the abort observer until run cleanup reports an unhandled error.
+			await Bun.sleep(0);
+			expect(abort).toHaveBeenCalledTimes(1);
+		} finally {
+			run.resolve({ exitCode: 0, cancelled: true, timedOut: false });
+			const result = await execution;
+			expect(result.cancelled).toBe(true);
+		}
+	});
+
+	it.each([
+		"pending",
+		"settled",
+	] as const)("observes an isolated abort rejected by close with the run %s", async runState => {
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const stderr = new PassThrough();
+		const child = Object.assign(new EventEmitter(), {
+			stdin,
+			stdout,
+			stderr,
+			exitCode: null as number | null,
+			signalCode: null,
+			kill: vi.fn(() => true),
+		});
+		vi.spyOn(childProcess, "spawn").mockReturnValue(child as unknown as childProcess.ChildProcessWithoutNullStreams);
+		const dispatched = Promise.withResolvers<{ token: string; id: number }>();
+		const abortDispatched = Promise.withResolvers<void>();
+		const requests: string[] = [];
+		stdin.on("data", chunk => {
+			const request = JSON.parse(String(chunk));
+			requests.push(request.type);
+			if (request.type === "init") {
+				queueMicrotask(() => stdout.write(`${JSON.stringify({ type: "ready", token: request.token })}\n`));
+			} else if (request.type === "run") {
+				dispatched.resolve(request);
+			} else if (request.type === "abort") {
+				// Leave the acknowledgement pending until worker teardown rejects it.
+				abortDispatched.resolve();
+			} else if (request.type === "close") {
+				child.exitCode = 0;
+				child.emit("close", 0, null);
+			}
+		});
+		let shell: IsolatedShell | undefined;
+		setShellFactoryForTests(options => {
+			shell = new IsolatedShell(options);
+			return shell;
+		});
+		const controller = new AbortController();
+		const execution = executeBash("echo monitor-line", {
+			cwd: tempDir,
+			oneShot: true,
+			timeout: null,
+			disableShellSnapshot: true,
+			signal: controller.signal,
+			onRawChunk: () => controller.abort(),
+		});
+		try {
+			const { token, id } = await dispatched.promise;
+			const chunk = { type: "chunk", token, id, chunk: "monitor-line\n" };
+			const result = { type: "result", token, id, result: { exitCode: 0, cancelled: false, timedOut: false } };
+			// Match Monitor's synchronous first-line cancellation. In the settled
+			// case the result arrives in the same read, before cancellation resumes.
+			stdout.write(`${JSON.stringify(chunk)}\n${runState === "settled" ? `${JSON.stringify(result)}\n` : ""}`);
+			await abortDispatched.promise;
+			if (runState === "pending") await shell!.close();
+			const resultValue = await execution;
+			await Bun.sleep(0);
+			expect(resultValue.cancelled).toBe(true);
+			expect(requests).toEqual(["init", "run", "abort", "close"]);
+			expect(shell!.isTerminal()).toBe(true);
+		} finally {
+			await shell?.close();
+			stdin.destroy();
+			stdout.destroy();
+			stderr.destroy();
+		}
 	});
 
 	it("does not execute or globally abort a cancelled queued isolated run", async () => {

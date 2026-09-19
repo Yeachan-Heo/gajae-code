@@ -15,14 +15,17 @@
  *   bun scripts/dev-link.ts            # link `gjc` -> src/cli.ts on PATH
  *   bun scripts/dev-link.ts --binary   # link `gjc` -> dist/gjc compiled binary
  *   bun scripts/dev-link.ts --check    # doctor: fail if `gjc` has drifted
+ *   bun scripts/dev-link.ts --worktree # doctor: node_modules / native addon readiness
  *
  * Env:
  *   GJC_DEV_LINK_DIR   override the target bin dir (default ~/.local/bin)
  */
 
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
+import { findForeignWorkspaceLinks, formatWorktreeReport, inspectWorktree } from "./worktree-deps";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const cliSource = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -34,6 +37,7 @@ const BUN_SHIM_VERSION = 5478;
 const MAX_BUN_SHIM_METADATA_BYTES = 64 * 1024;
 const MAX_BUN_SHIM_EXECUTABLE_BYTES = 1024 * 1024;
 const EXPECTED_WORKSPACE_WRAPPER = '#!/usr/bin/env bun\nimport { runCli } from "@gajae-code/coding-agent/cli";\n\nawait runCli(process.argv.slice(2));\n';
+const RECEIPT_VERSION = 1;
 
 function realpath(p: string): string | null {
 	try {
@@ -48,6 +52,42 @@ function lexists(p: string): boolean {
 	try {
 		fs.lstatSync(p);
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+function writeOwnershipReceipt(target: string, root: string, alias: string, source: string): void {
+	const parent = path.dirname(target);
+	const identity = fs.lstatSync(target);
+	const body = {
+		version: RECEIPT_VERSION,
+		alias,
+		target,
+		root,
+		source,
+		parent,
+		identity: { dev: String((identity as fs.Stats).dev), ino: String((identity as fs.Stats).ino) },
+	};
+	const auth = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+	const receipt = `${target}.gjc-managed.json`;
+	if (lexists(receipt)) {
+		const existing = fs.readFileSync(receipt, "utf8");
+		if (existing !== JSON.stringify({ ...body, auth }) + "\n") throw new Error(`Refusing to overwrite foreign ownership receipt: ${receipt}`);
+		return;
+	}
+	const fd = fs.openSync(receipt, "wx", 0o600);
+	try { fs.writeFileSync(fd, JSON.stringify({ ...body, auth }) + "\n"); } finally { fs.closeSync(fd); }
+}
+
+function hasTrustedOwnershipReceipt(target: string, root: string, alias: string): boolean {
+	try {
+		const raw = JSON.parse(fs.readFileSync(`${target}.gjc-managed.json`, "utf8"));
+		const body = { version: RECEIPT_VERSION, alias, target, root, source: raw.source, parent: raw.parent, identity: raw.identity };
+		const current = fs.lstatSync(target);
+		return raw.version === RECEIPT_VERSION && raw.alias === alias && raw.target === target && raw.root === root &&
+			raw.parent === path.dirname(target) && raw.identity?.dev === String(current.dev) && raw.identity?.ino === String(current.ino) &&
+			raw.auth === createHash("sha256").update(JSON.stringify(body)).digest("hex");
 	} catch {
 		return false;
 	}
@@ -317,30 +357,14 @@ function assertResolvedGjcMatchesTarget(winner: GjcHit | undefined, expectedReal
 }
 
 function assertWorkspaceLinksLocal(): void {
-	const repoRootReal = realpath(repoRoot) ?? repoRoot;
-	const scopeDir = path.join(repoRoot, "node_modules", "@gajae-code");
-	let entries: string[];
-	try {
-		entries = fs.readdirSync(scopeDir);
-	} catch {
-		return;
-	}
-	const stale: Array<{ link: string; real: string }> = [];
-	for (const entry of entries) {
-		const link = path.join(scopeDir, entry);
-		try {
-			if (!fs.lstatSync(link).isSymbolicLink()) continue;
-		} catch {
-			continue;
-		}
-		const real = realpath(link);
-		if (real && !real.startsWith(repoRootReal + path.sep)) stale.push({ link, real });
-	}
+	// Shared with the test preload's dependency probe so the doctor and an actual
+	// `bun test` run agree on what counts as a usable install.
+	const stale = findForeignWorkspaceLinks(repoRoot);
 	if (stale.length === 0) return;
 	console.error("✗ Workspace symlinks point outside this checkout (stale cross-worktree install):");
-	for (const { link, real } of stale) {
+	for (const { link, target } of stale) {
 		console.error(`    ${link}`);
-		console.error(`      -> ${real}`);
+		console.error(`      -> ${target}`);
 	}
 	console.error("  Fix: rm -rf node_modules/@gajae-code && bun install");
 	process.exit(1);
@@ -351,6 +375,16 @@ function assertSourceExists(): void {
 	console.error(`✗ Cannot find CLI source at ${cliSource}`);
 	console.error("  Run this from the gajae-code checkout.");
 	process.exit(1);
+}
+
+function worktreeCheck(): never {
+	// A checkout whose workspace links point into another worktree resolves, but
+	// against the wrong sources; report it like `--check` instead of a false green.
+	assertWorkspaceLinksLocal();
+	const report = inspectWorktree(repoRoot);
+	const write = report.ok ? console.log : console.error;
+	write(formatWorktreeReport(report));
+	process.exit(report.ok ? 0 : 1);
 }
 
 function check(): never {
@@ -402,13 +436,33 @@ function link(binary: boolean): never {
 	const linkSourceReal = realpath(linkSource) ?? linkSource;
 	fs.mkdirSync(targetDir, { recursive: true });
 	const target = path.join(targetDir, "gjc");
-	if (lexists(target)) fs.rmSync(target, { force: true });
-	fs.symlinkSync(linkSource, target);
-	console.log(`✓ Linked ${target} -> ${linkSource}`);
 	const aliasTarget = path.join(targetDir, "가재씨");
-	if (lexists(aliasTarget)) fs.rmSync(aliasTarget, { force: true });
-	fs.symlinkSync(linkSource, aliasTarget);
-	console.log(`✓ Linked ${aliasTarget} -> ${linkSource}`);
+	// Preflight BOTH managed links before mutating either. A foreign or stale
+	// alias must abort the whole command up front: if it were validated only
+	// after the primary `gjc` link was already replaced, a failing alias would
+	// leave the installation half-updated.
+	const assertReplaceable = (linkPath: string, name: string): void => {
+		if (!lexists(linkPath)) return;
+		const existing = realpath(linkPath);
+		if (!hasTrustedOwnershipReceipt(linkPath, repoRoot, name) || !existing || (existing !== cliSourceReal && existing !== realpath(binarySource))) {
+			console.error(`✗ Refusing to replace foreign or unknown ${linkPath}`);
+			process.exit(1);
+		}
+	};
+	assertReplaceable(target, "gjc");
+	assertReplaceable(aliasTarget, "가재씨");
+
+	const installLink = (linkPath: string, name: string): void => {
+		if (lexists(linkPath)) {
+			fs.rmSync(linkPath, { force: true });
+			if (lexists(`${linkPath}.gjc-managed.json`)) fs.rmSync(`${linkPath}.gjc-managed.json`, { force: true });
+		}
+		fs.symlinkSync(linkSource, linkPath);
+		writeOwnershipReceipt(linkPath, repoRoot, name, linkSourceReal);
+		console.log(`✓ Linked ${linkPath} -> ${linkSource}`);
+	};
+	installLink(target, "gjc");
+	installLink(aliasTarget, "가재씨");
 	if (!isOnPath(targetDir)) {
 		console.warn(`! ${targetDir} is not on your PATH — add it so \`gjc\` resolves:`);
 		console.warn(`    export PATH="${targetDir}:$PATH"`);
@@ -443,6 +497,7 @@ function link(binary: boolean): never {
 }
 
 if (import.meta.main) {
-	if (process.argv.includes("--check")) check();
+	if (process.argv.includes("--worktree")) worktreeCheck();
+	else if (process.argv.includes("--check")) check();
 	else link(process.argv.includes("--binary"));
 }

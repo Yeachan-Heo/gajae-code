@@ -27,6 +27,8 @@ pub mod build_info;
 pub mod clipboard;
 pub mod computer;
 pub mod crash;
+pub mod doctor_journal;
+pub mod doctor_link;
 pub mod edit_fuzzy;
 pub mod fd;
 pub mod fs_cache;
@@ -76,7 +78,7 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_16_6")]
+#[napi(js_name = "__piNativesV0_17_2")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Publish-result wire-contract sentinel.

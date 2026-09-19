@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import packageJson from "../package.json";
-import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli";
 import { parseArgs } from "../src/cli/args";
+import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli-main";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
@@ -142,8 +142,9 @@ process.exitCode = await child.exited;`;
 	}, 30_000);
 
 	it("registers launch plus retained workflow/runtime utility endpoints", async () => {
-		const source = await Bun.file(cliEntry).text();
+		const source = await Bun.file(path.join(path.dirname(cliEntry), "cli-main.ts")).text();
 		expect(extractRegisteredCommands(source)).toEqual([
+			"doctor",
 			"codex-native-hook",
 			"state",
 			"setup",
@@ -276,6 +277,26 @@ process.exitCode = await child.exited;`;
 			expect(output).not.toContain("private runtime");
 		}
 	}, 30_000);
+
+	it("routes `<command> <verb> --help` to the native help instead of the generic command summary", () => {
+		// `autoresearch` and `ultragoal` set `delegateHelp`, which exists so a
+		// command with nested verbs renders subcommand help itself. Both used to
+		// re-intercept the help flags and print generic command-level examples,
+		// discarding the verb, so no per-verb flag was reachable from the CLI.
+		const cases = [
+			{ argv: ["autoresearch", "verdict", "--help"], usage: "$ gjc autoresearch verdict", flag: "--status-json" },
+			{ argv: ["autoresearch", "critic", "--help"], usage: "$ gjc autoresearch critic", flag: "--evaluator" },
+			{ argv: ["autoresearch", "help", "verdict"], usage: "$ gjc autoresearch verdict", flag: "--caveat" },
+			{ argv: ["ultragoal", "review", "--help"], usage: "$ gjc ultragoal review", flag: "--executor-qa-json" },
+		];
+		for (const { argv, usage, flag } of cases) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...argv], { cwd: repoRoot, stderr: "pipe", stdout: "pipe" });
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+			expect(result.exitCode, output).toBe(0);
+			expect(output, output).toContain(usage);
+			expect(output, output).toContain(flag);
+		}
+	}, 60_000);
 
 	it("preserves root fast-path precedence", () => {
 		const cases = [

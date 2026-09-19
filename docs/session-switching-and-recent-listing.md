@@ -101,7 +101,7 @@ Handled after initial session-manager construction:
 
 1. list local candidates through the bounded read-only resume-picker path
 2. if empty: print `No sessions found` and exit early
-3. open the TUI picker; cancellation returns silently and exits without writes
+3. open the TUI picker; cancellation exits without resuming a session (explicit star/unstar or deletion actions remain saved)
 4. inspect the selected transcript read-only and confirm resumable tail state when required
 5. strictly open the approved identity, rechecking ownership before any replay-sanitization persistence
 6. publish the terminal breadcrumb only after strict-open sanitation succeeds, then continue startup from the opened manager
@@ -138,8 +138,11 @@ Flow:
 - Enter to select
 - Esc to cancel
 - Ctrl+C to exit
+- Ctrl+S to star/unstar the selected session without opening it; the footer shows this shortcut
 - fuzzy search across session id/title/cwd/first message/all messages/path
 - starred sessions are marked with `★` and appear before unstarred sessions
+- after a star change is saved, the list reorders while preserving the search query and selected session
+- while a star change is saving, list-changing input is frozen; failures appear inline without changing the displayed star state
 
 Empty-list render behavior:
 
@@ -150,6 +153,8 @@ Empty-list render behavior:
 Caveat: UI text says `Press Tab to view all`, but this component currently has no Tab handler and current wiring only lists current-scope sessions.
 
 `/star` and `/unstar` update only the active session. The read-only `/sessions` dashboard displays the same star marker but never mutates session metadata. Starring is a discovery aid, not a retention or deletion guard.
+
+Picker star changes preserve the candidate's path and do not publish a resume breadcrumb or consume its draft. The active-session row is checked against its session ID, workspace, and listed file identity inside the live manager's persistence fence; stale rows fail without changing the active session. Existing pre-star headers can gain the star capability in place through an exact-identity replacement; concurrent changes cause an error rather than overwriting the newer transcript. Formats older than v4 must be resumed/upgraded first, and files above the existing eager-read limit must use `/star` or `/unstar` inside the session.
 
 ## Runtime switch execution (`AgentSession.switchSession`)
 

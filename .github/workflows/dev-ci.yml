@@ -28,6 +28,11 @@ on:
         description: Optional exact terminal-green dev SHA; validation rejects a mismatch.
         required: false
         type: string
+      wsl_drvfs:
+        description: Run nonpublishing real WSLv2/NTFS DrvFS lock qualification for head_sha.
+        required: false
+        type: boolean
+        default: false
 
 # Least privilege by default: no dev-ci job needs a write-scoped GITHUB_TOKEN.
 # Every job only checks out, installs, tests, and exchanges artifacts through the
@@ -51,6 +56,55 @@ concurrency:
     && !(github.event_name == 'pull_request' && github.event.action == 'edited' && (github.event.changes.body != null || github.event.changes.title != null) && github.event.changes.base == null) }}
 
 jobs:
+  wsl-drvfs-qualification:
+    name: Opt-in real WSLv2/NTFS DrvFS qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.wsl_drvfs == true }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      QUALIFY_HEAD_SHA: ${{ inputs.head_sha }}
+      QUALIFY_BASE_REPOSITORY: ${{ inputs.base_repository }}
+      QUALIFY_HARNESS_SHA: ${{ github.workflow_sha }}
+      QUALIFY_EVIDENCE: ${{ github.workspace }}/wsl-drvfs-evidence
+    steps:
+      - name: Validate qualification inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:QUALIFY_EVIDENCE | Out-Null
+          "head_sha=$env:QUALIFY_HEAD_SHA`nharness_sha=$env:QUALIFY_HARNESS_SHA`nrepository=$env:GITHUB_REPOSITORY" | Set-Content "$env:QUALIFY_EVIDENCE/dispatch.txt"
+          if ($env:QUALIFY_HEAD_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Qualification requires exact lowercase 40-hex head_sha' }
+          if ($env:QUALIFY_BASE_REPOSITORY -cne $env:GITHUB_REPOSITORY) { throw 'Qualification requires this repository' }
+      - name: Checkout workflow harness independently
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: qualification-harness
+          persist-credentials: false
+      - name: Checkout exact qualification source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.head_sha }}
+          path: qualification-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Qualify exact source on disposable WSLv2 DrvFS
+        shell: pwsh
+        run: |
+          & ./qualification-harness/scripts/qualify-wsl-drvfs.ps1 -SourcePath (Join-Path $env:GITHUB_WORKSPACE 'qualification-source') -HeadSha $env:QUALIFY_HEAD_SHA -EvidencePath $env:QUALIFY_EVIDENCE
+      - name: Upload qualification evidence even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: wsl-drvfs-${{ github.run_id }}
+          path: ${{ env.QUALIFY_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 14
+
   pr-contract-bootstrap:
     name: PR contract bootstrap
     if: ${{ github.event_name == 'pull_request' }}
@@ -59,6 +113,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      # Fail closed: absent means the bootstrap never reported an authorized merge.
+      merge_authorized: ${{ steps.contract.outputs['gjc-merge-authorized'] }}
     env:
       PR_BODY: ${{ github.event.pull_request.body }}
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -78,6 +135,7 @@ jobs:
         with:
           bun-version: "1.4.0"
       - name: Validate bootstrap PR contract
+        id: contract
         shell: bash
         run: |
           set -euo pipefail
@@ -110,6 +168,7 @@ jobs:
             const reviewPermission = async login => { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/collaborators/${encodeURIComponent(login)}/permission`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Reviewer permission lookup failed: ${response.status}`); return (await response.json()).permission; };
             const fetchReviews = async () => { const reviews = []; for (let page = 1; ; page++) { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/pulls/${Bun.env.PR_NUMBER}/reviews?per_page=100&page=${page}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Reviews API failed: ${response.status}`); const batch = await response.json(); reviews.push(...batch); if (batch.length < 100) break; } return reviews; };
             let selfAuthorized = false;
+            let mergeAuthorized = false;
             if (verdict === "merge-self-approved") {
               // Honest solo path (issue #4703): owner-only, low-risk-only, backed by the
               // risk-record comment bound to this exact head. merge-approved NEVER accepts
@@ -155,13 +214,57 @@ jobs:
               if (latest?.state !== "APPROVED" || latest.commit_id !== head) throw new Error(`Reviewer ${reviewerId} lacks an effective exact-head approval.`);
               const permission = await reviewPermission(reviewerId);
               if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
+              mergeAuthorized = true;
             } else {
-              throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
+              // Waiting for a reviewer is a PENDING AUTHORIZATION, not a contract defect.
+              // The separate "Merge approval bootstrap" job turns this into its own red
+              // check, so this check keeps reporting contract validity alone. Every other
+              // failure above remains a throw and still fails THIS check.
+              console.log(`::notice::Verdict ${verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
             }
-            console.log(`Bootstrap PR contract valid: ${digest}${selfAuthorized ? " (SELF-AUTHORIZED: merge-self-approved, no independent human review)" : ""}`);
+            mergeAuthorized ||= selfAuthorized;
+            const { appendFileSync } = await import("node:fs");
+            appendFileSync(Bun.env.GITHUB_OUTPUT, `gjc-merge-authorized=${mergeAuthorized}\n`);
+            console.log(`Bootstrap PR contract valid: ${digest}${selfAuthorized ? " (SELF-AUTHORIZED: merge-self-approved, no independent human review)" : ""}${mergeAuthorized ? "" : " (merge NOT authorized yet)"}`);
           '
       - name: Run bootstrap G1 writer gate
         run: bun scripts/verify-gjc-state-writers.ts --fail --root .
+
+  merge-approval-bootstrap:
+    name: Merge approval bootstrap
+    needs: [pr-contract-bootstrap]
+    # always() is load-bearing. GitHub reports a SKIPPED job as Success for required
+    # checks (https://docs.github.com/en/pull-requests/reference/status-checks), so a
+    # plain `needs:` would skip this job when the contract job fails and publish a GREEN
+    # merge-approval check for a red contract — the precise hole this must not open.
+    # The job therefore always runs and decides from the upstream result plus its output.
+    # The event guard mirrors pr-contract-bootstrap's own: outside a pull_request there is
+    # no PR to authorize, and both jobs skip together.
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    # Reads only the upstream job's result and output: no checkout, no bun, no token.
+    permissions: {}
+    steps:
+      - name: Require an authorized merge verdict for this exact head
+        env:
+          CONTRACT_RESULT: ${{ needs.pr-contract-bootstrap.result }}
+          MERGE_AUTHORIZED: ${{ needs.pr-contract-bootstrap.outputs.merge_authorized }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "contract job result: ${CONTRACT_RESULT:-unknown}; merge authorized: ${MERGE_AUTHORIZED:-false}"
+          # Fail closed on anything that is not an explicit success + explicit true, so a
+          # skipped, cancelled, or failed bootstrap can never read as an authorized merge.
+          if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then
+            echo "::error::PR contract bootstrap did not succeed (${CONTRACT_RESULT:-unknown}); no merge authorization can be reported."
+            exit 1
+          fi
+          if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then
+            echo "::error::This exact head is not authorized to merge: the verdict is not merge-approved (or merge-self-approved) backed by the review evidence the contract requires. The PR contract itself is valid — only the approval is pending."
+            exit 1
+          fi
+          echo "Merge authorized for this exact head."
 
   # Planner: resolve changed-path relevance and the affected task plan once, then
   # fan the plan out into per-task shards. Emits the matrix, has_tasks/has_native
@@ -349,7 +452,7 @@ jobs:
   windows-dev-doctor:
     name: Windows dev:doctor + session-path regression
     needs: [affected-plan]
-    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts')) }}
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli/doctor') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/doctor-windows-repair-gate.test.ts')) }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -398,6 +501,10 @@ jobs:
           bun test ./scripts/dev-link.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun run dev:doctor
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The journal-backed repair refusal is a win32-only contract: the Rust
+          # journal authority is #[cfg(unix)], so the gate is proven on this runner.
+          bun test ./packages/coding-agent/test/doctor-windows-repair-gate.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Windows session-path canonicalization regression
         shell: pwsh
@@ -851,7 +958,7 @@ jobs:
           CI_DEV_HAS_PYTHON: ${{ needs.affected-plan.outputs.has_python }}
           CI_DEV_PYTHON_RESULT: skipped
           CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts') }}
+          CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli/doctor') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/doctor-windows-repair-gate.test.ts') }}
           CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT: ${{ needs.windows-native-build-toolchain.result }}
           CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/build-native.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/rust-toolchain-path.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/build-native-profile.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/ci-build-native.ts') }}
           CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
@@ -897,7 +1004,7 @@ jobs:
       CI_DEV_HAS_PYTHON: ${{ needs.affected-plan.outputs.has_python }}
       CI_DEV_PYTHON_RESULT: skipped
       CI_DEV_WINDOWS_DOCTOR_RESULT: ${{ needs.windows-dev-doctor.result }}
-      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts') }}
+      CI_DEV_WINDOWS_DOCTOR_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'scripts/dev-link') || needs.affected-plan.outputs.has_windows_session_path == 'true' || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/blob-store.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/session/session-manager.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/capability/fs.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/pr-4834-home-isolation.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/session/resident-cache-win32-gate.windows.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/cli/doctor') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/test/doctor-windows-repair-gate.test.ts') }}
       CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT: ${{ needs.windows-native-build-toolchain.result }}
       CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/build-native.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/rust-toolchain-path.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/build-native-profile.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/ci-build-native.ts') }}
       CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}

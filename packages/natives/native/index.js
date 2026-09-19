@@ -18,6 +18,7 @@ nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const ComputerController = nativeBindings.ComputerController;
+export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
 export const NativeRetainedBrokerPublication = nativeBindings.NativeRetainedBrokerPublication;
@@ -30,7 +31,7 @@ export const Shell = nativeBindings.Shell;
 
 // functions
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_16_6 = nativeBindings.__piNativesV0_16_6;
+export const __piNativesV0_17_2 = nativeBindings.__piNativesV0_17_2;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -45,13 +46,16 @@ export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
+export const exactReplaceRetained = nativeBindings.exactReplaceRetained;
 export const exactRestore = nativeBindings.exactRestore;
+export const exactSwapManagedLink = nativeBindings.exactSwapManagedLink;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;
 export const exactUnlinkDirectDetached = nativeBindings.exactUnlinkDirectDetached;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;
+export const getDoctorLinkProtocolVersion = nativeBindings.getDoctorLinkProtocolVersion;
 export const getSupportedLanguages = nativeBindings.getSupportedLanguages;
 export const getWorkProfile = nativeBindings.getWorkProfile;
 export const glob = nativeBindings.glob;
@@ -63,6 +67,7 @@ export const hasMatch = nativeBindings.hasMatch;
 export const highlightCode = nativeBindings.highlightCode;
 export const htmlToMarkdown = nativeBindings.htmlToMarkdown;
 export const initNativeCrashDiagnostics = nativeBindings.initNativeCrashDiagnostics;
+export const inspectConfigFilePermissionRepair = nativeBindings.inspectConfigFilePermissionRepair;
 export const invalidateFsScanCache = nativeBindings.invalidateFsScanCache;
 export const isoBackend = nativeBindings.isoBackend;
 export const isoDiff = nativeBindings.isoDiff;
@@ -88,6 +93,7 @@ export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoRepl
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;
 export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
 export const renameNoReplacePathAsync = nativeBindings.renameNoReplacePathAsync;
+export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;

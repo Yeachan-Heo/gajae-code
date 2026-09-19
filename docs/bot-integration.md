@@ -115,7 +115,7 @@ Mutating tools:
 - `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and an independently authorized token-file reference only; raw token material and paths outside the configured token root are rejected.
 - `gjc_coordinator_ack_codex_handoff` — acknowledges a Codex resume wake by durable `wake_key`; wake prompts never include GJC final responses.
 
-`gjc_coordinator_stop_session` closes a coordinator delegate-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. It refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral delegate sessions after the configured idle TTL.
+`gjc_coordinator_stop_session` closes a coordinator-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. Newly created `gjc_coordinator_start_session` sessions and fresh sessions created by `gjc_delegate_*` are ephemeral; existing recovered snapshots, reused sessions, and user-registered sessions retain their persisted ownership. The stop path refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral sessions after the configured idle TTL.
 
 `gjc_coordinator_retire_start_session` is the recovery terminal for a
 `gjc_coordinator_start_session` receipt stranded in `in_progress` after an
@@ -414,7 +414,7 @@ Hermes and OpenClaw can use the same MCP tool contract. Their names here are exa
 
 ## Long-running prompts are progress-aware
 
-`sdk.promptDeadlineMs` (default `1_800_000` ms) is an inactivity lease, not a fixed wall-clock kill. The SDK renews the accepted prompt's terminal deadline from attributable `tool_execution_start` / `tool_execution_end` events for the exact `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (default `21_600_000` ms, max `86_400_000`). Persist `session_id` / `turn_id` from the accepted prompt and reconcile via `turn.result` (Q26) or `gjc sdk session status` rather than replaying blindly. Heartbeats, streaming chatter, retries, and other-turn activity do not extend the lease. Distinguish `timeout_ms` on `await_turn` / coordinator await from the SDK terminal deadline.
+`sdk.promptDeadlineMs` (default `3_600_000` ms) is an inactivity lease, not a fixed wall-clock kill. The SDK renews the accepted prompt's terminal deadline from attributable `tool_execution_start` / `tool_execution_update` / `tool_execution_end` events for the exact `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (default `21_600_000` ms, max `86_400_000`). A running tool's partial-result `tool_execution_update` counts, so a long-running tool that streams output keeps the lease alive mid-run. Persist `session_id` / `turn_id` from the accepted prompt and reconcile via `turn.result` (Q26) or `gjc sdk session status` rather than replaying blindly. Heartbeats, assistant text/thinking chatter, retries, and other-turn activity do not extend the lease. Distinguish `timeout_ms` on `await_turn` / coordinator await from the SDK terminal deadline.
 
 ## Security and credential boundaries
 

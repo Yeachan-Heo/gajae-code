@@ -23,6 +23,7 @@ import {
 	reclaimDeadDaemonOwner,
 	renewDaemonHeartbeat,
 	renewOwnerHeartbeatSidecar,
+	retireProvisionalDaemonOwnership,
 	SERVING_EPOCH,
 	spawnTelegramDaemonOwner,
 	type TelegramDaemonFs,
@@ -30,6 +31,8 @@ import {
 	TelegramUpdatePoller,
 	waitForTelegramDaemonReady,
 } from "../src/sdk/bus/telegram-daemon";
+import { createDaemonControlHooks } from "../src/sdk/bus/telegram-daemon-cli";
+import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
 import type { NotificationSubscription } from "../src/sdk/router";
 
 function notificationSubscription(sessionId: string, generation = 1): NotificationSubscription {
@@ -1226,6 +1229,83 @@ describe("deleted forum-topic adoption updates", () => {
 		});
 	}
 });
+
+test("standalone Telegram command polling survives a zero-session idle window until explicit stop", async () => {
+	const agentDir = tempAgentDir();
+	const nowState = { value: 0 };
+	const timers = new Map<number, { callback: () => void; ms: number }>();
+	let nextTimerId = 1;
+	const firstPollEntered = Promise.withResolvers<void>();
+	const secondPollEntered = Promise.withResolvers<void>();
+	const releaseFirstPoll = Promise.withResolvers<void>();
+	let pollCount = 0;
+	const pid = process.pid;
+	const incarnation = "linux:4241";
+	await writeDaemonOwner(agentDir, {
+		pid,
+		incarnation,
+		ownerId: "standalone-owner",
+		acquisitionId: "standalone-owner",
+		ownershipPhase: "ready",
+		tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+		chatId: "42",
+		startedAt: 0,
+		heartbeatAt: 0,
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION,
+		servingEpoch: SERVING_EPOCH,
+	});
+	const daemon = new TelegramNotificationDaemon({
+		settings: settings(agentDir),
+		ownerId: "standalone-owner",
+		botToken: BOT_TOKEN,
+		chatId: "42",
+		idleTimeoutMs: 1,
+		keepAliveWithoutAttachments: true,
+		now: () => nowState.value,
+		pid,
+		pidIncarnation: () => incarnation,
+		setIntervalImpl: ((callback: () => void, ms: number) => {
+			const timer = nextTimerId++;
+			timers.set(timer, { callback, ms });
+			return timer as unknown as NodeJS.Timeout;
+		}) as typeof setInterval,
+		clearIntervalImpl: ((timer: NodeJS.Timeout) => {
+			timers.delete(timer as unknown as number);
+		}) as typeof clearInterval,
+		botApi: {
+			async call(method: string): Promise<unknown> {
+				if (method === "getUpdates") {
+					pollCount++;
+					if (pollCount === 1) {
+						firstPollEntered.resolve();
+						await releaseFirstPoll.promise;
+					}
+					if (pollCount === 2) secondPollEntered.resolve();
+					return { ok: true, result: [] };
+				}
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				return { ok: true, result: true };
+			},
+		},
+	});
+	try {
+		const runPromise = daemon.run();
+		await firstPollEntered.promise;
+		nowState.value = 100;
+		releaseFirstPoll.resolve();
+		await secondPollEntered.promise;
+		expect(pollCount).toBeGreaterThan(1);
+
+		daemon.requestStop();
+		await runPromise;
+		expect(timers.size).toBe(0);
+	} finally {
+		daemon.requestStop();
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("a throwing run-loop heartbeat renewal is contained and the daemon keeps serving (#4200)", async () => {
 	const runScenario = async (throwPath: "state" | "lock"): Promise<void> => {
 		const agentDir = tempAgentDir();
@@ -1438,6 +1518,298 @@ test("strict topic daemon rejects malformed present registry state before topic 
 		expect(
 			calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset?: unknown }).offset),
 		).toEqual([0]);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("official daemon status reports an unknown cause for a stopped legacy record", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation: "linux:100",
+			ownerId: "owner",
+			acquisitionId: "owner",
+			ownershipPhase: "ready",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			stoppedAt: 2,
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const status = await new TelegramDaemonController(settings(agentDir), {
+			pidAlive: () => false,
+		}).status();
+
+		expect(status.health).toBe("stopped");
+		expect(status.detail).toBe("stop cause: unknown");
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("official daemon status surfaces a persisted bounded stop cause", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation: "linux:100",
+			ownerId: "owner",
+			acquisitionId: "owner",
+			ownershipPhase: "ready",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			stoppedAt: 2,
+			stopCause: "reload",
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const status = await new TelegramDaemonController(settings(agentDir), {
+			pidAlive: () => false,
+		}).status();
+
+		expect(status.detail).toBe("stop cause: reload");
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	["owner", { ownerId: "owner-b" }],
+	["acquisition", { acquisitionId: "acquisition-b" }],
+	["pid", { pid: process.pid + 1 }],
+	["incarnation", { incarnation: "linux:4242" }],
+] as const)("provisional retirement rejects a foreign %s and accepts the matching lock", async (_field, foreignIdentity) => {
+	const agentDir = tempAgentDir();
+	const incarnation = "linux:4241";
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation,
+			ownerId: "owner-a",
+			acquisitionId: "owner-a",
+			ownershipPhase: "provisional",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const paths = daemonPaths(agentDir);
+		const originalState = await Bun.file(paths.state).text();
+		const foreignLock = `${JSON.stringify({
+			pid: state.pid,
+			incarnation,
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
+			startedAt: state.startedAt,
+			...foreignIdentity,
+		})}\n`;
+		await Bun.write(paths.lock, foreignLock);
+
+		const retirement = {
+			settings: settings(agentDir),
+			ownerId: state.ownerId,
+			acquisitionId: state.acquisitionId,
+			pid: state.pid,
+			pidAlive: () => false,
+			pidIncarnation: () => incarnation,
+			now: () => 2,
+		};
+		const retired = await retireProvisionalDaemonOwnership(retirement);
+
+		expect(retired).toBe(false);
+		expect(await Bun.file(paths.lock).text()).toBe(foreignLock);
+		expect(await Bun.file(paths.state).text()).toBe(originalState);
+
+		// Retirement acquires its own transition lock. This positive control
+		// proves the same setup reaches retirement rather than an early refusal.
+		await writeDaemonOwner(agentDir, state);
+		expect(await retireProvisionalDaemonOwnership(retirement)).toBe(true);
+		expect(await readDaemonState(retirement.settings)).toMatchObject({
+			ownershipPhase: "retired",
+			stoppedAt: 2,
+			stopCause: "startup_failed",
+		});
+		expect(fs.existsSync(paths.lock)).toBe(false);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"stop",
+	"reload",
+	"signal",
+	"idle_timeout",
+	"stalled_signal",
+] as const)("first stop cause %s survives orderly release", async cause => {
+	const agentDir = tempAgentDir();
+	const incarnation = "linux:4241";
+	const expectedCause = cause === "stalled_signal" ? "signal" : cause;
+	try {
+		const state: DaemonState = {
+			pid: process.pid,
+			incarnation,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			ownershipPhase: "ready",
+			tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+			chatId: "42",
+			startedAt: 1,
+			heartbeatAt: 1,
+			version: DAEMON_VERSION,
+			generation: DAEMON_GENERATION,
+			servingEpoch: SERVING_EPOCH,
+		};
+		await writeDaemonOwner(agentDir, state);
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: state.ownerId,
+			botToken: BOT_TOKEN,
+			chatId: state.chatId,
+			pid: process.pid,
+			pidIncarnation: () => incarnation,
+			botApi: { call: async () => ({ ok: true, result: [] }) },
+			idleTimeoutMs: 0,
+			...(cause === "stalled_signal"
+				? {
+						control: {
+							shouldStop: async () => false,
+							requestedAction: () => Promise.withResolvers<"reload" | "stop" | undefined>().promise,
+						},
+					}
+				: {}),
+		});
+
+		if (cause !== "idle_timeout") {
+			daemon.requestStop(expectedCause);
+			daemon.requestStop("unexpected_exception");
+			daemon.requestStop();
+		}
+		await daemon.run();
+
+		const stopped = await readDaemonState(settings(agentDir));
+		expect(stopped?.stopCause).toBe(expectedCause);
+		expect(stopped?.stoppedAt).toBeDefined();
+		expect(fs.existsSync(daemonPaths(agentDir).lock)).toBe(false);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("controller reload action survives the SIGTERM wakeup and daemon release", async () => {
+	const agentDir = tempAgentDir();
+	const incarnation = "linux:4241";
+	const now = Date.now();
+	let currentChatId = "42";
+	let signalSent = false;
+	let predecessorCause: string | undefined;
+	let pollEntered = false;
+	const pollReady = Promise.withResolvers<void>();
+	const baseSettings = settings(agentDir);
+	const settingsForDaemon = new Proxy(baseSettings, {
+		get(target, property) {
+			if (property === "getNotificationSettingsSnapshot") {
+				return () => {
+					const snapshot = target.getNotificationSettingsSnapshot();
+					return { ...snapshot, telegram: { ...snapshot.telegram, chatId: currentChatId } };
+				};
+			}
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
+	const state: DaemonState = {
+		pid: process.pid,
+		incarnation,
+		ownerId: "owner",
+		acquisitionId: "owner",
+		ownershipPhase: "ready",
+		tokenFingerprint: tokenFingerprint(BOT_TOKEN),
+		chatId: "42",
+		startedAt: now,
+		heartbeatAt: now,
+		version: DAEMON_VERSION,
+		generation: DAEMON_GENERATION,
+		servingEpoch: SERVING_EPOCH,
+	};
+	try {
+		await writeDaemonOwner(agentDir, state);
+		const daemon = new TelegramNotificationDaemon({
+			settings: settingsForDaemon,
+			ownerId: state.ownerId,
+			botToken: BOT_TOKEN,
+			chatId: state.chatId,
+			pid: process.pid,
+			pidIncarnation: () => incarnation,
+			control: createDaemonControlHooks(settingsForDaemon),
+			botApi: {
+				call: async (method, _body, options) => {
+					if (method !== "getUpdates") return { ok: true, result: [] };
+					pollEntered = true;
+					pollReady.resolve();
+					await new Promise<never>((_resolve, reject) => {
+						if (options?.signal?.aborted) {
+							reject(Object.assign(new Error("poll aborted"), { name: "AbortError" }));
+							return;
+						}
+						options?.signal?.addEventListener(
+							"abort",
+							() => reject(Object.assign(new Error("poll aborted"), { name: "AbortError" })),
+							{ once: true },
+						);
+					});
+				},
+			},
+		});
+		const daemonRun = daemon.run();
+		await pollReady.promise;
+
+		const controller = new TelegramDaemonController(settingsForDaemon, {
+			pidAlive: pid => {
+				if (pid !== process.pid) return false;
+				try {
+					const persisted = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as {
+						stopCause?: string;
+					};
+					if (persisted.stopCause) predecessorCause = persisted.stopCause;
+					return !signalSent || persisted.stopCause === undefined;
+				} catch {
+					return true;
+				}
+			},
+			pidIncarnation: () => incarnation,
+			processReference: () => ({
+				incarnation,
+				termination: "cooperative",
+				signalRoot: () => {
+					signalSent = true;
+					currentChatId = "43";
+					daemon.requestStop("signal");
+				},
+			}),
+		});
+
+		const result = await controller.reload({ gracefulTimeoutMs: 2_000, spawnIfStopped: false });
+		await daemonRun;
+
+		expect(pollEntered).toBe(true);
+		expect(result.ok).toBe(false);
+		expect(signalSent).toBe(true);
+		expect(predecessorCause).toBe("reload");
 	} finally {
 		fs.rmSync(agentDir, { recursive: true, force: true });
 	}

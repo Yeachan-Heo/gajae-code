@@ -206,14 +206,15 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 		expect(frames.filter(({ frame }) => correlationOf(frame).commandId === unrelated.commandId)).toHaveLength(0);
 		// The excluded owner is still pending and can be adopted only by its own start.
 		await handlers.get("agent_start")?.({ sdkRunToken: `${unrelated.commandId}:${unrelated.turnId}` }, ctx);
-		expect(
-			frames.filter(
-				({ frame }) =>
-					frame.type === "event" &&
-					frame.kind === "agent_start" &&
-					correlationOf(frame).commandId === unrelated.commandId,
-			),
-		).toHaveLength(1);
+		await waitFor(
+			() =>
+				frames.filter(
+					({ frame }) =>
+						frame.type === "event" &&
+						frame.kind === "agent_start" &&
+						correlationOf(frame).commandId === unrelated.commandId,
+				).length === 1,
+		);
 		await handlers.get("agent_end")?.(
 			{ sdkRunToken: `${unrelated.commandId}:${unrelated.turnId}`, messages: [] },
 			ctx,

@@ -1,8 +1,27 @@
 import { type ResolvedThinkingLevel, ThinkingLevel } from "@gajae-code/agent-core/thinking";
-import { clampThinkingLevelForModel, type Effort, THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
+import {
+	clampThinkingLevelForModel,
+	type Effort,
+	getMiniMaxThinkingMode,
+	THINKING_EFFORTS,
+} from "@gajae-code/ai/model-thinking";
 import type { Model } from "@gajae-code/ai/types";
+import { getThinkingLevelMetadata as getLevelMetadata, type ThinkingLevelMetadata } from "./thinking-metadata";
 
-export { getThinkingLevelMetadata, type ThinkingLevelMetadata } from "./thinking-metadata";
+export type { ThinkingLevelMetadata } from "./thinking-metadata";
+
+export function getThinkingLevelMetadata(level: ThinkingLevel, model?: Model): ThinkingLevelMetadata {
+	const mode = model && getMiniMaxThinkingMode(model);
+	if (mode === "always-on") {
+		return { value: level, label: "always on", description: "Reasoning is always on; effort control is unsupported" };
+	}
+	if (mode === "toggle" && level !== ThinkingLevel.Inherit) {
+		return level === ThinkingLevel.Off
+			? { value: level, label: "off", description: "Disable thinking (disabled)" }
+			: { value: level, label: "on", description: "Enable thinking (adaptive); no effort or token budget" };
+	}
+	return getLevelMetadata(level);
+}
 
 const THINKING_LEVELS = new Set<string>([ThinkingLevel.Inherit, ThinkingLevel.Off, ...THINKING_EFFORTS]);
 const EFFORT_LEVELS = new Set<string>(THINKING_EFFORTS);

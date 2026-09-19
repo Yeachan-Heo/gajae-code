@@ -12,7 +12,12 @@
  * advertise h2 via ALPN but then refuse or reset the connection at the HTTP/2
  * framing layer. Bun surfaces these as `ConnectionRefused`, `ConnectionReset`,
  * or `ConnectionClosed` rather than `HTTP2Unsupported`, so we treat those
- * codes as h2-fallback triggers as well.
+ * codes as h2-fallback triggers as well. `ConnectionRefused` is raised before
+ * the request is written, but a reset or a close does not prove the peer never
+ * consumed the body — it may have processed the request and died before
+ * answering. Replaying those two on h1 would duplicate the side effect, so
+ * `ConnectionReset` and `ConnectionClosed` fall back only for replay-safe
+ * methods; anything else rethrows the original error.
  *
  * ALPN-refusing hosts (notably zcode.z.ai, the GLM ZCode OAuth broker) abort
  * the TLS handshake entirely when the client offers ALPN h2. Bun reports that
@@ -47,12 +52,16 @@ export function installH2Fetch(): void {
 		// code; the h1 fallback below re-verifies the certificate itself.
 		"UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
 	]);
+	/** Fallback codes that may fire *after* the peer consumed the body — replay only when safe. */
+	const replayGatedCodes: ReadonlySet<string> = new Set(["ConnectionReset", "ConnectionClosed"]);
 	const wrapper = async function h2fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (!isHttps(input)) return original(input, init);
 		try {
 			return await original(input, { ...init, protocol: "http2" });
 		} catch (err) {
-			if (!h2FallbackCodes.has((err as { code?: string }).code ?? "")) throw err;
+			const code = (err as { code?: string }).code ?? "";
+			if (!h2FallbackCodes.has(code)) throw err;
+			if (replayGatedCodes.has(code) && !isReplaySafeRequest(input, init)) throw err;
 			return original(input, init);
 		}
 	} as typeof fetch & PatchedFetch;
@@ -61,6 +70,21 @@ export function installH2Fetch(): void {
 	Object.assign(wrapper, original);
 	wrapper[installed] = true;
 	globalThis.fetch = wrapper;
+}
+
+/** Methods a transport-layer retry cannot turn into a second side effect. */
+const replaySafeMethods: ReadonlySet<string> = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * Whether replaying this request on a fresh connection is side-effect free.
+ *
+ * PR #5614 introduces an identically-named helper with the same semantics for
+ * `HTTP2StreamReset`; whichever of the two lands second should collapse into
+ * this one rather than leaving the repo with two devices doing the same job.
+ */
+function isReplaySafeRequest(input: string | URL | Request, init?: RequestInit): boolean {
+	const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+	return replaySafeMethods.has(method.toUpperCase());
 }
 
 function isHttps(input: string | URL | Request): boolean {

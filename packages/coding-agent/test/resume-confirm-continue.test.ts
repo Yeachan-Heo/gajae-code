@@ -12,8 +12,11 @@ import {
 	BARE_RESUME_INTERACTIVE_ERROR,
 	BARE_RESUME_OPEN_ERROR,
 	createSessionManager,
+	operatorFacingSessionOpenMessage,
 	runInteractiveMode,
 	runRootCommand,
+	SessionForkDeclinedError,
+	SessionNotFoundError,
 	StartupUpdateOrchestrator,
 } from "../src/main";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
@@ -29,6 +32,9 @@ import {
 	SessionManager,
 	SessionTranscriptOversizedError,
 } from "../src/session/session-manager";
+
+const SESSION_FORK_DECLINED_MESSAGE =
+	'Session "selected" is in another project (/worktree). Re-run from that directory, or accept the fork when prompted.';
 
 const SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE =
 	"The selected legacy session's artifacts exceed the supported migration capacity. Archive or remove only that legacy session's artifacts after confirming they are no longer needed, then retry.";
@@ -412,6 +418,49 @@ describe("direct fork destination authority", () => {
 	});
 });
 
+describe("normal session startup open errors", () => {
+	it("maps a declined cross-project resume to actionable operator guidance", () => {
+		const error = new SessionForkDeclinedError("selected", "/worktree");
+
+		expect(error.code).toBe("session_fork_declined");
+		expect(error.sessionId).toBe("selected");
+		expect(error.projectDirectory).toBe("/worktree");
+		expect(operatorFacingSessionOpenMessage(error)).toBe(
+			'Session "selected" is in another project (/worktree). Re-run from that directory, or accept the fork when prompted.',
+		);
+	});
+
+	it("types missing fork and resume ids with an operator-facing message", async () => {
+		using sessionDir = TempDir.createSync("@gjc-session-open-missing-");
+		const activeSettings = {
+			get: (key: SettingPath) => (key === "sessionMemory.mode" ? "off" : "copy-retain"),
+			getAgentDir: () => "/managed-agent",
+		} as unknown as Settings;
+
+		for (const args of [
+			parseArgs(["--fork", "missing", "--session-dir", sessionDir.path()]),
+			parseArgs(["--resume", "missing", "--session-dir", sessionDir.path()]),
+		]) {
+			let error: unknown;
+			try {
+				await createSessionManager(args, "/workspace", activeSettings);
+			} catch (caught) {
+				error = caught;
+			}
+
+			expect(error).toBeInstanceOf(SessionNotFoundError);
+			if (!(error instanceof SessionNotFoundError)) throw new Error("Expected a typed missing-session error");
+			expect(error.code).toBe("session_not_found");
+			expect(error.sessionId).toBe("missing");
+			expect(operatorFacingSessionOpenMessage(error)).toBe('Session "missing" not found.');
+		}
+	});
+
+	it("leaves unrelated startup errors unrecognized", () => {
+		expect(operatorFacingSessionOpenMessage(new Error("unexpected startup failure"))).toBeUndefined();
+	});
+});
+
 it("bounds a rejected selected strict-open promise to one error before session startup or fallback", async () => {
 	let authDiscoveries = 0;
 	let sessionCreations = 0;
@@ -487,6 +536,11 @@ it("renders fixed redacted operator guidance for bare-resume managed failures", 
 
 it("renders the same fixed guidance for normal startup typed failures", async () => {
 	for (const testCase of [
+		{
+			error: new SessionForkDeclinedError("selected", "/worktree"),
+			message: SESSION_FORK_DECLINED_MESSAGE,
+		},
+		{ error: new SessionNotFoundError("missing"), message: 'Session "missing" not found.' },
 		{
 			error: new SessionArtifactCapacityError("PRIVATE_PATH PRIVATE_CONTENT"),
 			message: SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE,

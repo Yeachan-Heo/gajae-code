@@ -1,5 +1,11 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelSupportsServiceTier, modelsAreEqual } from "@gajae-code/ai/core";
+import {
+	getMiniMaxThinkingMode,
+	getSupportedEfforts,
+	type Model,
+	modelSupportsServiceTier,
+	modelsAreEqual,
+} from "@gajae-code/ai/core";
 import {
 	Container,
 	fuzzyFilter,
@@ -26,6 +32,7 @@ import type { BillingPath } from "../../config/billing-path";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
+	isModelProfileProxyConfigured,
 	requiresQualifiedModelProfileRoleResolution,
 	resolveProxyMode,
 	rewriteSelectorForProxy,
@@ -391,6 +398,7 @@ export class ModelSelectorComponent extends Container {
 	#onCancelCallback = (() => {}) as CancelCallback;
 	#errorMessage?: unknown;
 	#tui: TUI;
+	#renderScope: "full" | "layout";
 	#scopedModels: ReadonlyArray<ScopedModelItem>;
 	#temporaryOnly: boolean;
 	#currentModel?: Model;
@@ -425,6 +433,7 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeMenuOpen: boolean = false;
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
+	#credentiallessProviders = new Set<string>();
 	#bareProfileAuthByName = new Map<string, boolean>();
 	// Rebuilt with the provider and bare-selector snapshots on every catalog or credential refresh.
 	#profileAuthByName = new Map<string, boolean>();
@@ -452,6 +461,8 @@ export class ModelSelectorComponent extends Container {
 		onSelect: RoleSelectCallback,
 		onCancel: () => void,
 		options?: {
+			/** Use layout only when mounted outside the viewport-anchor transcript subtree. */
+			renderScope?: "full" | "layout";
 			temporaryOnly?: boolean;
 			initialSearchInput?: string;
 			sessionId?: string;
@@ -473,6 +484,7 @@ export class ModelSelectorComponent extends Container {
 		super();
 
 		this.#tui = tui;
+		this.#renderScope = options?.renderScope ?? "full";
 		this.#settings = settings;
 		this.#modelRegistry = modelRegistry;
 		this.#scopedModels = scopedModels;
@@ -556,7 +568,7 @@ export class ModelSelectorComponent extends Container {
 					this.#clampPresetCursor();
 					void this.#refreshProviderAuth();
 					this.#renderPresetLanding();
-					this.#tui.requestRender();
+					this.#requestRender();
 					return;
 				}
 				if (this.#viewMode === "smart-routing" && this.#smartRoutingPanel) return;
@@ -567,7 +579,7 @@ export class ModelSelectorComponent extends Container {
 					void this.#initializeCatalogView();
 					return;
 				}
-				if (this.#refreshCatalogView()) this.#tui.requestRender();
+				if (this.#refreshCatalogView()) this.#requestRender();
 			});
 		}
 
@@ -588,7 +600,7 @@ export class ModelSelectorComponent extends Container {
 			const panel = this.#smartRoutingPanel;
 			if (!panel) return;
 			panel.updateProviderOrderHint(this.#providerOrderHintFor(panel.getProviderOrder()));
-			this.#tui.requestRender();
+			this.#requestRender();
 		});
 		this.#unsubscribeAuthGeneration =
 			this.#modelRegistry.authStorage?.onGenerationChanged?.(() => {
@@ -606,11 +618,16 @@ export class ModelSelectorComponent extends Container {
 			} else {
 				this.#listContainer.addChild(new Text(theme.fg("muted", "Loading model presets..."), 0, 0));
 			}
-			this.#tui.requestRender();
+			this.#requestRender();
 			void this.#initializePresetLanding();
 		} else {
 			void this.#initializeCatalogView();
 		}
+	}
+
+	#requestRender(): void {
+		if (this.#renderScope === "layout") this.#tui.requestLayoutRender("model-selector");
+		else this.#tui.requestRender();
 	}
 
 	override dispose(): void {
@@ -1084,7 +1101,7 @@ export class ModelSelectorComponent extends Container {
 			this.#commitMaterializedCatalog(catalog);
 			this.#updateTabBar();
 			this.#applyTabFilter();
-			this.#tui.requestRender();
+			this.#requestRender();
 		} catch (presentationError) {
 			const finalError =
 				refreshError !== undefined
@@ -1117,7 +1134,7 @@ export class ModelSelectorComponent extends Container {
 			void this.#refreshSelectedProvider().catch(error => {
 				this.#errorMessage = error instanceof Error ? error.message : String(error);
 				this.#updateList();
-				this.#tui.requestRender();
+				this.#requestRender();
 			});
 		};
 		this.#tabBar = tabBar;
@@ -1432,17 +1449,16 @@ export class ModelSelectorComponent extends Container {
 				const proxyProvider = tryResolveProxyProviderId(this.#settings);
 				if (
 					proxyProvider !== undefined &&
-					!(this.#modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
+					!isModelProfileProxyConfigured(
+						proxyProvider,
+						this.#modelRegistry.getConfiguredProviderIds?.(),
+						this.#credentiallessProviders.has(proxyProvider),
+					)
 				)
 					return false;
 				try {
 					if (resolveProxyMode(this.#settings) === "always") {
-						const configuredProviders = this.#modelRegistry.getConfiguredProviderIds?.() ?? [];
-						if (
-							proxyProvider === undefined ||
-							this.#isProviderAuthenticated(proxyProvider) !== true ||
-							!configuredProviders.includes(proxyProvider)
-						)
+						if (proxyProvider === undefined || this.#isProviderAuthenticated(proxyProvider) !== true)
 							return false;
 					}
 				} catch {
@@ -1521,6 +1537,7 @@ export class ModelSelectorComponent extends Container {
 	async #refreshProviderAuth(): Promise<void> {
 		const refreshGeneration = ++this.#providerAuthRefreshGeneration;
 		this.#providerAuthById = new Map();
+		this.#credentiallessProviders = new Set();
 		this.#bareProfileAuthByName = new Map();
 		this.#profileAuthByName = new Map();
 		const availableModels = this.#getProfileAvailableModels();
@@ -1577,9 +1594,9 @@ export class ModelSelectorComponent extends Container {
 				[...providers].map(async provider => {
 					try {
 						const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
-						return [provider, apiKey === kNoAuth || isAuthenticated(apiKey)] as const;
+						return [provider, apiKey === kNoAuth || isAuthenticated(apiKey), apiKey === kNoAuth] as const;
 					} catch {
-						return [provider, false] as const;
+						return [provider, false, false] as const;
 					}
 				}),
 			);
@@ -1589,7 +1606,10 @@ export class ModelSelectorComponent extends Container {
 				refreshGeneration !== this.#providerAuthRefreshGeneration
 			)
 				return;
-			this.#providerAuthById = new Map(entries);
+			this.#providerAuthById = new Map(entries.map(([provider, authenticated]) => [provider, authenticated]));
+			this.#credentiallessProviders = new Set(
+				entries.filter(([, , keyless]) => keyless).map(([provider]) => provider),
+			);
 			const profileAuthEntries = await Promise.all(
 				[...this.#getPresetGroups().values()].flat().map(async profile => {
 					const bindings = resolveProfileBindings(profile);
@@ -1645,7 +1665,7 @@ export class ModelSelectorComponent extends Container {
 			) {
 				this.#providerAuthPending = false;
 				this.#renderPresetLanding();
-				this.#tui.requestRender();
+				this.#requestRender();
 			}
 		}
 	}
@@ -1739,7 +1759,7 @@ export class ModelSelectorComponent extends Container {
 		}
 		void this.#refreshProviderAuth();
 		this.#renderPresetLanding();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
@@ -1766,7 +1786,7 @@ export class ModelSelectorComponent extends Container {
 		this.#headerContainer.clear();
 		this.#listContainer.clear();
 		this.#listContainer.addChild(new Text(theme.fg("muted", "Loading models..."), 0, 0));
-		this.#tui.requestRender();
+		this.#requestRender();
 
 		const load = this.#loadModels().then(() => {
 			this.#catalogLoaded = true;
@@ -1786,7 +1806,7 @@ export class ModelSelectorComponent extends Container {
 				this.#buildProviderTabs();
 				this.#updateTabBar();
 				this.#updateList();
-				this.#tui.requestRender();
+				this.#requestRender();
 			}
 		} finally {
 			if (this.#catalogLoadPromise === load) this.#catalogLoadPromise = undefined;
@@ -1798,7 +1818,7 @@ export class ModelSelectorComponent extends Container {
 		this.#updateTabBar();
 		// Apply the latest query: input remains responsive while the catalog loads.
 		this.#filterModels(this.#searchInput.getValue());
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	/**
@@ -1844,7 +1864,7 @@ export class ModelSelectorComponent extends Container {
 		const modelLabel = sanitizeText(`${model.provider}/${model.id}`).replace(/\s+/g, " ").trim();
 		let label = modelLabel;
 		if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-			label += ` (${getThinkingLevelMetadata(thinkingLevel).label})`;
+			label += ` (${getThinkingLevelMetadata(thinkingLevel, model).label})`;
 		}
 		const billing = this.#billingPathForModel(model)?.label;
 		if (billing) label += ` [${billing}]`;
@@ -1945,7 +1965,7 @@ export class ModelSelectorComponent extends Container {
 		this.#tabBar = null;
 		this.#listContainer.clear();
 		this.#listContainer.addChild(this.#smartRoutingPanel);
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#switchToPresetMode(): void {
@@ -1954,7 +1974,7 @@ export class ModelSelectorComponent extends Container {
 		this.#presetCursor = Math.min(this.#presetCursor, Math.max(0, this.#getPresetRows().length - 1));
 		void this.#refreshProviderAuth();
 		this.#renderPresetLanding();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	refreshSmartRoutingState(): void {
@@ -1971,7 +1991,7 @@ export class ModelSelectorComponent extends Container {
 			stale: this.#smartRoutingIsStale(),
 			preview,
 		});
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#renderPresetLanding(): void {
@@ -2205,7 +2225,7 @@ export class ModelSelectorComponent extends Container {
 				const assigned = this.#roles[role];
 				if (roleInfo.tag && assigned && modelsAreEqual(assigned.model, item.model)) {
 					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
-					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
+					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel, item.model).label;
 
 					// Subagent roles (task.agentModelOverrides) run under task.serviceTier,
 					// so their ⚡ uses the effective subagent tier. A non-subagent
@@ -2317,6 +2337,11 @@ export class ModelSelectorComponent extends Container {
 	#renderActionMenu(item: ModelItem | CanonicalModelItem): void {
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(new Text(theme.fg("muted", `  Action for: ${item.model.id}`), 0, 0));
+		if (getMiniMaxThinkingMode(item.model) === "always-on") {
+			this.#listContainer.addChild(
+				new Text(theme.fg("muted", "  Reasoning: always on; effort control is unsupported"), 0, 0),
+			);
+		}
 		this.#listContainer.addChild(new Spacer(1));
 		const actionCount = this.#getActionCount(item.model);
 		for (let i = 0; i < actionCount; i++) {
@@ -2381,7 +2406,7 @@ export class ModelSelectorComponent extends Container {
 		// Show the highlighted reasoning level — never the model id (that mislabel
 		// made "Reasoning for Default: gpt-5.6-luna" look like a level).
 		const selectedLevel = choice.levels[this.#selectedThinkingIndex];
-		const selectedLevelLabel = selectedLevel ? getThinkingLevelMetadata(selectedLevel).label : "—";
+		const selectedLevelLabel = selectedLevel ? getThinkingLevelMetadata(selectedLevel, choice.item.model).label : "—";
 		this.#listContainer.addChild(new Spacer(1));
 		this.#listContainer.addChild(
 			new Text(theme.fg("muted", `  Reasoning for ${targetLabel}: ${selectedLevelLabel}`), 0, 0),
@@ -2389,7 +2414,7 @@ export class ModelSelectorComponent extends Container {
 		this.#listContainer.addChild(new Spacer(1));
 		for (let i = 0; i < choice.levels.length; i++) {
 			const level = choice.levels[i];
-			const metadata = getThinkingLevelMetadata(level);
+			const metadata = getThinkingLevelMetadata(level, choice.item.model);
 			const prefix = i === this.#selectedThinkingIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 			const label = `${metadata.label} — ${metadata.description}`;
 			this.#listContainer.addChild(
@@ -2717,7 +2742,7 @@ export class ModelSelectorComponent extends Container {
 			this.#clampPresetCursor();
 		}
 		void this.#refreshProviderAuth();
-		this.#tui.requestRender();
+		this.#requestRender();
 	}
 
 	#beginActionMenuOrSelect(item: ModelItem | CanonicalModelItem): void {
@@ -2930,7 +2955,7 @@ export class ModelSelectorComponent extends Container {
 	async #handleTrackedAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): Promise<void> {
 		if (this.#assignmentState !== "idle") return;
 		this.#assignmentState = "assigning";
-		this.#tui.requestRender();
+		this.#requestRender();
 		try {
 			await Promise.resolve(this.#onSelectCallback(selection));
 		} catch {
@@ -2940,7 +2965,7 @@ export class ModelSelectorComponent extends Container {
 			const shouldClose = this.#closeAfterAssignment;
 			this.#closeAfterAssignment = false;
 			if (shouldClose) this.#onCancelCallback();
-			else this.#tui.requestRender();
+			else this.#requestRender();
 		}
 	}
 

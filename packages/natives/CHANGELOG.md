@@ -2,9 +2,20 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Fixed
 
+- `exact_remove_directory_tree` accepts a detach-only mode that renames the validated directory to its no-replace `.removing` quarantine and returns it as a handle-bound detach instead of deleting it, so a host whose filter rejects the exact-removal primitive can still retire a lock tree. The Windows detach-only branch derives its identity from the retained handle, so a directory's non-zero mtime and size match the object being retired instead of failing the detach closed (#5434).
 - Recheck full computer-use supervisor state between keys, and report keyboard-event creation failures while retaining pressed keys for cleanup before cursor restoration.
+
+- The committed `native/index.d.ts` matches its generator output again, so building the workspace (`bun run build:native`, `sh scripts/install.sh --dev`) no longer leaves a tracked generated file dirty on a clean checkout.
+
+## [0.16.7] - 2026-09-13
 
 ## [0.16.6] - 2026-09-07
 

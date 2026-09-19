@@ -406,6 +406,12 @@ export interface BuildSystemPromptOptions {
 	alwaysApplyRules?: AlwaysApplyRule[];
 	/** Whether secret obfuscation is active. When true, explains the redaction format in the prompt. */
 	secretsEnabled?: boolean;
+	/**
+	 * Whether the `task` tool advertises the `isolated` parameter in this session
+	 * (`task.isolation.mode !== "none"`). Worktree routing guidance depends on it:
+	 * without isolation the agent must use a plain `git worktree`, never refuse.
+	 */
+	taskIsolationEnabled?: boolean;
 	/** Pre-loaded workspace tree (skips discovery if provided). May be a Promise to allow early kick-off. */
 	workspaceTree?: WorkspaceTree | Promise<WorkspaceTree>;
 	/**
@@ -570,6 +576,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolDiscoveryActive = false,
 		eagerTasks = false,
 		secretsEnabled = false,
+		taskIsolationEnabled = false,
 		workspaceTree: providedWorkspaceTree,
 		subagent = false,
 	} = options;
@@ -749,6 +756,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolDiscoveryActive: toolDiscoveryActive && hasHiddenToolDiscoveryTool,
 		eagerTasks,
 		secretsEnabled,
+		taskIsolationEnabled,
 		subagent,
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);

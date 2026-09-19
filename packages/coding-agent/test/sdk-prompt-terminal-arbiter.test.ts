@@ -6,6 +6,7 @@ import {
 	type ReconciliationStore,
 	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
+import { failedPromptOutcome } from "../src/sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../src/sdk/prompt-status";
 
 class MemoryStore implements ReconciliationStore {
@@ -94,7 +95,7 @@ const correlation = { commandId: "command", turnId: "turn" };
 const stopped = (reason: "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled") =>
 	({ kind: "stopped", reason, provenance: "agent" }) as const;
 const failed = (code: "prompt_failed" | "prompt_deadline_exceeded") =>
-	({ kind: "failed", code, message: `${code} message`, provenance: "agent_failed" }) as const;
+	failedPromptOutcome({ code, provenance: "agent_failed", evidence: {} });
 
 async function accepted(store = new MemoryStore()) {
 	const reconciliation = createKindAwareReconciliation({ store, now: () => 100 });
@@ -162,7 +163,7 @@ describe("SDK prompt terminal arbiter", () => {
 		);
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 			status: "failed",
-			error: { code: "legacy_error", message: "legacy message" },
+			error: { code: "legacy_error", message: "Prompt submission failed." },
 		});
 	});
 
@@ -190,7 +191,7 @@ describe("SDK prompt terminal arbiter", () => {
 		});
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 			status: "failed",
-			error: { code: "overridden", message: "override" },
+			error: { code: "overridden", message: "Prompt submission failed." },
 		});
 	});
 

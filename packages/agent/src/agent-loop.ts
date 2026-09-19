@@ -34,7 +34,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
-import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
+import { copyProviderResolvedToolCall, isProviderResolvedToolCall } from "@gajae-code/ai/utils/block-symbols";
 import {
 	attachUnicodeEscapeEvidence,
 	type UnicodeEscapeEvidence,
@@ -879,6 +879,7 @@ function sanitizeProviderSafetyStopProvenance(
 			return repaired;
 		}
 		restoreTransientUnicodeEscapeEvidence(rebuilt.content, message);
+		restoreProviderResolvedMarkers(rebuilt.content, message);
 		return rebuilt;
 	}
 	const rebuilt = managedAssistantShell(message, model);
@@ -2029,6 +2030,8 @@ function losslessDetachedClone<T>(value: T): T {
 						"kind",
 						"status",
 						"code",
+						"http2RstCode",
+						"nativeErrorCode",
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
@@ -2107,6 +2110,7 @@ function managedAssistantShell(
 	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
 	restoreTransientUnicodeEscapeEvidence(content, value);
+	restoreProviderResolvedMarkers(content, value);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -2179,6 +2183,52 @@ function managedAssistantShell(
 function managedContentBlock(block: unknown): AssistantMessage["content"] {
 	const normalized = managedAssistantContent(block);
 	return normalized ? [normalized] : [];
+}
+
+/**
+ * Carry the in-process provider-resolved marker across a managed snapshot.
+ *
+ * A managed shell deep-snapshots content, and symbol keys do not survive that.
+ * Losing the marker would let the loop dispatch a tool call the provider already
+ * executed, so it is re-attached by tool-call identity (`id` plus `name`), the
+ * same way transient unicode-escape evidence is restored.
+ */
+function restoreProviderResolvedMarkers(destination: AssistantMessage["content"], source: unknown): void {
+	const sourceContent = managedProperty(source, "content");
+	if (!Array.isArray(sourceContent)) return;
+	const marked = sourceContent.filter(
+		(block): block is object => typeof block === "object" && block !== null && isProviderResolvedToolCall(block),
+	);
+	if (marked.length === 0) return;
+	for (const destinationBlock of destination) {
+		if (destinationBlock.type !== "toolCall") continue;
+		const matches = marked.filter(
+			candidate =>
+				managedProperty(candidate, "id") === destinationBlock.id &&
+				managedProperty(candidate, "name") === destinationBlock.name,
+		);
+		// Ambiguity suppresses every candidate rather than dispatching a call the
+		// provider may already have executed: this predicate is a safety gate.
+		for (const match of matches) copyProviderResolvedToolCall(destinationBlock, match as object);
+	}
+}
+
+/**
+ * Detach content the way `structuredClone` does, but keep the in-process
+ * provider-resolved marker. The abort path clamps partial content and then
+ * filters provider-resolved calls out of the synthesized aborted results, so a
+ * plain structured clone would fabricate a failed tool result for a call the
+ * provider already ran.
+ */
+function cloneContentPreservingProviderResolved(content: AssistantMessage["content"]): AssistantMessage["content"] {
+	const cloned = structuredClone(content) as AssistantMessage["content"];
+	for (let index = 0; index < content.length; index += 1) {
+		const source = content[index];
+		const target = cloned[index];
+		if (source?.type !== "toolCall" || target?.type !== "toolCall") continue;
+		copyProviderResolvedToolCall(target, source);
+	}
+	return cloned;
 }
 
 function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
@@ -2624,6 +2674,7 @@ class ManagedAttemptTransaction {
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
 	#committed = false;
+	#rejected = false;
 	#degradedFieldDiagnostics = new Set<string>();
 
 	constructor(
@@ -2810,6 +2861,14 @@ class ManagedAttemptTransaction {
 
 	get committed(): boolean {
 		return this.#committed;
+	}
+
+	reject(): void {
+		this.#rejected = true;
+	}
+
+	get rejected(): boolean {
+		return this.#rejected;
 	}
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
@@ -3173,6 +3232,7 @@ class ManagedAttemptTransaction {
 				managedProperty(snapshot, "content") as AssistantMessage["content"],
 				value,
 			);
+			restoreProviderResolvedMarkers(managedProperty(snapshot, "content") as AssistantMessage["content"], value);
 		}
 		return snapshot;
 	}
@@ -4048,7 +4108,7 @@ async function runLoopBody(
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
-				!escapedToolTransaction?.committed &&
+				(!escapedToolTransaction?.committed || escapedToolTransaction.rejected) &&
 				hasEscapedNonAsciiToolCall(message)
 			) {
 				escapedNonAsciiResampleAttempt++;
@@ -4205,7 +4265,7 @@ async function runLoopBody(
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 				const toolCalls = message.content.filter(
-					(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+					(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
@@ -4238,7 +4298,7 @@ async function runLoopBody(
 			// Check for tool calls
 			type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 			const toolCalls = message.content.filter(
-				(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+				(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 			);
 			hasMoreToolCalls = toolCalls.length > 0;
 
@@ -4750,10 +4810,9 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Set up a single abort race: register the abort listener once for the whole
-			// stream and reuse the same race promise for every iterator.next() instead of
-			// allocating Promise.withResolvers and add/removeEventListener per event.
-			let abortRacePromise: Promise<typeof ABORTED> | undefined;
+			// Keep one listener, but race a fresh promise per read so pending abort
+			// reactions do not retain every event until the request ends.
+			let settleReadAbort: (() => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4769,18 +4828,32 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-				const onAbort = () => resolve(ABORTED);
+				const onAbort = () => settleReadAbort?.();
 				requestSignal.addEventListener("abort", onAbort, { once: true });
-				abortRacePromise = promise;
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (abortRacePromise) {
-						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
+					if (requestSignal) {
+						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+						let settled = false;
+						const settleAbort = (): void => {
+							if (settled) return;
+							settled = true;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
+						};
+						config.onAbortRaceReactionChange?.(1);
+						settleReadAbort = settleAbort;
+						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
+						try {
+							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
+						} finally {
+							settleAbort();
+							settleReadAbort = undefined;
+						}
 						if (result === ABORTED) {
 							closeIterator();
 							const aborted = emitAbortedAssistantMessage(
@@ -4819,17 +4892,20 @@ async function streamAssistantResponse(
 					const event = next.value;
 
 					switch (event.type) {
-						case "start":
+						case "start": {
 							partialMessage = config.fallbackManaged
 								? managedAssistantShell(event.partial, config.model, managedDegradedFieldDiagnostics)
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
+							let acceptedStart = true;
 							if (provisionalToolTransaction) {
-								config.onProvisionalAssistantMessageEvent?.(partialMessage, event);
+								acceptedStart = config.onProvisionalAssistantMessageEvent?.(partialMessage, event) !== false;
+								if (!acceptedStart) provisionalToolTransaction.reject();
 							}
-							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
+							if (acceptedStart) stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
+						}
 
 						case "toolChoiceIncapability":
 							config.onToolChoiceIncapability?.(event);
@@ -4862,13 +4938,17 @@ async function streamAssistantResponse(
 									? managedAssistantEventSnapshot(event, partialMessage, managedDegradedFieldDiagnostics)
 									: event;
 								context.messages[context.messages.length - 1] = partialMessage;
+								let acceptedUpdate = true;
 								if (provisionalToolTransaction) {
-									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
-									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
+									acceptedUpdate =
+										config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent) !== false;
+									if (!acceptedUpdate) provisionalToolTransaction.reject();
+									if (acceptedUpdate)
+										provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
 								} else {
 									config.onAssistantMessageEvent?.(partialMessage, partialEvent);
 								}
-								if (signal?.aborted) continue;
+								if (!acceptedUpdate || signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
 									assistantMessageEvent: partialEvent,
@@ -4939,7 +5019,7 @@ function emitAbortedAssistantMessage(
 	const now = Date.now();
 	const abortedMessage: AssistantMessage = {
 		role: "assistant",
-		content: partialMessage ? structuredClone(partialMessage.content) : [],
+		content: partialMessage ? cloneContentPreservingProviderResolved(partialMessage.content) : [],
 		api: config.model.api,
 		provider: config.model.provider,
 		model: config.model.id,
@@ -5035,7 +5115,7 @@ async function executeToolCalls(
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 	const toolCalls = assistantMessage.content.filter(
-		(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+		(c): c is ToolCallContent => c.type === "toolCall" && !isProviderResolvedToolCall(c),
 	);
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));

@@ -992,6 +992,14 @@ function redactSecrets(input: string): string {
 		// Google API keys are a fixed 39-character shape carrying no keyword.
 		/\bAIza[0-9A-Za-z_-]{35}\b/g,
 		/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+		// The shapes `crash/upstream/envelope.ts` classifies as credential-like.
+		// Stripe and Hugging Face separate with `_`, so the keyword rule above,
+		// which requires `sk`/`pk`/`rk` followed by `[-_A-Za-z0-9]`, still misses
+		// `hf_` and `npm_` entirely.
+		/\bnpm_[A-Za-z0-9]{20,}\b/g,
+		/\bglpat-[A-Za-z0-9_-]{20,}\b/g,
+		/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+		/\bhf_[A-Za-z0-9]{20,}\b/g,
 		// Basic-auth credentials in a URL. The scheme repetition is bounded for the
 		// same reason the boundary above is anchored.
 		/(?<![A-Za-z0-9+.-])[a-z][a-z0-9+.-]{0,15}:\/\/[^/\s:@]{1,256}:[^/\s@]{1,256}@/gi,

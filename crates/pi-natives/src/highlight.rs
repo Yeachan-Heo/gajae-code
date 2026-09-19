@@ -27,6 +27,32 @@ thread_local! {
 	static SCOPE_COLOR_CACHE: RefCell<HashMap<Scope, usize>> = RefCell::new(HashMap::with_capacity(256));
 }
 
+// Two LRU entries per calling thread protect interleaved Markdown/tool
+// consumers. Admission bounds entry count and source/output/palette bytes, NOT
+// parser heap. Expiry is lazy, sliding reuse expiry: idle allocations remain
+// until another highlight call or thread exit; this is not a ten-second
+// deallocation deadline. Ineligible inputs still take the unchanged full-color
+// path.
+const CHECKPOINT_ENTRIES: usize = 2;
+const CHECKPOINT_INPUT_BYTES: usize = 200_000;
+const CHECKPOINT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const CHECKPOINT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct HighlightCheckpoint {
+	code:        String,
+	lang:        Option<String>,
+	palette:     [String; 11],
+	offset:      usize,
+	output:      String,
+	parse_state: ParseState,
+	scope_stack: ScopeStack,
+	created:     std::time::Instant,
+}
+
+thread_local! {
+	static HIGHLIGHT_CHECKPOINT: RefCell<Vec<HighlightCheckpoint>> = const { RefCell::new(Vec::new()) };
+}
+
 fn get_syntax_set() -> &'static SyntaxSet {
 	SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
 }
@@ -369,6 +395,11 @@ pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColor
 	// Defense-in-depth (F19/F3): above the cap, skip the synchronous highlight and
 	// return the original code — the same fallback used when highlighting fails.
 	if code.len() > *MAX_HIGHLIGHT_BYTES {
+		HIGHLIGHT_CHECKPOINT.with(|slot| {
+			slot
+				.borrow_mut()
+				.retain(|entry| entry.created.elapsed() <= CHECKPOINT_MAX_AGE);
+		});
 		return code;
 	}
 	let inserted = colors.inserted.as_deref().unwrap_or("");
@@ -398,13 +429,42 @@ pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColor
 	}
 	.unwrap_or_else(|| ss.find_syntax_plain_text());
 
-	let mut parse_state = ParseState::new(syntax);
-	let mut scope_stack = ScopeStack::new();
-	let mut result = String::with_capacity(code.len() * 2);
-
-	for line in syntect::util::LinesWithEndings::from(code.as_str()) {
+	let eligible = code.len() <= CHECKPOINT_INPUT_BYTES
+		&& lang.as_ref().is_none_or(|value| value.len() <= 256)
+		&& palette.iter().map(|color| color.len()).sum::<usize>() <= 4096;
+	let previous = HIGHLIGHT_CHECKPOINT.with(|slot| {
+		let mut entries = slot.borrow_mut();
+		entries.retain(|entry| entry.created.elapsed() <= CHECKPOINT_MAX_AGE);
+		let index = entries.iter().rposition(|entry| {
+			eligible
+				&& entry.lang == lang
+				&& entry.palette.iter().zip(palette).all(|(a, b)| a == b)
+				&& code.starts_with(&entry.code)
+		});
+		index.map(|index| entries.remove(index))
+	});
+	let (mut parse_state, mut scope_stack, mut result, start) = match previous {
+		Some(entry) => (entry.parse_state, entry.scope_stack, entry.output, entry.offset),
+		None => {
+			(ParseState::new(syntax), ScopeStack::new(), String::with_capacity(code.len() * 2), 0)
+		},
+	};
+	// Only newline-terminated lines are stable. Reparse the incomplete final line
+	// from its pre-line state; an appended quote/comment delimiter can recolor it.
+	let stable_end = code.rfind('\n').map_or(0, |index| index + 1);
+	let mut offset = start;
+	let mut checkpoint = None;
+	let mut parse_failed = false;
+	for line in syntect::util::LinesWithEndings::from(&code[start..]) {
+		if eligible && offset == stable_end && result.len() <= CHECKPOINT_OUTPUT_BYTES {
+			checkpoint = Some((parse_state.clone(), scope_stack.clone(), result.clone()));
+		}
+		offset += line.len();
+		#[cfg(test)]
+		PARSED_LINES.with(|count| count.set(count.get() + 1));
 		let Ok(ops) = parse_state.parse_line(line, ss) else {
-			// Parse error - append unhighlighted line and continue
+			// Preserve the existing error output, but never retain an errored state.
+			parse_failed = true;
 			result.push_str(line);
 			continue;
 		};
@@ -457,6 +517,29 @@ pub fn highlight_code(code: String, lang: Option<String>, colors: HighlightColor
 		}
 	}
 
+	if eligible && !parse_failed && result.len() <= CHECKPOINT_OUTPUT_BYTES {
+		if stable_end == code.len() {
+			checkpoint = Some((parse_state, scope_stack, result.clone()));
+		}
+		if let Some((parse_state, scope_stack, output)) = checkpoint {
+			HIGHLIGHT_CHECKPOINT.with(|slot| {
+				let mut entries = slot.borrow_mut();
+				if entries.len() == CHECKPOINT_ENTRIES {
+					entries.remove(0);
+				}
+				entries.push(HighlightCheckpoint {
+					code,
+					lang,
+					palette: palette.map(str::to_owned),
+					offset: stable_end,
+					output,
+					parse_state,
+					scope_stack,
+					created: std::time::Instant::now(),
+				});
+			});
+		}
+	}
 	result
 }
 
@@ -479,6 +562,170 @@ pub fn supports_language(lang: String) -> bool {
 pub fn get_supported_languages() -> Vec<String> {
 	let ss = get_syntax_set();
 	ss.syntaxes().iter().map(|s| s.name.clone()).collect()
+}
+
+#[cfg(test)]
+thread_local! {
+	static PARSED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod incremental_tests {
+	use super::*;
+
+	fn colors() -> HighlightColors {
+		HighlightColors {
+			comment:     "\x1b[31m".into(),
+			keyword:     "\x1b[32m".into(),
+			function:    "\x1b[33m".into(),
+			variable:    "\x1b[34m".into(),
+			string:      "\x1b[35m".into(),
+			number:      "\x1b[36m".into(),
+			r#type:      "\x1b[91m".into(),
+			operator:    "\x1b[92m".into(),
+			punctuation: "\x1b[93m".into(),
+			inserted:    Some("\x1b[94m".into()),
+			deleted:     Some("\x1b[95m".into()),
+		}
+	}
+
+	#[test]
+	fn append_at_every_character_matches_cold_multiline_output() {
+		for (lang, code) in [
+			("cpp", "/* hello\n世界 */\nauto s = R\"tag(first\nsecond)tag\";\r\nint n = 42;"),
+			("python", "s = \"\"\"first\nsecond\"\"\"\r\n# 注釈\nprint(s)"),
+			("bash", "cat <<'EOF'\nhello 世界\nEOF\necho done\n"),
+			("html", "<script>\n/* hi\nthere */ let s='x';\n</script>\n"),
+			("rust", "/* outer\n/* inner */\n*/ let s = r#\"a\nb\"#;\n"),
+			("diff", "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n"),
+		] {
+			HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+			for end in code
+				.char_indices()
+				.map(|(i, _)| i)
+				.chain(std::iter::once(code.len()))
+			{
+				let input = &code[..end];
+				let warm = highlight_code(input.into(), Some(lang.into()), colors());
+				let checkpoint =
+					HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+				let cold = highlight_code(input.into(), Some(lang.into()), colors());
+				HIGHLIGHT_CHECKPOINT.with(|slot| *slot.borrow_mut() = checkpoint);
+				assert_eq!(warm, cold, "{lang} byte {end}");
+			}
+		}
+	}
+
+	#[test]
+	fn edits_language_and_theme_changes_match_cold() {
+		for (code, lang, changed_theme) in [
+			("/* open\nint x;", "cpp", false),
+			("// edit\nint x;", "cpp", false),
+			("// edit\nint x;\n42", "python", false),
+			("// edit\nint x;\n42\n", "python", true),
+			("", "rust", false),
+		] {
+			let make_colors = || {
+				if changed_theme {
+					HighlightColors::default()
+				} else {
+					colors()
+				}
+			};
+			let warm = highlight_code(code.into(), Some(lang.into()), make_colors());
+			let checkpoint = HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+			let cold = highlight_code(code.into(), Some(lang.into()), make_colors());
+			assert_eq!(warm, cold);
+			HIGHLIGHT_CHECKPOINT.with(|slot| *slot.borrow_mut() = checkpoint);
+		}
+	}
+
+	#[test]
+	fn admission_and_age_bound_retention_not_coloring() {
+		let code = "// hello\n".repeat(100);
+		highlight_code(code.clone(), Some("cpp".into()), colors());
+		HIGHLIGHT_CHECKPOINT.with(|slot| {
+			slot.borrow_mut().last_mut().unwrap().created -=
+				CHECKPOINT_MAX_AGE + std::time::Duration::from_secs(1);
+		});
+		PARSED_LINES.with(|count| count.set(0));
+		highlight_code(format!("{code}42"), Some("cpp".into()), colors());
+		assert_eq!(PARSED_LINES.with(|count| count.get()), 101);
+		HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow_mut().clear());
+		let large = "x\n".repeat(CHECKPOINT_INPUT_BYTES / 2 + 1);
+		assert_eq!(highlight_code(large.clone(), None, colors()), large);
+		assert!(HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow().is_empty()));
+		let mut palette = colors();
+		palette.comment = "x".repeat(4097);
+		highlight_code("// x\n".into(), Some("cpp".into()), palette);
+		assert!(HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow().is_empty()));
+	}
+
+	#[test]
+	fn ineligible_consumer_does_not_evict_active_block() {
+		for bytes in [CHECKPOINT_INPUT_BYTES + 1, 17 * 1024 * 1024] {
+			HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow_mut().clear());
+			let a = "// retained A\n".repeat(100);
+			highlight_code(a.clone(), Some("cpp".into()), colors());
+			let b = "x".repeat(bytes);
+			assert_eq!(highlight_code(b.clone(), None, colors()), b);
+			PARSED_LINES.with(|count| count.set(0));
+			let appended = format!("{a}int answer = 42;\n");
+			let warm = highlight_code(appended.clone(), Some("cpp".into()), colors());
+			assert_eq!(PARSED_LINES.with(|count| count.get()), 1, "B bytes {bytes}");
+			HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow_mut().clear());
+			assert_eq!(warm, highlight_code(appended, Some("cpp".into()), colors()));
+		}
+	}
+
+	#[test]
+	fn cache_evicts_lru_and_expires_all_entries_lazily() {
+		HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow_mut().clear());
+		for name in ["A", "B", "A", "C"] {
+			highlight_code(format!("// {name}\n"), Some("cpp".into()), colors());
+		}
+		HIGHLIGHT_CHECKPOINT.with(|slot| {
+			let mut entries = slot.borrow_mut();
+			assert_eq!(entries.len(), CHECKPOINT_ENTRIES);
+			assert_eq!(entries[0].code, "// A\n");
+			assert_eq!(entries[1].code, "// C\n");
+			for entry in entries.iter_mut() {
+				entry.created -= CHECKPOINT_MAX_AGE + std::time::Duration::from_secs(1);
+			}
+			// Lazy expiry does not asynchronously free idle entries.
+			assert_eq!(entries.len(), CHECKPOINT_ENTRIES);
+		});
+		let mut palette = colors();
+		palette.comment = "x".repeat(4097);
+		highlight_code("// ineligible\n".into(), Some("cpp".into()), palette);
+		assert!(HIGHLIGHT_CHECKPOINT.with(|slot| slot.borrow().is_empty()));
+	}
+
+	#[test]
+	fn interleaved_blocks_preserve_append_checkpoint() {
+		let a = "// block A\n".repeat(100);
+		highlight_code(a.clone(), Some("cpp".into()), colors());
+		highlight_code("/* block B */\n".repeat(100), Some("cpp".into()), colors());
+		PARSED_LINES.with(|count| count.set(0));
+		let appended = format!("{a}int answer = 42;\n");
+		let warm = highlight_code(appended.clone(), Some("cpp".into()), colors());
+		assert_eq!(PARSED_LINES.with(|count| count.get()), 1);
+		HIGHLIGHT_CHECKPOINT.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+		assert_eq!(warm, highlight_code(appended, Some("cpp".into()), colors()));
+	}
+
+	#[test]
+	fn growing_block_only_parses_the_changed_suffix() {
+		let prefix = "template<class T> T square(T x) { return x*x; }\n".repeat(1000);
+		highlight_code(prefix.clone(), Some("cpp".into()), HighlightColors::default());
+		PARSED_LINES.with(|count| count.set(0));
+		let code = format!("{prefix}int value = 42;\n");
+		assert_eq!(
+			highlight_code(code.clone(), Some("cpp".into()), HighlightColors::default()),
+			code
+		);
+		assert!(PARSED_LINES.with(|count| count.get()) <= 2, "append reparsed the unchanged prefix");
+	}
 }
 
 #[cfg(test)]

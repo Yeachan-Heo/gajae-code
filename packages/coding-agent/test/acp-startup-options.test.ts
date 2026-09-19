@@ -22,6 +22,7 @@ import {
 	ACP_FINAL_TEXT_LIMIT,
 	acpFinalTextFromMessage,
 	boundAcpFinalText,
+	hasAcpFinalTextContent,
 	resolveAcpFinalText,
 } from "../src/sdk/acp/final-text";
 
@@ -201,6 +202,13 @@ test("ACP final text resolution is exact, suffix-only, bounded, and Unicode-safe
 		text: "world",
 	});
 	expect(resolveAcpFinalText("prefix hello world suffix", "hello world").kind).toBe("none");
+	// Whitespace carries no assistant content: neither a whitespace-only final text nor a
+	// whitespace-only delta may be published (review P2).
+	expect(resolveAcpFinalText("", "   \n  ").kind).toBe("none");
+	expect(resolveAcpFinalText("hello", "hello   ").kind).toBe("none");
+	expect(hasAcpFinalTextContent("")).toBe(false);
+	expect(hasAcpFinalTextContent("   \n\t ")).toBe(false);
+	expect(hasAcpFinalTextContent(" a ")).toBe(true);
 	expect(resolveAcpFinalText("streamed", "different").kind).toBe("divergent");
 	expect(resolveAcpFinalText("안녕 ", "안녕 세계")).toEqual({
 		kind: "emit",

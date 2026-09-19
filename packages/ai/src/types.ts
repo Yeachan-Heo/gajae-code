@@ -34,6 +34,7 @@ import type {
 	WriteArgs,
 	WriteResult,
 } from "./providers/cursor/gen/agent_pb";
+import type { DevinAcpConfig, DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
@@ -60,6 +61,7 @@ export type KnownApi =
 	| "google-vertex"
 	| "ollama-chat"
 	| "cursor-agent"
+	| "devin-acp"
 	| "kiro-codewhisperer-stream";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
@@ -74,6 +76,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"devin-acp": DevinAcpOptions;
 	"kiro-codewhisperer-stream": KiroCodeWhispererOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
@@ -153,6 +156,7 @@ export const KNOWN_PROVIDERS = [
 	"fugu",
 	"gitlab-duo",
 	"cursor",
+	"devin",
 	"jetbrains-junie",
 	"deepseek",
 	"deepinfra",
@@ -456,6 +460,13 @@ export interface StreamOptions {
 	 */
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/**
+	 * Set by GJC for internal maintenance/one-shot work (context compaction,
+	 * handoff and branch summaries, utility generations) rather than an
+	 * interactive user turn. Agent-level providers use it to refuse requests they
+	 * cannot serve instead of forwarding them to a billed upstream agent.
+	 */
+	maintenanceCall?: boolean;
+	/**
 	 * Optional callback for inspecting or replacing provider payloads before sending.
 	 * Return undefined to keep the payload unchanged.
 	 * The `scope` parameter carries the per-attempt identity for execution attribution.
@@ -520,6 +531,12 @@ export interface StreamOptions {
 	authCredentialType?: "api_key" | "oauth";
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/**
+	 * Devin CLI ACP provider configuration (devin-acp only). When absent, the
+	 * provider spawns `devin acp` from PATH (or `GJC_DEVIN_CLI_PATH`) in the
+	 * current working directory and applies the default permission policy.
+	 */
+	devinAcp?: DevinAcpConfig;
 	/** Per-attempt identity for execution attribution. Threaded into onPayload/onResponse calls. */
 	attemptScope?: AttemptScopeRef;
 }
@@ -537,6 +554,15 @@ export interface AttemptScopeRef {
 	readonly attemptId: string;
 	readonly generation: number;
 	readonly lineage: string;
+}
+
+/**
+ * Runaway-repetition guard thresholds, per stream channel. A number sets the
+ * consecutive-repeat threshold; `false` disables that channel's guard.
+ */
+export interface RepetitionGuardOptions {
+	thinking?: number | false;
+	text?: number | false;
 }
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
@@ -575,6 +601,14 @@ export interface SimpleStreamOptions extends StreamOptions {
 	syntheticApiFormat?: "openai" | "anthropic";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/**
+	 * Runaway-repetition guard thresholds, per stream channel. Honoured by the
+	 * openai-completions transport; ignored by providers without a guard.
+	 * Defaults: thinking = DEFAULT_REPETITION_THRESHOLD, text = false — visible
+	 * output is a deliverable and intentional repetition there (logs, fixtures,
+	 * tables, generated code) must survive byte for byte (#5627).
+	 */
+	repetitionGuard?: RepetitionGuardOptions;
 }
 
 // Generic StreamFunction with typed options
@@ -786,6 +820,14 @@ export interface AssistantMessage {
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
+	/**
+	 * Bounded, redaction-safe failure classifier for a terminal provider/runtime
+	 * failure (a safe token matching `[A-Za-z0-9._-]{1,64}`), e.g.
+	 * `upstream_stream_interrupted`. Set by the provider/agent that owns the
+	 * classifier; never raw provider text and never a retry-admission fact (retry
+	 * policy keys on `transportFailure`, not on this diagnostic).
+	 */
+	errorCode?: string;
 	errorKind?: AssistantErrorKind;
 	/**
 	 * Structured, shape-only diagnostic for a terminal local staging-buffer

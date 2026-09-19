@@ -4,13 +4,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isContinuingMidRunMaintenanceOutcome, ThinkingLevel } from "@gajae-code/agent-core";
+import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
+	isModelProfileProxyConfigured,
 	requiresQualifiedModelProfileRoleResolution,
 	resolveProxyMode,
 	rewriteSelectorForProxy,
@@ -47,6 +48,7 @@ import {
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
+	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
 import {
@@ -58,7 +60,16 @@ import {
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
-import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import {
+	assistantFailureCode,
+	failedPromptOutcome,
+	failureEvidence,
+	formatPromptFailureForLocalLog,
+	PROMPT_FAILURE_MESSAGE_SUBMISSION,
+	type PromptFailureEvidence,
+	rephaseFailedOutcome,
+	sanitizePromptFailure,
+} from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
 import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
@@ -185,6 +196,13 @@ export function verifyMasterCapabilityFrame(input: {
 
 /** Maximum time a replaced runtime may retain a lifecycle persistence task. */
 const LIFECYCLE_QUIESCENCE_MS = 1_000;
+/**
+ * Keep a live session's broker discovery recoverable well inside the session
+ * index's two-minute heartbeat freshness window. `ensureBroker` has its own
+ * bounded startup/recovery budget; the in-flight guard below prevents those
+ * budgets from stacking when one attempt outlives this cadence.
+ */
+export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -547,6 +565,11 @@ export interface CreateSdkSessionRuntimeOptions {
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
+	/** Timer seams for deterministic broker-recovery lifecycle tests. */
+	setIntervalImpl?: typeof setInterval;
+	clearIntervalImpl?: typeof clearInterval;
+	/** Test-only broker ensure seam; production always uses the owner-fenced helper. */
+	ensureBrokerImpl?: typeof ensureBroker;
 	/** Test-only observation of a genuinely timed-out lifecycle drain. */
 	onLifecycleDrainTimeoutForTests?: () => void;
 	/** Test-only observation of bounded failure-diagnostic deduplication state. */
@@ -599,24 +622,39 @@ const isPreservedProviderFailure = (code: string | undefined): boolean =>
  * classifier so a failed terminal can never be quarantined on reload.
  */
 function canonicalFailedOutcome(
-	failure?: { code?: unknown; message?: unknown },
+	failure?: { code?: unknown; message?: unknown; providerCode?: unknown },
 	provenance: "agent_failed" | "deadline" = "agent_failed",
+	evidence: PromptFailureEvidence = {},
+	providerCode?: string,
 ): InvocationOutcome {
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
-	return {
-		kind: "failed",
+	const known = typeof failure?.code === "string" ? failure.code : undefined;
+	const explicit = providerCode ?? (typeof failure?.providerCode === "string" ? failure.providerCode : undefined);
+	return failedPromptOutcome({
 		code: deadline ? "prompt_deadline_exceeded" : "prompt_failed",
-		message: deadline ? "Prompt deadline exceeded." : EMPTY_PROMPT_FAILURE.message,
 		provenance: deadline ? "deadline" : "agent_failed",
-	};
+		...(explicit !== undefined
+			? { providerCode: explicit }
+			: known !== undefined && known !== "prompt_failed" && known !== "prompt_deadline_exceeded"
+				? { providerCode: known }
+				: {}),
+		evidence,
+	});
 }
 
 function canonicalTerminalOutcome(
 	outcome: unknown,
-	failure?: { code?: unknown; message?: unknown },
+	failure?: { code?: unknown; message?: unknown; providerCode?: unknown },
+	evidence: PromptFailureEvidence = {},
 ): InvocationOutcome | undefined {
 	if (outcome && typeof outcome === "object") {
-		const candidate = outcome as { kind?: unknown; reason?: unknown; provenance?: unknown; code?: unknown };
+		const candidate = outcome as {
+			kind?: unknown;
+			reason?: unknown;
+			provenance?: unknown;
+			code?: unknown;
+			providerCode?: unknown;
+		};
 		if (candidate.kind === "stopped") {
 			if (candidate.reason === "cancelled" && candidate.provenance === "client_cancel")
 				return { kind: "stopped", reason: "cancelled", provenance: "client_cancel" };
@@ -628,9 +666,11 @@ function canonicalTerminalOutcome(
 			return canonicalFailedOutcome(
 				{ code: candidate.code, message: (outcome as { message?: unknown }).message },
 				candidate.provenance === "deadline" ? "deadline" : "agent_failed",
+				evidence,
+				typeof candidate.providerCode === "string" ? candidate.providerCode : undefined,
 			);
 	}
-	if (failure !== undefined) return canonicalFailedOutcome(failure);
+	if (failure !== undefined) return canonicalFailedOutcome(failure, "agent_failed", evidence);
 	return undefined;
 }
 interface InvocationRecord extends InvocationCorrelation {
@@ -1185,7 +1225,9 @@ export function createInvocationReconciliation(
 				delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 				delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
 				next.content = reduceTurnResultContent(next.content, frame.content);
-				const incomingOutcome = canonicalTerminalOutcome(frame.outcome) ?? canonicalTerminalOutcome(pendingOutcome);
+				const incomingOutcome =
+					canonicalTerminalOutcome(frame.outcome, undefined, failureEvidence(next, frame.hasActivity)) ??
+					canonicalTerminalOutcome(pendingOutcome, undefined, failureEvidence(next, frame.hasActivity));
 				if (
 					incomingOutcome?.kind === "stopped" &&
 					(next.error === undefined || next.error.code === "prompt_deadline_exceeded")
@@ -1194,9 +1236,21 @@ export function createInvocationReconciliation(
 					if (next.error?.code === "prompt_deadline_exceeded") delete next.error;
 					next.status = "terminal_ok";
 				} else if (incomingOutcome?.kind === "failed") {
-					next.outcome = incomingOutcome;
+					// The provider diagnostic recorded before the boundary carries the
+					// bounded classifier; prefer it over a generic frame outcome that lost
+					// the provider code.
+					const recordErrorOutcome =
+						next.error !== undefined && next.error.code !== "prompt_deadline_exceeded"
+							? canonicalFailedOutcome(next.error, "agent_failed", failureEvidence(next))
+							: undefined;
+					const preferRecordError =
+						recordErrorOutcome?.kind === "failed" &&
+						recordErrorOutcome.providerCode !== undefined &&
+						incomingOutcome.providerCode === undefined;
+					next.outcome = preferRecordError ? recordErrorOutcome : incomingOutcome;
 					if (next.error === undefined)
 						next.error = { code: incomingOutcome.code, message: incomingOutcome.message };
+					else next.error = { code: next.error.code, message: incomingOutcome.message };
 					next.status = "failed";
 				} else if (next.error !== undefined) {
 					next.outcome = canonicalFailedOutcome(next.error);
@@ -1211,6 +1265,15 @@ export function createInvocationReconciliation(
 					next.error = EMPTY_PROMPT_FAILURE;
 					next.outcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
 				} else next.status = "terminal_ok";
+				if (next.outcome !== undefined)
+					next.outcome = rephaseFailedOutcome(
+						next.outcome as SdkPromptTerminalOutcome,
+						failureEvidence(next, frame.hasActivity),
+					);
+				if ((next.outcome as SdkPromptTerminalOutcome | undefined)?.kind === "failed") {
+					const failed = next.outcome as Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+					next.error = { code: next.error?.code ?? failed.code, message: failed.message };
+				}
 				next.receiptState = reduceReceiptState(
 					next.receiptState,
 					reportableTurnResultContent(next.content) ? "present" : "missing",
@@ -1272,11 +1335,12 @@ export function createInvocationReconciliation(
 		hydrate,
 		async claimPendingOutcome(kind, correlation, outcome) {
 			const record = records.get(key(kind, correlation));
-			const normalized = canonicalTerminalOutcome(outcome);
+			const normalized = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record ?? {}));
 			if (normalized === undefined) throw new Error("Invalid terminal outcome.");
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return normalized;
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-			if (pending !== undefined) return canonicalTerminalOutcome(pending) ?? normalized;
+			if (pending !== undefined)
+				return canonicalTerminalOutcome(pending, undefined, failureEvidence(record)) ?? normalized;
 			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
 			next.pendingOutcome = normalized;
 			records.set(key(kind, correlation), next);
@@ -1320,14 +1384,22 @@ export function createInvocationReconciliation(
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
 			const requestedOutcome = canonicalTerminalOutcome(
 				outcome ?? (record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+				undefined,
+				failureEvidence(record, evidence?.hasActivity),
 			);
 			const priorFailure = record.error;
+			const requestedProviderCode = requestedOutcome?.kind === "failed" ? requestedOutcome.providerCode : undefined;
 			// A provider diagnostic recorded before a deadline finalization is stronger
 			// than the synthetic deadline claim. Preserve it as the terminal failure
 			// intent instead of allowing a later agent_end to look successful.
 			const finalOutcome =
 				priorFailure !== undefined && priorFailure.code !== "prompt_deadline_exceeded"
-					? canonicalFailedOutcome(priorFailure)
+					? canonicalFailedOutcome(
+							priorFailure,
+							"agent_failed",
+							failureEvidence(record, evidence?.hasActivity),
+							requestedProviderCode,
+						)
 					: requestedOutcome?.kind === "stopped"
 						? requestedOutcome
 						: priorFailure !== undefined &&
@@ -1335,12 +1407,22 @@ export function createInvocationReconciliation(
 									(requestedOutcome.kind === "failed" &&
 										(requestedOutcome.code === "prompt_deadline_exceeded" ||
 											priorFailure.code !== "prompt_deadline_exceeded")))
-							? canonicalFailedOutcome(priorFailure)
+							? canonicalFailedOutcome(
+									priorFailure,
+									"agent_failed",
+									failureEvidence(record, evidence?.hasActivity),
+									requestedProviderCode,
+								)
 							: requestedOutcome;
 			const previousRecord = { ...record };
 			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
 			finalizedRecord.content = reduceTurnResultContent(finalizedRecord.content, evidence?.content);
 			let resolvedOutcome = finalOutcome;
+			if (resolvedOutcome !== undefined)
+				resolvedOutcome = rephaseFailedOutcome(
+					resolvedOutcome,
+					failureEvidence(record, evidence?.hasActivity),
+				) as InvocationOutcome;
 			if (resolvedOutcome?.kind === "stopped") {
 				// Stopped is a successful terminal boundary: it must never coexist with
 				// an earlier diagnostic failure.
@@ -1350,11 +1432,11 @@ export function createInvocationReconciliation(
 				finalizedRecord.status = "failed";
 				finalizedRecord.error =
 					recordError !== undefined
-						? { code: recordError.code, message: recordError.message }
+						? { code: recordError.code, message: resolvedOutcome.message }
 						: priorFailure !== undefined &&
 								(resolvedOutcome.code === "prompt_deadline_exceeded" ||
 									priorFailure.code !== "prompt_deadline_exceeded")
-							? priorFailure
+							? { code: priorFailure.code, message: resolvedOutcome.message }
 							: { code: resolvedOutcome.code, message: resolvedOutcome.message };
 			} else if (kind === "prompt") {
 				// Evidence-based empty predicate (exact-head review P1/P2): the same
@@ -1363,9 +1445,14 @@ export function createInvocationReconciliation(
 				// only a genuinely empty, no-activity completion fails closed.
 				const terminalText = evidence?.content?.text.trim() ?? "";
 				if (terminalText === "" && !evidence?.hasActivity && evidence?.outcomeKind !== "stopped") {
-					resolvedOutcome = canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+					const emptyOutcome = canonicalFailedOutcome(
+						EMPTY_PROMPT_FAILURE,
+						"agent_failed",
+						failureEvidence(finalizedRecord, evidence?.hasActivity),
+					) as Extract<InvocationOutcome, { kind: "failed" }>;
+					resolvedOutcome = emptyOutcome;
 					finalizedRecord.status = "failed";
-					finalizedRecord.error = EMPTY_PROMPT_FAILURE;
+					finalizedRecord.error = { code: emptyOutcome.code, message: emptyOutcome.message };
 				} else finalizedRecord.status = "terminal_ok";
 			} else finalizedRecord.status = "terminal_ok";
 			finalizedRecord.receiptState = reduceReceiptState(
@@ -1571,18 +1658,18 @@ function createQuerySurface(
 		};
 		try {
 			const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(profileSettings);
-			if (profile.source !== "user") {
-				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.() ?? [];
-				if (proxyProvider !== undefined && !configuredProviders.includes(proxyProvider))
+			if (proxyProvider !== undefined) {
+				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.();
+				const credentialless =
+					proxyProvider === "opencodex" &&
+					!configuredProviders?.includes(proxyProvider) &&
+					(await ctx.modelRegistry.getApiKeyForProvider(proxyProvider, getProfileCredentialSessionId())) ===
+						kNoAuth;
+				if (!isModelProfileProxyConfigured(proxyProvider, configuredProviders, credentialless))
 					return { available: false };
 			}
 			if (profile.source !== "user" && proxyMode === "always") {
-				if (
-					proxyProvider === undefined ||
-					!proxyAuthenticated ||
-					!(ctx.modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
-				)
-					return { available: false };
+				if (proxyProvider === undefined || !proxyAuthenticated) return { available: false };
 			}
 			const bindings = resolveProfileBindings(profile);
 			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];
@@ -2127,7 +2214,9 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
  * after retry/fallback policy has settled, so this is the safe boundary at which
  * to publish the additive failure diagnostic before terminal reconciliation.
  */
-function providerFailureFromAgentEnd(event: unknown): { code: string; message: string } | undefined {
+function providerFailureFromAgentEnd(
+	event: unknown,
+): { code: string; message: string; providerCode?: string } | undefined {
 	try {
 		if (!event || typeof event !== "object") return undefined;
 		const messages = (event as { messages?: unknown }).messages;
@@ -2143,7 +2232,8 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 			errorMessage?: unknown;
 			errorKind?: unknown;
 			errorStatus?: unknown;
-			transportFailure?: { status?: unknown };
+			errorCode?: unknown;
+			transportFailure?: { status?: unknown; providerCode?: unknown };
 		};
 		let stopReason: unknown;
 		try {
@@ -2189,10 +2279,24 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 				// A throwing transport metadata accessor is also statusless.
 			}
 		}
+		const providerCode = assistantFailureCode(assistant);
 		if (status === 402 || status === 429)
-			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
-		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
-		return { code: "provider_rejected", message: "Prompt submission failed." };
+			return {
+				code: `provider_http_${status}`,
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+				...(providerCode !== undefined ? { providerCode } : {}),
+			};
+		if (status !== undefined)
+			return {
+				code: "provider_rejected",
+				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+				...(providerCode !== undefined ? { providerCode } : {}),
+			};
+		return {
+			code: "provider_rejected",
+			message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
+			...(providerCode !== undefined ? { providerCode } : {}),
+		};
 	} catch {
 		// Provider metadata is untrusted: an SDK/provider adapter may expose a
 		// throwing getter while the lifecycle boundary still needs to terminalize.
@@ -4075,6 +4179,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					sdkRunToken: string;
 				}>;
 				registerBroker: () => Promise<void>;
+				stopBrokerRecovery: () => void;
 				quiesceInput: () => void;
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
@@ -4287,6 +4392,78 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	let nextLifecycleEpoch = 0;
 	const skillTerminalRecoveryKeys = new Set<string>();
+	/**
+	 * Exactly one correlated terminal BOUNDARY (agent_end) may reach the wire per
+	 * correlation. The provider agent_end handler and the prompt-deadline expiry can both
+	 * reach their emission after the other has already published: the handler captures its
+	 * transitions synchronously and then awaits durable writes, while the deadline callback
+	 * fires only after its own claim/finalize awaits have settled. Neither can be stopped by
+	 * removing lifecycle references, and noteTransition is a no-op once the record is
+	 * terminal, so durable state would record one outcome while clients received two. This
+	 * claim is the shared arbiter, taken synchronously -- no await between the check and the
+	 * set -- by whoever is about to publish the boundary.
+	 *
+	 * The key is never removed at cleanup: dropping it when the correlation retires would
+	 * re-open the window, and would stop a late real boundary from being idempotent for an
+	 * already-retired correlation. Growth is bounded by FIFO eviction instead (a Set
+	 * preserves insertion order). A correlation displaced by 1024 later boundaries is long
+	 * retired, and its durable record stays authoritative for anything a consumer missed.
+	 *
+	 * Eviction must never reach a correlation that can still be published (review P1). A
+	 * handler captures its transitions, awaits durable writes, and claims only immediately
+	 * before its emit; parked on those awaits, 1024 later boundaries would otherwise evict
+	 * its key and let its delayed agent_end publish a SECOND boundary for a correlation the
+	 * deadline already terminalized. Every would-be publisher therefore RETAINS its
+	 * correlations for as long as it can still reach a claim, and a retained key is skipped
+	 * as an eviction victim.
+	 */
+	const MAX_PUBLISHED_TERMINAL_BOUNDARIES = 1024;
+	const publishedTerminalBoundaries = new Set<string>();
+	/** Correlations with at least one publisher still able to reach a claim. */
+	const retainedTerminalBoundaries = new Map<string, number>();
+	/**
+	 * Protect every correlation this publisher may still claim, and return its release.
+	 * Callers MUST release on every exit path -- published, claim lost, or threw -- so a
+	 * failure cannot leak a permanent protection.
+	 */
+	const retainTerminalBoundaries = (
+		invocations: ReadonlyArray<{ correlation: InvocationCorrelation }>,
+	): (() => void) => {
+		const keys = invocations.map(({ correlation }) => lifecycleCorrelationKey(correlation));
+		for (const key of keys) retainedTerminalBoundaries.set(key, (retainedTerminalBoundaries.get(key) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			for (const key of keys) {
+				const retained = retainedTerminalBoundaries.get(key);
+				if (retained === undefined) continue;
+				if (retained > 1) retainedTerminalBoundaries.set(key, retained - 1);
+				else retainedTerminalBoundaries.delete(key);
+			}
+		};
+	};
+	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean => {
+		const key = lifecycleCorrelationKey(correlation);
+		if (publishedTerminalBoundaries.has(key)) return false;
+		publishedTerminalBoundaries.add(key);
+		while (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
+			let victim: string | undefined;
+			for (const candidate of publishedTerminalBoundaries) {
+				if (retainedTerminalBoundaries.has(candidate)) continue;
+				victim = candidate;
+				break;
+			}
+			// Every key is still publishable: exceed the bound rather than evict a live
+			// one. Correctness beats the bound, and the excess is bounded by the live
+			// lifecycles the session already bounds.
+			if (victim === undefined) break;
+			publishedTerminalBoundaries.delete(victim);
+		}
+		return true;
+	};
+	const hasClaimedTerminalBoundary = (correlation: InvocationCorrelation): boolean =>
+		publishedTerminalBoundaries.has(lifecycleCorrelationKey(correlation));
 	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
 		if (!owner) return Promise.resolve();
 		let task: Promise<void>;
@@ -4637,6 +4814,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
+		// Retained BEFORE the first durable await: from here this publisher can still
+		// reach the claim below, so no later boundary may evict its correlations while
+		// it is parked. A start retains too -- its keys are not published yet, so the
+		// protection is inert, and one unconditional release path cannot leak.
+		const releaseTerminalRetention = retainTerminalBoundaries(transitions);
 		try {
 			for (const invocation of transitions) {
 				try {
@@ -4718,6 +4900,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 				);
 				for (const invocation of transitions) {
+					// A correlation whose terminal boundary is already published was
+					// terminalized by the deadline, which emitted its own diagnostic together
+					// with the pair; a second correlated agent_failed would duplicate it. The
+					// check is READ-ONLY: the claim is taken by would-be agent_end publishers
+					// alone, because the real path emits its agent_failed and its agent_end
+					// from two SEPARATE emitLifecycle invocations, so claiming here would make
+					// the publisher block its own boundary. In the ordinary flow this changes
+					// nothing -- agent_failed precedes agent_end and the claim is untaken.
+					if (hasClaimedTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({
 							type,
@@ -4765,6 +4956,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// above with the one uncorrelated frame, so it cannot settle a live prompt.
 				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
 				for (const invocation of transitions) {
+					// Claim synchronously, immediately before the emit: the durable awaits
+					// above give the deadline expiry room to publish this correlation's
+					// boundary first. On a lost claim skip ONLY this frame -- every durable
+					// write, diagnostic cleanup, batch retirement and waiter resolution below
+					// still runs. `observed` deliberately stays true: it means "the correlated
+					// publication reached the wire", and it did, the deadline put it there.
+					// Flipping it would make a terminal abort's durable row refuse to claim
+					// terminalPublished for a boundary that IS on the wire.
+					if (!claimTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
 					} catch {
@@ -4781,6 +4981,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		} catch {
 			observed = false;
+		} finally {
+			// Every exit path -- published, claim lost, or threw -- releases: this
+			// publisher can no longer reach a claim.
+			releaseTerminalRetention();
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
@@ -4840,7 +5044,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		return trackLifecycle(
+		// Interactive/skill turns must not wait on durable start persist. Keep
+		// trackLifecycle so drain, persist-then-publish, content-hold release, and
+		// shutdown still run; do not return that promise to the extension runner
+		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+		void trackLifecycle(
 			async () =>
 				emitLifecycle(
 					"agent_start",
@@ -4856,7 +5064,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					event.sdkRunTokens,
 				),
 			owner,
-		);
+		).catch(error => {
+			logger.error("SDK agent_start lifecycle task failed", {
+				error: sanitizePromptFailure(error),
+			});
+		});
 	});
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
@@ -4964,7 +5176,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
 	// false-fire prompt_deadline_exceeded during a long shared run.
-	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
+	const renewAttributableProgress = (
+		eventType: "tool_execution_start" | "tool_execution_update" | "tool_execution_end",
+		event: AgentSessionEvent,
+		ctx: ExtensionContext,
+	): void => {
+		// Pairing-only tool boundaries synthesized while an abort unwinds never
+		// entered a tool. Treating them as progress lets a deadline renew its own
+		// lease after claiming the terminal outcome, leaving that claim pending
+		// instead of durably finalizing it.
+		if (isNonDispatchedToolEvent(event)) return;
 		// Tool events do not carry an SDK run token. Prefer the lifecycle-active
 		// runtime for the current session so a retained predecessor cannot make a
 		// live replacement look ambiguous and suppress its lease renewal.
@@ -5075,11 +5296,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		publishContentFrames(current, event as AgentSessionEvent, invocations);
 	};
-	api.on("tool_execution_start", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_start", ctx);
+	api.on("tool_execution_start", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_start", event as AgentSessionEvent, ctx);
 	});
-	api.on("tool_execution_end", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_end", ctx);
+	api.on("tool_execution_update", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_update", event as AgentSessionEvent, ctx);
+	});
+	api.on("tool_execution_end", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_end", event as AgentSessionEvent, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -5088,6 +5312,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		typeof (error as { code?: unknown }).code === "string"
 			? (error as { code: string }).code
 			: undefined;
+	const brokerDiagnosticCode = (error: unknown): string => {
+		const code = errorCode(error);
+		return code !== undefined && /^[A-Za-z0-9_.-]{1,64}$/u.test(code) ? code : "unavailable";
+	};
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -5120,11 +5348,69 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
 			},
-			onExpired: correlation => {
+			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
-				if (!owner) return;
-				removeLifecycleReferences(owner, correlation);
-				maybeRetireLifecycleOwner(owner);
+				if (deadlineOutcome === undefined) {
+					if (!owner) return;
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+					return;
+				}
+				const failure = sanitizePromptFailure(
+					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
+				);
+				// The deadline publishes a failed/end PAIR and owns it atomically, so the
+				// boundary claim is taken once, here, covering both frames. Losing it means
+				// a real agent_end already reached the wire for this correlation: emit
+				// NEITHER frame, but still run the cleanup below, and still let #expire
+				// finish its durable reconciliation. Losing the boundary must not skip
+				// cleanup.
+				//
+				// Retained for the whole publication: this path owns the correlation from
+				// here, so a concurrent boundary must not evict its key mid-flight.
+				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
+				try {
+					if (claimTerminalBoundary(correlation)) {
+						// Each required frame is emitted INDEPENDENTLY (review P2): a throwing
+						// diagnostic must never suppress the boundary, which is the frame this
+						// path exists to deliver. Both failures are reported, never rethrown --
+						// the cleanup below still has to run.
+						try {
+							runtime.emitEvent({
+								type: "agent_failed",
+								sessionId,
+								...correlation,
+								error: failure,
+							});
+						} catch (error) {
+							logger.warn("sdk: deadline correlated diagnostic publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
+						try {
+							runtime.emitEvent({
+								type: "agent_end",
+								sessionId,
+								...correlation,
+								outcome: canonicalFailedOutcome(failure, "deadline"),
+							});
+						} catch (error) {
+							logger.error("sdk: deadline correlated boundary publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
+					}
+				} finally {
+					releaseTerminalRetention();
+				}
+				if (owner) {
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+				}
 			},
 		});
 		const pending: Array<{
@@ -5764,77 +6050,139 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
+		let brokerRegistrationInFlight: Promise<void> | undefined;
+		let brokerRecoveryStopped = false;
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
-			try {
-				if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
-					throw new Error("Lifecycle broker registration requires a request identity.");
-				await ensureBroker({ agentDir: options.agentDir });
-				const index = await new SessionIndex(options.agentDir).open();
-				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
-				const effectiveIncarnation = processIncarnation(process.pid);
-				const direct = await reattestMasterSessionIdentity({
-					index,
-					locator,
-					masterCapability: options.masterCapability,
-					attestationEpoch: options.masterAttestationEpoch,
-					ownerSessionId: options.masterOwnerSessionId,
-					sessionId,
-					pid: process.pid,
-					processIncarnation: effectiveIncarnation,
-				});
-				await runtime.registerWithBroker({
-					register: async input => {
-						if (publishedEndpointUrl === undefined)
-							throw new Error("SDK transport endpoint was not published before broker registration.");
-						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
-						const file = await readEndpointFile(endpointPath);
-						if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
-						const endpoint = JSON.parse(file.source) as Record<string, unknown>;
-						if (
-							endpoint.sessionId !== input.sessionId ||
-							endpoint.pid !== process.pid ||
-							endpoint.url !== publishedEndpointUrl ||
-							endpoint.token !== transport.token
-						)
-							throw new Error("SDK endpoint did not match the published transport authority.");
-						const endpointMtimeMs = file.mtimeMs;
-						const endpointFileId = `${file.dev}:${file.ino}`;
-						const masterRole = masterAttestationForEffectiveHost({
-							masterCapability: options.masterCapability,
-							attestationEpoch: options.masterAttestationEpoch,
-							ownerSessionId: options.masterOwnerSessionId,
-							sessionId: input.sessionId,
-							pid: process.pid,
-							processIncarnation: effectiveIncarnation,
-							direct,
-						});
-						await index.append({
-							type: "host_registered",
-							...input,
-							locator,
-							pid: process.pid,
-							endpointMtimeMs,
-							endpointFileId,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-							...(masterRole ? { masterRole } : {}),
-						});
-					},
-					unregister: async input => {
-						await index.append({
-							type: "host_unregistered",
-							...input,
-							locator,
-							pid: process.pid,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-						});
-					},
-				});
-				brokerRegistered = true;
-			} catch (error) {
-				if (options.brokerRegistrationRequired) throw error;
-				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
+			if (brokerRegistrationInFlight !== undefined) {
+				await brokerRegistrationInFlight;
+				return;
 			}
+			const registration = (async (): Promise<void> => {
+				try {
+					if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
+						throw new Error("Lifecycle broker registration requires a request identity.");
+					await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+					if (brokerRecoveryStopped) return;
+					const index = await new SessionIndex(options.agentDir).open();
+					if (brokerRecoveryStopped) return;
+					const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+					const effectiveIncarnation = processIncarnation(process.pid);
+					const direct = await reattestMasterSessionIdentity({
+						index,
+						locator,
+						masterCapability: options.masterCapability,
+						attestationEpoch: options.masterAttestationEpoch,
+						ownerSessionId: options.masterOwnerSessionId,
+						sessionId,
+						pid: process.pid,
+						processIncarnation: effectiveIncarnation,
+					});
+					if (brokerRecoveryStopped) return;
+					let brokerRegistrationEvent: SessionIndexEvent | undefined;
+					await runtime.registerWithBroker({
+						register: async input => {
+							if (publishedEndpointUrl === undefined)
+								throw new Error("SDK transport endpoint was not published before broker registration.");
+							const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+							const file = await readEndpointFile(endpointPath);
+							if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
+							const endpoint = JSON.parse(file.source) as Record<string, unknown>;
+							if (
+								endpoint.sessionId !== input.sessionId ||
+								endpoint.pid !== process.pid ||
+								endpoint.url !== publishedEndpointUrl ||
+								endpoint.token !== transport.token
+							)
+								throw new Error("SDK endpoint did not match the published transport authority.");
+							const endpointMtimeMs = file.mtimeMs;
+							const endpointFileId = `${file.dev}:${file.ino}`;
+							const masterRole = masterAttestationForEffectiveHost({
+								masterCapability: options.masterCapability,
+								attestationEpoch: options.masterAttestationEpoch,
+								ownerSessionId: options.masterOwnerSessionId,
+								sessionId: input.sessionId,
+								pid: process.pid,
+								processIncarnation: effectiveIncarnation,
+								direct,
+							});
+							const published = await index.append({
+								type: "host_registered",
+								...input,
+								locator,
+								pid: process.pid,
+								endpointMtimeMs,
+								endpointFileId,
+								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
+								...(masterRole ? { masterRole } : {}),
+							});
+							brokerRegistrationEvent = published;
+							if (brokerRecoveryStopped) {
+								// Teardown may have run before append returned its ownership proof.
+								await index.unregisterIfCurrent(published);
+								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
+							}
+						},
+						unregister: async input => {
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							// Use the successful publication's proof, never a teardown-time file read.
+							await index.unregisterIfCurrent(expected);
+							if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
+						},
+					});
+					if (brokerRecoveryStopped) return;
+					brokerRegistered = true;
+				} catch (error) {
+					if (options.brokerRegistrationRequired) throw error;
+					logger.warn("sdk broker registration unavailable", { code: brokerDiagnosticCode(error) });
+				}
+			})();
+			brokerRegistrationInFlight = registration;
+			try {
+				await registration;
+			} finally {
+				if (brokerRegistrationInFlight === registration) brokerRegistrationInFlight = undefined;
+			}
+		};
+		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
+		let brokerRecoveryInFlight: Promise<void> | undefined;
+		const runBrokerRecovery = async (): Promise<void> => {
+			if (brokerRecoveryStopped || brokerRecoveryInFlight !== undefined) return;
+			const recovery = (async (): Promise<void> => {
+				if (brokerRecoveryStopped) return;
+				if (brokerRegistered) await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+				else await registerBroker();
+			})();
+			brokerRecoveryInFlight = recovery;
+			try {
+				await recovery;
+			} catch (error) {
+				logger.warn("sdk broker recovery unavailable", { code: brokerDiagnosticCode(error) });
+			} finally {
+				if (brokerRecoveryInFlight === recovery) brokerRecoveryInFlight = undefined;
+			}
+		};
+		const startBrokerRecovery = (): void => {
+			if (brokerRecoveryStopped || brokerRecoveryTimer !== undefined) return;
+			const timer = (options.setIntervalImpl ?? setInterval)(
+				() => void runBrokerRecovery(),
+				SESSION_BROKER_RECOVERY_INTERVAL_MS,
+			) as NodeJS.Timeout;
+			brokerRecoveryTimer = timer;
+			timer.unref?.();
+		};
+		const stopBrokerRecovery = (): void => {
+			brokerRecoveryStopped = true;
+			if (brokerRecoveryTimer === undefined) return;
+			(options.clearIntervalImpl ?? clearInterval)(brokerRecoveryTimer);
+			brokerRecoveryTimer = undefined;
 		};
 		const runtimeOwner: RuntimeState = {
 			sessionId,
@@ -5848,6 +6196,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			pending,
 			openLifecycleBatches,
 			registerBroker,
+			stopBrokerRecovery,
 			quiesceInput: () => {
 				inputGate.quiescing = true;
 				lifecycleOwnerHolder.quiescing = true;
@@ -5868,8 +6217,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			publishedEndpointUrl = (await runtime.start()).url;
 			await registerBroker();
+			if (!brokerRecoveryStopped) startBrokerRecovery();
 		} catch (error) {
 			active = undefined;
+			stopBrokerRecovery();
 			disposeGate?.();
 			try {
 				await runtime.stop();
@@ -5890,6 +6241,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pending,
 					openLifecycleBatches,
 					registerBroker,
+					stopBrokerRecovery,
 					quiesceInput: () => {
 						inputGate.quiescing = true;
 						lifecycleOwnerHolder.quiescing = true;
@@ -5923,6 +6275,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
+		current.stopBrokerRecovery();
 		current.quiesceInput();
 		current.fenceGateResolutions();
 		try {

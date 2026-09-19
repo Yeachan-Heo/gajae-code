@@ -373,13 +373,18 @@ export const TIER_MAP_SKIP_LIST = {
 	"opencode-go/muse-spark-1.2-contributor": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
+	"opencode-go/muse-spark-1.3-contributor": {
+		rationale: "catalog addition from PR #5485; not yet curated",
+	},
 	"opencode-go/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/qwen3.8-max": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-go/union-alpha": { rationale: "stealth model; capability tier not yet independently reviewed" },
 	"opencode-zen/grok-4.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/hy3-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/kimi-k3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/ling-3.0-tiny-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-zen/nemotron-3.5-lightning-free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"opencode-zen/union-alpha": { rationale: "stealth model; capability tier not yet independently reviewed" },
 	"openrouter/anthropic/claude-fable-5:batch": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"openrouter/anthropic/claude-haiku-4.5:batch": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
@@ -536,6 +541,18 @@ export const TIER_MAP_SKIP_LIST = {
 	"alibaba-token-plan/glm-5.2": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"alibaba-token-plan/qwen3.8-max": { baseline: true, rationale: "post-feature catalog addition; not yet curated" },
 	"alibaba-token-plan/qwen3.8-max-preview": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"alibaba-token-plan/deepseek-v4-pro-0813": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"alibaba-token-plan/deepseek-v4.1-flash": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
+	"alibaba-token-plan/glm-5.3": {
+		baseline: true,
+		rationale: "post-feature catalog addition; not yet curated",
+	},
 	"amazon-bedrock/anthropic.claude-3-5-haiku-20241022-v1:0": {
 		baseline: true,
 		rationale: "pre-feature baseline; not yet curated",
@@ -4330,6 +4347,8 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai-codex/gpt-5.5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai-codex/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai-codex/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/codex-mini-latest": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4-turbo": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -4370,6 +4389,8 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai/gpt-5.6-sol": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-terra": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai/gpt-image-2.5-flare": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
+	"openai/gpt-image-2.5-sunburst": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/gpt-realtime-2.1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

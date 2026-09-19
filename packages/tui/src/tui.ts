@@ -819,6 +819,9 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
 	widthReflowScanRows: number;
+	widthReflowVisibleWidthCalls: number;
+	kittyPlacementScanRows: number;
+	kittyPlacementReferenceRows: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -1183,6 +1186,9 @@ export class TUI extends Container {
 		debugRedrawAppendWrites: 0,
 		differentialGuardVisibleWidthCalls: 0,
 		widthReflowScanRows: 0,
+		widthReflowVisibleWidthCalls: 0,
+		kittyPlacementScanRows: 0,
+		kittyPlacementReferenceRows: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1191,6 +1197,9 @@ export class TUI extends Container {
 			debugRedrawAppendWrites: 0,
 			differentialGuardVisibleWidthCalls: 0,
 			widthReflowScanRows: 0,
+			widthReflowVisibleWidthCalls: 0,
+			kittyPlacementScanRows: 0,
+			kittyPlacementReferenceRows: 0,
 		};
 	}
 
@@ -4128,7 +4137,12 @@ export class TUI extends Container {
 		lines: string[],
 		owners: ReadonlyMap<string, KittyPlacementOwner>,
 	): KittyPlacementSpan[] {
+		// encodeKittyPlacement is only reachable from renderImage's kitty branch, so a
+		// line rendered under any other protocol cannot carry a placement and the scan
+		// can only return empty. See the commit message for the consumers this covers.
+		if (TERMINAL.imageProtocol !== ImageProtocol.Kitty) return [];
 		const placements: KittyPlacementSpan[] = [];
+		TUI.#renderCounters.kittyPlacementScanRows += lines.length;
 		for (let row = 0; row < lines.length; row++) {
 			for (const placement of extractKittyPlacementReferences(lines[row])) {
 				placements.push({
@@ -4613,7 +4627,12 @@ export class TUI extends Container {
 			const safeLines = reuseCached ? cached.safeLines : rendered.lines.map(stripTerminalEraseControls);
 			const kittyPlacements = reuseCached
 				? cached.kittyPlacements
-				: rendered.lines.map(line => [...extractKittyPlacementReferences(line)]);
+				: TERMINAL.imageProtocol === ImageProtocol.Kitty
+					? rendered.lines.map(line => {
+							TUI.#renderCounters.kittyPlacementReferenceRows++;
+							return [...extractKittyPlacementReferences(line)];
+						})
+					: [];
 			if (!reuseCached && componentRevision !== undefined && source !== null) {
 				this.#viewportAnchorRenderCache = {
 					component: child,
@@ -4736,8 +4755,9 @@ export class TUI extends Container {
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		const nextKittyPlacementSpans = this.#kittyPlacementSpansForLines(newLines, placementOwners);
-		const previousLogicalFrame = this.#latestRenderedLines.slice();
-		const previousRawFrame = this.#latestRaw.slice();
+		// Reassigned, never mutated in place -- a reference is the snapshot.
+		const previousLogicalFrame = this.#latestRenderedLines;
+		const previousRawFrame = this.#latestRaw;
 		const previousRenderedLength = previousLogicalFrame.length;
 		this.#latestRenderedLines = newLines;
 		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
@@ -5086,13 +5106,6 @@ export class TUI extends Container {
 			return;
 		}
 		const useViewportRepaintPath = this.#viewportRepaintHost();
-		const widthReflowRequired =
-			widthChanged &&
-			this.#previousWidth > 0 &&
-			rawLines.some(line => {
-				TUI.#renderCounters.widthReflowScanRows += 1;
-				return !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width);
-			});
 		if (
 			widthChanged &&
 			!this.#legacyMultiplexerFullRender &&
@@ -5176,6 +5189,16 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes, unless
 		// a proven coalesced append is continuing through the durable append path.
 		if (widthChanged && !coalescedWidthAppend) {
+			// Measure only where the reflow decision is consumed. Viewport-only
+			// resize repaints return above; coalesced appends also skip this scan.
+			const widthReflowRequired =
+				this.#previousWidth > 0 &&
+				rawLines.some(line => {
+					TUI.#renderCounters.widthReflowScanRows += 1;
+					if (TERMINAL.isImageLine(line)) return false;
+					TUI.#renderCounters.widthReflowVisibleWidthCalls += 1;
+					return visibleWidth(line) > Math.min(this.#previousWidth, width);
+				});
 			if (!widthReflowRequired) {
 				this.#widthSettleRepairPending = false;
 				logRedraw(`terminal width changed without reflow (${this.#previousWidth} -> ${width})`);

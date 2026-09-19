@@ -10,6 +10,7 @@ import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
+import { BUNDLED_GJC_SKILL_CATALOG } from "../defaults/gjc-skills.generated";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
@@ -27,7 +28,9 @@ import {
 import { expandTilde } from "../tools/path-utils";
 import { loadSkills, type Skill } from "./skills";
 
-export type RuntimeSkillDiscoverySource = "project" | "user";
+export type RuntimeSkillDiscoverySource = "project" | "user" | "bundled";
+/** Search requests cover filesystem scopes; bundled is only a candidate source. */
+type RuntimeSkillDiscoveryScope = Exclude<RuntimeSkillDiscoverySource, "bundled">;
 
 export interface RuntimeSkillDiscoveryCandidate {
 	name: string;
@@ -49,7 +52,7 @@ export interface RuntimeSkillDiscoveryDiagnostics {
 
 export interface RuntimeSkillDiscoveryResult {
 	candidates: RuntimeSkillDiscoveryCandidate[];
-	/** Deduped, policy-allowed skills the query filter ran against; candidates.length <= scanned. */
+	/** Deduped skill metadata the query filter ran against, including bundled entries; candidates.length <= scanned. */
 	scanned: number;
 	diagnostics: RuntimeSkillDiscoveryDiagnostics;
 }
@@ -62,7 +65,7 @@ export interface DiscoverRuntimeSkillsOptions {
 	profileAuthority?: "default" | "custom";
 	query?: string;
 	limit?: number;
-	source?: RuntimeSkillDiscoverySource | "all";
+	source?: RuntimeSkillDiscoveryScope | "all";
 	policy?: SkillsSettings;
 }
 
@@ -148,7 +151,7 @@ function getUseWhen(skill: CapabilitySkill): string[] | undefined {
 	return values.length > 0 ? values : undefined;
 }
 
-function sourceEnabled(source: RuntimeSkillDiscoverySource, policy: SkillsSettings | undefined): boolean {
+function sourceEnabled(source: RuntimeSkillDiscoveryScope, policy: SkillsSettings | undefined): boolean {
 	if (policy?.enabled !== true) return false;
 	return resolveSkillScopeTrust(policy, source);
 }
@@ -186,7 +189,7 @@ async function realPathOrSelf(filePath: string): Promise<string> {
 }
 
 interface ScanJobResult {
-	items: Array<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource; providerPriority: number }>;
+	items: Array<{ skill: CapabilitySkill; source: RuntimeSkillDiscoveryScope; providerPriority: number }>;
 	warnings: string[];
 	label: string;
 }
@@ -263,7 +266,7 @@ async function scanProjectOrUserDir(
 	dir: string,
 	level: "project" | "user",
 	label: string,
-	source: RuntimeSkillDiscoverySource,
+	source: RuntimeSkillDiscoveryScope,
 	providerPriority: number,
 	authorityRoot?: string,
 ): Promise<ScanJobResult> {
@@ -285,7 +288,7 @@ async function scanProjectOrUserDir(
 interface ConventionImportScan {
 	host: "Claude Code" | "Codex";
 	dir: string;
-	scope: RuntimeSkillDiscoverySource;
+	scope: RuntimeSkillDiscoveryScope;
 	skills: CapabilitySkill[];
 }
 
@@ -300,7 +303,7 @@ interface ConventionImportScan {
  */
 async function collectConventionImportCandidates(
 	ctx: { cwd: string; home: string; repoRoot: string | null },
-	source: RuntimeSkillDiscoverySource | "all",
+	source: RuntimeSkillDiscoveryScope | "all",
 	policy: SkillsSettings | undefined,
 ): Promise<ConventionImportScan[]> {
 	const scans: ConventionImportScan[] = [];
@@ -362,7 +365,7 @@ function reportConventionImportCandidates(
  * tool and `gjc skills discover`.
  */
 export function describeDisabledSkillScopes(
-	source: RuntimeSkillDiscoverySource | "all",
+	source: RuntimeSkillDiscoveryScope | "all",
 	policy: SkillsSettings | undefined,
 ): string | undefined {
 	if (policy?.enabled !== true) {
@@ -393,6 +396,23 @@ export function describeNoSkillMatch(query: string | undefined, scanned: number)
 	const trimmed = (query ?? "").trim();
 	if (trimmed.length === 0 || scanned === 0) return undefined;
 	return `No skill matched every query term (${scanned} skill${scanned === 1 ? "" : "s"} scanned). Matching is conjunctive substring: every whitespace-separated term must appear in the skill's name, description, source, or use conditions, unless a term equals the exact skill name. Retry with the exact skill name or fewer terms; a zero-candidate result does not prove no skills exist.`;
+}
+
+function getBundledSkillCandidates(): RuntimeSkillDiscoveryCandidate[] {
+	// Catalog loaders remain lazy; discovery reads only each entry's metadata.
+	return BUNDLED_GJC_SKILL_CATALOG.flatMap(entry => {
+		if (entry.kind !== "skill" || entry.name === undefined) return [];
+		return [
+			{
+				name: entry.name,
+				description: entry.description ?? "",
+				source: "bundled" as const,
+				// `embedded:gjc/...` is the stable non-filesystem identifier used by
+				// bundled Skill metadata; the relative path comes from the generated catalog.
+				path: `embedded:gjc/${entry.relativePath}`,
+			},
+		];
+	});
 }
 
 export async function discoverRuntimeSkills(
@@ -458,7 +478,7 @@ export async function discoverRuntimeSkills(
 			collectPluginSkills(home, options.cwd, allowedLevels).then(result => ({
 				items: result.items.map(skill => ({
 					skill,
-					source: skill.level as RuntimeSkillDiscoverySource,
+					source: skill.level as RuntimeSkillDiscoveryScope,
 					providerPriority: 70,
 				})),
 				warnings: result.warnings,
@@ -478,6 +498,19 @@ export async function discoverRuntimeSkills(
 	const seenPaths = new Set<string>();
 	const candidates: RuntimeSkillDiscoveryCandidate[] = [];
 	let scanned = 0;
+	// Bundled workflow skills are neither project nor user scope, so explicit
+	// project/user requests exclude them; source "all" includes them regardless
+	// of filesystem trust and include/ignore/disabled policy filters because the
+	// bundled definitions cannot be replaced.
+	if (source === "all") {
+		for (const candidate of getBundledSkillCandidates()) {
+			const normalizedName = getSkillFilesystemIdentity(candidate.name);
+			seenNames.add(normalizedName);
+			seenPaths.add(candidate.path);
+			scanned += 1;
+			if (matchesQuery(candidate, options.query ?? "")) candidates.push(candidate);
+		}
+	}
 	const orderedItems: ScanJobResult["items"] = [];
 	for (const entry of settled) {
 		if ("error" in entry) {

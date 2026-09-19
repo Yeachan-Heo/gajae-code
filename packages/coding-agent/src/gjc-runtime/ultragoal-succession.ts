@@ -382,6 +382,26 @@ function repositoryIdentity(binding: RepositoryBinding): Record<string, unknown>
 	};
 }
 
+/**
+ * Self-transfer guards are narrower than repository identity guards: linked
+ * worktrees share a common dir but carry independent `.gjc` state, so they are
+ * valid succession peers. `captureRepositoryBinding` records a realpath for
+ * active roots, but persisted plan bindings are operator-controlled and may
+ * contain a symlink alias.
+ * Resolve both roots through the filesystem before comparing them; a failed
+ * resolution is a refusal, never a fallback to lexical path comparison.
+ */
+async function canonicalWorktreeRoot(binding: RepositoryBinding, side: "source" | "target"): Promise<string> {
+	try {
+		return await fs.realpath(binding.worktreeRoot);
+	} catch {
+		throw new UltragoalSuccessionError(
+			"unsafe_target",
+			`Cannot resolve the ${side} worktree root physically (${binding.worktreeRoot}); refusing succession.`,
+		);
+	}
+}
+
 function successionOperationId(input: {
 	sourceRepository: RepositoryBinding;
 	sourceSessionId: string;
@@ -781,11 +801,15 @@ async function resolveTargetRepositoryBinding(
 		throw new UltragoalSuccessionError("unsafe_target", `--target-repo is not a directory: ${raw}`);
 	}
 	const target = publicRepositoryBinding(await captureRepositoryBinding(resolved, { displayPath: resolved }));
-	if (repositoryBindingsMatch(target, sourceBinding)) {
+	const [targetRoot, sourceRoot] = await Promise.all([
+		canonicalWorktreeRoot(target, "target"),
+		canonicalWorktreeRoot(sourceBinding, "source"),
+	]);
+	if (targetRoot === sourceRoot) {
 		throw new UltragoalSuccessionError(
 			"unsafe_target",
 			`--target-repo resolves to the source repository itself (${target.worktreeRoot}). ` +
-				"Succession moves work across repositories; it is not a rebind of the original run.",
+				"Succession requires a distinct worktree or repository; it is not a rebind of the original run.",
 		);
 	}
 	return target;
@@ -1277,7 +1301,11 @@ export async function adoptUltragoalSuccession(
 				"adoption is pinned to the exact worktree the offer named.",
 		);
 	}
-	if (repositoryBindingsMatch(targetActual, sourceRepository)) {
+	const [targetRoot, sourceRoot] = await Promise.all([
+		canonicalWorktreeRoot(targetActual, "target"),
+		canonicalWorktreeRoot(sourceRepository, "source"),
+	]);
+	if (targetRoot === sourceRoot) {
 		throw new UltragoalSuccessionError(
 			"unsafe_target",
 			"Refusing to adopt a succession offer into its own source repository.",

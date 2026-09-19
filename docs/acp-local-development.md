@@ -53,6 +53,26 @@ the broker is replaced by one running that checkout's source:
 79955  00:09  bun --config=.../src/sdk/broker/internal-source.bunfig.toml .../src/cli.ts sdk broker-internal --agent-dir /Users/you/.gjc/agent
 ```
 
+### Startup-control provenance errors
+
+If `session/new` rejects with `-32603` and
+`requires a newer GJC SDK session with startup control provenance`, the broker
+or session host is older than the ACP front end; the external client is
+supported. The check requires the host capability `primaryControlSurface`,
+which landed after v0.16.7 in `be4c88383` (#5411). A v0.16.7 host can report
+`promptTerminalOutcomeVersion: 1` while omitting `primaryControlSurface`, so
+the front end correctly rejects that half-upgraded session.
+
+Restart the broker from the same checkout, closing its existing session hosts:
+
+```sh
+bun run restart:sdk-broker -- --close-session-hosts
+ps -eo pid,etime,command | grep '[b]roker-internal'
+```
+
+For an isolated client or CI run, set `GJC_CODING_AGENT_DIR` to a fresh
+directory so the client owns a broker started from the same build.
+
 The restart asks the published broker to shut down over its authenticated
 loopback channel and starts a replacement. `--close-session-hosts` first closes
 every broker-spawned host in that agent directory, so it can interrupt active
@@ -116,7 +136,7 @@ Paseo runs its daemon as a separate long-lived process, so it needs its own
 restart after a config change — but not after a GJC rebuild, since it spawns
 `gjc` per session. `--wait-timeout 3m` stops the CLI from waiting; it does not
 cancel the agent, which may remain `running`. That timeout is separate from
-GJC's `sdk.promptDeadlineMs`, which defaults to 30 minutes and settles as
+GJC's `sdk.promptDeadlineMs`, which defaults to 60 minutes and settles as
 `prompt_deadline_exceeded`.
 
 Errors surface in the daemon log with the JSON-RPC payload intact, which is

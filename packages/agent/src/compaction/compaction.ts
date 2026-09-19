@@ -868,6 +868,12 @@ export interface SummaryOptions {
 	remoteEndpoint?: string;
 	remoteInstructions?: string;
 	initiatorOverride?: MessageAttribution;
+	/**
+	 * Marks this as GJC maintenance work rather than an interactive user turn.
+	 * Agent-level providers (e.g. `devin-acp`) refuse maintenance calls they
+	 * cannot serve instead of forwarding them to a billed upstream agent.
+	 */
+	maintenanceCall?: boolean;
 	metadata?: Record<string, unknown>;
 	convertToLlm?: ConvertToLlm;
 	/**
@@ -1026,6 +1032,7 @@ export async function generateSummary(
 			apiKey,
 			reasoning: maintenanceReasoning(model),
 			initiatorOverride: options?.initiatorOverride,
+			maintenanceCall: options?.maintenanceCall,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
 			providerSessionId: options?.providerSessionId,
@@ -1065,6 +1072,12 @@ export interface HandoffOptions {
 	promptExtension?: string;
 	convertToLlm?: ConvertToLlm;
 	initiatorOverride?: MessageAttribution;
+	/**
+	 * Marks this as GJC maintenance work rather than an interactive user turn.
+	 * Agent-level providers (e.g. `devin-acp`) refuse maintenance calls they
+	 * cannot serve instead of forwarding them to a billed upstream agent.
+	 */
+	maintenanceCall?: boolean;
 	metadata?: Record<string, unknown>;
 	/**
 	 * Optional telemetry handle. When provided, the handoff LLM call is
@@ -1124,6 +1137,7 @@ export async function generateHandoff(
 			reasoning: maintenanceReasoning(model),
 			toolChoice: "none",
 			initiatorOverride: options.initiatorOverride,
+			maintenanceCall: options.maintenanceCall,
 			metadata: options.metadata,
 			sessionId: options.sessionId,
 			providerSessionId: options.providerSessionId,
@@ -1397,6 +1411,7 @@ export async function compact(
 		remoteEndpoint: settings.remoteEnabled === false ? undefined : settings.remoteEndpoint,
 		remoteInstructions: options?.remoteInstructions,
 		initiatorOverride: options?.initiatorOverride,
+		maintenanceCall: options?.maintenanceCall,
 		metadata: options?.metadata,
 		convertToLlm: options?.convertToLlm,
 		telemetry: options?.telemetry,
@@ -1574,6 +1589,7 @@ async function generateTurnPrefixSummary(
 			apiKey,
 			reasoning: maintenanceReasoning(model),
 			initiatorOverride: options?.initiatorOverride,
+			maintenanceCall: options?.maintenanceCall,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
 			providerSessionId: options?.providerSessionId,

@@ -30,7 +30,11 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Clear work with demonstrated architecture or sequencing risk suggests `/skill:ralplan --deliberate`; reconciliation must persist its final receipt before choosing approval or an admitted handoff. A valid non-off final runtime receipt enters the existing handoff chain; otherwise it stops pending approval.
 - Use `/skill:ultragoal` for durable goal ledgers and `/skill:autoresearch` for goal-directed research missions that end on a structured verdict rather than an implementation.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
-- An explicit user request to use a worktree (for example, "use worktree") overrides direct editing: delegate implementation through `task` with `isolated: true`. This is the in-session counterpart of launching `gjc --worktree`; if task isolation is unavailable, report that conflict instead of editing in the parent session.
+{{#if taskIsolationEnabled}}
+- An explicit user request to use a worktree (for example, "use worktree") overrides direct editing: delegate implementation through `task` with `isolated: true`. This is the in-session counterpart of launching `gjc --worktree`; if a specific task cannot be delegated that way, create or select a dedicated git worktree with `git worktree add` and implement there instead of editing the parent checkout.
+{{else}}
+- An explicit user request to use a worktree (for example, "use worktree") overrides direct editing of the current checkout: create or select a dedicated git worktree with `git worktree add` and implement there. Task-level isolation is off in this session, so `task` does NOT accept `isolated`; NEVER refuse worktree work over that missing parameter. Mention the `task.isolation.mode` setting only if the user explicitly wants subagent-level isolation.
+{{/if}}
 - Active skills are authoritative: never ignore an invoked skill; read the full skill text and follow it exactly.
 - Before explicit execution approval or a valid non-off ralplan final runtime receipt, planning and interview workflows NEVER edit product source, run mutating shell commands, commit, push, open PRs, or delegate implementation.
 </routing>

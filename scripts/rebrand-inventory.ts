@@ -40,7 +40,7 @@ const rootLegacyScriptKeys = new Set(["test:py"]);
 
 const ignoredDirs = new Set([".git", "node_modules", ".gjc", "dist", "build", "coverage", ".turbo"]);
 const ignoredFiles = new Set(["bun.lock", "Cargo.lock"]);
-const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm"]);
+const ignoredExtensions = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".node", ".wasm", ".pdf"]);
 
 const forbiddenLegacyTokens = ["@oh-my" + "-pi", "oh-my" + "-pi", "om" + "p"] as const;
 const legacyTokenPatterns = forbiddenLegacyTokens.map(token => ({
@@ -208,7 +208,12 @@ function scanLegacyHits(): LegacyHit[] {
 		const rel = relative(file);
 		let content: string;
 		try {
-			content = fs.readFileSync(file, "utf8");
+			const bytes = fs.readFileSync(file);
+			// Binary assets are not brand surfaces, and decoding them as text produces
+			// mojibake in which a compressed byte run can spell a legacy token. Skip
+			// them by content rather than relying on the extension list alone.
+			if (isBinary(bytes)) continue;
+			content = bytes.toString("utf8");
 		} catch {
 			continue;
 		}
@@ -223,6 +228,56 @@ function scanLegacyHits(): LegacyHit[] {
 		}
 	}
 	return hits;
+}
+
+/** Bytes inspected when classifying a file as text or binary, matching git's sniff window. */
+const binarySniffBytes = 8000;
+
+/**
+ * Trim a trailing UTF-8 sequence the sniff window cut in half.
+ *
+ * Without this, a valid UTF-8 text file longer than the window decodes as
+ * invalid purely because its last multibyte character was split, and the file
+ * would be misclassified as binary.
+ */
+function trimSplitUtf8Sequence(window: Buffer, truncated: boolean): Buffer {
+	if (!truncated) return window;
+	for (let back = 1; back <= 3 && back <= window.length; back++) {
+		const byte = window[window.length - back]!;
+		if ((byte & 0b1100_0000) === 0b1000_0000) continue; // continuation byte; keep walking back
+		const expected = byte >= 0b1111_0000 ? 4 : byte >= 0b1110_0000 ? 3 : byte >= 0b1100_0000 ? 2 : 1;
+		return expected > back ? window.subarray(0, window.length - back) : window;
+	}
+	return window;
+}
+
+/**
+ * Conservative text/binary classification.
+ *
+ * A NUL byte is decisive, but plenty of binary assets carry none — a PNG, a
+ * woff2 font, or a compiled addon can be NUL-free in its first block while
+ * still decoding into mojibake that spells a legacy token. Extension lists
+ * cannot close that hole either, because `walk()` includes arbitrary unknown
+ * extensions. So the classifier also rejects content that is not valid UTF-8
+ * and content dominated by non-text control bytes, and only then treats the
+ * file as a brand surface.
+ */
+function isBinary(bytes: Buffer): boolean {
+	if (bytes.length === 0) return false;
+	const truncated = bytes.length > binarySniffBytes;
+	const window = trimSplitUtf8Sequence(bytes.subarray(0, binarySniffBytes), truncated);
+	if (window.includes(0)) return true;
+	try {
+		new TextDecoder("utf-8", { fatal: true }).decode(window);
+	} catch {
+		return true;
+	}
+	let nonText = 0;
+	for (const byte of window) {
+		const printable = byte >= 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d;
+		if (!printable || byte === 0x7f) nonText++;
+	}
+	return nonText / window.length > 0.3;
 }
 
 function collectRootMetadataViolations(): MetadataViolation[] {

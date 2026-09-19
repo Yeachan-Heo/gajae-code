@@ -27,6 +27,7 @@ function markManagedAttemptValidated<T extends object>(options: T): T {
 import { getCustomApi } from "./api-registry";
 import type { Effort } from "./model-thinking";
 import {
+	getMiniMaxThinkingMode,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
 	requireSupportedEffort,
@@ -39,6 +40,7 @@ import {
 	readAwsStaticEnvironmentCredentials,
 } from "./providers/aws-credential-config";
 import type { CursorOptions } from "./providers/cursor";
+import type { DevinAcpOptions } from "./providers/devin-acp";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
@@ -54,6 +56,7 @@ import {
 	streamAzureOpenAIResponses,
 	streamBedrock,
 	streamCursor,
+	streamDevinAcp,
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
@@ -398,6 +401,9 @@ export function stream<TApi extends Api>(
 			(options || {}) as KiroCodeWhispererOptions,
 			onStreamCreated,
 		);
+	} else if (model.api === "devin-acp") {
+		// Devin authenticates through its own CLI, so there is no GJC API key to resolve.
+		return streamDevinAcp(model as Model<"devin-acp">, context, (options || {}) as DevinAcpOptions, onStreamCreated);
 	}
 
 	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
@@ -494,6 +500,9 @@ export async function complete<TApi extends Api>(
 	options?: OptionsForApi<TApi>,
 ): Promise<AssistantMessage> {
 	const s = stream(model, context, options);
+	for await (const _event of s) {
+		// Completion callers only need the terminal message, not buffered events.
+	}
 	return s.result();
 }
 
@@ -818,6 +827,9 @@ export async function completeSimple<TApi extends Api>(
 	options?: SimpleStreamOptions,
 ): Promise<AssistantMessage> {
 	const s = streamSimple(model, context, options);
+	for await (const _event of s) {
+		// Completion callers only need the terminal message, not buffered events.
+	}
 	return s.result();
 }
 
@@ -952,6 +964,7 @@ function mapOptionsForApi<TApi extends Api>(
 		cacheRetention: options?.cacheRetention ?? model.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
+		maintenanceCall: options?.maintenanceCall,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 		requestMaxRetries: options?.fallbackManaged ? 0 : options?.requestMaxRetries,
 		streamMaxRetries: options?.fallbackManaged ? 0 : options?.streamMaxRetries,
@@ -959,6 +972,7 @@ function mapOptionsForApi<TApi extends Api>(
 		sessionId: options?.sessionId,
 		providerSessionId: options?.providerSessionId,
 		providerSessionState: options?.providerSessionState,
+		devinAcp: options?.devinAcp,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onStreamCreated: options?.onStreamCreated,
@@ -971,6 +985,16 @@ function mapOptionsForApi<TApi extends Api>(
 
 	switch (model.api) {
 		case "anthropic-messages": {
+			const miniMaxMode = getMiniMaxThinkingMode(model);
+			if (miniMaxMode) {
+				return castApi<"anthropic-messages">({
+					...base,
+					thinkingEnabled:
+						miniMaxMode === "toggle" ? !!options?.reasoning && !options?.disableReasoning : undefined,
+					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
+					serviceTier: options?.serviceTier,
+				});
+			}
 			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
 			const reasoning = options?.reasoning;
 			if (!reasoning || !model.reasoning) {
@@ -1087,9 +1111,15 @@ function mapOptionsForApi<TApi extends Api>(
 			return castApi<"openai-completions">({
 				...base,
 				reasoning: resolveOpenAiReasoningEffort(model, options),
-				disableReasoning: options?.disableReasoning,
+				// Agent-level off is represented by an absent effort. MiniMax's
+				// native OpenAI endpoint defaults to on, so send an explicit switch.
+				disableReasoning:
+					getMiniMaxThinkingMode(model) === "toggle"
+						? !options?.reasoning || options?.disableReasoning
+						: options?.disableReasoning,
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
+				repetitionGuard: options?.repetitionGuard,
 			});
 
 		case "openai-responses":
@@ -1266,6 +1296,11 @@ function mapOptionsForApi<TApi extends Api>(
 				onToolResult,
 			});
 		}
+
+		case "devin-acp":
+			return castApi<"devin-acp">({
+				...base,
+			});
 
 		case "kiro-codewhisperer-stream":
 			return castApi<"kiro-codewhisperer-stream">({

@@ -11,10 +11,11 @@ import { createNotificationsExtension } from "../src/sdk/bus";
 
 /**
  * A provider failure reaches this extension as an `agent_end` carrying an error
- * assistant message. The SDK/ACP failure envelope uses the fixed safe token
- * "Prompt submission failed." (see `sanitizePromptFailure`), while the assistant
- * message can remain in the local session transcript. The bounded operator log
- * keeps that failure diagnosable without widening the SDK/ACP redaction boundary.
+ * assistant message. The SDK/ACP failure envelope carries only the bounded,
+ * derived phase/category wording (see `promptFailureMessage` and
+ * `sanitizePromptFailure`), never raw provider text, while the assistant message
+ * can remain in the local session transcript. The bounded operator log keeps that
+ * failure diagnosable without widening the SDK/ACP redaction boundary.
  */
 
 const dirs: string[] = [];
@@ -162,13 +163,21 @@ isolatedSdkHostTest(
 			const first = await submit("failing-prompt");
 			await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "failed prompt terminal");
 
-			// The SDK failure envelope never names the cause, only the fixed safe token.
+			// The legacy wire discriminator is preserved, but a post-start failure is
+			// no longer described as a submission rejection.
 			const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
 			expect(failure).toMatchObject({
 				commandId: first.commandId,
 				turnId: first.turnId,
-				error: { code: "agent_error", message: "Prompt submission failed." },
-				outcome: { kind: "failed", code: "prompt_failed", message: "Prompt submission failed." },
+				error: { code: "agent_error", message: "Agent run failed after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Agent run failed after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "agent_runtime",
+				},
 			});
 			expect(JSON.stringify(failure)).not.toContain("materialization budget");
 			expect(JSON.stringify(failure)).not.toContain("secret-provider-token");
@@ -186,6 +195,82 @@ isolatedSdkHostTest(
 		} finally {
 			unsubscribe();
 			errorSpy.mockRestore();
+		}
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	},
+	75_000,
+);
+
+isolatedSdkHostTest(
+	"SDK host carries a bounded provider stream classifier with a post-start phase",
+	async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-provider-stream-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-prompt-provider-stream-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const reason = "upstream request failed: stream interrupted before terminal response event";
+		const model = createMockModel({
+			handler: {
+				// Mirrors the real Responses provider catch attaching the bounded
+				// classifier produced by the shared SSE parser.
+				throw: Object.assign(new Error(reason), { code: "upstream_stream_interrupted" }),
+			},
+		});
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["test"], messages: [], tools: [] },
+			streamFn: model.stream,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+		});
+		let handlers!: Map<string, (event: unknown, context: unknown) => unknown>;
+		handlers = await start(sessionContext, async () => {
+			await agent.prompt("work the provider failure");
+		});
+		const unsubscribe = agent.subscribe(event => {
+			void handlers.get(event.type)?.(event, sessionContext);
+		});
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		try {
+			socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "provider-stream",
+					operation: "turn.prompt",
+					input: { text: "work the provider failure" },
+				}),
+			);
+			await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "provider stream terminal");
+
+			const failure = frames.find(frame => frame.type === "agent_failed") as Record<string, unknown>;
+			expect(failure).toMatchObject({
+				error: { code: "agent_error", message: "Provider failure after execution started." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Provider failure after execution started.",
+					provenance: "agent_failed",
+					phase: "post_start",
+					category: "provider_transport",
+					providerCode: "upstream_stream_interrupted",
+				},
+			});
+			// Raw provider text never crosses the SDK boundary.
+			expect(JSON.stringify(failure)).not.toContain(reason);
+		} finally {
+			unsubscribe();
 		}
 
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
@@ -248,7 +333,14 @@ isolatedSdkHostTest(
 				commandId: acknowledgement.result?.commandId,
 				turnId: acknowledgement.result?.turnId,
 				error: { code: "internal", message: "Prompt submission failed." },
-				outcome: { kind: "failed", code: "prompt_failed", message: "Prompt submission failed." },
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Prompt submission failed.",
+					provenance: "agent_failed",
+					phase: "submission",
+					category: "agent_runtime",
+				},
 			});
 			expect(JSON.stringify(failure)).not.toContain("Accepted sendUserMessage rejected");
 			expect(sdkPromptTerminalFailedCount).toBe(1);

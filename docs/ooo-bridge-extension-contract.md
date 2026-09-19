@@ -56,6 +56,23 @@ Before command dispatch, the exact-prefix helper increments the Ouroboros bridge
 
 ## Installation and discovery
 
+### Runtime status
+
+Session startup loads filesystem extension modules. Unless `options.disableExtensionDiscovery` is set, `createAgentSession` calls `discoverAndLoadExtensions` with the explicit `options.additionalExtensionPaths`, the `extensions` setting, and the canonical native locations below, applying the `disabledExtensions` setting to every form discovery reaches (`disableExtensionDiscovery` keeps its documented opt-out semantics: the explicit `additionalExtensionPaths` load as given, exactly like `cli/list-models.ts`). `options.preloadedExtensions` short-circuits discovery for a caller that already loaded extensions. A discovered module that fails to import is reported through the shared logger and skipped while the remaining modules still load. If discovery itself fails, the session warns, records the failure in `extensionsResult.errors`, and degrades to the explicitly configured paths — and then to no extensions at all — instead of failing session creation; a single unreadable, unresolvable, or pathological configured entry cannot drop the extensions that other sources contribute.
+
+Disabling one module is `disabledExtensions: ["extension-module:<name>"]`; the retired `--no-extensions` / `--extension` CLI flags are not a control surface here (ACP-only launch flags).
+
+A bridge installed under the locations below is therefore discovered and activated, and its `input` handler runs. `gjc customize doctor` is read-only and never executes a module, so it reports the module as `[stored-only]` and says why its dynamic registrations remain opaque:
+
+```text
+ouroboros-ooo-bridge  [stored-only]  gjc/user  (canonical)
+  reason: managed — Trusted filesystem extension module discovered for session-start
+          loading. Doctor does not execute the module, so its runtime input handlers,
+          tools, commands, and flags remain opaque until a session loads it.
+```
+
+GJC plugin bundles carry `subskills`, `tools`, `hooks`, `mcps`, `system_appendix`, and `agent-appendix` (`docs/gjc-plugins.md`). An `input`-event surface is still outside that set, so a bundle cannot deliver this bridge; the extension module location below is its supported delivery surface.
+
 ### Pinned Ouroboros baseline
 
 This path is verified against [Q00/ouroboros `v0.50.7`](https://github.com/Q00/ouroboros/releases/tag/v0.50.7). Install its MCP profile at the exact version, then configure GJC:

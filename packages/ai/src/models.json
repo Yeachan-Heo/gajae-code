@@ -116,6 +116,76 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"deepseek-v4-pro-0813": {
+			"id": "deepseek-v4-pro-0813",
+			"name": "DeepSeek V4 Pro 0813",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
+		"deepseek-v4.1-flash": {
+			"id": "deepseek-v4.1-flash",
+			"name": "DeepSeek V4.1 Flash",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
 		"glm-5": {
 			"id": "glm-5",
 			"name": "GLM-5",
@@ -195,6 +265,42 @@
 				"mode": "effort",
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
+			}
+		},
+		"glm-5.3": {
+			"id": "glm-5.3",
+			"name": "GLM-5.3",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
 			}
 		},
 		"kimi-k2.5": {
@@ -64677,6 +64783,52 @@
 			"provider": "openai",
 			"baseUrl": ""
 		},
+		"gpt-image-2.5-flare": {
+			"id": "gpt-image-2.5-flare",
+			"name": "GPT Image 2.5 Flare",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-sunburst": {
+			"id": "gpt-image-2.5-sunburst",
+			"name": "GPT Image 2.5 Sunburst",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-responses",
+			"provider": "openai",
+			"baseUrl": ""
+		},
 		"gpt-realtime-2.1": {
 			"id": "gpt-realtime-2.1",
 			"name": "GPT-Realtime-2.1",
@@ -65528,6 +65680,52 @@
 		"gpt-image-2": {
 			"id": "gpt-image-2",
 			"name": "GPT Image 2",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-flare": {
+			"id": "gpt-image-2.5-flare",
+			"name": "GPT Image 2.5 Flare",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"output": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 128000,
+			"maxTokens": 16384,
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": ""
+		},
+		"gpt-image-2.5-sunburst": {
+			"id": "gpt-image-2.5-sunburst",
+			"name": "GPT Image 2.5 Sunburst",
 			"reasoning": false,
 			"input": [
 				"text"
@@ -66470,6 +66668,31 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"muse-spark-1.3-contributor": {
+			"id": "muse-spark-1.3-contributor",
+			"name": "Muse Spark 1.3 Contributor",
+			"api": "openai-responses",
+			"provider": "opencode-go",
+			"baseUrl": "https://opencode.ai/zen/go/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.1,
+				"output": 0.2,
+				"cacheRead": 0.002,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"qwen3.8-flash": {
 			"id": "qwen3.8-flash",
 			"name": "Qwen3.8 Flash",
@@ -66488,6 +66711,31 @@
 				"cacheWrite": 0.2
 			},
 			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
+		"union-alpha": {
+			"id": "union-alpha",
+			"name": "Union Alpha Free",
+			"api": "anthropic-messages",
+			"provider": "opencode-go",
+			"baseUrl": "https://opencode.ai/zen/go",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "budget",
@@ -68512,6 +68760,31 @@
 			},
 			"contextWindow": 131072,
 			"maxTokens": 131072
+		},
+		"union-alpha": {
+			"id": "union-alpha",
+			"name": "Union Alpha Free",
+			"api": "anthropic-messages",
+			"provider": "opencode-zen",
+			"baseUrl": "https://opencode.ai/zen",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 262144,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "budget",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
 		}
 	},
 	"opengateway": {

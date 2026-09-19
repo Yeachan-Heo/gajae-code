@@ -894,6 +894,15 @@ export async function autoresearchIssueVerdict(input: {
 
 /* ------------------------------ CLI dispatch ------------------------------ */
 
+/**
+ * A help request is `--help`/`-h` anywhere in the argv, or a leading `help`
+ * verb. Exported so the CLI command class routes help back through this
+ * runtime instead of a generic command-level fallback.
+ */
+export function isAutoresearchHelpInvocation(args: readonly string[]): boolean {
+	return args.includes("--help") || args.includes("-h") || args[0] === "help";
+}
+
 function renderAutoresearchHelp(): string {
 	return [
 		"Run native GJC Autoresearch workflow commands",
@@ -1081,7 +1090,7 @@ export async function runNativeAutoresearchCommand(
 	cwd = process.cwd(),
 ): Promise<AutoresearchCommandResult> {
 	try {
-		if (args.includes("--help") || args.includes("-h") || args[0] === "help") {
+		if (isAutoresearchHelpInvocation(args)) {
 			return { status: 0, stdout: renderAutoresearchHelp() };
 		}
 		const verb = args[0];

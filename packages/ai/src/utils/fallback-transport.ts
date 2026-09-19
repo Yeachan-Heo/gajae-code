@@ -48,6 +48,10 @@ export type TransportHeaders = Headers | Record<string, string | undefined>;
  */
 export interface TransportFailureFacts {
 	kind: "transport";
+	/** Diagnostic HTTP/2 reset code; not HTTP status or retry authority. */
+	http2RstCode?: number;
+	/** Native HTTP/2 error code; diagnostic only, not retry authority. */
+	nativeErrorCode?: string;
 	status?: number;
 	/** Canonical provider error code used for fallback classification. */
 	providerCode?: string;
@@ -235,6 +239,9 @@ export function transportFailureFacts(
 	// (consumers deliberately re-run transportFailureFacts on embedded facts).
 	const headers = retainedHeaderRecord(rawHeaders);
 	const normalizedCode = providerCode?.toLowerCase();
+	const http2RstCode = finiteNonNegativeInteger(propertyOf(value, "http2RstCode"));
+	const nativeCode = stringValue(propertyOf(value, "nativeErrorCode")) ?? stringValue(propertyOf(value, "code"));
+	const nativeErrorCode = nativeCode && /^ERR_HTTP2_[A-Z_]+$/.test(nativeCode) ? nativeCode : undefined;
 	const requestBytes = finiteNonNegativeInteger(propertyOf(value, "requestBytes"));
 	const firstEventElapsedMs = finiteNonNegativeInteger(propertyOf(value, "firstEventElapsedMs"));
 	const firstEventTimeoutMs = finiteNonNegativeInteger(propertyOf(value, "firstEventTimeoutMs"));
@@ -244,6 +251,8 @@ export function transportFailureFacts(
 		endpointClassValue === "canonical" || endpointClassValue === "custom" ? endpointClassValue : undefined;
 	const credentialModelUnavailable = propertyOf(value, "credentialModelUnavailable") === true;
 	if (
+		http2RstCode === undefined &&
+		nativeErrorCode === undefined &&
 		status === undefined &&
 		headers === undefined &&
 		!isQuotaCode(normalizedCode) &&
@@ -268,6 +277,8 @@ export function transportFailureFacts(
 	}
 	return {
 		kind: "transport",
+		...(http2RstCode === undefined ? {} : { http2RstCode }),
+		...(nativeErrorCode === undefined ? {} : { nativeErrorCode }),
 		status,
 		providerCode,
 		anthropicErrorType,

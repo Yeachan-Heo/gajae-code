@@ -28,7 +28,7 @@ import type {
 	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
-import { kCursorExecResolved } from "../utils/block-symbols";
+import { kProviderResolvedToolCall } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { FirstEventTimeoutError, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
@@ -676,6 +676,12 @@ const CURSOR_WRITE_DRAIN_TIMEOUT_MS = 5_000;
 const CURSOR_MAX_PENDING_SHELL_WRITE_BYTES = 1024 * 1024;
 const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
 const cursorWriteErrors = new WeakMap<object, unknown>();
+interface CursorWriteListeners {
+	finishes: Set<(error?: unknown) => void>;
+	onError: (error: unknown) => void;
+	onClose: () => void;
+}
+const cursorWriteListeners = new WeakMap<object, CursorWriteListeners>();
 
 function closeStalledCursorRequest(request: http2.ClientHttp2Stream): void {
 	// A request whose peer stopped reading may never invoke a write callback. Close
@@ -833,25 +839,44 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 	// late transport error cannot surface as an unhandled rejection in the gap.
 	completion.promise.catch(() => {});
 	pending.add(completion.promise);
+	let listeners = cursorWriteListeners.get(request);
+	if (!listeners) {
+		const finishes = new Set<(error?: unknown) => void>();
+		const onError = (error: unknown) => {
+			for (const finish of [...finishes]) finish(error);
+		};
+		listeners = {
+			finishes,
+			onError,
+			onClose: () => onError(new Error("Cursor request closed before write completed")),
+		};
+		cursorWriteListeners.set(request, listeners);
+	}
+	const shared = listeners;
 	const finish = (error?: unknown) => {
 		if (completed) return;
 		completed = true;
 		pending.delete(completion.promise);
 		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
-		if (typeof request.removeListener === "function") {
-			request.removeListener("close", onClose);
-			request.removeListener("error", finish);
+		shared.finishes.delete(finish);
+		if (shared.finishes.size === 0) {
+			if (typeof request.removeListener === "function") {
+				request.removeListener("close", shared.onClose);
+				request.removeListener("error", shared.onError);
+			}
+			cursorWriteListeners.delete(request);
+			// Keep the pending set and first error until the final drain observes them.
 		}
 		if (error == null) completion.resolve();
 		else completion.reject(error);
 	};
-	const onClose = () => finish(new Error("Cursor request closed before write completed"));
+	shared.finishes.add(finish);
 	try {
 		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
 		// test seam tolerant of a minimal writer stub as well.
-		if (typeof request.once === "function") {
-			request.once("close", onClose);
-			request.once("error", finish);
+		if (shared.finishes.size === 1 && typeof request.once === "function") {
+			request.once("close", shared.onClose);
+			request.once("error", shared.onError);
 		}
 		return request.write(frame, finish) !== false;
 	} catch (error) {
@@ -1263,6 +1288,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalDrainStarted = false;
 		let execQueuePrefix: Promise<void> | undefined;
 		let terminalPendingError: unknown;
+		let requestCloseError: (Error & { http2RstCode?: number; nativeErrorCode?: string }) | undefined;
+		// Native errors may be frozen; keep observations separate from their identity.
+		const requestErrorResetCodes = new WeakMap<Error, number | undefined>();
 		let terminalBoundarySeen = false;
 		// Lookahead can validate turnEnded while an exec handler holds the normal
 		// parser. Close new exec admission immediately, but leave the validated
@@ -1570,6 +1598,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			h2RequestErrorHandler = error => {
 				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
+				// Enrich only the synthetic reset diagnostic with the first observed
+				// native code. Never replace its message, priority, or retry class.
+				if (requestCloseError && !requestCloseError.nativeErrorCode) {
+					requestCloseError.nativeErrorCode = transportFailureFacts(error)?.nativeErrorCode;
+				}
+				if (!requestErrorResetCodes.has(error)) requestErrorResetCodes.set(error, h2Request?.rstCode);
 				terminalize(error, "drainable");
 			};
 			h2Request.on("error", h2RequestErrorHandler);
@@ -1612,7 +1646,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				responseEnded = true;
-				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), "drainable");
+				requestCloseError = Object.assign(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), {
+					http2RstCode: h2Request?.rstCode,
+				});
+				terminalize(requestCloseError, "drainable");
 			};
 			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
 			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
@@ -2308,6 +2345,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			output.stopReason = callerAbortError || options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.transportFailure = transportFailureFacts(mappedError);
+			if (mappedError instanceof Error && requestErrorResetCodes.has(mappedError)) {
+				output.transportFailure = transportFailureFacts({
+					...output.transportFailure,
+					// The native error can precede the request's reset observation.
+					// Fill a missing observation at settlement, after terminal draining;
+					// local teardown may supply it, so this is not remote-cause evidence.
+					http2RstCode: requestErrorResetCodes.get(mappedError) ?? h2Request?.rstCode,
+				});
+			}
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			finalizeCursorUsage(output, usageState);
 			calculateCost(model, output.usage);
@@ -2384,7 +2430,7 @@ type ToolCallState = ToolCall & {
 	index: number;
 	partialJson?: string;
 	kind: "mcp" | "todo_write" | "native" | "cursor-exec";
-	[kCursorExecResolved]?: true;
+	[kProviderResolvedToolCall]?: true;
 };
 
 interface BlockState {
@@ -4320,7 +4366,7 @@ function synthesizeCursorExecToolCall(
 		arguments: cursorJsonSafeValue(args) as Record<string, unknown>,
 		index: output.content.length,
 		kind: "cursor-exec",
-		[kCursorExecResolved]: true,
+		[kProviderResolvedToolCall]: true,
 	};
 	output.content.push(block);
 	const contentIndex = output.content.length - 1;

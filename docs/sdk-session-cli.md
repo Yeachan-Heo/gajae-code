@@ -60,6 +60,23 @@ from Git scopes deterministically and reported in `warnings`.
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
 `status`, `tail`, `retire`, and raw control/query behavior is unchanged.
 
+For a process-isolated caller that needs bounded discovery, request exactly one
+Broker page instead of the semantic all-pages list:
+
+```sh
+gjc sdk session raw global --op session.list --page --limit 20 \
+  --agent-dir <agent-dir>
+gjc sdk session raw global --op session.list --page --cursor <opaque-cursor> \
+  --limit 20 --agent-dir <agent-dir>
+```
+
+`--page` preserves the Broker page envelope, including `indexSeq`, `warnings`,
+the bounded `sessions` array, and the opaque `continuationCursor`. The cursor
+is a snapshot continuation: pass it back unchanged, with the same `--limit`,
+and never restart from the first page or locally slice an all-pages result.
+Semantic `gjc sdk session list` remains the fully paginated, scope-filtered
+operation.
+
 - `sessionId` and the `locator` (`cwd`, `worktreeRoot`, `stateRoot`), where `cwd`
   is the canonical workspace directory and `worktreeRoot` is the canonical Git
   worktree root or `null` outside a worktree;
@@ -174,7 +191,29 @@ operation and returns the broker/host response:
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
-  `session.delete`, `session.reconcile_uncertain`) require `--idempotency-key`.
+  `session.delete`, `session.reconcile_uncertain`, `session.lookup`) require
+  `--idempotency-key`.
+
+`session.lookup` is a read-only reconciliation of a previously submitted
+`session.create`. Reuse the caller request key and the same create target that
+were retained before dispatch; GJC derives the Broker identity and fingerprint
+inside the lifecycle boundary. It never calls `session.create` and never
+replays session work:
+
+```sh
+gjc sdk session raw global --op session.lookup \
+  --idempotency-key <create-request-key> \
+  --json-input '{"cwd":"/absolute/path/to/repo"}' \
+  --agent-dir <agent-dir>
+```
+
+The credential-free result identifies the original operation and request key.
+`status: "found"` carries the canonical session result; `pending`,
+`not_found`, `conflict`, `uncertain`, and `terminal` are distinct structured
+outcomes and retain `certainty` and the recovery identity. A missing record is
+not proof that the create did not execute, so callers must not resubmit solely
+because lookup reports `not_found`. Reconciliation failures exit nonzero while
+preserving the structured outcome in JSON.
 
 A separately connected local controller can stop the active turn and its exact
 owned work with an explicitly confirmed operator abort:

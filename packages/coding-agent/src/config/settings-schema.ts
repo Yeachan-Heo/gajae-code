@@ -416,7 +416,7 @@ export const SETTINGS_SCHEMA = {
 	// SDK-owned prompt deadline. Hidden from the UI; ACP has no separate timeout.
 	"sdk.promptDeadlineMs": {
 		type: "number",
-		default: 1_800_000,
+		default: 3_600_000,
 		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},

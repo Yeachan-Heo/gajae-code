@@ -16,6 +16,7 @@ import {
 	imageGenTool,
 	UnsupportedImageProviderError,
 } from "@gajae-code/coding-agent/tools/image-gen";
+import * as piUtils from "@gajae-code/utils";
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
@@ -249,6 +250,8 @@ describe("imageGenTool", () => {
 
 	it("e2e writes OpenAI Responses image_generation WebP output to a temp file", async () => {
 		delete Bun.env.OPENAI_BASE_URL;
+		// Settings/registry fixtures do not isolate the trusted user .env and shell sources.
+		vi.spyOn(piUtils, "$credentialEnv").mockReturnValue(undefined);
 		let requestUrl: string | undefined;
 		let requestBody: unknown;
 
@@ -455,6 +458,60 @@ function makeAntigravityCtx(modelRegistry: Partial<ModelRegistry>): CustomToolCo
 		abort: () => {},
 	};
 }
+
+describe("imageGenTool selected image-role model", () => {
+	const models: Model[] = [
+		{ ...ANTIGRAVITY_MODEL, id: "gemini-3.1-flash-image" },
+		{
+			...ANTIGRAVITY_MODEL,
+			api: "google-generative-ai",
+			provider: "google",
+			id: "gemini-3.1-flash-image",
+		},
+		{ ...OPENROUTER_MODEL, id: "google/gemini-3.1-flash-image" },
+		{ ...OPENROUTER_MODEL, provider: "alibaba-token-plan", id: "wan2.7-image-pro" },
+	];
+
+	for (const model of models) {
+		it(`preserves ${model.provider}/${model.id} in the request and result`, async () => {
+			let requestUrl: string | undefined;
+			let requestedModel: string | undefined;
+			const fetchMock = (async (input: string | URL | Request, init?: RequestInit) => {
+				requestUrl = String(input);
+				requestedModel = (JSON.parse(String(init?.body)) as { model?: string }).model;
+				return model.provider === "google-antigravity" ? antigravitySseResponse() : Response.json({});
+			}) as typeof fetch;
+			fetchMock.preconnect = originalFetch.preconnect;
+			global.fetch = fetchMock;
+
+			const ctx = makeAntigravityCtx({});
+			ctx.modelRegistry = makeMockRegistry(
+				{
+					getApiKey: async () => "test-image-key",
+					getApiKeyForProvider: async () => "test-image-key",
+					authStorage: {
+						getOAuthAccess: async () => ({ accessToken: "test-token", projectId: "test-project" }),
+					} as unknown as ModelRegistry["authStorage"],
+				},
+				[model],
+			);
+			ctx.settings = makeMockSettings(`${model.provider}/${model.id}`);
+			// The main conversation model must not override the dedicated image role.
+			ctx.model = OPENAI_MODEL;
+
+			const result = await imageGenTool.execute("selected-image-model", { subject: "a cat" }, undefined, ctx);
+			generatedImagePaths.push(...(result.details?.imagePaths ?? []));
+			if (model.provider === "google") {
+				expect(requestUrl).toBe(
+					`https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent`,
+				);
+			} else {
+				expect(requestedModel).toBe(model.id);
+			}
+			expect(result.details?.model).toBe(model.id);
+		});
+	}
+});
 
 describe("imageGenTool antigravity provider", () => {
 	it("uses structured getOAuthAccess metadata (access token + projectId) for the request", async () => {

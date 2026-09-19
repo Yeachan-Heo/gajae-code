@@ -90,7 +90,7 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex, type SessionIndexEvent } from "../broker/session-index";
 import {
 	CAP_GATED_FRAME_KINDS,
 	createSdkSurfaceFactory,
@@ -121,7 +121,12 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "../prompt-deadline-lease";
-import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import {
+	assistantFailureCode,
+	failedPromptOutcome,
+	formatPromptFailureForLocalLog,
+	sanitizePromptFailure,
+} from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -3420,7 +3425,15 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (durableSkillAccepted && skillRecon) {
+					} else if (durableSkillAccepted && skillRecon && !promptOwned) {
+						// A lifecycle-owned skill (requester connection present, submission
+						// registered by onPromptAccepted) is terminalized solely by the
+						// correlated agent_end handler (terminalizePrompt -> claim ->
+						// finalize with the final text). This promise-settlement transition
+						// carries no text and would pre-empt that finalization, dropping the
+						// durable content; it remains only for ownerless acceptance, where
+						// no lifecycle handler will ever fire — and there it is the sole
+						// terminal publication, so it must carry the returned text itself.
 						trackReconciliationProducer?.(
 							skillRecon.noteTransition(correlation, {
 								type: "agent_end",
@@ -4798,10 +4811,19 @@ export function createNotificationsExtension(
 			 * by the firing deadline timer, cleared when the attempt completes or
 			 * is superseded). Fresh attributable progress recorded while the
 			 * attempt awaits durable reconciliation advances the lease generation;
-			 * the attempt must then back off instead of terminalizing a live prompt
-			 * (mirrors PromptDeadlineManager).
+			 * before self-abort starts, the attempt must then back off instead of
+			 * terminalizing a live prompt (mirrors PromptDeadlineManager).
 			 */
-			deadlineAttempt?: { lease: PromptDeadlineLease; generation: number };
+			deadlineAttempt?: {
+				lease: PromptDeadlineLease;
+				generation: number;
+				/**
+				 * Set synchronously immediately before this expiry attempt aborts
+				 * its own run. Progress from that abort belongs to this attempt,
+				 * not to an independently live prompt.
+				 */
+				selfAbortStarted?: true;
+			};
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
@@ -5053,6 +5075,8 @@ export function createNotificationsExtension(
 							code: "prompt_deadline_exceeded",
 							message: "Prompt deadline exceeded.",
 							provenance: "deadline",
+							phase: "submission",
+							category: "deadline",
 						},
 						{ fence: true },
 						{ diagnostic: { reason: "Prompt deadline exceeded." } },
@@ -5101,10 +5125,24 @@ export function createNotificationsExtension(
 		const deadlineAttemptStatus = (
 			key: string,
 			submission: PromptSubmission,
-			attempt: { lease: PromptDeadlineLease; generation: number },
+			attempt: { lease: PromptDeadlineLease; generation: number; selfAbortStarted?: true },
 		): DeadlineAttemptStatus => {
 			if (promptSubmissions.get(key) !== submission || submission.deadlineLease !== attempt.lease) return "stale";
 			const lease = submission.deadlineLease;
+			// A deadline expiry attempt must not be superseded by progress that its
+			// OWN abort caused. Terminal fencing aborts the running tool, and the
+			// agent loop pairs that tool off with a `tool_execution_end` which is
+			// NOT marked non-dispatched — the marker is reserved for calls that
+			// never started, and this one did (`dispatched = record.started`,
+			// agent-loop.ts). So the abort's teardown reaches renewPromptDeadline as
+			// ordinary attributable progress and advances the generation of the very
+			// lease this attempt is expiring. Reading that as supersession makes the
+			// attempt back off, re-arm, and walk into the identical trap forever: the
+			// prompt never gets a terminal frame and its durable claim stays pending
+			// (#5583). Progress observed BEFORE the self-abort is still authoritative
+			// — that is the post-claim fence, and it keeps a genuinely live prompt
+			// from being killed.
+			if (attempt.selfAbortStarted) return "current";
 			if (lease.generation !== attempt.generation && Date.now() < promptDeadlineAt(lease)) return "superseded";
 			return "current";
 		};
@@ -5396,6 +5434,10 @@ export function createNotificationsExtension(
 				}
 				let proof: RunSettlementProof;
 				try {
+					// Mark immediately before the abort seam, with no await between:
+					// abort-time attributable completion is caused by this deadline
+					// attempt and must not supersede its own expiry terminal.
+					if (deadlineAttempt) deadlineAttempt.selfAbortStarted = true;
 					proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
 						// Terminal abort registers the continuation fence for the
@@ -5522,7 +5564,10 @@ export function createNotificationsExtension(
 						type: "agent_failed",
 						sessionId: runtime.id,
 						...correlation,
-						error: extra?.error ?? { code: winner.code, message: winner.message },
+						error:
+							extra?.error !== undefined
+								? { code: extra.error.code, message: winner.message }
+								: { code: winner.code, message: winner.message },
 						outcome: winner,
 					});
 				} else {
@@ -5580,12 +5625,12 @@ export function createNotificationsExtension(
 				error: formatPromptFailureForLocalLog(error),
 			});
 			const sanitized = sanitizePromptFailure(error);
-			const outcome: SdkPromptTerminalOutcome = {
-				kind: "failed",
+			const outcome: SdkPromptTerminalOutcome = failedPromptOutcome({
 				code: "prompt_failed",
-				message: sanitized.message,
 				provenance: "agent_failed",
-			};
+				providerCode: sanitized.code,
+				evidence: {},
+			});
 			// This rejection bypasses `agent_end`, so record its local-only reason at
 			// the accepted submission failure boundary before terminalization begins.
 			logger.error("sdk_prompt_terminal_failed", {
@@ -7993,6 +8038,7 @@ export function createNotificationsExtension(
 						processIncarnation: hostProcessIncarnation,
 					});
 					throwIfLifecycleStopped();
+					let registration: SessionIndexEvent | undefined;
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -8006,7 +8052,7 @@ export function createNotificationsExtension(
 								processIncarnation: hostProcessIncarnation,
 								direct,
 							});
-							await index.append({
+							registration = await index.append({
 								type: "host_registered",
 								...input,
 								locator,
@@ -8023,13 +8069,16 @@ export function createNotificationsExtension(
 							});
 						},
 						unregister: async input => {
-							await index.append({
-								type: "host_unregistered",
-								...input,
-								locator,
-								pid: process.pid,
-								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
-							});
+							const expected = registration;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.unregisterIfCurrent(expected);
+							if (registration === expected) registration = undefined;
 						},
 					});
 					throwIfLifecycleStopped();
@@ -8948,8 +8997,15 @@ export function createNotificationsExtension(
 		if (correlation) {
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
-			) as Array<{ stopReason?: unknown; errorKind?: unknown }>;
+			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
 			const finalAssistant = assistants[0];
+			const terminalAssistant = assistants.find(
+				message =>
+					(message as { stopReason?: unknown }).stopReason === "error" ||
+					(message as { stopReason?: unknown }).stopReason === "aborted",
+			) as
+				| { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown; errorCode?: unknown }
+				| undefined;
 			const pendingOutcome = rt.peekPromptPendingOutcome(correlation);
 			let outcome: SdkPromptTerminalOutcome;
 			if (pendingOutcome) outcome = pendingOutcome;
@@ -8966,24 +9022,24 @@ export function createNotificationsExtension(
 				finalAssistant?.stopReason !== "aborted"
 			)
 				outcome = { kind: "stopped", reason: "end_turn", provenance: "agent" };
-			else
-				outcome = {
-					kind: "failed",
+			else {
+				// The provider/agent's own bounded classifier travels on the terminal
+				// assistant message; the phase is finalized against the durable record
+				// (startedAt) when the outcome is claimed.
+				const providerCode = assistantFailureCode(terminalAssistant);
+				outcome = failedPromptOutcome({
 					code: "prompt_failed",
-					message: "Prompt submission failed.",
 					provenance: "agent_failed",
-				};
+					...(providerCode !== undefined ? { providerCode } : {}),
+					evidence: {},
+				});
+			}
 			const successAssistant = assistants.find(
 				message => (message as { stopReason?: unknown }).stopReason === "stop",
 			);
 			const finalText = successAssistant ? acpFinalTextFromMessage(successAssistant).text : "";
 			// The normalized outcome is the ACP contract; existing SDK clients keep the
 			// legacy failure discriminator on the wire and in the reconciliation record.
-			const terminalAssistant = assistants.find(
-				message =>
-					(message as { stopReason?: unknown }).stopReason === "error" ||
-					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -9015,7 +9071,7 @@ export function createNotificationsExtension(
 					? {
 							// Only the legacy discriminator is preserved; provider text is never
 							// retained, matching `sanitizePromptFailure`.
-							error: { code: legacyCode, message: "Prompt submission failed." },
+							error: { code: legacyCode, message: outcome.message },
 						}
 					: {}),
 			});

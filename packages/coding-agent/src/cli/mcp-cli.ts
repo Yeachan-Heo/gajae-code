@@ -19,6 +19,7 @@ import {
 	resolveScopeMCPConfigPath,
 	upsertScopeMCPServer,
 } from "../runtime-mcp/scope-config";
+import { type AutoloadStatus, computeAutoloadStatus } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 
 export type MCPAction = "add" | "list" | "remove";
@@ -51,9 +52,6 @@ interface ScopedPath {
 	path: string;
 }
 
-/** Runtime status of a stored registration for conventional autoload. */
-type AutoloadStatus = "autoload" | "autoload-off" | "disabled";
-
 interface RedactedServerEntry {
 	name: string;
 	config: MCPServerConfig;
@@ -71,23 +69,6 @@ interface RuntimeServerEntry extends RedactedServerEntry {
 const REDACTED = "<redacted>";
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session)/i;
-
-/**
- * Compute the conventional-autoload status of a stored server.
- *
- * - `autoload-off`: the server opted out of startup connection via `autoload: false`.
- * - `disabled`: the server is disabled via `enabled: false` or the `disabledServers` list.
- * - `autoload`: connected by ordinary standalone sessions at startup.
- */
-export function computeAutoloadStatus(
-	name: string,
-	config: MCPServerConfig,
-	disabledServers: ReadonlySet<string>,
-): AutoloadStatus {
-	if (config.enabled === false || disabledServers.has(name)) return "disabled";
-	if (config.autoload === false) return "autoload-off";
-	return "autoload";
-}
 
 function autoloadStatusNote(status: AutoloadStatus): string {
 	switch (status) {

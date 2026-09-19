@@ -4004,6 +4004,7 @@ describe("openai-codex streaming", () => {
 	it("applies each reused websocket request's idle timeout", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected SSE fallback"));
 		let sendCount = 0;
 		class RequestScopedIdleWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
@@ -4032,9 +4033,14 @@ describe("openai-codex streaming", () => {
 			...options,
 			streamIdleTimeoutMs: 20,
 			streamMaxRetries: 0,
+			// Measure this request's websocket deadline, not an HTTP fallback round trip.
+			disableProviderRetries: true,
 		}).result();
 		expect(stalled.stopReason).toBe("error");
 		expect(Date.now() - startedAt).toBeLessThan(600);
+		expect(stalled.errorMessage).toContain("idle timeout waiting for websocket");
+		expect(sendCount).toBe(2);
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
 	it("replays x-codex-turn-state on subsequent SSE requests", async () => {

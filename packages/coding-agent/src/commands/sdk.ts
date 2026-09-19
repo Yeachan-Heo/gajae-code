@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,7 +14,11 @@ import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { reconcileBrokerGenerationForStartup, withBrokerStartupLock } from "../sdk/broker/ensure";
+import {
+	emitBrokerStartupTestSignal,
+	reconcileBrokerGenerationForStartup,
+	withBrokerStartupLock,
+} from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -39,7 +44,7 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
+import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
@@ -80,20 +85,89 @@ export async function lifecycleArgs(
 }
 
 /**
- * How long a session host tolerates the complete absence of a live broker
- * publication before treating itself as orphaned. Hosts intentionally survive
- * broker restarts (a replacement broker republishes discovery within seconds),
- * so this must comfortably exceed a restart window while still bounding the
- * lifetime of hosts whose broker is gone for good — otherwise every crashed or
+ * How long a session host tolerates losing the broker it was launched under
+ * before treating itself as orphaned.
+ *
+ * A host is reachable only through its own broker: routing lives in the broker
+ * process and a replacement broker never adopts hosts from an earlier
+ * incarnation, so a host that outlives its broker is stranded no matter how
+ * healthy the agent directory looks afterwards. The grace still has to outlast
+ * a restart-shaped gap, because a broker that is merely slow to republish must
+ * never cost a live host — but it must stay finite, or every crashed or
  * torn-down broker leaks a detached multi-hundred-megabyte host forever.
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
 
+async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
+	if (await Bun.file(gateFile).exists()) return;
+	const directory = path.dirname(gateFile);
+	const filename = path.basename(gateFile);
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		let watcher: nodeFs.FSWatcher | undefined;
+		const finish = (error?: unknown): void => {
+			if (settled) return;
+			settled = true;
+			watcher?.close();
+			if (error === undefined) resolve();
+			else reject(error);
+		};
+		try {
+			watcher = nodeFs.watch(directory, (_eventType, changed) => {
+				if (String(changed) !== filename) return;
+				void Bun.file(gateFile)
+					.exists()
+					.then(exists => {
+						if (exists) finish();
+					})
+					.catch(finish);
+			});
+		} catch (error) {
+			finish(error);
+			return;
+		}
+		void Bun.file(gateFile)
+			.exists()
+			.then(exists => {
+				if (exists) finish();
+			})
+			.catch(finish);
+	});
+}
+
 /**
- * Resolves only once no live broker publication has been observable in
- * `agentDir` for the full grace window. A reappearing broker (including a
- * replacement with a different pid) resets the window; an unreadable
+ * Identity of the broker incarnation an observation describes, or `null` when
+ * it carries no usable identity.
+ *
+ * Two observations with different identities are two different brokers, never
+ * the same broker seen twice: `incarnation` is start-time derived, so it
+ * separates a genuine survivor from a successor that merely reused the pid.
+ */
+function brokerPublicationIdentity(observation: unknown): string | null {
+	if (!observation || typeof observation !== "object") return null;
+	const { ownerId, pid, incarnation } = observation as {
+		ownerId?: unknown;
+		pid?: unknown;
+		incarnation?: unknown;
+	};
+	const parts = [
+		typeof ownerId === "string" ? ownerId : "",
+		Number.isSafeInteger(pid) ? String(pid) : "",
+		typeof incarnation === "string" ? incarnation : "",
+	];
+	return parts.some(part => part !== "") ? parts.join(":") : null;
+}
+
+/**
+ * Resolves only once the broker this host was launched under has been
+ * unobservable for the full grace window.
+ *
+ * The first identifiable publication pins that broker. A later publication from
+ * a different incarnation is a replacement, and a replacement cannot route to
+ * this host — observing one is evidence of being stranded, not of being alive —
+ * so it accrues against the bound instead of resetting it. Only the pinned
+ * broker reappearing resets the window. An unreadable or unidentifiable
  * publication is not proof of orphanhood but accrues against the same bound.
  */
 export async function watchSessionHostBrokerLiveness(deps: {
@@ -110,6 +184,7 @@ export async function watchSessionHostBrokerLiveness(deps: {
 	const graceMs = deps.graceMs ?? SESSION_HOST_BROKER_ABSENCE_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_BROKER_POLL_MS;
 	let absentSince: number | null = null;
+	let ownBroker: string | null = null;
 	for (;;) {
 		let live: unknown = null;
 		try {
@@ -117,7 +192,9 @@ export async function watchSessionHostBrokerLiveness(deps: {
 		} catch {
 			// Transient read failures are ambiguity, not proof of orphanhood.
 		}
-		if (live) {
+		const identity = brokerPublicationIdentity(live);
+		if (identity !== null && (ownBroker === null || identity === ownBroker)) {
+			ownBroker ??= identity;
 			absentSince = null;
 		} else {
 			absentSince ??= now();
@@ -872,7 +949,7 @@ class SdkSessionHelp extends Command {
 			description:
 				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
 		}),
-		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
+		limit: Flags.integer({ description: "Search or raw session.list page size from 1 to 100" }),
 		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
@@ -883,6 +960,7 @@ class SdkSessionHelp extends Command {
 		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
 		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
+		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
 	};
 	async run(): Promise<void> {}
 }
@@ -983,6 +1061,8 @@ class SdkSessionCommand extends Command {
 			strict: Boolean(flagRec.strict),
 			untilIdle: Boolean(flagRec["until-idle"]),
 			allEvents: Boolean(flagRec["all-events"]),
+			page: Boolean(flagRec.page),
+			limit: flagRec.limit as number | undefined,
 			agentDir: flagRec["agent-dir"] as string | undefined,
 			repo: flagRec.repo as string | undefined,
 			scope: flagRec.scope as string | undefined,
@@ -1077,7 +1157,29 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (action === "serve") {
-			await runSdkServe(this.argv.slice(1));
+			try {
+				await runSdkServe(this.argv.slice(1));
+			} catch (error) {
+				if (!(error instanceof SdkServeError)) throw error;
+				// stdout is the frame channel in --stdio mode, so the envelope goes to
+				// stderr; returning instead of rethrowing is what keeps a session-selection
+				// failure from reaching the embedder as an uncaught exception.
+				process.stderr.write(
+					`${JSON.stringify({
+						ok: false,
+						error: {
+							code: error.code,
+							message: error.message,
+							...(error.details === undefined ? {} : { details: error.details }),
+							// A broker teardown that failed alongside the primary failure is
+							// recorded on the error; dropping it here would hide from the
+							// embedder that the session may not have been released cleanly.
+							...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
+						},
+					})}\n`,
+				);
+				process.exitCode = error.exitCode;
+			}
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
@@ -1090,7 +1192,7 @@ export default class Sdk extends Command {
 		const agentDir = path.resolve(internal.agentDir);
 		let broker: Broker | undefined;
 		try {
-			broker = await withBrokerStartupLock(agentDir, async deadline => {
+			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 				const remainingMs = Math.max(1, deadline - Date.now());
 				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
 				const watchdogMs =
@@ -1107,9 +1209,24 @@ export default class Sdk extends Command {
 						const stalled = Promise.withResolvers<void>();
 						await stalled.promise;
 					}
+					const startupGateFile = process.env.GJC_SDK_TEST_BROKER_STARTUP_GATE_FILE;
+					if (startupGateFile) {
+						await emitBrokerStartupTestSignal("startup-gate-waiting");
+						await waitForBrokerStartupTestGate(startupGateFile);
+						await emitBrokerStartupTestSignal("startup-gate-released");
+					}
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 						await Bun.sleep(startupDelayMs);
+					// The real broker-internal entry point is the only place that reads this
+					// launcher-supplied environment variable; it is validated here and handed
+					// to Broker as a typed setting, never read a second time inside broker.ts
+					// from process.env directly.
+					const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+					const restartRequestId =
+						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+							? restartRequestEnv
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
@@ -1124,6 +1241,7 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
 					await candidate.start();
@@ -1131,6 +1249,10 @@ export default class Sdk extends Command {
 				} finally {
 					clearTimeout(startupWatchdog);
 				}
+			};
+			broker = await withBrokerStartupLock(agentDir, startupOperation, {
+				onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+				onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 			});
 		} catch (error) {
 			if (broker) {

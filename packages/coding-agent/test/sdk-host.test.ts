@@ -175,6 +175,33 @@ describe("SessionSdkHost", () => {
 		expect(host.started).toBe(false);
 	});
 
+	test("does not swallow orphan transition errors as allowed lock contention", async () => {
+		const host = new SessionSdkHost({
+			sessionId: "orphan-stop",
+			stateRoot: "/tmp/orphan-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				throw new FileLockAcquireError(
+					"/tmp/index.jsonl",
+					"/tmp/index.jsonl.lock",
+					1,
+					"orphan transition retained at /tmp/index.jsonl.lock.removing",
+					"orphan_transition",
+					"/tmp/index.jsonl.lock.removing",
+				);
+			},
+		});
+
+		await expect(host.stop({ allowLockContention: true })).rejects.toBeInstanceOf(FileLockAcquireError);
+		expect(host.started).toBe(true);
+	});
+
 	test("does not defer a non-lock error even when its message resembles contention", async () => {
 		const error = new Error("Failed to acquire lock for an unrelated operation");
 		const host = new SessionSdkHost({
