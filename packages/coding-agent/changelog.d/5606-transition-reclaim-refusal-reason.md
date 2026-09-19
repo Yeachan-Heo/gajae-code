@@ -1,0 +1,3 @@
+### Fixed
+
+- `transition_claim_timeout` now names why the stale-transition reclaim refused instead of collapsing six structurally different situations into one message. A wedged coordinator state claim could previously be a released tombstone from another installation, a tombstone with no installation identity, one still inside its release grace window, a live owner, a claim an external process restamped between inspection and capture, or a non-empty claim — all of which needed different operator action and all of which read identically. The error now carries a bounded classifier (for example `(reclaim refused: released_owner_foreign_host)`); it is a fixed enum member and never a path, token, host id, pid, or errno (#5606).

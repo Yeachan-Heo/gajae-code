@@ -2189,6 +2189,24 @@
 		}
 	},
 	{
+		"sourceId": "slash_command:fork",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "include",
+		"sdkId": "session.branch",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "prohibited",
+			"acp": "prohibited",
+			"daemonCli": "prohibited"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "slash_command:provider",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
@@ -4177,6 +4195,17 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:pendingToolExecutions",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

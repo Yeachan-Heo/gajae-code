@@ -1,2 +1,2 @@
-Generate a 3-6 word title for a coding session from the user's first message. Capture the main task or topic.
+Generate a 3-6 word title for a coding session from the supplied user message or conversation digest. If multiple messages are supplied, identify the primary/current task from the digest, weighting the newest substantive message highest; do not assume the first message is the task. If one message is supplied, capture its main task or topic.
 Output ONLY the title. No quotes or trailing punctuation.
