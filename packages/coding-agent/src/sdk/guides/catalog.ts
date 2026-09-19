@@ -241,13 +241,13 @@ export async function fetchGuideManifestOnline(params: {
  */
 const BUNDLED_GUIDE_MANIFEST_ID = "gajae-code-advisory-bundled";
 const BUNDLED_GUIDE_SIGNATURE_HEX =
-	"682028a6834dfd2b39db57fb6cc185b9e2bdf21a3256d907fbbb8ddb20a0ce285f3a21b970df7d4055acfb2aede13d8f69931249c6d27fc092bfa2b60e936303";
+	"62715b7716b30d3ea7b6ef41dfd7848c82dffed972a8729e4a5b8e3a9ee05d8cbcefeabc27b8796b1754622672a8fd2698a7ab638ca205c202f7479c34763c00";
 
 const bundledGuideAdvisoryTexts: Readonly<Record<string, string>> = {
 	"getting-started":
 		"GJC ships a small set of signed advisory guides with the client so `gjc sdk guides list` and `gjc sdk guides show <guideId>` work offline on a fresh install. Guides are advisory text only: they are rendered for reading and never executed or applied as configuration. To receive newer guides, run `gjc sdk guides refresh --url <https manifest url>`. The manifest must come from the allowlisted HTTPS host and must be signed by a pinned Ed25519 key; a rejected refresh falls back to the last verified cache, then to the bundled seed, and any rejection is reported in the warnings list.",
 	"sdk/session-cli":
-		"`gjc sdk session` is the broker-bound command family for operating live GJC SDK sessions from the terminal: `list` enumerates managed sessions, `inspect` shows session details, `send` submits a prompt turn, `status` reports session health, and `tail` follows the event stream. The explicit `raw` hatch dispatches one SDK operation as `control`, `query`, or `global`. Authority resolves through the local broker and endpoint credentials are never rendered by the CLI.",
+		"`gjc sdk session` is the broker-bound command family for operating live GJC SDK sessions from the terminal: `list` enumerates managed sessions, `inspect` shows session details, `send` submits a prompt turn, `status` reports session health, `tail` follows the event stream, and `close` ends the current live host generation. The explicit `raw` hatch dispatches one SDK operation as `control`, `query`, or `global`. Authority resolves through the local broker and endpoint credentials are never rendered by the CLI.",
 	"troubleshooting/sdk-connection":
 		"When an SDK connection fails, first check that the session host is alive and healthy: `gjc sdk session status` reports readiness and liveness. If the broker is gone, restart it and re-list sessions; detached hosts are reaped after a bounded absence grace. Fetch-boundary failures (offline host, allowlisted URL violations, signature rejections) are reported as typed errors with exit code 1 so scripts can fail closed instead of silently serving unverified content.",
 };

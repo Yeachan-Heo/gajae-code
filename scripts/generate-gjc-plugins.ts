@@ -55,7 +55,7 @@ const DELEGATE_META: DelegateMeta[] = [
  * `scripts/verify-gjc-skill-docs.ts` checks every skill reference against it,
  * so a skill can never advertise a verb the CLI does not ship.
  */
-export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "raw"] as const;
+export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "close", "raw"] as const;
 export type SdkSessionCliVerb = (typeof SDK_SESSION_CLI_VERBS)[number];
 
 export const SDK_SESSION_RAW_KINDS = ["control", "query", "global"] as const;
@@ -186,7 +186,7 @@ run when the operator explicitly invokes them.
 
 ## Broker authority
 
-\`list\`, \`inspect\`, \`send\`, \`status\`, and \`tail\` resolve sessions through the
+\`list\`, \`inspect\`, \`send\`, \`status\`, \`tail\`, and \`close\` resolve sessions through the
 SDK broker. The broker validates the indexed session against its durable
 endpoint record and hands the CLI a connection credential the CLI uses and
 never prints. \`--agent-dir\` selects the broker state directory.
@@ -205,6 +205,11 @@ never prints. \`--agent-dir\` selects the broker state directory.
   it never cancels a running turn.
 - \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.result\` with
   \`kind: "prompt"\` for a previously submitted operation reference.
+
+- \`gjc sdk session close <sessionId>\` — closes the current live host generation
+  through the broker without attaching. The default idempotency key includes the
+  endpoint generation and incarnation, so retries for one host replay while a
+  resumed host with the same session id gets a new lifecycle identity.
 
 - \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
   durable checkpoint followed by live event-ring frames. \`--strict\` fails

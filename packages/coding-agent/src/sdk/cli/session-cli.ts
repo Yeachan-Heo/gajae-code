@@ -58,12 +58,12 @@ export type SdkSessionCliAction =
 	| "send"
 	| "status"
 	| "tail"
+	| "close"
 	| "retire"
 	| "global"
 	| "raw"
 	| "control"
-	| "query"
-	| "global";
+	| "query";
 export type SdkSessionListScope = "repo" | "cwd" | "worktree" | "all";
 export type SdkSessionCliRawKind = "control" | "query" | "global";
 
@@ -93,6 +93,10 @@ export interface SdkSessionCliArgs {
 	json?: boolean;
 
 	agentDir?: string;
+}
+
+export interface SdkSessionCliDependencies {
+	readonly lifecycleService?: SessionLifecycleService;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -1803,11 +1807,44 @@ function lifecycleMutationRequest(
 	return { ...base, operation, capability: "session.delete", target };
 }
 
+async function resolveCloseAuthority(
+	lifecycle: SessionLifecycleService,
+	sessionId: string,
+): Promise<{ endpointGeneration: number; endpointIncarnation: string }> {
+	const listed = await lifecycle.list({
+		actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
+		capability: "session.list",
+		target: { resolveSessionId: sessionId },
+	});
+	if (!listed.ok) throw new SdkSessionCliError(listed.error.code, listed.error.message, 1);
+	if (!("sessions" in listed.result))
+		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for session close", 1);
+	const row = listed.result.sessions.find(session => session.sessionId === sessionId);
+	if (
+		row === undefined ||
+		typeof row.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(row.endpointGeneration) ||
+		row.endpointGeneration <= 0 ||
+		typeof row.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(row.endpointIncarnation)
+	)
+		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} has no live endpoint authority.`, 1);
+	return { endpointGeneration: row.endpointGeneration, endpointIncarnation: row.endpointIncarnation };
+}
+
+function sessionCloseRequestKey(
+	sessionId: string,
+	authority: { endpointGeneration: number; endpointIncarnation: string },
+): string {
+	return `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}:${authority.endpointGeneration}:${authority.endpointIncarnation}`;
+}
+
 async function runRawGlobal(
 	agentDir: string,
 	operation: string,
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
+	lifecycleOverride?: SessionLifecycleService,
 ): Promise<unknown> {
 	if (args.page && operation !== "session.list")
 		throw new SdkSessionCliError("usage", "--page is only available for raw global session.list.", 2);
@@ -1834,7 +1871,7 @@ async function runRawGlobal(
 	if (operation === "session.lookup") {
 		if (!args.idempotencyKey)
 			throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for session lookup.", 2);
-		const lifecycle = createBrokerSessionLifecycleService(agentDir);
+		const lifecycle = lifecycleOverride ?? createBrokerSessionLifecycleService(agentDir);
 		return await lifecycle.lookup({
 			actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
 			capability: "session.lookup",
@@ -1847,7 +1884,7 @@ async function runRawGlobal(
 		throw new SdkSessionCliError("unknown_operation", `Unknown global operation: ${operation}`, 1);
 	if (!args.idempotencyKey)
 		throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
-	const lifecycle = createBrokerSessionLifecycleService(agentDir);
+	const lifecycle = lifecycleOverride ?? createBrokerSessionLifecycleService(agentDir);
 	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
 	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
 	throwResponseFailure(response);
@@ -1869,6 +1906,7 @@ export async function runSdkSessionCli(
 	setExitCode: (exitCode: 1 | 2) => void = exitCode => {
 		process.exitCode = exitCode;
 	},
+	deps: SdkSessionCliDependencies = {},
 ): Promise<void> {
 	try {
 		const action = args.action;
@@ -1938,28 +1976,43 @@ export async function runSdkSessionCli(
 				throw new SdkSessionCliError("invalid_input", "Close sessionId does not match the selected session.", 2);
 			const secretError = validateAdapterSecretFields("session.close", input);
 			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
+			const lifecycle = deps.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);
+			const hasExplicitAuthority =
+				Object.hasOwn(input, "endpointGeneration") || Object.hasOwn(input, "endpointIncarnation");
+			const authority = hasExplicitAuthority
+				? typeof input.endpointGeneration === "number" &&
+					Number.isSafeInteger(input.endpointGeneration) &&
+					input.endpointGeneration > 0 &&
+					typeof input.endpointIncarnation === "string" &&
+					/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+					? { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation }
+					: undefined
+				: await resolveCloseAuthority(lifecycle, sessionId);
+			const target = { ...input, sessionId, ...(authority ?? {}) };
+			const requestKey =
+				args.idempotencyKey ??
+				(authority === undefined
+					? `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}`
+					: sessionCloseRequestKey(sessionId, authority));
 			// Closing never attaches: a Router attachment registers this process as a
 			// live client and renews the host's abandonment window, which is the
 			// opposite of what a close is for. The Broker answers the lifecycle
 			// mutation over its own client.
 			//
-			// The default request key is DERIVED from the session, not random: a close
-			// is one terminal intent per session, so a retried invocation must replay
-			// the same lifecycle request and be deduplicated by the Broker instead of
-			// issuing a second close against a host that may already be gone. An
-			// explicit --idempotency-key still wins for callers that key by attempt.
+			// The default request key is scoped to the current endpoint generation and
+			// incarnation. A retry for one live host replays, while a resumed host with
+			// the same session id receives a fresh lifecycle identity.
 			writeOutput(
 				stripSecretFields(
 					await runRawGlobal(
 						agentDir,
 						"session.close",
-						{ ...input, sessionId },
+						target,
 						{
 							...args,
-							idempotencyKey:
-								args.idempotencyKey ??
-								`${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}`,
+							idempotencyKey: requestKey,
 						},
+						lifecycle,
 					),
 				),
 			);

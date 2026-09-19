@@ -903,13 +903,29 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
 		case "session.delete":
 		case "session.reconcile_uncertain":
 			return { sessionId: id };
+		case "session.close":
+			return { sessionId: id, ...closeTargetAuthority(input) };
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+function closeTargetAuthority(input: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	if (
+		typeof input.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(input.endpointGeneration) ||
+		input.endpointGeneration <= 0 ||
+		typeof input.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation };
 }
 
 /**
@@ -3390,7 +3406,9 @@ export class Broker {
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry = this.ledger.get(identity);
+		const entry =
+			this.ledger.get(identity) ??
+			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
 		if (!entry) return error("not_found", "lifecycle operation was not found");
 		if (entry.fingerprint !== requestedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");

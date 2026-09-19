@@ -43,10 +43,12 @@ export async function deriveIdempotencyIdentity(
 	agentDir: string,
 	operation: string,
 	callerKey: string,
-	_protocolVersionOrLegacyTargetHash?: string,
+	targetHash?: string,
 ): Promise<string> {
 	const key = await getBrokerIdentityKey(agentDir);
-	return createHmac("sha256", Buffer.from(key, "hex")).update(`3|${operation}|${callerKey}`).digest("hex");
+	return createHmac("sha256", Buffer.from(key, "hex"))
+		.update(`4|${operation}|${callerKey}|${targetHash ?? ""}`)
+		.digest("hex");
 }
 
 export async function deriveLegacyTargetIdentity(
