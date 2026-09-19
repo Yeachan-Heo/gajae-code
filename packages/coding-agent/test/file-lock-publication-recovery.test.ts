@@ -175,6 +175,47 @@ const primaryPrimitive =
 				? "windows_rename_noreplace"
 				: undefined;
 
+describe.skipIf(process.platform !== "linux")("file lock receipt producer validation", () => {
+	test("accepts the native receipt when ambient platform metadata is spoofed", async () => {
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!descriptor?.configurable) throw new Error("process_platform_not_configurable");
+		const { file, lock } = await makeFixture();
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("renameat2_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async () => {
+				throw new Error("unexpected directory publication fallback");
+			},
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+			await expect(withFileLock(file, async () => "entered", quickAcquire)).resolves.toBe("entered");
+		} finally {
+			Object.defineProperty(process, "platform", descriptor);
+		}
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("rejects a receipt whose primitive does not match the requested operation", async () => {
+		const { file, lock } = await makeFixture();
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("mkdirat_renameat_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async () => {
+				throw new Error("unexpected directory publication fallback");
+			},
+		});
+		await expect(withFileLock(file, async () => "entered", quickAcquire)).rejects.toThrow(
+			"invalid primary success receipt",
+		);
+		await expect(fs.lstat(lock)).resolves.toBeTruthy();
+	});
+});
+
 describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific success receipts", () => {
 	for (const operation of ["primary", "directory"] as const) {
 		const expected = operation === "primary" ? primaryPrimitive : "mkdirat_renameat_noreplace";
@@ -187,8 +228,15 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 			"unsupported",
 			"unknown",
 		];
+		const primaryPrimitives = new Set<NativeNoReplaceResult["primitive"]>([
+			"renameat2_noreplace",
+			"renameatx_np_excl",
+			"windows_rename_noreplace",
+		]);
 		const invalidResults: [string, NativeNoReplaceResult][] = primitives
-			.filter(primitive => primitive !== expected)
+			.filter(primitive =>
+				operation === "primary" ? !primaryPrimitives.has(primitive) : primitive !== expected,
+			)
 			.map(primitive => [`wrong primitive ${primitive}`, successfulPublication(primitive)]);
 		const valid = successfulPublication(expected ?? "unsupported");
 		invalidResults.push(

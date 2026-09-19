@@ -954,16 +954,14 @@ function isValidNativeNoReplaceResult(value: unknown): value is NativeNoReplaceR
 function isSuccessfulNativePublication(value: unknown, operation: "primary" | "directory"): boolean {
 	if (!isValidNativeNoReplaceResult(value) || !value.ok) return false;
 	if (operation === "directory") return value.primitive === "mkdirat_renameat_noreplace";
-	switch (process.platform) {
-		case "linux":
-			return value.primitive === "renameat2_noreplace";
-		case "darwin":
-			return value.primitive === "renameatx_np_excl";
-		case "win32":
-			return value.primitive === "windows_rename_noreplace";
-		default:
-			return false;
-	}
+	// Native code records the primitive it actually invoked in the receipt. That
+	// primitive is the producer-platform evidence; process.platform is only ambient
+	// capability metadata and may be overridden by a coordinator discovery test.
+	return (
+		value.primitive === "renameat2_noreplace" ||
+		value.primitive === "renameatx_np_excl" ||
+		value.primitive === "windows_rename_noreplace"
+	);
 }
 
 function isCommittedDirectoryVerificationFailure(value: unknown): value is NativeNoReplaceResult {
