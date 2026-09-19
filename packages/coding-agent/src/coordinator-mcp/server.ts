@@ -8054,9 +8054,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				const binding = await exactBrokerSessionBinding(sessionId, cwd);
 				const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const priorWorkspace = optionalString(priorSession?.broker_workspace);
 				const priorAuthority =
 					priorSession &&
-					priorSession.broker_workspace === binding.workspace &&
+					priorWorkspace !== null &&
+					sameCanonicalPath(priorWorkspace, binding.workspace, platform) &&
 					priorSession.endpoint_generation === binding.endpointGeneration &&
 					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
 						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
@@ -8904,13 +8906,35 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Coordinator session is bound to another workspace.",
 										},
 									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
+								// Delegate-created managed-worktree sessions retain the caller's
+								// repository cwd separately from the broker's execution worktree.
+								// Resolve endpoint authority in that persisted broker workspace;
+								// using canonicalCwd here searches the parent repository and makes
+								// every follow-up appear unindexed even while its endpoint is live.
+								const persistedBrokerWorkspace = optionalString(existing.broker_workspace);
+								if (!persistedBrokerWorkspace)
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								let bindingWorkspace: string;
+								try {
+									bindingWorkspace = await canonicalBrokerWorkspace(persistedBrokerWorkspace);
+								} catch {
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								}
+								const binding = await exactBrokerSessionBinding(sessionId, bindingWorkspace);
 								if (
-									!sameCanonicalPath(
-										optionalString(existing.broker_workspace) ?? "",
-										canonicalCwd,
-										platform,
-									) ||
+									!sameCanonicalPath(binding.workspace, persistedBrokerWorkspace, platform) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
 								)
