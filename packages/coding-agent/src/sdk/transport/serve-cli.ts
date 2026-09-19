@@ -323,9 +323,11 @@ export async function resolveServeSession(broker: SdkClient, explicitSessionId?:
 		// ambiguous, no explicit id — stays the selector's to report, so this
 		// decision does not depend on the selector's error text.
 		// `terminal` is its own projected field and is one of the reasons `live` is false, so
-		// `!row.live` alone treats a session that has already stopped as recoverable. A stopped
-		// row is not a stale endpoint; resuming it would restart finished work. Only rows whose
-		// liveness failed for a non-terminal reason are recovery candidates.
+		// `!row.live` alone treats a session that has already stopped as recoverable. The broker
+		// dead-process reaper is the deliberate exception: it appends a process_exited provenance
+		// marker to its host_unregistered row, so that terminal-looking row is recoverable. An
+		// intentional host_unregistered or session_closed row has no marker and stays terminal;
+		// resuming it would restart finished work.
 		if (
 			row !== undefined &&
 			!row.ambiguous &&
