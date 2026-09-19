@@ -500,6 +500,13 @@ describe("SDK serve raw relay", () => {
 			websocket: {
 				open(ws) {
 					connections.push({ ws, messages: [] });
+					ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: 3,
+							capabilities: ["tool_activity_v2", "turn_stream"],
+						}),
+					);
 				},
 				message(ws, message) {
 					const connection = connections.find(candidate => candidate.ws === ws);
@@ -529,10 +536,22 @@ describe("SDK serve raw relay", () => {
 			onTransportError: () => {},
 		});
 		try {
-			await waitFor(() => connections[0], "upstream connection");
+			const connection = await waitFor(() => connections[0], "upstream connection");
+			await waitFor(() => received[0], "upstream hello");
+			expect(connection.messages).toEqual([]);
 			input.write(`${JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] })}\n`);
 			await Bun.sleep(20);
-			expect(received.some(chunk => chunk.toString().includes("tool_activity"))).toBe(false);
+			expect(
+				received
+					.map(chunk => chunk.toString("utf8").trim())
+					.some(line => {
+						try {
+							return (JSON.parse(line) as { type?: unknown }).type === "tool_activity";
+						} catch {
+							return false;
+						}
+					}),
+			).toBe(false);
 		} finally {
 			await pair.close();
 			server.stop(true);
