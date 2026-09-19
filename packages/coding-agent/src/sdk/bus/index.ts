@@ -50,7 +50,12 @@ type NotificationServer = NativeNotificationServer;
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
 
 import { AsyncJobManager } from "../../async";
-import { Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -125,9 +130,16 @@ import {
 	assistantFailureCode,
 	failedPromptOutcome,
 	formatPromptFailureForLocalLog,
+	PROMPT_FAILURE_MESSAGE_DEADLINE,
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
+import {
+	IDLE_TOOL_BOUNDARY_RESULT,
+	TOOL_CALL_BOUNDARY_GRACE_MS,
+	type ToolBoundaryWaitResult,
+	waitForToolCallBoundary,
+} from "../prompt-tool-boundary";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
 	lifecycleStartupCapabilityForApi,
@@ -273,6 +285,20 @@ type PromptTerminalExtra = {
 	diagnostic?: PromptTerminalDiagnostic;
 	diagnosticAlreadyLogged?: boolean;
 };
+
+/**
+ * Diagnostic reason for a deadline terminal. The pre-#5637 string is preserved
+ * byte-identically whenever the abort landed at a tool boundary (or with no tool
+ * running); only a force-termination with tool calls still executing gets its
+ * own reason, so the "we killed a tool mid-flight" case stops being
+ * indistinguishable from a clean expiry. The failure code, provenance, category
+ * and message are untouched either way — downstream retry classification must
+ * not move.
+ */
+function promptDeadlineDiagnosticReason(boundary: ToolBoundaryWaitResult): string {
+	if (boundary.outcome !== "forced") return PROMPT_FAILURE_MESSAGE_DEADLINE;
+	return `${PROMPT_FAILURE_MESSAGE_DEADLINE} Forced after ${TOOL_CALL_BOUNDARY_GRACE_MS}ms with ${boundary.pendingToolCallIds.length} tool call(s) still executing.`;
+}
 
 function formatPromptTerminalFailureReason(reason: unknown): string {
 	let rawReason: string;
@@ -4104,6 +4130,13 @@ export function createNotificationsExtension(
 				handle: string,
 				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
 			) => Promise<RunSettlementProof>;
+			/**
+			 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+			 * ledger holds for an execution handle (#5637). Strictly read-only: it
+			 * never claims, seals or otherwise mutates ledger state. Optional so an
+			 * older host that does not thread it degrades to the event-derived set.
+			 */
+			pendingToolExecutions?: (handle: string) => readonly string[];
 		};
 	} = {},
 ): void {
@@ -4805,6 +4838,8 @@ export function createNotificationsExtension(
 		const configRevision = { current: 0 };
 		const PROMPT_SUBMISSION_CAPACITY = 128;
 		const PROMPT_SUBMISSION_TTL_MS = 5 * 60_000;
+		/** Bound on remembered `tool_execution_end`s that outran their own start. */
+		const UNMATCHED_TOOL_END_CAPACITY = 64;
 		const PROMPT_TERMINAL_TOMBSTONE_CAPACITY = 256;
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		// SDK-owned terminalization grace; injectable in tests, never a user setting.
@@ -4865,6 +4900,14 @@ export function createNotificationsExtension(
 				 */
 				selfAbortStarted?: true;
 			};
+			/**
+			 * A due deadline expiry is already awaiting the tool-call boundary for
+			 * this submission. Progress that cannot renew past an already-due hard
+			 * cap re-arms a zero-delay timer on every delivery; without this fence
+			 * each one would open ANOTHER grace wait and they would pile up through
+			 * the whole grace (review thread P2).
+			 */
+			deadlineExpiryInFlight?: boolean;
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
@@ -4873,6 +4916,22 @@ export function createNotificationsExtension(
 			preflightAbort?: () => void | Promise<void>;
 			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
+			/**
+			 * Dispatched tool calls currently executing for this correlation. A SET of
+			 * ids, not a counter: a duplicate or unmatched `tool_execution_end` must
+			 * not drive it negative and falsely report the prompt idle (#5637).
+			 */
+			runningToolCallIds: Set<string>;
+			/**
+			 * Ids whose `tool_execution_end` was delivered with no matching start yet.
+			 * The fanout is asynchronous and unordered across listeners, so the end of
+			 * a finished call can land first; without this the late start would add a
+			 * call that is already over and leave it running forever. Bounded, and
+			 * only ever written on that out-of-order path.
+			 */
+			endedToolCallIds: Set<string>;
+			/** Drained when `runningToolCallIds` becomes empty; one entry per waiting expiry attempt. */
+			toolIdleWaiters: Array<() => void>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
@@ -5083,10 +5142,6 @@ export function createNotificationsExtension(
 				finalizePrompt(key, correlation);
 			}
 		};
-		const readFiniteSetting = (key: "sdk.promptDeadlineMs" | "sdk.promptMaxRuntimeMs", fallback: number): number => {
-			const value = settings?.get(key);
-			return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-		};
 		/**
 		 * (Re)arm the accepted prompt's terminal deadline from its current lease.
 		 * `terminalizePrompt` stays the single authoritative terminal owner; this
@@ -5099,33 +5154,104 @@ export function createNotificationsExtension(
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			submission.deadlineTimer = setTimeout(
 				() => {
-					const current = promptSubmissions.get(key);
-					// Identity fencing: a discarded, evicted or re-accepted submission is
-					// never terminalized by a predecessor's timer.
-					if (!current || current.deadlineLease !== lease) return;
-					// Progress delivered while this timer was pending renews the lease, so
-					// re-arm instead of terminalizing a demonstrably live prompt.
-					if (Date.now() < promptDeadlineAt(lease)) {
-						armPromptDeadline(key, correlation);
-						return;
-					}
-					// Register the expiry attempt BEFORE the awaited durable claim:
-					// progress arriving while the claim is in flight must supersede
-					// this attempt (see the post-claim fence in terminalizePrompt).
-					current.deadlineAttempt = { lease, generation: lease.generation };
-					void terminalizePrompt(
-						correlation,
-						{
-							kind: "failed",
-							code: "prompt_deadline_exceeded",
-							message: "Prompt deadline exceeded.",
-							provenance: "deadline",
-							phase: "submission",
-							category: "deadline",
-						},
-						{ fence: true },
-						{ diagnostic: { reason: "Prompt deadline exceeded." } },
-					);
+					void (async () => {
+						const current = promptSubmissions.get(key);
+						// Identity fencing: a discarded, evicted or re-accepted submission is
+						// never terminalized by a predecessor's timer.
+						if (!current || current.deadlineLease !== lease) return;
+						// Progress delivered while this timer was pending renews the lease, so
+						// re-arm instead of terminalizing a demonstrably live prompt.
+						if (Date.now() < promptDeadlineAt(lease)) {
+							armPromptDeadline(key, correlation);
+							return;
+						}
+						// Nothing to terminalize behind the terminal owner — and nothing to
+						// wait for on its behalf either. `terminalizePrompt` refuses this
+						// state anyway; checking it here keeps a superseded timer from
+						// opening a boundary wait it can never use.
+						if (current.terminal || current.phase !== "active") return;
+						// One boundary wait per submission (review thread P2). At an already
+						// due HARD CAP `promptDeadlineAt` is pinned to `acceptedAt + maxMs`,
+						// so every streamed `tool_execution_update` — attributable progress
+						// by design, so a multi-minute compile does not trip the inactivity
+						// lease — re-arms a ZERO-delay timer that walks straight past the
+						// re-arm check above. `deadlineAttempt` cannot serve as the fence: it
+						// is registered only AFTER the wait, precisely so the boundary event
+						// that ends the wait is not read as superseding it.
+						if (current.deadlineExpiryInFlight) return;
+						current.deadlineExpiryInFlight = true;
+						try {
+							// Let an in-flight dispatched tool call reach its boundary first
+							// (#5637): terminal fencing aborts the run before it waits for
+							// settlement, so a tool aborted mid-write leaves a torn artifact.
+							// The wait sits BEFORE the attempt is registered on purpose — inside
+							// `terminalizePrompt` the very `tool_execution_end` that ends the
+							// wait would bump the lease generation and the post-claim fence
+							// would read this attempt as "superseded", so the deadline would
+							// effectively never fire while tools run. Here the existing
+							// renewal/re-arm logic handles that case unchanged. Nothing has been
+							// aborted yet, so this wait is composed with NO abort signal: an
+							// already-aborted one would make the path unreachable.
+							const boundary: ToolBoundaryWaitResult =
+								pendingToolCallIdsFor(current).length === 0
+									? IDLE_TOOL_BOUNDARY_RESULT
+									: await waitForToolCallBoundary({
+											pending: () => pendingToolCallIdsFor(current),
+											whenIdle: () => whenPromptToolsIdle(current),
+											graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+										});
+							// Every pre-await fence is re-validated after the await, in order.
+							const after = promptSubmissions.get(key);
+							if (!after || after.deadlineLease !== lease) return;
+							if (after.terminal || after.phase !== "active") return;
+							if (Date.now() < promptDeadlineAt(lease)) {
+								// The boundary event renewed the lease: the prompt is demonstrably
+								// alive, so re-arm instead of terminalizing it.
+								armPromptDeadline(key, correlation);
+								return;
+							}
+							if (boundary.outcome === "forced") {
+								// Ids only: never tool arguments, output, paths or anything
+								// credential-shaped.
+								logger.warn("sdk_prompt_deadline_forced_mid_tool", {
+									commandId: correlation.commandId,
+									turnId: correlation.turnId,
+									graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+									pendingToolCallIds: boundary.pendingToolCallIds,
+								});
+							}
+							// Register the expiry attempt BEFORE the awaited durable claim:
+							// progress arriving while the claim is in flight must supersede
+							// this attempt (see the post-claim fence in terminalizePrompt).
+							// The generation is read AFTER the boundary wait because the
+							// boundary event may have bumped it and this attempt is
+							// deliberately the current one.
+							after.deadlineAttempt = { lease, generation: lease.generation };
+							void terminalizePrompt(
+								correlation,
+								{
+									kind: "failed",
+									code: "prompt_deadline_exceeded",
+									message: "Prompt deadline exceeded.",
+									provenance: "deadline",
+									phase: "submission",
+									category: "deadline",
+								},
+								{ fence: true },
+								{ diagnostic: { reason: promptDeadlineDiagnosticReason(boundary) } },
+							);
+						} finally {
+							// `finally` is safe here, and a bare clear before each `return` is
+							// not: a leaked `true` disables the deadline for the rest of the
+							// submission's life, which is strictly worse than the pile-up it
+							// guards. It can only ever clear the flag THIS attempt set on THIS
+							// object — a competing attempt would have returned at the guard
+							// above without setting it — and an attempt that threw is no longer
+							// waiting, so re-admitting the next one is correct. The wait itself
+							// is bounded by the grace, so this always runs.
+							current.deadlineExpiryInFlight = false;
+						}
+					})();
 				},
 				Math.max(0, promptDeadlineAt(lease) - Date.now()),
 			);
@@ -5136,6 +5262,7 @@ export function createNotificationsExtension(
 			const correlation = runtime.activePromptCorrelation;
 			// Renewal is attributed exactly like the correlated delivery below.
 			renewPromptDeadline(correlation, event);
+			noteToolDispatchBoundary(correlation, event);
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.abandoned) return;
 			const frame = {
@@ -5222,6 +5349,99 @@ export function createNotificationsExtension(
 			if (submission.deadlineLease.generation === generation) return;
 			armPromptDeadline(key, correlation);
 		};
+		/**
+		 * Track which dispatched tool calls are executing for the accepted prompt,
+		 * so an expired deadline can abort at a tool boundary instead of mid-write
+		 * (#5637). Attribution is deliberately identical to `renewPromptDeadline`'s
+		 * — same funnel, same allowlist, same pairing-only exclusion — because a
+		 * call that cannot prove progress cannot prove it is running either.
+		 * `tool_execution_update` proves neither start nor end, so it never changes
+		 * membership.
+		 */
+		const noteToolDispatchBoundary = (
+			correlation: { commandId: string; turnId: string },
+			event: { type: string; toolCallId?: unknown },
+		) => {
+			if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+			if (isNonDispatchedToolEvent(event) || typeof event.toolCallId !== "string") return;
+			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			if (!submission) return;
+			if (event.type === "tool_execution_start") {
+				// A start whose own end already arrived describes a call that is over:
+				// re-adding it would strand an id that can never be removed again, and
+				// the deadline would then burn the whole grace and report a forced
+				// mid-tool kill for a tool that is not running (review thread P1,
+				// mirror case). The id is consumed, so the pair closes exactly once.
+				if (submission.endedToolCallIds.delete(event.toolCallId)) return;
+				submission.runningToolCallIds.add(event.toolCallId);
+				return;
+			}
+			if (!submission.runningToolCallIds.delete(event.toolCallId)) {
+				// End with no known start: remember it only for this out-of-order case.
+				submission.endedToolCallIds.add(event.toolCallId);
+				// Oldest-first eviction; a Set iterates in insertion order.
+				while (submission.endedToolCallIds.size > UNMATCHED_TOOL_END_CAPACITY) {
+					const oldest = submission.endedToolCallIds.values().next().value;
+					if (oldest === undefined) break;
+					submission.endedToolCallIds.delete(oldest);
+				}
+				return;
+			}
+			if (submission.runningToolCallIds.size > 0) return;
+			for (const resolve of submission.toolIdleWaiters.splice(0)) resolve();
+		};
+		/**
+		 * Authoritative set of tool calls executing for this submission (#5637).
+		 *
+		 * The run resource ledger is the source of truth, not the extension fanout.
+		 * AgentLoop reserves a `kind: "tool"` lease SYNCHRONOUSLY inside its
+		 * dispatch loop, before the tool's `execute` is invoked, and the lease
+		 * settles at the call's real end. `tool_execution_start` instead travels an
+		 * ASYNCHRONOUS path — enqueued on the agent event stream, drained a turn
+		 * later, then handed to listeners whose returned promises are deliberately
+		 * not awaited, behind any user extension registered ahead of this one. So
+		 * `runningToolCallIds` can still be EMPTY while a file-mutating tool is
+		 * already writing, which is exactly the mid-`apply_patch` kill this fix
+		 * exists to prevent.
+		 *
+		 * So whenever the ledger can be read it is the SOLE authority, and a read
+		 * that comes back empty means empty. The fanout is wrong in both
+		 * directions, not one: ledger-running/event-idle must not report idle (the
+		 * mid-`apply_patch` kill above), and ledger-empty/event-running must not
+		 * report pending — the same asynchrony that delays a start also delays an
+		 * end, so a `tool_execution_end` stuck behind another extension would
+		 * otherwise burn the whole grace and record a forced mid-tool kill for a
+		 * call that had already returned.
+		 *
+		 * The fanout stays for observability and still wakes `toolIdleWaiters`, but
+		 * it is the pending authority only when the ledger cannot be consulted: an
+		 * older host without the seam, no execution handle bound yet, or a read
+		 * that threw. That fallback is exactly the pre-ledger behaviour and never
+		 * worse.
+		 */
+		const pendingToolCallIdsFor = (submission: PromptSubmission): string[] => {
+			const handle = submission.executionHandle;
+			const readLedger = terminalAbortSeams?.pendingToolExecutions;
+			if (handle && readLedger)
+				try {
+					// Materialized inside the `try` so only a COMPLETED read wins; a read
+					// that succeeds with no entries still answers "nothing is running",
+					// which is the whole point of preferring it over the stale fanout.
+					return [...readLedger(handle)];
+				} catch (error) {
+					// A seam failure must never disable the deadline or extend it
+					// unboundedly; fall back to the event-derived set for this attempt.
+					logger.warn(`sdk: pending tool execution seam failed: ${String(error)}`);
+				}
+			return [...submission.runningToolCallIds];
+		};
+		/** Resolves once no dispatched tool call is executing for this submission. */
+		const whenPromptToolsIdle = (submission: PromptSubmission): Promise<void> => {
+			if (submission.runningToolCallIds.size === 0) return Promise.resolve();
+			const { promise, resolve } = Promise.withResolvers<void>();
+			submission.toolIdleWaiters.push(resolve);
+			return promise;
+		};
 		const flushPromptLifecycle = (key: string, submission: PromptSubmission) => {
 			for (const frame of submission.bufferedFrames.splice(0)) {
 				try {
@@ -5283,8 +5503,8 @@ export function createNotificationsExtension(
 				createdAt: Date.now(),
 				deadlineLease: createPromptDeadlineLease({
 					now: Date.now(),
-					leaseMs: readFiniteSetting("sdk.promptDeadlineMs", 1_800_000),
-					maxMs: readFiniteSetting("sdk.promptMaxRuntimeMs", 21_600_000),
+					leaseMs: resolveSdkPromptDeadlineMs(settings?.get("sdk.promptDeadlineMs")),
+					maxMs: resolveSdkPromptMaxRuntimeMs(settings?.get("sdk.promptMaxRuntimeMs")),
 				}),
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
@@ -5292,6 +5512,9 @@ export function createNotificationsExtension(
 				...(preflightAbort ? { preflightAbort } : {}),
 				reconciliationKind,
 				bufferedFrames: [],
+				runningToolCallIds: new Set<string>(),
+				endedToolCallIds: new Set<string>(),
+				toolIdleWaiters: [],
 			};
 			const key = promptSubmissionKey(correlation);
 			promptSubmissions.set(key, submission);
