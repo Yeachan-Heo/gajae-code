@@ -72,6 +72,11 @@ describe("managed DAG policy (no native effects or verification authority)", () 
 			expect(() => parseManagedTaskDefinitions(nodes)).toThrow();
 		}
 	});
+	it("rejects duplicate dependency edges and self-edges", async () => {
+		const { node } = await fixture();
+		expect(() => parseManagedTaskDefinitions([node("a", ["b", "b"]), node("b")])).toThrow("duplicate predecessor");
+		expect(() => parseManagedTaskDefinitions([node("a", ["a"])])).toThrow("dependency cycle");
+	});
 	it("readiness is deterministic, dependency-based, and never inferred from closed worker", async () => {
 		const { state, node } = await fixture();
 		const graph = await defineManagedTaskGraph(state, {

@@ -7,6 +7,7 @@ import {
 	admitManagedTask,
 	createManagedDomainBinding,
 	defineManagedTaskGraph,
+	loadManagedEnrollmentRecord,
 	type ManagedDomainBinding,
 	type ManagedTaskDefinition,
 	managedEnrollmentIndexPath,
@@ -303,5 +304,30 @@ describe("strict private shared domain transactions", () => {
 		const restored = await restoreManagedAttemptRefs(root);
 		expect(restored.failedRoots).toContain(root);
 		expect(restored.refs).toHaveLength(0);
+	});
+	it("recovers an enrollment published before an interrupted first state", async () => {
+		const { root, binding, node } = await fixture();
+		await recordManagedEnrollment(root, root);
+		expect((await loadManagedEnrollmentRecord(root)).controlRoots).toEqual([root]);
+
+		// A crash after the enrollment index publication but before state.json
+		// leaves no native identity and is safe to retire on restart.
+		await expect(
+			transactManagedTaskDomain(
+				{ binding, expectedRevision: 0, assertNoManagedEvidence: async () => {} },
+				async () => {
+					throw new Error("simulated crash before state publication");
+				},
+			),
+		).rejects.toThrow("simulated crash before state publication");
+		await expect(fs.stat(managedTaskDomainPath(root))).rejects.toThrow();
+		const restored = await restoreManagedAttemptRefs(root);
+		expect(restored).toEqual({ refs: [], failedRoots: [] });
+		expect((await loadManagedEnrollmentRecord(root)).controlRoots).toEqual([]);
+
+		await recordManagedEnrollment(root, root);
+		const enrolled = await enroll(binding, [node("a")]);
+		expect(enrolled.state.state_revision).toBe(1);
+		expect((await loadManagedEnrollmentRecord(root)).controlRoots).toEqual([root]);
 	});
 });

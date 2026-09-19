@@ -1615,6 +1615,42 @@ export async function recordManagedEnrollment(
 	);
 }
 
+/**
+ * Remove a root that was pre-published for a first enrollment but never got a
+ * domain state. Native identities make the root non-recoverable, so callers
+ * must leave those entries indexed and report them as failed instead.
+ */
+async function removeEmptyManagedEnrollment(agentDir: string, controlRoot: string): Promise<boolean> {
+	requirePolicy(isCanonicalAbsolute(controlRoot), "control root is not canonical");
+	const agent = await fs.realpath(agentDir);
+	const target = managedEnrollmentIndexPath(agent);
+	const writer = { cwd: agent, privateDurable: { directory: path.dirname(target) } };
+	return withWorkflowStateLock(
+		target,
+		async () => {
+			const record = await loadEnrollmentIndexUnderLock(target);
+			if (!record.controlRoots.includes(controlRoot)) return true;
+			if (record.nativeIdentities.length > 0 || (record.byRoot[controlRoot] ?? []).length > 0) return false;
+			const controlRoots = record.controlRoots.filter(root => root !== controlRoot);
+			const byRoot = { ...record.byRoot };
+			delete byRoot[controlRoot];
+			const expectedRevision = await persistedEnrollmentRevision(target);
+			const written = await writeGuardedJsonAtomic(
+				target,
+				enrollmentIndexDocument({
+					controlRoots,
+					nativeIdentities: [...new Set(Object.values(byRoot).flat())],
+					byRoot,
+				}),
+				{ ...writer, policy: "source", expectedRevision, lockHeld: true },
+			);
+			requirePolicy(written.written, "source publication skipped");
+			return true;
+		},
+		writer,
+	);
+}
+
 async function persistedEnrollmentRevision(target: string): Promise<number> {
 	const read = await readExistingStateForMutation(target);
 	if (read.kind === "absent") return 0;
@@ -1675,10 +1711,18 @@ export async function restoreManagedAttemptRefs(agentDir: string): Promise<Resto
 	const identity = await objectIdentity(await fs.realpath(agentDir));
 	const refs: ManagedAttemptRef[] = [];
 	const failedRoots: string[] = [];
-	for (const controlRoot of await loadManagedEnrollmentIndex(agentDir)) {
+	const enrollment = await loadManagedEnrollmentRecord(agentDir);
+	for (const controlRoot of enrollment.controlRoots) {
 		try {
 			const read = await readExistingStateForMutation(managedTaskDomainPath(controlRoot));
 			if (read.kind !== "valid") {
+				if (
+					read.kind === "absent" &&
+					enrollment.nativeIdentities.length === 0 &&
+					(enrollment.byRoot[controlRoot] ?? []).length === 0
+				) {
+					if (await removeEmptyManagedEnrollment(agentDir, controlRoot)) continue;
+				}
 				failedRoots.push(controlRoot);
 				continue;
 			}
