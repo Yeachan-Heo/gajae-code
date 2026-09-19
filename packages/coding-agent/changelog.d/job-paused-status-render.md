@@ -1,0 +1,4 @@
+### Fixed
+
+- The `job` tool result renderer no longer drops the whole component render when a snapshot carries the `paused` status of a folded background job. `Unknown theme color: undefined` came from `statusToColor` returning `undefined` for a status outside its switch, which `formatBadge` then handed to `theme.fg`; paused and unknown snapshot statuses now resolve to a defined icon (`pending`) and badge color (`muted`).
+- Paused snapshots are no longer reported as finished work. The result text partitions terminal jobs (`completed` / `failed` / `cancelled`) under `## Completed` and lists paused or unknown-status snapshots under `## Waiting` with their raw status, and the renderer header counts them as unsettled (`waiting on N of M`) instead of reporting success over a "settled" job list.

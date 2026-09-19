@@ -3430,7 +3430,15 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (durableSkillAccepted && skillRecon) {
+					} else if (durableSkillAccepted && skillRecon && !promptOwned) {
+						// A lifecycle-owned skill (requester connection present, submission
+						// registered by onPromptAccepted) is terminalized solely by the
+						// correlated agent_end handler (terminalizePrompt -> claim ->
+						// finalize with the final text). This promise-settlement transition
+						// carries no text and would pre-empt that finalization, dropping the
+						// durable content; it remains only for ownerless acceptance, where
+						// no lifecycle handler will ever fire — and there it is the sole
+						// terminal publication, so it must carry the returned text itself.
 						trackReconciliationProducer?.(
 							skillRecon.noteTransition(correlation, {
 								type: "agent_end",
