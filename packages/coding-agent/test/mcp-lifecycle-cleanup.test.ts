@@ -145,7 +145,7 @@ describe("MCP lifecycle cleanup", () => {
 		expect(manager.getConnectionStatus("stuck")).toBe("disconnected");
 	});
 
-	it("connectServers still fails fast for a server that declared no connection window", async () => {
+	it("connectServers keeps a server with the default connection window alive", async () => {
 		let capturedSignal: AbortSignal | undefined;
 		mock.module("../src/runtime-mcp/client", () => ({
 			...mcpClient,
@@ -165,9 +165,13 @@ describe("MCP lifecycle cleanup", () => {
 		);
 
 		expect(Date.now() - startedAt).toBeLessThan(2_000);
-		expect(capturedSignal?.aborted).toBe(true);
+		expect(capturedSignal?.aborted).toBe(false);
 		expect(result.tools).toHaveLength(0);
-		expect(result.errors.get("stuck")).toBe("MCP server connection timed out during startup: stuck");
+		expect(result.errors).toEqual(new Map());
+		expect(manager.getConnectionStatus("stuck")).toBe("connecting");
+
+		await manager.disconnectAll();
+		expect(capturedSignal?.aborted).toBe(true);
 		expect(manager.getConnectionStatus("stuck")).toBe("disconnected");
 	});
 

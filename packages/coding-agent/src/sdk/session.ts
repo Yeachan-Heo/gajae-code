@@ -3248,6 +3248,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				} catch (error) {
 					logger.warn("Failed to discover conventional MCP servers", { error: safeErrorForLog(error) });
 				}
+			} else {
+				try {
+					const skipped = await loadAllMCPConfigs(cwd, {
+						agentDir,
+						enableProjectConfig: settings.has("mcp.enableProjectConfig")
+							? settings.get("mcp.enableProjectConfig")
+							: true,
+						filterExa: false,
+						filterBrowser: false,
+						autoloadOnly: true,
+						nativeOnly: true,
+						settings,
+					});
+					for (const name of Object.keys(skipped.configs)) {
+						logger.warn("Skipping MCP autoload registration", {
+							path: `mcp:${name}`,
+							serverName: name,
+							reason: "conventional MCP autoload is disabled for this session",
+						});
+					}
+				} catch (error) {
+					logger.warn("Failed to diagnose disabled conventional MCP autoload", {
+						error: safeErrorForLog(error),
+					});
+				}
 			}
 			// Always-on GJC plugin-bundle MCP servers, merged over conventional
 			// servers on name collisions. Top-level sessions own a manager and
@@ -3270,6 +3295,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
 				const pluginNames = new Set(Object.keys(configs));
+				const overriddenConventionalNames = [...pluginNames].filter(name => Object.hasOwn(conventionalConfigs, name));
 				const mergedConfigs = { ...conventionalConfigs, ...configs };
 				const mergedSources = {
 					...conventionalSources,
@@ -3313,6 +3339,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							conventionalConfigs,
 							pluginNames,
 						);
+						for (const name of overriddenConventionalNames) {
+							logger.warn("Skipping MCP autoload registration", {
+								path: `mcp:${name}`,
+								serverName: name,
+								reason: "overridden by a GJC plugin MCP registration",
+							});
+						}
 					}
 				}
 			} catch (error) {

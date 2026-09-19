@@ -4,7 +4,7 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, logger } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { Settings } from "../config/settings";
@@ -15,6 +15,14 @@ import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
 import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
+
+function logSkippedServer(name: string, reason: string): void {
+	logger.warn("Skipping MCP autoload registration", {
+		path: `mcp:${name}`,
+		serverName: name,
+		reason,
+	});
+}
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -154,7 +162,15 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled
-		servers = enableProjectConfig ? result.items : result.items.filter(server => server._source.level !== "project");
+		servers = result.items;
+		const loadedItems = new Set(result.items);
+		for (const server of result.all) {
+			if (server._shadowed) {
+				logSkippedServer(server.name, "shadowed by a higher-priority MCP registration");
+			} else if (!loadedItems.has(server)) {
+				logSkippedServer(server.name, "invalid MCP registration");
+			}
+		}
 		// The disabledServers denylist is honored from both native scopes so a
 		// name listed in either GJC config file stays out of runtime loading.
 		// Each scope is read independently: a malformed config file in one scope
@@ -173,10 +189,19 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let sources: Record<string, SourceMeta> = {};
 	for (const server of servers) {
 		const config = convertToLegacyConfig(server);
+		if (!exactConfig && !enableProjectConfig && server._source.level === "project") {
+			logSkippedServer(server.name, "project MCP autoload is disabled by settings");
+			continue;
+		}
 		if (config.enabled === false || disabledServers.has(server.name)) {
+			logSkippedServer(
+				server.name,
+				config.enabled === false ? "registration is disabled" : "server is listed in disabledServers",
+			);
 			continue;
 		}
 		if (autoloadOnly && config.autoload === false) {
+			logSkippedServer(server.name, "autoload is disabled for this registration");
 			continue;
 		}
 		configs[server.name] = config;
@@ -292,6 +317,7 @@ export function filterExaMCPServers(
 
 	for (const [name, config] of Object.entries(configs)) {
 		if (isExaMCPServer(name, config)) {
+			logSkippedServer(name, "filtered because the native Exa integration handles this server");
 			// Extract API key before filtering
 			const apiKey = extractExaApiKey(config);
 			if (apiKey) {
@@ -423,7 +449,9 @@ export function filterBrowserMCPServers(
 	const filteredSources: Record<string, SourceMeta> = {};
 
 	for (const [name, config] of Object.entries(configs)) {
-		if (!isBrowserMCPServer(name, config)) {
+		if (isBrowserMCPServer(name, config)) {
+			logSkippedServer(name, "filtered because the native browser integration handles this server");
+		} else {
 			filtered[name] = config;
 			if (sources[name]) {
 				filteredSources[name] = sources[name];

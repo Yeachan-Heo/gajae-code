@@ -43,13 +43,15 @@ describe("MCP startup and the declared connection window", () => {
 	test("reads the declared window per server rather than as one batch budget", () => {
 		expect(withinDeclaredConnectionWindow({ command: "declared", timeout: 90_000 }, STARTUP_CEILING_MS)).toBe(true);
 		expect(withinDeclaredConnectionWindow({ command: "declared", timeout: 90_000 }, 90_000)).toBe(false);
-		// No declared window, or a meaningless one, is not an open window.
-		expect(withinDeclaredConnectionWindow({ command: "undeclared" }, 0)).toBe(false);
+		// An omitted timeout uses connectToServer's 30-second default window.
+		expect(withinDeclaredConnectionWindow({ command: "undeclared" }, STARTUP_CEILING_MS)).toBe(true);
+		expect(withinDeclaredConnectionWindow({ command: "undeclared" }, 30_000)).toBe(false);
+		// Meaningless explicit values are not open windows.
 		expect(withinDeclaredConnectionWindow({ command: "zero", timeout: 0 }, 0)).toBe(false);
 		expect(withinDeclaredConnectionWindow({ command: "nan", timeout: Number.NaN }, 0)).toBe(false);
 	});
 
-	test("keeps a server inside its declared window connecting and fails only the one without a window", async () => {
+	test("keeps every server inside its effective connection window connecting", async () => {
 		const manager = new MCPManager(process.cwd());
 		try {
 			const startedAt = Date.now();
@@ -75,17 +77,19 @@ describe("MCP startup and the declared connection window", () => {
 			expect(result.connectedServers).toEqual([]);
 			expect(result.tools).toEqual([]);
 
-			// One batch-wide verdict is gone: the two servers are judged against
-			// their own windows, so they no longer fail together.
-			expect(result.errors.get("undeclared")).toContain("timed out");
+			// One batch-wide verdict is gone: both servers are judged against
+			// their effective windows, so neither is dropped at the startup wait.
+			expect(result.errors).toEqual(new Map());
 			expect(result.errors.has("declared")).toBe(false);
-			expect(manager.getConnectionStatus("undeclared")).toBe("disconnected");
+			expect(manager.getConnectionStatus("undeclared")).toBe("connecting");
 			expect(manager.getConnectionStatus("declared")).toBe("connecting");
 
-			// The surviving connection completes on its own and publishes tools.
+			// Both connections complete on their own and publish tools.
+			await waitFor(() => manager.getConnectedServers().includes("undeclared"));
 			await waitFor(() => manager.getConnectedServers().includes("declared"));
+			await waitFor(() => manager.getTools().some(tool => tool.name === "mcp__undeclared_ping"));
 			await waitFor(() => manager.getTools().some(tool => tool.name === "mcp__declared_ping"));
-			expect(manager.getConnectedServers()).toEqual(["declared"]);
+			expect(manager.getConnectedServers().sort()).toEqual(["declared", "undeclared"]);
 		} finally {
 			await manager.disconnectAll();
 		}

@@ -103,6 +103,8 @@ type RetiredLeaseRelease = {
 
 const STARTUP_TIMEOUT_MS = 250;
 const STARTUP_TIMEOUT_GRACE_MS = 500;
+/** Default connection window used by connectToServer when no timeout is configured. */
+const DEFAULT_CONNECTION_TIMEOUT_MS = 30_000;
 /**
  * Default ceiling on how long `discoverAndConnect` waits for a server batch to
  * come up. Deliberately short: a config with a large `timeout` must not be able
@@ -136,8 +138,10 @@ export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): 
 }
 
 /**
- * Whether `config` declared a connection window that is still open `elapsedMs`
- * into startup.
+ * Whether the server's effective connection window is still open `elapsedMs`
+ * into startup. An omitted timeout uses the same 30-second default as
+ * `connectToServer`, so ordinary autoload registrations are not discarded just
+ * because the short startup wait elapsed.
  *
  * The startup wait bounds how long session start blocks; a declared `timeout`
  * bounds how long the server itself may take to come up (`connectToServer`
@@ -145,7 +149,7 @@ export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): 
  * about whether the operator's declared window has been spent.
  */
 export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedMs: number): boolean {
-	const timeout = config.timeout;
+	const timeout = config.timeout ?? DEFAULT_CONNECTION_TIMEOUT_MS;
 	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return false;
 	return elapsedMs < timeout;
 }
@@ -1067,6 +1071,11 @@ export class MCPManager {
 					"MCP connection cleanup pending";
 				errors.set(name, this.#serverError(message));
 				reportedErrors.add(name);
+				logger.warn("Skipping MCP autoload registration", {
+					path: `mcp:${name}`,
+					serverName: name,
+					reason: message,
+				});
 				continue;
 			}
 			if (sources[name]) {
@@ -1093,14 +1102,25 @@ export class MCPManager {
 				this.#pendingToolLoads.has(name) ||
 				this.#pendingReconnections.has(name)
 			) {
+				logger.warn("Skipping MCP autoload registration", {
+					path: `mcp:${name}`,
+					serverName: name,
+					reason: "connection already pending",
+				});
 				continue;
 			}
 
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, this.#serverError(validationErrors.join("; ")));
+				const reason = validationErrors.join("; ");
+				errors.set(name, this.#serverError(reason));
 				reportedErrors.add(name);
+				logger.warn("Skipping MCP autoload registration", {
+					path: `mcp:${name}`,
+					serverName: name,
+					reason,
+				});
 				continue;
 			}
 
@@ -1252,7 +1272,12 @@ export class MCPManager {
 					this.#pendingToolLoads.delete(name);
 					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
 					const message = error instanceof Error ? error.message : String(error);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
+					logger.error("MCP tool load failed", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: message,
+						error: message,
+					});
 				});
 		}
 
@@ -1319,26 +1344,32 @@ export class MCPManager {
 				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
 				if (pendingWithoutCache.length > 0) {
 					// The startup wait elapsing means "stop blocking session start", not
-					// "this server failed". A server whose operator declared a `timeout`
-					// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
-					// is still inside that window it keeps connecting in the background
-					// under `connectToServer`'s own timeout, and the background tool load
-					// adopts it. Only a server that declared no window, or already spent it,
-					// is torn down and reported. Exact-config (`toolsOnly`) startup still
-					// fails fast: it builds a catalog once, so a missing server is an error.
+					// "this server failed". A server stays in the background while its
+					// effective connection window is open; an omitted timeout uses the
+					// 30-second default enforced by `connectToServer`. Exact-config
+					// (`toolsOnly`) startup still fails fast: it builds a catalog once, so
+					// a missing server is an error.
 					const startupElapsedMs = Date.now() - startupStartedAt;
 					for (const task of pendingWithoutCache) {
 						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
 							logger.warn("MCP server still connecting after the startup wait", {
 								path: `mcp:${task.name}`,
+								serverName: task.name,
 								startupWaitMs: startupTimeoutMs,
-								declaredTimeoutMs: task.config.timeout,
+								connectionTimeoutMs: task.config.timeout ?? DEFAULT_CONNECTION_TIMEOUT_MS,
 							});
 							continue;
 						}
 						const message = `MCP server connection timed out during startup: ${task.name}`;
 						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
+						logger.warn("Skipping MCP autoload registration", {
+							path: `mcp:${task.name}`,
+							serverName: task.name,
+							reason: message,
+							startupWaitMs: startupTimeoutMs,
+							connectionTimeoutMs: task.config.timeout ?? DEFAULT_CONNECTION_TIMEOUT_MS,
+						});
 						task.connectionAbort.abort(new Error(message));
 						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
 						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
