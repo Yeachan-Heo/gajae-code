@@ -2023,7 +2023,7 @@ describe("file lock owner-token removal guard (#606)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
-	test("fails closed when the lock stat does not provide a creation time", async () => {
+	test("uses the stable file identity when the lock stat does not provide a creation time", async () => {
 		const base = await makeTemp();
 		const lockDir = path.join(base, "missing-birthtime.lock");
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: 1000 });
@@ -2037,9 +2037,46 @@ describe("file lock owner-token removal guard (#606)", () => {
 			return missingBirthtime;
 		}) as typeof fs.lstat);
 
-		await expect(readFileLockObservationForGc(lockDir)).rejects.toThrow(
-			"File lock identity birthtime is unavailable.",
-		);
+		const observed = await readFileLockObservationForGc(lockDir);
+		expect(observed).not.toBeNull();
+		expect(observed?.identity.infoBirthtimeNs).toBe("0");
+	});
+
+	test("releases a lock when the filesystem reports an epoch birthtime", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "epoch-birthtime.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realLstat = fs.lstat;
+		vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+			const stats = await realLstat(target, options);
+			if (String(target) !== path.join(lockDir, "info")) return stats;
+			const epochBirthtime = Object.create(Object.getPrototypeOf(stats));
+			Object.assign(epochBirthtime, stats, { birthtimeNs: 0n });
+			return epochBirthtime;
+		}) as typeof fs.lstat);
+
+		await expect(withFileLock(lockedFile, async () => "completed")).resolves.toBe("completed");
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("keeps exhaustion diagnostics non-throwing when the filesystem reports an epoch birthtime", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "epoch-birthtime-contended.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, { pid: process.pid, timestamp: Date.now() });
+		const realLstat = fs.lstat;
+		vi.spyOn(fs, "lstat").mockImplementation((async (target, options) => {
+			const stats = await realLstat(target, options);
+			if (String(target) !== path.join(lockDir, "info")) return stats;
+			const epochBirthtime = Object.create(Object.getPrototypeOf(stats));
+			Object.assign(epochBirthtime, stats, { birthtimeNs: 0n });
+			return epochBirthtime;
+		}) as typeof fs.lstat);
+
+		await expect(
+			withFileLock(lockedFile, async () => undefined, { retries: 1, retryDelayMs: 1 }),
+		).rejects.toBeInstanceOf(FileLockAcquireError);
+		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
 	test("refuses (owner_changed) when a live owner has reclaimed the same path", async () => {

@@ -247,8 +247,10 @@ type LockInfoPathState = {
 
 function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 	if (stats.isSymbolicLink() || !stats.isFile()) return null;
-	if (typeof stats.birthtimeNs !== "bigint" || stats.birthtimeNs <= 0n)
-		throw new Error("File lock identity birthtime is unavailable.");
+	// Some supported filesystems report creation time as missing or epoch zero. Keep
+	// the stable dev/inode identity and content evidence usable instead of wedging
+	// acquire/release/GC on a metadata field the filesystem cannot provide.
+	const birthtimeNs = typeof stats.birthtimeNs === "bigint" && stats.birthtimeNs > 0n ? stats.birthtimeNs : 0n;
 	return {
 		dev: stats.dev,
 		ino: stats.ino,
@@ -256,19 +258,21 @@ function lockInfoFileState(stats: BigIntStats): LockInfoFileState | null {
 		size: stats.size,
 		mtimeNs: stats.mtimeNs,
 		ctimeNs: stats.ctimeNs,
-		birthtimeNs: stats.birthtimeNs,
+		birthtimeNs,
 		nlink: stats.nlink,
 	};
 }
 
 function sameLockInfoFileState(left: LockInfoFileState, right: LockInfoFileState): boolean {
+	const birthtimeMatches =
+		left.birthtimeNs === 0n || right.birthtimeNs === 0n || left.birthtimeNs === right.birthtimeNs;
 	return (
 		left.dev === right.dev &&
 		left.ino === right.ino &&
 		left.mode === right.mode &&
 		left.size === right.size &&
 		left.mtimeNs === right.mtimeNs &&
-		left.birthtimeNs === right.birthtimeNs &&
+		birthtimeMatches &&
 		left.nlink === right.nlink
 	);
 }
@@ -685,6 +689,8 @@ function sameFileLockTreeAfterPublication(
 	staged: NativeDirectoryTreeSnapshot,
 	published: NativeDirectoryTreeSnapshot,
 ): boolean {
+	// ctime is intentionally omitted: native snapshots expose no birthtime, and a
+	// metadata-only change must not reject an otherwise identical published tree.
 	return (
 		staged.rootDev === published.rootDev &&
 		staged.rootIno === published.rootIno &&
@@ -1199,7 +1205,12 @@ async function removeVerifiedOwnedLockDirWithoutNative(
 	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
 	if (
 		!infoEntry ||
-		!nativeFileLockInfoMatchesStableIdentity(captured.snapshot.rootDev, captured.snapshot.rootIno, infoEntry, expected) ||
+		!nativeFileLockInfoMatchesStableIdentity(
+			captured.snapshot.rootDev,
+			captured.snapshot.rootIno,
+			infoEntry,
+			expected,
+		) ||
 		!nativeFileLockInfoMatchesContentEvidence(infoEntry, expected)
 	)
 		return "owner_changed";
