@@ -148,6 +148,11 @@
 					"minimum": 60000,
 					"maximum": 86400000
 				},
+				"flushWorktreeOnDeadline": {
+					"type": "boolean",
+					"description": "Autosave uncommitted changes in the session's worktree as a WIP commit when a prompt deadline retires a prompt.",
+					"default": true
+				},
 				"masterOrphanGraceMs": {
 					"type": "integer",
 					"description": "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",

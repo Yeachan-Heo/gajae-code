@@ -444,6 +444,12 @@ export const SETTINGS_SCHEMA = {
 		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},
+	"sdk.flushWorktreeOnDeadline": {
+		type: "boolean",
+		default: true,
+		description:
+			"Autosave uncommitted changes in the session's worktree as a WIP commit when a prompt deadline retires a prompt.",
+	},
 	"sdk.masterOrphanGraceMs": {
 		type: "number",
 		default: 120_000,

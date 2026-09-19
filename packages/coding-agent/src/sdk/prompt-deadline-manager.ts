@@ -1,3 +1,4 @@
+import { logger } from "@gajae-code/utils";
 import type { KindAwareReconciliation } from "./bus/kind-aware-reconciliation";
 import type { InvocationCorrelation, InvocationReconciliation } from "./host/session-runtime";
 import {
@@ -15,6 +16,56 @@ const MAX_EXPIRY_RETRIES = 5;
 const MAX_UNCERTAINTY_RETRIES = 3;
 const EXPIRY_RETRY_DELAY_MS = 1_000;
 const UNCERTAINTY_RETRY_DELAY_MS = 1_000;
+
+/**
+ * Hard real-time bound on the best-effort durability hook, shared with
+ * `prompt-deadline-flush` so the manager's race and the flush's own abort
+ * signal cannot drift apart.
+ */
+export const DEADLINE_FLUSH_TIMEOUT_MS = 10_000;
+
+/**
+ * Run a best-effort durability flush under a hard real-time bound that ALWAYS
+ * settles, and never let its result reach the caller.
+ *
+ * Shared by both expiry paths — this manager and the notification bus's own
+ * terminalization (#5583) — so there is one bound, one abort, and one warning,
+ * with no drift between them. A rejection is swallowed; a `run` that never
+ * settles is abandoned after `timeoutMs` with its signal aborted so any git
+ * subprocess dies. The signal alone is not sufficient: `git.withRepoLock`
+ * awaits its predecessor before honouring it, so a hung predecessor in the
+ * per-repo write chain is cut only by this outer race.
+ */
+export async function runBoundedDeadlineFlush(
+	run: (signal: AbortSignal) => unknown,
+	timeoutMs: number = DEADLINE_FLUSH_TIMEOUT_MS,
+): Promise<void> {
+	const controller = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	// An async wrapper so a `run` that throws synchronously becomes a rejection.
+	const flushed = (async () => {
+		await run(controller.signal);
+	})();
+	// The abandoned promise may still reject long after we stop awaiting it.
+	flushed.catch(() => {});
+	try {
+		const bound = new Promise<"timeout">(resolve => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			// Never let a pending bound keep the process alive.
+			(timer as unknown as { unref?: () => void }).unref?.();
+		});
+		if ((await Promise.race([flushed.then(() => "flushed" as const), bound])) === "timeout") {
+			controller.abort(new Error(`prompt deadline flush exceeded ${timeoutMs}ms`));
+			logger.warn(
+				`sdk: prompt deadline flush exceeded its ${timeoutMs}ms bound; abandoning it and continuing teardown`,
+			);
+		}
+	} catch {
+		// A failing flush never changes the deadline outcome.
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
 
 type DeadlineReconciliation = InvocationReconciliation | KindAwareReconciliation;
 
@@ -49,6 +100,8 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+	readonly #onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+	readonly #deadlineFlushTimeoutMs: number;
 
 	constructor(options: {
 		reconciliation: DeadlineReconciliation;
@@ -56,12 +109,38 @@ export class PromptDeadlineManager {
 		getMaxMs: () => number;
 		now?: () => number;
 		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+		/**
+		 * Best-effort durability hook for the single path that genuinely retires a
+		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
+		 * pending claim but BEFORE the durable terminal, so a crash in that window
+		 * leaves the record pending and recovery retries the prompt; a
+		 * rejection is swallowed and never changes the deadline outcome. Not called
+		 * when a real terminal transition or a real failure won the race, nor when
+		 * renewed progress supersedes this expiry instance. The hook receives an
+		 * abort signal that fires when it outruns `deadlineFlushTimeoutMs`.
+		 */
+		onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+		/**
+		 * Hard bound on `onDeadlineExceeded`. Measured with a real timer, not
+		 * `now`, because it guards real subprocesses — which is also why it is a
+		 * constructor option: a fake clock cannot shorten it for tests.
+		 */
+		deadlineFlushTimeoutMs?: number;
 	}) {
 		this.#reconciliation = options.reconciliation;
 		this.#getLeaseMs = options.getLeaseMs;
 		this.#getMaxMs = options.getMaxMs;
 		this.#now = options.now ?? Date.now;
 		this.#onExpired = options.onExpired;
+		this.#onDeadlineExceeded = options.onDeadlineExceeded;
+		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
+	}
+
+	/** Run the durability hook under the shared bound; see `runBoundedDeadlineFlush`. */
+	async #runDeadlineFlush(correlation: InvocationCorrelation): Promise<void> {
+		const hook = this.#onDeadlineExceeded;
+		if (hook === undefined) return;
+		await runBoundedDeadlineFlush(signal => hook(correlation, signal), this.#deadlineFlushTimeoutMs);
 	}
 
 	#clearTimer(key: string): void {
@@ -174,6 +253,28 @@ export class PromptDeadlineManager {
 		// await (exact-head review P2): fresh attributable progress during the
 		// claim must cancel this expiry instance instead of surfacing an exceeded
 		// outcome for a prompt that is demonstrably alive.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		// Durability BEFORE the durable terminal (#5583, #5623 review round 4). The
+		// claim above is already the durable pending marker, so a process death
+		// anywhere in this window leaves the record PENDING and restart recovery
+		// retries the prompt — work that was never autosaved is never reported as
+		// finished. Running the flush after `finalizeOutcome` instead made the
+		// autosave the one step a crash could silently skip, which is the whole
+		// durability guarantee of this change. The cost is that the durable terminal
+		// is delayed by at most the flush's bound.
+		//
+		// The wait is BOUNDED, not just guarded (#5623 review round 2): a hook that
+		// never settles — a blocking git lock, a credential prompt — would leave the
+		// finalize, `#onExpired` and `clear` below unreachable, stranding the prompt
+		// with neither a terminal nor an owner. A try/catch cannot rescue a promise
+		// that never settles, so the flush is raced against a real timer and
+		// abandoned if it outruns it.
+		await this.#runDeadlineFlush(correlation);
+		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
+		// like any other here, and up to ten seconds long, so progress can land and
+		// renew the lease while it runs. A renewed prompt must not be terminalized as
+		// deadline-exceeded by this stale pass; `#backOffIfSuperseded` reschedules on
+		// the way out, so it keeps a live deadline.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome, () => {

@@ -64,6 +64,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
@@ -5371,6 +5372,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
 			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
+			// Persist the agent's uncommitted work before the retirement below tears
+			// the session down (#5583). Best effort by contract: failures are logged
+			// inside the flush and the deadline outcome is unaffected.
+			onDeadlineExceeded: async (_correlation, signal) => {
+				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
+				// `has` is true only for a value the user actually wrote, so this
+				// separates an explicit opt-in from the schema default. The flush only
+				// honours the default inside a linked worktree the session owns.
+				const explicitOptIn =
+					options.settings?.has?.("sdk.flushWorktreeOnDeadline" as never) === true &&
+					options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === true;
+				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, signal });
+			},
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {
