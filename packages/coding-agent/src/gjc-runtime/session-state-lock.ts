@@ -49,7 +49,6 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
  */
 const LOCK_ACQUIRE_MAX_WAIT_MS = 60_000;
 const LOCK_STALE_MS = 30_000;
-const RELEASED_TRANSITION_GRACE_MS = 1_000;
 const SESSION_STATE_LOCK_BUSY = Symbol("session-state-lock-busy");
 
 interface LockRetryBudget {
@@ -570,7 +569,7 @@ export type SessionStateLockUnavailableReason =
 /**
  * Why a stale-transition reclaim refused, as a bounded classifier.
  *
- * `transition_claim_timeout` collapsed six structurally different refusals into
+ * `transition_claim_timeout` collapsed several structurally different refusals into
  * one message, so an operator could not tell a foreign-host tombstone from a
  * live owner from a directory an external process was stamping — the gap #5606
  * asked for. Every member is a fixed enum: never a path, token, host id, pid or
@@ -583,8 +582,6 @@ export type TransitionReclaimRefusal =
 	| "released_owner_unprovenanced"
 	/** A released tombstone belonging to a different installation. */
 	| "released_owner_foreign_host"
-	/** A released tombstone still inside `RELEASED_TRANSITION_GRACE_MS`. */
-	| "released_owner_within_grace"
 	/** The owner is alive, or its liveness could not be disproven. */
 	| "owner_live_or_unverifiable"
 	/** The claim changed between inspection and capture — an external writer. */
@@ -787,7 +784,7 @@ function lockUnavailable(
 /**
  * `transition_claim_timeout` with the reclaim refusal that kept repeating.
  *
- * The bare classifier could not distinguish six structurally different
+ * The bare classifier could not distinguish several structurally different
  * refusals, so an operator had no way to tell which action would help (#5606).
  * The suffix is a fixed enum member and nothing else — this string reaches user
  * reports, so it must never carry a path, token, host id, pid or errno.
@@ -1967,8 +1964,6 @@ async function reclaimStaleTransitionClaim(
 		const legacyHost = await currentLegacyOwnerHostId();
 		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost)
 			return { reclaimed: false, refusal: "released_owner_foreign_host" };
-		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS)
-			return { reclaimed: false, refusal: "released_owner_within_grace" };
 	} else if (await lockOwnerIsAlive(owner)) {
 		// Only a host-qualified owner whose pid is PROVEN dead (ESRCH, or a live pid
 		// with a provably different incarnation) authorizes reclaim. The generation
@@ -2427,8 +2422,20 @@ async function runLockPathTransition<T>(
 			// succession of contenders. A later maintenance pass can take the freed claim.
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 			if (outcome.reclaimed) {
-				if (lockRetryExhausted(budget))
-					throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				if (lockRetryExhausted(budget)) {
+					// A released tombstone is the previous holder's explicit handoff. Its
+					// owner sidecar is removed together with the empty claim, so allow the
+					// waiter to take the newly-free pathname even when the old wait budget
+					// expired while reclaiming it. A dead-owner reclaim that immediately
+					// gets replaced still has an owner sidecar and remains bounded by the
+					// original deadline.
+					const ownerStillPresent = await fs.lstat(`${transitionDir}.owner`).then(
+						() => true,
+						error => (error as NodeJS.ErrnoException).code !== "ENOENT",
+					);
+					if (ownerStillPresent)
+						throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
+				}
 				continue;
 			}
 			if (!(await waitForLockRetry(budget)))

@@ -166,6 +166,19 @@ function successfulPublication(primitive: NativeNoReplaceResult["primitive"]): N
 	};
 }
 
+function sharingViolationPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "sharing_violation",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "sharing_violation",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
 const primaryPrimitive =
 	process.platform === "linux"
 		? "renameat2_noreplace"
@@ -338,6 +351,27 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 			expect(await fs.readdir(root)).toEqual(["state.json"]);
 		});
 	}
+});
+
+test("retries a pre-mutation sharing violation and publishes the file lock", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			attempts++;
+			if (attempts < 3) return sharingViolationPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire)).resolves.toContain(
+		'"pid"',
+	);
+	expect(attempts).toBe(3);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {

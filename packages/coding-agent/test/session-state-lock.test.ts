@@ -3105,4 +3105,31 @@ describe("session state lock failure diagnostics", () => {
 			expect(error.reason).toBe("transition_claim_timeout");
 		});
 	});
+
+	it("lets a waiter reclaim a fresh released claim without a timeout", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "released-waiter.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 1,
+				start_time: "unknown",
+				token: "released-waiter",
+				owner_host_id: "local-host",
+				released: true,
+			}),
+		);
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 5_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		} finally {
+			now.mockRestore();
+		}
+	});
 });
