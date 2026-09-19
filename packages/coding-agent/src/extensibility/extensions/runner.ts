@@ -273,6 +273,7 @@ export class ExtensionRunner {
 	#getCredentialSessionId: () => string = () => "";
 	#isIdleFn: () => boolean = () => true;
 	#getActivePromptHandleFn: () => string | undefined = () => undefined;
+	#getSessionWorkLeaseFn: ExtensionContextActions["getSessionWorkLease"] = undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void | Promise<void> = () => {};
 	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
@@ -428,6 +429,7 @@ export class ExtensionRunner {
 		this.#getCredentialSessionId = contextActions.getCredentialSessionId ?? (() => "");
 		this.#isIdleFn = contextActions.isIdle;
 		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
+		this.#getSessionWorkLeaseFn = contextActions.getSessionWorkLease;
 		this.#abortFn = contextActions.abort;
 		this.#abortPromptAndWaitFn =
 			contextActions.abortPromptAndWait ??
@@ -799,6 +801,7 @@ export class ExtensionRunner {
 				return getModel();
 			},
 			getActivePromptHandle: () => this.#getActivePromptHandleFn(),
+			getSessionWorkLease: () => this.#getSessionWorkLeaseFn?.(),
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
 			abortPromptAndWait: (handle, options) => this.#abortPromptAndWaitFn(handle, options),

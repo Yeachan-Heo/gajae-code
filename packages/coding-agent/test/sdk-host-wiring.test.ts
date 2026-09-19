@@ -68,7 +68,7 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
-import { sessionHostAttachedClients, sessionHostWorkInFlight } from "../src/sdk/broker/lifecycle";
+import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
@@ -790,7 +790,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		await host.session.extensionRunner?.emit({ type: "agent_start" });
-		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 		await host.session.extensionRunner?.emit({
 			type: "agent_end",
@@ -798,7 +798,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 			messages: [{ role: "assistant", stopReason: "stop" }],
 		} as never);
 		await Bun.sleep(20);
-		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostWorkLeaseActive()).toBe(false);
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {

@@ -50,6 +50,7 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
 import type { AgentSessionEventListener } from "../../session/agent-session";
+import type { SessionWorkLease } from "../../session/session-work-lease";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -482,6 +483,8 @@ export interface ExtensionContext {
 	isIdle(): boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle(): string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?(): SessionWorkLease;
 	/** Abort the current agent operation */
 	abort(): void | Promise<void>;
 	/** Abort and prove whether resources for a specific prompt settled. */
@@ -1660,6 +1663,8 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?: () => SessionWorkLease;
 	abort: () => void | Promise<void>;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 
