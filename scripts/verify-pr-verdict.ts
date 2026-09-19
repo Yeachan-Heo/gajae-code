@@ -76,6 +76,16 @@ export interface IndependentReviewerEvidence {
 	permission: string;
 	approvedHead: boolean;
 	approvedLogin?: string;
+	/**
+	 * Why a commit-id-bound APPROVED review was refused, when one exists.
+	 *
+	 * `rebound` means precedence is PROVEN: a readable head date and a readable earlier
+	 * submission, i.e. GitHub re-pointed a stale review after a force-push. `unreadable`
+	 * means the review is refused but that claim cannot be made — typically a head commit
+	 * date that could not be read, which fails closed rather than admitting the approval.
+	 * Absent means this login has no approval bound to the head at all (#5692 review).
+	 */
+	refusedApproval?: "rebound" | "unreadable";
 }
 
 /** A review normalized from either API shape so one rule can decide the effective one. */
@@ -83,6 +93,75 @@ interface EffectiveReview {
 	login?: string;
 	state?: string;
 	oid?: string;
+	/** ISO submission time. Absent means the caller could not read it; that fails closed. */
+	submittedAt?: string;
+}
+
+/**
+ * Whether a review's reported commit can be trusted as the head it actually reviewed.
+ *
+ * `review.commit_id` is NOT immutable: GitHub re-points it at the new branch tip when a PR
+ * is force-pushed and stale-review dismissal does not fire. `dev` is unprotected, so the
+ * branch almost every PR targets has no dismissal, and a rebase therefore turned every prior
+ * approval into an apparent exact-head approval. Two live cases: an approval submitted
+ * 4h24m before its attributed head existed, and another two days before (#5692).
+ *
+ * `headKnownAt` is the earliest time this head is PROVEN to have existed. A review submitted
+ * before that cannot have reviewed it.
+ *
+ * It must come from a server-observed source. The head's committer date is NOT one: the
+ * contributor sets it, so `GIT_COMMITTER_DATE` backdating would make a stale approval look
+ * fresh — a fail-open in the guard that exists to fail closed (#5692 review). The caller
+ * therefore derives it from the PR timeline's force-push events, whose `created_at` GitHub
+ * writes and the contributor cannot.
+ *
+ * Both timestamps must be readable and parseable; an unknown time is never treated as fresh.
+ *
+ * A TIE is refused, not admitted. GitHub serializes both values at second granularity, so a
+ * review submitted at `12:00:00.9` and a force-push recorded at `12:00:00.1` are
+ * indistinguishable — the review predates the head it claims and would still be accepted by
+ * a strict `<`. No legitimate review is submitted in the same second as the force-push that
+ * created the head it reviews, since the reviewer has to fetch and read it first, so
+ * rejecting ties costs nothing real (#5692 review).
+ */
+function reviewPrecedesHead(submittedAt: string | undefined, headKnownAt: string | undefined): boolean {
+	if (submittedAt === undefined || headKnownAt === undefined) return true;
+	const submitted = Date.parse(submittedAt);
+	const known = Date.parse(headKnownAt);
+	if (!Number.isFinite(submitted) || !Number.isFinite(known)) return true;
+	return submitted <= known;
+}
+
+/**
+ * Latest readable timestamp among a contributor-supplied floor and server-observed events.
+ *
+ * A force-push strictly postdates the head it created, so when both are present the later
+ * value is the stronger proof.
+ *
+ * A server-observed entry that is PRESENT but unparseable returns `undefined`, refusing the
+ * approval. Silently dropping it and falling back to the contributor's committer date would
+ * reinstate the backdate hole: a force-push did happen, we simply could not read when, and
+ * "could not read the authority" is not the same as "no authority exists". Only a genuinely
+ * empty event list falls back, because no force-push means nothing re-bound `commit_id`
+ * (#5692 review).
+ */
+function latestKnownHeadTime(
+	committedAt: string | undefined,
+	serverObserved: Array<string | undefined>,
+): string | undefined {
+	// An entry that is absent or blank is just as unreadable as one that will not parse:
+	// the force-push happened, we simply cannot read when. Filtering those out first and
+	// only then checking parseability silently discarded them and fell back to the
+	// contributor's committer date — the same fail-open, reached through `created_at: null`
+	// instead of a malformed string. Count before filtering (#5692 review).
+	const present = serverObserved.map(value => value?.trim()).filter(value => value !== undefined && value.length > 0);
+	if (present.length !== serverObserved.length) return undefined;
+	if (present.some(value => !Number.isFinite(Date.parse(value as string)))) return undefined;
+	const candidates = [committedAt?.trim(), ...present].filter(
+		(value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)),
+	);
+	if (candidates.length === 0) return undefined;
+	return candidates.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
 }
 
 /**
@@ -91,8 +170,34 @@ interface EffectiveReview {
  * callers (the event approval, the independent-reviewer evidence, and the push preflight)
  * must never disagree about which review counts — the divergence that produced issue #5483
  * and later the withdrawn-approval gap the QA lane found.
+ *
+ * `headKnownAt` also discards reviews that predate the head they claim, which is how a
+ * force-push silently re-binds a stale approval onto new code (#5692).
+ *
+ * It is REQUIRED, and `undefined` rejects rather than admitting. An earlier version made
+ * the precedence test conditional on having a head date, which meant a failed commit
+ * lookup, an absent committer date, or an empty local `git show` skipped the check entirely
+ * and admitted the approval — a fail-OPEN in the very guard that exists to fail closed.
+ *
+ * ORDER MATTERS. Selection happens first, freshness second. Filtering on freshness before
+ * taking the last review let an unreadable later CHANGES_REQUESTED be dropped from the list,
+ * promoting an earlier valid APPROVED back to "last word" and authorizing a merge the
+ * reviewer had withdrawn. A withdrawal whose time cannot be read must refuse, never vanish
+ * (#5692 review).
  */
-function effectiveExactHeadReview(reviews: EffectiveReview[], login: string, headSha: string): EffectiveReview | undefined {
+/**
+ * The identity's last word on the exact head, before any freshness judgement.
+ *
+ * Single-sourced because `effectiveExactHeadReview` and `refusedApprovalKind` must never
+ * disagree about which review counts. They each had their own copy of this filter, and when
+ * only one was reordered to select before judging freshness the two diverged — the same
+ * class of split that produced #5483 (#5692 review).
+ */
+function lastExactHeadReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+): EffectiveReview | undefined {
 	return reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
@@ -100,6 +205,59 @@ function effectiveExactHeadReview(reviews: EffectiveReview[], login: string, hea
 			&& review.oid === headSha,
 		)
 		.at(-1);
+}
+
+function effectiveExactHeadReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headKnownAt: string | undefined,
+): EffectiveReview | undefined {
+	const lastOnHead = lastExactHeadReview(reviews, login, headSha);
+	if (lastOnHead === undefined) return undefined;
+	return reviewPrecedesHead(lastOnHead.submittedAt, headKnownAt) ? undefined : lastOnHead;
+}
+
+/**
+ * Why this identity has no usable exact-head approval, when it has one bound by commit id.
+ *
+ * `rebound` is claimed ONLY when precedence is actually proven: a readable head date and a
+ * readable earlier submission. When either date is unreadable the answer is `unreadable`,
+ * not `rebound` — the review is still refused, but asserting it was re-bound would be a
+ * claim the evidence does not support (#5692 review).
+ */
+type RefusedApprovalKind = "rebound" | "unreadable" | undefined;
+
+function refusedApprovalKind(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headKnownAt: string | undefined,
+): RefusedApprovalKind {
+	// Shares `lastExactHeadReview` with `effectiveExactHeadReview` so the two can never
+	// disagree about which review counts. Duplicating the selection here is exactly the
+	// divergence that produced #5483, and it reappeared once already when only one of the
+	// two was reordered to select before judging freshness (#5692 review).
+	const lastOnHead = lastExactHeadReview(reviews, login, headSha);
+	// A later CHANGES_REQUESTED is an ordinary withdrawal, not a freshness problem, and
+	// must keep reporting as "no approval" rather than as a refusal.
+	if (lastOnHead?.state !== "APPROVED") return undefined;
+	const headMs = headKnownAt === undefined ? Number.NaN : Date.parse(headKnownAt);
+	if (!Number.isFinite(headMs)) return "unreadable";
+	const submitted = lastOnHead.submittedAt === undefined ? Number.NaN : Date.parse(lastOnHead.submittedAt);
+	if (!Number.isFinite(submitted)) return "unreadable";
+	return submitted <= headMs ? "rebound" : "unreadable";
+}
+
+/** Spreadable `refusedApproval` field, omitted entirely when there is nothing to report. */
+function refusedApprovalField(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt: string | undefined,
+): { refusedApproval?: "rebound" | "unreadable" } {
+	const kind = refusedApprovalKind(reviews, login, headSha, headCommittedAt);
+	return kind === undefined ? {} : { refusedApproval: kind };
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -392,8 +550,21 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
 	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null) && !input.independentReviewerUnavailable) {
-		const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
-		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind === "independent" ? `independent:${review.extra.login}` : review.extra.kind}); the risk-classified gate is not satisfied.`);
+		// Three distinct situations, three distinct remedies. "No approval" sends the author
+		// looking for a reviewer; a re-bound approval means the named reviewer already read
+		// DIFFERENT code and must re-review this head; unreadable evidence means the gate
+		// refused without being able to prove either. Collapsing the first two is what let me
+		// tell two PR authors their only remaining step was flipping a verdict verb (#5692).
+		const named = review.extra.kind === "independent" ? review.extra.login : review.extra.kind;
+		const refused = input.independentReviewer?.refusedApproval;
+		if (refused === "rebound") {
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub re-pointed a stale review after a force-push, so it is not an approval of this code; a review submitted after the current head is required.`);
+		} else if (refused === "unreadable") {
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, who has an APPROVED review bound to this head, but its freshness could not be established: the head commit date or the review submission time was unreadable. The approval is refused rather than assumed valid; re-run once the head commit is readable, or obtain a review submitted after the current head.`);
+		} else {
+			const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
+			diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${named}); the risk-classified gate is not satisfied.`);
+		}
 	}
 	if (review.extra.kind === "independent" && review.extra.login.toLowerCase() === input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review extra:independent:${review.extra.login} names the PR author; the independent reviewer must be a distinct maintainer.`);
@@ -422,6 +593,8 @@ interface PullRequestReview {
 	state?: string;
 	commit_id?: string;
 	user?: { login?: string };
+	/** Needed to detect a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submitted_at?: string;
 }
 
 interface CollaboratorPermission {
@@ -533,11 +706,13 @@ async function fetchPushPreflightSelfReview(repo: string, number: number, author
 	return { comment: newest, error: null };
 }
 
-/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}'` emits it. */
+/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}'` emits it. */
 interface LiveReview {
 	author: { login: string } | null;
 	state: string;
 	commit: { oid: string } | null;
+	/** Detects a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submittedAt: string | null;
 }
 
 /**
@@ -550,18 +725,48 @@ interface LiveReview {
  * returned as an error so the caller can report it as unread instead of unauthorized.
  */
 async function fetchPushPreflightIndependentReviewer(repo: string, number: number, login: string, headSha: string, cwd: string): Promise<{ evidence: IndependentReviewerEvidence | null; error: string | null }> {
-	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}"], cwd);
+	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}"], cwd);
 	if (listed.exitCode !== 0) return { evidence: null, error: listed.stderr || `gh exited ${listed.exitCode}` };
 	const parsed = parseGhJsonl<LiveReview>(listed.stdout);
 	if (!parsed.ok) return { evidence: null, error: parsed.error };
-	const approvedHead = effectiveExactHeadReview(
-		parsed.values.map(review => ({ login: review.author?.login, state: review.state, oid: review.commit?.oid })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = parsed.values.map(review => ({
+		login: review.author?.login,
+		state: review.state,
+		oid: review.commit?.oid,
+		submittedAt: review.submittedAt ?? undefined,
+	}));
+	// The head's committer date is contributor-controlled (`GIT_COMMITTER_DATE`), so it is
+	// a floor, not authority. The authority is the PR timeline's force-push events, whose
+	// `created_at` GitHub writes (#5692 review).
+	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
+	const committedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
+	const forcePushedAt = await gh(
+		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", '.[] | select(.event=="head_ref_force_pushed") | (.created_at // "unreadable")'],
+		cwd,
+	);
+	if (forcePushedAt.exitCode !== 0)
+		return { evidence: null, error: forcePushedAt.stderr || `gh exited ${forcePushedAt.exitCode}` };
+	// The projection emits a literal "unreadable" for an event with no `created_at`, so a
+	// present-but-unusable force-push cannot masquerade as an empty line (#5692 review).
+	// Drop line-splitting artifacts only. A genuinely absent `created_at` already arrives
+	// as the literal "unreadable" from the projection, so blank lines here are never
+	// missing data and must not be mistaken for it.
+	const headKnownAt = latestKnownHeadTime(
+		committedAt,
+		forcePushedAt.stdout.split("\n").filter(line => line.trim().length > 0),
+	);
+	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
 	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
-	return { evidence: { permission: permission.stdout.trim(), approvedHead, approvedLogin: login }, error: null };
+	return {
+		evidence: {
+			permission: permission.stdout.trim(),
+			approvedHead,
+			approvedLogin: login,
+			...(approvedHead ? {} : refusedApprovalField(normalized, login, headSha, headKnownAt)),
+		},
+		error: null,
+	};
 }
 
 export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
@@ -582,11 +787,21 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approval = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		reviewerId,
-		headSha,
-	);
+	// Normalize BEFORE the head-date call so a malformed review response still fails on the
+	// reviews payload rather than spending an extra API request first.
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headers = {
+		Accept: "application/vnd.github+json",
+		Authorization: `Bearer ${token}`,
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headKnownAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
 		headers: {
@@ -608,6 +823,44 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
  * CHANGES_REQUESTED supersedes an earlier APPROVED exactly as it does for a merge-approved
  * verdict (issue #4703 hardening, extended after the push preflight mirrored this lookup).
  */
+/**
+ * Earliest time the PR head is PROVEN to have existed, from server-observed data.
+ *
+ * The commit's committer date is contributor-controlled (`GIT_COMMITTER_DATE`), so on its
+ * own it is not authority: backdating it would make a stale approval look fresh. GitHub
+ * writes the PR timeline's `head_ref_force_pushed.created_at`, and a force-push is exactly
+ * what re-points `commit_id` onto a new head, so the latest one is a trustworthy floor.
+ *
+ * Returns the later of the two, and `undefined` when neither can be read — which every
+ * caller treats as "cannot prove freshness" and therefore refuses (#5692 review).
+ */
+async function fetchHeadKnownAt(
+	repository: string,
+	number: number,
+	headSha: string,
+	headers: Record<string, string>,
+): Promise<string | undefined> {
+	const commit = await fetch(`https://api.github.com/repos/${repository}/commits/${headSha}`, { headers });
+	const committedAt = commit.ok
+		? ((await commit.json()) as { commit?: { committer?: { date?: string } } }).commit?.committer?.date
+		: undefined;
+	// Paginate: timeline events are returned oldest-first, so reading only the first page
+	// would miss the MOST RECENT force-push on a busy PR — exactly the one that re-bound
+	// the review. A page that cannot be read refuses rather than truncating the evidence.
+	const forcePushes: Array<string | undefined> = [];
+	for (let page = 1; ; page++) {
+		const timeline = await fetch(
+			`https://api.github.com/repos/${repository}/issues/${number}/timeline?per_page=100&page=${page}`,
+			{ headers },
+		);
+		if (!timeline.ok) return undefined;
+		const events = (await timeline.json()) as Array<{ event?: string; created_at?: string }>;
+		for (const entry of events) if (entry.event === "head_ref_force_pushed") forcePushes.push(entry.created_at);
+		if (events.length < 100) break;
+	}
+	return latestKnownHeadTime(committedAt, forcePushes);
+}
+
 export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
@@ -626,15 +879,23 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approved = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headKnownAt = await fetchHeadKnownAt(repository, number, headSha, headers);
+	const approved = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
 	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
-	return { permission: collaborator.permission ?? "none", approvedHead: approved, approvedLogin: login };
+	return {
+		permission: collaborator.permission ?? "none",
+		approvedHead: approved,
+		approvedLogin: login,
+		...(approved ? {} : refusedApprovalField(normalized, login, headSha, headKnownAt)),
+	};
 }
 
 async function git(args: string[], cwd: string): Promise<{ exitCode: number; stdout: Uint8Array; stderr: string }> {
