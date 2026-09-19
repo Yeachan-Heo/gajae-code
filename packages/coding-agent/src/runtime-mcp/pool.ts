@@ -755,6 +755,18 @@ export class MCPConnectionPool {
 				options.signal.reason ?? new Error(`MCP replacement preparation aborted: ${name}`),
 			);
 		}
+		const pending = this.#pending.get(key);
+		if (pending && !pending.cancelled && !pending.settled) {
+			this.cancelPendingEntry(
+				key,
+				pending,
+				new MCPPoolAcquireAbortError(
+					name,
+					key,
+					new Error(`MCP connection acquisition superseded by replacement: ${name}`),
+				),
+			);
+		}
 		const identity = buildMCPPoolKeyIdentity(name, config, options);
 		const generation = (this.#entryGenerations.get(key) ?? 0) + 1;
 		this.#entryGenerations.set(key, generation);
@@ -1080,7 +1092,13 @@ export class MCPConnectionPool {
 				onRequest: options.onRequest,
 			});
 			entry.connection = connection;
-			if (pending.cancelled || this.#pending.get(key) !== pending || this.#shuttingDown) {
+			const superseded = this.#entryGenerations.get(key) !== generation;
+			if (pending.cancelled || this.#pending.get(key) !== pending || this.#shuttingDown || superseded) {
+				if (superseded && !pending.cancelled) {
+					pending.cancelled = true;
+					pending.cancellationReason = new Error(`MCP connection acquisition superseded: ${name}`);
+					pending.openAbortController.abort(pending.cancellationReason);
+				}
 				try {
 					await connection.transport.close();
 				} catch (closeError) {

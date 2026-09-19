@@ -4,10 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager } from "../../src/runtime-mcp/manager";
+import { MCPConnectionPool } from "../../src/runtime-mcp/pool";
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../../src/runtime-mcp/redaction";
 import { DeferredMCPTool, MCPTool } from "../../src/runtime-mcp/tool-bridge";
-import type { MCPServerConnection, MCPToolCallResult, MCPTransport } from "../../src/runtime-mcp/types";
+import type {
+	MCPServerConnection,
+	MCPToolCallResult,
+	MCPToolDefinition,
+	MCPTransport,
+} from "../../src/runtime-mcp/types";
 import type { AgentSession } from "../../src/session/agent-session";
 
 const managers: MCPManager[] = [];
@@ -199,5 +205,97 @@ describe("exact-config MCP session controls", () => {
 		expect(manager.getConnectionStatus("exact")).toBe("connected");
 		expect(manager.getTools()).toHaveLength(1);
 		expect(live.transport.connected).toBe(true);
+	});
+
+	test("startup catalog publication fences a committed suspension", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-exact-mcp-startup-fence-"));
+		roots.push(root);
+		const configPath = join(root, "mcp.json");
+		await Bun.write(
+			configPath,
+			JSON.stringify({ mcpServers: { exact: { type: "http", url: "http://127.0.0.1:1" } } }),
+		);
+		const listStarted = Promise.withResolvers<void>();
+		const allowList = Promise.withResolvers<void>();
+		const pool = new MCPConnectionPool({ connect: async (name, _config) => connection(name, []) });
+		const manager = new MCPManager(root, null, { toolsOnly: true, pool });
+		managers.push(manager);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => {
+			listStarted.resolve();
+			await allowList.promise;
+			return [{ name: "lookup", inputSchema: { type: "object" } }];
+		});
+
+		const startup = manager.discoverAndConnect({ configPath });
+		await listStarted.promise;
+		const suspension = await manager.prepareExactServerControl("suspend", "exact");
+		await suspension.commit();
+		allowList.resolve();
+
+		const result = await startup;
+		expect(result.tools).toHaveLength(0);
+		expect(manager.getTools()).toHaveLength(0);
+	});
+
+	test("prepared resume aborts a duplicate tool catalog instead of overwriting it", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-exact-mcp-duplicate-"));
+		roots.push(root);
+		const configPath = join(root, "mcp.json");
+		await Bun.write(
+			configPath,
+			JSON.stringify({
+				mcpServers: {
+					stable: { type: "stdio", command: "stable" },
+					target: { type: "stdio", command: "target" },
+				},
+			}),
+		);
+		const transports = new Map<string, MCPTransport>();
+		const transportStates = new Map<string, { connected: boolean }>();
+		const definitions = new Map<string, MCPToolDefinition[]>([
+			["stable", [{ name: "collision", inputSchema: { type: "object" } }]],
+			["target", [{ name: "target", inputSchema: { type: "object" } }]],
+		]);
+		const pool = new MCPConnectionPool({
+			connect: async (name, config) => {
+				const state = { connected: true };
+				transportStates.set(name, state);
+				const transport: MCPTransport = {
+					get connected() {
+						return state.connected;
+					},
+					request: async <T>() => ({}) as T,
+					notify: async () => {},
+					close: async () => {
+						state.connected = false;
+					},
+				};
+				transports.set(name, transport);
+				return {
+					...connection(name, []),
+					config,
+					transport,
+				};
+			},
+		});
+		const manager = new MCPManager(root, null, { toolsOnly: true, pool });
+		managers.push(manager);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async server => definitions.get(server.name) ?? []);
+
+		await manager.discoverAndConnect({ configPath });
+		const suspension = await manager.prepareExactServerControl("suspend", "target");
+		await suspension.commit();
+		const targetState = transportStates.get("target");
+		if (!targetState) throw new Error("target transport was not opened");
+		targetState.connected = false;
+		definitions.set("target", [
+			{ name: "collision", inputSchema: { type: "object" } },
+			{ name: "collision", inputSchema: { type: "object" } },
+		]);
+
+		const resumed = await manager.prepareExactServerControl("resume", "target");
+		expect(resumed.result.status).toBe("unavailable");
+		expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__stable_collision"]);
+		expect(transports.get("target")?.connected).toBe(false);
 	});
 });

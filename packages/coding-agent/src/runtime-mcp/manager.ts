@@ -1147,11 +1147,14 @@ export class MCPManager {
 			// Skip if already connected.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
-				allTools.push(
-					...this.#tools.filter(
-						tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-					),
-				);
+				if (this.#isExactToolPublicationAllowed(name)) {
+					allTools.push(
+						...this.#tools.filter(
+							tool =>
+								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+						),
+					);
+				}
 				continue;
 			}
 
@@ -1437,19 +1440,21 @@ export class MCPManager {
 						continue;
 					}
 					connectedServers.add(name);
-					const reconnect = () => this.reconnectServer(name);
-					try {
-						allTools.push(
-							...MCPTool.fromTools(
-								this.#connectionForLease(connection),
-								serverTools,
-								reconnect,
-								this.#exactToolOptions(name, task.config.sharing === "shared"),
-							),
-						);
-					} catch (error) {
-						await this.#cleanupConnectionTasks(connectionTasks);
-						throw error;
+					if (this.#isExactToolPublicationAllowed(name)) {
+						const reconnect = () => this.reconnectServer(name);
+						try {
+							allTools.push(
+								...MCPTool.fromTools(
+									this.#connectionForLease(connection),
+									serverTools,
+									reconnect,
+									this.#exactToolOptions(name, task.config.sharing === "shared"),
+								),
+							);
+						} catch (error) {
+							await this.#cleanupConnectionTasks(connectionTasks);
+							throw error;
+						}
 					}
 				} else if (task.tracked.status === "rejected") {
 					const reason = task.tracked.reason;
@@ -1467,7 +1472,7 @@ export class MCPManager {
 					}
 				} else {
 					const cached = cachedTools.get(name);
-					if (cached) {
+					if (cached && this.#isExactToolPublicationAllowed(name)) {
 						const source = this.#sources.get(name);
 						const reconnect = () => this.reconnectServer(name);
 						try {
@@ -1511,6 +1516,7 @@ export class MCPManager {
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+		if (!this.#isExactToolPublicationAllowed(name)) return;
 		this.#tools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
@@ -1603,7 +1609,16 @@ export class MCPManager {
 	 * Get all loaded tools.
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
-		return this.#tools.filter(tool => !tool.mcpServerName || !this.#suppressedServers.has(tool.mcpServerName));
+		return this.#tools.filter(tool => !tool.mcpServerName || this.#isExactToolPublicationAllowed(tool.mcpServerName));
+	}
+
+	#isExactToolPublicationAllowed(name: string): boolean {
+		return (
+			!this.#toolsOnly ||
+			(!this.#suppressedServers.has(name) &&
+				!this.#pendingExactSuspensions.has(name) &&
+				!this.#pendingExactControlServers.has(name))
+		);
 	}
 
 	isExactServerSuppressed(name: string): boolean {
@@ -1816,7 +1831,7 @@ export class MCPManager {
 		);
 	}
 
-	#preparedCatalogCommit(
+	async #preparedCatalogCommit(
 		name: string,
 		status: "resumed" | "reconnected",
 		serverTools: CustomTool<TSchema, MCPToolDetails>[],
@@ -1830,7 +1845,7 @@ export class MCPManager {
 			  }
 			| undefined,
 		expectedConnection: MCPServerConnection | undefined,
-	): PreparedExactMcpServerControl {
+	): Promise<PreparedExactMcpServerControl> {
 		const tools = [
 			...this.#tools.filter(
 				tool =>
@@ -1839,6 +1854,18 @@ export class MCPManager {
 			...serverTools,
 		];
 		sortMCPToolsByName(tools);
+		if (this.#toolsOnly && new Set(tools.map(tool => tool.name)).size !== tools.length) {
+			let abortError: unknown;
+			try {
+				await candidate?.abort();
+			} catch (error) {
+				abortError = error;
+			}
+			this.#pendingExactControlServers.delete(name);
+			this.#drainDeferredSharedRebinds();
+			if (abortError !== undefined) throw abortError;
+			return this.#settledExactControl({ name, status: "unavailable", toolCount: 0 });
+		}
 		let settled = false;
 		const precommit = (): void => {
 			if (settled) return;

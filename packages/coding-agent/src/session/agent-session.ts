@@ -387,7 +387,7 @@ import type { LazyService } from "../runtime/lazy-service";
 import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { type ExactMcpServerControlResult, MCPManager } from "../runtime-mcp/manager";
-import { getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
+import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
@@ -10374,9 +10374,11 @@ export class AgentSession {
 	}
 
 	async #prepareExactMcpControlRetirement(): Promise<PreparedExactMcpRetirement | undefined> {
-		if (!getExactMcpControls(this)) return undefined;
+		const controls = getExactMcpControls(this);
+		if (!controls) return undefined;
 		const snapshot = this.#captureExactMcpSessionState();
 		const prepared = await this.#ownedMcpManager?.prepareExactServerControlReset();
+		const restoreControls = (): void => attachExactMcpControls(this, controls);
 		try {
 			if (prepared) await this.refreshMCPTools(prepared.tools, { persistMCPSelection: false });
 			return {
@@ -10388,17 +10390,20 @@ export class AgentSession {
 						revokeExactMcpControls(this);
 					} catch (error) {
 						this.#restoreExactMcpSessionState(snapshot);
+						restoreControls();
 						await prepared?.abort();
 						throw error;
 					}
 				},
 				abort: async () => {
 					this.#restoreExactMcpSessionState(snapshot);
+					restoreControls();
 					await prepared?.abort();
 				},
 			};
 		} catch (error) {
 			this.#restoreExactMcpSessionState(snapshot);
+			restoreControls();
 			await prepared?.abort();
 			throw error;
 		}
