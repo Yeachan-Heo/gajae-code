@@ -2362,7 +2362,11 @@ export function compactTransaction(transaction: CoordinatorSessionTransactionV1,
 			if (
 				request.phase === "completed" &&
 				!pinnedRequests.has(request) &&
-				old(request.updated_at) &&
+				// `updated_at` may carry a timestamp reported by a remote peer (for
+				// example, an answer gate's `resolved_at`). Retention must age the
+				// locally recorded request instead, so remote clock skew cannot make a
+				// fresh receipt eligible for deletion.
+				old(request.created_at) &&
 				JSON.stringify(transaction.canonical).includes(id) === false
 			)
 				delete group[id];

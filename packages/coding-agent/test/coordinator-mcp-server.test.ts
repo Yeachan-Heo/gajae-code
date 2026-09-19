@@ -10592,6 +10592,126 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		expect(answerCalls).toBe(2);
 	});
 
+	it("retains a fresh accepted receipt when the gate reports an old resolved_at", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const remoteResolvedAt = "2000-01-01T00:00:00.000Z";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("old-resolved-at", runtimeTurnId)],
+								complete: true,
+								revision: "old-resolved-at",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: remoteResolvedAt } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "old resolved at",
+			idempotency_key: "old-resolved-at-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		const accepted = await server.callTool("gjc_coordinator_submit_question_answer", {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			question_id: "old-resolved-at",
+			answer_binding: question.answer_binding,
+			answer: { selected: ["opt_0"] },
+			idempotency_key: "old-resolved-at-answer",
+			allow_mutation: true,
+		});
+		expect(accepted).toMatchObject({ ok: true, status: "accepted", resolved_at: remoteResolvedAt });
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const persisted = await withSessionTransaction(paths, "visible-session", async transaction => transaction);
+		const receipts = Object.values(persisted.requests.answers);
+		expect(receipts).toHaveLength(1);
+		expect(receipts[0]).toMatchObject({ phase: "completed", updated_at: remoteResolvedAt });
+		expect(Date.parse(receipts[0]!.created_at)).toBeGreaterThan(Date.parse(remoteResolvedAt));
+	});
+
+	it("compacts a completed answer receipt once its local insertion time is old", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let runtimeTurnId = "";
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query =>
+				query === "Q12"
+					? {
+							ok: true,
+							page: {
+								items: [sharedAskGate("old-local-receipt", runtimeTurnId)],
+								complete: true,
+								revision: "old-local-receipt",
+							},
+						}
+					: { ok: true, page: { items: [], complete: true, revision: "context" } },
+			undefined,
+			undefined,
+			undefined,
+			{
+				controlResult: control =>
+					control.operation === "workflow.gate_answer"
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
+						: undefined,
+			},
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "old local receipt",
+			idempotency_key: "old-local-receipt-prompt",
+			allow_mutation: true,
+		});
+		runtimeTurnId = String((sent.turn as Record<string, Record<string, unknown>>).delivery.runtime_turn_id);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		const question = (listed.questions as Array<Record<string, unknown>>)[0]!;
+		await expect(
+			server.callTool("gjc_coordinator_submit_question_answer", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				question_id: "old-local-receipt",
+				answer_binding: question.answer_binding,
+				answer: { selected: ["opt_0"] },
+				idempotency_key: "old-local-receipt-answer",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, status: "accepted" });
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		await withSessionTransaction(paths, "visible-session", async transaction => {
+			const request = Object.values(transaction.requests.answers)[0];
+			if (!request) throw new Error("missing_answer_receipt");
+			request.created_at = "2000-01-01T00:00:00.000Z";
+		});
+		const compacted = await readSessionTransaction(paths, "visible-session");
+		expect(compacted?.requests.answers).toEqual({});
+	});
+
 	it("reverts an answer claim when runtime admission changes before dispatch and permits exact retry", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
