@@ -247,6 +247,46 @@ test("published runtime evidence is the host's own client count and work, and re
 	expect(sessionHostAttachedClients()).toEqual(baseClients);
 });
 
+test("an attached observer daemon does not count as demand, while in-flight work still does", async () => {
+	const baseClients = sessionHostAttachedClients() ?? 0;
+	let work = false;
+	const publication = publishSessionHostRuntimeEvidence({
+		attachedClients: () => 1,
+		observerClients: () => 1,
+		workInFlight: () => work,
+	});
+	try {
+		const readDemand = () => Math.max(0, (sessionHostAttachedClients() ?? baseClients) - baseClients);
+		const idleOutcome = await runUntilStable(
+			{
+				readAttachedClients: readDemand,
+				readWorkInFlight: sessionHostWorkInFlight,
+				idleGraceMs: 20,
+				firstAttachGraceMs: 40,
+				pollMs: 10,
+			},
+			200,
+			{ nowMs: 0 },
+		);
+		expect(idleOutcome).toBe("reaped");
+		work = true;
+		const inFlightOutcome = await runUntilStable(
+			{
+				readAttachedClients: readDemand,
+				readWorkInFlight: sessionHostWorkInFlight,
+				idleGraceMs: 20,
+				firstAttachGraceMs: 40,
+				pollMs: 10,
+			},
+			200,
+			{ nowMs: 0 },
+		);
+		expect(inFlightOutcome).toBe("still-running");
+	} finally {
+		publication.retract();
+	}
+});
+
 test("a retracting runtime cannot clear the evidence of the runtime that succeeded it", () => {
 	const baseClients = sessionHostAttachedClients();
 	const predecessor = publishSessionHostRuntimeEvidence({

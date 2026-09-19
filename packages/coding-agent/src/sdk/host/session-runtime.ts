@@ -26,7 +26,12 @@ import {
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
-import { type Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	type Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
@@ -364,6 +369,17 @@ export interface SdkOnlyTerminalAbortSeams {
 			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
 		},
 	) => Promise<{ status: string; terminalScope?: unknown }>;
+	/**
+	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+	 * ledger holds for an execution handle (#5637). Strictly read-only: it
+	 * never claims, reserves, seals or quarantines ledger state. Declared here
+	 * so both hosts expose ONE seam contract — the bus route consumes it for its
+	 * deadline tool-boundary wait, and this route threads it so a future boundary
+	 * wait or deadline abort reads the ledger rather than silently falling back
+	 * to the event-derived set. Optional so an older host that does not thread it
+	 * degrades to that fallback instead of failing to construct.
+	 */
+	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
 	maxDurableTerminalReservationsForTests?: number;
 }
@@ -423,6 +439,11 @@ export class SessionSdkSessionRuntime {
 
 	getProviderDefinitions(capability: string): unknown | undefined {
 		return this.host.getProviderDefinitions(capability);
+	}
+
+	/** Persist the host's current observable activity for broker/session-list consumers. */
+	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
+		await this.host.reportActivity(state, at);
 	}
 
 	emitEvent(frame: SdkFrame): void {
@@ -5044,6 +5065,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+		// The activity checkpoint is already fire-and-forget and does not depend on
+		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+			?.reportActivity("active")
+			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
 		// Interactive/skill turns must not wait on durable start persist. Keep
 		// trackLifecycle so drain, persist-then-publish, content-hold release, and
 		// shutdown still run; do not return that promise to the extension runner
@@ -5074,6 +5100,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
 		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_end")?.runtime)
+			?.reportActivity("idle")
+			.catch(error => logger.warn(`sdk: idle activity checkpoint failed: ${String(error)}`));
 		// Capture the oldest unmatched batch synchronously. A successor may start
 		// while the failed diagnostic persists; that must not retarget the
 		// predecessor's reason or terminal boundary to the successor invocation.
@@ -5340,14 +5369,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await steerReconciliation.hydrateFromStore();
 		const deadlineManager = new PromptDeadlineManager({
 			reconciliation,
-			getLeaseMs: () => {
-				const v = options.settings?.get("sdk.promptDeadlineMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 1_800_000;
-			},
-			getMaxMs: () => {
-				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
-			},
+			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
+			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {
@@ -6122,6 +6145,34 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								await index.unregisterIfCurrent(published);
 								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
 							}
+						},
+						heartbeat: async input => {
+							// Heartbeat only ever speaks for the publication this host proved it
+							// owns. A stale or foreign generation must not renew liveness.
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.append({
+								type: "host_heartbeat",
+								sessionId: expected.sessionId,
+								locator: expected.locator,
+								endpointGeneration: expected.endpointGeneration,
+								pid: expected.pid,
+								...(expected.processIncarnation === undefined
+									? {}
+									: { processIncarnation: expected.processIncarnation }),
+								...(expected.hostIncarnation === undefined
+									? {}
+									: { hostIncarnation: expected.hostIncarnation }),
+								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+								activity: input.activity,
+								ts: input.activity.at,
+							});
 						},
 						unregister: async input => {
 							const expected = brokerRegistrationEvent;

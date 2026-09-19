@@ -1303,13 +1303,13 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			name: "approval re-bound onto this head by a force-push does not count",
 			reviews: [review("review-bot", "APPROVED", head, beforeHead)],
 			approved: false,
-			rebound: true,
+			refused: "rebound",
 		},
 		{
 			name: "an approval with no submission time fails closed",
 			reviews: [{ state: "APPROVED", commit_id: head, user: { login: "review-bot" } }],
 			approved: false,
-			rebound: true,
+			refused: "unreadable",
 		},
 	]) ("$name", async scenario => {
 		const originalFetch = globalThis.fetch;
@@ -1330,8 +1330,40 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 				permission: "write",
 				approvedHead: scenario.approved,
 				approvedLogin: "review-bot",
-				...(scenario.approved ? {} : { reboundStaleApproval: scenario.rebound === true }),
+				...(scenario.refused ? { refusedApproval: scenario.refused } : {}),
 			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test.each([
+		{ name: "commits API failure", commits: () => new Response("nope", { status: 500 }) },
+		{ name: "missing committer date", commits: () => Response.json({ commit: { committer: {} } }) },
+		{ name: "unparseable committer date", commits: () => Response.json({ commit: { committer: { date: "not-a-date" } } }) },
+	])("an unreadable head commit date refuses the approval rather than admitting it: $name", async scenario => {
+		// The first cut of #5692 skipped the precedence test entirely when the head date was
+		// absent, so a failed commit lookup ADMITTED the approval — a fail-open in the guard
+		// that exists to fail closed (#5692 review).
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+			// Refused, but NOT claimed re-bound: precedence was never proven.
+			expect(evidence.refusedApproval).toBe("unreadable");
 		} finally {
 			spy.mockRestore();
 			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;

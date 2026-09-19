@@ -15446,6 +15446,31 @@ export class AgentSession {
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		return AsyncJobManager.endpointIdOf(manager) ?? this.sessionManager.getSessionId() ?? "local";
 	}
+	/**
+	 * Tool call ids the run resource ledger currently holds for `handle` (#5637).
+	 *
+	 * The authoritative answer to "is a tool running?": AgentLoop reserves the
+	 * `kind: "tool"` lease SYNCHRONOUSLY inside its dispatch loop, before the
+	 * tool's `execute` is invoked, and the lease settles when the call really
+	 * ends — whereas `tool_execution_start` only reaches an extension after an
+	 * asynchronous fanout. Strictly read-only: it takes a snapshot and never
+	 * claims, reserves, seals or quarantines. An unknown run reads as empty,
+	 * matching `RunResourceLedger.pending`.
+	 */
+	pendingToolExecutions(handle: string): readonly string[] {
+		const ids = new Set<string>();
+		for (const entry of this.agent.resourceLedger.pending(handle)) {
+			if (entry.kind !== "tool") continue;
+			// AgentLoop labels a tool reservation `<toolName>:<toolCallId>`, and
+			// registers the reservation and its tracked task under the SAME label, so
+			// the set also collapses that pair to one id. A label without a separator
+			// is passed through rather than dropped: over-reporting a running tool
+			// only costs a bounded wait, under-reporting kills it mid-write.
+			const separator = entry.label.indexOf(":");
+			ids.add(separator < 0 ? entry.label : entry.label.slice(separator + 1));
+		}
+		return [...ids];
+	}
 	async abortPromptAndWait(
 		handle: string,
 		options: {
