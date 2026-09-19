@@ -174,88 +174,102 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		expect(parsed.providers["other-provider"]?.models?.map(model => model.id)).toEqual(["other-model"]);
 	});
 
-	it("rolls back the literal credential when cancelled during persistence", async () => {
-		const modelsPath = await tempModelsPath();
-		const controller = new AbortController();
-		const { promise: setGate, resolve: resolveSet } = Promise.withResolvers<void>();
-		const store = await SqliteAuthCredentialStore.open(path.join(tempRoot!, "agent.db"));
-		try {
-			const authStorage = new AuthStorage(store);
-			const probeController = controller;
-			await expect(
-				addApiCompatibleProvider({
-					compatibility: "openai",
-					providerId: "rollback-gateway",
-					baseUrl: "https://gateway.example.com/v1",
-					apiKey: "sk-literal-live",
-					discover: true,
-					modelsPath,
-					authStorage: {
-						exportSnapshot: () => authStorage.exportSnapshot(),
-						set: async (...args: Parameters<AuthStorage["set"]>) => {
-							const result = await authStorage.set(...args);
-							// Simulate a delayed credential store: abort while
-							// the write is resolving, before models.yml lands.
-							probeController.abort(new Error("revision superseded"));
-							resolveSet();
-							return result;
-						},
-						remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
-					},
-					discoverySignal: controller.signal,
-					probeDiscovery: async () => ({
-						models: ["live-model"],
-						endpoint: "https://gateway.example.com/v1/models",
-					}),
-				}),
-			).rejects.toThrow("was cancelled; setup did not write any config");
-			await setGate;
-			expect(await Bun.file(modelsPath).exists()).toBe(false);
-			expect(authStorage.has("rollback-gateway")).toBe(false);
-		} finally {
-			store.close();
-		}
-	});
-
-	it("restores the prior credential when a force replacement is cancelled mid-write", async () => {
+	it("publishes a replacement credential only after config commit", async () => {
 		const modelsPath = await tempModelsPath();
 		const controller = new AbortController();
 		const store = await SqliteAuthCredentialStore.open(path.join(tempRoot!, "agent.db"));
 		try {
 			const authStorage = new AuthStorage(store);
 			await authStorage.set("force-gateway", { type: "api_key", key: "sk-old-key" });
-			const { promise: setGate, resolve: resolveSet } = Promise.withResolvers<void>();
-			await expect(
-				addApiCompatibleProvider({
-					compatibility: "openai",
-					providerId: "force-gateway",
-					baseUrl: "https://gateway.example.com/v1",
-					apiKey: "sk-new-key",
-					discover: true,
-					force: true,
-					modelsPath,
-					authStorage: {
-						exportSnapshot: () => authStorage.exportSnapshot(),
-						set: async (...args: Parameters<AuthStorage["set"]>) => {
-							const result = await authStorage.set(...args);
-							controller.abort(new Error("revision superseded"));
-							resolveSet();
-							return result;
-						},
-						remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
+			await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "force-gateway",
+				baseUrl: "https://old-gateway.example.com/v1",
+				apiKey: "sk-old-key",
+				models: ["old-model"],
+				modelsPath,
+				authStorage,
+			});
+			const events: string[] = [];
+			const result = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "force-gateway",
+				baseUrl: "https://gateway.example.com/v1",
+				apiKey: "sk-new-key",
+				force: true,
+				models: ["new-model"],
+				modelsPath,
+				authStorage: {
+					exportSnapshot: () => authStorage.exportSnapshot(),
+					set: async (...args: Parameters<AuthStorage["set"]>) => {
+						events.push("before-credential");
+						const config = YAML.parse(await Bun.file(modelsPath).text()) as {
+							providers: Record<string, { baseUrl?: string }>;
+						};
+						expect(config.providers["force-gateway"]?.baseUrl).toBe("https://gateway.example.com/v1");
+						expect(await authStorage.peekApiKey("force-gateway")).toBe("sk-old-key");
+						const result = await authStorage.set(...args);
+						events.push("after-credential");
+						return result;
 					},
-					discoverySignal: controller.signal,
-					probeDiscovery: async () => ({
-						models: ["live-model"],
-						endpoint: "https://gateway.example.com/v1/models",
-					}),
-				}),
-			).rejects.toThrow("was cancelled; setup did not write any config");
-			await setGate;
-			expect(await Bun.file(modelsPath).exists()).toBe(false);
-			expect(await authStorage.peekApiKey("force-gateway")).toBe("sk-old-key");
+					remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
+				},
+			});
+			expect(result.providerId).toBe("force-gateway");
+			expect(events).toEqual(["before-credential", "after-credential"]);
+			expect(await authStorage.peekApiKey("force-gateway")).toBe("sk-new-key");
 		} finally {
+			controller.abort();
 			store.close();
+		}
+	});
+
+	it("does not roll back a newer credential after a post-commit write failure", async () => {
+		const modelsPath = await tempModelsPath();
+		const store = await SqliteAuthCredentialStore.open(path.join(tempRoot!, "agent.db"));
+		const authStorage = new AuthStorage(store);
+		try {
+			await authStorage.set("race-gateway", { type: "api_key", key: "sk-old-key" });
+			await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "race-gateway",
+				baseUrl: "https://old-gateway.example.com/v1",
+				apiKey: "sk-old-key",
+				models: ["old-model"],
+				modelsPath,
+				authStorage,
+			});
+			const underlyingSet = authStorage.set.bind(authStorage);
+			const result = await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "race-gateway",
+				baseUrl: "https://new-gateway.example.com/v1",
+				apiKey: "sk-new-key",
+				models: ["new-model"],
+				force: true,
+				modelsPath,
+				authStorage: {
+					exportSnapshot: () => authStorage.exportSnapshot(),
+					set: async (...args: Parameters<AuthStorage["set"]>) => {
+						await underlyingSet(...args);
+						await underlyingSet("race-gateway", { type: "api_key", key: "sk-peer-key" });
+						throw new Error("credential write failed after peer update");
+					},
+					remove: (...args: Parameters<AuthStorage["remove"]>) => authStorage.remove(...args),
+				},
+			});
+			void result;
+			throw new Error("expected setup to fail");
+		} catch (error) {
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain("could not publish credentials");
+			expect(await authStorage.peekApiKey("race-gateway")).toBe("sk-peer-key");
+			const config = YAML.parse(await Bun.file(modelsPath).text()) as {
+				providers: Record<string, { baseUrl?: string }>;
+			};
+			expect(config.providers["race-gateway"]?.baseUrl).toBe("https://old-gateway.example.com/v1");
+		} finally {
+			authStorage.close();
 		}
 	});
 

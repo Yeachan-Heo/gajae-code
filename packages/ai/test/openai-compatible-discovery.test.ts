@@ -252,6 +252,25 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		}
 	});
 
+	it("returns no models when a runtime endpoint stalls past its deadline", async () => {
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(), 20);
+			return controller.signal;
+		});
+		global.fetch = (async (_url: string | URL | Request, init?: RequestInit) =>
+			await new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")), {
+					once: true,
+				});
+			})) as typeof fetch;
+		try {
+			expect(await fetchOpenAICompatibleModels(options)).toBeNull();
+		} finally {
+			timeoutSpy.mockRestore();
+		}
+	});
+
 	it("accepts only loopback endpoints for implicit local-provider overrides", () => {
 		const fallback = "http://127.0.0.1:8080/v1";
 		const accepted = [

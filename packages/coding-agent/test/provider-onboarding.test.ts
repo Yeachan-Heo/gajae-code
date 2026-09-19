@@ -910,7 +910,7 @@ describe("provider onboarding precommit cancellation", () => {
 		}
 	});
 
-	it("reports unrestorable snapshot recovery without deleting credentials on config failure", async () => {
+	it("does not mutate credentials when config commit fails", async () => {
 		const modelsPath = await tempModelsPath();
 		const authStorage = await AuthStorage.create(getAgentDbPath());
 		const snapshotSpy = vi.spyOn(authStorage, "exportSnapshot").mockReturnValue({
@@ -945,15 +945,12 @@ describe("provider onboarding precommit cancellation", () => {
 				(error: unknown) => error,
 			);
 			expect(failure).toBeInstanceOf(Error);
-			expect((failure as Error).cause).toBe(originalCause);
-			expect((failure as Error).message).toContain("could not restore prior credentials");
-			expect(setSpy).toHaveBeenCalledTimes(1);
+			expect(failure).toBe(originalCause);
+			expect(setSpy).not.toHaveBeenCalled();
 			expect(removeSpy).not.toHaveBeenCalled();
-			expect(await authStorage.peekApiKey("unrestorable")).toBe("sk-new-secret");
+			expect(await authStorage.peekApiKey("unrestorable")).toBeUndefined();
 			expect(await Bun.file(modelsPath).exists()).toBe(false);
-			expect(logSpy).toHaveBeenCalledWith((failure as Error).message);
-			expect(JSON.stringify(logSpy.mock.calls)).not.toContain("sk-new-secret");
-			expect(JSON.stringify(logSpy.mock.calls)).not.toContain("sk-oauth-secret");
+			expect(logSpy).not.toHaveBeenCalled();
 		} finally {
 			snapshotSpy.mockRestore();
 			setSpy.mockRestore();
@@ -963,62 +960,46 @@ describe("provider onboarding precommit cancellation", () => {
 			authStorage.close();
 		}
 	});
-	for (const recovery of ["restore", "remove", "open"] as const) {
-		it(`surfaces and safely logs failed credential ${recovery} recovery after cancellation`, async () => {
-			const modelsPath = await tempModelsPath();
-			const controller = new AbortController();
-			const authStorage = await AuthStorage.create(getAgentDbPath());
-			if (recovery === "restore")
-				await authStorage.set("failed-recovery", { type: "api_key", key: "sk-old-secret" });
-			const set = authStorage.set.bind(authStorage);
-			const setSpy = vi
-				.spyOn(authStorage, "set")
-				.mockImplementation(async (...args: Parameters<AuthStorage["set"]>) => {
-					if (controller.signal.aborted) throw new Error("broker echoed sk-old-secret sk-new-secret");
-					await set(...args);
-					controller.abort();
-				});
-			const removeSpy = vi.spyOn(authStorage, "remove").mockRejectedValue(new Error("broker echoed sk-new-secret"));
-			const createSpy = vi.spyOn(AuthStorage, "create").mockImplementation(async () => {
-				if (controller.signal.aborted) throw new Error("open echoed sk-new-secret");
-				return authStorage;
+	it("restores config without rolling back credentials after a publish failure", async () => {
+		const modelsPath = await tempModelsPath();
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		await authStorage.set("publish-failure", { type: "api_key", key: "sk-old-secret" });
+		const original = YAML.stringify({
+			providers: {
+				"publish-failure": {
+					baseUrl: "https://old.example.com/v1",
+					api: "openai-responses",
+					models: [{ id: "old-model" }],
+				},
+			},
+		});
+		await Bun.write(modelsPath, original);
+		const underlyingSet = authStorage.set.bind(authStorage);
+		const setSpy = vi
+			.spyOn(authStorage, "set")
+			.mockImplementation(async (...args: Parameters<AuthStorage["set"]>) => {
+				await underlyingSet(...args);
+				throw new Error("broker echoed sk-new-secret");
 			});
-			const closeSpy = vi.spyOn(authStorage, "close").mockImplementation(() => undefined);
-			const logSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined);
-			try {
-				const failure = await addApiCompatibleProvider({
+		try {
+			await expect(
+				addApiCompatibleProvider({
 					compatibility: "openai",
-					providerId: "failed-recovery",
-					baseUrl: "https://example.com/v1",
+					providerId: "publish-failure",
+					baseUrl: "https://new.example.com/v1",
 					apiKey: "sk-new-secret",
-					models: ["model"],
+					models: ["new-model"],
 					modelsPath,
 					force: true,
-					authStorage: recovery === "open" ? undefined : authStorage,
-					discoverySignal: controller.signal,
-				}).then(
-					() => undefined,
-					(error: unknown) => error,
-				);
-				expect(failure).toBeInstanceOf(Error);
-				const error = failure as Error;
-				expect(error.message).toContain("credential recovery is required");
-				expect(error.cause).toBeInstanceOf(Error);
-				expect((error.cause as Error).message).toContain("was cancelled");
-				expect(logSpy).toHaveBeenCalledWith(error.message);
-				const diagnostics = JSON.stringify(logSpy.mock.calls) + error.message + String(error.cause);
-				expect(diagnostics).not.toContain("sk-old-secret");
-				expect(diagnostics).not.toContain("sk-new-secret");
-				expect(await Bun.file(modelsPath).exists()).toBe(false);
-				expect(await authStorage.peekApiKey("failed-recovery")).toBe("sk-new-secret");
-			} finally {
-				setSpy.mockRestore();
-				removeSpy.mockRestore();
-				createSpy.mockRestore();
-				closeSpy.mockRestore();
-				logSpy.mockRestore();
-				authStorage.close();
-			}
-		});
-	}
+					authStorage,
+				}),
+			).rejects.toThrow("could not publish credentials");
+			expect(YAML.parse(await Bun.file(modelsPath).text())).toEqual(YAML.parse(original));
+			expect(await authStorage.peekApiKey("publish-failure")).toBe("sk-new-secret");
+			expect(setSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			setSpy.mockRestore();
+			authStorage.close();
+		}
+	});
 });

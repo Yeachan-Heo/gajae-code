@@ -480,34 +480,20 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		provider.apiKeyEnv = validated.apiKey;
 	}
 	// Serialize config merging under the file lock. Credential storage is a
-	// separate authority, not an atomic transaction with models.yml: restore
-	// successful credential writes on precommit failure and report failed recovery.
+	// separate authority, not an atomic transaction with models.yml. Publish the
+	// new config first and only then update the credential authority so a live
+	// session can never send a replacement key to the old base URL.
 	type CredentialStore = ProviderSetupCredentialStore;
-	type ApiKeyEntry = { type: "api_key"; key: string };
 	const cancelledError = (): Error =>
 		new Error(`Model discovery for '${validated.providerId}' was cancelled; setup did not write any config.`);
-	// Snapshot the complete prior credential entries so a `--force`
-	// replacement cancelled mid-write restores them exactly instead of
-	// deleting them while the old models.yml provider remains. A
-	// resolved-key snapshot is insufficient: the provider may hold multiple
-	// entries, OAuth credentials, or env-resolved keys that were never
-	// stored. Non-api_key entries cannot be restored from a snapshot
-	// (refresh material is sentinelized), so refuse those replacements
-	// upfront rather than destroying them on abort.
-	const snapshotRestorableKeys = (store: CredentialStore): { restorable: ApiKeyEntry[]; unrestorable: number } => {
+	// A cancellable replacement must not overwrite OAuth rows that cannot be
+	// restored from the redacted snapshot. The check is read-only and happens
+	// before the config commit; credentials are never rolled back after a
+	// concurrent writer can have changed them.
+	const hasUnrestorableCredentials = (store: CredentialStore): boolean => {
 		const storageProvider = resolveOAuthStorageProvider(validated.providerId);
 		const priorEntries = store.exportSnapshot().credentials.filter(entry => entry.provider === storageProvider);
-		const restorable = priorEntries
-			.filter((entry): entry is typeof entry & { credential: ApiKeyEntry } => entry.credential.type === "api_key")
-			.map(entry => entry.credential);
-		return { restorable, unrestorable: priorEntries.length - restorable.length };
-	};
-	const rollbackCredential = async (store: CredentialStore, restorable: ApiKeyEntry[]): Promise<void> => {
-		if (restorable.length > 0) {
-			await store.set(validated.providerId, restorable);
-		} else {
-			await store.remove(validated.providerId);
-		}
+		return priorEntries.some(entry => entry.credential.type !== "api_key");
 	};
 	const withCredentialStore = async (fn: (store: CredentialStore) => Promise<void>): Promise<void> => {
 		if (input.authStorage) {
@@ -530,25 +516,19 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		if (current.providers?.[validated.providerId] && !input.force) {
 			throw new Error(`Provider '${validated.providerId}' already exists. Use --force to replace it.`);
 		}
-		let restorable: ApiKeyEntry[] = [];
-		let unrestorable = 0;
-		let wroteKey = false;
+		if (validated.credentialSource !== "env" && input.discoverySignal) {
+			await withCredentialStore(async store => {
+				if (hasUnrestorableCredentials(store)) {
+					throw new Error(
+						`Provider '${validated.providerId}' holds non-API-key credentials that cannot be restored if setup is cancelled; remove them first or omit --force.`,
+					);
+				}
+			});
+		}
+		if (input.discoverySignal?.aborted) throw cancelledError();
+		const configExistedBeforeCommit = await Bun.file(modelsPath).exists();
+		let configCommitted = false;
 		try {
-			if (validated.credentialSource !== "env") {
-				await withCredentialStore(async store => {
-					const snapshot = snapshotRestorableKeys(store);
-					restorable = snapshot.restorable;
-					unrestorable = snapshot.unrestorable;
-					if (snapshot.unrestorable > 0 && input.discoverySignal) {
-						throw new Error(
-							`Provider '${validated.providerId}' holds non-API-key credentials that cannot be restored if setup is cancelled; remove them first or omit --force.`,
-						);
-					}
-					await store.set(validated.providerId, { type: "api_key", key: validated.apiKey });
-					wroteKey = true;
-				});
-			}
-			if (input.discoverySignal?.aborted) throw cancelledError();
 			await writeModelsConfig(
 				modelsPath,
 				{
@@ -560,20 +540,31 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 				},
 				input.discoverySignal,
 			);
+			configCommitted = true;
+			// Cancellation after the atomic config rename cannot undo the saved
+			// provider. Finish publishing the matching literal credential even if
+			// the caller dismissed the wizard during the rename.
+			if (validated.credentialSource !== "env") {
+				await withCredentialStore(store =>
+					store.set(validated.providerId, { type: "api_key", key: validated.apiKey }),
+				);
+			}
 		} catch (error) {
-			if (wroteKey) {
+			if (configCommitted) {
 				try {
-					if (unrestorable > 0) throw new Error("Prior credentials cannot be restored from a snapshot.");
-					await withCredentialStore(store => rollbackCredential(store, restorable));
+					if (configExistedBeforeCommit) await writeModelsConfig(modelsPath, current);
+					else await fs.rm(modelsPath, { force: true });
 				} catch {
-					// Store errors can contain credentials; never log or interpolate them.
-					// Log independently of the wizard, which may already be dismissed.
-					const recovery =
-						restorable.length > 0 || unrestorable > 0 ? "restore prior credentials" : "remove new credentials";
-					const message = `Provider '${validated.providerId}' setup failed before config commit and could not ${recovery}; credential recovery is required.`;
+					// Store/config errors can contain credentials; never log or
+					// interpolate them. Log independently of the wizard, which may
+					// already be dismissed.
+					const message = `Provider '${validated.providerId}' setup failed while publishing credentials and could not restore the previous config; credential recovery is required.`;
 					logger.error(message);
 					throw new Error(message, { cause: error });
 				}
+				throw new Error(
+					`Provider '${validated.providerId}' setup could not publish credentials; the previous config was restored.`,
+				);
 			}
 			throw error;
 		}

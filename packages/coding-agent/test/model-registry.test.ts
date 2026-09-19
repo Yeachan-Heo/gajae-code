@@ -3585,6 +3585,44 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 		});
 
+		test("explicit model definitions remain authoritative over same-id discovery", async () => {
+			writeRawModelsJson({
+				"explicit-discovery": {
+					baseUrl: "https://provider.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "explicit-model",
+							name: "Configured model",
+							contextWindow: 123_456,
+							maxTokens: 7_654,
+						},
+					],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			using _hook = hookFetch(
+				() =>
+					new Response(
+						JSON.stringify({ data: [{ id: "explicit-model", owned_by: "anthropic" }, { id: "live-model" }] }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+			);
+			await registry.refreshProvider("explicit-discovery", "online");
+
+			expect(registry.find("explicit-discovery", "explicit-model")).toMatchObject({
+				api: "openai-responses",
+				name: "Configured model",
+				contextWindow: 123_456,
+				maxTokens: 7_654,
+			});
+			expect(registry.find("explicit-discovery", "live-model")).toBeDefined();
+		});
+
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
 			writeRawModelsJson({
 				openai: {

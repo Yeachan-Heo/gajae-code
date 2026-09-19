@@ -52,6 +52,22 @@ describe("runtime models-list discovery hardening", () => {
 		return path.join(tempDir, "models.db");
 	}
 
+	test("does not probe a configured endpoint during registry construction or offline startup refresh", async () => {
+		let providerRequests = 0;
+		using _hook = hookFetch(input => {
+			if (String(input).includes("hardened.example.com")) providerRequests += 1;
+			return new Response(JSON.stringify({ data: [{ id: "startup-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		await Bun.sleep(0);
+		expect(providerRequests).toBe(0);
+		await registry.refresh("offline");
+		expect(providerRequests).toBe(0);
+	});
+
 	test("rejects a declared oversized body without buffering it", async () => {
 		using _hook = hookFetch(
 			() =>
