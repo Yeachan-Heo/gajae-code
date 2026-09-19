@@ -1027,10 +1027,12 @@ function isBrokerLockArtifactName(name: string): boolean {
  * Decide whether one candidate directory is provably abandoned.
  *
  * Fail-closed by construction: every branch that cannot prove abandonment
- * returns a retention reason. A tombstone is only abandoned when its owner
- * record parses and names a dead PID — an unreadable, permission-denied, or
- * absent record keeps it forever. Backup directories carry no owner contract,
- * so an absent record there is not ambiguity and age alone governs.
+ * returns a retention reason. A tombstone is abandoned when its owner record
+ * parses and names a dead PID, or when the aged tombstone is empty after its
+ * owner record disappeared. An unreadable or permission-denied record, and a
+ * non-empty tombstone with no record, remain ambiguous and are retained.
+ * Backup directories carry no owner contract, so an absent record there is
+ * not ambiguity and age alone governs.
  */
 async function classifyBrokerLockArtifact(
 	directory: string,
@@ -1051,7 +1053,14 @@ async function classifyBrokerLockArtifact(
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code !== "ENOENT" && code !== "ENOTDIR") return "owner-record-unreadable";
-		return name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX) ? "owner-record-missing" : "abandoned";
+		if (!name.startsWith(BROKER_LOCK_TOMBSTONE_PREFIX)) return "abandoned";
+		try {
+			const entries = await fs.readdir(target);
+			return entries.length === 0 ? "abandoned" : "owner-record-missing";
+		} catch (readError) {
+			if ((readError as NodeJS.ErrnoException).code === "ENOENT") return "abandoned";
+			return "owner-record-unreadable";
+		}
 	}
 	let pid: unknown;
 	try {
@@ -1071,7 +1080,8 @@ async function classifyBrokerLockArtifact(
  * of the lock's dev+ino, so a machine accrues one directory per dead owner and
  * nothing ever removed them (54 on the install in #3963). Reaping is
  * best-effort and fail-closed: anything live, unreadable, permission-denied, or
- * otherwise ambiguous is kept and the reason is logged.
+ * otherwise ambiguous is kept; per-path reasons are debug-logged and one
+ * warning summarizes the retained stale artifacts by reason.
  */
 export async function reapStaleBrokerLockArtifacts(input: {
 	agentDir: string;
@@ -1085,6 +1095,7 @@ export async function reapStaleBrokerLockArtifacts(input: {
 	const pidAlive = input.pidAlive ?? isPidAlive;
 	const removed: string[] = [];
 	const retained: BrokerLockArtifactRetention[] = [];
+	const retainedCounts = new Map<BrokerLockArtifactRetentionReason, number>();
 	let names: string[];
 	try {
 		names = await fs.readdir(directory);
@@ -1106,7 +1117,10 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		}
 		if (verdict !== "abandoned") {
 			retained.push({ path: target, reason: verdict });
-			if (verdict !== "within-grace") logger.warn(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+			if (verdict !== "within-grace") {
+				logger.debug(`sdk broker: retained stale lock artifact ${name} (${verdict})`);
+				retainedCounts.set(verdict, (retainedCounts.get(verdict) ?? 0) + 1);
+			}
 			continue;
 		}
 		try {
@@ -1115,8 +1129,17 @@ export async function reapStaleBrokerLockArtifacts(input: {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
 			retained.push({ path: target, reason: "removal-failed" });
-			logger.warn(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			logger.debug(`sdk broker: retained stale lock artifact ${name} (removal-failed)`);
+			retainedCounts.set("removal-failed", (retainedCounts.get("removal-failed") ?? 0) + 1);
 		}
+	}
+	if (retainedCounts.size > 0) {
+		const details = [...retainedCounts.entries()]
+			.toSorted(([left], [right]) => left.localeCompare(right))
+			.map(([reason, count]) => `${reason}: ${count}`)
+			.join(", ");
+		const count = [...retainedCounts.values()].reduce((total, value) => total + value, 0);
+		logger.warn(`sdk broker: retained ${count} stale lock artifact(s) (${details})`);
 	}
 	if (removed.length > 0) logger.info(`sdk broker: reaped ${removed.length} stale lock artifact(s)`);
 	return { removed, retained };
