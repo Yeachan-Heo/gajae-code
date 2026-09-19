@@ -134,6 +134,35 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
 		expect(await run(root, ["status", "--porcelain"])).toBe("?? unsaved.ts\n");
 	});
+
+	test("does not adopt worktree defaults from .gjc/agents or .gjc/skills", async () => {
+		const root = await initRepo("gjc-deadline-flush-defaults-");
+		await fsp.mkdir(path.join(root, ".gjc", "agents"), { recursive: true });
+		await fsp.mkdir(path.join(root, ".gjc", "skills"), { recursive: true });
+		await fsp.writeFile(path.join(root, ".gjc", "agents", "local.md"), "local agent default\n");
+		await fsp.writeFile(path.join(root, ".gjc", "skills", "local.md"), "local skill default\n");
+		await fsp.writeFile(path.join(root, "work.ts"), "export const work = true;\n");
+
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeDefined();
+		expect(await run(root, ["show", "HEAD:work.ts"])).toBe("export const work = true;\n");
+		expect(await run(root, ["ls-tree", "-r", "--name-only", "HEAD", ".gjc"])).toBe("");
+		expect(await run(root, ["status", "--porcelain", "--", ".gjc/agents", ".gjc/skills"])).toBe(
+			"?? .gjc/agents/\n?? .gjc/skills/\n",
+		);
+	});
+
+	test("aborts before ref adoption when the deadline attempt is superseded", async () => {
+		const root = await initRepo("gjc-deadline-flush-superseded-direct-");
+		await fsp.writeFile(path.join(root, "work.ts"), "export const work = true;\n");
+		expect(
+			await flushWorktreeOnPromptDeadline(root, {
+				explicitOptIn: true,
+				isCurrent: () => false,
+			}),
+		).toBeUndefined();
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
+		expect(await run(root, ["status", "--porcelain", "--", "work.ts"])).toBe("?? work.ts\n");
+	});
 });
 
 describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {

@@ -150,7 +150,7 @@
 				},
 				"flushWorktreeOnDeadline": {
 					"type": "boolean",
-					"description": "Autosave uncommitted changes in the session's worktree as a WIP commit when a prompt deadline retires a prompt.",
+					"description": "Autosave uncommitted changes in the session's linked worktree by default as a WIP commit when a prompt deadline retires a prompt; primary checkouts require an explicit true opt-in.",
 					"default": true
 				},
 				"masterOrphanGraceMs": {

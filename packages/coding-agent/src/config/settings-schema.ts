@@ -448,7 +448,7 @@ export const SETTINGS_SCHEMA = {
 		type: "boolean",
 		default: true,
 		description:
-			"Autosave uncommitted changes in the session's worktree as a WIP commit when a prompt deadline retires a prompt.",
+			"Autosave uncommitted changes in the session's linked worktree by default as a WIP commit when a prompt deadline retires a prompt; primary checkouts require an explicit true opt-in.",
 	},
 	"sdk.masterOrphanGraceMs": {
 		type: "number",

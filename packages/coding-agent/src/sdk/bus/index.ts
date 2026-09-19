@@ -5772,11 +5772,20 @@ export function createNotificationsExtension(
 					// `has` is true only for a value the user actually wrote, so this
 					// separates an explicit opt-in from the schema default. The flush only
 					// honours the default inside a linked worktree the session owns.
-					const explicitOptIn =
-						settings?.has?.("sdk.flushWorktreeOnDeadline") === true &&
-						settings?.get("sdk.flushWorktreeOnDeadline") === true;
+					const configured = settings?.get("sdk.flushWorktreeOnDeadline");
+					const hasExplicitSetting =
+						typeof settings?.has === "function"
+							? settings.has("sdk.flushWorktreeOnDeadline")
+							: configured === true;
+					const explicitOptIn = hasExplicitSetting === true && configured === true;
 					await runBoundedDeadlineFlush(signal =>
-						flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, signal }),
+						flushWorktreeOnPromptDeadline(ctx.cwd, {
+							explicitOptIn,
+							isCurrent: () =>
+								deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) ===
+								"current",
+							signal,
+						}),
 					);
 				}
 			}

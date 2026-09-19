@@ -5375,15 +5375,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Persist the agent's uncommitted work before the retirement below tears
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
-			onDeadlineExceeded: async (_correlation, signal) => {
+			onDeadlineExceeded: async (_correlation, signal, isCurrent) => {
 				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
 				// `has` is true only for a value the user actually wrote, so this
 				// separates an explicit opt-in from the schema default. The flush only
 				// honours the default inside a linked worktree the session owns.
-				const explicitOptIn =
-					options.settings?.has?.("sdk.flushWorktreeOnDeadline" as never) === true &&
-					options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === true;
-				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, signal });
+				const configured = options.settings?.get("sdk.flushWorktreeOnDeadline" as never);
+				const hasExplicitSetting =
+					typeof options.settings?.has === "function"
+						? options.settings.has("sdk.flushWorktreeOnDeadline" as never)
+						: configured === true;
+				const explicitOptIn = hasExplicitSetting === true && configured === true;
+				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, isCurrent, signal });
 			},
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;

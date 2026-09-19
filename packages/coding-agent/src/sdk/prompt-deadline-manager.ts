@@ -100,7 +100,11 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
-	readonly #onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+	readonly #onDeadlineExceeded?: (
+		correlation: InvocationCorrelation,
+		signal: AbortSignal,
+		isCurrent?: () => boolean,
+	) => void | Promise<void>;
 	readonly #deadlineFlushTimeoutMs: number;
 
 	constructor(options: {
@@ -117,9 +121,14 @@ export class PromptDeadlineManager {
 		 * rejection is swallowed and never changes the deadline outcome. Not called
 		 * when a real terminal transition or a real failure won the race, nor when
 		 * renewed progress supersedes this expiry instance. The hook receives an
-		 * abort signal that fires when it outruns `deadlineFlushTimeoutMs`.
+		 * abort signal that fires when it outruns `deadlineFlushTimeoutMs`, plus a
+		 * generation fence for irreversible worktree adoption.
 		 */
-		onDeadlineExceeded?: (correlation: InvocationCorrelation, signal: AbortSignal) => void | Promise<void>;
+		onDeadlineExceeded?: (
+			correlation: InvocationCorrelation,
+			signal: AbortSignal,
+			isCurrent?: () => boolean,
+		) => void | Promise<void>;
 		/**
 		 * Hard bound on `onDeadlineExceeded`. Measured with a real timer, not
 		 * `now`, because it guards real subprocesses — which is also why it is a
@@ -137,10 +146,22 @@ export class PromptDeadlineManager {
 	}
 
 	/** Run the durability hook under the shared bound; see `runBoundedDeadlineFlush`. */
-	async #runDeadlineFlush(correlation: InvocationCorrelation): Promise<void> {
+	async #runDeadlineFlush(
+		correlation: InvocationCorrelation,
+		lease: PromptDeadlineLease,
+		generation: number,
+	): Promise<void> {
 		const hook = this.#onDeadlineExceeded;
 		if (hook === undefined) return;
-		await runBoundedDeadlineFlush(signal => hook(correlation, signal), this.#deadlineFlushTimeoutMs);
+		const key = leaseKey(correlation);
+		await runBoundedDeadlineFlush(
+			signal =>
+				hook(correlation, signal, () => {
+					const current = this.#leases.get(key);
+					return current === lease && current.generation === generation;
+				}),
+			this.#deadlineFlushTimeoutMs,
+		);
 	}
 
 	#clearTimer(key: string): void {
@@ -244,10 +265,20 @@ export class PromptDeadlineManager {
 			provenance: "deadline",
 			evidence: {},
 		}) as PromptDeadlineOutcome;
+		let winner: SdkPromptTerminalOutcome = outcome;
 		try {
-			await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			const claimed = await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			if (claimed !== undefined) winner = claimed;
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
+		}
+		// A real terminal may win between lookup and this claim. Its existing
+		// pending outcome is authoritative: release this expiry fence without
+		// running the deadline-only durability hook or publishing a deadline result.
+		if (winner.kind !== "failed" || winner.code !== "prompt_deadline_exceeded" || winner.provenance !== "deadline") {
+			this.#expiring.delete(key);
+			this.#expiryRetries.delete(key);
+			return;
 		}
 		// Re-verify the captured lease is still authoritative after the claim
 		// await (exact-head review P2): fresh attributable progress during the
@@ -269,7 +300,7 @@ export class PromptDeadlineManager {
 		// with neither a terminal nor an owner. A try/catch cannot rescue a promise
 		// that never settles, so the flush is raced against a real timer and
 		// abandoned if it outruns it.
-		await this.#runDeadlineFlush(correlation);
+		await this.#runDeadlineFlush(correlation, lease, generation);
 		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
 		// like any other here, and up to ten seconds long, so progress can land and
 		// renew the lease while it runs. A renewed prompt must not be terminalized as
