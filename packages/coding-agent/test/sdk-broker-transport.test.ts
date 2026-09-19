@@ -49,6 +49,17 @@ function lifecycleFingerprint(operation: string, input: Record<string, unknown>)
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
 
+function lifecycleTargetHash(target: Record<string, unknown>): string {
+	return createHash("sha256")
+		.update(
+			`{${Object.keys(target)
+				.sort()
+				.map(key => `${JSON.stringify(key)}:${JSON.stringify(target[key])}`)
+				.join(",")}}`,
+		)
+		.digest("hex");
+}
+
 type TerminalLifecycleState = "terminal_ok" | "terminal_error" | "terminal_uncertain";
 
 async function persistLifecycleOutcome(
@@ -173,6 +184,7 @@ describe("SDK broker WebSocket transport", () => {
 				broker.settings.agentDir,
 				"session.close",
 				"lookup-error",
+				lifecycleTargetHash(closeInput),
 			);
 			expect(broker.ledger.get(closeIdentity)).toMatchObject({
 				operationKey: "session.close\0lookup-error",

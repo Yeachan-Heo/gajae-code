@@ -158,6 +158,29 @@ describe("guide manifest verification", () => {
 		if (!result.ok) expect(result.error.code).toBe("invalid_signature");
 	});
 
+	it("rejects a valid signature from a retired bundled signer", () => {
+		const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+		const publicDer = publicKey.export({ type: "spki", format: "der" });
+		const keyId = createHash("sha256").update(publicDer).digest("hex");
+		addTestGuidePinnedKey({
+			keyId,
+			spkiDerHex: publicDer.toString("hex"),
+			source: "bundled",
+			validUntil: Date.UTC(2026, 0, 1),
+		});
+		try {
+			const manifest = makeManifest({ keyId, guides: [entry("a", "A", "text")] });
+			const result = verifyGuideManifest({
+				manifest,
+				signatureBytes: sign(null, canonicalGuideManifestBytes(manifest), privateKey),
+				now: NOW,
+			});
+			expect(result).toMatchObject({ ok: false, error: { code: "expired" } });
+		} finally {
+			removeTestGuidePinnedKey(keyId);
+		}
+	});
+
 	it("rejects a not-yet-issued manifest (not_yet_valid)", () => {
 		const manifest = makeManifest({ guides: [entry("a", "A", "text")] });
 		const result = verifyGuideManifest({
