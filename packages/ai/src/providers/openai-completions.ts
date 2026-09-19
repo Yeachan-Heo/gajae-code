@@ -8,6 +8,7 @@ import type {
 	ChatCompletionContentPartImage,
 	ChatCompletionContentPartText,
 	ChatCompletionMessageParam,
+	ChatCompletionToolChoiceOption,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
@@ -1922,19 +1923,28 @@ function buildParams(
 	if (compat.extraBody) {
 		// The resolved output limit owns the selected wire field; extraBody is a
 		// free-form compatibility escape hatch and must not add a competing
-		// max-token field or overwrite the resolved budget.
-		const { max_tokens, max_completion_tokens, max_output_tokens, ...restExtra } = compat.extraBody as Record<
-			string,
-			unknown
-		>;
-		// The same discipline applies to tool_choice: an endpoint whose
-		// tool_choice default is "none" (IO Intelligence) injects
-		// {tool_choice:"auto"} here so ordinary agent turns can still call
-		// tools, but turns that deliberately carry no tools strip their
-		// tool_choice above — re-adding it would emit tool_choice with an
-		// empty tools list, exactly the shape strict backends reject.
-		if (!Array.isArray(params.tools) || params.tools.length === 0) {
-			delete (restExtra as Record<string, unknown>).tool_choice;
+		// max-token field or overwrite the resolved budget. tool_choice follows
+		// the same discipline on both sides: an injected default (an endpoint
+		// whose tool_choice default is "none", like IO Intelligence, would
+		// otherwise stop tool calls) may only fill the gap on an ordinary turn
+		// that offers tools but resolved no directive of its own. Explicit
+		// directives — forced tools, retry reminders — stay untouched, and
+		// turns that deliberately carry no tools keep their stripped shape
+		// instead of re-adding tool_choice with an empty tools list.
+		const {
+			max_tokens,
+			max_completion_tokens,
+			max_output_tokens,
+			tool_choice,
+			...restExtra
+		} = compat.extraBody as Record<string, unknown>;
+		if (
+			tool_choice !== undefined &&
+			params.tool_choice === undefined &&
+			Array.isArray(params.tools) &&
+			params.tools.length > 0
+		) {
+			params.tool_choice = tool_choice as ChatCompletionToolChoiceOption;
 		}
 		Object.assign(params, restExtra);
 	}

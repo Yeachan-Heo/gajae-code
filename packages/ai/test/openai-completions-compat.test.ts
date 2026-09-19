@@ -963,6 +963,40 @@ describe("openai-completions compatibility", () => {
 		expect(payload.tool_choice).toBe("auto");
 	});
 
+	it("keeps an explicit forced tool_choice over the extraBody default", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			compat: {
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "set_title",
+			description: "Set the conversation title",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			toolChoice: "required",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload.tool_choice).toBe("required");
+	});
+
 	it("preserves the streamed reasoning field name when replay requires reasoning content", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
