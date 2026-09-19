@@ -19611,6 +19611,11 @@ export class AgentSession {
 			this.#compactionAbortController = compactionAbortController;
 			const steeringBeforeCompaction = this.agent.snapshotSteering();
 			const steeringDisplaysBeforeCompaction = [...this.#steeringMessages];
+			const trackedSteersBeforeCompaction = new Map(
+				[...this.#trackedQueuedInputs.values()]
+					.filter(state => state.message !== undefined && steeringBeforeCompaction.includes(state.message))
+					.map(state => [state.message as AgentMessage, state] as const),
+			);
 			const followUpBeforeCompaction = this.agent.snapshotFollowUp();
 			const followUpDisplaysBeforeCompaction = [...this.#followUpMessages];
 			const trackedFollowUpsBeforeCompaction = new Map(
@@ -19629,7 +19634,16 @@ export class AgentSession {
 				} finally {
 					const steeringAfterAbort = new Set(this.agent.snapshotSteering());
 					const missingSteering = steeringBeforeCompaction.filter(message => !steeringAfterAbort.has(message));
-					if (missingSteering.length > 0) this.agent.restoreSteering(missingSteering);
+					const restorableSteering: AgentMessage[] = [];
+					for (const message of missingSteering) {
+						const trackedState = trackedSteersBeforeCompaction.get(message);
+						if (trackedState) {
+							if (!trackedState.terminalSettled) this.#settleTrackedQueuedInputRemoved(trackedState, "removed");
+							continue;
+						}
+						restorableSteering.push(message);
+					}
+					if (restorableSteering.length > 0) this.agent.restoreSteering(restorableSteering);
 					this.#reconcileCompactionQueueDisplay(steeringDisplaysBeforeCompaction, "steering");
 					const followUpAfterAbort = new Set(this.agent.snapshotFollowUp());
 					const missingFollowUp = followUpBeforeCompaction.filter(message => !followUpAfterAbort.has(message));
