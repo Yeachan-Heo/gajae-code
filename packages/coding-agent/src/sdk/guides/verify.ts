@@ -21,6 +21,8 @@ export interface GuidePinnedKey {
 	/** DER-encoded SPKI public key, hex. */
 	spkiDerHex: string;
 	source: "bundled";
+	/** Optional retirement bound for old bundled signers. */
+	validUntil?: number;
 }
 
 /**
@@ -30,10 +32,20 @@ export interface GuidePinnedKey {
  * Private key material is never shipped; manifests are signed out-of-band.
  */
 const guidePinnedKeys: GuidePinnedKey[] = [
+	// Bundled advisory seed signer for the current offline catalog. The previous
+	// key remains trusted below until the current seed's 2036 expiry so already-
+	// cached manifests do not lose authority during a bundled-guide refresh.
+	{
+		keyId: "71efa9f212e39350e34f88aed5ab7242854e7e20ea91455e8861c973a6fc2eaf",
+		spkiDerHex: "302a300506032b657003210062c441fc5953cdc67d0c46f09b814dcb30de1465dcafb385092dbdcf9844cfeb",
+		source: "bundled",
+		validUntil: Date.UTC(2036, 0, 1),
+	},
 	{
 		keyId: "6c4b134ff9fb86a52d55cb6bb7c2fab938405b53b4148afc4249a2cb6f504bce",
 		spkiDerHex: "302a300506032b6570032100ef665d05c6795341dfc893866d8fe5be4b48891c0ed0d125940d7032de37723e",
 		source: "bundled",
+		validUntil: Date.UTC(2036, 0, 1),
 	},
 ];
 export const GUIDE_PINNED_KEYS: readonly GuidePinnedKey[] = Object.freeze(
@@ -124,7 +136,10 @@ export function verifyGuideManifest(params: {
 		return guideFailure("invalid_signature", "Detached signature verification failed.");
 	}
 	if (!valid)
-		return guideFailure("invalid_signature", "Detached signature does not match the canonical manifest bytes.");
+		if (!valid)
+			return guideFailure("invalid_signature", "Detached signature does not match the canonical manifest bytes.");
+	if (pinned.validUntil !== undefined && now > pinned.validUntil)
+		return guideFailure("expired", `Guide signer ${pinned.keyId} expired before this manifest was read.`);
 	if (!Number.isSafeInteger(now) || now < manifest.issuedAt)
 		return guideFailure("not_yet_valid", "Guide manifest is not authoritative until its issuedAt instant.");
 	if (now > manifest.expiresAt)

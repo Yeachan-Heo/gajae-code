@@ -143,6 +143,11 @@ function canonicalCleanupSessionId(value: unknown): value is string {
 }
 
 const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	// Terminal evidence intentionally has no time-based expiry: forgetting a
+	// completed close would allow a delayed duplicate to reach a later host
+	// generation. The row/byte bounds below are storage limits; compaction keeps
+	// each identity's accepted anchor and latest terminal state instead of
+	// expiring replay authority.
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
@@ -696,8 +701,11 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
-	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
-		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	findByOperationKey(operationKey: string, fingerprint?: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(
+			entry =>
+				entry.operationKey === operationKey && (fingerprint === undefined || entry.fingerprint === fingerprint),
+		);
 	}
 	/**
 	 * Legacy target-inclusive rows predate the operation/key index. Their opaque

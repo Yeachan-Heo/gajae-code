@@ -1,6 +1,6 @@
 ---
 name: gjc-sdk-session
-description: Operate GJC SDK sessions from the CLI (`gjc sdk session list|inspect|send|status|tail|raw` plus the explicit raw control|query|global hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
+description: Operate GJC SDK sessions from the CLI (`gjc sdk session list|inspect|send|status|tail|close|raw` plus the explicit raw control|query|global hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
 ---
 
 # GJC SDK session CLI (advisory)
@@ -13,7 +13,7 @@ run when the operator explicitly invokes them.
 
 ## Broker authority
 
-`list`, `inspect`, `send`, `status`, and `tail` resolve sessions through the
+`list`, `inspect`, `send`, `status`, `tail`, and `close` resolve sessions through the
 SDK broker. The broker validates the indexed session against its durable
 endpoint record and hands the CLI a connection credential the CLI uses and
 never prints. `--agent-dir` selects the broker state directory.
@@ -32,6 +32,11 @@ never prints. `--agent-dir` selects the broker state directory.
   it never cancels a running turn.
 - `gjc sdk session status <sessionId> <opRef>` — lossless `turn.result` with
   `kind: "prompt"` for a previously submitted operation reference.
+
+- `gjc sdk session close <sessionId>` — closes the current live host generation
+  through the broker without attaching. The default idempotency key includes the
+  endpoint generation and incarnation, so retries for one host replay while a
+  resumed host with the same session id gets a new lifecycle identity.
 
 - `gjc sdk session tail <sessionId>` — retained transcript replay from the
   durable checkpoint followed by live event-ring frames. `--strict` fails

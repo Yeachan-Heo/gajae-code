@@ -1,27 +1,38 @@
-import { beforeEach, expect, mock, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import path from "node:path";
+import { runSdkSessionCli, type SdkSessionCliDependencies } from "../src/sdk/cli/session-cli";
 
-type Captured = {
-	requests: unknown[];
-};
-
-const captured: Captured = { requests: [] };
+const captured: { requests: unknown[]; listCalls: number } = { requests: [], listCalls: 0 };
 let executeResult: unknown = {
 	ok: true,
 	operation: "session.close",
 	result: { sessionId: "sess-1" },
 };
-
-mock.module("../src/sdk/lifecycle/broker-client", () => ({
-	createBrokerSessionLifecycleService: () => ({
-		execute: async (request: unknown) => {
-			captured.requests.push(request);
-			return executeResult;
-		},
-	}),
-}));
-
-const { runSdkSessionCli } = await import("../src/sdk/cli/session-cli");
+const lifecycle: SdkSessionCliDependencies["lifecycleService"] = {
+	list: async () => {
+		captured.listCalls += 1;
+		return {
+			ok: true,
+			operation: "session.list",
+			result: {
+				indexSeq: 1,
+				sessions: [
+					{
+						sessionId: "sess-1",
+						endpointGeneration: 3,
+						endpointIncarnation: "a".repeat(64),
+						live: true,
+					},
+				],
+				warnings: [],
+			},
+		};
+	},
+	execute: async (request: unknown) => {
+		captured.requests.push(request);
+		return executeResult;
+	},
+} as unknown as SdkSessionCliDependencies["lifecycleService"];
 
 const AGENT_DIR = path.join("/tmp", "gjc-sdk-session-close-test-agent");
 
@@ -34,12 +45,14 @@ async function run(args: Record<string, unknown>): Promise<{ outputs: unknown[];
 		code => {
 			exitCode = code;
 		},
+		{ lifecycleService: lifecycle },
 	);
 	return { outputs, exitCode };
 }
 
 beforeEach(() => {
 	captured.requests = [];
+	captured.listCalls = 0;
 	executeResult = { ok: true, operation: "session.close", result: { sessionId: "sess-1" } };
 });
 
@@ -48,6 +61,7 @@ test("close requires a session id before any lifecycle contact", async () => {
 	expect(exitCode).toBe(2);
 	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "usage" } });
 	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(0);
 });
 
 test("close refuses a json input whose sessionId contradicts the selected session", async () => {
@@ -59,27 +73,31 @@ test("close refuses a json input whose sessionId contradicts the selected sessio
 	expect(exitCode).toBe(2);
 	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "invalid_input" } });
 	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(0);
 });
 
-test("close dispatches session.close with a request key derived from the session", async () => {
+test("close dispatches session.close with current endpoint authority in its request key", async () => {
 	const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-1" });
 	expect(exitCode).toBeUndefined();
 	expect(outputs[0]).toMatchObject({ ok: true, operation: "session.close" });
+	expect(captured.listCalls).toBe(1);
 	expect(captured.requests).toHaveLength(1);
 	expect(captured.requests[0]).toMatchObject({
 		operation: "session.close",
 		capability: "session.close",
-		// Derived, not random: a retried close must replay one lifecycle request.
-		requestKey: "sdk:session-cli:session.close:sess-1",
-		target: { sessionId: "sess-1" },
+		requestKey: `sdk:session-cli:session.close:sess-1:3:${"a".repeat(64)}`,
+		target: { sessionId: "sess-1", endpointGeneration: 3, endpointIncarnation: "a".repeat(64) },
 	});
 });
 
-test("a retried close replays the identical request key", async () => {
+test("a retried close replays the identical request key for one endpoint generation", async () => {
 	await run({ action: "close", sessionId: "sess-1" });
 	await run({ action: "close", sessionId: "sess-1" });
 	const keys = captured.requests.map(request => (request as { requestKey: string }).requestKey);
-	expect(keys).toEqual(["sdk:session-cli:session.close:sess-1", "sdk:session-cli:session.close:sess-1"]);
+	expect(keys).toEqual([
+		`sdk:session-cli:session.close:sess-1:3:${"a".repeat(64)}`,
+		`sdk:session-cli:session.close:sess-1:3:${"a".repeat(64)}`,
+	]);
 });
 
 test("an explicit idempotency key wins over the derived one", async () => {
@@ -103,10 +121,12 @@ test("endpoint authority passes through when the caller supplies it", async () =
 	await run({
 		action: "close",
 		sessionId: "sess-1",
-		jsonInput: JSON.stringify({ endpointGeneration: 3, endpointIncarnation: 9 }),
+		jsonInput: JSON.stringify({ endpointGeneration: 3, endpointIncarnation: "b".repeat(64) }),
 	});
+	expect(captured.listCalls).toBe(0);
 	expect(captured.requests[0]).toMatchObject({
-		target: { sessionId: "sess-1", endpointGeneration: 3, endpointIncarnation: 9 },
+		target: { sessionId: "sess-1", endpointGeneration: 3, endpointIncarnation: "b".repeat(64) },
+		requestKey: `sdk:session-cli:session.close:sess-1:3:${"b".repeat(64)}`,
 	});
 });
 
