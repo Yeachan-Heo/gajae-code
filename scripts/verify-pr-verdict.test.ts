@@ -1460,6 +1460,71 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			else Bun.env.GITHUB_TOKEN = previousToken;
 		}
 	});
+
+	test("an unreadable later withdrawal cannot resurrect an earlier approval (#5692 review)", async () => {
+		// The freshness filter used to run BEFORE selecting the last review, so a later
+		// CHANGES_REQUESTED with an unreadable time was dropped from the list and the
+		// earlier valid APPROVED was promoted back to "last word" — authorizing a merge
+		// the reviewer had explicitly withdrawn.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([
+					review("review-bot", "APPROVED"),
+					{ state: "CHANGES_REQUESTED", commit_id: head, user: { login: "review-bot" } },
+				]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("a force-push event with an unreadable time refuses, not falls back (#5692 review)", async () => {
+		// A force-push DID happen; we simply cannot read when. Dropping it and using the
+		// contributor's committer date would reinstate the backdate hole, so "could not
+		// read the authority" must not collapse into "no authority exists".
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return Response.json([{ event: "head_ref_force_pushed", created_at: "not-a-date" }]);
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect(evidence.approvedHead).toBe(false);
+			expect(evidence.refusedApproval).toBe("unreadable");
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
 });
 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {

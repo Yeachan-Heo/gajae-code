@@ -136,16 +136,24 @@ function reviewPrecedesHead(submittedAt: string | undefined, headKnownAt: string
  * Latest readable timestamp among a contributor-supplied floor and server-observed events.
  *
  * A force-push strictly postdates the head it created, so when both are present the later
- * value is the stronger proof. Unparseable entries are ignored rather than trusted, and an
- * all-unreadable set yields `undefined` so the caller fails closed (#5692 review).
+ * value is the stronger proof.
+ *
+ * A server-observed entry that is PRESENT but unparseable returns `undefined`, refusing the
+ * approval. Silently dropping it and falling back to the contributor's committer date would
+ * reinstate the backdate hole: a force-push did happen, we simply could not read when, and
+ * "could not read the authority" is not the same as "no authority exists". Only a genuinely
+ * empty event list falls back, because no force-push means nothing re-bound `commit_id`
+ * (#5692 review).
  */
 function latestKnownHeadTime(
 	committedAt: string | undefined,
 	serverObserved: Array<string | undefined>,
 ): string | undefined {
-	const candidates = [committedAt, ...serverObserved]
-		.map(value => value?.trim())
-		.filter((value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)));
+	const present = serverObserved.map(value => value?.trim()).filter(value => value !== undefined && value.length > 0);
+	if (present.some(value => !Number.isFinite(Date.parse(value as string)))) return undefined;
+	const candidates = [committedAt?.trim(), ...present].filter(
+		(value): value is string => value !== undefined && value.length > 0 && Number.isFinite(Date.parse(value)),
+	);
 	if (candidates.length === 0) return undefined;
 	return candidates.reduce((latest, value) => (Date.parse(value) > Date.parse(latest) ? value : latest));
 }
@@ -157,29 +165,35 @@ function latestKnownHeadTime(
  * must never disagree about which review counts — the divergence that produced issue #5483
  * and later the withdrawn-approval gap the QA lane found.
  *
- * `headCommittedAt` also discards reviews that predate the head they claim, which is how a
+ * `headKnownAt` also discards reviews that predate the head they claim, which is how a
  * force-push silently re-binds a stale approval onto new code (#5692).
  *
- * It is REQUIRED, and `undefined` rejects every review rather than admitting them. An
- * earlier version made the precedence test conditional on having a head date, which meant a
- * failed commit lookup, an absent committer date, or an empty local `git show` skipped the
- * check entirely and admitted the approval — a fail-OPEN in the very guard that exists to
- * fail closed (#5692 review).
+ * It is REQUIRED, and `undefined` rejects rather than admitting. An earlier version made
+ * the precedence test conditional on having a head date, which meant a failed commit
+ * lookup, an absent committer date, or an empty local `git show` skipped the check entirely
+ * and admitted the approval — a fail-OPEN in the very guard that exists to fail closed.
+ *
+ * ORDER MATTERS. Selection happens first, freshness second. Filtering on freshness before
+ * taking the last review let an unreadable later CHANGES_REQUESTED be dropped from the list,
+ * promoting an earlier valid APPROVED back to "last word" and authorizing a merge the
+ * reviewer had withdrawn. A withdrawal whose time cannot be read must refuse, never vanish
+ * (#5692 review).
  */
 function effectiveExactHeadReview(
 	reviews: EffectiveReview[],
 	login: string,
 	headSha: string,
-	headCommittedAt: string | undefined,
+	headKnownAt: string | undefined,
 ): EffectiveReview | undefined {
-	return reviews
+	const lastOnHead = reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
 			&& review.state !== "COMMENTED"
-			&& review.oid === headSha
-			&& !reviewPrecedesHead(review.submittedAt, headCommittedAt),
+			&& review.oid === headSha,
 		)
 		.at(-1);
+	if (lastOnHead === undefined) return undefined;
+	return reviewPrecedesHead(lastOnHead.submittedAt, headKnownAt) ? undefined : lastOnHead;
 }
 
 /**
@@ -712,11 +726,13 @@ async function fetchPushPreflightIndependentReviewer(repo: string, number: numbe
 	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
 	const committedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
 	const forcePushedAt = await gh(
-		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", 'select(.event=="head_ref_force_pushed") | .created_at'],
+		["api", "--paginate", `repos/${repo}/issues/${number}/timeline`, "--jq", 'select(.event=="head_ref_force_pushed") | (.created_at // "unreadable")'],
 		cwd,
 	);
 	if (forcePushedAt.exitCode !== 0)
 		return { evidence: null, error: forcePushedAt.stderr || `gh exited ${forcePushedAt.exitCode}` };
+	// The projection emits a literal "unreadable" for an event with no `created_at`, so a
+	// present-but-unusable force-push cannot masquerade as an empty line (#5692 review).
 	const headKnownAt = latestKnownHeadTime(committedAt, forcePushedAt.stdout.split("\n"));
 	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headKnownAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
