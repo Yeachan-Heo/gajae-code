@@ -3200,6 +3200,35 @@ describe("runDaemonCommand", () => {
 			{ force: true, gracefulTimeoutMs: 11, killTimeoutMs: 22, spawnIfStopped: false, allowDisabledNoop: true },
 		]);
 	});
+
+	test("controller construction failures keep their root cause instead of becoming a retryable unavailable", async () => {
+		// A malformed config or a programming error is permanent. Reporting it as
+		// `unavailable` tells the caller to retry something that can never succeed,
+		// and erases the only evidence of what is actually broken.
+		const cause = new Error("telegram.botToken failed schema validation");
+		await expect(
+			runDaemonCommand(
+				{ action: "status", kinds: ["telegram"], all: false, json: false, force: false },
+				{
+					settings: {} as never,
+					get controllers(): BuiltInDaemonController[] {
+						throw cause;
+					},
+				},
+			),
+		).rejects.toThrow(cause);
+		await expect(
+			runDaemonCommand(
+				{ action: "status", kinds: ["telegram"], all: false, json: false, force: false },
+				{
+					settings: {} as never,
+					get controllers(): BuiltInDaemonController[] {
+						throw cause;
+					},
+				},
+			),
+		).rejects.not.toBeInstanceOf(PublicCommandFailure);
+	});
 });
 
 describe("cli registration", () => {

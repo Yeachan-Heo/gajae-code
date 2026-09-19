@@ -134,13 +134,15 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 	}
 	const unknownKinds = cmd.kinds.filter(kind => !(KNOWN_KINDS as readonly string[]).includes(kind));
 	if (unknownKinds.length > 0) throw new UnknownDaemonKindError(unknownKinds, KNOWN_KINDS);
-	let controllers: BuiltInDaemonController[];
-	try {
-		const settings = deps.settings ?? (await Settings.init());
-		controllers = deps.controllers ?? selectDaemonControllers(settings, cmd.kinds, cmd.all);
-	} catch {
-		throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
-	}
+	// Settings and controller construction failures are NOT an availability
+	// condition. Malformed configuration, permission/IO errors, and programming
+	// errors are permanent and each needs its own root cause: collapsing them into
+	// `unavailable` tells an operator (or an AI caller) to retry a failure that
+	// will never succeed. Let them propagate to the normal CLI error rendering,
+	// which is the pre-existing contract for this path.
+	const settings = deps.settings ?? (await Settings.init());
+	const controllers: BuiltInDaemonController[] =
+		deps.controllers ?? selectDaemonControllers(settings, cmd.kinds, cmd.all);
 
 	if (cmd.action === "list" || cmd.action === "status") {
 		const statusResults = await Promise.allSettled(controllers.map(controller => controller.status()));
