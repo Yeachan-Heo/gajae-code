@@ -2,7 +2,13 @@
 
 OpenAI Image 2.5 의 이미지 편집 엔드포인트를 쓴다.
 원본 레이아웃·색·구조를 유지하고 라벨만 한국어로 바꾸는 게 목표다.
-원본의 "Stage 4" 번호 오류(3단계 박스가 없다)도 여기서 바로잡는다.
+
+입력 이미지는 gen_workflow.py 가 PaperBanana 로 만든 것이다.
+PaperBanana 원본: https://github.com/dwzhu-pku/PaperBanana
+
+
+번호 계약: 박스는 1·2·3 세 개뿐이고 승인 게이트는 번호가 없다.
+gen_workflow.py 의 method 텍스트와 같은 계약이다.
 """
 import base64
 import os
@@ -45,7 +51,8 @@ PROMPT = """\
   네 칸: "executor (코드 작성)", "architect (읽기 전용 리뷰)",
         "planner (순서 설계)", "critic (계획 비판)"
 
-중요: 마지막 박스는 반드시 "3단계"다. 원본의 "Stage 4"는 오류이므로 고친다.
+중요: 번호가 붙은 박스는 1·2·3 셋뿐이다. 승인 게이트는 결정 지점이라
+번호가 없으므로 번호를 건너뛰면 안 된다. 마지막 박스는 "3단계"다.
 """
 
 
@@ -53,6 +60,14 @@ def main():
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise SystemExit("OPENAI_API_KEY 없음")
+
+    # 입력이 상류 재생성 이후로 낡지 않았는지 먼저 본다.
+    import provenance
+    ok, why = provenance.check(str(_ASSETS), "pb_workflow_crop.png")
+    if not ok:
+        raise SystemExit(
+            f"입력이 신뢰할 수 없다: pb_workflow_crop.png — {why}\n"
+            f"gen_workflow.py 를 먼저 돌려 크롭본을 갱신하세요.")
 
     with open(SRC, "rb") as f:
         files = {"image": ("diagram.png", f.read(), "image/png")}
@@ -75,6 +90,11 @@ def main():
         img = requests.get(payload["url"], timeout=180)
         open(DST, "wb").write(img.content)
     print("saved:", DST, os.path.getsize(DST), "bytes")
+
+    from crop import crop
+    cropped = crop(DST, str(_ASSETS / "pb_workflow_ko_crop.png"))
+    provenance.record(str(_ASSETS), cropped, SRC, DST)
+    print("SHEET_INPUT:", cropped)
 
 
 if __name__ == "__main__":

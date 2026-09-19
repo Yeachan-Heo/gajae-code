@@ -89,6 +89,13 @@ export function stripAmbientProviderEnvironment(env: Record<string, string | und
  * root it ships. The preload must apply the same rule or a repo-planted pin
  * would be honored here and rejected in production — isolation would silently
  * not happen while production resolved the live default directory.
+ *
+ * NOTE: `scripts/test-preload.ts` no longer calls this. It feeds BOTH isolation
+ * decisions from `projectEnvSnapshot()` in `packages/utils/src/env-file.ts`, the
+ * same layered reader production uses, because this one sees only `cwd/.env` and
+ * therefore missed `GJC_LOG_DIR` declared in `.env.local` / `.env.$NODE_ENV` /
+ * `.env.$NODE_ENV.local`. Kept exported for callers and tests that want the
+ * single-file parse on its own.
  */
 export function readProjectEnvFile(cwd: string): Record<string, string> {
 	let raw: string;

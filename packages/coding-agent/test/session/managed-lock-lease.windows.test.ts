@@ -159,7 +159,8 @@ describe("managed migration lock lease ownership", () => {
 				fs.writeFileSync(first.path, original, { mode: 0o600 });
 			};
 
-			await expect(first.release()).rejects.toThrow("identity_mismatch");
+			// A replacement is lost ownership, even when descriptor recovery discovers it.
+			await expect(first.release()).rejects.toThrow("migration_busy");
 			expect(fs.readFileSync(first.path)).toEqual(original);
 			await first.release();
 			expect(fs.readFileSync(first.path)).toEqual(original);

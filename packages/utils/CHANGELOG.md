@@ -1,6 +1,18 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.17.2] - 2026-09-18
+
+### Fixed
+
+- Isolate the test log sink so `bun test` no longer appends fixture `level:error` records to the operator's shared `~/.gjc/logs/gjc.<date>.log`. The effective log directory is now resolved in one place and provenance-checked — a `GJC_LOG_DIR` the checkout's own `.env` declares is refused, as it already is for the config and agent directories — and both the rotating file transport and the log readers (report bundles, the debug log view, the HTTP dump directory) go through it, so writes and reads can no longer disagree. The test preload pins the sink to a per-process temp directory, distrusting any value the project `.env` supplied.
+- Derive the test preload's provenance from the same layered dotenv snapshot production uses (`.env`, `.env.$NODE_ENV`, `.env.local`, `.env.$NODE_ENV.local`) instead of a second, narrower reader that saw only `cwd/.env`. A `GJC_LOG_DIR` declared in one of the layered files could previously slip past the preload — which honored it and therefore never isolated — and then be rejected by production's provenance check, silently routing every test log record to the operator's canonical `~/.gjc/logs` sink. `bun test` sets `NODE_ENV=test`, so `.env.test` and `.env.test.local` were live in exactly the runs this guard protects.
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Changed
 
 - The startup timing tree drops the unused module-load span machinery (`recordModuleLoadSpan` and the `(modules)` summary renderer) that had no producer since the module-timer hook was removed, and any span still open at print time — such as a dispatch span wrapping the very run that prints — now reports elapsed-at-print instead of a misleading `0.00ms`.
@@ -9,6 +21,8 @@
 ### Fixed
 
 - `redactCrashSecrets` now recognizes the five vendor token shapes `crash/upstream/envelope.ts` already classifies as credential-like: npm, GitLab PAT, Stripe live/test keys, and Hugging Face tokens. That classification only guards the Sentry frame fields it wraps; the crash log this module persists and the `gjc crash report` body a user files as a public issue both reach egress through this function alone, so four of the five survived verbatim on both paths. Stripe and Hugging Face separate with `_`, which is why the existing `sk-` rule never matched them.
+
+- Silence Winston when both logger transports are disabled so suppressed records do not leak warnings to stdout or stderr.
 
 ## [0.16.7] - 2026-09-13
 

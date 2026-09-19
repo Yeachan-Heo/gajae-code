@@ -893,7 +893,7 @@ describe("runSubprocess yield reminders", () => {
 			store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
 			const manager = new ArtifactManager(store);
 			const retainAuthority = store.retainAuthority.bind(store);
-			vi.spyOn(store, "retainAuthority").mockImplementation(() => {
+			const retainAuthoritySpy = vi.spyOn(store, "retainAuthority").mockImplementation(() => {
 				const authority = retainAuthority();
 				if (!authority) return undefined;
 				retainedAuthorities.push(authority);
@@ -939,13 +939,16 @@ describe("runSubprocess yield reminders", () => {
 					}),
 				),
 			);
-			await Promise.all(childRuns);
+			const results = await Promise.all(childRuns);
+			expect(results).toEqual(childIds.map(() => expect.objectContaining({ exitCode: 0 })));
 
 			// Managed siblings share a lifecycle parent but must retain distinct child provider scopes.
 			const expectedScopes = childIds.map(id => JSON.stringify(["subagent-canonical", "parent-session", id]));
 			const providerScopes = createAgentSessionSpy.mock.calls.map(([options]) => options?.providerSessionId);
 			expect(providerScopes.sort()).toEqual(expectedScopes.sort());
-			expect(retainedAuthorities).toHaveLength(childIds.length);
+			expect(retainAuthoritySpy).toHaveBeenCalledTimes(childIds.length);
+			// Only Linux stores own native retained roots; other platforms use directory identity checks.
+			expect(retainedAuthorities).toHaveLength(process.platform === "linux" ? childIds.length : 0);
 			await Promise.all(childIds.map(id => fs.stat(path.join(artifactsDir, `${id}.md.selector.json`))));
 		} finally {
 			await Promise.allSettled(childRuns);
@@ -1299,43 +1302,10 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(cases[0].expectedThinkingLevel);
 		expect(createAgentSessionSpy.mock.calls[1]?.[0]?.thinkingLevel).toBe(cases[1].expectedThinkingLevel);
 	});
-	it("surfaces auth fallback model substitution and annotates session model_change", async () => {
+	it("fails closed for an unauthenticated explicit model without invoking a session or provider", async () => {
 		vi.clearAllMocks();
-		const session = createMockSession(({ emit }) => {
-			emit({
-				type: "tool_execution_end",
-				toolCallId: "tool-auth-fallback",
-				toolName: "yield",
-				result: {
-					content: [{ type: "text", text: "Result submitted." }],
-					details: { status: "success", data: { ok: true } },
-				},
-				isError: false,
-			});
-		});
-		const sessionModelChanges: Array<{
-			model: string;
-			role?: string;
-			metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
-		}> = [];
-		(
-			session as unknown as {
-				sessionManager: {
-					appendSessionInit: () => void;
-					appendModelChange: (
-						model: string,
-						role?: string,
-						metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
-					) => string;
-				};
-			}
-		).sessionManager = {
-			appendSessionInit: () => {},
-			appendModelChange: (model, role, metadata) => {
-				sessionModelChanges.push({ model, role, metadata });
-				return "model-change-id";
-			},
-		};
+		const session = createMockSession(() => {});
+		const promptSpy = vi.spyOn(session, "prompt");
 		const createAgentSessionSpy = mockCreateAgentSession(session);
 		const modelRegistry = {
 			refresh: async () => {},
@@ -1348,25 +1318,21 @@ describe("runSubprocess yield reminders", () => {
 
 		const result = await runSubprocess({
 			...baseOptions,
-			id: "subagent-auth-fallback-warning",
+			id: "subagent-explicit-auth-failure",
 			modelOverride: "openai-codex/gpt-5.3-codex:high",
 			parentActiveModelPattern: "openai-codex/gpt-5.5",
 			modelRegistry,
 			inheritedServiceTier: "priority",
 		});
 
-		expect(result.modelSubstitutionWarning).toEqual({
-			requested: "openai-codex/gpt-5.3-codex",
-			effective: "openai-codex/gpt-5.5",
-			reason: "auth_unavailable",
-		});
-		expect(result.fastMode).toBe(true);
-		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
-		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
-			reason: "auth_unavailable",
-			requestedModel: { provider: "openai-codex", id: "gpt-5.3-codex" },
-		});
-		expect(sessionModelChanges).toEqual([]);
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("Requested model openai-codex/gpt-5.3-codex:high authentication failed");
+		expect(result.stderr).toContain(
+			"Explicit provider/model selectors fail closed and do not fall back to the parent session model.",
+		);
+		expect(result.modelSubstitutionWarning).toBeUndefined();
+		expect(createAgentSessionSpy).not.toHaveBeenCalled();
+		expect(promptSpy).not.toHaveBeenCalled();
 	});
 
 	it("reports Fast for an opted-in custom provider using the child tier snapshot", async () => {

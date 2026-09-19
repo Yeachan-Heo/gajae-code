@@ -1,9 +1,11 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import { getMiniMaxThinkingMode } from "@gajae-code/ai/model-thinking";
 import { TERMINAL, truncateToWidth } from "@gajae-code/tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@gajae-code/utils";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
+import { getThinkingLevelMetadata } from "../../../thinking";
 import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
@@ -113,7 +115,10 @@ const modelSegment: StatusLineSegment = {
 		}
 
 		// Add thinking level with dot separator
-		if (opts.showThinkingLevel !== false && state.model?.thinking) {
+		const miniMaxMode = state.model && getMiniMaxThinkingMode(state.model);
+		if (opts.showThinkingLevel !== false && miniMaxMode) {
+			content += `${theme.sep.dot}${getThinkingLevelMetadata(state.thinkingLevel ?? ThinkingLevel.Off, state.model).label}`;
+		} else if (opts.showThinkingLevel !== false && state.model?.thinking) {
 			const level = state.thinkingLevel ?? ThinkingLevel.Off;
 			if (level !== ThinkingLevel.Off) {
 				const thinkingText = theme.thinking[level as keyof typeof theme.thinking];

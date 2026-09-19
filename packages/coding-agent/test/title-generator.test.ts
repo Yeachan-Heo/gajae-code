@@ -1,7 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import * as ai from "@gajae-code/ai";
 import { type Api, getBundledModel, type Model } from "@gajae-code/ai";
-import { formatSessionTerminalTitle, generateSessionTitle } from "../src/utils/title-generator";
+import { prompt } from "@gajae-code/utils";
+import titleSystemPrompt from "../src/prompts/system/title-system.md" with { type: "text" };
+import {
+	buildConversationTitleInput,
+	formatSessionTerminalTitle,
+	generateSessionTitle,
+} from "../src/utils/title-generator";
+
+const EXPECTED_TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
+
+function user(content: string): AgentMessage {
+	return { role: "user", content, timestamp: 0 } as AgentMessage;
+}
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -53,7 +66,16 @@ describe("title generator", () => {
 		);
 
 		expect(title).toBe("Structured Title");
+		expect(EXPECTED_TITLE_SYSTEM_PROMPT).toContain("conversation digest");
+		expect(EXPECTED_TITLE_SYSTEM_PROMPT).toContain("newest substantive message");
 		expect(completeSimpleMock.mock.calls[0]?.[1]).toMatchObject({
+			systemPrompt: [EXPECTED_TITLE_SYSTEM_PROMPT],
+			messages: [
+				{
+					role: "user",
+					content: "<user-message>\nInvestigate the resolver\n</user-message>",
+				},
+			],
 			tools: [expect.objectContaining({ name: "set_title" })],
 		});
 		expect(completeSimpleMock.mock.calls[0]?.[2]).toMatchObject({
@@ -101,6 +123,44 @@ describe("title generator", () => {
 
 		expect(title).toBe("Budget Title");
 		expect(maxTokens).toBeGreaterThanOrEqual(1024);
+	});
+
+	it("keeps the newest content from a six-message digest in the generation request", async () => {
+		const model = getModelOrThrow("claude-sonnet-4-5");
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+			stopReason: "stop",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-title",
+					name: "set_title",
+					arguments: { title: "Latest Task" },
+				},
+			],
+		} as never);
+		const latestMarker = "Latest task: preserve the newest digest content";
+		const digest = buildConversationTitleInput(
+			Array.from({ length: 6 }, (_, index) =>
+				user(`${index === 5 ? latestMarker : `Earlier task ${index + 1}`} ${"x".repeat(600)}`),
+			),
+		);
+
+		expect(digest).toBeDefined();
+		expect(digest!.length).toBeLessThanOrEqual(2000);
+		expect(digest).toContain(latestMarker);
+
+		const title = await generateSessionTitle(digest!, createRegistry(model), createSettings(model));
+
+		expect(title).toBe("Latest Task");
+		expect(completeSimpleMock.mock.calls[0]?.[1]).toMatchObject({
+			systemPrompt: [EXPECTED_TITLE_SYSTEM_PROMPT],
+			messages: [
+				{
+					role: "user",
+					content: expect.stringContaining(latestMarker),
+				},
+			],
+		});
 	});
 });
 

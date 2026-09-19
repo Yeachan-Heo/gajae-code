@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -183,6 +183,12 @@ type SdkControlServerOptions = {
 	eventWebhookDelivery?: NonNullable<
 		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
 	>["eventWebhookDelivery"];
+	onCoordinatorEventWatchReady?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWatchReady"];
+	onCoordinatorEventWake?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWake"];
 	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
 	eventWebhookEnv?: Record<string, string>;
 	/** Injectable host model resolver for coordinator `model` pin tests. */
@@ -448,6 +454,8 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
+			onCoordinatorEventWatchReady: serverOptions.onCoordinatorEventWatchReady,
+			onCoordinatorEventWake: serverOptions.onCoordinatorEventWake,
 			afterPromptReceiptPersisted: serverOptions.afterPromptReceiptPersisted,
 			afterAnswerRemoteStarted: serverOptions.afterAnswerRemoteStarted,
 			afterCanonicalTurnCommit: serverOptions.afterCanonicalTurnCommit,
@@ -3913,6 +3921,131 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 	});
 
+	it("admits a complete empty Q12 snapshot for an authenticated running turn", async () => {
+		const root = await tempRoot();
+		const queries: string[] = [];
+		const server = await createSdkControlServer(root, [], queries, () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "1" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "continue working",
+			idempotency_key: "empty-live-q12",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "1", reason: null },
+		});
+		expect(queries).toContain("Q12");
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({
+			turn: { status: "active" },
+		});
+	});
+
+	it("does not admit an empty Q12 snapshot when cancellation races the query", async () => {
+		const root = await tempRoot();
+		const queryStarted = Promise.withResolvers<void>();
+		const releaseQuery = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(root, [], [], async () => {
+			queryStarted.resolve();
+			await releaseQuery.promise;
+			return { ok: true, page: { items: [], complete: true, revision: "empty-after-cancel" } };
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty cancellation race",
+			idempotency_key: "empty-cancel-race-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		const listed = server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		await queryStarted.promise;
+		await expect(
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				status: "cancelled",
+				summary: "cancelled while Q12 was in flight",
+				idempotency_key: "empty-cancel-race-report",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, turn: { status: "cancelled" } });
+		releaseQuery.resolve();
+		await expect(listed).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({ turn: { status: "cancelled" } });
+	});
+
+	it.each([
+		["stale writer receipt", { stripWriterIdentity: true, currentTurnId: null }],
+		["replayed turn association", { stripWriterIdentity: false, currentTurnId: "replayed-turn" }],
+	] as const)("keeps an empty Q12 snapshot fail-closed for a %s", async (_name, mutation) => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "empty-stale-or-replay" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty stale or replay control",
+			idempotency_key: `empty-${mutation.stripWriterIdentity ? "stale" : "replay"}`,
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: mutation.currentTurnId ?? sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		if (mutation.stripWriterIdentity) {
+			const stateFile = coordinatorSessionStatePath(root, "visible-session");
+			const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+			delete state.sidecar_key_id;
+			delete state.sidecar_signature;
+			await fs.writeFile(stateFile, JSON.stringify(state));
+		}
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+	});
+
 	it("admits a live ask while the agent-session sidecar is still running", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -4002,7 +4135,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
-	it("does not admit a forged live running sidecar without exact writer identity", async () => {
+	it.each([
+		false,
+		true,
+	])("does not admit a forged live running sidecar without exact writer identity (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4011,7 +4147,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("forged-live-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("forged-live-ask", runtimeTurnId)],
 							complete: true,
 							revision: "forged-live-ask",
 						},
@@ -4197,7 +4333,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
 	});
 
-	it("keeps an uncertain terminal boundary fail-closed despite a pending gate row", async () => {
+	it.each([
+		false,
+		true,
+	])("keeps an uncertain terminal boundary fail-closed despite a Q12 snapshot (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4206,7 +4345,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
 							complete: true,
 							revision: "uncertain-terminal",
 						},
@@ -8376,18 +8515,34 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const controls: SdkControl[] = [];
 		let gateAvailable = false;
 		let runtimeTurnId = "unbound";
-		const server = await createSdkControlServer(root, controls, [], query => {
-			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
-			if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
-			return {
-				ok: true,
-				page: {
-					items: [sharedAskGate("wake-gate", runtimeTurnId)],
-					complete: true,
-					revision: "q12-open",
-				},
-			};
-		});
+		const watchReady = Promise.withResolvers<void>();
+		const wakeObserved = Promise.withResolvers<void>();
+		const realSetTimeout = setTimeout;
+		const realClearTimeout = clearTimeout;
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
+				return {
+					ok: true,
+					page: {
+						items: [sharedAskGate("wake-gate", runtimeTurnId)],
+						complete: true,
+						revision: "q12-open",
+					},
+				};
+			},
+			undefined,
+			undefined,
+			undefined,
+			{
+				onCoordinatorEventWatchReady: () => watchReady.resolve(),
+				onCoordinatorEventWake: () => wakeObserved.resolve(),
+			},
+		);
 		await registerSdkSession(server, root);
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -8414,24 +8569,44 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
 		const cursor = Number(initial.next_after_seq);
-		gateAvailable = true;
-		const pending = server.callTool("gjc_coordinator_watch_events", {
-			session_id: "visible-session",
-			after_seq: cursor,
-			timeout_ms: 500,
-		});
-		await appendCoordinatorEventForTest(coordinatorNamespace(root), {
-			kind: "session.state_changed",
-			sessionId: "visible-session",
-			summary: "wake",
-		});
-		const result = await pending;
-		expect(result).toMatchObject({
-			ok: true,
-			events: expect.arrayContaining([
-				expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
-			]),
-		});
+		const namespaceDir = coordinatorNamespace(root);
+		const wakeBudgetMs = 500;
+		// Keep the protocol's 500ms fallback budget without charging CI scheduling to
+		// setup. Success is gated by the product's watcher-wake signal below; the real
+		// timer only provides an outer failure guard when that signal never arrives.
+		vi.useFakeTimers();
+		let wakeSafetyTimer: ReturnType<typeof realSetTimeout> | undefined;
+		try {
+			const pending = server.callTool("gjc_coordinator_watch_events", {
+				session_id: "visible-session",
+				event_types: ["question.opened"],
+				after_seq: cursor,
+				timeout_ms: wakeBudgetMs,
+			});
+			wakeSafetyTimer = realSetTimeout(
+				() => wakeObserved.reject(new Error("Coordinator event wake was not observed.")),
+				2_000,
+			);
+			await watchReady.promise;
+			gateAvailable = true;
+			await appendCoordinatorEventForTest(namespaceDir, {
+				kind: "session.state_changed",
+				sessionId: "visible-session",
+				summary: "wake",
+			});
+			await wakeObserved.promise;
+			const result = await pending;
+			expect(result).toMatchObject({
+				ok: true,
+				timed_out: false,
+				events: expect.arrayContaining([
+					expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
+				]),
+			});
+		} finally {
+			if (wakeSafetyTimer !== undefined) realClearTimeout(wakeSafetyTimer);
+			vi.useRealTimers();
+		}
 	});
 
 	it("imports a pre-WAL active Q12 turn into canonical admission, listing, and answer handling", async () => {
@@ -9079,49 +9254,48 @@ describe("Coordinator MCP deep-audit regressions", () => {
 	});
 
 	it("advertises Linux-only artifact capability consistently across platform discovery", async () => {
-		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
-		try {
-			for (const [platform, available] of [
-				["linux", true],
-				["darwin", false],
-				["win32", false],
-			] as const) {
-				Object.defineProperty(process, "platform", originalPlatform);
-				const server = await createSdkControlServer(
-					await tempRoot(),
-					[],
-					[],
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{
-						platform,
-					},
-				);
-				// Namespace setup uses the real host addon; only artifact capability
-				// discovery and refusal below simulate another platform.
-				expect(await server.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
-				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
-				const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
-				const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
-					tool => tool.name === "gjc_coordinator_read_artifact",
-				);
-				expect(artifact?.description).toContain(
-					available ? "Read one bounded artifact" : "Unavailable on this platform",
-				);
-				if (!available) {
-					await expect(
-						server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" }),
-					).resolves.toEqual({
-						ok: false,
-						error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
-					});
-				}
+		for (const [platform, available] of [
+			["linux", true],
+			["darwin", false],
+			["win32", false],
+		] as const) {
+			const server = await createSdkControlServer(
+				await tempRoot(),
+				[],
+				[],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					platform,
+				},
+			);
+			// Namespace setup uses the real host addon; only artifact capability
+			// discovery and refusal below simulate another platform.
+			expect(await server.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
+			const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
+			const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
+				tool => tool.name === "gjc_coordinator_read_artifact",
+			);
+			expect(artifact?.description).toContain(
+				available ? "Read one bounded artifact" : "Unavailable on this platform",
+			);
+			if (!available) {
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" })).resolves.toEqual({
+					ok: false,
+					error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+				});
 			}
-		} finally {
-			Object.defineProperty(process, "platform", originalPlatform);
+			if (available && process.platform !== "linux") {
+				// The injected platform may only ADD a refusal; the real-host gate in
+				// safeOpenCoordinatorArtifact refuses here regardless of the injected value.
+				// Skipped on linux hosts where the injected and host platforms agree.
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" })).resolves.toEqual({
+					ok: false,
+					error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+				});
+			}
 		}
 	});
 

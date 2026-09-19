@@ -163,6 +163,10 @@ class Section:
         return LH_HEAD + sum(self.row_height(r, width) for r in self.rows) + 0.10 * SCALE
 
 
+# PDF 백엔드가 /CreationDate 에 빌드 시각을 박아 같은 입력에도 바이트가
+# 달라진다. None 을 주면 그 키를 생략해 재생성이 바이트 동일해진다.
+PDF_META = {"CreationDate": None}
+
 _mfig = None
 
 
@@ -313,7 +317,8 @@ class Page:
                          ha="right", va="bottom")
 
         self._report_overflow()
-        self.fig.savefig(out, dpi=DPI, facecolor="white", pad_inches=0)
+        self.fig.savefig(out, dpi=DPI, facecolor="white", pad_inches=0,
+                         metadata=PDF_META if out.endswith(".pdf") else None)
         plt.close(self.fig)
         print(f"saved: {out}   {W:.2f} x {height:.2f} in   "
               f"ratio 1:{height / W:.2f}")
@@ -372,7 +377,7 @@ class Page:
         from matplotlib.backends.backend_pdf import PdfPages
         n = len(pages)
         if out.endswith(".pdf"):
-            with PdfPages(out) as pdf:
+            with PdfPages(out, metadata=PDF_META) as pdf:
                 for i, gs in enumerate(pages):
                     fig = self._fig(gs, height, header_fn if i == 0 else None,
                                     footer, f"{i + 1} / {n}")

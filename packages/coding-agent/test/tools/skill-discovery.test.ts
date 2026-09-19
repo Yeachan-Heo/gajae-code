@@ -11,6 +11,7 @@ import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { SkillDiscoveryTool } from "@gajae-code/coding-agent/tools/skill-discovery";
 import { $ } from "bun";
 import { safeRm } from "../../../../scripts/safe-cleanup";
+import { discoverRuntimeSkills } from "../../src/extensibility/runtime-skill-discovery";
 
 async function makeSkill(
 	root: string,
@@ -233,7 +234,71 @@ describe("SkillDiscoveryTool", () => {
 		}
 	});
 
-	it("does not return bundled built-in skills or grow the core prompt catalog", async () => {
+	it("discovers bundled workflow skills from the catalog with filesystem precedence and notices", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-cwd-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bundled-discovery-home-"));
+		const policy = { enabled: true, trustProjectSkills: true, trustUserSkills: true };
+		try {
+			let result = await discoverRuntimeSkills({ cwd, home, source: "all", policy });
+			expect(result.candidates.map(candidate => candidate.name)).toEqual([
+				"autoresearch",
+				"deep-interview",
+				"ralplan",
+				"ultragoal",
+			]);
+			expect(result.candidates.every(candidate => candidate.source === "bundled")).toBe(true);
+			expect(result.scanned).toBe(4);
+			const limited = await discoverRuntimeSkills({ cwd, home, source: "all", limit: 2, policy });
+			expect(limited.candidates.map(candidate => candidate.name)).toEqual(["autoresearch", "deep-interview"]);
+
+			const exact = result.candidates.find(candidate => candidate.name === "ralplan");
+			expect(exact).toEqual(
+				expect.objectContaining({
+					name: "ralplan",
+					source: "bundled",
+					description: "Consensus planning entrypoint that auto-gates vague ultragoal requests before execution",
+					path: "embedded:gjc/skills/ralplan/SKILL.md",
+				}),
+			);
+			const filteredPolicy = await discoverRuntimeSkills({
+				cwd,
+				home,
+				source: "all",
+				query: "ralplan",
+				policy: {
+					...policy,
+					ignoredSkills: ["*"],
+					includeSkills: ["never-match"],
+					disabledExtensions: ["skill:ralplan"],
+				},
+			});
+			expect(filteredPolicy.candidates).toEqual([expect.objectContaining({ name: "ralplan", source: "bundled" })]);
+
+			const userOnly = await discoverRuntimeSkills({ cwd, home, source: "user", policy });
+			expect(userOnly.candidates).toEqual([]);
+
+			await makeSkill(path.join(cwd, ".gjc", "skills"), "ralplan", "Filesystem impostor");
+			result = await discoverRuntimeSkills({ cwd, home, source: "all", query: "ralplan", policy });
+			expect(result.candidates.map(candidate => candidate.name)).toEqual(["ralplan"]);
+			expect(result.candidates[0]?.source).toBe("bundled");
+			expect(
+				result.diagnostics.messages.some(
+					message => message.includes("filesystem copy") && message.includes("shadowed"),
+				),
+			).toBe(true);
+
+			const tool = new SkillDiscoveryTool(createSession(cwd, { home, settings: runtimeSkillSettings() }));
+			const nonsense = await tool.execute("bundled-notice", { query: "quantum submarine tarot", source: "all" });
+			expect(nonsense.details?.candidates).toEqual([]);
+			expect(nonsense.details?.notice).toBeString();
+			expect(nonsense.details?.notice?.length).toBeGreaterThan(0);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("returns bundled built-in skills without allowing filesystem copies to shadow them or growing the core prompt catalog", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-builtins-suppressed-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
 		await makeSkill(
@@ -269,10 +334,15 @@ describe("SkillDiscoveryTool", () => {
 		expect(details).toBeDefined();
 		const names = details!.candidates.map(candidate => candidate.name);
 		expect(names).toContain("project-helper");
-		expect(names).not.toContain("ralplan");
-		expect(names).not.toContain("Ralplan");
-		expect(names).not.toContain("ralplan.");
-		expect(result.details?.candidates.find(candidate => candidate.name === "ralplan")).toBeUndefined();
+		expect(names.filter(name => name.toLowerCase().replace(/[. ]+$/u, "") === "ralplan")).toEqual(["ralplan"]);
+		expect(details!.candidates.find(candidate => candidate.name === "ralplan")).toEqual(
+			expect.objectContaining({
+				name: "ralplan",
+				source: "bundled",
+				path: "embedded:gjc/skills/ralplan/SKILL.md",
+			}),
+		);
+		expect(details!.diagnostics?.some(message => message.includes("bundled GJC workflow skill"))).toBe(true);
 
 		const prompt = await buildSystemPrompt({
 			cwd,
@@ -317,14 +387,19 @@ describe("SkillDiscoveryTool", () => {
 		expect(sent[0]?.details).toEqual(expect.objectContaining({ name: "project-helper" }));
 	});
 
-	it("does not discover or invoke runtime skills when skills.enabled is false", async () => {
+	it("keeps bundled workflow candidates when filesystem skills are disabled", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-disabled-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Blocked body.");
 		const settings = runtimeSkillSettings({ "skills.enabled": false });
 
 		const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
-		expect(discovery.details?.candidates).toEqual([]);
-		expect(discovery.details?.notice).toContain("`skills.enabled` is false");
+		expect(discovery.details?.candidates.map(candidate => candidate.name)).toEqual([
+			"autoresearch",
+			"deep-interview",
+			"ralplan",
+			"ultragoal",
+		]);
+		expect(discovery.details?.notice).toBeUndefined();
 
 		const sent: Array<{ content: string; details?: unknown }> = [];
 		const tool = new SkillTool(
@@ -361,22 +436,48 @@ describe("SkillDiscoveryTool", () => {
 		expect(allScope.details?.notice).toContain("`skills.trustProjectSkills` is false");
 
 		// Fully enabled policy with a non-matching query: the conjunctive filter
-		// dropped the one scanned skill, so the notice explains why and how to retry.
+		// dropped the five scanned skills, so the notice explains why and how to retry.
 		const enabled = runtimeSkillSettings();
 		const filtered = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
 			query: "no-such-skill-anywhere",
 		});
 		expect(filtered.details?.candidates).toEqual([]);
-		expect(filtered.details?.notice).toContain("No skill matched every query term (1 skill scanned)");
+		expect(filtered.details?.notice).toContain("No skill matched every query term (5 skills scanned)");
+
 		expect(filtered.details?.notice).toContain("conjunctive substring");
 
-		// Fully enabled policy with no scanned skills at all: genuinely empty, no notice.
-		const emptyCwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
-		const genuine = await new SkillDiscoveryTool(createSession(emptyCwd, { settings: enabled })).execute("call", {
+		// Genuine emptiness stays silent: an explicit user-scope request in an
+		// empty environment excludes the bundled workflow skills (they are
+		// neither project nor user scope), scans nothing, and produces no
+		// diagnostics, so there is nothing to explain. This is the one case the
+		// tool prompt defines as "no skills in the searched scopes".
+		// The home is pinned to an empty directory: the developer's real
+		// ~/.claude/skills would otherwise contribute convention-import
+		// diagnostics and make this case pass or fail per machine.
+		const emptyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-notice-empty-"));
+		const emptyCwd = path.join(emptyRoot, "cwd");
+		const emptyHome = path.join(emptyRoot, "home");
+		await fs.mkdir(emptyCwd);
+		await fs.mkdir(emptyHome);
+		const genuine = await new SkillDiscoveryTool(
+			createSession(emptyCwd, { settings: enabled, home: emptyHome }),
+		).execute("call", {
 			query: "no-such-skill-anywhere",
+			source: "user",
 		});
 		expect(genuine.details?.candidates).toEqual([]);
 		expect(genuine.details?.notice).toBeUndefined();
+
+		// The same empty environment under source "all" is NOT genuine emptiness:
+		// the bundled workflow skills are always scanned, so the query filter is
+		// what emptied the result and the notice must say so.
+		const genuineAll = await new SkillDiscoveryTool(
+			createSession(emptyCwd, { settings: enabled, home: emptyHome }),
+		).execute("call", {
+			query: "no-such-skill-anywhere",
+		});
+		expect(genuineAll.details?.candidates).toEqual([]);
+		expect(genuineAll.details?.notice).toContain("No skill matched every query term (4 skills scanned)");
 
 		// Found results never carry a notice.
 		const found = await new SkillDiscoveryTool(createSession(cwd, { settings: enabled })).execute("call", {
@@ -399,7 +500,7 @@ describe("SkillDiscoveryTool", () => {
 			query: "deploy kubernetes payments",
 		});
 		expect(topic.details?.candidates).toEqual([]);
-		expect(topic.details?.notice).toContain("No skill matched every query term (1 skill scanned)");
+		expect(topic.details?.notice).toContain("No skill matched every query term (5 skills scanned)");
 		expect(topic.details?.notice).toContain("Retry with the exact skill name");
 
 		// The exact hyphenated name still matches and carries no notice.
@@ -463,8 +564,12 @@ describe("SkillDiscoveryTool", () => {
 				createSession(cwd, { settings: runtimeSkillSettings(), home }),
 			).execute("call", {});
 			expect(allSources.details?.candidates).toEqual([
+				expect.objectContaining({ name: "autoresearch", source: "bundled" }),
+				expect.objectContaining({ name: "deep-interview", source: "bundled" }),
 				expect.objectContaining({ name: "historical", source: "user" }),
+				expect.objectContaining({ name: "ralplan", source: "bundled" }),
 				expect.objectContaining({ name: "shared", description: "Project user skill", source: "project" }),
+				expect.objectContaining({ name: "ultragoal", source: "bundled" }),
 			]);
 		} finally {
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
@@ -627,7 +732,13 @@ describe("SkillDiscoveryTool", () => {
 				"call",
 				{},
 			);
-			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["user-helper"]);
+			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+				"autoresearch",
+				"deep-interview",
+				"ralplan",
+				"ultragoal",
+				"user-helper",
+			]);
 			await expect(
 				new SkillTool(
 					createSession(cwd, { skills: [], settings: projectDisabled, home, sendCustomMessage: async () => {} }),
@@ -639,7 +750,13 @@ describe("SkillDiscoveryTool", () => {
 				"call",
 				{},
 			);
-			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["project-helper"]);
+			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+				"autoresearch",
+				"deep-interview",
+				"project-helper",
+				"ralplan",
+				"ultragoal",
+			]);
 			await expect(
 				new SkillTool(
 					createSession(cwd, { skills: [], settings: userDisabled, home, sendCustomMessage: async () => {} }),
@@ -679,7 +796,12 @@ describe("SkillDiscoveryTool", () => {
 			"call",
 			{},
 		);
-		expect(result.details?.candidates).toEqual([]);
+		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+			"autoresearch",
+			"deep-interview",
+			"ralplan",
+			"ultragoal",
+		]);
 		const diagnostics = result.details?.diagnostics ?? [];
 		expect(diagnostics.some(message => message.includes('"claude-helper"') && message.includes(".claude"))).toBe(
 			true,
@@ -763,7 +885,13 @@ describe("SkillDiscoveryTool", () => {
 			disabledExtensions: ["skill:disabled-one"],
 		});
 		const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
-		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["visible-one"]);
+		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+			"autoresearch",
+			"deep-interview",
+			"ralplan",
+			"ultragoal",
+			"visible-one",
+		]);
 		const diagnostics = result.details?.diagnostics ?? [];
 		expect(diagnostics.some(message => message.includes("bundled GJC workflow skill"))).toBe(true);
 		expect(diagnostics.some(message => message.includes("skills.ignoredSkills"))).toBe(true);
@@ -788,7 +916,12 @@ describe("SkillDiscoveryTool", () => {
 			"call",
 			{},
 		);
-		expect(result.details?.candidates).toEqual([]);
+		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+			"autoresearch",
+			"deep-interview",
+			"ralplan",
+			"ultragoal",
+		]);
 		const diagnostics = result.details?.diagnostics ?? [];
 		expect(diagnostics.some(message => message.includes("no parseable frontmatter"))).toBe(true);
 		expect(diagnostics.some(message => message.includes("missing a description"))).toBe(true);
@@ -870,6 +1003,11 @@ describe("SkillDiscoveryTool", () => {
 
 		const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
 
-		expect(result.details?.candidates).toEqual([]);
+		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual([
+			"autoresearch",
+			"deep-interview",
+			"ralplan",
+			"ultragoal",
+		]);
 	});
 });

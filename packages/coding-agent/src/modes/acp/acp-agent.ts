@@ -46,14 +46,20 @@ import {
 	AcpSdkAdapterError,
 	acpMcpLaunchFailure,
 } from "../../sdk/acp";
-import { resolveAcpFinalText } from "../../sdk/acp/final-text";
+import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
 import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
-import { failedPromptOutcome, isSdkPromptFailurePhase, rephaseFailedOutcome } from "../../sdk/prompt-failure";
+import {
+	failedPromptOutcome,
+	isSafePromptFailureCode,
+	isSdkPromptFailurePhase,
+	promptFailureRetryability,
+	rephaseFailedOutcome,
+} from "../../sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
@@ -177,6 +183,8 @@ interface PromptWaiter {
 	lastFrameAt: number;
 	/** Type of that prompt-owned frame, reported when the watchdog expires. */
 	lastFrameType: string;
+	/** True while the prompt is blocked in provider preflight, before the turn is dispatched. */
+	awaitingProviderPreflight: boolean;
 	/** Cancels the armed inactivity watchdog; re-armed by prompt-owned frames. */
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
@@ -185,6 +193,12 @@ interface PromptWaiter {
 	observedTurnActivity: boolean;
 	/** True once a prompt-owned tool execution frame was observed; vetoes a first-turn retry that would re-run it. */
 	observedToolExecution: boolean;
+	/**
+	 * Newest `plan` update published for this prompt, retained so an abandoned turn can report
+	 * what it had left to do (issue #5669). Absent means no plan was ever observed, which is
+	 * evidence of nothing — distinct from an observed plan whose entries are all `completed`.
+	 */
+	planSnapshot?: AcpPlanSnapshot;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -618,12 +632,109 @@ type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed"
  * category — so settlement carries that classification instead of discarding it into a bare
  * `AcpSdkAdapterError` (review P1, issue #5574).
  */
-class AcpPromptFailureError extends AcpSdkAdapterError {
+export class AcpPromptFailureError extends AcpSdkAdapterError {
 	readonly failure: SdkPromptFailedOutcome;
 	constructor(failure: SdkPromptFailedOutcome) {
 		super(failure.code, failure.message);
 		this.failure = failure;
 	}
+}
+
+/**
+ * The wire projection of a prompt terminal's classification (issue #5615).
+ *
+ * `super(failure.code, failure.message)` above narrows the error to the generic
+ * `prompt_failed` plus its fixed redacted message, so the classification the
+ * terminal already computed used to die at the JSON-RPC boundary: an ACP client
+ * saw only `-32603 {code, details}` and could not tell a transient provider blip
+ * from a dead session without parsing English. These fields carry it across.
+ *
+ * `providerCode` is re-checked against the safe-token rule rather than trusted:
+ * `terminalOutcome` accepts the host's `providerCode` on a `typeof` check alone,
+ * and this is the first path that puts it on the wire, so an unbounded value is
+ * dropped instead of becoming a leak of provider text (the redaction contract in
+ * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
+ */
+function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+	return {
+		phase: failure.phase,
+		category: failure.category,
+		retryability: promptFailureRetryability(failure.category),
+		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+	};
+}
+
+/**
+ * What an ACP `plan` update said the turn intended to do. Structural rather than the SDK's
+ * `PlanEntry` so only the fields this evidence reads are depended on.
+ */
+type AcpPlanSnapshot = Array<{
+	content: string;
+	status: "pending" | "in_progress" | "completed";
+	_meta?: { gjcTodoStatus?: unknown } | null;
+}>;
+
+/**
+ * An abandoned prompt that still carries the plan its turn was working through (issue #5669).
+ *
+ * The watchdog settles a prompt whose host stopped producing frames, and that rejection used to
+ * be a bare `AcpSdkAdapterError`: `{code, details}` and nothing else. A wrapper could not tell
+ * "the agent finished" from "the agent stopped with work left", so an abandoned turn's unverified
+ * diff was published as if it were complete. The last observed plan is the evidence that settles
+ * that question, so settlement carries it instead of dropping it at the JSON-RPC boundary.
+ */
+export class AcpPromptAbandonedError extends AcpSdkAdapterError {
+	readonly plan: AcpPlanSnapshot | undefined;
+	constructor(code: string, message: string, plan: AcpPlanSnapshot | undefined) {
+		super(code, message);
+		this.plan = plan;
+	}
+}
+
+/** Most pending plan entries that may reach the wire. */
+const ACP_ABANDON_PLAN_MAX_ENTRIES = 10;
+/** Longest one pending entry's text may be on the wire. */
+const ACP_ABANDON_PLAN_MAX_CONTENT_CHARS = 200;
+
+/**
+ * Whether a plan entry describes work the turn never finished (issue #5669).
+ *
+ * An entry whose ACP status is `completed` can still be unfinished: ACP's `PlanEntryStatus` has no
+ * `abandoned` member, so a task dropped via `/todo drop` is projected as `completed` for the
+ * client's plan UI while the mapper keeps the internal status in `_meta.gjcTodoStatus`. Completion
+ * evidence has to read that internal truth — reading the wire status alone would report a plan of
+ * nothing but dropped tasks as a finished turn. `_meta` crosses a JSON boundary, so the internal
+ * status is compared as `unknown` rather than asserted into a type.
+ */
+function planEntryUnfinished(entry: AcpPlanSnapshot[number]): boolean {
+	return entry.status !== "completed" || entry._meta?.gjcTodoStatus === "abandoned";
+}
+
+/**
+ * The wire projection of an abandoned prompt's plan (issue #5669).
+ *
+ * Plan text is model-authored, so it is bounded the same way `promptFailureWireData` bounds a
+ * provider classifier: a capped number of entries, each capped in length, and never restated in
+ * the human message. The counts are what a wrapper actually gates on; the contents are there so
+ * the reader can name the unfinished steps without a log dive.
+ *
+ * An absent plan yields no keys at all. "No plan was ever observed" is not the same claim as
+ * "the plan was complete", and a client must be able to tell them apart, so the fields are
+ * omitted rather than nulled or reported as unknown.
+ */
+function promptAbandonWireData(plan: AcpPlanSnapshot | undefined): Record<string, string> {
+	if (!plan) return {};
+	const pending = plan.filter(planEntryUnfinished);
+	return {
+		planIncomplete: pending.length > 0 ? "true" : "false",
+		planPendingCount: String(pending.length),
+		planTotalCount: String(plan.length),
+		planPending: JSON.stringify(
+			pending
+				.slice(0, ACP_ABANDON_PLAN_MAX_ENTRIES)
+				.map(entry => entry.content.slice(0, ACP_ABANDON_PLAN_MAX_CONTENT_CHARS)),
+		),
+	};
 }
 
 /**
@@ -1251,9 +1362,21 @@ export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
 	const message = error instanceof Error ? error.message : code;
+	// A prompt terminal additionally publishes its classification (issue #5615). The
+	// spread is empty for every other error, so their payloads are byte-identical to
+	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
+	// this enriches `data`, it does not restate the redacted message.
+	const data =
+		error instanceof AcpPromptFailureError
+			? { code, details: message, ...promptFailureWireData(error.failure) }
+			: { code, details: message };
+	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
+	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
+	// that observed no plan adds no keys, so its payload stays byte-identical to before.
+	if (error instanceof AcpPromptAbandonedError) Object.assign(data, promptAbandonWireData(error.plan));
 	switch (code) {
 		case "authentication_failed":
-			return RequestError.authRequired({ code, details: message }, message);
+			return RequestError.authRequired(data, message);
 		// `not_found` stays -32603 with its discriminator in `data`: ACP's
 		// `resourceNotFound` (-32002) is a URI-addressed resource error, and an unknown
 		// session id is not a resource URI. Pinned ACP core-v1 conformance also requires
@@ -1261,12 +1384,15 @@ export function acpRequestFailure(error: unknown): unknown {
 		case "invalid_input":
 		case "unsupported":
 		case "unsupported_content":
-			return RequestError.invalidParams({ code, details: message }, message);
+			return RequestError.invalidParams(data, message);
 		default:
 			// The remaining internal codes (conflict, unavailable, busy, …) have no ACP
 			// counterpart and stay -32603. Keep the discriminator in `data` so a client can
-			// branch on retry/reconnect instead of parsing an English message.
-			return RequestError.internalError({ code, details: message }, message);
+			// branch on retry/reconnect instead of parsing an English message. `prompt_failed`
+			// and `prompt_deadline_exceeded` land here and keep -32603 by design: pinned ACP
+			// core-v1 conformance expects -32603/-32000 for this class, so the added
+			// classification travels in `data` rather than in a renumbered code.
+			return RequestError.internalError(data, message);
 	}
 }
 
@@ -2055,6 +2181,7 @@ export class AcpAgent implements Agent {
 			deferredActivityFrames: [],
 			lastFrameAt: this.#promptWatchdogClock.now(),
 			lastFrameType: "prompt_dispatch",
+			awaitingProviderPreflight: true,
 			activity: new PromptActivity(),
 			observedTurnActivity: false,
 			observedToolExecution: false,
@@ -2066,9 +2193,24 @@ export class AcpAgent implements Agent {
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		// Silence has to be bounded from the moment the prompt owns the session: a host that
+		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Provider preflight is part of that window — it awaits a lease the host may never win
+		// — so the bound is armed before it, not after (issue #5658). The arm below re-arms
+		// this same waiter once preflight clears, and #armPromptWatchdog cancels the previous
+		// timer first, so only one timer is ever live.
+		this.#armPromptWatchdog(params.sessionId, record, waiter);
+		// The watchdog settles `response`, not this await, so a preflight that never returns
+		// would pin session/prompt open with the caller's promise already rejected. Racing the
+		// settlement lets the re-checks below hand that rejection back to the caller.
+		const settlement = response.then(
+			() => undefined,
+			() => undefined,
+		);
 		try {
-			await record.adapter.ensureProviders();
+			await Promise.race([record.adapter.ensureProviders(), settlement]);
 		} catch (error) {
+			waiter.awaitingProviderPreflight = false;
 			if (waiter.settled || record.activePrompt !== waiter) {
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				return await response;
@@ -2081,11 +2223,13 @@ export class AcpAgent implements Agent {
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
 				record.busy = record.backgroundBusy;
+				clearPromptWatchdog(waiter);
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
 			throw error;
 		}
+		waiter.awaitingProviderPreflight = false;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
 			return await response;
@@ -2096,8 +2240,9 @@ export class AcpAgent implements Agent {
 			return await response;
 		}
 
-		// Silence has to be bounded from the moment the prompt owns the session: a host that
-		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Re-arm now that preflight is behind us: the bound armed before it already covered
+		// this prompt's ownership window, and this call replaces that timer rather than
+		// racing it, so the dispatched turn gets the full inactivity bound of its own.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
 		// Echo the user's own message back as `user_message_chunk`. Clients render their
 		// transcript from session/update, so without this a prompt's text and any attached
@@ -3257,15 +3402,32 @@ export class AcpAgent implements Agent {
 	async #expirePromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled || waiter.terminalReserved) return;
 		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
-		const cause = this.#promptTransportGone(id, record) ?? "the SDK session host stopped producing frames";
+		// A prompt still in preflight has never reached the host, so "stopped producing frames"
+		// would point the reader at the wrong phase: nothing was ever dispatched to produce them.
+		const cause =
+			this.#promptTransportGone(id, record) ??
+			(waiter.awaitingProviderPreflight
+				? "the SDK session host never finished provider preflight"
+				: "the SDK session host stopped producing frames");
+		// Counts only: the plan's contents are model-authored and belong on the bounded wire
+		// projection, not in the log line (issue #5669).
+		const plan = waiter.planSnapshot;
 		logger.error("acp_prompt_watchdog_expired", {
 			sessionId: id,
 			cause,
 			silenceMs,
 			lastFrameType: waiter.lastFrameType,
+			awaitingProviderPreflight: waiter.awaitingProviderPreflight,
 			inactivityBoundMs: waiter.activity.inactivityBoundMs,
 			toolRunning: waiter.activity.running,
 			awaitingModel: waiter.activity.awaitingModel,
+			...(plan
+				? {
+						planIncomplete: plan.some(planEntryUnfinished),
+						planPendingCount: plan.filter(planEntryUnfinished).length,
+						planTotalCount: plan.length,
+					}
+				: {}),
 			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
 			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
 		});
@@ -3273,11 +3435,12 @@ export class AcpAgent implements Agent {
 			record,
 			id,
 			waiter,
-			new AcpSdkAdapterError(
+			new AcpPromptAbandonedError(
 				"prompt_abandoned",
 				`ACP prompt was abandoned after ${Math.round(silenceMs / 1_000)}s of silence: ${cause}. Last frame was ` +
 					`"${waiter.lastFrameType}" (${describeCorrelation(waiter.correlation)}). The turn was settled so the ` +
 					`client stops waiting; the session still accepts the next prompt.`,
+				plan,
 			),
 		);
 	}
@@ -3467,7 +3630,11 @@ export class AcpAgent implements Agent {
 			// the first-turn retry gate — which the settlement below releases — would see
 			// "started, no output", resubmit, and let BOTH this terminal's final text and the
 			// retry's answer reach ACP consumers. Record the output before settling (review P1).
-			if (typeof event.finalText === "string" && event.finalText) record.promptObservedAssistantOutput = true;
+			// Whitespace-only final text carries no assistant content. `hasAcpFinalTextContent` is the
+			// single presence predicate shared with the terminal publication gate below, so a terminal
+			// this gate treats as "no output" can never publish a chunk alongside the retry's answer.
+			if (typeof event.finalText === "string" && hasAcpFinalTextContent(event.finalText))
+				record.promptObservedAssistantOutput = true;
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
@@ -3534,6 +3701,12 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
+			// The newest plan REPLACES the retained one: a plan update is the whole list, not a
+			// delta, so `todo_auto_clear`'s empty `entries` correctly leaves no pending work behind
+			// (issue #5669). Retained here rather than at frame ingress because this is where the
+			// mapper has already decided what the client is being told the plan is.
+			if (promptOwner && notification.update.sessionUpdate === "plan")
+				promptOwner.planSnapshot = notification.update.entries;
 			// A live assistant text/thought chunk for this prompt owner has now been exposed to
 			// ACP consumers. Record it so the first-turn readiness retry is vetoed: a re-submit
 			// would deliver a second attempt's output on top of these chunks (issue #5574).
@@ -3628,7 +3801,7 @@ export class AcpAgent implements Agent {
 		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
-		if (promptOwner && finalText) {
+		if (promptOwner && hasAcpFinalTextContent(finalText)) {
 			const finalTextTask = (async () => {
 				await Bun.sleep(0);
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);

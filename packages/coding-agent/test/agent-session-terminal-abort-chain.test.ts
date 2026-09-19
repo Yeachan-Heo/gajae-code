@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,8 +29,12 @@ import { MonitorTool } from "@gajae-code/coding-agent/tools/monitor";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
+import { createTempDirRegistry, reapStaleTempDirs, sweepAfterSettle } from "./helpers/temp-dir-registry";
 
 const TEST_ABORT_GRACE_MS = 50;
+/** Prefix this suite owns exclusively; the reaper must never widen past it. */
+const TEMP_DIR_PREFIX = "pi-terminal-abort-chain-";
+const tempDirRegistry = createTempDirRegistry();
 
 /** Scripted assistant turn that issues a single `bash` tool call. */
 function bashCall(command: string, callId: string, background = false): MockResponse {
@@ -79,11 +83,54 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	let toolSession: ToolSession;
 	let settingsRef: Settings;
 	let modelRegistryRef: ModelRegistry;
+	let extraManagers: Set<AsyncJobManager>;
+
+	const trackExtraManager = (candidate: AsyncJobManager): AsyncJobManager => {
+		extraManagers.add(candidate);
+		return candidate;
+	};
+
+	const createIndependentSessionManager = (cwd: string): SessionManager => {
+		// Lifecycle-launched processes expose one preallocated session id through
+		// the environment. Synthetic managers in this block represent independent
+		// endpoints, so give each one its own consumed preallocation instead of
+		// letting that process-wide id collapse their ownership keys.
+		const lifecycleRequestId = process.env.GJC_LIFECYCLE_REQUEST_ID;
+		const lifecycleSessionId = process.env.GJC_SESSION_ID;
+		const syntheticSessionId = `terminal-abort-${Snowflake.next()}`;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = `terminal-abort-request-${Snowflake.next()}`;
+		process.env.GJC_SESSION_ID = syntheticSessionId;
+		try {
+			return SessionManager.inMemory(cwd);
+		} finally {
+			if (lifecycleRequestId === undefined) delete process.env.GJC_LIFECYCLE_REQUEST_ID;
+			else process.env.GJC_LIFECYCLE_REQUEST_ID = lifecycleRequestId;
+			if (lifecycleSessionId === undefined) delete process.env.GJC_SESSION_ID;
+			else process.env.GJC_SESSION_ID = lifecycleSessionId;
+		}
+	};
+
+	// Reclaim roots abandoned by an earlier run whose teardown hook timed out
+	// before this suite grew its own sweep. Age-gated so a shard running
+	// concurrently on this host is never touched.
+	beforeAll(() => {
+		reapStaleTempDirs(TEMP_DIR_PREFIX);
+	});
+
+	// Backstop for the two paths the per-case `finally` cannot cover: an
+	// `afterEach` abandoned for exceeding its budget never reaches its
+	// `finally`, and a writer that outlives teardown can recreate a root the
+	// `finally` already removed. `afterAll` still runs in both cases.
+	afterAll(async () => {
+		await sweepAfterSettle(tempDirRegistry);
+	});
 
 	beforeEach(async () => {
 		manualTeardown = false;
-		tempDir = path.join(os.tmpdir(), `pi-terminal-abort-chain-${Snowflake.next()}`);
+		extraManagers = new Set();
+		tempDir = path.join(os.tmpdir(), `${TEMP_DIR_PREFIX}${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		tempDirRegistry.register(tempDir);
 
 		resetSettingsForTest();
 		await Settings.init({ inMemory: true, cwd: tempDir });
@@ -165,20 +212,35 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	});
 
 	afterEach(async () => {
-		if (manualTeardown) {
-			session.agent.abort();
-			await manager.dispose({ timeoutMs: 1_000 });
-			await chainSessionManager.close();
-		} else {
-			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-			await session.dispose();
-		}
-		AsyncJobManager.setInstance(undefined);
-		AsyncJobManager.unregisterManager(manager);
-		authStorage?.close();
-		authStorage = undefined;
-		if (fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true, force: true });
+		try {
+			if (manualTeardown) {
+				session.agent.abort();
+				await manager.dispose({ timeoutMs: 1_000 });
+				await chainSessionManager.close();
+			} else {
+				// Stop the block-owned manager before joining coordinator persistence.
+				// A completion callback can enqueue persistence work, so waiting for
+				// that queue first would leave teardown waiting on the manager that
+				// teardown itself is responsible for settling.
+				await manager.dispose({ timeoutMs: 3_000 });
+				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				await session.dispose();
+			}
+		} finally {
+			const managers = [...extraManagers];
+			extraManagers.clear();
+			for (const extraManager of managers) {
+				try {
+					await extraManager.dispose({ timeoutMs: 1_000 });
+				} finally {
+					AsyncJobManager.unregisterManager(extraManager);
+				}
+			}
+			AsyncJobManager.setInstance(undefined);
+			AsyncJobManager.unregisterManager(manager);
+			authStorage?.close();
+			authStorage = undefined;
+			tempDirRegistry.release(tempDir);
 		}
 	}, 30_000);
 
@@ -221,7 +283,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// abort consults the endpoint manager and cannot cancel the actual
 		// job, and missing-job settlement retires the tuple while the job
 		// keeps running.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		try {
 			AsyncJobManager.setInstance(foreign);
 			scriptedResponses = [bashCall("sleep 30", "call_endpoint_manager", true), stopReply("ok")];
@@ -233,13 +295,12 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			await promptPromise;
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
 		}
 	}, 20_000);
 
 	it("preserves the live global manager when duplicate endpoint admission rejects session construction", async () => {
-		const liveSessionManager = SessionManager.inMemory(tempDir);
-		const duplicateSessionManager = SessionManager.inMemory(tempDir);
+		const liveSessionManager = createIndependentSessionManager(tempDir);
+		const duplicateSessionManager = createIndependentSessionManager(tempDir);
 		let liveSession: AgentSession | undefined;
 		const endpointId = liveSessionManager.getSessionId();
 		const duplicateId = vi.spyOn(duplicateSessionManager, "getSessionId").mockReturnValue(endpointId);
@@ -301,7 +362,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 20_000);
 
 	it("releases an admitted endpoint manager when startup fails before session construction", async () => {
-		const startupSessionManager = SessionManager.inMemory(tempDir);
+		const startupSessionManager = createIndependentSessionManager(tempDir);
 		const endpointId = startupSessionManager.getSessionId();
 		const blockedArtifactsDir = path.join(tempDir, "not-a-directory");
 		await Bun.write(blockedArtifactsDir, "file blocks local root initialization");
@@ -1348,7 +1409,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// the job was created in — the process-global instance belongs to a
 		// different concurrent session and would ack a same-id foreign delivery
 		// while leaving this session's delivery queued.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		try {
 			AsyncJobManager.setInstance(foreign);
 			const bindEndpoint = chainSessionManager.getSessionId() ?? "local";
@@ -1371,7 +1432,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			);
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
 		}
 	}, 20_000);
 
@@ -1380,7 +1440,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// #snapshotJobs must resolve the session's endpoint manager — a
 		// non-global session A otherwise inspects session B's manager and
 		// cannot manage the job A just launched.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		try {
 			AsyncJobManager.setInstance(foreign);
 			scriptedResponses = [bashCall("sleep 30", "call_jobtool", true), stopReply("ok")];
@@ -1396,7 +1456,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			await waitFor(() => manager.getJob(job.id)?.status !== "running", "endpoint job cancelled", 5_000);
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
 		}
 	}, 20_000);
 
@@ -1404,7 +1463,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// Child sessions have their own unregistered endpoint. Their tools must
 		// use the manager inherited from the parent rather than process-global
 		// session B, or jobs and their async-result delivery cross session trees.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		try {
 			AsyncJobManager.setInstance(foreign);
 			const childToolSession: ToolSession = {
@@ -1430,7 +1489,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			);
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
 		}
 	}, 20_000);
 
@@ -1443,8 +1501,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// instance would cancel nothing of A's (B's manager), then rekeying
 		// retires A's predecessor registrations while A's old job keeps
 		// running and its stale completion reaches the successor.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
-		const owned = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const owned = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const releaseForeign = Promise.withResolvers<void>();
 		const releaseOwned = Promise.withResolvers<void>();
 		let ownedEffects = 0;
 		let transitionSession: AgentSession | undefined;
@@ -1453,10 +1512,20 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			// A same-owner job exists in BOTH managers: the old (broken) code
 			// canceled the global instance's job; the fixed code must only
 			// touch the session-owned manager.
-			foreign.register("task", "foreign same-owner job", () => Promise.withResolvers<never>().promise, {
-				id: "foreign-owner-job",
-				ownerId: "sub-route-1",
-			});
+			foreign.register(
+				"task",
+				"foreign same-owner job",
+				async ({ signal }) => {
+					const aborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+					await Promise.race([releaseForeign.promise, aborted.promise]);
+					return "foreign complete";
+				},
+				{
+					id: "foreign-owner-job",
+					ownerId: "sub-route-1",
+				},
+			);
 			owned.register(
 				"task",
 				"owned job",
@@ -1487,7 +1556,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			});
 			transitionSession = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(tempDir),
+				sessionManager: createIndependentSessionManager(tempDir),
 				settings: settingsRef,
 				modelRegistry: modelRegistryRef,
 				toolRegistry: new Map([[bashToolRef.name, bashToolRef as unknown as AgentTool]]),
@@ -1511,10 +1580,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(owned.getJob("owned-owner-job")).toBeUndefined();
 			expect(ownedEffects).toBe(1);
 		} finally {
+			releaseForeign.resolve();
 			releaseOwned.resolve();
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
-			AsyncJobManager.unregisterManager(owned);
 			await transitionSession?.dispose();
 		}
 	}, 20_000);
@@ -1525,16 +1593,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// jobs — with concurrent top-level sessions and B as the process-global
 		// instance, snapshotting B would report no running jobs for A or show
 		// B's.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
-		const owned = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const owned = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		const releaseOwned = Promise.withResolvers<void>();
 		let snapshotSession: AgentSession | undefined;
 		try {
 			AsyncJobManager.setInstance(foreign);
-			foreign.register("bash", "foreign job", () => Promise.withResolvers<never>().promise, {
-				id: "snap-foreign",
-				ownerId: "sub-snap-1",
-			});
+			foreign.register(
+				"bash",
+				"foreign job",
+				async ({ signal }) => {
+					const aborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+					await aborted.promise;
+					return "foreign complete";
+				},
+				{
+					id: "snap-foreign",
+					ownerId: "sub-snap-1",
+				},
+			);
 			owned.register(
 				"bash",
 				"owned job",
@@ -1562,7 +1640,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			});
 			snapshotSession = new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(tempDir),
+				sessionManager: createIndependentSessionManager(tempDir),
 				settings: settingsRef,
 				modelRegistry: modelRegistryRef,
 				toolRegistry: new Map([[bashToolRef.name, bashToolRef as unknown as AgentTool]]),
@@ -1575,8 +1653,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		} finally {
 			releaseOwned.resolve();
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
-			AsyncJobManager.unregisterManager(owned);
 			await snapshotSession?.dispose();
 		}
 	}, 20_000);
@@ -1588,16 +1664,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// terminal filter must NOT retire its ownership tuple — otherwise a
 		// later scope:"owned" abort finds an empty causal set and reports
 		// stopped_owned while the job remains visibly paused.
-		const pausedManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: () => {} });
+		const pausedManager = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: () => {} }));
 		const pausedEndpoint = "ep-paused-route";
 		try {
 			AsyncJobManager.registerForEndpoint(pausedEndpoint, pausedManager);
 			// Occupy the only concurrency slot so the resume queues instead of
 			// starting.
-			pausedManager.register("task", "filler", () => Promise.withResolvers<never>().promise, {
-				id: "filler-paused",
-				ownerId: "sub-paused-1",
-			});
+			pausedManager.register(
+				"task",
+				"filler",
+				async ({ signal }) => {
+					const aborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+					await aborted.promise;
+					return "filler complete";
+				},
+				{
+					id: "filler-paused",
+					ownerId: "sub-paused-1",
+				},
+			);
 			pausedManager.registerSubagentRecord({
 				subagentId: "sub-paused-1",
 				ownerId: "sub-paused-1",
@@ -1650,7 +1736,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			// only completed/failed/cancelled jobs retire their registrations.
 			expect(lookupOwnedRegistration(queuedId, queuedId, pausedEndpoint)).toBeDefined();
 		} finally {
-			AsyncJobManager.unregisterManager(pausedManager);
+			await pausedManager.dispose({ timeoutMs: 1_000 });
 		}
 	}, 20_000);
 
@@ -1723,8 +1809,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// where B is the global instance and both roots share the `main` owner
 		// id, transitioning A would lease/settle B's subagents while A's work
 		// stays live. The lease must resolve through the session-owned manager.
-		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
-		const owned = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const owned = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		const ownerId = "lease-owner-1";
 		let leaseSession: AgentSession | undefined;
 		try {
@@ -1734,7 +1820,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			// while this lease is held; the session-owned manager has none.
 			const foreignLease = foreign.beginOwnerSubagentShutdown(ownerId);
 			expect(foreignLease).toBeDefined();
-			const sessMgr = SessionManager.inMemory(tempDir);
+			const sessMgr = createIndependentSessionManager(tempDir);
 			// Mirror sdk/session.ts: the owning session registers its manager
 			// under its endpoint.
 			AsyncJobManager.registerForEndpoint(sessMgr.getSessionId(), owned);
@@ -1771,8 +1857,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(foreignLease).toBeDefined();
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
-			AsyncJobManager.unregisterManager(owned);
 			await leaseSession?.dispose();
 		}
 	}, 20_000);
@@ -1783,8 +1867,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// records/jobs live in A's manager but list/pause/resume/message/cancel
 		// inspected B's — the record is absent there or belongs to another
 		// same-id subagent.
-		const globalMgr = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
-		const epMgr = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const globalMgr = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const epMgr = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		const epId = "ep-subagent-route";
 		try {
 			AsyncJobManager.setInstance(globalMgr);
@@ -1823,8 +1907,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(ids).not.toContain("sub-global-1");
 		} finally {
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(globalMgr);
-			AsyncJobManager.unregisterManager(epMgr);
 		}
 	}, 20_000);
 
@@ -1838,19 +1920,23 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// delivery in B was discarded.
 		const releaseForeignDelivery = Promise.withResolvers<void>();
 		const releaseOwnedDelivery = Promise.withResolvers<void>();
-		const foreign = new AsyncJobManager({
-			maxRunningJobs: 4,
-			onJobComplete: () => releaseForeignDelivery.promise,
-		});
-		const owned = new AsyncJobManager({
-			maxRunningJobs: 4,
-			onJobComplete: () => releaseOwnedDelivery.promise,
-		});
+		const foreign = trackExtraManager(
+			new AsyncJobManager({
+				maxRunningJobs: 4,
+				onJobComplete: () => releaseForeignDelivery.promise,
+			}),
+		);
+		const owned = trackExtraManager(
+			new AsyncJobManager({
+				maxRunningJobs: 4,
+				onJobComplete: () => releaseOwnedDelivery.promise,
+			}),
+		);
 		const ownerId = "xlumo-owner";
 		let clearSession: AgentSession | undefined;
 		try {
 			AsyncJobManager.setInstance(foreign);
-			const sessMgr = SessionManager.inMemory(tempDir);
+			const sessMgr = createIndependentSessionManager(tempDir);
 			AsyncJobManager.registerForEndpoint(sessMgr.getSessionId(), owned);
 			// Completed-but-undelivered jobs (the delivery callback never
 			// resolves) leave pending deliveries in each manager.
@@ -1898,8 +1984,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			releaseForeignDelivery.resolve();
 			releaseOwnedDelivery.resolve();
 			AsyncJobManager.setInstance(manager);
-			AsyncJobManager.unregisterManager(foreign);
-			AsyncJobManager.unregisterManager(owned);
 			await clearSession?.dispose();
 		}
 	}, 20_000);
@@ -1947,7 +2031,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		registerOwnedRegistration(dropRegistration, { isJobTerminal: () => true });
 		registerOwnedRegistration(freshRegistration, { isJobTerminal: () => true });
 
-		const owned = new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: () => {} });
+		const owned = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: () => {} }));
 		let dropSession: AgentSession | undefined;
 		try {
 			AsyncJobManager.registerForEndpoint("ep-xlumr", owned);
@@ -2029,7 +2113,6 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(contents).not.toContain("dropped monitor line");
 			expect(contents).toContain("fresh monitor line");
 		} finally {
-			AsyncJobManager.unregisterManager(owned);
 			await dropSession?.dispose();
 		}
 	}, 20_000);

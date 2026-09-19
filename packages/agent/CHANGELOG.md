@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Added
 
 - Maintenance LLM calls (compaction, handoff, branch summaries) forward a `maintenanceCall: true` marker to the provider. Agent-level providers such as Devin over ACP use it to refuse work they cannot serve instead of forwarding a summarization prompt to a billed upstream agent.

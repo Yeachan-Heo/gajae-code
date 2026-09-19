@@ -3345,6 +3345,51 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080");
 		});
 
+		test.each([
+			["opencode-go", "https://opencode.ai/zen/go"],
+			["opencode-zen", "https://opencode.ai/zen"],
+		] as const)("%s Union Alpha survives production discovery and offline registry reload", async (provider, baseUrl) => {
+			authStorage.setRuntimeApiKey(provider, "union-test-key");
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== `${baseUrl}/v1/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+				requests++;
+				return Response.json({ data: [{ id: "union-alpha" }] });
+			});
+			const registrySettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			const expected = {
+				id: "union-alpha",
+				provider,
+				name: "Union Alpha Free",
+				api: "anthropic-messages",
+				baseUrl,
+				contextWindow: 262_144,
+				maxTokens: 131_072,
+				input: ["text", "image"],
+				reasoning: true,
+			};
+			try {
+				await registry.refreshProvider(provider, "online");
+				expect(requests).toBe(1);
+				expect(registry.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.dynamicModelIds).toEqual([
+					"union-alpha",
+				]);
+			} finally {
+				registry.dispose();
+			}
+			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			try {
+				await reloaded.refreshProvider(provider, "offline");
+				expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(requests).toBe(1);
+			} finally {
+				reloaded.dispose();
+			}
+		});
+
 		test("discoverable custom compat survives refresh", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -8215,7 +8260,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
@@ -8251,7 +8296,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);

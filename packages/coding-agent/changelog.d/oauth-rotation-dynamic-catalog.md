@@ -1,3 +1,0 @@
-### Fixed
-
-- Dynamically discovered models (for example `google-antigravity/gemini-3.8-flash-tiered`) no longer disappear from a long-running session when the provider's OAuth token refreshes and the catalog is later rebuilt, such as after the models config changes. Provider auth evidence now follows the account-backed credential row instead of its rotating token, so cached discovery stays valid across refreshes; presets that reference those models no longer turn unavailable and their roles no longer drop out until restart. Swapping accounts, removing credentials, changing OAuth project or endpoint fields, and an expired credential that cannot refresh still invalidate the catalog.

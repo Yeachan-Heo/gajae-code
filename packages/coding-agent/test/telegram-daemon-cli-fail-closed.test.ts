@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
@@ -11,7 +12,11 @@ import {
 	SERVING_EPOCH,
 	type TelegramDaemonOptions,
 } from "../src/sdk/bus/telegram-daemon";
-import { createDaemonControlHooks, runDaemonInternal } from "../src/sdk/bus/telegram-daemon-cli";
+import {
+	createDaemonControlHooks,
+	loadLightweightDaemonSettings,
+	runDaemonInternal,
+} from "../src/sdk/bus/telegram-daemon-cli";
 import { writeTelegramControlRequest } from "../src/sdk/bus/telegram-daemon-control";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
@@ -231,6 +236,117 @@ describe("issue #4403 — CLI fail-closed + daemon watchdog reconciliation", () 
 			await Bun.sleep(100);
 			expect(reapCalled).toBe(true);
 		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		"disabled",
+		"missing",
+		"malformed",
+		"permission-denied",
+		"token-rotated",
+		"chat-rotated",
+	] as const)("watchdog stops standalone ingress when configuration is %s", async scenario => {
+		const agentDir = tempAgentDir();
+		const ownerId = `${process.pid}-test-disable`;
+		const incarnation = "linux:4242";
+		const configPath = path.join(agentDir, "config.yml");
+		const rawConfig: Record<string, unknown> = {
+			notifications: {
+				enabled: true,
+				telegram: { enabled: true, botToken: BOT_TOKEN, chatId: "42" },
+			},
+		};
+		fs.writeFileSync(configPath, JSON.stringify(rawConfig));
+		writeReadyState(agentDir, process.pid, incarnation, ownerId);
+		const warning = spyOn(logger, "warn");
+		let watchdogCallback: (() => void) | undefined;
+		let stopCalled = false;
+		let standaloneIngress = false;
+		const { promise: daemonRun, resolve: resolveRun } = Promise.withResolvers<void>();
+		const watchdogReady = Promise.withResolvers<void>();
+		let settingsLoads = 0;
+		let runner: Promise<void> | undefined;
+		try {
+			runner = runDaemonInternal(["--owner-id", ownerId, "--agent-dir", agentDir], {
+				processPid: process.pid,
+				pidAlive: () => true,
+				pidIncarnation: () => incarnation,
+				loadInstallationHostId: async () => "host-id",
+				SettingsImpl: {
+					init: async () => {
+						settingsLoads += 1;
+						if (settingsLoads > 1 && scenario === "permission-denied")
+							throw Object.assign(new Error(`denied ${BOT_TOKEN}`), { code: "EACCES" });
+						return loadLightweightDaemonSettings(agentDir);
+					},
+				},
+				DaemonImpl: class {
+					constructor(opts: TelegramDaemonOptions) {
+						standaloneIngress = opts.keepAliveWithoutAttachments === true;
+					}
+					requestStop(): void {
+						stopCalled = true;
+						resolveRun();
+					}
+					async run(): Promise<void> {
+						await daemonRun;
+					}
+				} as never,
+				setInterval: (cb: () => void, ms: number) => {
+					if (ms === 5_000) {
+						watchdogCallback = cb;
+						watchdogReady.resolve();
+					}
+					return 1 as unknown as Timer;
+				},
+				clearInterval: () => {},
+				readDaemonState: async (_settings: Settings) => {
+					const raw = fs.readFileSync(daemonPaths(agentDir).state, "utf8");
+					return JSON.parse(raw) as DaemonState;
+				},
+			});
+			await watchdogReady.promise;
+			expect(standaloneIngress).toBe(true);
+			switch (scenario) {
+				case "missing":
+					fs.unlinkSync(configPath);
+					break;
+				case "malformed":
+					fs.writeFileSync(configPath, `notifications: [${BOT_TOKEN}`);
+					break;
+				case "permission-denied":
+					break;
+				default:
+					fs.writeFileSync(
+						configPath,
+						JSON.stringify({
+							notifications: {
+								enabled: true,
+								telegram: {
+									enabled: scenario !== "disabled",
+									botToken: scenario === "token-rotated" ? `${BOT_TOKEN}new` : BOT_TOKEN,
+									chatId: scenario === "chat-rotated" ? "43" : "42",
+								},
+							},
+						}),
+					);
+			}
+			watchdogCallback?.();
+			for (let attempt = 0; attempt < 100 && !stopCalled; attempt++) await Bun.sleep(5);
+			expect(stopCalled).toBe(true);
+			expect(settingsLoads).toBeGreaterThan(1);
+			await runner;
+			if (scenario === "malformed" || scenario === "permission-denied")
+				expect(warning).toHaveBeenCalledWith(
+					"telegram-daemon: configuration verification failed; stopping command ingress",
+				);
+			expect(JSON.stringify(warning.mock.calls)).not.toContain(BOT_TOKEN);
+		} finally {
+			resolveRun();
+			await runner?.catch(() => undefined);
+			warning.mockRestore();
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});

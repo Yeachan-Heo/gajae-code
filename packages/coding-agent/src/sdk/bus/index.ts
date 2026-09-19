@@ -3425,7 +3425,15 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (durableSkillAccepted && skillRecon) {
+					} else if (durableSkillAccepted && skillRecon && !promptOwned) {
+						// A lifecycle-owned skill (requester connection present, submission
+						// registered by onPromptAccepted) is terminalized solely by the
+						// correlated agent_end handler (terminalizePrompt -> claim ->
+						// finalize with the final text). This promise-settlement transition
+						// carries no text and would pre-empt that finalization, dropping the
+						// durable content; it remains only for ownerless acceptance, where
+						// no lifecycle handler will ever fire — and there it is the sole
+						// terminal publication, so it must carry the returned text itself.
 						trackReconciliationProducer?.(
 							skillRecon.noteTransition(correlation, {
 								type: "agent_end",
@@ -4803,10 +4811,19 @@ export function createNotificationsExtension(
 			 * by the firing deadline timer, cleared when the attempt completes or
 			 * is superseded). Fresh attributable progress recorded while the
 			 * attempt awaits durable reconciliation advances the lease generation;
-			 * the attempt must then back off instead of terminalizing a live prompt
-			 * (mirrors PromptDeadlineManager).
+			 * before self-abort starts, the attempt must then back off instead of
+			 * terminalizing a live prompt (mirrors PromptDeadlineManager).
 			 */
-			deadlineAttempt?: { lease: PromptDeadlineLease; generation: number };
+			deadlineAttempt?: {
+				lease: PromptDeadlineLease;
+				generation: number;
+				/**
+				 * Set synchronously immediately before this expiry attempt aborts
+				 * its own run. Progress from that abort belongs to this attempt,
+				 * not to an independently live prompt.
+				 */
+				selfAbortStarted?: true;
+			};
 			phase: "active" | "outcome_claimed" | "terminalizing" | "publication_closed" | "delivered";
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
@@ -5108,10 +5125,24 @@ export function createNotificationsExtension(
 		const deadlineAttemptStatus = (
 			key: string,
 			submission: PromptSubmission,
-			attempt: { lease: PromptDeadlineLease; generation: number },
+			attempt: { lease: PromptDeadlineLease; generation: number; selfAbortStarted?: true },
 		): DeadlineAttemptStatus => {
 			if (promptSubmissions.get(key) !== submission || submission.deadlineLease !== attempt.lease) return "stale";
 			const lease = submission.deadlineLease;
+			// A deadline expiry attempt must not be superseded by progress that its
+			// OWN abort caused. Terminal fencing aborts the running tool, and the
+			// agent loop pairs that tool off with a `tool_execution_end` which is
+			// NOT marked non-dispatched — the marker is reserved for calls that
+			// never started, and this one did (`dispatched = record.started`,
+			// agent-loop.ts). So the abort's teardown reaches renewPromptDeadline as
+			// ordinary attributable progress and advances the generation of the very
+			// lease this attempt is expiring. Reading that as supersession makes the
+			// attempt back off, re-arm, and walk into the identical trap forever: the
+			// prompt never gets a terminal frame and its durable claim stays pending
+			// (#5583). Progress observed BEFORE the self-abort is still authoritative
+			// — that is the post-claim fence, and it keeps a genuinely live prompt
+			// from being killed.
+			if (attempt.selfAbortStarted) return "current";
 			if (lease.generation !== attempt.generation && Date.now() < promptDeadlineAt(lease)) return "superseded";
 			return "current";
 		};
@@ -5403,6 +5434,10 @@ export function createNotificationsExtension(
 				}
 				let proof: RunSettlementProof;
 				try {
+					// Mark immediately before the abort seam, with no await between:
+					// abort-time attributable completion is caused by this deadline
+					// attempt and must not supersede its own expiry terminal.
+					if (deadlineAttempt) deadlineAttempt.selfAbortStarted = true;
 					proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
 						// Terminal abort registers the continuation fence for the

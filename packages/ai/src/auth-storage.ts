@@ -1197,7 +1197,10 @@ function raceUsageWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undef
 function isTimeoutAbort(signal: AbortSignal): boolean {
 	const reason: unknown = signal.reason;
 	return (
-		typeof reason === "object" && reason !== null && "name" in reason && (reason as { name?: unknown }).name === "TimeoutError"
+		typeof reason === "object" &&
+		reason !== null &&
+		"name" in reason &&
+		(reason as { name?: unknown }).name === "TimeoutError"
 	);
 }
 

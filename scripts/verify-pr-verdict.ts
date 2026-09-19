@@ -76,6 +76,13 @@ export interface IndependentReviewerEvidence {
 	permission: string;
 	approvedHead: boolean;
 	approvedLogin?: string;
+	/**
+	 * True when this login DOES have an APPROVED review reporting the exact head, but it was
+	 * submitted before that head existed — a stale approval GitHub re-pointed after a
+	 * force-push. Distinguished from "no approval" so the diagnostic can say which it is,
+	 * because the remedies differ: one needs a reviewer, the other needs a re-review (#5692).
+	 */
+	reboundStaleApproval?: boolean;
 }
 
 /** A review normalized from either API shape so one rule can decide the effective one. */
@@ -83,6 +90,29 @@ interface EffectiveReview {
 	login?: string;
 	state?: string;
 	oid?: string;
+	/** ISO submission time. Absent means the caller could not read it; that fails closed. */
+	submittedAt?: string;
+}
+
+/**
+ * Whether a review's reported commit can be trusted as the head it actually reviewed.
+ *
+ * `review.commit_id` is NOT immutable: GitHub re-points it at the new branch tip when a PR
+ * is force-pushed and stale-review dismissal does not fire. `dev` is unprotected, so the
+ * branch almost every PR targets has no dismissal, and a rebase therefore turned every prior
+ * approval into an apparent exact-head approval. Two live cases: an approval submitted
+ * 4h24m before its attributed head existed, and another two days before (#5692).
+ *
+ * A review cannot review a commit that does not exist yet, so a submission earlier than the
+ * head's committer date proves re-binding. Both timestamps must be readable and parseable —
+ * an unknown time is never treated as fresh.
+ */
+function reviewPrecedesHead(submittedAt: string | undefined, headCommittedAt: string | undefined): boolean {
+	if (submittedAt === undefined || headCommittedAt === undefined) return true;
+	const submitted = Date.parse(submittedAt);
+	const committed = Date.parse(headCommittedAt);
+	if (!Number.isFinite(submitted) || !Number.isFinite(committed)) return true;
+	return submitted < committed;
 }
 
 /**
@@ -91,15 +121,41 @@ interface EffectiveReview {
  * callers (the event approval, the independent-reviewer evidence, and the push preflight)
  * must never disagree about which review counts — the divergence that produced issue #5483
  * and later the withdrawn-approval gap the QA lane found.
+ *
+ * `headCommittedAt` additionally discards reviews that predate the head they claim, which is
+ * how a force-push silently re-binds a stale approval onto new code (#5692). Omitting it
+ * keeps the pre-#5692 behaviour and is only for callers with no head date at all.
  */
-function effectiveExactHeadReview(reviews: EffectiveReview[], login: string, headSha: string): EffectiveReview | undefined {
+function effectiveExactHeadReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt?: string,
+): EffectiveReview | undefined {
 	return reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
 			&& review.state !== "COMMENTED"
-			&& review.oid === headSha,
+			&& review.oid === headSha
+			&& !(headCommittedAt !== undefined && reviewPrecedesHead(review.submittedAt, headCommittedAt)),
 		)
 		.at(-1);
+}
+
+/** True when this identity has a review bound to the head but only by a re-pointed commit id. */
+function hasReboundStaleReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt: string | undefined,
+): boolean {
+	if (headCommittedAt === undefined) return false;
+	return reviews.some(review =>
+		review.login?.toLowerCase() === login.toLowerCase()
+		&& review.state === "APPROVED"
+		&& review.oid === headSha
+		&& reviewPrecedesHead(review.submittedAt, headCommittedAt),
+	);
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -109,9 +165,27 @@ export interface AuthenticatedSelfReviewComment {
 }
 
 export interface PrValidationResult {
+	/** CONTRACT validity only: shape, exact-head binding, digest freshness, forgery, fast gate. */
 	ok: boolean;
 	verdict?: ParsedPrVerdict;
 	diagnostics: string[];
+	/**
+	 * Whether this exact head is authorized to merge. Separated from `ok` so "your PR is
+	 * malformed" and "your PR is waiting for a reviewer" stop sharing one red check. The
+	 * predicate itself is unchanged; only the channel it is reported on moved.
+	 * A merge is never authorized while the contract itself is invalid.
+	 */
+	mergeAuthorized: boolean;
+	/** Why the merge is not authorized yet. Never contract defects, never forgery claims. */
+	authorizationDiagnostics: string[];
+}
+
+/**
+ * A result decided without any authorization question: merge authorization mirrors the
+ * contract verdict, exactly as every caller behaved before the gate was split out.
+ */
+function contractResult(ok: boolean, diagnostics: string[], verdict?: ParsedPrVerdict): PrValidationResult {
+	return { ok, verdict, diagnostics, mergeAuthorized: ok, authorizationDiagnostics: [] };
 }
 
 export function parsePrVerdict(body: string): { verdict?: ParsedPrVerdict; diagnostics: string[] } {
@@ -257,6 +331,10 @@ export function selfReviewSatisfiesPolicy(review: ParsedSelfReview, independentR
 export function validatePrContract(input: PrValidationInput): PrValidationResult {
 	const parsed = parsePrVerdict(input.body);
 	const diagnostics = [...parsed.diagnostics];
+	// "Not approved yet" is a pending authorization, not a defect in the PR. It is the only
+	// diagnostic reported here; every false claim (self-approval, an unbacked reviewer-id, a
+	// stale digest) stays a CONTRACT defect.
+	const authorizationDiagnostics: string[] = [];
 	if (input.baseRef !== "dev") diagnostics.push(`PR base must be dev, not ${JSON.stringify(input.baseRef)}. Retarget the PR to dev.`);
 	if (!SHA40.test(input.baseSha)) diagnostics.push("Immutable PR event base SHA must be a lowercase 40-hex commit.");
 	if (!SHA40.test(input.headSha)) diagnostics.push("Exact PR head SHA must be a lowercase 40-hex commit.");
@@ -304,11 +382,13 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 			}
 		}
 		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved" && parsed.verdict.verdict !== "merge-self-approved") {
-			diagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
+			authorizationDiagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
 		}
 	}
 	diagnostics.push(...selfReview.diagnostics);
-	return { ok: diagnostics.length === 0, verdict: parsed.verdict, diagnostics };
+	const ok = diagnostics.length === 0;
+	// Invariant: a malformed contract can never report an authorized merge.
+	return { ok, verdict: parsed.verdict, diagnostics, mergeAuthorized: ok && authorizationDiagnostics.length === 0, authorizationDiagnostics };
 }
 
 /**
@@ -368,8 +448,17 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
 	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null) && !input.independentReviewerUnavailable) {
-		const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
-		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind === "independent" ? `independent:${review.extra.login}` : review.extra.kind}); the risk-classified gate is not satisfied.`);
+		// Name the re-bound case separately. "No approval" sends the author looking for a
+		// reviewer; a re-bound approval means the named reviewer already looked at DIFFERENT
+		// code and has to re-review this head. Collapsing the two is what let me tell two
+		// PR authors their only remaining step was flipping a verdict verb (#5692).
+		const named = review.extra.kind === "independent" ? review.extra.login : review.extra.kind;
+		if (input.independentReviewer?.reboundStaleApproval === true) {
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub re-pointed a stale review after a force-push, so it is not an approval of this code; a review submitted after the current head is required.`);
+		} else {
+			const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
+			diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${named}); the risk-classified gate is not satisfied.`);
+		}
 	}
 	if (review.extra.kind === "independent" && review.extra.login.toLowerCase() === input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review extra:independent:${review.extra.login} names the PR author; the independent reviewer must be a distinct maintainer.`);
@@ -398,6 +487,8 @@ interface PullRequestReview {
 	state?: string;
 	commit_id?: string;
 	user?: { login?: string };
+	/** Needed to detect a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submitted_at?: string;
 }
 
 interface CollaboratorPermission {
@@ -509,11 +600,13 @@ async function fetchPushPreflightSelfReview(repo: string, number: number, author
 	return { comment: newest, error: null };
 }
 
-/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}'` emits it. */
+/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}'` emits it. */
 interface LiveReview {
 	author: { login: string } | null;
 	state: string;
 	commit: { oid: string } | null;
+	/** Detects a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submittedAt: string | null;
 }
 
 /**
@@ -526,18 +619,32 @@ interface LiveReview {
  * returned as an error so the caller can report it as unread instead of unauthorized.
  */
 async function fetchPushPreflightIndependentReviewer(repo: string, number: number, login: string, headSha: string, cwd: string): Promise<{ evidence: IndependentReviewerEvidence | null; error: string | null }> {
-	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}"], cwd);
+	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}"], cwd);
 	if (listed.exitCode !== 0) return { evidence: null, error: listed.stderr || `gh exited ${listed.exitCode}` };
 	const parsed = parseGhJsonl<LiveReview>(listed.stdout);
 	if (!parsed.ok) return { evidence: null, error: parsed.error };
-	const approvedHead = effectiveExactHeadReview(
-		parsed.values.map(review => ({ login: review.author?.login, state: review.state, oid: review.commit?.oid })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = parsed.values.map(review => ({
+		login: review.author?.login,
+		state: review.state,
+		oid: review.commit?.oid,
+		submittedAt: review.submittedAt ?? undefined,
+	}));
+	// Locally the head commit is already in the object store, so read its committer date
+	// straight from git rather than spending another API call (#5692).
+	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
+	const headCommittedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
+	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
 	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
-	return { evidence: { permission: permission.stdout.trim(), approvedHead, approvedLogin: login }, error: null };
+	return {
+		evidence: {
+			permission: permission.stdout.trim(),
+			approvedHead,
+			approvedLogin: login,
+			...(approvedHead ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+		},
+		error: null,
+	};
 }
 
 export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
@@ -558,11 +665,21 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approval = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		reviewerId,
-		headSha,
-	);
+	// Normalize BEFORE the head-date call so a malformed review response still fails on the
+	// reviews payload rather than spending an extra API request first.
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headers = {
+		Accept: "application/vnd.github+json",
+		Authorization: `Bearer ${token}`,
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
+	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headCommittedAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
 		headers: {
@@ -584,6 +701,24 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
  * CHANGES_REQUESTED supersedes an earlier APPROVED exactly as it does for a merge-approved
  * verdict (issue #4703 hardening, extended after the push preflight mirrored this lookup).
  */
+/**
+ * Committer date of the PR head, used to discard reviews that predate it (#5692).
+ *
+ * Returns `undefined` when the commit cannot be read, and every caller treats that as
+ * "cannot prove freshness" rather than "fresh": an unreadable head date makes
+ * `reviewPrecedesHead` refuse the review instead of admitting it.
+ */
+async function fetchHeadCommittedAt(
+	repository: string,
+	headSha: string,
+	headers: Record<string, string>,
+): Promise<string | undefined> {
+	const response = await fetch(`https://api.github.com/repos/${repository}/commits/${headSha}`, { headers });
+	if (!response.ok) return undefined;
+	const commit = await response.json() as { commit?: { committer?: { date?: string } } };
+	return commit.commit?.committer?.date;
+}
+
 export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
@@ -602,15 +737,23 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approved = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
+	const approved = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
 	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
-	return { permission: collaborator.permission ?? "none", approvedHead: approved, approvedLogin: login };
+	return {
+		permission: collaborator.permission ?? "none",
+		approvedHead: approved,
+		approvedLogin: login,
+		...(approved ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+	};
 }
 
 async function git(args: string[], cwd: string): Promise<{ exitCode: number; stdout: Uint8Array; stderr: string }> {
@@ -750,7 +893,7 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const rawEvent = (await Bun.file(eventPath).json()) as PullRequestEvent;
 	const event = await resolvePullRequestEvent(rawEvent);
 	const pr = event.pull_request;
-	if (!pr) return { ok: false, diagnostics: ["GitHub event payload does not contain pull_request data."] };
+	if (!pr) return contractResult(false, ["GitHub event payload does not contain pull_request data."]);
 	const body = pr.body ?? "";
 	const authorLogin = pr.user?.login ?? "";
 	const baseRef = pr.base?.ref ?? "";
@@ -761,13 +904,13 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	}
 	const checkedOut = await git(["rev-parse", "HEAD"], cwd);
 	if (checkedOut.exitCode !== 0 || new TextDecoder().decode(checkedOut.stdout).trim() !== headSha) {
-		return { ok: false, diagnostics: [`Checked-out source must equal exact PR head ${headSha}.` ] };
+		return contractResult(false, [`Checked-out source must equal exact PR head ${headSha}.` ]);
 	}
 	const fetchBase = await git(["fetch", "--no-tags", trustedRoot, baseSha], cwd);
-	if (fetchBase.exitCode !== 0) return { ok: false, diagnostics: [`Could not fetch immutable PR base ${baseSha}: ${fetchBase.stderr}`] };
+	if (fetchBase.exitCode !== 0) return contractResult(false, [`Could not fetch immutable PR base ${baseSha}: ${fetchBase.stderr}`]);
 	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
 	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
-	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute exact PR diff: ${diff.stderr}`] };
+	if (diff.exitCode !== 0) return contractResult(false, [`Could not compute exact PR diff: ${diff.stderr}`]);
 	const parsed = parsePrVerdict(body);
 	const approval = parsed.verdict?.verdict === "merge-approved"
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
@@ -872,21 +1015,21 @@ export function parseGhPrCreate(command: string): { bodyFile?: string; body?: st
 
 async function validatePreflight(command: string, cwd: string, trustedRoot: string, invocationCwd: string): Promise<PrValidationResult> {
 	const parsed = parseGhPrCreate(command);
-	if (parsed === null) return { ok: true, diagnostics: [] };
-	if (!parsed.bodyFile && parsed.body === undefined) return { ok: false, diagnostics: ["gh pr create must provide --body-file or --body so the PR verdict can be validated before submission."] };
+	if (parsed === null) return contractResult(true, []);
+	if (!parsed.bodyFile && parsed.body === undefined) return contractResult(false, ["gh pr create must provide --body-file or --body so the PR verdict can be validated before submission."]);
 	let body = parsed.body!;
 	if (parsed.bodyFile) {
 		const bodyPath = path.resolve(invocationCwd, parsed.bodyFile);
 		try {
 			body = await Bun.file(bodyPath).text();
 		} catch (error) {
-			return { ok: false, diagnostics: [`Could not read PR body file ${bodyPath}: ${error instanceof Error ? error.message : String(error)}`] };
+			return contractResult(false, [`Could not read PR body file ${bodyPath}: ${error instanceof Error ? error.message : String(error)}`]);
 		}
 	}
 	const baseRef = parsed.base ?? "dev";
 	const refreshBase = await git(["fetch", "--no-tags", "origin", "dev"], cwd);
 	if (refreshBase.exitCode !== 0) {
-		return { ok: false, diagnostics: [`Could not refresh origin/dev before PR preflight: ${refreshBase.stderr}. Run git fetch origin dev and retry.`] };
+		return contractResult(false, [`Could not refresh origin/dev before PR preflight: ${refreshBase.stderr}. Run git fetch origin dev and retry.`]);
 	}
 	const base = await git(["rev-parse", "origin/dev"], cwd);
 	const head = await git(["rev-parse", "HEAD"], cwd);
@@ -958,12 +1101,12 @@ async function contractRepository(pushRepo: string, cwd: string): Promise<{ repo
 
 /** Validate local contract structure and exact pushed bytes, not merge authorization. */
 async function validatePushPreflight(branch: string, headSha: string, remote: string, cwd: string, trustedRoot: string, destination?: string): Promise<PrValidationResult> {
-	if (!SHA40.test(headSha)) return { ok: false, diagnostics: [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`] };
+	if (!SHA40.test(headSha)) return contractResult(false, [`Pushed commit ${headSha} is not a lowercase 40-hex commit.`]);
 	const pushRepo = await pushRemoteRepository(remote, cwd, destination);
-	if (!pushRepo) return { ok: false, diagnostics: [`Could not resolve the GitHub repository behind push remote ${remote}; refusing to validate against an unknown repository.`] };
+	if (!pushRepo) return contractResult(false, [`Could not resolve the GitHub repository behind push remote ${remote}; refusing to validate against an unknown repository.`]);
 	// A fork push opens its PR upstream, so the contract lives in the parent repository.
 	const authority = await contractRepository(pushRepo, cwd);
-	if (!authority) return { ok: false, diagnostics: [`Could not establish the PR contract repository for ${pushRepo}; repository fork metadata must identify an explicit non-fork or a valid parent.`] };
+	if (!authority) return contractResult(false, [`Could not establish the PR contract repository for ${pushRepo}; repository fork metadata must identify an explicit non-fork or a valid parent.`]);
 	const { repo: baseRepo, forkOwner } = authority;
 	// The head is qualified by the owner actually receiving the push, so a same-named
 	// branch in another fork can never be mistaken for this PR.
@@ -974,7 +1117,7 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 	for (let page = 1; ; page++) {
 		const endpoint = `repos/${baseRepo}/pulls?state=open&head=${encodeURIComponent(`${headOwner}:${branch}`)}&per_page=100&page=${page}`;
 		const listed = await gh(["api", endpoint], cwd);
-		if (listed.exitCode !== 0) return { ok: false, diagnostics: [`Could not resolve the open PR for ${branch} in ${baseRepo}: ${listed.stderr || `gh exited ${listed.exitCode}`}.`] };
+		if (listed.exitCode !== 0) return contractResult(false, [`Could not resolve the open PR for ${branch} in ${baseRepo}: ${listed.stderr || `gh exited ${listed.exitCode}`}.`]);
 		let pulls: LivePullRequest[];
 		try {
 			const parsed: unknown = JSON.parse(listed.stdout);
@@ -984,30 +1127,30 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 				|| typeof pr.user?.login !== "string")) throw new Error("Malformed pull request metadata");
 			pulls = parsed;
 		} catch (error) {
-			return { ok: false, diagnostics: [`Could not parse the pull request response for ${branch}: ${error instanceof Error ? error.message : String(error)}`] };
+			return contractResult(false, [`Could not parse the pull request response for ${branch}: ${error instanceof Error ? error.message : String(error)}`]);
 		}
 		candidates.push(...pulls.filter(pr => pr.head.ref === branch && pr.head.repo?.owner.login.toLowerCase() === headOwner.toLowerCase()));
 		if (pulls.length < 100) break;
 	}
 	if (candidates.length > 1) {
-		return { ok: false, diagnostics: [`Branch ${branch} matches ${candidates.length} open PRs in ${baseRepo} from ${headOwner} (#${candidates.map(candidate => candidate.number).join(", #")}); cannot determine which contract governs this push.`] };
+		return contractResult(false, [`Branch ${branch} matches ${candidates.length} open PRs in ${baseRepo} from ${headOwner} (#${candidates.map(candidate => candidate.number).join(", #")}); cannot determine which contract governs this push.`]);
 	}
 	const pr = candidates[0];
-	if (!pr) return { ok: true, diagnostics: [] };
+	if (!pr) return contractResult(true, []);
 	// The base is the repository the PR was queried in -- for a fork push that is the
 	// upstream, never the contributor's local origin/dev. The ref is the PR's own base
 	// branch rather than an assumed "dev".
 	const baseRemoteUrl = `https://github.com/${baseRepo}.git`;
 	const refreshBase = await git(["fetch", "--no-tags", baseRemoteUrl, pr.base.ref], cwd);
 	if (refreshBase.exitCode !== 0) {
-		return { ok: false, diagnostics: [`Could not fetch the PR base ${baseRepo}#${pr.base.ref} before the push preflight: ${refreshBase.stderr}`] };
+		return contractResult(false, [`Could not fetch the PR base ${baseRepo}#${pr.base.ref} before the push preflight: ${refreshBase.stderr}`]);
 	}
 	const base = await git(["rev-parse", "FETCH_HEAD"], cwd);
 	const baseSha = new TextDecoder().decode(base.stdout).trim();
-	if (!SHA40.test(baseSha)) return { ok: false, diagnostics: [`Could not resolve ${baseRepo}#${pr.base.ref} to a commit: ${base.stderr}`] };
+	if (!SHA40.test(baseSha)) return contractResult(false, [`Could not resolve ${baseRepo}#${pr.base.ref} to a commit: ${base.stderr}`]);
 	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
 	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
-	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`] };
+	if (diff.exitCode !== 0) return contractResult(false, [`Could not compute the exact ${baseSha}...${headSha} diff: ${diff.stderr}`]);
 	const body = pr.body ?? "";
 	const bodyRiskParsed = parseBodyRisk(body);
 	const authorLogin = pr.user?.login ?? "";
@@ -1061,7 +1204,27 @@ async function validatePushPreflight(branch: string, headSha: string, remote: st
 			diagnostics.push(`Re-run the push once \`gh api\` can read the ${SELF_REVIEW_PREFIX} record for ${baseRepo}#${pr.number}, or push with GJC_SKIP_PR_PREFLIGHT=1 (or --no-verify) while the change is still awaiting review.`);
 		}
 	}
-	return { ok: diagnostics.length === 0, verdict: result.verdict, diagnostics };
+	return contractResult(diagnostics.length === 0, diagnostics, result.verdict);
+}
+
+/**
+ * Which verdict decides this invocation's exit code. `all` is the default every existing
+ * caller keeps: one exit code covering the contract AND the merge authorization, exactly as
+ * before the split. `contract` and `approval` each report one half under its own check name.
+ */
+export type GateMode = "all" | "contract" | "approval";
+
+export const MERGE_AUTHORIZED_OUTPUT = "gjc-merge-authorized";
+
+export function gateExitCode(gate: GateMode, result: Pick<PrValidationResult, "ok" | "mergeAuthorized">): number {
+	switch (gate) {
+		case "contract":
+			return result.ok ? 0 : 1;
+		case "approval":
+			return result.mergeAuthorized ? 0 : 1;
+		case "all":
+			return result.ok && result.mergeAuthorized ? 0 : 1;
+	}
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -1078,6 +1241,12 @@ export async function main(argv: string[]): Promise<number> {
 	const pushRemote = pushRemoteIndex >= 0 && argv[pushRemoteIndex + 1] ? argv[pushRemoteIndex + 1]! : "origin";
 	const pushUrlIndex = argv.indexOf("--push-url");
 	const pushUrl = pushUrlIndex >= 0 ? argv[pushUrlIndex + 1] ?? "" : undefined;
+	const gateIndex = argv.indexOf("--gate");
+	const gate = (gateIndex >= 0 ? argv[gateIndex + 1] ?? "" : "all") as GateMode;
+	if (gate !== "all" && gate !== "contract" && gate !== "approval") {
+		console.error("::error::--gate must be contract or approval");
+		return 1;
+	}
 	const signIndex = argv.indexOf("--self-review-sign");
 	if (signIndex >= 0) {
 		const args = argv.slice(signIndex + 1);
@@ -1105,10 +1274,18 @@ export async function main(argv: string[]): Promise<number> {
 			? await validatePushPreflight(argv[pushIndex + 1]!, argv[pushIndex + 2]!, pushRemote, cwd, trustedRoot, pushUrl)
 			: preflightIndex >= 0 && argv[preflightIndex + 1]
 				? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
-				: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] [--push-url <destination-url>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
+				: contractResult(false, ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --push-preflight <branch> <head-sha> [--push-remote <remote>] [--push-url <destination-url>] | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>; add --gate <contract|approval> to report only one half of the verdict"]);
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
+	for (const diagnostic of result.authorizationDiagnostics) {
+		// Under --gate contract the pending approval is not this check's verdict, so it is
+		// reported as a notice: the log still explains why the merge has not happened.
+		if (gate === "contract") console.log(`::notice::${diagnostic}`);
+		else console.error(`::error::${diagnostic}`);
+	}
+	// Machine-readable so a workflow can fan the two verdicts out into two check names.
+	console.log(`${MERGE_AUTHORIZED_OUTPUT}=${result.mergeAuthorized}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
-	return result.ok ? 0 : 1;
+	return gateExitCode(gate, result);
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));

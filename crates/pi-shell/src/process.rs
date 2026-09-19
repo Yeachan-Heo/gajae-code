@@ -836,7 +836,11 @@ mod platform {
 			snapshot_all_pids()?
 				.into_iter()
 				.filter_map(Process::from_pid)
-				.filter(|process| unsafe { libc::getsid(process.pid()) } == sid)
+				.filter(|process| {
+					// SAFETY: getsid only reads the integer PID value and does not
+					// access caller-owned memory.
+					(unsafe { libc::getsid(process.pid()) }) == sid
+				})
 				.collect(),
 		)
 	}
@@ -2737,6 +2741,17 @@ mod tests {
 
 		child.kill().expect("kill owned child");
 		child.wait().expect("reap owned child");
+		// Release the child handle before asserting absence. `wait` reaps the
+		// child but `std::process::Child` closes the underlying handle only on
+		// drop, and Windows keeps a process object — with its creation-time
+		// identity, so `OpenProcess` and `from_pid` both still succeed — alive
+		// for as long as any handle to it is open. Holding `child` past the
+		// reap therefore pins the very incarnation this test waits to see
+		// disappear (observed in CI: `Present { incarnation:
+		// "windows:134341044275280593" }` for the whole 2s poll budget). The
+		// assertion below still demands a positive `Absent`, so dropping the
+		// handle removes a fixture artifact rather than weakening the contract.
+		drop(child);
 
 		// Process-table absence is not guaranteed to be visible to the very next
 		// observation on every platform; poll briefly for the confirmed-dead

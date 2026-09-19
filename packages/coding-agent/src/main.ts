@@ -698,17 +698,61 @@ export const BARE_RESUME_OPEN_ERROR = "Could not open the selected session. Use 
 const SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE =
 	"The selected legacy session's artifacts exceed the supported migration capacity. Archive or remove only that legacy session's artifacts after confirming they are no longer needed, then retry.";
 
-function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
+export class SessionForkDeclinedError extends Error {
+	readonly code = "session_fork_declined" as const;
+	readonly #sessionId: string;
+	readonly #projectDirectory: string;
+
+	constructor(sessionId: string, projectDirectory: string) {
+		super(
+			`Session "${sessionId}" is in another project (${projectDirectory}). Re-run from that directory, or accept the fork when prompted.`,
+		);
+		this.name = "SessionForkDeclinedError";
+		this.#sessionId = sessionId;
+		this.#projectDirectory = projectDirectory;
+	}
+
+	get sessionId(): string {
+		return this.#sessionId;
+	}
+
+	get projectDirectory(): string {
+		return this.#projectDirectory;
+	}
+}
+
+export class SessionNotFoundError extends Error {
+	readonly code = "session_not_found" as const;
+	readonly #sessionId: string;
+
+	constructor(sessionId: string) {
+		super(`Session "${sessionId}" not found.`);
+		this.name = "SessionNotFoundError";
+		this.#sessionId = sessionId;
+	}
+
+	get sessionId(): string {
+		return this.#sessionId;
+	}
+}
+
+export function operatorFacingSessionOpenMessage(value: unknown): string | undefined {
 	const code =
-		value instanceof SessionArtifactCapacityError
+		value instanceof SessionForkDeclinedError
 			? value.code
-			: value instanceof SessionMigrationBusyError
+			: value instanceof SessionNotFoundError
 				? value.code
-				: value instanceof SessionTranscriptOversizedError
+				: value instanceof SessionArtifactCapacityError
 					? value.code
-					: typeof value === "string"
-						? value
-						: undefined;
+					: value instanceof SessionMigrationBusyError
+						? value.code
+						: value instanceof SessionTranscriptOversizedError
+							? value.code
+							: typeof value === "string"
+								? value
+								: undefined;
+	if (code === "session_fork_declined" && value instanceof SessionForkDeclinedError) return value.message;
+	if (code === "session_not_found" && value instanceof SessionNotFoundError) return value.message;
 	if (code === "artifact_capacity_exceeded") return SESSION_ARTIFACT_CAPACITY_RECOVERY_MESSAGE;
 	if (code === "oversized") return SESSION_OVERSIZED_RECOVERY_MESSAGE;
 	if (code === "migration_busy") return new SessionMigrationBusyError().message;
@@ -1012,7 +1056,7 @@ export async function createSessionManager(
 			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
 		);
 		if (!match) {
-			throw new Error(`Session "${forkSource}" not found.`);
+			throw new SessionNotFoundError(forkSource);
 		}
 		return await SessionManager.forkFrom(
 			match.session.path,
@@ -1043,7 +1087,7 @@ export async function createSessionManager(
 			parsed.sessionDir ? undefined : activeSettings.getAgentDir(),
 		);
 		if (!match) {
-			throw new Error(`Session "${sessionArg}" not found.`);
+			throw new SessionNotFoundError(sessionArg);
 		}
 		if (match.scope === "global") {
 			const normalizedCwd = normalizePathForComparison(cwd);
@@ -1051,7 +1095,7 @@ export async function createSessionManager(
 			if (normalizedCwd !== normalizedMatchCwd) {
 				const shouldFork = await promptForkSession(match.session);
 				if (!shouldFork) {
-					throw new Error(`Session "${sessionArg}" is in another project (${match.session.cwd}).`);
+					throw new SessionForkDeclinedError(sessionArg, match.session.cwd);
 				}
 				return await SessionManager.forkFrom(
 					match.session.path,

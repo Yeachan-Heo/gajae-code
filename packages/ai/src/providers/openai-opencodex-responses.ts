@@ -31,6 +31,11 @@ interface CatalogRow {
 	maxTokens?: unknown;
 	reasoning?: unknown;
 	input?: unknown;
+	capabilities?: {
+		context_length?: unknown;
+		input_modalities?: unknown;
+		supports_reasoning?: unknown;
+	};
 }
 
 export interface OpenCodexEndpoint {
@@ -120,6 +125,9 @@ function asPositiveNumber(value: unknown, fallback: number): number {
 
 function normalizeCatalogPayload(payload: unknown): CatalogRow[] {
 	if (Array.isArray(payload)) return payload as CatalogRow[];
+	if (payload && typeof payload === "object" && Array.isArray((payload as { data?: unknown }).data)) {
+		return (payload as { data: CatalogRow[] }).data;
+	}
 	if (payload && typeof payload === "object" && Array.isArray((payload as { models?: unknown }).models)) {
 		return (payload as { models: CatalogRow[] }).models;
 	}
@@ -127,12 +135,14 @@ function normalizeCatalogPayload(payload: unknown): CatalogRow[] {
 }
 
 function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"openai-responses"> | undefined {
+	if (!row || typeof row !== "object") return undefined;
 	const rawId = typeof row.id === "string" ? row.id.trim() : typeof row.model === "string" ? row.model.trim() : "";
 	if (!rawId || rawId.includes("\n")) return undefined;
 	const publicId = `opencodex/${rawId}`;
+	const modalities = row.input ?? row.capabilities?.input_modalities;
 	const input =
-		Array.isArray(row.input) && row.input.every(value => value === "text" || value === "image")
-			? row.input
+		Array.isArray(modalities) && modalities.every(value => value === "text" || value === "image")
+			? modalities
 			: ["text"];
 	return {
 		id: publicId,
@@ -142,10 +152,10 @@ function normalizeModel(row: CatalogRow, endpoint: OpenCodexEndpoint): Model<"op
 		provider: "opencodex",
 		baseUrl: `${endpoint.baseUrl}/v1`,
 		compat: { supportsServiceTier: true },
-		reasoning: row.reasoning !== false,
+		reasoning: (row.reasoning ?? row.capabilities?.supports_reasoning) !== false,
 		input,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: asPositiveNumber(row.contextWindow, 128_000),
+		contextWindow: asPositiveNumber(row.contextWindow ?? row.capabilities?.context_length, 128_000),
 		maxTokens: asPositiveNumber(row.maxTokens, 16_384),
 	};
 }
@@ -154,7 +164,7 @@ export async function fetchOpenCodexModels(): Promise<readonly Model<"openai-res
 	const endpoint = await resolveOpenCodexEndpoint();
 	if (!endpoint) return null;
 	try {
-		const rows = normalizeCatalogPayload(await fetchJson(`${endpoint.baseUrl}/api/models`));
+		const rows = normalizeCatalogPayload(await fetchJson(`${endpoint.baseUrl}/v1/models`));
 		const models = rows
 			.map(row => normalizeModel(row, endpoint))
 			.filter((model): model is Model<"openai-responses"> => model !== undefined);

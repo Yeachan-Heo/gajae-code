@@ -452,7 +452,12 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["todo_write", "Todo Write", "Write a structured todo list", "discoverable"],
 		["web_search", "Web Search", "Search the web for up-to-date information", "discoverable"],
 		["search_tool_bm25", "SearchTools", undefined, "essential"],
-		["skill_discovery", "SkillDiscovery", "Discover project and user runtime skills by thin metadata", "essential"],
+		[
+			"skill_discovery",
+			"SkillDiscovery",
+			"Discover bundled GJC workflow, project, and user runtime skills by thin metadata",
+			"essential",
+		],
 		["telegram_send", "TelegramSend", "Send a workspace file to Telegram", "discoverable"],
 		["write", "Write", "Write content to a file", "discoverable"],
 		["skill", "Skill", "Chain into another available skill", "essential"],

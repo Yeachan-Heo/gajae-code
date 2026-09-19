@@ -11,6 +11,7 @@ import {
 	isTelegramComplete,
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
+	tokenFingerprint,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
 import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
@@ -317,6 +318,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	const initialTokenFingerprint = tokenFingerprint(cfg.botToken);
+	const initialChatId = cfg.chatId;
 	// Startup hygiene: reclaim inert quarantine/staging debris left by crashed
 	// writers so the notifications dir cannot grow unboundedly and slow every
 	// later endpoint scan. Never awaited by startup; a rejection is logged and
@@ -425,6 +428,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
+		keepAliveWithoutAttachments: true,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),
 		topicRegistryAuthority,
@@ -525,6 +529,31 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				// running daemon — a stale or reused PID could match, killing a
 				// foreign process. The stall watchdog below handles non-progress.
 			}
+			// The daemon's startup settings object is intentionally lightweight and
+			// does not watch the config file. Re-resolve it only after the complete
+			// owner proof above. Unknown configuration cannot authorize continued
+			// command ingress with startup credentials.
+			try {
+				const refreshedSettings = await resolveDaemonSettings(resolvedAgentDir, deps);
+				if (!watchdogActive || stopRequested) return;
+				const refreshedCfg = getNotificationConfig(refreshedSettings);
+				if (
+					!isProviderEffectivelyEnabled(refreshedCfg, "telegram") ||
+					!isTelegramComplete(refreshedCfg) ||
+					tokenFingerprint(refreshedCfg.botToken) !== initialTokenFingerprint ||
+					refreshedCfg.chatId !== initialChatId
+				) {
+					stopRequested = true;
+					daemon.requestStop("stop");
+					return;
+				}
+			} catch {
+				if (!watchdogActive || stopRequested) return;
+				stopRequested = true;
+				daemon.requestStop("stop");
+				logger.warn("telegram-daemon: configuration verification failed; stopping command ingress");
+				return;
+			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
 				lastHeartbeatAt = heartbeatAt;
 				stalledSince = now();
@@ -536,8 +565,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				daemon.requestStop("stop");
 			}
 		} catch {
-			// Missing, malformed, or temporarily unreadable state is ambiguous.
-			// Stop only on positive supersession or observed non-progress.
+			// Ambiguous ownership state does not authorize owner replacement.
+			// Configuration verification has its own fail-closed boundary above.
 		} finally {
 			watchdogTickInFlight = false;
 		}

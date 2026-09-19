@@ -8,11 +8,13 @@ import {
 	applyPreparedModelProfileActivation,
 	formatModelProfileCredentialError,
 	ModelProfileCredentialError,
+	ModelProfileUnknownProviderError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 	restoreMaterializedModelProfileForDeletion,
+	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -1855,6 +1857,145 @@ describe("model profile activation", () => {
 			}),
 		).rejects.toThrow('Unknown model profile "missing". Available profiles: alpha, beta');
 	});
+	test("required provider this build does not know is a build mismatch, not a credential gap", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": { executor: "provider-a/original" },
+			"modelProfile.default": "old-profile",
+		});
+		const profile: ModelProfileDefinition = {
+			name: "from-newer-build",
+			requiredProviders: ["openai-codex", "future-provider-x"],
+			modelMapping: { default: "future-provider-x/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getConfiguredProviderIds: () => [],
+		} as unknown as ModelRegistry;
+
+		const error = (await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: profile.name,
+		}).catch((caught: unknown) => caught)) as ModelProfileUnknownProviderError;
+
+		expect(error).toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(error).toBeInstanceOf(ModelProfileCredentialError);
+		expect(error.code).toBe("unknown_provider");
+		// Only the undeclared, unshipped provider is named; openai-codex ships in
+		// every build and stays a credential concern.
+		expect(error.providers).toEqual(["future-provider-x"]);
+		expect(error.message).toBe(
+			'Model profile "from-newer-build" requires provider(s) this build does not know: future-provider-x. The profile likely targets a newer or custom build; declare the provider(s) in models.yml or use a build that ships them.',
+		);
+		expect(error.message).not.toContain("Run /login");
+		expect(session.setModelTemporaryCalls).toEqual([]);
+		expect(settings.get("modelProfile.default")).toBe("old-profile");
+	});
+
+	test("required provider declared in models.yml keeps the credential diagnosis", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "declared-provider",
+			requiredProviders: ["future-provider-x"],
+			modelMapping: { default: "future-provider-x/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ missingProviders: ["future-provider-x"], profiles: [profile] }),
+			getConfiguredProviderIds: () => ["future-provider-x"],
+		} as unknown as ModelRegistry;
+
+		await expect(
+			activateModelProfile({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(
+			'Model profile "declared-provider" requires credentials for: future-provider-x. Run /login and configure the missing provider(s), then retry.',
+		);
+	});
+
+	test("alternative groups only report unknown providers when every member is unknown", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-provider-group",
+			requiredProviders: ["future-provider-x", "provider-a"],
+			alternativeProviderGroups: [["future-provider-x", "provider-a"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const registry = {
+			...fakeRegistry({ missingProviders: ["future-provider-x"], profiles: [profile] }),
+			getConfiguredProviderIds: () => ["provider-a"],
+		} as unknown as ModelRegistry;
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "provider-a", id: "default" });
+	});
+
+	test("runtime-registered provider satisfies the unknown-provider gate", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-runtime-provider-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		const runtimeRegistry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+		try {
+			runtimeRegistry.registerProvider("runtime-provider", {
+				baseUrl: "https://runtime-provider.example.test/v1",
+				api: "openai-completions",
+				apiKey: "RUNTIME_PROVIDER_KEY",
+				models: [
+					{
+						id: "default",
+						name: "Runtime Default",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1000,
+						maxTokens: 1000,
+					},
+				],
+			});
+			expect(runtimeRegistry.isKnownProvider("runtime-provider")).toBe(true);
+
+			const profile: ModelProfileDefinition = {
+				name: "runtime-provider-profile",
+				requiredProviders: ["runtime-provider"],
+				modelMapping: { default: "runtime-provider/default" },
+				source: "user",
+			};
+			const baseRegistry = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...baseRegistry,
+				getConfiguredProviderIds: () => [],
+				isKnownProvider: runtimeRegistry.isKnownProvider.bind(runtimeRegistry),
+				getApiKeyForProvider: runtimeRegistry.getApiKeyForProvider.bind(runtimeRegistry),
+				getAll: runtimeRegistry.getAll.bind(runtimeRegistry),
+				getAvailable: runtimeRegistry.getAvailable.bind(runtimeRegistry),
+				getAvailableForProfileActivation: runtimeRegistry.getAvailableForProfileActivation.bind(runtimeRegistry),
+			} as unknown as ModelRegistry;
+
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "runtime-provider", id: "default" });
+		} finally {
+			await runtimeRegistry.dispose();
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
 
 	test("apply rolls back runtime changes when persistence throws", async () => {
 		const session = fakeSession();
@@ -2473,6 +2614,76 @@ describe("preset-equivalent profile activation", () => {
 });
 
 describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
+	test("preserves an exported model when native discovery also exposes its wire id", () => {
+		const models = [
+			model("opencodex", "anthropic/claude-opus-5"),
+			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5"), wireModelId: "anthropic/claude-opus-5" },
+		];
+		expect(
+			rewriteSelectorForProxy(
+				"anthropic/claude-opus-5",
+				"opencodex",
+				"always",
+				models,
+				new Set(),
+				new Set(["anthropic"]),
+			),
+		).toBe("opencodex/anthropic/claude-opus-5");
+	});
+
+	test("retains public proxy aliases when a distinct wire id is configured", () => {
+		const alias = { ...model("litellm", "xai/grok-4.3"), wireModelId: "deployment-42" };
+		expect(
+			rewriteSelectorForProxy("xai/grok-4.3:high", "litellm", "always", [alias], new Set(), new Set(["xai"])),
+		).toBe("litellm/xai/grok-4.3:high");
+	});
+
+	test("rejects ambiguous wire ids instead of choosing an arbitrary pool route", () => {
+		const aliases = ["one", "two"].map(id => ({ ...model("opencodex", id), wireModelId: "gpt-5.6-terra" }));
+		expect(() =>
+			rewriteSelectorForProxy(
+				"openai-codex/gpt-5.6-terra",
+				"opencodex",
+				"always",
+				aliases,
+				new Set(),
+				new Set(["openai-codex"]),
+			),
+		).toThrow("ambiguous models");
+	});
+
+	test("routes every Opus + Codex role through discovered OpenCodex without a models.yml entry", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "opus-codex")!;
+		const base = fakeRegistry({ profiles: [profile] });
+		const discovered = base
+			.getAll()
+			.filter(model => model.provider === "anthropic" || model.provider === "openai-codex")
+			.map(model => {
+				const wireModelId = model.provider === "anthropic" ? `anthropic/${model.id}` : model.id;
+				return { ...model, provider: "opencodex", id: `opencodex/${wireModelId}`, wireModelId };
+			});
+		const registry = {
+			...base,
+			getAll: () => [...base.getAll(), ...discovered],
+			getConfiguredProviderIds: () => [],
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : `key-${provider}`),
+		};
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "opencodex", "modelProfile.proxyMode": "always" }),
+			profileName: "opus-codex",
+		});
+		expect(prepared.defaultModel?.provider).toBe("opencodex");
+		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "opencodex/opencodex/gpt-5.6-terra:low",
+			architect: "opencodex/opencodex/gpt-5.6-sol:high",
+			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
+			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+		});
+	});
+
 	const proxyModel = (id: string, thinking?: Model["thinking"]): Model => model("litellm", id, thinking);
 
 	// xai/grok-4.3 is pinned by builtin grok profiles and is proxy-routable.
@@ -2759,7 +2970,10 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		const registry = {
 			...base,
 			getAll: () => [...base.getAll(), proxyModel("acme-private/alpha")],
-			getConfiguredProviderIds: () => ["litellm"],
+			// acme-private models a user-declared custom provider, so it must be
+			// part of the configured ids or activation diagnoses it as a provider
+			// this build does not know instead of a missing credential.
+			getConfiguredProviderIds: () => ["litellm", "acme-private"],
 			getApiKeyForProvider: async (provider: string) =>
 				provider === "litellm" ? "key-litellm" : base.getApiKeyForProvider(provider),
 		};

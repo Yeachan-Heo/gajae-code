@@ -25,6 +25,49 @@ afterEach(async () => {
 });
 
 describe("OpenCodex discovery", () => {
+	test("uses the public catalog without management credentials and retains capabilities", async () => {
+		const calls: string[] = [];
+		spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(
+				async (input: string | Request | URL, init?: RequestInit) => {
+					const url = String(input);
+					calls.push(url);
+					expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+					if (url.endsWith("/healthz")) return Response.json({ ok: true, version: "opencodex", port: 10100 });
+					if (url.endsWith("/v1/models"))
+						return Response.json({
+							object: "list",
+							data: [
+								{
+									id: "anthropic/claude-opus-5",
+									capabilities: {
+										context_length: 1_000_000,
+										input_modalities: ["text", "image"],
+										supports_reasoning: true,
+									},
+								},
+								{ id: "gpt-5.6-terra", capabilities: { supports_reasoning: false } },
+								null,
+							],
+						});
+					return new Response("management authentication required", { status: 401 });
+				},
+				{ preconnect: originalFetch.preconnect },
+			),
+		);
+		const models = await fetchOpenCodexModels();
+		expect(calls).toEqual(["http://127.0.0.1:10100/healthz", "http://127.0.0.1:10100/v1/models"]);
+		expect(models).toHaveLength(2);
+		expect(models?.[0]).toMatchObject({
+			id: "opencodex/anthropic/claude-opus-5",
+			wireModelId: "anthropic/claude-opus-5",
+			contextWindow: 1_000_000,
+			input: ["text", "image"],
+			reasoning: true,
+		});
+		expect(models?.[1]).toMatchObject({ wireModelId: "gpt-5.6-terra", reasoning: false });
+	});
+
 	test("prefers runtime metadata before the default port and preserves raw model ids", async () => {
 		await Bun.write(path.join(tempHome, "runtime-port.json"), JSON.stringify({ hostname: "127.0.0.1", port: 10201 }));
 		const calls: string[] = [];
@@ -42,7 +85,7 @@ describe("OpenCodex discovery", () => {
 		);
 
 		const models = await fetchOpenCodexModels();
-		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10201/api/models"]);
+		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10201/v1/models"]);
 		expect(models?.[0]).toMatchObject({
 			id: "opencodex/provider/model",
 			wireModelId: "provider/model",
@@ -153,7 +196,7 @@ describe("OpenCodex discovery", () => {
 		);
 
 		expect(await fetchOpenCodexModels()).toBeNull();
-		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10201/api/models"]);
+		expect(calls).toEqual(["http://127.0.0.1:10201/healthz", "http://127.0.0.1:10201/v1/models"]);
 		expect(redirects).toEqual(["error", "error"]);
 	});
 

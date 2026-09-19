@@ -1,3 +1,0 @@
-### Fixed
-
-- Claude Code compatibility attribution moved from `2.1.257` to `2.1.273`, and the Gemini CLI spoofed version from `0.58.0` to `0.60.0`. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli/<version>` fingerprint surfaces as an HTTP 400 on a model the account can otherwise reach. Both constants had drifted since the scheduled `spoofed-version-sync` check landed, which is what failed that job.

@@ -70,6 +70,72 @@ const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 
+export interface BrokerStartupLockTestHooks {
+	onAcquired?: () => void;
+	onContended?: () => void;
+}
+
+/**
+ * Test-only phase observation for detached broker startup regressions. The
+ * signal is opt-in through the child environment and never affects broker
+ * ownership or error handling when the test seam is absent.
+ */
+export async function emitBrokerStartupTestSignal(signal: string): Promise<void> {
+	const directory = process.env.GJC_SDK_TEST_BROKER_SIGNAL_DIR;
+	if (!directory || !/^[a-z0-9-]+$/.test(signal)) return;
+	try {
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(directory, signal), `${process.pid}\n`);
+	} catch {
+		// Test observability must never change broker startup semantics.
+	}
+}
+
+/**
+ * The parent discovery budget published as a composition rather than a number.
+ * A test that stages a fence contention has to time itself against these legs,
+ * and retyping the sum makes it win or lose on scheduler noise while letting a
+ * change to any single leg silently re-tune it (#5604). This is the one source
+ * of truth for how the budget is built; nothing may restate the arithmetic.
+ */
+export const BROKER_DISCOVERY_BUDGET = {
+	staleRetirementMs: STALE_BROKER_RETIREMENT_TIMEOUT_MS,
+	startupLockWaitMs: STARTUP_LOCK_WAIT_MS,
+	publicationMs: BROKER_PUBLICATION_TIMEOUT_MS,
+	/** What the startup fence grants its holder: retirement plus one publication attempt. */
+	fenceOperationMs: STALE_BROKER_RETIREMENT_TIMEOUT_MS + BROKER_PUBLICATION_TIMEOUT_MS,
+	/**
+	 * When a child spawned under the parent's spawn lock gives up on the fence,
+	 * measured from that lock acquisition: the parent retires the stale incumbent
+	 * first, then the child exhausts its own fence wait. Not a production
+	 * constant -- an emergent property of the two legs that precede publication.
+	 */
+	childFenceWaitMs: STALE_BROKER_RETIREMENT_TIMEOUT_MS + STARTUP_LOCK_WAIT_MS,
+	discoveryMs: DISCOVERY_TIMEOUT_MS,
+} as const;
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Clock the discovery budget is measured on. The default is the real one; a test
+ * installs a virtual clock to assert the composition order -- stale retirement,
+ * then the child fence, then startup and publication -- in-process instead of
+ * racing three wall clocks against each other (#5604). Reaping keeps its own
+ * {@link ReapTiming} seam and is deliberately not driven from here.
+ */
+export interface EnsureBrokerTiming {
+	now(): number;
+	sleep(ms: number): Promise<void>;
+}
+
+const REAL_ENSURE_BROKER_TIMING: EnsureBrokerTiming = { now: Date.now, sleep };
+let ensureBrokerTiming: EnsureBrokerTiming = REAL_ENSURE_BROKER_TIMING;
+
+/** Test hook: drives the discovery budget on a controllable clock. */
+export function setEnsureBrokerTimingForTest(timing: EnsureBrokerTiming | undefined): void {
+	ensureBrokerTiming = timing ?? REAL_ENSURE_BROKER_TIMING;
+}
+
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
 interface BrokerLockHostIdentity {
@@ -104,7 +170,7 @@ async function readBrokerDiscoveryBeforeDeadline(
 	heartbeatTtlMs: number | undefined,
 	deadline: number,
 ): Promise<BrokerDiscovery | null> {
-	const remainingMs = deadline - Date.now();
+	const remainingMs = deadline - ensureBrokerTiming.now();
 	if (!Number.isFinite(remainingMs)) return await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 	if (remainingMs <= 0) throw new Error("Timed out reading SDK broker discovery.");
 	const read = readBrokerDiscovery(agentDir, heartbeatTtlMs);
@@ -151,14 +217,17 @@ async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}
 export async function withBrokerStartupLock<T>(
 	agentDir: string,
 	operation: (deadline: number) => Promise<T>,
+	testHooks: BrokerStartupLockTestHooks = {},
 ): Promise<T> {
 	const hostIdentity = await brokerLockHostIdentity(agentDir);
 	return withFileLock(
 		path.join(agentDir, "sdk", STARTUP_LOCK_TARGET_NAME),
-		() => operation(Date.now() + STALE_BROKER_RETIREMENT_TIMEOUT_MS + BROKER_PUBLICATION_TIMEOUT_MS),
+		() => operation(ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.fenceOperationMs),
 		{
 			retries: Math.ceil(STARTUP_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 			retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
+			onAcquired: testHooks.onAcquired,
+			onContended: testHooks.onContended,
 			...hostIdentity,
 		},
 	);
@@ -275,7 +344,6 @@ const DEFAULT_REAP_TIMING: ReapTiming = {
 	gracefulMs: REAP_GRACEFUL_MS,
 	killVerifyMs: REAP_SIGKILL_CAP_MS,
 };
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * Terminate and reap a detached broker this process spawned, targeting the exact
@@ -410,9 +478,9 @@ export async function closeBrokerClientBeforeDeadline(
 ): Promise<void> {
 	const close = client.close();
 	void close.catch(() => undefined);
-	const remainingMs = deadline - Date.now();
+	const remainingMs = deadline - ensureBrokerTiming.now();
 	if (remainingMs <= 0) return;
-	await Promise.race([close, Bun.sleep(remainingMs)]);
+	await Promise.race([close, ensureBrokerTiming.sleep(remainingMs)]);
 }
 
 async function retireUnusableBroker(
@@ -420,7 +488,7 @@ async function retireUnusableBroker(
 	settings: EnsureBrokerSettings,
 	outerDeadline = Number.POSITIVE_INFINITY,
 ): Promise<void> {
-	const deadline = Math.min(outerDeadline, Date.now() + STALE_BROKER_RETIREMENT_TIMEOUT_MS);
+	const deadline = Math.min(outerDeadline, ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.staleRetirementMs);
 	let shutdownSucceeded = false;
 	try {
 		const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
@@ -443,10 +511,10 @@ async function retireUnusableBroker(
 		} catch {}
 	}
 	// Wait for the stale identity to disappear (owner-fenced: pid+incarnation).
-	while (Date.now() < deadline) {
+	while (ensureBrokerTiming.now() < deadline) {
 		const current = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
 		if (!sameBrokerOwner(current, stale)) break;
-		await sleep(STALE_BROKER_POLL_MS);
+		await ensureBrokerTiming.sleep(STALE_BROKER_POLL_MS);
 	}
 }
 
@@ -459,6 +527,7 @@ export async function reconcileBrokerGenerationForStartup(
 	if (!current) return undefined;
 	if (await isBrokerReusable(current)) return current;
 	await retireUnusableBroker(current, settings, deadline);
+	await emitBrokerStartupTestSignal("retirement-finished");
 	const replacement = await readBrokerDiscoveryBeforeDeadline(settings.agentDir, settings.heartbeatTtlMs, deadline);
 	return replacement && (await isBrokerReusable(replacement)) ? replacement : undefined;
 }
@@ -506,7 +575,7 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
 	const initialDiscoveryDeadline =
-		Date.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
+		ensureBrokerTiming.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 	const priorOwner = owners.get(settings.agentDir);
 	const existing = await readBrokerDiscoveryBeforeDeadline(
 		settings.agentDir,
@@ -514,7 +583,11 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		initialDiscoveryDeadline,
 	);
 	const restartIntent = await readBrokerRestartIntent(settings.agentDir);
-	if (restartIntent && restartIntent.expiresAt > Date.now() && restartIntent.requestId !== settings.restartRequestId)
+	if (
+		restartIntent &&
+		restartIntent.expiresAt > ensureBrokerTiming.now() &&
+		restartIntent.requestId !== settings.restartRequestId
+	)
 		throw new Error("broker_restart_in_progress");
 	if (initiator === "fixture-lease" && (priorOwner || existing)) throw fixtureLeaseUnavailable();
 	if (priorOwner) {
@@ -543,9 +616,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
 	try {
 		const deadline =
-			Date.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
+			ensureBrokerTiming.now() +
+			(initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 		const lockedIntent = await readBrokerRestartIntent(settings.agentDir);
-		if (lockedIntent && lockedIntent.expiresAt > Date.now() && lockedIntent.requestId !== settings.restartRequestId)
+		if (
+			lockedIntent &&
+			lockedIntent.expiresAt > ensureBrokerTiming.now() &&
+			lockedIntent.requestId !== settings.restartRequestId
+		)
 			throw new Error("broker_restart_in_progress");
 		// The lock winner may still find a discovery published by an earlier winner
 		// that finished between our first read and the lock acquisition.
@@ -572,7 +650,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		// parent's diagnostic handle must not discard exact ownership of a live child.
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
-		while (Date.now() < deadline) {
+		while (ensureBrokerTiming.now() < deadline) {
 			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
 			try {
 				const discovered = await readBrokerDiscoveryBeforeDeadline(
@@ -582,7 +660,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				);
 				if (discovered) {
 					if (!(await isBrokerReusable(discovered))) {
-						await sleep(50);
+						await ensureBrokerTiming.sleep(50);
 						continue;
 					}
 					if (owner.markReady(discovered)) {
@@ -596,7 +674,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			} catch (error) {
 				discoveryError = error;
 			}
-			await sleep(50);
+			await ensureBrokerTiming.sleep(50);
 		}
 		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
 		if (exitedBeforeDiscovery && child.exitCode === 0) {
@@ -616,7 +694,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 						await owner.stop();
 						return { kind: "external-discovery", discovery: winner };
 					}
-					await sleep(50);
+					await ensureBrokerTiming.sleep(50);
 				}
 			} catch {
 				// fall through to cleanup + failure
@@ -649,8 +727,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			// reaches the end of its publication allowance, so keep the parent attached
 			// to the exact agent dir and give that incumbent one final bounded chance to
 			// publish before treating the replacement failure as terminal.
-			const recoveryDeadline = Math.min(deadline, Date.now() + BROKER_PUBLICATION_TIMEOUT_MS);
-			while (Date.now() < recoveryDeadline) {
+			const recoveryDeadline = Math.min(deadline, ensureBrokerTiming.now() + BROKER_DISCOVERY_BUDGET.publicationMs);
+			while (ensureBrokerTiming.now() < recoveryDeadline) {
 				try {
 					const incumbent = await readBrokerDiscoveryBeforeDeadline(
 						settings.agentDir,
@@ -665,7 +743,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					// Keep the bounded retry alive; a transient read failure is not
 					// authority to classify the incumbent as failed.
 				}
-				await sleep(50);
+				await ensureBrokerTiming.sleep(50);
 			}
 		}
 		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";

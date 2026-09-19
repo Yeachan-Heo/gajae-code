@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+### Added
+
+- Union Alpha Free on OpenCode Go and Zen with Anthropic Messages routing, image input, reasoning, and the published free-tier limits.
+
+### Fixed
+
+- Share Cursor HTTP/2 write error and close listeners across pending frames to avoid listener-limit warnings during write bursts while preserving write-failure and drain-timeout handling.
+
+- Discover local OpenCodex models through the public `/v1/models` endpoint instead of the admin-only management API, preserving public context, input, and reasoning capabilities.
+
+- Preserve OpenCode protocol-specific base URLs during model discovery and recover reviewed Union Alpha limits from pre-catalogue discovery caches.
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Added
 
 - Devin CLI is now a first-class provider (`devin`, api `devin-acp`). Devin publishes no model-inference endpoint, so GJC speaks its documented programmatic surface instead: it spawns `devin acp` and drives the Agent Client Protocol over stdio. Devin owns model selection (discovered from the account's ACP session `model` config option), tool execution, conversation history, and usage; GJC renders Devin's tool calls read-only and always ends the turn with a normal stop so they are never re-executed, forwards cancellation as ACP `session/cancel`, and answers Devin's permission requests from `GJC_DEVIN_PERMISSION_MODE` (`allow` grants `allow_once` and cancels when none is offered, never granting a persistent approval; `deny` rejects; invalid values fail closed). Maintenance and utility calls that need a text model — compaction, handoff, branch summaries, session titles — are refused instead of being spent on a Devin agent turn; `StreamOptions.maintenanceCall` marks them. See `docs/devin-provider.md`.
@@ -38,6 +56,8 @@
 - A started non-abortable Cursor mutation now keeps stream/run terminal publication behind the mutation's actual settlement. Caller abort and the local exec deadline still determine the eventual terminal reason, but neither can publish while an archive write may still commit, preventing post-terminal filesystem mutation (#4834 review).
 - Cursor `delete` is now part of the non-abortable settlement fence: its dispatch forwards `markNonAbortable` through the Agent run guard and the coding-agent bridge marks before the unlink runs, so a caller abort or deadline can no longer publish the exec terminal while the deletion is still in flight (#4834 review).
 - Cursor usage-context caching now hashes only normalized wire-visible tool definitions instead of complete class-backed tool instances. Session state containing filesystem `bigint` identities can no longer fail requests during preflight serialization, while tool name, description, and schema changes still invalidate cached conversation state.
+
+- Claude Code compatibility attribution moved from `2.1.257` to `2.1.273`, and the Gemini CLI spoofed version from `0.58.0` to `0.60.0`. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli/<version>` fingerprint surfaces as an HTTP 400 on a model the account can otherwise reach. Both constants had drifted since the scheduled `spoofed-version-sync` check landed, which is what failed that job.
 
 ## [0.16.7] - 2026-09-13
 

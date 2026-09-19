@@ -229,7 +229,14 @@ afterEach(async () => {
 	}
 });
 
-describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detached owner lifecycle, B1)", () => {
+// Not platform-gated. `tmux` here is a bash fixture (`createFakeTmuxBin`) and the cgroup
+// inputs are injected through `GJC_HARNESS_TEST_*`, so these cases carry no real Linux
+// dependency; `tmux-owner-isolation` is parameterized on `platform` and handles non-Linux
+// through an explicit `not_applicable` classification. A blanket
+// `describe.skipIf(process.platform !== "linux")` made every case here invisible on macOS,
+// which left CI as the only place they ran and made a red `dev` undiagnosable (#5399).
+// One case below is genuinely Linux-bound and is gated individually.
+describe("gjc harness start --detach (detached owner lifecycle, B1)", () => {
 	it("spawns a tmux-resident owner; submit + finalize route to it cross-process; retire stops it", async () => {
 		const started = await runHarness([
 			"start",
@@ -281,8 +288,16 @@ describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detac
 		// Owner-backed finalize: the evidence gate HONESTLY refuses without real commit/PR/tests
 		// (no fake completion evidence in shipped code).
 		const fin = await runHarness(["finalize", "--session", SID]);
-		const finEvidence = (fin.json?.evidence as Record<string, unknown>).finalize as Record<string, unknown>;
-		expect(finEvidence).toBeTruthy();
+		const finRoot = (fin.json?.evidence ?? {}) as Record<string, unknown>;
+		// `#finalizeVerb` (commands/harness.ts) answers `{ completed: false, reason: "owner-not-live" }`
+		// with NO `finalize` key when the owner route fails, so reading `evidence.finalize` first
+		// reports a bare `Received: undefined` and hides why. Project the routing reason into the
+		// assertion so a dead or unreachable owner names itself in the failure output (#5399).
+		expect({ hasFinalize: "finalize" in finRoot, reason: finRoot.reason ?? null }).toEqual({
+			hasFinalize: true,
+			reason: null,
+		});
+		const finEvidence = finRoot.finalize as Record<string, unknown>;
 		expect(finEvidence.completed).toBe(false);
 		expect((finEvidence.blockers as unknown[]).length).toBeGreaterThan(0);
 
@@ -353,24 +368,33 @@ describe.skipIf(process.platform !== "linux")("gjc harness start --detach (detac
 			reason: "lifecycle-blocked",
 		});
 	}, 60_000);
-	it("fails closed without detached fallback when scoped bootstrap fails", async () => {
-		const systemdRun = path.join(root, ".test-bin", "systemd-run");
-		await writeFile(systemdRun, "#!/usr/bin/env bash\nexit 9\n", "utf8");
-		await chmod(systemdRun, 0o755);
-		const started = await runHarness(
-			["start", "--input", JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID, detach: true })],
-			{
-				GJC_HARNESS_TEST_CALLER_CGROUP: "/system.slice/caller.service\n",
-				PATH: `${path.dirname(systemdRun)}:${process.env.PATH ?? ""}`,
-			},
-		);
-		expect(started.code).toBe(1);
-		const evidence = started.json?.evidence as Record<string, unknown>;
-		expect(evidence.ownerRuntime).toBe("manual");
-		expect(evidence.ownerFallbackReason).toBe("tmux-owner-scope_bootstrap_failed:tmux-owner-cleanup_uncertain");
-		expect(evidence.reason).toBe("tmux-owner-isolation-failed");
-		expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
-	}, 60_000);
+	// The only genuinely Linux-bound case in this describe: it drives the `unsafe_service`
+	// cgroup branch, and `classifyCgroup` answers `not_applicable` for every non-Linux
+	// platform by design, so the scope-bootstrap failure it asserts cannot arise elsewhere.
+	// The CLI runs in a spawned subprocess, so the platform cannot be injected the way
+	// #5673 injects it into an in-process server factory. Gate this test, not the suite.
+	it.skipIf(process.platform !== "linux")(
+		"fails closed without detached fallback when scoped bootstrap fails",
+		async () => {
+			const systemdRun = path.join(root, ".test-bin", "systemd-run");
+			await writeFile(systemdRun, "#!/usr/bin/env bash\nexit 9\n", "utf8");
+			await chmod(systemdRun, 0o755);
+			const started = await runHarness(
+				["start", "--input", JSON.stringify({ harness: "gajae-code", workspace, sessionId: SID, detach: true })],
+				{
+					GJC_HARNESS_TEST_CALLER_CGROUP: "/system.slice/caller.service\n",
+					PATH: `${path.dirname(systemdRun)}:${process.env.PATH ?? ""}`,
+				},
+			);
+			expect(started.code).toBe(1);
+			const evidence = started.json?.evidence as Record<string, unknown>;
+			expect(evidence.ownerRuntime).toBe("manual");
+			expect(evidence.ownerFallbackReason).toBe("tmux-owner-scope_bootstrap_failed:tmux-owner-cleanup_uncertain");
+			expect(evidence.reason).toBe("tmux-owner-isolation-failed");
+			expect((started.json?.state as Record<string, unknown>).ownerLive).toBe(false);
+		},
+		60_000,
+	);
 	it("recover bootstraps an owner for a started session whose owner was never spawned (#421)", async () => {
 		gitInit(workspace);
 		// start WITHOUT --detach persists a `started` session with no owner lease/endpoint.

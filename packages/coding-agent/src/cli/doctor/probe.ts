@@ -1,5 +1,6 @@
 import { logger } from "@gajae-code/utils";
 import type { DoctorProbeKind, DoctorProbeReceipt } from "./probe-types";
+import { PROBE_OUTPUT_LIMIT_BYTES } from "./probe-types";
 
 const loaders = {
 	native: () => import("./native-probe"),
@@ -29,7 +30,7 @@ export async function runDoctorProbe(kind: DoctorProbeKind): Promise<void> {
 		};
 	}
 	const text = JSON.stringify(receipt);
-	if (Buffer.byteLength(text) > 64 * 1024) {
+	if (Buffer.byteLength(text) > PROBE_OUTPUT_LIMIT_BYTES) {
 		process.stdout.write(
 			`${JSON.stringify({ schemaVersion: 1, kind, status: "failed", reasonCode: "limit_exceeded", checks: [] })}\n`,
 		);

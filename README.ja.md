@@ -294,7 +294,7 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 </details>
 
 長いプロンプトを残したままにしても安全です。SDK プロンプトのデッドラインは進捗を反映する無操作リース
-（`sdk.promptDeadlineMs`、デフォルト 30 分）で、`sdk.promptMaxRuntimeMs`（デフォルト 6 時間）により上限が定められます。更新されるのは受理された turn に帰属するツール実行だけであり、ハートビートやストリーミングテキストでは更新されません。
+（`sdk.promptDeadlineMs`、デフォルト 60 分）で、`sdk.promptMaxRuntimeMs`（デフォルト 6 時間）により上限が定められます。更新されるのは受理された turn に帰属するツール実行だけであり、ハートビートやストリーミングテキストでは更新されません。
 
 1 セッションずつではなく多くのワークツリーへイベント駆動で展開する必要がある場合、ネイティブの
 [Coordinator MCP ブリッジ](docs/hermes-mcp-bridge.md)（`gjc mcp-serve coordinator`、`gjc setup hermes` でインストール）が、その形の委任ツールを提供します。

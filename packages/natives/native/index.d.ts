@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -349,15 +350,6 @@ export declare class NotificationServer {
   stopAndWait(): Promise<void>
 }
 
-export declare class PortableRecoveryFsRoot {
-  writeExclusive(relativeName: string, data: Uint8Array): RecoveryFsResult
-  replace(relativeName: string, data: Uint8Array): RecoveryFsResult
-  identity(): RecoveryFsResult
-  list(maxEntries: number): Array<string>
-  read(relativeName: string, maxBytes: number): RecoveryFsResult
-  close(): RecoveryFsResult
-}
-
 /** Stable process reference. */
 export declare class Process {
   /** Open a stable process reference from a PID. */
@@ -591,7 +583,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_16_7(): void
+export declare function __piNativesV0_17_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2161,8 +2153,6 @@ export interface NotificationEndpoint {
   /** The session id this endpoint serves. */
   sessionId: string
 }
-
-export declare function openPortableRecoveryFsRoot(rootPath: string): PortableRecoveryFsRoot
 
 /**
  * Acquire an immutable trusted-root descriptor. Linux is required; every

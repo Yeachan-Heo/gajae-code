@@ -3,7 +3,12 @@
  * Provider error text is retained only in the local diagnostic log; wire and
  * persisted reconciliation details expose a fixed redacted message.
  */
-import type { SdkPromptFailureCategory, SdkPromptFailurePhase, SdkPromptTerminalOutcome } from "./prompt-status";
+import type {
+	SdkPromptFailureCategory,
+	SdkPromptFailurePhase,
+	SdkPromptFailureRetryability,
+	SdkPromptTerminalOutcome,
+} from "./prompt-status";
 
 export const PROMPT_FAILURE_CODE_MAX = 64;
 const LOCAL_FAILURE_LOG_MAX = 16_384;
@@ -77,6 +82,43 @@ export function promptFailureCategory(
 	if (PROVIDER_REJECTED_CODES.has(code) || /^provider_http_4\d\d$/.test(code)) return "provider_rejected";
 	if (AGENT_RUNTIME_CODES.has(code)) return "agent_runtime";
 	return "unknown";
+}
+
+/**
+ * Whether the bounded category says an identical re-submission could still
+ * succeed. Read off the category alone, so it cannot drift from the sets above.
+ *
+ * `provider_transport` is the only transient class: every classifier in
+ * `PROVIDER_TRANSPORT_CODES` (and the 5xx range) describes the link to the
+ * provider failing, never a judgement about the request, so the same bytes may
+ * well succeed on a second attempt. That is exactly the class the shipped
+ * first-turn gate (`isStartupReadinessFailure`, issue #5574) already treats as
+ * re-submittable, so the wire signal and the internal gate stay in agreement.
+ *
+ * Everything else is terminal for this turn: `provider_rejected` is the provider
+ * judging this request (quota, refusal, 4xx) and re-sending it reproduces the
+ * rejection; `deadline` means the turn's budget is spent, which a re-submit does
+ * not restore; `agent_runtime` is a local fault that re-running the same prompt
+ * re-enters. `unknown` stays `unknown` — the module's standing contract is to
+ * preserve uncertain attribution rather than guess a recovery for it.
+ *
+ * This is advisory classification for the caller, not a retry gate: nothing in
+ * this repo's retry paths consults it.
+ */
+export function promptFailureRetryability(category: SdkPromptFailureCategory): SdkPromptFailureRetryability {
+	if (category === "provider_transport") return "transient";
+	if (category === "unknown") return "unknown";
+	return "terminal";
+}
+
+/**
+ * Whether a value is a safe bounded classifier token — the same rule
+ * `sanitizePromptFailure` and `assistantFailureCode` apply before retaining one.
+ * Anything else is provider text rather than a classifier and must not be
+ * forwarded to a caller.
+ */
+export function isSafePromptFailureCode(value: unknown): value is string {
+	return typeof value === "string" && value.length <= PROMPT_FAILURE_CODE_MAX && /^[A-Za-z0-9._-]+$/.test(value);
 }
 
 /**

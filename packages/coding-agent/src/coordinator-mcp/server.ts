@@ -307,6 +307,9 @@ interface CoordinatorServices {
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
+	/** Observable transitions for consumers coordinating with the filesystem-backed event wait. */
+	onCoordinatorEventWatchReady?: () => void;
+	onCoordinatorEventWake?: () => void;
 	/** Test barrier invoked after an accepted prompt receipt is durable and before turn finalization. */
 	afterPromptReceiptPersisted?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after an answer dispatch is claimed and before its final admission check. */
@@ -3188,18 +3191,24 @@ function waitForTurnStateChange(namespaceDir: string, turn: TurnRecord, timeoutM
 	return deferred.promise;
 }
 
-async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number): Promise<void> {
+async function waitForCoordinatorEvents(
+	namespaceDir: string,
+	timeoutMs: number,
+	onWatchReady?: () => void,
+	onWake?: () => void,
+): Promise<void> {
 	const deferred = Promise.withResolvers<void>();
 	const watchers: nodeFs.FSWatcher[] = [];
 	let settled = false;
-	const finish = () => {
+	const finish = (woke: boolean) => {
 		if (settled) return;
 		settled = true;
 		for (const watcher of watchers) watcher.close();
 		clearTimeout(timer);
+		if (woke) onWake?.();
 		deferred.resolve();
 	};
-	const timer = setTimeout(finish, Math.max(timeoutMs, 0));
+	const timer = setTimeout(() => finish(false), Math.max(timeoutMs, 0));
 	timer.unref?.();
 	const eventDir = eventsDir(namespaceDir);
 	const watchedDirs = [
@@ -3213,16 +3222,17 @@ async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number)
 		try {
 			const watcher = nodeFs.watch(dir, (_eventType, filename) => {
 				if (dir === eventDir) {
-					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
+					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish(true);
 					return;
 				}
-				if (typeof filename === "string" && filename.endsWith(".json")) finish();
+				if (typeof filename === "string" && filename.endsWith(".json")) finish(true);
 			});
 			watchers.push(watcher);
 		} catch {
 			// Directory may not be watchable on this platform; the timeout remains a bounded fallback.
 		}
 	}
+	onWatchReady?.();
 	return deferred.promise;
 }
 
@@ -4457,6 +4467,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					const liveTurn = admission.active_turn_id
 						? transaction.canonical.turns[admission.active_turn_id]
 						: undefined;
+					// The Q12 query runs outside this transaction. Re-check the turn that
+					// admission observed so cancellation or terminal reconciliation cannot
+					// make an in-flight empty snapshot look like a healthy running result.
+					if (
+						admission.active_turn_id &&
+						(!liveTurn || TERMINAL_TURN_STATUSES.has(liveTurn.status as TurnStatus))
+					) {
+						q12Admitted = false;
+						return;
+					}
 					// A headless ask opens a durable Q12 gate before the runtime has a
 					// distinct needs_user_input lifecycle marker. Admit that narrow,
 					// observable in-flight state only when the sidecar, active turn, and
@@ -4768,7 +4788,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 				options,
 			);
-			if (!q12Admitted || (liveInFlightCandidate && !liveInFlightAskAdmitted))
+			// A complete empty Q12 snapshot proves no pending gate at this revision,
+			// even while an authenticated, acknowledged turn is still running.
+			// Nonempty snapshots still require an admitted ask; all writer, waiting
+			// token and terminal fences above remain authoritative.
+			if (!q12Admitted || (liveInFlightCandidate && items.length > 0 && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,
@@ -8631,7 +8655,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (matched.length === 0 && timeoutMs > 0) {
 					const deadline = absoluteDeadline;
 					while (matched.length === 0 && Date.now() < deadline && !watchController.signal.aborted) {
-						await waitForCoordinatorEvents(namespaceDir, Math.min(50, Math.max(1, deadline - Date.now())));
+						await waitForCoordinatorEvents(
+							namespaceDir,
+							Math.min(50, Math.max(1, deadline - Date.now())),
+							services.onCoordinatorEventWatchReady,
+							services.onCoordinatorEventWake,
+						);
 						if (Date.now() >= deadline || watchController.signal.aborted) break;
 						try {
 							await exportRetainedDeliveries(32, watchController.signal);

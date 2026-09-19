@@ -26,6 +26,7 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
 import {
+	getMiniMaxThinkingMode,
 	hasOpus47ApiRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
@@ -3610,7 +3611,14 @@ function buildParams(
 		);
 	}
 
-	if (model.reasoning) {
+	const miniMaxMode = getMiniMaxThinkingMode(model, baseUrl);
+	if (model.reasoning && miniMaxMode === "toggle") {
+		// MiniMax's Messages endpoint defaults to off and only supports a
+		// switch. Claude budget_tokens/output_config.effort do not apply.
+		if (options?.thinkingEnabled !== undefined) {
+			params.thinking = { type: options.thinkingEnabled ? "adaptive" : "disabled" };
+		}
+	} else if (model.reasoning && miniMaxMode !== "always-on") {
 		if (options?.thinkingEnabled) {
 			const mode = model.thinking?.mode;
 			const requestedEffort = options.reasoning;

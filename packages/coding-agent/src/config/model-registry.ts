@@ -18,6 +18,7 @@ import {
 	getBundledModels,
 	getBundledProviders,
 	getEnvApiKey,
+	getMiniMaxThinkingMode,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
 	isCodexGpt56Tier,
@@ -280,6 +281,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (!modelSupportsReasoningControl(model)) return false;
+	if (getMiniMaxThinkingMode(model) === "toggle") return true;
 	if (model.provider === "openai" || model.provider === "openai-codex" || isDirectXaiReasoningEffortModel(model))
 		return true;
 	if (role === null) return false;
@@ -4768,6 +4770,25 @@ export class ModelRegistry {
 	/** Provider ids declared in models.yml, including override-only providers. */
 	getConfiguredProviderIds(): readonly string[] {
 		return [...this.#configuredProviderIds];
+	}
+
+	/**
+	 * Whether this registry can serve a provider id from any active source.
+	 *
+	 * Built-in providers are backed by the bundled AI catalog, configured
+	 * providers come from models.yml, and extension registrations are retained
+	 * in the runtime provider stores below. Runtime model/override state is
+	 * included for direct registrations that do not have an extension source id.
+	 */
+	isKnownProvider(provider: string): boolean {
+		return (
+			isKnownProvider(provider) ||
+			this.#configuredProviderIds.has(provider) ||
+			this.#runtimeProviderSourceByName.has(provider) ||
+			this.#runtimeModelOverlays.some(model => model.provider === provider) ||
+			this.#runtimeProviderApiKeys.has(provider) ||
+			this.#runtimeProviderOverrides.has(provider)
+		);
 	}
 
 	#isModelAvailable(model: Model<Api>, disabledProviders?: ReadonlySet<string>): boolean {

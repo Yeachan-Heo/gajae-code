@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
+import { PROVIDER_ACTIVATION_MAX_ATTEMPTS } from "../src/sdk/acp/adapter";
 import { SdkClientError } from "../src/sdk/client";
 
 import type { SessionAttachment } from "../src/sdk/router";
@@ -66,6 +67,45 @@ test("ACP provider activation retries the current Router attachment after rotati
 			attachment: secondAttachment,
 			frame: { type: "register_provider", capability: "ui" },
 		});
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider activation gives up with an attributable error when the attachment rotates on every attempt", async () => {
+	let currentGeneration = 1;
+	let registrations = 0;
+	let adapter!: AcpSdkAdapter;
+	const attachment = (generation: number): SessionAttachment => ({
+		authorityId: `session-1:${generation}`,
+		sessionId: "session-1",
+		generation,
+		isCurrent: () => currentGeneration === generation,
+		send: async () => {},
+		sendMaintenance: () => {},
+	});
+	adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations += 1;
+				// The Router hands the session to a fresh attachment before every registration
+				// is answered, so each round takes a lease on a connection that is already gone
+				// and the retry can never converge. The successor is accepted while it is still
+				// not current, because acceptAttachment starts its own background activation
+				// for a current attachment and this test is about one loop, not a fan-out.
+				adapter.acceptAttachment(attachment(currentGeneration + 1));
+				currentGeneration += 1;
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}-${registrations}` } };
+			},
+		} as never,
+		attachment: attachment(1),
+		sessionId: "session-1",
+		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+	});
+	try {
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_activation_exhausted" });
+		// The budget is spent in attempts, not wall clock, so the loop terminates promptly.
+		expect(registrations).toBe(PROVIDER_ACTIVATION_MAX_ATTEMPTS);
 	} finally {
 		await adapter.close();
 	}
