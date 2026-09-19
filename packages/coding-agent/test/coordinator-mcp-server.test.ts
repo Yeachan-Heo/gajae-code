@@ -89,9 +89,10 @@ installExactIdentityNatives();
  * Resolution time for the stubbed workflow gate. It MUST stay inside the
  * coordinator's compaction retention window and therefore MUST NOT be a literal.
  *
- * The product stamps this remote-supplied value onto the answer request's
- * `updated_at`, and `compactTransaction` deletes a `completed` request whose
- * `updated_at` is older than `RETENTION_MS` (30 days). A hardcoded date silently
+ * The product preserves this remote-supplied value as receipt metadata while
+ * stamping the answer request's `updated_at` from local persistence time, and
+ * `compactTransaction` deletes a `completed` request whose `updated_at` is older
+ * than `RETENTION_MS` (30 days). A hardcoded date silently
  * turns these cases red exactly 30 days after the day it names, with no code
  * change and nothing in git history to point at: the previous literal
  * `2026-08-20T00:00:00.000Z` expired at `2026-09-19T00:00:00Z`.

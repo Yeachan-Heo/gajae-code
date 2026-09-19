@@ -10996,7 +10996,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							if (status !== "accepted")
 								throw new SdkClientError("terminal_uncertain", "Workflow gate answer was not accepted.");
 							const reportedResolvedAt =
-								typeof resolution?.resolved_at === "string" ? resolution.resolved_at : undefined;
+								typeof resolution?.resolved_at === "string" &&
+								Number.isFinite(Date.parse(resolution.resolved_at))
+									? resolution.resolved_at
+									: undefined;
 							// The gate timestamp is remote metadata; retention must age the local receipt from
 							// the coordinator's own persistence time so a skewed or replayed response cannot
 							// delete a fresh answer.
