@@ -111,7 +111,12 @@ async function createFixture(
 		observeTerminalReservation?: boolean;
 		controlledRetryBackoff?: boolean;
 		priorTranscriptUserTurn?: boolean;
-		promptAcknowledgementError?: { code: string; message: string };
+		promptAcknowledgementError?: {
+			code: string;
+			message: string;
+			providerCode?: string;
+			phase?: "submission" | "post_start";
+		};
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -351,7 +356,7 @@ async function createFixture(
 							ok: false,
 							error: options.promptAcknowledgementError,
 						}),
-						);
+					);
 					return;
 				}
 				const response = JSON.stringify({
@@ -684,6 +689,41 @@ test("ACP projects a direct prompt_failed request rejection with retryability", 
 			phase: "submission",
 			category: "agent_runtime",
 			retryability: "terminal",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP preserves classifier fields on a direct prompt_failed request rejection", async () => {
+	const fixture = await createFixture({
+		promptAcknowledgementError: {
+			code: "prompt_failed",
+			message: "Prompt submission failed.",
+			providerCode: "upstream_stream_interrupted",
+			phase: "post_start",
+		},
+	});
+	try {
+		const pending = prompt(fixture, "direct classified prompt rejection");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const rejection = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			"direct classified prompt failure",
+		);
+
+		const failure = acpRequestFailure(rejection) as RequestError;
+		expect(failure).toBeInstanceOf(RequestError);
+		expect(failure.data).toMatchObject({
+			code: "prompt_failed",
+			details: "Prompt submission failed.",
+			phase: "post_start",
+			category: "provider_transport",
+			retryability: "transient",
+			providerCode: "upstream_stream_interrupted",
 		});
 	} finally {
 		fixture.dispose();
