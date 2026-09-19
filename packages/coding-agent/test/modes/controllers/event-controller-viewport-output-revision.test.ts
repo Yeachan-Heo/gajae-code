@@ -43,8 +43,8 @@ function createContext(handle: ToolExecutionHandle): {
 		settings: { get: () => true },
 		toolOutputExpanded: false,
 		chatContainer: new Container(),
-		session: { getToolByName: vi.fn() },
-		sessionManager: { getCwd: vi.fn(() => process.cwd()) },
+		session: { getToolByName: vi.fn(), agent: { appendMessage: vi.fn() } },
+		sessionManager: { getCwd: vi.fn(() => process.cwd()), appendMessage: vi.fn() },
 	} as unknown as InteractiveModeContext;
 	return {
 		ctx,
@@ -399,6 +399,93 @@ describe("EventController viewport output revision", () => {
 		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
 		expect(handle.updateResult).toHaveBeenCalledTimes(1);
 		expect(handle.consumeVisibleTranscriptChange).toHaveBeenCalledTimes(1);
+	});
+
+	it("retains orphan assistant output and publishes its committed viewport revision", async () => {
+		await Settings.init({ inMemory: true });
+		const handle: ToolExecutionHandle = {
+			updateArgs: vi.fn(),
+			updateResult: vi.fn(),
+			setArgsComplete: vi.fn(),
+			setExpanded: vi.fn(),
+		};
+		const { ctx, recordVisibleTranscriptMutation } = createContext(handle);
+		ctx.pendingTools.clear();
+		ctx.setWorkingMessage = vi.fn();
+		ctx.updateEditorBorderColor = vi.fn();
+		ctx.editor = { getText: () => "" } as never;
+		ctx.session = {
+			isCompacting: false,
+			isStreaming: false,
+			getLastAssistantMessage: vi.fn(() => undefined),
+			agent: { appendMessage: vi.fn(), state: { messages: [] } },
+		} as never;
+		ctx.sessionManager = {
+			appendMessage: vi.fn(),
+			getSessionName: vi.fn(() => ""),
+			getCwd: vi.fn(() => process.cwd()),
+		} as never;
+		ctx.planModeController = { flushPendingModelSwitch: vi.fn(async () => {}) } as never;
+		const controller = new EventController(ctx);
+		vi.spyOn(controller, "sendCompletionNotification").mockImplementation(() => {});
+
+		await controller.handleEvent({ type: "message_start", message: assistantMessage("") });
+		const component = ctx.streamingComponent!;
+		const partial = assistantMessage("orphan partial output");
+		await controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+		expect(recordVisibleTranscriptMutation).not.toHaveBeenCalled();
+
+		await controller.handleEvent({ type: "agent_end", messages: [] } as never);
+
+		expect(ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("orphan partial output");
+		expect(ctx.streamingComponent).toBeUndefined();
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
+	});
+
+	it("reconciles a pending assistant delta onto the reattached owner and advances one revision", async () => {
+		await Settings.init({ inMemory: true });
+		const handle: ToolExecutionHandle = {
+			updateArgs: vi.fn(),
+			updateResult: vi.fn(),
+			setArgsComplete: vi.fn(),
+			setExpanded: vi.fn(),
+		};
+		const { ctx, drain, recordVisibleTranscriptMutation } = createContext(handle);
+		ctx.pendingTools.clear();
+		const controller = new EventController(ctx);
+		await controller.handleEvent({ type: "message_start", message: assistantMessage("") });
+		const component = ctx.streamingComponent!;
+		const projection = vi.spyOn(component, "updateContent");
+		await controller.handleEvent({
+			type: "message_update",
+			message: assistantMessage("before reconcile"),
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+		recordVisibleTranscriptMutation.mockClear();
+		ctx.chatContainer.detachChild(component);
+		controller.resetAssistantTextPresentation();
+		ctx.chatContainer.clear();
+		ctx.chatContainer.addChild(component);
+		controller.rebindAssistantTextPresentation();
+		const latest = assistantMessage("after reconcile");
+		await controller.handleEvent({
+			type: "message_update",
+			message: latest,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		drain();
+
+		expect(ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(projection).toHaveBeenCalledTimes(1);
+		expect(projection).toHaveBeenLastCalledWith(latest, { streaming: true });
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("after reconcile");
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not revise for a synchronous no-op projection", async () => {

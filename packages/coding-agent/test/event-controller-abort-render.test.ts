@@ -10,7 +10,7 @@
  *   C2  errorMessage = undefined + aborted + no TTSR flag
  *       → `streamingMessage.errorMessage` is set to "Operation aborted";
  *         `updateContent` receives the original message ref.
- *   C3  isTtsrAbortPending = true + aborted
+ *   C3  ttsrAbort event snapshot + aborted
  *       → `updateContent` receives a message with `stopReason: "stop"`;
  *         `errorMessage` is NOT set (TTSR existing behavior unchanged).
  */
@@ -55,11 +55,7 @@ function makeAssistantMessage(overrides: Partial<AssistantMessage> = {}): Assist
 	};
 }
 
-function createFixture(opts: {
-	streamingMessage: AssistantMessage;
-	isTtsrAbortPending?: boolean;
-	retryAttempt?: number;
-}) {
+function createFixture(opts: { streamingMessage: AssistantMessage; retryAttempt?: number }) {
 	const updateContent = vi.fn();
 	const setUsageInfo = vi.fn();
 	const streamingComponent = { updateContent, setUsageInfo };
@@ -86,10 +82,12 @@ function createFixture(opts: {
 		streamingComponent,
 		streamingMessage: opts.streamingMessage,
 		pendingTools: new Map(),
+		setTodos: vi.fn(),
 		session: {
-			isTtsrAbortPending: opts.isTtsrAbortPending ?? false,
+			agent: { appendMessage: vi.fn() },
 			retryAttempt: opts.retryAttempt ?? 0,
 		},
+		sessionManager: { appendMessage: vi.fn() },
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);
@@ -97,10 +95,53 @@ function createFixture(opts: {
 }
 
 describe("EventController #handleMessageEnd abort labeling", () => {
+	it("reconciles optimistic todo state from a corrected persistence receipt", async () => {
+		const f = createFixture({ streamingMessage: makeAssistantMessage() });
+		const optimistic = [{ name: "Work", tasks: [{ content: "New task", status: "in_progress" as const }] }];
+		const durable = [{ name: "Prior", tasks: [{ content: "Durable task", status: "in_progress" as const }] }];
+
+		await f.controller.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "call_todo_write",
+			toolName: "todo_write",
+			result: { content: [], details: { phases: optimistic } },
+			isError: false,
+		} as never);
+		await f.controller.handleEvent({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "call_todo_write",
+				toolName: "todo_write",
+				content: [{ type: "text", text: "Todo state persistence failed" }],
+				details: { phases: durable, failureKind: "persistence" },
+				isError: true,
+				timestamp: Date.now(),
+			},
+		});
+
+		expect(f.ctx.setTodos).toHaveBeenNthCalledWith(1, optimistic);
+		expect(f.ctx.setTodos).toHaveBeenNthCalledWith(2, durable);
+	});
+
+	it("rebuilds the transcript after terminal persistence recovery", async () => {
+		const f = createFixture({ streamingMessage: makeAssistantMessage() });
+		f.ctx.rebuildChatFromMessages = vi.fn();
+
+		await f.controller.handleEvent({
+			type: "notice",
+			level: "info",
+			message: "Recovered interrupted assistant output into canonical session history.",
+			source: "terminal-persistence-recovered",
+		});
+
+		expect(f.ctx.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+	});
+
 	for (const ending of ["success", "error", "visible", "silent", "ttsr"] as const) {
 		it(`queued text cannot supersede authoritative ${ending} finalization`, async () => {
 			const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
-			const f = createFixture({ streamingMessage: initial, isTtsrAbortPending: ending === "ttsr" });
+			const f = createFixture({ streamingMessage: initial });
 			await f.controller.handleEvent({ type: "message_start", message: initial });
 			const component = f.ctx.streamingComponent!;
 			const projection = vi.spyOn(component, "updateContent");
@@ -126,7 +167,11 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 				errorMessage:
 					ending === "silent" ? SILENT_ABORT_MARKER : ending === "error" ? "provider failed" : undefined,
 			});
-			await f.controller.handleEvent({ type: "message_end", message: final });
+			await f.controller.handleEvent({
+				type: "message_end",
+				message: final,
+				...(ending === "ttsr" ? { ttsrAbort: true } : {}),
+			});
 			expect(f.preparations.size).toBe(0);
 			expect(usage).toHaveBeenCalledTimes(1);
 			const finalProjectionCount = projection.mock.calls.length;
@@ -188,7 +233,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 		});
 
 		await controller.handleEvent({ type: "message_end", message });
@@ -204,14 +248,11 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		expect(arg.errorMessage).toBe("Operation aborted");
 	});
 
-	it("C3: isTtsrAbortPending=true + aborted -> updateContent stopReason='stop', errorMessage NOT set", async () => {
+	it("C3: ttsrAbort event snapshot + aborted -> updateContent stopReason='stop', errorMessage NOT set", async () => {
 		const message = makeAssistantMessage({ stopReason: "aborted", errorMessage: undefined });
-		const { controller, streamingComponent } = createFixture({
-			streamingMessage: message,
-			isTtsrAbortPending: true,
-		});
+		const { controller, streamingComponent } = createFixture({ streamingMessage: message });
 
-		await controller.handleEvent({ type: "message_end", message });
+		await controller.handleEvent({ type: "message_end", message, ttsrAbort: true });
 
 		// TTSR keeps its existing flag-only render path — `errorMessage` stays undefined,
 		// and the display copy gets `stopReason: "stop"`.
@@ -228,7 +269,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 			retryAttempt: 1,
 		});
 
@@ -253,7 +293,6 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		});
 		const { controller, streamingComponent } = createFixture({
 			streamingMessage: message,
-			isTtsrAbortPending: false,
 			retryAttempt: 0,
 		});
 
@@ -264,5 +303,166 @@ describe("EventController #handleMessageEnd abort labeling", () => {
 		const arg = streamingComponent.updateContent.mock.calls[0]![0] as AssistantMessage;
 		expect(arg).toBe(message);
 		expect(arg.errorMessage).toBe(formatted);
+	});
+
+	it("orphan agent_end commits the latest partial assistant before terminal cleanup", async () => {
+		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: () => {
+				entered.resolve();
+				return gate.promise;
+			},
+		} as never;
+		let stopped = false;
+		f.ctx.isStopped = () => stopped;
+
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		const partial = makeAssistantMessage({
+			stopReason: "aborted",
+			errorMessage: undefined,
+			content: [{ type: "text", text: "partial" }],
+		});
+		await f.controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		const pending = f.controller.handleEvent({ type: "agent_end", messages: [partial] } as never);
+		await entered.promise;
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		expect(Bun.stripANSI(component.render(80).join("\n"))).toContain("partial");
+		expect(partial.errorMessage).toBe("Operation aborted");
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+		f.captured[0]!();
+		stopped = true;
+		gate.resolve();
+		await pending;
+	});
+
+	it("force-cancelled agent_end marks an orphan provisional partial as aborted", async () => {
+		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: () => {
+				entered.resolve();
+				return gate.promise;
+			},
+		} as never;
+		let stopped = false;
+		f.ctx.isStopped = () => stopped;
+
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		const partial = makeAssistantMessage({
+			stopReason: "stop",
+			content: [{ type: "text", text: "partial before forced cancellation" }],
+		});
+		await f.controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		const pending = f.controller.handleEvent({ type: "agent_end", messages: [], stopReason: "cancelled" } as never);
+		await entered.promise;
+
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(true);
+		const rendered = Bun.stripANSI(component.render(80).join("\n"));
+		expect(rendered).toContain("partial before forced cancellation");
+		expect(rendered).toContain("Operation aborted");
+		expect(partial.stopReason).toBe("stop");
+		expect(partial.errorMessage).toBeUndefined();
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+		stopped = true;
+		gate.resolve();
+		await pending;
+	});
+
+	it("force-cancelled agent_end preserves pending silent-abort suppression", async () => {
+		const initial = makeAssistantMessage({ stopReason: "stop", content: [] });
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		f.ctx.planModeController = {
+			flushPendingModelSwitch: () => {
+				entered.resolve();
+				return gate.promise;
+			},
+		} as never;
+		let stopped = false;
+		f.ctx.isStopped = () => stopped;
+
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		const partial = makeAssistantMessage({
+			stopReason: "stop",
+			content: [{ type: "text", text: "silent partial before forced recovery" }],
+		});
+		await f.controller.handleEvent({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0 },
+		} as never);
+
+		const pending = f.controller.handleEvent({
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			silentAbort: true,
+		} as never);
+		await entered.promise;
+
+		const rendered = Bun.stripANSI(component.render(80).join("\n"));
+		expect(rendered).toContain("silent partial before forced recovery");
+		expect(rendered).not.toContain("Operation aborted");
+		expect(rendered).not.toContain(SILENT_ABORT_MARKER);
+		expect(partial.stopReason).toBe("stop");
+		expect(partial.errorMessage).toBeUndefined();
+		stopped = true;
+		gate.resolve();
+		await pending;
+	});
+
+	it("terminal persistence failure removes the uncommitted live projection", async () => {
+		const initial = makeAssistantMessage({
+			stopReason: "stop",
+			content: [{ type: "text", text: "must not survive failed persistence" }],
+		});
+		const f = createFixture({ streamingMessage: initial });
+		f.ctx.setWorkingMessage = vi.fn();
+		f.ctx.planModeController = { flushPendingModelSwitch: vi.fn() } as never;
+		f.ctx.isStopped = () => false;
+		f.ctx.updateEditorBorderColor = vi.fn();
+		const recordVisibleTranscriptMutation = vi.fn();
+		f.ctx.recordVisibleTranscriptMutation = recordVisibleTranscriptMutation;
+		(f.ctx.session as unknown as { isCompacting: boolean }).isCompacting = true;
+		f.ctx.session.getLastAssistantMessage = () => makeAssistantMessage({ stopReason: "aborted" });
+		await f.controller.handleEvent({ type: "message_start", message: initial });
+		const component = f.ctx.streamingComponent!;
+		recordVisibleTranscriptMutation.mockClear();
+
+		await f.controller.handleEvent({
+			type: "agent_end",
+			messages: [],
+			stopReason: "cancelled",
+			terminalPersistenceFailed: true,
+		} as never);
+
+		expect(f.ctx.chatContainer.hasLiveChild(component)).toBe(false);
+		expect(f.ctx.streamingComponent).toBeUndefined();
+		expect(f.ctx.streamingMessage).toBeUndefined();
+		expect(recordVisibleTranscriptMutation).toHaveBeenCalledTimes(1);
 	});
 });

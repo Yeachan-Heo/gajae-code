@@ -180,7 +180,7 @@ describe("AgentSession fallback upstream request counts", () => {
 		maxAttempts: number,
 		streamFn: AgentOptions["streamFn"],
 		modelsOrSettings: { primary: Model; fallback: Model } | Record<string, unknown> = {},
-	): { primary: Model; fallback: Model } {
+	): { primary: Model; fallback: Model; sessionManager: SessionManager } {
 		const models =
 			"primary" in modelsOrSettings && "fallback" in modelsOrSettings
 				? (modelsOrSettings as { primary: Model; fallback: Model })
@@ -201,9 +201,10 @@ describe("AgentSession fallback upstream request counts", () => {
 			...settingsOverrides,
 		});
 		settings.setModelRole("default", selector(primary));
-		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 		session!.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
-		return { primary, fallback };
+		return { primary, fallback, sessionManager };
 	}
 
 	it("does not replay exported Alibaba lazy-stream timeouts for direct or managed-fallback requests", async () => {
@@ -473,7 +474,7 @@ describe("AgentSession fallback upstream request counts", () => {
 		const fallbackSwitches: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
 		const events: AgentSessionEvent[] = [];
 		let primaryCalls = 0;
-		const { primary, fallback } = createSession(1, (model, context, options) => {
+		const { primary, fallback, sessionManager } = createSession(1, (model, context, options) => {
 			calls.push({
 				selector: selector(model),
 				fallbackManaged: options?.fallbackManaged,
@@ -525,6 +526,9 @@ describe("AgentSession fallback upstream request counts", () => {
 		]);
 		expect(session!.messages.filter(message => message.role === "user")).toHaveLength(1);
 		expect(session!.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+		expect(
+			sessionManager.getBranch().filter(entry => entry.type === "message" && entry.message.role === "assistant"),
+		).toHaveLength(1);
 	});
 
 	it("advances typed 429 with hostile overflow prose without running maintenance", async () => {

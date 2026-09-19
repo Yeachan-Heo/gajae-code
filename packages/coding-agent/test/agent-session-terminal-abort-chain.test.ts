@@ -224,6 +224,11 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				// teardown itself is responsible for settling.
 				await manager.dispose({ timeoutMs: 3_000 });
 				await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				// #5321's sidecar-settlement wait, kept but moved AFTER the manager
+				// disposal above: awaiting session work before that dispose is the
+				// order 3224ac7e27 removed, because a completion callback owned by
+				// this manager can enqueue persistence and deadlock teardown.
+				await session.awaitSessionSettlement();
 				await session.dispose();
 			}
 		} finally {
@@ -1093,6 +1098,50 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		);
 		await promptPromise;
 	}, 30_000);
+
+	it("rejects an owned completion replayed from another live endpoint", async () => {
+		const foreignManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: () => {} });
+		const foreignEndpoint = `${chainSessionManager.getSessionId()}-foreign`;
+		AsyncJobManager.registerForEndpoint(foreignEndpoint, foreignManager);
+		const registration: TurnRegistrationKey = {
+			endpointId: foreignEndpoint,
+			endpointGeneration: 0,
+			lineageIdHash: "foreign-replay-lineage",
+			promptAttemptEpoch: 91,
+			jobId: "foreign-live-job",
+			jobGeneration: "job:foreign:1",
+		};
+		registerTerminalTurnScope({
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+		});
+		registerOwnedRegistration(registration, { isJobTerminal: () => false });
+		const envelope: OwnedCompletionEnvelope = {
+			lineageIdHash: registration.lineageIdHash,
+			promptAttemptEpoch: registration.promptAttemptEpoch,
+			registration,
+		};
+		try {
+			await expect(
+				session.sendCustomMessage(
+					{
+						customType: "async-result",
+						content: "foreign owned completion",
+						display: false,
+						details: { ownedCompletions: [envelope] },
+						attribution: "agent",
+					},
+					{ triggerTurn: true },
+				),
+			).rejects.toThrow("different session endpoint");
+			expect(
+				lookupOwnedRegistration(registration.jobId, registration.jobGeneration, registration.endpointId),
+			).toBeDefined();
+		} finally {
+			AsyncJobManager.unregisterManager(foreignManager);
+			await foreignManager.dispose({ timeoutMs: 1_000 });
+		}
+	});
 
 	it("removed steers never fire their ownership hook into a later rearm", async () => {
 		// Review thread P1: promotion hooks must bind to the messages a run

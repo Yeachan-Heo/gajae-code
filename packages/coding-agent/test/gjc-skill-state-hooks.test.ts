@@ -9,6 +9,7 @@ import { runNativeRalplanCommand } from "../src/gjc-runtime/ralplan-runtime";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
+	activeStateDir,
 	modeStatePath,
 	sessionSpecsDir,
 	sessionStateDir,
@@ -17,7 +18,9 @@ import { reconcileWorkflowSkillState } from "../src/gjc-runtime/state-runtime";
 import { RequiredOnWriteEnvelopeSchema } from "../src/gjc-runtime/state-schema";
 import {
 	detectWorkflowEnvelopeIntegrityMismatch,
+	mergeActiveEntrySubskills,
 	readActiveEntries,
+	removeActiveEntry,
 	writeActiveEntry,
 	writeGuardedJsonAtomic,
 	writeGuardedWorkflowEnvelopeAtomic,
@@ -476,6 +479,55 @@ describe("GJC native skill-state hooks", () => {
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
 
 		await expect(readVisibleSkillActiveState(root, "test-session")).resolves.toMatchObject(state);
+	});
+
+	it("does not resurrect a stale snapshot after authoritative entries are cleared", async () => {
+		const root = await cwd();
+		const sessionId = "test-cleared-authoritative-entries";
+		const stateDir = sessionStateDir(root, sessionId);
+		await fs.mkdir(activeStateDir(root, sessionId), { recursive: true });
+		await fs.writeFile(
+			path.join(stateDir, "skill-active-state.json"),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				skill: "ultragoal",
+				active_skills: [{ skill: "ultragoal", active: true, phase: "executing", session_id: sessionId }],
+			}),
+		);
+
+		await expect(
+			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
+		).resolves.toBeNull();
+
+		await writeActiveEntry(
+			root,
+			{ sessionId },
+			"deep-interview",
+			{
+				skill: "deep-interview",
+				active: true,
+				phase: "interviewing",
+				session_id: sessionId,
+			},
+			{ cwd: root },
+		);
+		await expect(
+			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
+		).resolves.toMatchObject({
+			skill: "deep-interview",
+			phase: "interviewing",
+			active_skills: [expect.objectContaining({ skill: "deep-interview" })],
+		});
+
+		await activeStateModule.applyHandoffToActiveState({
+			cwd: root,
+			caller: { cwd: root, skill: "deep-interview", active: false, phase: "handoff", sessionId },
+			callee: { cwd: root, skill: "ralplan", active: true, phase: "planner", sessionId },
+		});
+		const entries = await readActiveEntries(root, { sessionId });
+		expect(entries.map(entry => entry.skill).sort()).toEqual(["deep-interview", "ralplan"]);
+		expect(entries.some(entry => entry.skill === "ultragoal")).toBe(false);
 	});
 
 	it("fails open and logs when custom skill-active state is corrupt", async () => {
@@ -2013,6 +2065,37 @@ disabledExtensions:
 		expect(persistedMode.current_phase).toBe("requirements");
 		expect(persistedEntry.phase).toBe("requirements");
 		expect(rebuiltSnapshot.phase).toBe("requirements");
+	});
+
+	it("does not recreate an active entry removed before a subskill merge", async () => {
+		const root = await cwd();
+		const sessionId = "session-subskill-removal-race";
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "deep-interview", sessionId });
+		const [expected] = await readActiveEntries(root, { sessionId });
+		if (!expected) throw new Error("Expected seeded active entry");
+		await removeActiveEntry(root, { sessionId }, "deep-interview");
+
+		const merged = await mergeActiveEntrySubskills(
+			root,
+			{ sessionId },
+			"deep-interview",
+			expected,
+			[
+				{
+					plugin: "gjc",
+					subskillName: "ralplan",
+					parent: "deep-interview",
+					bindsTo: "session",
+					phase: "planner",
+					activationArg: "",
+				},
+			],
+			"2099-01-01T00:00:00.000Z",
+		);
+
+		expect(merged.result).toMatchObject({ written: false, reason: "stale-skip" });
+		expect(merged.predecessor).toBeUndefined();
+		expect(await readActiveEntries(root, { sessionId })).toEqual([]);
 	});
 
 	it("seeds ralplan repository binding for the first explicit-target role write", async () => {

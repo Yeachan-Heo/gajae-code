@@ -4269,7 +4269,13 @@ async function runLoopBody(
 				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
+					const result = createAbortedToolResult(
+						toolCall,
+						stream,
+						message.stopReason,
+						message.errorMessage,
+						attemptScope,
+					);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -4285,6 +4291,7 @@ async function runLoopBody(
 					});
 				}
 				stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+				await config.afterTurnEndPublished?.();
 				publishAgentEnd(
 					stream,
 					config,
@@ -4313,6 +4320,7 @@ async function runLoopBody(
 							stream,
 							"error",
 							"Tool calls are disabled during repeated malformed tool-call recovery.",
+							attemptScope,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -4365,7 +4373,42 @@ async function runLoopBody(
 				pendingRecovery = undefined;
 			}
 
+			const composerRecoveryExhausted = sawComposerBashPolicyBlock && composerBashPolicyRecoveryAttempted;
+			const malformedRecoveryAvailable = repeatedMalformedToolCall && !malformedToolRecoveryAttempted;
+			const malformedRecoveryExhausted =
+				consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS && !malformedRecoveryAvailable;
+			const policyTerminalCommitted =
+				!loopSignal.aborted && (composerRecoveryExhausted || malformedRecoveryExhausted);
+			if (policyTerminalCommitted && composerRecoveryExhausted) {
+				message.stopReason = "error";
+				const recoveryLimitMessage =
+					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${recoveryLimitMessage}`
+					: recoveryLimitMessage;
+			} else if (policyTerminalCommitted && malformedRecoveryExhausted) {
+				message.stopReason = "error";
+				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
+				message.errorMessage = message.errorMessage
+					? `${message.errorMessage} | ${breakerMessage}`
+					: breakerMessage;
+			}
+
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+			await config.afterTurnEndPublished?.();
+			if (policyTerminalCommitted) {
+				if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
+					config.requeueSteeringMessages?.(steeringMessagesFromExecution);
+				}
+				publishAgentEnd(
+					stream,
+					config,
+					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
+					attemptScope,
+				);
+				stream.end(newMessages);
+				return;
+			}
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
 				// Same aborted-run guard as the drain below: the steer interrupt unwound
@@ -4410,44 +4453,9 @@ async function runLoopBody(
 			if (sawComposerBashPolicyBlock && !composerBashPolicyRecoveryAttempted) {
 				pendingRecovery = { kind: "composer-bash-policy", inserted: false };
 				composerBashPolicyRecoveryAttempted = true;
-			} else if (sawComposerBashPolicyBlock) {
-				message.stopReason = "error";
-				const recoveryLimitMessage =
-					"Composer bash policy blocked repository file I/O again after its one automatic recovery turn. Continue with dedicated repository tools.";
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${recoveryLimitMessage}`
-					: recoveryLimitMessage;
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
-				return;
 			} else if (repeatedMalformedToolCall && !malformedToolRecoveryAttempted) {
 				pendingRecovery = { kind: "malformed-tool-call", inserted: false };
 				malformedToolRecoveryAttempted = true;
-			} else if (consecutiveMalformedTurns >= MAX_CONSECUTIVE_MALFORMED_TURNS) {
-				// Deterministic terminal circuit breaker. The one-shot recovery turn
-				// above already had its chance; if the model is still emitting only
-				// malformed tool calls after it, the run cannot make progress and must
-				// stop rather than burn the provider budget. Terminates on consecutive
-				// count, not argument signatures, so rotating invalid shapes are bounded
-				// too.
-				message.stopReason = "error";
-				const breakerMessage = `Stopping after ${consecutiveMalformedTurns} consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.`;
-				message.errorMessage = message.errorMessage
-					? `${message.errorMessage} | ${breakerMessage}`
-					: breakerMessage;
-				publishAgentEnd(
-					stream,
-					config,
-					buildAgentEndEvent(newMessages, telemetry, stepCounter.count, "completed", attemptScope),
-					attemptScope,
-				);
-				stream.end(newMessages);
-				return;
 			}
 		}
 
@@ -4993,6 +5001,16 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			promoteTypedEmptyResponseStop(trailing);
+			if (!config.fallbackManaged || (trailing.stopReason !== "error" && trailing.stopReason !== "aborted")) {
+				if (addedPartial) {
+					context.messages[context.messages.length - 1] = trailing;
+				} else {
+					context.messages.push(trailing);
+					stream.push({ type: "message_start", message: { ...trailing }, scope });
+				}
+				stream.push({ type: "message_end", message: trailing, scope });
+			}
 			await finishChat(trailing);
 			return trailing;
 		});
@@ -5134,6 +5152,7 @@ async function executeToolCalls(
 
 	const records = toolCalls.map(toolCall => {
 		const metadata = acceptedToolCallMetadata.get(toolCall) ?? escapedToolCallMetadata(toolCall);
+		const cleanupSettled = Promise.withResolvers<void>();
 		return {
 			toolCall: stripToolCallEvidence(toolCall),
 			metadata,
@@ -5147,6 +5166,9 @@ async function executeToolCalls(
 			toolResultMessage: undefined as ToolResultMessage | undefined,
 			resultEmitted: false,
 			argumentValidationFailed: false,
+			preDispatchEntered: false,
+			cleanupClaimed: false,
+			cleanupSettled,
 		};
 	});
 	const checkSteering = async (): Promise<void> => {
@@ -5305,14 +5327,79 @@ async function executeToolCalls(
 		record.started = true;
 	};
 
+	const settleDispatchedCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
+		if (record.cleanupClaimed) return record.cleanupSettled.promise;
+		record.cleanupClaimed = true;
+		try {
+			if (afterToolCall) {
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled after dispatch." }],
+								isError: true,
+								details: { cancellation: "after_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
+			}
+		} catch {
+			// Cancellation is authoritative; the hook is best-effort cleanup only.
+		} finally {
+			record.cleanupSettled.resolve();
+		}
+	};
+
+	const settlePreDispatchCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
+		if (record.cleanupClaimed) return record.cleanupSettled.promise;
+		record.cleanupClaimed = true;
+		try {
+			if (afterToolCall) {
+				await Promise.race([
+					afterToolCall(
+						{
+							assistantMessage,
+							toolCall: record.toolCall,
+							args: record.args,
+							result: {
+								content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+								isError: true,
+								details: { cancellation: "before_dispatch" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					),
+					Bun.sleep(1_000),
+				]);
+			}
+		} catch {
+			// Cancellation is authoritative; the hook is best-effort cleanup only.
+		} finally {
+			record.cleanupSettled.resolve();
+		}
+	};
+
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (record.skipped || interruptState.triggered) {
+		if (record.skipped || interruptState.triggered || signal?.aborted) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
 			record.skipped = true;
+			record.cleanupClaimed = true;
+			record.cleanupSettled.resolve();
 			return;
 		}
+		record.preDispatchEntered = true;
 
 		record.toolCall = stripToolCallEvidence(record.toolCall);
 		const { toolCall, tool } = record;
@@ -5349,6 +5436,7 @@ async function executeToolCalls(
 		let result: AgentToolResult<any> = { content: [], details: {} };
 		let isError = false;
 		let caughtError: unknown;
+		let preDispatchCancellationResult: AgentToolResult<any> | undefined;
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
@@ -5483,14 +5571,23 @@ async function executeToolCalls(
 					effectiveArgs,
 					toolContext,
 				);
-				// Preparation is complete. A successful publication is the only transition
-				// that marks this record dispatched; intrinsic invocation then consumes locals.
-				publishToolDispatch(record, startEvent);
-				const execution = intrinsicReflectApply(execute, tool, invocationArguments);
-				const rawResult = await execution;
-				const coerced = coerceToolResult(rawResult);
-				result = coerced.result;
-				if (coerced.malformed || result.isError) isError = true;
+				if (toolSignal.aborted) {
+					record.skipped = true;
+					preDispatchCancellationResult = {
+						content: [{ type: "text", text: "Tool call cancelled before dispatch." }],
+						isError: true,
+						details: { cancellation: "before_dispatch" },
+					};
+				} else {
+					// Preparation is complete. A successful publication is the only transition
+					// that marks this record dispatched; intrinsic invocation then consumes locals.
+					publishToolDispatch(record, startEvent);
+					const execution = intrinsicReflectApply(execute, tool, invocationArguments);
+					const rawResult = await execution;
+					const coerced = coerceToolResult(rawResult);
+					result = coerced.result;
+					if (coerced.malformed || result.isError) isError = true;
+				}
 			} catch (e) {
 				caughtError = e;
 				result = {
@@ -5499,8 +5596,35 @@ async function executeToolCalls(
 				};
 				isError = true;
 			}
+			if (afterToolCall && !record.started && !record.cleanupClaimed) {
+				record.cleanupClaimed = true;
+				try {
+					await afterToolCall(
+						{
+							assistantMessage,
+							toolCall,
+							args: record.args,
+							result: preDispatchCancellationResult ?? {
+								content: [{ type: "text", text: "Tool call failed before dispatch." }],
+								isError: true,
+								details: { cancellation: "pre_dispatch_failure" },
+							},
+							isError: true,
+							context: currentContext,
+						},
+						toolSignal,
+					);
+				} catch {
+					// Pre-dispatch failure is authoritative; cleanup hooks are best-effort.
+				} finally {
+					record.cleanupSettled.resolve();
+				}
+			}
 
-			if (afterToolCall) {
+			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
+				await settleDispatchedCancellationCleanup(record);
+			} else if (afterToolCall && record.started && !signal?.aborted && !toolSignal.aborted) {
+				record.cleanupClaimed = true;
 				try {
 					const after = await afterToolCall(
 						{
@@ -5528,11 +5652,17 @@ async function executeToolCalls(
 						details: {},
 					};
 					isError = true;
+				} finally {
+					record.cleanupSettled.resolve();
 				}
+			}
+			if (!record.cleanupClaimed) {
+				record.cleanupClaimed = true;
+				record.cleanupSettled.resolve();
 			}
 		});
 
-		const interrupted = interruptState.triggered;
+		const interrupted = interruptState.triggered || record.skipped;
 		if (interrupted) {
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);
@@ -5634,6 +5764,15 @@ async function executeToolCalls(
 					record.skipped = true;
 					emitToolResult(record, createAbortedToolExecutionResult(), true);
 				}
+				for (const record of records) {
+					if (record.started || record.cleanupClaimed) continue;
+					void settlePreDispatchCancellationCleanup(record);
+				}
+				await Promise.all(
+					records.map(record =>
+						record.started ? settleDispatchedCancellationCleanup(record) : record.cleanupSettled.promise,
+					),
+				);
 			}
 		} finally {
 			signal.removeEventListener("abort", onAbort);
@@ -5669,6 +5808,7 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error",
 	errorMessage?: string,
+	scope?: AttemptScope,
 ): ToolResultMessage {
 	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
@@ -5689,6 +5829,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
+		scope,
 	};
 	markNonDispatchedToolEvent(startEvent);
 	stream.push(startEvent);
@@ -5698,6 +5839,7 @@ function createAbortedToolResult(
 		toolName: toolCall.name,
 		result,
 		isError: true,
+		scope,
 	};
 	markNonDispatchedToolEvent(endEvent);
 	stream.push(endEvent);
@@ -5712,8 +5854,8 @@ function createAbortedToolResult(
 		timestamp: Date.now(),
 	};
 
-	stream.push({ type: "message_start", message: toolResultMessage });
-	stream.push({ type: "message_end", message: toolResultMessage });
+	stream.push({ type: "message_start", message: toolResultMessage, scope });
+	stream.push({ type: "message_end", message: toolResultMessage, scope });
 
 	return toolResultMessage;
 }
