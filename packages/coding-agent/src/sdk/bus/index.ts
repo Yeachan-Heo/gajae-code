@@ -2656,13 +2656,18 @@ function sdkControlSurface(
 		return "unknown";
 	};
 	const sendSteer = async (text: string, clientRef?: string) => {
-		let workLease = hostWorkLease?.acquire();
+		let workLease: SessionWorkLeaseHandle | undefined;
 		let queuedWorkLease: SessionWorkLeaseHandle | undefined;
+		let accepted = false;
+		const acquireWorkLease = (): void => {
+			if (!workLease) workLease = hostWorkLease?.acquire();
+		};
 		const releaseWorkLease = (): void => {
 			workLease?.release();
 			workLease = undefined;
 		};
 		const onAccepted = (): void => {
+			accepted = true;
 			if (!workLease) return;
 			queuedWorkLease = workLease;
 			if (queueWorkLease) queueWorkLease(workLease);
@@ -2677,6 +2682,7 @@ function sdkControlSurface(
 			}
 		};
 		if (clientRef === undefined) {
+			acquireWorkLease();
 			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
 			try {
 				await api.sendUserMessage(text, {
@@ -2685,6 +2691,10 @@ function sdkControlSurface(
 					onPreflightAccepted: onAccepted,
 					onQueuedPromoted: onPromoted,
 				});
+				// The session send contract invokes one of the preflight hooks before
+				// resolving. Keep the fallback for adapters that resolve without a hook,
+				// so a successful no-op dispatch cannot pin host liveness.
+				if (!accepted) releaseWorkLease();
 			} catch (error) {
 				releaseWorkLease();
 				throw error;
@@ -2696,6 +2706,7 @@ function sdkControlSurface(
 			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
 		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
 		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		acquireWorkLease();
 		try {
 			await api.sendUserMessage(text, {
 				deliverAs: "steer",
@@ -2703,6 +2714,7 @@ function sdkControlSurface(
 				onPreflightAccepted: onAccepted,
 				onQueuedPromoted: onPromoted,
 			});
+			if (!accepted) releaseWorkLease();
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
 				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
@@ -5676,6 +5688,10 @@ export function createNotificationsExtension(
 		) => {
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (submission.workLease) {
+				submission.workLease.release();
+				submission.workLease = undefined;
+			}
 			if (!submission.terminal) {
 				submission.terminal = true;
 				submission.fatal = true;
@@ -7168,11 +7184,28 @@ export function createNotificationsExtension(
 			// #4743: join fire-and-forget reconciliation producers at teardown.
 			trackReconciliationProducer,
 			workLease,
-			lease => runtime?.pendingIngressWorkLeases.push(lease),
 			lease => {
-				if (!runtime) return;
-				const index = runtime.pendingIngressWorkLeases.indexOf(lease);
-				if (index >= 0) runtime.pendingIngressWorkLeases.splice(index, 1);
+				const currentRuntime = runtime;
+				// A queued steer must either enter the runtime-owned pending list before
+				// teardown fences it, or release its handle immediately. The runtime and
+				// registry checks make this transfer atomic with the stopping flag from
+				// the event loop's perspective; stopSession drains the list after fencing.
+				if (
+					!currentRuntime ||
+					currentRuntime.stopping ||
+					currentRuntime.serverStopped ||
+					runtimes.get(id) !== currentRuntime
+				) {
+					lease.release();
+					return;
+				}
+				currentRuntime.pendingIngressWorkLeases.push(lease);
+			},
+			lease => {
+				const currentRuntime = runtime;
+				if (!currentRuntime) return;
+				const index = currentRuntime.pendingIngressWorkLeases.indexOf(lease);
+				if (index >= 0) currentRuntime.pendingIngressWorkLeases.splice(index, 1);
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;

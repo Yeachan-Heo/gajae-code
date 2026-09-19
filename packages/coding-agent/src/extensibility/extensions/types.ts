@@ -50,7 +50,6 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { Theme } from "../../modes/theme/theme";
 import type { AgentSessionEventListener } from "../../session/agent-session";
-import type { SessionWorkLease } from "../../session/session-work-lease";
 import type {
 	ClientBridge,
 	ClientBridgePermissionOption,
@@ -59,6 +58,7 @@ import type {
 } from "../../session/client-bridge";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { SessionWorkLease } from "../../session/session-work-lease";
 import type {
 	BashToolDetails,
 	BashToolInput,
