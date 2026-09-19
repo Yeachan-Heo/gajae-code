@@ -58,6 +58,7 @@ import type {
 } from "../../session/client-bridge";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { SessionWorkLease } from "../../session/session-work-lease";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -482,6 +483,8 @@ export interface ExtensionContext {
 	isIdle(): boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle(): string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?(): SessionWorkLease;
 	/** Abort the current agent operation */
 	abort(): void | Promise<void>;
 	/** Abort and prove whether resources for a specific prompt settled. */
@@ -1660,6 +1663,8 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
+	/** The session's authoritative host-liveness lease. */
+	getSessionWorkLease?: () => SessionWorkLease;
 	abort: () => void | Promise<void>;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 
