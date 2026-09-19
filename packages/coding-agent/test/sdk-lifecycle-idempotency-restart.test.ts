@@ -228,6 +228,29 @@ describe("SDK lifecycle ledger", () => {
 		}
 	});
 
+	it("rejects a writerless FIFO without blocking the terminal read", async () => {
+		if (process.platform === "win32") return;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-fifo-"));
+		const fifoPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
+		try {
+			await fs.mkdir(path.dirname(fifoPath), { recursive: true });
+			const mkfifo = Bun.spawn(["mkfifo", fifoPath]);
+			expect(await mkfifo.exited).toBe(0);
+
+			const result = await Promise.race([
+				new LifecycleLedger(dir).readTerminal("target", "request"),
+				Bun.sleep(1_000).then(() => "timeout" as const),
+			]);
+			if (result === "timeout") throw new Error("FIFO terminal read blocked past the bounded timeout");
+			expect(result).toEqual({
+				kind: "rejected",
+				reason: "not-regular-file",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects a stat-oversized ledger with oversized-by-stat", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-read-source-stat-"));
 		try {

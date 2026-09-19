@@ -546,7 +546,8 @@ export class LifecycleLedger {
 	async #readBoundedSourceReadOnly(): Promise<BoundedSourceRead> {
 		let handle: fs.FileHandle | undefined;
 		try {
-			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const nonBlocking = process.platform === "win32" ? 0 : fsSync.constants.O_NONBLOCK;
+			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | nonBlocking);
 			const stat = await handle.stat({ bigint: true });
 			if (!stat.isFile()) return { kind: "rejected", reason: "not-regular-file" };
 			if (stat.size > BigInt(this.#limits.maxBytes)) return { kind: "rejected", reason: "oversized-by-stat" };
