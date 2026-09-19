@@ -776,15 +776,12 @@ function buildWorktreeAddArgs(plan: GjcLaunchWorktreePlan, branchAlreadyExisted:
 	return args;
 }
 
-function classifyWorktreeAddFailure(
-	plan: GjcLaunchWorktreePlan,
-	args: string[],
-	stderr: string,
-): LaunchWorktreeGuardError {
+function classifyWorktreeAddFailure(plan: GjcLaunchWorktreePlan, args: string[], stderr: string): Error {
 	if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) return launchGuard("branch_in_use", plan.branchName);
-	// Keep the code prefix even when git supplied a message, so the failure stays a
-	// classified launch guard instead of falling through to the crash path.
-	return launchGuard("worktree_add_failed", stderr || args.join(" "));
+	// Only known actionable refusals are guards. Unexpected git failures (for example
+	// repository corruption or an I/O error) must retain the ordinary crash path so the
+	// caller preserves the stack and durable crash record.
+	return new Error(stderr || `git ${args.join(" ")} failed`);
 }
 
 export function ensureLaunchWorktree(

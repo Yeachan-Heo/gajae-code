@@ -906,6 +906,21 @@ describe("launch guard classification", () => {
 		expect(asLaunchWorktreeGuardError("worktree_dirty:/repo")).toBeNull();
 		expect(asLaunchWorktreeGuardError(null)).toBeNull();
 	});
+	it("keeps unexpected git worktree-add failures on the crash path", async () => {
+		const repo = await createRepo("gjc-launch-worktree-add-failure-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: true, name: null });
+		if (!planned.enabled) throw new Error("expected an enabled worktree plan");
+		planned.baseRef = "missing-worktree-add-ref";
+		let caught: unknown;
+		try {
+			ensureLaunchWorktree(planned);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		expect(asLaunchWorktreeGuardError(caught)).toBeNull();
+		expect((caught as Error).message).toContain("missing-worktree-add-ref");
+	});
 
 	it("passes an already-classified guard through unchanged", () => {
 		const guard = new LaunchWorktreeGuardError("worktree_dirty", "worktree_dirty:/repo");
