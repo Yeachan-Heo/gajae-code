@@ -19637,10 +19637,7 @@ export class AgentSession {
 					const restorableSteering: AgentMessage[] = [];
 					for (const message of missingSteering) {
 						const trackedState = trackedSteersBeforeCompaction.get(message);
-						if (trackedState) {
-							if (!trackedState.terminalSettled) this.#settleTrackedQueuedInputRemoved(trackedState, "removed");
-							continue;
-						}
+						if (trackedState && (trackedState.terminalSettled || trackedState.cancelRequested)) continue;
 						restorableSteering.push(message);
 					}
 					if (restorableSteering.length > 0) this.agent.restoreSteering(restorableSteering);
