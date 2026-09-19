@@ -17,7 +17,7 @@ This skill is for trusted local scripts. Its approval challenge is a procedural 
 6. Obtain one explicit approval immediately before the call. Approval is single-use and becomes invalid if the operation, input, or target changes.
    The templates emit a nonce-bearing, input-bound `APPROVE <session> <operation> <digest> <nonce>` challenge and read the exact response once from the active process's standard input. Present it verbatim through the external host only after the human accepts that exact action.
 7. On denial, cancellation, unavailable target, or changed input, send no CLI request.
-8. Add `--json` explicitly to every machine CLI call. Successful session JSON is unchanged; default ordinary failures are text on stderr. On failure consume the single `gjc.command-error` version 1 stdout envelope, preserve outcome certainty/references, and never publish raw stderr or interpret absent JSON as success. Usage exits 2; operation failures exit 1.
+8. Add `--json` explicitly to every machine CLI call. Successful session JSON is unchanged; default ordinary failures are text on stderr. Except for `session.lookup`, consume the single `gjc.command-error` version 1 stdout envelope on failure, preserve outcome certainty/references, and never publish raw stderr or interpret absent JSON as success. `session.lookup` deliberately returns a structured reconciliation DTO (`ok`, `operation`, `status`, `certainty`, `error`) on stdout and may exit 1 for outcomes such as `not_found` or `conflict`; preserve those fields instead of treating the DTO as a malformed failure envelope. Usage exits 2; operation failures exit 1.
 
 ## Allowed per-session controls
 
@@ -90,7 +90,8 @@ For a lost `session.create` response, use the read-only lookup with the same req
 ```sh
 gjc sdk session raw global --op session.lookup \
   --idempotency-key <create-request-key> \
-  --json-input '{"cwd":"/absolute/path/to/repo"}'
+  --json-input '{"cwd":"/absolute/path/to/repo"}' \
+  --json
 ```
 
 Lookup never replays creation. Treat `not_found` as an unknown outcome, not as proof that the create did not execute; `found`, `pending`, `conflict`, `uncertain`, and `terminal` remain distinct structured statuses.
