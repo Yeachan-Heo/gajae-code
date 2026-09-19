@@ -231,7 +231,7 @@ describe("provider onboarding wizard red-team", () => {
 				"Provider 'visible-provider' configured as openai-compatible.",
 				"Models: visible-model",
 				"Base URL: https://api.example.com/v1",
-				"API key: CUST…_KEY (environment variable)",
+				"API key: *** (environment variable)",
 				`Config: ${path.join(tempAgentDir!, "models.yml")}`,
 			].join("\n");
 			const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<void>();
