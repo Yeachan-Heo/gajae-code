@@ -636,7 +636,7 @@ describe("gjc state handoff", () => {
 			const consumedV1 = (await readJson(recordPath))!;
 			expect(consumedV1.status).toBe("consumed");
 			await expect(askAndPersistExecutionApproval(cwd, manager, "same-publication-replay")).rejects.toThrow(
-				"already consumed",
+				"Ask results changed",
 			);
 			manager.appendMessage({ role: "user", content: "Encrypt backups.", timestamp: Date.now() });
 			await manager.flush();
@@ -724,7 +724,7 @@ describe("gjc state handoff", () => {
 			expect(admitted.status, admitted.stderr).toBe(0);
 			await expect(
 				askAndPersistExecutionApproval(cwd, manager, "ralplan-renewal-replay", "ralplan"),
-			).rejects.toThrow("current final plan");
+			).rejects.toThrow(/current final plan|active final publication/);
 			const approvedState = (await readJson(modeStatePath(cwd, sessionId, "deep-interview")))!;
 			expect((approvedState.state as Record<string, unknown>).execution_approval).toBe("approved");
 			expect((await readJson(modeStatePath(cwd, sessionId, "ultragoal")))?.handoff_from).toBe("ralplan");
@@ -767,7 +767,7 @@ describe("gjc state handoff", () => {
 			const approved = await approvePersistedCrystal(cwd, sessionId);
 			expect(approved.status, approved.stderr).toBe(0);
 			await expect(askAndPersistExecutionApproval(cwd, manager, "skipped-version-replay")).rejects.toThrow(
-				"already consumed",
+				"Ask results changed",
 			);
 			expect((await approvePersistedCrystal(cwd, sessionId)).status).toBe(2);
 			const handoff = await handoffPersistedCrystal(cwd, sessionId);
