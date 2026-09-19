@@ -25,6 +25,11 @@ afterEach(async () => {
 
 const ELF_HEADER = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
 
+async function writeFixtureFile(filePath: string, content: Uint8Array | string, mode = 0o755): Promise<void> {
+	await fs.writeFile(filePath, content, { mode });
+	await fs.chmod(filePath, mode);
+}
+
 function digestOf(content: Buffer): string {
 	return createHash("sha256").update(content).digest("hex");
 }
@@ -42,10 +47,10 @@ async function fixture(): Promise<InstallFixture> {
 	roots.push(root);
 	const target = path.join(root, "gjc");
 	const targetBytes = Buffer.concat([ELF_HEADER, Buffer.from("old-runtime")]);
-	await fs.writeFile(target, targetBytes);
+	await writeFixtureFile(target, targetBytes);
 	const candidatePath = path.join(root, "candidate-source");
 	const candidateBytes = Buffer.concat([ELF_HEADER, Buffer.from("new-runtime")]);
-	await fs.writeFile(candidatePath, candidateBytes);
+	await writeFixtureFile(candidatePath, candidateBytes);
 	// The dispatch authority proves ownership by resolving to the exact
 	// currently-running compiled image path; simulate that by pointing the
 	// authority at `target` itself so classifySource treats it as standalone.
@@ -71,7 +76,7 @@ function candidateFor(f: InstallFixture): RestoreCandidate {
 function fakeDeps(f: InstallFixture): InstallRepairDependencies {
 	return {
 		fetchCandidate: async (_candidate, stagingPath) => {
-			await fs.copyFile(f.candidatePath, stagingPath);
+			await writeFixtureFile(stagingPath, await fs.readFile(f.candidatePath));
 		},
 		verifyCandidate: async (stagingPath, candidate) => {
 			const snapshot = await snapshotRegularFile(stagingPath);
@@ -267,7 +272,7 @@ describe("doctor standalone install repair: pending/retry conflict", () => {
 		const f = await fixture();
 		const descriptor = await describeInstallRestore(f.target, f.authority, "stable", "v1.2.3");
 		const stagingPath = `${f.target}.restore.interrupted`;
-		await fs.copyFile(f.candidatePath, stagingPath);
+		await writeFixtureFile(stagingPath, await fs.readFile(f.candidatePath));
 		const stagingSnapshot = await snapshotRegularFile(stagingPath);
 		const parentIdentity = await snapshotDirectory(f.root);
 		const pendingCandidate = candidateFor(f);
