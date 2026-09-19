@@ -49,6 +49,7 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
  */
 const LOCK_ACQUIRE_MAX_WAIT_MS = 60_000;
 const LOCK_STALE_MS = 30_000;
+const RELEASED_TRANSITION_GRACE_MS = 1_000;
 const SESSION_STATE_LOCK_BUSY = Symbol("session-state-lock-busy");
 
 interface LockRetryBudget {
@@ -582,6 +583,8 @@ export type TransitionReclaimRefusal =
 	| "released_owner_unprovenanced"
 	/** A released tombstone belonging to a different installation. */
 	| "released_owner_foreign_host"
+	/** A released tombstone still inside `RELEASED_TRANSITION_GRACE_MS`. */
+	| "released_owner_within_grace"
 	/** The owner is alive, or its liveness could not be disproven. */
 	| "owner_live_or_unverifiable"
 	/** The claim changed between inspection and capture — an external writer. */
@@ -1917,6 +1920,7 @@ async function releaseTransitionClaim(
  */
 interface TransitionReclaimOutcome {
 	reclaimed: boolean;
+	reclaimReason?: "released_handoff" | "dead_owner";
 	refusal?: TransitionReclaimRefusal;
 }
 
@@ -1942,7 +1946,10 @@ async function reclaimStaleTransitionClaim(
 			},
 			quarantineName,
 		);
-		return { reclaimed: reclaimed === "owner_removed" };
+		return {
+			reclaimed: reclaimed === "owner_removed",
+			...(reclaimed === "owner_removed" ? { reclaimReason: "dead_owner" as const } : {}),
+		};
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
@@ -1964,6 +1971,8 @@ async function reclaimStaleTransitionClaim(
 		const legacyHost = await currentLegacyOwnerHostId();
 		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost)
 			return { reclaimed: false, refusal: "released_owner_foreign_host" };
+		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS)
+			return { reclaimed: false, refusal: "released_owner_within_grace" };
 	} else if (await lockOwnerIsAlive(owner)) {
 		// Only a host-qualified owner whose pid is PROVEN dead (ESRCH, or a live pid
 		// with a provably different incarnation) authorizes reclaim. The generation
@@ -1991,7 +2000,10 @@ async function reclaimStaleTransitionClaim(
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: removed.ok };
+		return {
+			reclaimed: removed.ok,
+			...(removed.ok ? { reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" } : {}),
+		};
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -2008,7 +2020,7 @@ async function reclaimStaleTransitionClaim(
 		// successor populated the detached path.
 		await removeTransitionDir(removed.detachedPath);
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return { reclaimed: true };
+		return { reclaimed: true, reclaimReason: owner.released === true ? "released_handoff" : "dead_owner" };
 	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
@@ -2423,17 +2435,14 @@ async function runLockPathTransition<T>(
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
 			if (outcome.reclaimed) {
 				if (lockRetryExhausted(budget)) {
-					// A released tombstone is the previous holder's explicit handoff. Its
-					// owner sidecar is removed together with the empty claim, so allow the
-					// waiter to take the newly-free pathname even when the old wait budget
-					// expired while reclaiming it. A dead-owner reclaim that immediately
-					// gets replaced still has an owner sidecar and remains bounded by the
-					// original deadline.
+					// Only a released tombstone is the previous holder's explicit handoff.
+					// Ordinary dead-owner reclaims remain bounded by the original deadline,
+					// even though both reclaim paths unlink their owner sidecar.
 					const ownerStillPresent = await fs.lstat(`${transitionDir}.owner`).then(
 						() => true,
 						error => (error as NodeJS.ErrnoException).code !== "ENOENT",
 					);
-					if (ownerStillPresent)
+					if (outcome.reclaimReason !== "released_handoff" || ownerStillPresent)
 						throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
 				}
 				continue;

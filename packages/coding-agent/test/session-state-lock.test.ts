@@ -3020,6 +3020,54 @@ describe("session state lock failure diagnostics", () => {
 			});
 		});
 
+		it("holds a fresh released tombstone during the handoff grace window", async () => {
+			const dir = await claimWith("reclaim-fresh-release", {
+				pid: 1,
+				start_time: "unknown",
+				token: "fresh-release-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			setSystemTime();
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_within_grace",
+			});
+		});
+
+		it("labels a released handoff after its grace window", async () => {
+			const dir = await claimWith("reclaim-released-handoff", {
+				pid: 1,
+				start_time: "unknown",
+				token: "released-handoff-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			setSystemTime();
+			const old = new Date(Date.now() - 2_000);
+			await fs.utimes(`${dir}.owner`, old, old);
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: true,
+				reclaimReason: "released_handoff",
+			});
+		});
+
+		it("labels a proven-dead owner reclaim separately from a released handoff", async () => {
+			const dir = await claimWith("reclaim-dead-owner", {
+				pid: 999_999,
+				start_time: "unknown",
+				token: "dead-owner-token",
+				owner_host_id: "local-host",
+			});
+			SessionStateLockTestHooks.probeProcessSignal = () => {
+				throw Object.assign(new Error("owner exited"), { code: "ESRCH" });
+			};
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: true,
+				reclaimReason: "dead_owner",
+			});
+		});
+
 		it("names a live owner rather than reporting a bare timeout", async () => {
 			// This process is unambiguously alive, so liveness cannot be disproven.
 			const dir = await claimWith("reclaim-live", {
@@ -3106,7 +3154,7 @@ describe("session state lock failure diagnostics", () => {
 		});
 	});
 
-	it("lets a waiter reclaim a fresh released claim without a timeout", async () => {
+	it("lets a waiter reclaim an aged released claim without a timeout", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "released-waiter.json");
 		const transitionDir = `${stateFile}.lock.transition`;
@@ -3121,6 +3169,9 @@ describe("session state lock failure diagnostics", () => {
 				released: true,
 			}),
 		);
+		setSystemTime();
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(`${transitionDir}.owner`, old, old);
 		let monotonicNow = 0;
 		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
 		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
@@ -3130,6 +3181,39 @@ describe("session state lock failure diagnostics", () => {
 			await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
 		} finally {
 			now.mockRestore();
+		}
+	});
+
+	it("keeps a dead-owner reclaim bounded by the transition deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "dead-owner-waiter.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 999_999,
+				start_time: "unknown",
+				token: "dead-owner-waiter",
+				owner_host_id: "local-host",
+			}),
+		);
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("owner exited"), { code: "ESRCH" });
+		};
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 5_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toMatchObject({
+				reason: "transition_claim_timeout",
+			});
+		} finally {
+			now.mockRestore();
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+			await fs.rmdir(transitionDir).catch(() => undefined);
 		}
 	});
 });

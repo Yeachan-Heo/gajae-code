@@ -1027,7 +1027,11 @@ async function publishNoReplaceWithSharingRetry(
 	destinationPath: string,
 ): Promise<NativeNoReplaceResult> {
 	let result = await publish(sourcePath, destinationPath);
-	for (let attempt = 1; attempt < PUBLICATION_SHARING_RETRY_ATTEMPTS && isPreMutationSharingViolation(result); attempt++) {
+	for (
+		let attempt = 1;
+		attempt < PUBLICATION_SHARING_RETRY_ATTEMPTS && isPreMutationSharingViolation(result);
+		attempt++
+	) {
 		await Bun.sleep(PUBLICATION_SHARING_RETRY_DELAY_MS * attempt);
 		result = await publish(sourcePath, destinationPath);
 	}

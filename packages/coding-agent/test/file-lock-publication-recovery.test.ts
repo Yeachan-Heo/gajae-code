@@ -366,9 +366,9 @@ test("retries a pre-mutation sharing violation and publishes the file lock", asy
 		renameDirectoryNoReplacePathAsync,
 	});
 
-	await expect(withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire)).resolves.toContain(
-		'"pid"',
-	);
+	await expect(
+		withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire),
+	).resolves.toContain('"pid"');
 	expect(attempts).toBe(3);
 	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
 	expect(await fs.readdir(root)).toEqual([]);
