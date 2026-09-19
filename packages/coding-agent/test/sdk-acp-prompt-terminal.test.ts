@@ -61,6 +61,7 @@ type Fixture = {
 	releaseFailureDiagnostic(): void;
 	releasePromptAcknowledgement(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
+	rebindSession(): Promise<void>;
 	mutationInputs: Record<string, unknown>[];
 	recoveryInputs: Record<string, unknown>[];
 	releaseRecoveryResult(result: unknown): void;
@@ -560,6 +561,7 @@ async function createFixture(
 	);
 	blockNextIdleUpdate = options.blockIdleUpdate === true;
 	blockAdvisoryQuery = true;
+	let reboundGeneration = authority.endpointGeneration;
 
 	return {
 		agent,
@@ -614,6 +616,17 @@ async function createFixture(
 		releaseFailureDiagnostic: () => failureDiagnosticRelease.resolve(),
 		releasePromptAcknowledgement: () => deferredPromptAcknowledgement?.(),
 		sendTerminal,
+		rebindSession: async () => {
+			reboundGeneration++;
+			const rebound = await prepareExactSessionAuthority({
+				...authorityOptions,
+				endpointGeneration: reboundGeneration,
+			});
+			await publishExactSessionAuthority(
+				{ ...authorityOptions, endpointGeneration: reboundGeneration, indexSeq: reboundGeneration },
+				rebound,
+			);
+		},
 		dispose: () => {
 			agentMessageUpdateRelease.resolve();
 			failureDiagnosticRelease.resolve();
@@ -3162,6 +3175,31 @@ test("ACP publishes retained truncation metadata even when the retained prefix w
 	}
 });
 
+test("ACP refreshes a stale Router attachment before retained recovery without replay", async () => {
+	const fixture = await createRecoveryFixture("rejected");
+	try {
+		const pending = prompt(fixture, "recover after attachment replacement");
+		await bounded(fixture.promptDelivered, "recovery mutation delivery");
+		await fixture.rebindSession();
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query after rebind");
+		fixture.releaseRecoveryResult(retainedTerminal(fixture));
+		expect(await bounded(pending, "rebound retained terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) >= 2, "rebound retained text publication");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		expect(fixture.recoveryInputs).toHaveLength(1);
+		const retainedChunks = fixture.updates.filter(
+			update =>
+				update.update.sessionUpdate === "agent_message_chunk" &&
+				update.update.content.type === "text" &&
+				update.update.content.text === "retained report",
+		);
+		expect(retainedChunks).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
 test("ACP does not retry a recovered startup-readiness failure that carries final text", async () => {
 	const fixture = await createRecoveryFixture("accepted", undefined, { controlledRetryBackoff: true });
 	try {
@@ -3206,6 +3244,24 @@ test("ACP does not retry a recovered startup-readiness failure that carries fina
 		]);
 		expect(settlement.kind).toBe("rejected");
 		if (settlement.kind === "rejected") expect(settlement.error).toMatchObject({ code: "prompt_failed" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP remaps a recovered end-turn to cancelled after an acknowledged cancel", async () => {
+	const fixture = await createRecoveryFixture("held");
+	try {
+		const pending = prompt(fixture, "recover after acknowledged cancellation");
+		await bounded(fixture.promptDelivered, "recovery mutation delivery");
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
+		fixture.releaseRecoveryResult(retainedTerminal(fixture));
+		expect(await bounded(pending, "cancelled recovered terminal settlement")).toEqual({
+			stopReason: "cancelled",
+		});
 		expect(fixture.promptDeliveryCount()).toBe(1);
 	} finally {
 		fixture.dispose();
@@ -3455,6 +3511,47 @@ test("ACP recovery settlement is independent of advisory final-text backpressure
 		expect(await bounded(pending, "settlement before publication")).toEqual({ stopReason: "end_turn" });
 		await bounded(fixture.agentMessageUpdateEntered, "blocked recovered final text");
 		expect(fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk")).toBe(false);
+	} finally {
+		fixture.releaseAgentMessageUpdate();
+		fixture.dispose();
+	}
+});
+
+test("ACP serializes recovered text behind a queued stream frame", async () => {
+	const fixture = await createRecoveryFixture("accepted", "streamed prefix");
+	try {
+		const pending = prompt(fixture, "recover behind queued stream");
+		await bounded(fixture.promptDelivered, "accepted mutation");
+		fixture.sendAssistantMessage("streamed prefix", true);
+		await bounded(fixture.agentMessageUpdateEntered, "queued stream frame");
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		fixture.releaseRecoveryResult({
+			...retainedTerminal(fixture),
+			content: { version: 1, type: "text", text: "streamed prefix suffix" },
+		});
+		expect(await bounded(pending, "recovered queued stream settlement")).toEqual({ stopReason: "end_turn" });
+		await Bun.sleep(0);
+		expect(
+			fixture.updates.some(
+				update =>
+					update.update.sessionUpdate === "agent_message_chunk" &&
+					update.update.content.type === "text" &&
+					update.update.content.text === " suffix",
+			),
+		).toBe(false);
+		fixture.releaseAgentMessageUpdate();
+		await waitFor(
+			() => fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 2,
+			"ordered recovered stream publication",
+		);
+		const chunks = fixture.updates
+			.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+			.map(update => {
+				const content = (update.update as { content?: { type?: string; text?: string } }).content;
+				return content?.type === "text" ? content.text : "";
+			});
+		expect(chunks).toEqual(["streamed prefix", " suffix"]);
 	} finally {
 		fixture.releaseAgentMessageUpdate();
 		fixture.dispose();

@@ -3235,6 +3235,27 @@ export class AcpAgent implements Agent {
 				timedOut = true;
 				deadline.reject(new Error("status query timeout"));
 			}, 5_000);
+			const refreshAttachment = async (): Promise<void> => {
+				if (this.#sessions.get(id) !== record || record.adapter !== adapter) return;
+				// A reconnect can revoke the adapter's opaque attachment before Router has
+				// published its replacement. Force an authority pass first, then hand the
+				// exact current capability back to the adapter before issuing the read-only
+				// lookup. This pass does not replay the prompt mutation.
+				await this.#router.reconcile({ waitForReplay: false });
+				if (!ownsRecovery()) return;
+				const refreshed = this.#router.attachment(id);
+				if (!refreshed?.isCurrent())
+					throw new AcpSdkAdapterError(
+						"unavailable",
+						"ACP session has no current Router attachment for recovery.",
+					);
+				if (refreshed !== record.attachment || !record.attachment.isCurrent()) {
+					await adapter.attachmentReady(refreshed);
+					record.attachment = refreshed;
+				}
+			};
+			await Promise.race([refreshAttachment(), deadline.promise]);
+			if (!ownsRecovery()) return;
 			// Bound observation only: the mutation and the read are never replayed or aborted.
 			const response = object(
 				await Promise.race([
@@ -3305,7 +3326,12 @@ export class AcpAgent implements Agent {
 				waiter.acknowledged = true;
 				record.busy = record.backgroundBusy;
 				this.#advanceTerminalGeneration(record);
-				waiter.terminal = { outcome, correlation };
+				const settledOutcome =
+					record.cancelRequested && outcome.kind === "stopped" && outcome.reason === "end_turn"
+						? { ...outcome, reason: "cancelled" as const, provenance: "client_cancel" as const }
+						: outcome;
+				const publicationBarrier = record.frameTail;
+				waiter.terminal = { outcome: settledOutcome, correlation };
 				// Recovered final text is published on the async terminal tail below. Record it
 				// before settling so a first-turn startup-readiness failure cannot be retried
 				// after this retained answer has already been committed for publication.
@@ -3316,12 +3342,13 @@ export class AcpAgent implements Agent {
 					adapter,
 					record.publicationGeneration,
 					{
-						type: outcome.kind === "failed" ? "agent_failed" : "agent_end",
-						outcome,
+						type: settledOutcome.kind === "failed" ? "agent_failed" : "agent_end",
+						outcome: settledOutcome,
 						finalText: readableText ? content.text : undefined,
 						finalTextTruncated: content?.truncated === true,
 					},
 					waiter,
+					publicationBarrier,
 				);
 				return;
 			} else {
@@ -4113,13 +4140,15 @@ export class AcpAgent implements Agent {
 		publicationGeneration: number,
 		event: JsonObject,
 		promptOwner: PromptWaiter | undefined,
+		publicationBarrier?: Promise<void>,
 	): void {
 		const failedTerminal = event.type === "agent_failed";
 		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
-		let decorationStart = Promise.resolve();
+		let decorationStart = publicationBarrier ?? Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
 		if (promptOwner && hasAcpFinalTextContent(finalText)) {
 			const finalTextTask = (async () => {
+				if (publicationBarrier) await publicationBarrier;
 				await Bun.sleep(0);
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
 				if (resolution.kind === "emit") {
