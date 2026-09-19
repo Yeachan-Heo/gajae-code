@@ -366,6 +366,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:login": "auth.login",
 	"slash_command:clear": "context.clear",
 	"slash_command:new": "session.new",
+	"slash_command:fork": "session.fork",
 	"slash_command:compact": "compaction.run",
 	"slash_command:handoff": "session.handoff",
 	"slash_command:resume": "session.resume",
