@@ -24,6 +24,7 @@ import {
 	recordNonCrystalExecutionApproval,
 	runNativeStateCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/state-runtime";
+import { beginWorkflowTransactionJournal } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { AskTool } from "@gajae-code/coding-agent/tools/ask";
@@ -362,6 +363,37 @@ describe("non-Crystal user-gated execution approval", () => {
 			});
 		});
 	}
+
+	it("repairs an ordinary approval record after its specialized audit append is interrupted", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await publish(cwd, sessionId, "deep-interview");
+			await ask(cwd, manager, "deep-interview", "recoverable-approval", false);
+			const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, "deep-interview");
+			const recordContent = await fs.readFile(recordPath, "utf8");
+			const record = JSON.parse(recordContent) as {
+				status: string;
+			};
+			const digest = createHash("sha256").update(recordContent).digest("hex");
+			const mutationId = `deep-interview:ordinary-execution-approval:${record.status}:${digest}`;
+			const auditFile = auditPath(cwd, sessionId);
+			const auditRows = (await fs.readFile(auditFile, "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>)
+				.filter(row => row.mutation_id !== mutationId);
+			await fs.writeFile(auditFile, `${auditRows.map(row => JSON.stringify(row)).join("\n")}\n`, "utf8");
+			await beginWorkflowTransactionJournal({
+				cwd,
+				sessionId,
+				mutationId,
+				paths: [recordPath, auditFile],
+			});
+			const consumed = await consume(cwd, sessionId);
+			expect(consumed.status, consumed.stderr).toBe(0);
+			const repairedAudit = await fs.readFile(auditFile, "utf8");
+			expect(repairedAudit).toContain(`"mutation_id":"${mutationId}"`);
+		});
+	});
 
 	it("ordinary interview refuses expired user consent without altering authority evidence", async () => {
 		await withSession(async (cwd, manager, sessionId) => {
