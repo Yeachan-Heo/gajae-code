@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -1939,13 +1939,9 @@ function approvalTranscriptPrefix(
 	leafAskToolCallIds: Set<string>;
 } {
 	const [header, ...records] = approvalTranscriptRecords(text);
-	if (
-		header?.type !== "session" ||
-		header.id !== sessionId ||
-		typeof header.cwd !== "string" ||
-		path.resolve(header.cwd) !== path.resolve(cwd)
-	)
+	if (header?.type !== "session" || header.id !== sessionId || typeof header.cwd !== "string")
 		throw new StateCommandError(2, "execution approval transcript identity mismatch");
+	let effectiveCwd = header.cwd;
 	const ids = new Set<string>();
 	const askToolCallCounts = new Map<string, number>();
 	let leafAskToolCallIds = new Set<string>();
@@ -1953,8 +1949,13 @@ function approvalTranscriptPrefix(
 	for (const record of records) {
 		if (record.type === "header_patch") {
 			const patch = record.patch;
-			if (!isPlainObject(patch) || ["id", "cwd", "version"].some(key => key in patch))
+			if (
+				!isPlainObject(patch) ||
+				Object.keys(patch).some(key => !["cwd", "title", "titleSource", "starred"].includes(key)) ||
+				(patch.cwd !== undefined && typeof patch.cwd !== "string")
+			)
 				throw new StateCommandError(2, "execution approval transcript identity patch is invalid");
+			if (typeof patch.cwd === "string") effectiveCwd = patch.cwd;
 			continue;
 		}
 		if (record.type === "entry_patch") {
@@ -2004,6 +2005,8 @@ function approvalTranscriptPrefix(
 		ids.add(record.id);
 		leaf = record.id;
 	}
+	if (path.resolve(effectiveCwd) !== path.resolve(cwd))
+		throw new StateCommandError(2, "execution approval transcript identity mismatch");
 	return { leaf, ids, askToolCallCounts, leafAskToolCallIds };
 }
 
@@ -2155,7 +2158,12 @@ export async function executionApprovalLineage(
 		const upstream = current.value.handoff_from;
 		if (upstream && upstream !== "deep-interview")
 			throw new StateCommandError(2, "execution approval has unsupported upstream lineage");
-		if (!(await hasCurrentDeepInterviewHandoff(cwd, sessionId, "ralplan", current.value))) return "ordinary";
+		const currentHandoffAt = await currentDeepInterviewHandoffAt(cwd, sessionId, "ralplan", current.value);
+		if (!currentHandoffAt) {
+			if (current.value.handoff_from === undefined && current.value.upstream_handoff_at === undefined)
+				return "ordinary";
+			throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
+		}
 		const read = await readExistingStateForMutation(modeStateFile(cwd, "deep-interview", sessionId));
 		if (read.kind !== "valid") throw new StateCommandError(2, "execution approval upstream state is unavailable");
 		assertNoFutureWorkflowEnvelope(read.value, "deep-interview", "execution approval upstream");
@@ -2172,7 +2180,7 @@ export async function executionApprovalLineage(
 			read.value.active !== false ||
 			read.value.current_phase !== "handoff" ||
 			read.value.handoff_to !== stage ||
-			read.value.handoff_at !== (current.value.upstream_handoff_at ?? current.value.handoff_at)
+			read.value.handoff_at !== currentHandoffAt
 		)
 			throw new StateCommandError(2, "execution approval cannot authenticate Deep Interview approval lineage");
 		interview = read.value;
@@ -2308,37 +2316,92 @@ export async function captureExecutionApprovalPresentation(
 	};
 }
 
-async function writeNonCrystalApproval(cwd: string, record: NonCrystalExecutionApprovalRecord): Promise<void> {
-	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, record.session_id, record.stage);
-	const content = `${JSON.stringify(record)}\n`;
-	const digest = createHash("sha256").update(content).digest("hex");
-	await writeArtifact(recordPath, content, {
-		cwd,
-		audit: {
-			category: "artifact",
-			verb: "write",
-			owner: "gjc-runtime",
-			skill: record.stage,
-			sessionId: record.session_id,
-		},
-	});
-	const auditEntry = {
+function nonCrystalApprovalMutationId(record: NonCrystalExecutionApprovalRecord, digest: string): string {
+	return `${record.stage}:ordinary-execution-approval:${record.status}:${digest}`;
+}
+
+function nonCrystalApprovalAuditEntry(
+	cwd: string,
+	record: NonCrystalExecutionApprovalRecord,
+	digest: string,
+	mutationId: string,
+): AuditEntry & Record<string, unknown> {
+	return {
 		ts: nowIso(),
 		category: "state",
 		verb: "approve-execution",
 		owner: "gjc-runtime",
 		skill: record.stage,
-		mutation_id: `${record.stage}:ordinary-execution-approval:${record.status}:${digest}`,
+		mutation_id: mutationId,
 		forced: false,
-		paths: [recordPath],
+		paths: [nonCrystalExecutionApprovalRecordPath(cwd, record.session_id, record.stage)],
 		ordinary_approval_status: record.status,
 		question_id: record.question_id,
 		gate_id: record.gate_id,
 		artifact_sha256: record.artifact_sha256,
 		run_id: record.run_id,
 		ordinary_approval_sha256: digest,
-	} satisfies AuditEntry & Record<string, unknown>;
-	await appendAuditEntry(cwd, record.session_id, auditEntry);
+	};
+}
+
+async function repairPendingNonCrystalApprovalAudit(
+	cwd: string,
+	record: NonCrystalExecutionApprovalRecord,
+	recordPath: string,
+	digest: string,
+): Promise<void> {
+	const mutationId = nonCrystalApprovalMutationId(record, digest);
+	const journal = await readWorkflowTransactionJournal(cwd, record.session_id, mutationId);
+	if (!journal) return;
+	if (
+		journal.status !== "pending" ||
+		journal.paths.length !== 2 ||
+		path.resolve(journal.paths[0]!) !== path.resolve(recordPath) ||
+		path.resolve(journal.paths[1]!) !== path.resolve(auditPath(cwd, record.session_id))
+	)
+		return;
+	const rows = await nonCrystalApprovalAuditRows(cwd, record.session_id, record.stage);
+	if (!rows.some(row => row.mutation_id === mutationId && row.ordinary_approval_sha256 === digest))
+		await appendAuditEntry(cwd, record.session_id, nonCrystalApprovalAuditEntry(cwd, record, digest, mutationId));
+	await updateWorkflowTransactionJournal(cwd, record.session_id, mutationId, {
+		steps: ["record", "audit"],
+	});
+	await completeWorkflowTransactionJournal(cwd, record.session_id, mutationId);
+}
+
+async function writeNonCrystalApproval(cwd: string, record: NonCrystalExecutionApprovalRecord): Promise<void> {
+	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, record.session_id, record.stage);
+	const content = `${JSON.stringify(record)}\n`;
+	const digest = createHash("sha256").update(content).digest("hex");
+	const mutationId = nonCrystalApprovalMutationId(record, digest);
+	await beginWorkflowTransactionJournal({
+		cwd,
+		sessionId: record.session_id,
+		mutationId,
+		paths: [recordPath, auditPath(cwd, record.session_id)],
+	});
+	const journal = await readWorkflowTransactionJournal(cwd, record.session_id, mutationId);
+	if (!journal) throw new StateCommandError(2, "ordinary execution approval recovery journal is invalid");
+	if (journal.status !== "pending")
+		throw new StateCommandError(2, "ordinary execution approval recovery journal is invalid");
+	if (!journal.steps.includes("record")) {
+		await writeArtifact(recordPath, content, {
+			cwd,
+			audit: {
+				category: "artifact",
+				verb: "write",
+				owner: "gjc-runtime",
+				skill: record.stage,
+				sessionId: record.session_id,
+			},
+		});
+		await updateWorkflowTransactionJournal(cwd, record.session_id, mutationId, { steps: ["record"] });
+	}
+	const rows = await nonCrystalApprovalAuditRows(cwd, record.session_id, record.stage);
+	if (!rows.some(row => row.mutation_id === mutationId && row.ordinary_approval_sha256 === digest))
+		await appendAuditEntry(cwd, record.session_id, nonCrystalApprovalAuditEntry(cwd, record, digest, mutationId));
+	await updateWorkflowTransactionJournal(cwd, record.session_id, mutationId, { steps: ["record", "audit"] });
+	await completeWorkflowTransactionJournal(cwd, record.session_id, mutationId);
 }
 
 async function nonCrystalApprovalAuditRows(
@@ -2399,6 +2462,12 @@ async function readNonCrystalApproval(
 	)
 		throw new StateCommandError(2, "ordinary execution approval record is invalid");
 	const digest = createHash("sha256").update(content).digest("hex");
+	await repairPendingNonCrystalApprovalAudit(
+		cwd,
+		value as unknown as NonCrystalExecutionApprovalRecord,
+		recordPath,
+		digest,
+	);
 	const latest = (await nonCrystalApprovalAuditRows(cwd, sessionId, stage)).at(-1);
 	if (latest?.ordinary_approval_sha256 !== digest)
 		throw new StateCommandError(2, "ordinary execution approval lacks sanctioned audit provenance");
@@ -2927,7 +2996,7 @@ export async function recordDeepInterviewExecutionApproval(options: {
 					2,
 					"deep-interview execution approval publication changed while awaiting consent",
 				);
-			const gateId = options.gateId ?? options.questionId;
+			const gateId = options.gateId ?? `interactive-${randomUUID()}`;
 			if (!isExecutionApprovalId(gateId))
 				throw new StateCommandError(2, "deep-interview execution approval descriptor is invalid");
 			const now = nowIso();
@@ -3074,12 +3143,49 @@ function sameBoundedFileIdentity(left: nodeFs.BigIntStats, right: nodeFs.BigIntS
 	);
 }
 
+async function assertNoSymlinkedAncestors(filePath: string, label: string): Promise<void> {
+	const parent = path.dirname(path.resolve(filePath));
+	const parsed = path.parse(parent);
+	let current = parsed.root;
+	for (const segment of parent.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		let stat: nodeFs.Stats;
+		try {
+			stat = await fs.lstat(current);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+			throw new StateCommandError(2, `failed to read ${label}: ${(error as Error).message}`);
+		}
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new StateCommandError(2, `${label} parent is invalid`);
+		try {
+			if ((await fs.realpath(current)) !== current) throw new StateCommandError(2, `${label} parent is invalid`);
+			const handle = await fs.open(
+				current,
+				nodeFs.constants.O_RDONLY |
+					(nodeFs.constants.O_DIRECTORY ?? 0) |
+					(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0)),
+			);
+			try {
+				const opened = await handle.stat();
+				if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.mode !== stat.mode)
+					throw new StateCommandError(2, `${label} parent changed during validation`);
+			} finally {
+				await handle.close();
+			}
+		} catch (error) {
+			if (error instanceof StateCommandError) throw error;
+			throw new StateCommandError(2, `${label} parent cannot be opened safely`);
+		}
+	}
+}
+
 async function readBoundedIdentityText(
 	filePath: string,
 	maxBytes: number,
 	label: string,
 	options: { tail?: boolean; offset?: number } = {},
 ): Promise<string | undefined> {
+	await assertNoSymlinkedAncestors(filePath, label);
 	let initialStat: nodeFs.BigIntStats;
 	try {
 		initialStat = await fs.lstat(filePath, { bigint: true });
@@ -3145,6 +3251,7 @@ async function readBoundedIdentityText(
 }
 
 async function hashIdentityFile(filePath: string, label: string): Promise<string | undefined> {
+	await assertNoSymlinkedAncestors(filePath, label);
 	let initialStat: nodeFs.BigIntStats;
 	try {
 		initialStat = await fs.lstat(filePath, { bigint: true });
@@ -3225,6 +3332,7 @@ async function assertSanctionedExecutionApprovalAudit(
 	const indexedApprovalPath = path.join(sessionStateDir(cwd, sessionId), "deep-interview-approval-audit.json");
 	let indexedRaw = "";
 	try {
+		await assertNoSymlinkedAncestors(indexedApprovalPath, "deep-interview execution approval index");
 		const sameFileIdentity = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats): boolean =>
 			left.dev === right.dev &&
 			left.ino === right.ino &&
@@ -3283,28 +3391,12 @@ async function assertSanctionedExecutionApprovalAudit(
 	}
 	let auditRaw = "";
 	try {
-		const filePath = auditPath(cwd, sessionId);
-		const stat = await fs.stat(filePath);
-		const maxBytes = 1024 * 1024;
-		const start = Math.max(0, stat.size - maxBytes);
-		const handle = await fs.open(filePath, "r");
-		try {
-			const buffer = Buffer.alloc(stat.size - start);
-			let offset = 0;
-			while (offset < buffer.length) {
-				const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, start + offset);
-				if (bytesRead === 0) throw new Error("execution approval audit ended before the bounded tail was read");
-				offset += bytesRead;
-			}
-			auditRaw = buffer.subarray(0, offset).toString("utf-8");
-			if (start > 0) {
-				const firstNewline = auditRaw.indexOf("\n");
-				auditRaw = firstNewline >= 0 ? auditRaw.slice(firstNewline + 1) : "";
-			}
-		} finally {
-			await handle.close();
-		}
+		auditRaw =
+			(await readBoundedIdentityText(auditPath(cwd, sessionId), 1024 * 1024, "execution approval audit", {
+				tail: true,
+			})) ?? "";
 	} catch (error) {
+		if (error instanceof StateCommandError) throw error;
 		const err = error as NodeJS.ErrnoException;
 		if (err.code === "ENOENT" && !indexedRaw)
 			throw new StateCommandError(2, "deep-interview execution approval lacks sanctioned approval audit record");
@@ -3397,26 +3489,57 @@ async function assertSanctionedExecutionApprovalAudit(
 }
 
 /** Historical audit entries do not attach lineage to a replacement workflow run. */
+function deepInterviewLineageHandoffAt(state: Record<string, unknown>): string | undefined {
+	const handoffFrom = typeof state.handoff_from === "string" ? state.handoff_from.trim() : "";
+	return handoffFrom === "deep-interview"
+		? typeof state.handoff_at === "string"
+			? state.handoff_at
+			: undefined
+		: typeof state.upstream_handoff_at === "string"
+			? state.upstream_handoff_at
+			: typeof state.handoff_at === "string"
+				? state.handoff_at
+				: undefined;
+}
+
 async function hasCurrentDeepInterviewHandoff(
 	cwd: string,
 	sessionId: string,
 	callee: CanonicalGjcWorkflowSkill,
 	state: Record<string, unknown>,
 ): Promise<boolean> {
-	const handoffAt = state.upstream_handoff_at ?? state.handoff_at;
+	const handoffAt = await currentDeepInterviewHandoffAt(cwd, sessionId, callee, state);
 	if (
 		state.handoff_from === undefined &&
 		state.upstream_handoff_at === undefined &&
 		(handoffAt === undefined || state.handoff_to !== undefined)
 	)
 		return false;
-	if (
-		typeof handoffAt !== "string" ||
-		!handoffAt.trim() ||
-		!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, callee, { handoffAt }))
-	)
+	if (typeof handoffAt !== "string" || !handoffAt.trim())
 		throw new StateCommandError(2, "execution handoff cannot authenticate Deep Interview approval lineage");
 	return true;
+}
+
+async function currentDeepInterviewHandoffAt(
+	cwd: string,
+	sessionId: string,
+	callee: CanonicalGjcWorkflowSkill,
+	state: Record<string, unknown>,
+): Promise<string | undefined> {
+	const preferred = deepInterviewLineageHandoffAt(state);
+	const candidates = [
+		preferred,
+		state.handoff_from === "deep-interview" &&
+		state.current_phase === "handoff" &&
+		typeof state.updated_at === "string" &&
+		state.updated_at === state.handoff_at &&
+		typeof state.upstream_handoff_at === "string"
+			? state.upstream_handoff_at
+			: undefined,
+	].filter((value, index, values): value is string => Boolean(value?.trim()) && values.indexOf(value) === index);
+	for (const handoffAt of candidates)
+		if (await hasAuditedDeepInterviewHandoff(cwd, sessionId, callee, { handoffAt })) return handoffAt;
+	return undefined;
 }
 
 async function hasAuditedDeepInterviewHandoff(
@@ -3878,10 +4001,12 @@ async function assertDeepInterviewExecutionLineage(
 		if (upstream === "ralplan" && !(await verifiedRalplanFinalEvidence(cwd, sessionId, upstreamState)))
 			throw new StateCommandError(2, "execution handoff cannot traverse a stuck or unverifiable Ralplan final");
 		if (upstream === "deep-interview") {
-			const currentLineageHandoffAt =
-				typeof currentState.upstream_handoff_at === "string"
-					? currentState.upstream_handoff_at
-					: currentState.handoff_at;
+			const currentLineageHandoffAt = await currentDeepInterviewHandoffAt(
+				cwd,
+				sessionId,
+				currentSkill,
+				currentState,
+			);
 			if (
 				upstreamState.active !== false ||
 				upstreamState.current_phase !== "handoff" ||

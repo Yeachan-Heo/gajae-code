@@ -2372,6 +2372,171 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("rejects a versioned Crystal path collision without replacing the canonical state", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-version-collision-"));
+		const sessionId = "crystallize-version-collision";
+		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const first = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"collision",
+					"--json",
+				],
+				root,
+			);
+			expect(first.status, first.stderr).toBe(0);
+			const payload = JSON.parse(first.stdout ?? "{}");
+			const statePath = deepInterviewStatePath(root, sessionId);
+			const beforeState = await fs.readFile(statePath, "utf8");
+			const indexPath = path.join(sessionSpecsDir(root, sessionId), "deep-interview-index.jsonl");
+			await fs.appendFile(
+				indexPath,
+				`${JSON.stringify({
+					slug: "collision",
+					stage: "final",
+					path: payload.spec_path,
+					created_at: "2026-09-19T00:00:00.000Z",
+					sha256: "b".repeat(64),
+				})}\n`,
+			);
+			const retry = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"collision",
+					"--json",
+				],
+				root,
+			);
+			expect(retry.status).toBe(2);
+			expect(retry.stderr).toContain("conflicting rows");
+			expect(await fs.readFile(statePath, "utf8")).toBe(beforeState);
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not expose a partially-written Crystal artifact as a readable version", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-partial-artifact-"));
+		const sessionId = "crystallize-partial-artifact";
+		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const first = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"partial",
+					"--json",
+				],
+				root,
+			);
+			expect(first.status, first.stderr).toBe(0);
+			const payload = JSON.parse(first.stdout ?? "{}");
+			const statePath = deepInterviewStatePath(root, sessionId);
+			const beforeState = await fs.readFile(statePath, "utf8");
+			await fs.writeFile(payload.spec_path, "# Deep Interview Crystal v1\n\n## Delta\n", "utf8");
+			const retry = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"partial",
+					"--json",
+				],
+				root,
+			);
+			expect(retry.status).toBe(2);
+			expect(retry.stderr).toContain("published Crystal artifact verification failed");
+			expect(await fs.readFile(statePath, "utf8")).toBe(beforeState);
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a symlinked Crystal session/spec parent before publication", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-symlink-parent-"));
+		const outside = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-symlink-target-"));
+		const sessionId = "crystallize-symlink-parent";
+		const sessionFile = path.join(root, ".gjc", "sessions", "conversation.jsonl");
+		const specsPath = sessionSpecsDir(root, sessionId);
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			await fs.mkdir(path.dirname(specsPath), { recursive: true });
+			await fs.symlink(outside, specsPath, "dir");
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"symlinked",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("publication parent");
+			expect(await fs.readdir(outside)).toEqual([]);
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(outside, { recursive: true, force: true });
+		}
+	});
+
 	it("honors an explicit managed transcript beyond the discovery candidate cap", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-explicit-cap-"));
 		const sessionId = "crystallize-explicit-cap";
