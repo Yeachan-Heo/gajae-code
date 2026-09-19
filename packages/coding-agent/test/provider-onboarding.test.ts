@@ -323,7 +323,7 @@ describe("provider onboarding setup core", () => {
 				}
 			>;
 		};
-		const provider = parsed.providers?.["ionet"];
+		const provider = parsed.providers?.ionet;
 
 		expect(result.providerId).toBe("ionet");
 		expect(result.presetName).toBe("IO Intelligence (io.net)");
