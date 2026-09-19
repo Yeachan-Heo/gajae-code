@@ -821,6 +821,7 @@ type TuiRenderCounterSnapshot = {
 	widthReflowScanRows: number;
 	widthReflowVisibleWidthCalls: number;
 	kittyPlacementScanRows: number;
+	kittyPlacementReferenceRows: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -1188,6 +1189,7 @@ export class TUI extends Container {
 		widthReflowScanRows: 0,
 		widthReflowVisibleWidthCalls: 0,
 		kittyPlacementScanRows: 0,
+		kittyPlacementReferenceRows: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1198,6 +1200,7 @@ export class TUI extends Container {
 			widthReflowScanRows: 0,
 			widthReflowVisibleWidthCalls: 0,
 			kittyPlacementScanRows: 0,
+			kittyPlacementReferenceRows: 0,
 		};
 	}
 
@@ -4671,7 +4674,12 @@ export class TUI extends Container {
 			const safeLines = reuseCached ? cached.safeLines : rendered.lines.map(stripTerminalEraseControls);
 			const kittyPlacements = reuseCached
 				? cached.kittyPlacements
-				: rendered.lines.map(line => [...extractKittyPlacementReferences(line)]);
+				: TERMINAL.imageProtocol === ImageProtocol.Kitty
+					? rendered.lines.map(line => {
+							TUI.#renderCounters.kittyPlacementReferenceRows++;
+							return [...extractKittyPlacementReferences(line)];
+						})
+					: [];
 			if (!reuseCached && componentRevision !== undefined && source !== null) {
 				this.#viewportAnchorRenderCache = {
 					component: child,

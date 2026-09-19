@@ -260,6 +260,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * next tool/turn boundary either way.
 	 */
 	toolInterruptPolicy?: "abort_tools" | "finish_tools";
+	/** Test-only diagnostic for bounding pending per-read abort-race reactions. */
+	onAbortRaceReactionChange?: (delta: 1 | -1) => void;
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.

@@ -436,6 +436,7 @@ type ResourceDisposer = () => void | Promise<void>;
 
 const resourceOwners = new Map<string, ResourceDisposer>();
 let resourcePostmortemRegistered = false;
+let activeResourceOwnerDisposals = 0;
 
 function ensureResourcePostmortem(): void {
 	if (resourcePostmortemRegistered) return;
@@ -477,23 +478,33 @@ export function resourceOwnerCount(): number {
 	return resourceOwners.size;
 }
 
+/** True while a process-level resource-owner sweep is in progress. */
+export function isResourceOwnerDisposalActive(): boolean {
+	return activeResourceOwnerDisposals > 0;
+}
+
 /**
  * Run and clear every registered resource disposer. Attempts all disposers even
  * if some throw, then surfaces the failures as an `AggregateError` so callers
  * can distinguish "all closed" from "a resource may still be alive".
  */
 export async function disposeAllResourceOwners(): Promise<void> {
-	const disposers = [...resourceOwners.values()];
-	resourceOwners.clear();
-	const errors: unknown[] = [];
-	for (const disposer of disposers) {
-		try {
-			await disposer();
-		} catch (err) {
-			errors.push(err);
+	activeResourceOwnerDisposals += 1;
+	try {
+		const disposers = [...resourceOwners.values()];
+		resourceOwners.clear();
+		const errors: unknown[] = [];
+		for (const disposer of disposers) {
+			try {
+				await disposer();
+			} catch (err) {
+				errors.push(err);
+			}
 		}
-	}
-	if (errors.length > 0) {
-		throw new AggregateError(errors, `${errors.length} resource disposer(s) failed during teardown`);
+		if (errors.length > 0) {
+			throw new AggregateError(errors, `${errors.length} resource disposer(s) failed during teardown`);
+		}
+	} finally {
+		activeResourceOwnerDisposals -= 1;
 	}
 }
