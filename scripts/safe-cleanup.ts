@@ -298,6 +298,17 @@ export function assessDeletionTarget(target: string, world: SafeCleanupWorld): D
 			for (const component of kit.componentsBetween(effectiveRoot, canonical)) {
 				const owner = tryRun(() => world.statUid(component));
 				if (owner === undefined) {
+					// A component that no longer exists cannot be deleted wrongly: the
+					// canonical target is already gone, so the removal is a no-op. Treat
+					// it exactly like the non-existent-target branch below instead of
+					// aborting the process. Lock releases rename to `<name>.removing` and
+					// unlink it, so a concurrent release routinely makes a component
+					// vanish between the existence check above and this stat (#5399:
+					// interactive-star-reminder exited 70 on
+					// `star-reminder.json.lock.removing`).
+					// A component that still EXISTS but cannot be stat'ed is a genuine
+					// refusal: ownership is unproven and deletion must fail closed.
+					if (tryRun(() => world.existsSync(component)) !== true) continue;
 					return refuse(
 						"unowned-path",
 						`refusing to delete ${canonical}: ownership of ${component} could not be verified`,

@@ -560,6 +560,33 @@ export type SessionStateLockUnavailableReason =
 	| "transition_claim_timeout"
 	| "unsafe_lock_path_type";
 
+/**
+ * Why a stale-transition reclaim refused, as a bounded classifier.
+ *
+ * `transition_claim_timeout` collapsed six structurally different refusals into
+ * one message, so an operator could not tell a foreign-host tombstone from a
+ * live owner from a directory an external process was stamping — the gap #5606
+ * asked for. Every member is a fixed enum: never a path, token, host id, pid or
+ * raw errno, because this rides on an error message users paste into reports.
+ */
+export type TransitionReclaimRefusal =
+	/** The claim vanished, or its owner sidecar was absent/unparseable/invalid. */
+	| "claim_or_owner_unreadable"
+	/** A released tombstone carrying no `owner_host_id` at all. */
+	| "released_owner_unprovenanced"
+	/** A released tombstone belonging to a different installation. */
+	| "released_owner_foreign_host"
+	/** A released tombstone still inside `RELEASED_TRANSITION_GRACE_MS`. */
+	| "released_owner_within_grace"
+	/** The owner is alive, or its liveness could not be disproven. */
+	| "owner_live_or_unverifiable"
+	/** The claim changed between inspection and capture — an external writer. */
+	| "claim_generation_changed"
+	/** The claim was not empty when captured, so it is not ours to remove. */
+	| "claim_not_empty"
+	/** The claim's canonical path or directory snapshot could not be taken. */
+	| "claim_capture_failed";
+
 interface SessionStateLockUnavailableDetails {
 	lockPath: string;
 	reason: SessionStateLockUnavailableReason;
@@ -747,6 +774,28 @@ function lockUnavailable(
 		reason,
 		...(budget ? { attempts: budget.attempts + 1, elapsedMs: Math.round(lockRetryElapsedMs(budget)) } : {}),
 		...(cause === undefined ? {} : { cause }),
+	});
+}
+
+/**
+ * `transition_claim_timeout` with the reclaim refusal that kept repeating.
+ *
+ * The bare classifier could not distinguish six structurally different
+ * refusals, so an operator had no way to tell which action would help (#5606).
+ * The suffix is a fixed enum member and nothing else — this string reaches user
+ * reports, so it must never carry a path, token, host id, pid or errno.
+ */
+function transitionClaimTimeout(
+	transitionDir: string,
+	budget: LockRetryBudget,
+	cause: unknown,
+	refusal: TransitionReclaimRefusal | undefined,
+): SessionStateLockUnavailableError {
+	const error = lockUnavailable(transitionDir, "transition_claim_timeout", budget, cause);
+	if (refusal === undefined) return error;
+	return Object.assign(error, {
+		reclaimRefusal: refusal,
+		message: `${error.message.replace(/\.$/, "")} (reclaim refused: ${refusal}).`,
 	});
 }
 
@@ -1846,12 +1895,26 @@ async function releaseTransitionClaim(
 	}
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<boolean> {
+/**
+ * Outcome of one stale-transition reclaim attempt. `reclaimed` drives the
+ * caller's retry accounting exactly as the previous boolean did; `refusal`
+ * exists only so the eventual `transition_claim_timeout` can name which
+ * precondition said no (#5606).
+ */
+interface TransitionReclaimOutcome {
+	reclaimed: boolean;
+	refusal?: TransitionReclaimRefusal;
+}
+
+async function reclaimStaleTransitionClaim(
+	transitionDir: string,
+	quarantineName: string,
+): Promise<TransitionReclaimOutcome> {
 	let stat: fsSync.BigIntStats;
 	try {
 		stat = await fs.lstat(transitionDir, { bigint: true });
 	} catch {
-		return false;
+		return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	}
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
@@ -1865,41 +1928,43 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 			},
 			quarantineName,
 		);
-		return reclaimed === "owner_removed";
+		return { reclaimed: reclaimed === "owner_removed" };
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
-	if (!ownerSnapshot) return false;
+	if (!ownerSnapshot) return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	let owner: unknown;
 	try {
 		owner = JSON.parse(ownerSnapshot.bytes);
 	} catch {
-		return false;
+		return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	}
-	if (!validLockOwner(owner)) return false;
+	if (!validLockOwner(owner)) return { reclaimed: false, refusal: "claim_or_owner_unreadable" };
 	await SessionStateLockTestHooks.afterTransitionStaleInspection?.(transitionDir);
 	if (owner.released === true) {
 		// A released record is safe only when it is qualified by this installation.
 		// Never let a shared-volume tombstone, an absent identity, or a legacy foreign
 		// identity authorize removal of a claim this process cannot own.
-		if (owner.owner_host_id === undefined) return false;
+		if (owner.owner_host_id === undefined) return { reclaimed: false, refusal: "released_owner_unprovenanced" };
 		const currentHost = await currentOwnerHostId();
 		const legacyHost = await currentLegacyOwnerHostId();
-		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return false;
-		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return false;
+		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost)
+			return { reclaimed: false, refusal: "released_owner_foreign_host" };
+		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS)
+			return { reclaimed: false, refusal: "released_owner_within_grace" };
 	} else if (await lockOwnerIsAlive(owner)) {
 		// Only a host-qualified owner whose pid is PROVEN dead (ESRCH, or a live pid
 		// with a provably different incarnation) authorizes reclaim. The generation
 		// + exact-tree checks below then bind the removal to the very directory
 		// inspected here, on every platform; a claim stranded by a force-quit
 		// (`postmortem.quit`) would otherwise wall the session directory forever.
-		return false;
+		return { reclaimed: false, refusal: "owner_live_or_unverifiable" };
 	}
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
-	if (!nativePath) return false;
+	if (!nativePath) return { reclaimed: false, refusal: "claim_capture_failed" };
 	const captured = nativeSessionStateLock().snapshotDirectoryTree(nativePath);
-	if (!captured.ok || !captured.snapshot) return false;
+	if (!captured.ok || !captured.snapshot) return { reclaimed: false, refusal: "claim_capture_failed" };
 	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
 	if (
 		root?.kind !== "directory" ||
@@ -1909,12 +1974,12 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		root.mtimeNs !== String(generation.mtimeNs) ||
 		root.ctimeNs !== String(generation.ctimeNs)
 	)
-		return false;
-	if (captured.snapshot.entries.length !== 1) return false;
+		return { reclaimed: false, refusal: "claim_generation_changed" };
+	if (captured.snapshot.entries.length !== 1) return { reclaimed: false, refusal: "claim_not_empty" };
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return removed.ok;
+		return { reclaimed: removed.ok };
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -1931,7 +1996,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		// successor populated the detached path.
 		await removeTransitionDir(removed.detachedPath);
 		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		return true;
+		return { reclaimed: true };
 	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
@@ -2310,6 +2375,7 @@ async function runLockPathTransition<T>(
 		throw new SessionStateLockUnavailableError(new Error("Safe transition ownership is unsupported."));
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
+	let lastReclaimRefusal: TransitionReclaimRefusal | undefined;
 
 	for (;;) {
 		if (ownerAccessStrategy() === "unsupported" && fsSync.existsSync(transitionDir))
@@ -2332,18 +2398,24 @@ async function runLockPathTransition<T>(
 			// Claims are held only for pathname bookkeeping, so a changed claim identity is
 			// proof that contenders are cycling through rather than that one is wedged.
 			const observedClaim = await observedLockHolderIdentity(transitionDir);
-			const reclaimed = await reclaimStaleTransitionClaim(transitionDir, quarantineName);
-			creditLockHandoffProgress(budget, observedClaim, reclaimed);
+			const outcome = await reclaimStaleTransitionClaim(transitionDir, quarantineName);
+			creditLockHandoffProgress(budget, observedClaim, outcome.reclaimed);
+			// Remember the LAST refusal: on a wedged claim every retry refuses for the
+			// same reason, and that reason is the actionable one. Carrying it onto the
+			// timeout is the whole point — `transition_claim_timeout` alone cannot tell
+			// a foreign-host tombstone from a live owner from an external writer
+			// restamping the claim directory (#5606).
+			if (outcome.refusal !== undefined) lastReclaimRefusal = outcome.refusal;
 			// One safe reclaim may make progress, but a try-acquire never follows a
 			// succession of contenders. A later maintenance pass can take the freed claim.
 			if (budget.nonBlocking) throw SESSION_STATE_LOCK_BUSY;
-			if (reclaimed) {
+			if (outcome.reclaimed) {
 				if (lockRetryExhausted(budget))
-					throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
+					throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
 				continue;
 			}
 			if (!(await waitForLockRetry(budget)))
-				throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
+				throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
 			continue;
 		}
 		const pendingSetup: PendingTransitionRelease = {
@@ -2751,6 +2823,34 @@ async function observedLockHolderIdentity(lockPath: string): Promise<string | un
 	const stat = await fs.lstat(lockPath, { bigint: true }).catch(() => null);
 	if (!stat?.isDirectory()) return undefined;
 	return `d:${stat.dev}:${stat.ino}:${stat.ctimeNs}`;
+}
+
+/**
+ * Classify one stale-transition reclaim attempt.
+ *
+ * @internal exported as the seam the refusal classifier is tested through. Driving
+ * a real `transition_claim_timeout` would mean waiting out `LOCK_ACQUIRE_MAX_WAIT_MS`
+ * (60s) per case, and `tryWithSessionStateFileLock` throws BUSY before the timeout
+ * is ever built, so the per-branch reasons have no other reachable surface (#5606).
+ */
+export async function classifyTransitionReclaimForTests(
+	transitionDir: string,
+	quarantineName: string,
+): Promise<TransitionReclaimOutcome> {
+	return reclaimStaleTransitionClaim(transitionDir, quarantineName);
+}
+
+/**
+ * Build the timeout error exactly as the transition loop does.
+ *
+ * @internal exported so the message contract — a bounded enum suffix and nothing
+ * else — is pinned without a 60s wait (#5606).
+ */
+export function transitionClaimTimeoutForTests(
+	transitionDir: string,
+	refusal: TransitionReclaimRefusal | undefined,
+): SessionStateLockUnavailableError {
+	return transitionClaimTimeout(transitionDir, lockRetryBudget(), new Error("EEXIST"), refusal);
 }
 
 /**

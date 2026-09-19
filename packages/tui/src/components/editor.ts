@@ -443,6 +443,7 @@ export class Editor implements Component, Focusable {
 	#wrappedLineCache: CachedWrappedLine[] = [];
 	#docVersion = 0;
 	#layoutCache: LayoutCache | undefined;
+	#logicalLayoutCache: Array<{ text: string; width: number; cursorCol: number | undefined; lines: LayoutLine[] }> = [];
 
 	// Emacs-style kill ring
 	#killRing = new KillRing();
@@ -754,11 +755,20 @@ export class Editor implements Component, Focusable {
 	}
 
 	invalidate(): void {
+		this.#logicalLayoutCache.length = 0;
 		this.#wrappedLineCache.length = 0;
 		this.#layoutCache = undefined;
 	}
 
+	#trimLogicalLayoutCache(): void {
+		// Retain at most one layout per current logical line, never deleted tails.
+		if (this.#logicalLayoutCache.length > this.#state.lines.length) {
+			this.#logicalLayoutCache.length = this.#state.lines.length;
+		}
+	}
+
 	#bumpDocumentVersion(): void {
+		this.#trimLogicalLayoutCache();
 		this.#docVersion += 1;
 		this.#layoutCache = undefined;
 	}
@@ -1163,6 +1173,16 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		try {
+			this.#handleInput(data);
+		} finally {
+			// Undo snapshots invalidate before mutation; trim after all input paths,
+			// including early returns and nested bracketed-paste handling.
+			this.#trimLogicalLayoutCache();
+		}
+	}
+
+	#handleInput(data: string): void {
 		const kb = getKeybindings();
 
 		// Handle character jump mode (awaiting next character to jump to)
@@ -1585,6 +1605,11 @@ export class Editor implements Component, Focusable {
 		return wrapped;
 	}
 
+	/** Test-only seam: retained per-logical-line layout entries. */
+	get logicalLayoutCacheSize(): number {
+		return this.#logicalLayoutCache.length;
+	}
+
 	/** Test-only seam: current wrap-cache entry count (memory-bound assertions). */
 	get wrappedLineCacheSize(): number {
 		return this.#wrappedLineCache.length;
@@ -1624,6 +1649,16 @@ export class Editor implements Component, Focusable {
 	}
 
 	#layoutLogicalLine(lineIndex: number, contentWidth: number): LayoutLine[] {
+		const text = this.#state.lines[lineIndex] || "";
+		const cursorCol = lineIndex === this.#state.cursorLine ? this.#state.cursorCol : undefined;
+		const cached = this.#logicalLayoutCache[lineIndex];
+		if (cached?.text === text && cached.width === contentWidth && cached.cursorCol === cursorCol) return cached.lines;
+		const lines = this.#buildLogicalLine(lineIndex, contentWidth);
+		this.#logicalLayoutCache[lineIndex] = { text, width: contentWidth, cursorCol, lines };
+		return lines;
+	}
+
+	#buildLogicalLine(lineIndex: number, contentWidth: number): LayoutLine[] {
 		__editorPerfCounters.layoutLogicalLinesProcessed += 1;
 		const line = this.#state.lines[lineIndex] || "";
 		const isCurrentLine = lineIndex === this.#state.cursorLine;
@@ -1722,6 +1757,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	#layoutText(contentWidth: number): LayoutLine[] {
+		this.#trimLogicalLayoutCache();
 		__editorPerfCounters.layoutTextInvocations += 1;
 		const key = this.#makeLayoutCacheKey(contentWidth);
 		const cached = this.#layoutCache;

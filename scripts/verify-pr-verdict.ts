@@ -76,6 +76,13 @@ export interface IndependentReviewerEvidence {
 	permission: string;
 	approvedHead: boolean;
 	approvedLogin?: string;
+	/**
+	 * True when this login DOES have an APPROVED review reporting the exact head, but it was
+	 * submitted before that head existed — a stale approval GitHub re-pointed after a
+	 * force-push. Distinguished from "no approval" so the diagnostic can say which it is,
+	 * because the remedies differ: one needs a reviewer, the other needs a re-review (#5692).
+	 */
+	reboundStaleApproval?: boolean;
 }
 
 /** A review normalized from either API shape so one rule can decide the effective one. */
@@ -83,6 +90,29 @@ interface EffectiveReview {
 	login?: string;
 	state?: string;
 	oid?: string;
+	/** ISO submission time. Absent means the caller could not read it; that fails closed. */
+	submittedAt?: string;
+}
+
+/**
+ * Whether a review's reported commit can be trusted as the head it actually reviewed.
+ *
+ * `review.commit_id` is NOT immutable: GitHub re-points it at the new branch tip when a PR
+ * is force-pushed and stale-review dismissal does not fire. `dev` is unprotected, so the
+ * branch almost every PR targets has no dismissal, and a rebase therefore turned every prior
+ * approval into an apparent exact-head approval. Two live cases: an approval submitted
+ * 4h24m before its attributed head existed, and another two days before (#5692).
+ *
+ * A review cannot review a commit that does not exist yet, so a submission earlier than the
+ * head's committer date proves re-binding. Both timestamps must be readable and parseable —
+ * an unknown time is never treated as fresh.
+ */
+function reviewPrecedesHead(submittedAt: string | undefined, headCommittedAt: string | undefined): boolean {
+	if (submittedAt === undefined || headCommittedAt === undefined) return true;
+	const submitted = Date.parse(submittedAt);
+	const committed = Date.parse(headCommittedAt);
+	if (!Number.isFinite(submitted) || !Number.isFinite(committed)) return true;
+	return submitted < committed;
 }
 
 /**
@@ -91,15 +121,41 @@ interface EffectiveReview {
  * callers (the event approval, the independent-reviewer evidence, and the push preflight)
  * must never disagree about which review counts — the divergence that produced issue #5483
  * and later the withdrawn-approval gap the QA lane found.
+ *
+ * `headCommittedAt` additionally discards reviews that predate the head they claim, which is
+ * how a force-push silently re-binds a stale approval onto new code (#5692). Omitting it
+ * keeps the pre-#5692 behaviour and is only for callers with no head date at all.
  */
-function effectiveExactHeadReview(reviews: EffectiveReview[], login: string, headSha: string): EffectiveReview | undefined {
+function effectiveExactHeadReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt?: string,
+): EffectiveReview | undefined {
 	return reviews
 		.filter(review =>
 			review.login?.toLowerCase() === login.toLowerCase()
 			&& review.state !== "COMMENTED"
-			&& review.oid === headSha,
+			&& review.oid === headSha
+			&& !(headCommittedAt !== undefined && reviewPrecedesHead(review.submittedAt, headCommittedAt)),
 		)
 		.at(-1);
+}
+
+/** True when this identity has a review bound to the head but only by a re-pointed commit id. */
+function hasReboundStaleReview(
+	reviews: EffectiveReview[],
+	login: string,
+	headSha: string,
+	headCommittedAt: string | undefined,
+): boolean {
+	if (headCommittedAt === undefined) return false;
+	return reviews.some(review =>
+		review.login?.toLowerCase() === login.toLowerCase()
+		&& review.state === "APPROVED"
+		&& review.oid === headSha
+		&& reviewPrecedesHead(review.submittedAt, headCommittedAt),
+	);
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -392,8 +448,17 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
 	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null) && !input.independentReviewerUnavailable) {
-		const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
-		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind === "independent" ? `independent:${review.extra.login}` : review.extra.kind}); the risk-classified gate is not satisfied.`);
+		// Name the re-bound case separately. "No approval" sends the author looking for a
+		// reviewer; a re-bound approval means the named reviewer already looked at DIFFERENT
+		// code and has to re-review this head. Collapsing the two is what let me tell two
+		// PR authors their only remaining step was flipping a verdict verb (#5692).
+		const named = review.extra.kind === "independent" ? review.extra.login : review.extra.kind;
+		if (input.independentReviewer?.reboundStaleApproval === true) {
+			diagnostics.push(`Self-review risk ${review.risk} names extra:independent:${named}, whose APPROVED review reports this exact head but was submitted BEFORE that head commit existed. GitHub re-pointed a stale review after a force-push, so it is not an approval of this code; a review submitted after the current head is required.`);
+		} else {
+			const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
+			diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${named}); the risk-classified gate is not satisfied.`);
+		}
 	}
 	if (review.extra.kind === "independent" && review.extra.login.toLowerCase() === input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review extra:independent:${review.extra.login} names the PR author; the independent reviewer must be a distinct maintainer.`);
@@ -422,6 +487,8 @@ interface PullRequestReview {
 	state?: string;
 	commit_id?: string;
 	user?: { login?: string };
+	/** Needed to detect a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submitted_at?: string;
 }
 
 interface CollaboratorPermission {
@@ -533,11 +600,13 @@ async function fetchPushPreflightSelfReview(repo: string, number: number, author
 	return { comment: newest, error: null };
 }
 
-/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}'` emits it. */
+/** A review as `gh api --jq '.[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}'` emits it. */
 interface LiveReview {
 	author: { login: string } | null;
 	state: string;
 	commit: { oid: string } | null;
+	/** Detects a `commit_id` re-pointed onto a newer head by a force-push (#5692). */
+	submittedAt: string | null;
 }
 
 /**
@@ -550,18 +619,32 @@ interface LiveReview {
  * returned as an error so the caller can report it as unread instead of unauthorized.
  */
 async function fetchPushPreflightIndependentReviewer(repo: string, number: number, login: string, headSha: string, cwd: string): Promise<{ evidence: IndependentReviewerEvidence | null; error: string | null }> {
-	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}}"], cwd);
+	const listed = await gh(["api", "--paginate", `repos/${repo}/pulls/${number}/reviews`, "--jq", ".[] | {author: {login: .user.login}, state, commit: {oid: .commit_id}, submittedAt: .submitted_at}"], cwd);
 	if (listed.exitCode !== 0) return { evidence: null, error: listed.stderr || `gh exited ${listed.exitCode}` };
 	const parsed = parseGhJsonl<LiveReview>(listed.stdout);
 	if (!parsed.ok) return { evidence: null, error: parsed.error };
-	const approvedHead = effectiveExactHeadReview(
-		parsed.values.map(review => ({ login: review.author?.login, state: review.state, oid: review.commit?.oid })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = parsed.values.map(review => ({
+		login: review.author?.login,
+		state: review.state,
+		oid: review.commit?.oid,
+		submittedAt: review.submittedAt ?? undefined,
+	}));
+	// Locally the head commit is already in the object store, so read its committer date
+	// straight from git rather than spending another API call (#5692).
+	const headDate = await git(["show", "-s", "--format=%cI", headSha], cwd);
+	const headCommittedAt = headDate.exitCode === 0 ? Buffer.from(headDate.stdout).toString().trim() || undefined : undefined;
+	const approvedHead = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
 	const permission = await gh(["api", `repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`, "--jq", ".permission"], cwd);
 	if (permission.exitCode !== 0) return { evidence: null, error: permission.stderr || `gh exited ${permission.exitCode}` };
-	return { evidence: { permission: permission.stdout.trim(), approvedHead, approvedLogin: login }, error: null };
+	return {
+		evidence: {
+			permission: permission.stdout.trim(),
+			approvedHead,
+			approvedLogin: login,
+			...(approvedHead ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+		},
+		error: null,
+	};
 }
 
 export async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string, token = Bun.env.GITHUB_TOKEN): Promise<{ login?: string; headSha?: string }> {
@@ -582,11 +665,21 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approval = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		reviewerId,
-		headSha,
-	);
+	// Normalize BEFORE the head-date call so a malformed review response still fails on the
+	// reviews payload rather than spending an extra API request first.
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headers = {
+		Accept: "application/vnd.github+json",
+		Authorization: `Bearer ${token}`,
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
+	const approval = effectiveExactHeadReview(normalized, reviewerId, headSha, headCommittedAt);
 	if (approval?.state !== "APPROVED") return {};
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
 		headers: {
@@ -608,6 +701,24 @@ export async function authenticatedApproval(event: PullRequestEvent, reviewerId:
  * CHANGES_REQUESTED supersedes an earlier APPROVED exactly as it does for a merge-approved
  * verdict (issue #4703 hardening, extended after the push preflight mirrored this lookup).
  */
+/**
+ * Committer date of the PR head, used to discard reviews that predate it (#5692).
+ *
+ * Returns `undefined` when the commit cannot be read, and every caller treats that as
+ * "cannot prove freshness" rather than "fresh": an unreadable head date makes
+ * `reviewPrecedesHead` refuse the review instead of admitting it.
+ */
+async function fetchHeadCommittedAt(
+	repository: string,
+	headSha: string,
+	headers: Record<string, string>,
+): Promise<string | undefined> {
+	const response = await fetch(`https://api.github.com/repos/${repository}/commits/${headSha}`, { headers });
+	if (!response.ok) return undefined;
+	const commit = await response.json() as { commit?: { committer?: { date?: string } } };
+	return commit.commit?.committer?.date;
+}
+
 export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
@@ -626,15 +737,23 @@ export async function fetchIndependentReviewerEvidence(event: PullRequestEvent, 
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const approved = effectiveExactHeadReview(
-		reviews.map(review => ({ login: review.user?.login, state: review.state, oid: review.commit_id })),
-		login,
-		headSha,
-	)?.state === "APPROVED";
+	const normalized = reviews.map(review => ({
+		login: review.user?.login,
+		state: review.state,
+		oid: review.commit_id,
+		submittedAt: review.submitted_at,
+	}));
+	const headCommittedAt = await fetchHeadCommittedAt(repository, headSha, headers);
+	const approved = effectiveExactHeadReview(normalized, login, headSha, headCommittedAt)?.state === "APPROVED";
 	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
 	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
-	return { permission: collaborator.permission ?? "none", approvedHead: approved, approvedLogin: login };
+	return {
+		permission: collaborator.permission ?? "none",
+		approvedHead: approved,
+		approvedLogin: login,
+		...(approved ? {} : { reboundStaleApproval: hasReboundStaleReview(normalized, login, headSha, headCommittedAt) }),
+	};
 }
 
 async function git(args: string[], cwd: string): Promise<{ exitCode: number; stdout: Uint8Array; stderr: string }> {
