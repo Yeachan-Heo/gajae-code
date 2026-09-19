@@ -335,7 +335,7 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 		: "terminal_error";
 }
 
-type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
+export type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
 type SessionListCursor = {
 	sessions: IndexedSession[];
@@ -636,7 +636,7 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
-function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
