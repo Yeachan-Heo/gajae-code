@@ -35,7 +35,7 @@ import {
 	MCPPoolLeaseReleaseError,
 } from "./pool";
 import type { MCPProtocolObservation } from "./protocol";
-import { DEFAULT_MCP_STARTUP_WAIT_MS } from "./startup-policy";
+import { DEFAULT_MCP_STARTUP_WAIT_MS, MAX_MCP_STARTUP_WAIT_MS, MCP_STARTUP_WAIT_GRACE_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -103,14 +103,14 @@ type RetiredLeaseRelease = {
 };
 
 const STARTUP_TIMEOUT_MS = DEFAULT_MCP_STARTUP_WAIT_MS;
-const STARTUP_TIMEOUT_GRACE_MS = 500;
+const STARTUP_TIMEOUT_GRACE_MS = MCP_STARTUP_WAIT_GRACE_MS;
 /**
  * Default ceiling on how long `discoverAndConnect` waits for a server batch to
  * come up. Deliberately short: a config with a large `timeout` must not be able
  * to hang ordinary startup. ACP lifecycle launches carry their own, larger
  * budget derived from the readiness deadline (see `maxStartupTimeoutMs`).
  */
-const MAX_STARTUP_TIMEOUT_MS = 1_750;
+const MAX_STARTUP_TIMEOUT_MS = MAX_MCP_STARTUP_WAIT_MS;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
@@ -1068,6 +1068,13 @@ export class MCPManager {
 					"MCP connection cleanup pending";
 				errors.set(name, this.#serverError(message));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: message,
+					});
+				}
 				continue;
 			}
 			if (sources[name]) {
@@ -1094,14 +1101,29 @@ export class MCPManager {
 				this.#pendingToolLoads.has(name) ||
 				this.#pendingReconnections.has(name)
 			) {
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: "connection already pending",
+					});
+				}
 				continue;
 			}
 
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, this.#serverError(validationErrors.join("; ")));
+				const reason = validationErrors.join("; ");
+				errors.set(name, this.#serverError(reason));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason,
+					});
+				}
 				continue;
 			}
 
@@ -1251,9 +1273,11 @@ export class MCPManager {
 					this.#retainConnectionCleanupFailure(name, error);
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
+					if (!allowBackgroundLogging || this.#toolsOnly || reportedErrors.has(name)) return;
 					const message = error instanceof Error ? error.message : String(error);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
+					errors.set(name, this.#serverError(message));
+					reportedErrors.add(name);
+					logger.error("MCP tool load failed", { path: `mcp:${name}`, serverName: name, error: message });
 				});
 		}
 
@@ -1332,18 +1356,22 @@ export class MCPManager {
 						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
 							logger.warn("MCP server still connecting after the startup wait", {
 								path: `mcp:${task.name}`,
+								serverName: task.name,
 								startupWaitMs: startupTimeoutMs,
 								declaredTimeoutMs: task.config.timeout,
 							});
 							continue;
 						}
 						const message = `MCP server connection timed out during startup: ${task.name}`;
-						logger.warn("MCP server connection timed out during startup", {
-							path: `mcp:${task.name}`,
-							startupWaitMs: startupTimeoutMs,
-							declaredTimeoutMs: task.config.timeout,
-							remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
-						});
+						if (!this.#toolsOnly) {
+							logger.warn("MCP server connection timed out during startup", {
+								path: `mcp:${task.name}`,
+								serverName: task.name,
+								startupWaitMs: startupTimeoutMs,
+								declaredTimeoutMs: task.config.timeout,
+								remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
+							});
+						}
 						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
 						task.connectionAbort.abort(new Error(message));
@@ -1394,6 +1422,7 @@ export class MCPManager {
 					if (!(this.#toolsOnly && reason instanceof MCPExpectedFailure)) {
 						logger.warn("MCP server connection failed during startup", {
 							path: `mcp:${name}`,
+							serverName: name,
 							error: message,
 							remediation:
 								"Check the server command and set --timeout <ms> when startup is expected to be slow.",

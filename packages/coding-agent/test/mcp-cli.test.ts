@@ -178,6 +178,62 @@ describe("gjc mcp CLI helpers", () => {
 		expect((await readMCPConfigFile(configPath)).mcpServers?.srv).toMatchObject({ command: "new-bin" });
 	});
 
+	it("bases skipped-add disclosure on the stored registration", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+		await runMCPCommand({
+			action: "add",
+			name: "untimed",
+			commandArgs: ["old-bin"],
+			flags: {},
+			cwd: projectDir,
+		});
+		stdout.mockClear();
+		await runMCPCommand({
+			action: "add",
+			name: "untimed",
+			commandArgs: ["new-bin"],
+			flags: { json: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const skippedUntimed = JSON.parse(stdoutText(stdout)) as {
+			status: string;
+			config: { command: string; timeout?: number };
+			startupDiagnostic?: string;
+		};
+		expect(skippedUntimed.status).toBe("skipped");
+		expect(skippedUntimed.config.command).toBe("old-bin");
+		expect(skippedUntimed.config.timeout).toBeUndefined();
+		expect(skippedUntimed.startupDiagnostic).toContain("No per-server timeout is declared");
+
+		await runMCPCommand({
+			action: "add",
+			name: "timed",
+			commandArgs: ["timed-bin"],
+			flags: { timeout: 10_000 },
+			cwd: projectDir,
+		});
+		stdout.mockClear();
+		await runMCPCommand({
+			action: "add",
+			name: "timed",
+			commandArgs: ["replacement-bin"],
+			flags: { json: true },
+			cwd: projectDir,
+		});
+
+		const skippedTimed = JSON.parse(stdoutText(stdout)) as {
+			status: string;
+			config: { command: string; timeout?: number };
+			startupDiagnostic?: string;
+		};
+		expect(skippedTimed.status).toBe("skipped");
+		expect(skippedTimed.config.command).toBe("timed-bin");
+		expect(skippedTimed.config.timeout).toBe(10_000);
+		expect(skippedTimed.startupDiagnostic).toBeUndefined();
+	});
+
 	it("redacts malformed pair values from argument errors", async () => {
 		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 

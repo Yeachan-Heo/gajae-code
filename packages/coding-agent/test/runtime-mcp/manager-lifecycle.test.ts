@@ -102,6 +102,37 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
+	test("retains a post-return background tool-load failure in the result errors", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const backgroundFailure = Promise.withResolvers<never>();
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		const listToolsSpy = vi
+			.spyOn(mcpClient, "listTools")
+			.mockImplementation(async () => await backgroundFailure.promise);
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{ late: { type: "http", url: "http://127.0.0.1:1", timeout: 10_000 } },
+				{},
+			);
+			expect(connectSpy).toHaveBeenCalledTimes(1);
+			expect(listToolsSpy).toHaveBeenCalledTimes(1);
+			expect(result.errors.has("late")).toBe(false);
+
+			backgroundFailure.reject(new Error("background tools failure"));
+			await waitFor(() => result.errors.get("late") === "background tools failure");
+			expect(result.errors.get("late")).toBe("background tools failure");
+			expect(error).toHaveBeenCalledWith("MCP tool load failed", {
+				path: "mcp:late",
+				serverName: "late",
+				error: "background tools failure",
+			});
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
 	// The long startup ceiling is ACP-scoped (PR #3164 Option B): a slow gateway
 	// gets its configured window only when the caller supplies an explicit
 	// budget, as ACP lifecycle launches do. Without one, the short default

@@ -4,6 +4,10 @@ export type AutoloadStatus = "autoload" | "autoload-off" | "disabled";
 
 /** Ordinary standalone sessions stop blocking on MCP startup after this wait. */
 export const DEFAULT_MCP_STARTUP_WAIT_MS = 250;
+/** Grace added to the largest declared per-server startup window. */
+export const MCP_STARTUP_WAIT_GRACE_MS = 500;
+/** Ordinary startup never blocks longer than this batch ceiling. */
+export const MAX_MCP_STARTUP_WAIT_MS = 1_750;
 
 /** Pure startup policy shared by runtime-facing CLI inspection and doctor. */
 export function computeAutoloadStatus(
