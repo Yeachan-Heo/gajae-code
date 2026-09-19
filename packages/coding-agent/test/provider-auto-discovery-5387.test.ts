@@ -259,7 +259,44 @@ describe("issue #5387 custom provider auto-discovery", () => {
 		}
 	});
 
-	it("refuses setup when cancelled while acquiring the config lock", async () => {
+	it("probes with the credential the runtime will use after an env force replacement", async () => {
+		const modelsPath = await tempModelsPath();
+		const store = await SqliteAuthCredentialStore.open(path.join(tempRoot!, "agent.db"));
+		const requests: string[] = [];
+		try {
+			const authStorage = new AuthStorage(store);
+			await authStorage.set("force-env-gateway", { type: "api_key", key: "sk-old-runtime-key" });
+			process.env.FORCE_ENV_GATEWAY_KEY = "sk-new-probe-key";
+			using _hook = hookFetch((_input, init) => {
+				const headers = init?.headers;
+				const authorization =
+					headers instanceof Headers
+						? headers.get("Authorization")
+						: ((headers as Record<string, string> | undefined)?.Authorization ?? undefined);
+				requests.push(authorization ?? "");
+				return modelsListResponse(["live-model"]);
+			});
+			await addApiCompatibleProvider({
+				compatibility: "openai",
+				providerId: "force-env-gateway",
+				baseUrl: "https://gateway.example.com/v1",
+				apiKeyEnv: "FORCE_ENV_GATEWAY_KEY",
+				discover: true,
+				force: true,
+				modelsPath,
+				authStorage,
+			});
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			await registry.refreshProvider("force-env-gateway");
+			expect(requests).toHaveLength(2);
+			expect(requests[0]).toBe(requests[1]);
+		} finally {
+			delete process.env.FORCE_ENV_GATEWAY_KEY;
+			store.close();
+		}
+	});
+
+	it("refuses to write config when cancelled while acquiring the config lock", async () => {
 		const modelsPath = await tempModelsPath();
 		const controller = new AbortController();
 		controller.abort(new Error("cancelled before lock"));

@@ -208,7 +208,7 @@ describe("provider onboarding wizard", () => {
 				"Provider 'live-provider' configured as openai-compatible.",
 				"Models: live-model",
 				"Base URL: https://api.example.com/v1",
-				"API key: CUST…_KEY (environment variable)",
+				"API key: *** (environment variable)",
 				`Config: ${path.join(tempAgentDir!, "models.yml")}`,
 			].join("\n");
 			const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<void>();

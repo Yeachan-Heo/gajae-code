@@ -718,7 +718,8 @@ describe("provider onboarding setup core", () => {
 		expect(formatProviderPresetList()).toContain("glm");
 		expect(parseModelList(["a,b", "a", " c "])).toEqual(["a", "b", "c"]);
 		expect(redactSecret("short")).toBe("***");
-		expect(redactSecret("sk-1234567890")).toBe("sk-1…7890");
+		expect(redactSecret("sk-1234567890")).toBe("***");
+		expect(redactSecret("sk-secret-1234")).toBe("***");
 	});
 
 	it("parses setup command provider preset option", () => {

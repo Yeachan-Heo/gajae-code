@@ -8946,7 +8946,8 @@ describe("ModelRegistry", () => {
 			]);
 
 			await registry.refreshProvider("discovery-provider", "online");
-			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.error).toContain("returned no models");
 			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
 				{ provider: "mixed", connectionKind: "credentialless" },
 			]);
@@ -9001,7 +9002,8 @@ describe("ModelRegistry", () => {
 			hasModels = false;
 			await registry.refreshProvider("credentialless-discovery", "online");
 
-			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.error).toContain("returned no models");
 			expect(registry.find("credentialless-discovery", "discovered-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
 		});

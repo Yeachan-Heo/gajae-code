@@ -59,7 +59,7 @@ export interface ProviderSetupInput {
 	 * authority that stored the key. When omitted, onboarding falls back
 	 * to a short-lived store at the agent DB path (headless/CLI behavior).
 	 */
-	authStorage?: Pick<AuthStorage, "set" | "remove" | "exportSnapshot">;
+	authStorage?: ProviderSetupCredentialStore;
 }
 
 export interface ProviderSetupResult {
@@ -81,6 +81,9 @@ export interface ProviderSetupResult {
 
 type ProviderConfig = NonNullable<NonNullable<ModelsConfig["providers"]>[string]>;
 type ProviderCompatConfig = NonNullable<ProviderConfig["compat"]>;
+type ProviderSetupCredentialStore = Pick<AuthStorage, "set" | "remove" | "exportSnapshot"> & {
+	peekApiKey?: (provider: string) => Promise<string | undefined>;
+};
 
 interface ProviderPreset {
 	id: string;
@@ -105,8 +108,6 @@ interface ProviderPreset {
 }
 
 const PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
-const REDACT_PREFIX = 4;
-const REDACT_SUFFIX = 4;
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = providerPresets as ProviderPreset[];
 
 export function getDefaultModelsPath(): string {
@@ -161,10 +162,35 @@ export function parseModelList(values: readonly string[]): string[] {
 	return [...new Set(models)];
 }
 
-export function redactSecret(secret: string): string {
-	const trimmed = secret.trim();
-	if (trimmed.length <= REDACT_PREFIX + REDACT_SUFFIX) return "***";
-	return `${trimmed.slice(0, REDACT_PREFIX)}…${trimmed.slice(-REDACT_SUFFIX)}`;
+async function resolveStoredApiKeyForProbe(
+	providerId: string,
+	inputStore: ProviderSetupCredentialStore | undefined,
+): Promise<string | undefined> {
+	let store = inputStore;
+	let ownedStore: AuthStorageImpl | undefined;
+	if (!store) {
+		ownedStore = await AuthStorageImpl.create(getAgentDbPath());
+		store = ownedStore;
+	}
+	try {
+		const storageProvider = resolveOAuthStorageProvider(providerId);
+		const snapshot = store.exportSnapshot();
+		const hasStoredApiKey = snapshot.credentials.some(
+			entry => entry.provider === storageProvider && entry.credential.type === "api_key",
+		);
+		if (!hasStoredApiKey) return undefined;
+		if (store.peekApiKey) return (await store.peekApiKey(providerId))?.trim() || undefined;
+		const entry = snapshot.credentials.find(
+			candidate => candidate.provider === storageProvider && candidate.credential.type === "api_key",
+		);
+		return entry?.credential.type === "api_key" ? entry.credential.key.trim() || undefined : undefined;
+	} finally {
+		ownedStore?.close();
+	}
+}
+
+export function redactSecret(_secret: string): string {
+	return "***";
 }
 
 function apiForCompatibility(compatibility: ProviderCompatibility): ProviderSetupApi {
@@ -411,10 +437,14 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	if (validated.discovery?.type === "openai-models-list" && validated.models.length === 0 && !validated.preset) {
 		const probe = input.probeDiscovery ?? probeOpenAIModelsList;
 		const credentialSource = validated.credentialSource;
+		const storedApiKey =
+			credentialSource === "env" && input.force
+				? await resolveStoredApiKeyForProbe(validated.providerId, input.authStorage)
+				: undefined;
 		const probed = await probe({
 			baseUrl: validated.baseUrl,
-			apiKeyEnv: credentialSource === "env" ? validated.apiKey : undefined,
-			apiKey: credentialSource === "literal" ? validated.apiKey : undefined,
+			apiKeyEnv: credentialSource === "env" && !storedApiKey ? validated.apiKey : undefined,
+			apiKey: credentialSource === "literal" ? validated.apiKey : storedApiKey,
 			signal: input.discoverySignal,
 		});
 		// The caller (wizard revision/cancel) may have aborted while the probe
@@ -452,7 +482,7 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 	// Serialize config merging under the file lock. Credential storage is a
 	// separate authority, not an atomic transaction with models.yml: restore
 	// successful credential writes on precommit failure and report failed recovery.
-	type CredentialStore = Pick<AuthStorage, "set" | "remove" | "exportSnapshot">;
+	type CredentialStore = ProviderSetupCredentialStore;
 	type ApiKeyEntry = { type: "api_key"; key: string };
 	const cancelledError = (): Error =>
 		new Error(`Model discovery for '${validated.providerId}' was cancelled; setup did not write any config.`);

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,7 +8,7 @@ import {
 	scrubDiscoveryError,
 } from "@gajae-code/coding-agent/config/model-registry";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { hookFetch, Snowflake } from "@gajae-code/utils";
+import { hookFetch, logger, Snowflake } from "@gajae-code/utils";
 
 /**
  * Runtime hardening for the OpenAI `/v1/models` discovery path that a
@@ -139,21 +139,31 @@ describe("runtime models-list discovery hardening", () => {
 	});
 
 	test("redacts the bearer from transport failure state", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		using _hook = hookFetch(() => {
-			throw new Error("socket hang up (Authorization: Bearer sk-hardened)");
+			const error = new Error("socket hang up (Authorization: Bearer sk-hardened)");
+			void error.stack;
+			throw error;
 		});
-		const registry = new ModelRegistryImpl(authStorage, modelsPath);
-		await registry.refreshProvider("hardened");
-		const state = registry.getProviderDiscoveryState("hardened");
-		expect(state?.status).toBe("unavailable");
-		expect(state?.error ?? "").not.toContain("sk-hardened");
+		try {
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refreshProvider("hardened");
+			const state = registry.getProviderDiscoveryState("hardened");
+			expect(state?.status).toBe("unavailable");
+			expect(state?.error ?? "").not.toContain("sk-hardened");
+			expect(JSON.stringify(warn.mock.calls)).not.toContain("sk-hardened");
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	test("scrubDiscoveryError redacts resolved secrets and preserves Error identity", () => {
 		const original = new Error("boom Bearer sk-hardened end");
+		void original.stack;
 		const scrubbed = scrubDiscoveryError(original, ["sk-hardened", undefined]) as Error;
 		expect(scrubbed).toBe(original);
 		expect(scrubbed.message).toBe("boom Bearer [redacted] end");
+		expect(scrubbed.stack ?? "").not.toContain("sk-hardened");
 		expect(scrubDiscoveryError("plain sk-hardened text", ["sk-hardened"])).toBe("plain [redacted] text");
 	});
 
@@ -167,6 +177,25 @@ describe("runtime models-list discovery hardening", () => {
 			expect(registry.getProviderDiscoveryState("hardened")?.status).toBe("unavailable");
 			expect(registry.getAll().filter(model => model.provider === "hardened")).toEqual([]);
 		}
+		const cached = readModelCache<Api>("hardened", 24 * 60 * 60 * 1000, Date.now, cacheDbPath());
+		expect(cached?.models).toEqual([]);
+		expect(cached?.authoritative).toBe(false);
+	});
+
+	test("treats an empty live catalog as an actionable unavailable result", async () => {
+		using _hook = hookFetch(
+			() =>
+				new Response(JSON.stringify({ data: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		await registry.refreshProvider("hardened");
+		const state = registry.getProviderDiscoveryState("hardened");
+		expect(state?.status).toBe("unavailable");
+		expect(state?.error ?? "").toContain("returned no models");
+		expect(registry.getAll().filter(model => model.provider === "hardened")).toEqual([]);
 		const cached = readModelCache<Api>("hardened", 24 * 60 * 60 * 1000, Date.now, cacheDbPath());
 		expect(cached?.models).toEqual([]);
 		expect(cached?.authoritative).toBe(false);

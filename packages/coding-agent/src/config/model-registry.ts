@@ -150,7 +150,7 @@ function redactDiscoveryUrl(value: string | URL): string {
 /**
  * Scrub resolved credential material from a discovery failure before it is
  * published to discovery state, cache provenance, or the logger. Mutates
- * Error messages in place to preserve class/stack; wraps non-Errors.
+ * Error messages and stacks in place to preserve class/identity; wraps non-Errors.
  */
 export function scrubDiscoveryError(error: unknown, secrets: ReadonlyArray<string | undefined>): unknown {
 	const redact = (text: string): string => {
@@ -161,8 +161,16 @@ export function scrubDiscoveryError(error: unknown, secrets: ReadonlyArray<strin
 		return scrubbed;
 	};
 	if (error instanceof Error) {
-		error.message = redact(error.message);
-		if (typeof error.cause === "string") error.cause = redact(error.cause);
+		const seen = new Set<Error>();
+		const scrubError = (current: Error): void => {
+			if (seen.has(current)) return;
+			seen.add(current);
+			current.message = redact(current.message);
+			if (typeof current.stack === "string") current.stack = redact(current.stack);
+			if (current.cause instanceof Error) scrubError(current.cause);
+			else if (typeof current.cause === "string") current.cause = redact(current.cause);
+		};
+		scrubError(error);
 		return error;
 	}
 	if (typeof error === "string") return redact(error);
@@ -3607,24 +3615,35 @@ export class ModelRegistry {
 		};
 	}
 
-	#discoverModelsByProviderType(
+	async #discoverModelsByProviderType(
 		providerConfig: DiscoveryProviderConfig,
 		apiKey: string | undefined,
 	): Promise<Model<Api>[]> {
+		let models: Model<Api>[];
 		switch (providerConfig.discovery.type) {
 			case "ollama":
-				return this.#discoverOllamaModels(providerConfig, apiKey);
+				models = await this.#discoverOllamaModels(providerConfig, apiKey);
+				break;
 			case "llama.cpp":
-				return this.#discoverLlamaCppModels(providerConfig, apiKey);
+				models = await this.#discoverLlamaCppModels(providerConfig, apiKey);
+				break;
 			case "lm-studio":
 			case "omlx":
 			case "vllm":
 			case "sglang":
 			case "openai-models-list":
-				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
+				models = await this.#discoverOpenAIModelsList(providerConfig, apiKey);
+				break;
 			case "models-dev":
-				return this.#discoverModelsDevProvider(providerConfig);
+				models = await this.#discoverModelsDevProvider(providerConfig);
+				break;
 		}
+		if (providerConfig.discovery.type === "openai-models-list" && models.length === 0) {
+			throw new Error(
+				`Model discovery for ${redactDiscoveryUrl(providerConfig.baseUrl ?? "")} returned no models; add --model <id> or fix the endpoint catalog.`,
+			);
+		}
+		return models;
 	}
 
 	async #discoverBuiltInProviderModels(
