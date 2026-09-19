@@ -2,9 +2,19 @@
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-18
+
+## [0.17.1] - 2026-09-17
+
+## [0.17.0] - 2026-09-17
+
 ### Performance
 
 - Defer resize reflow-decision scans to their consuming branch, skipping them on unchanged-width frames and viewport-only repaints; coalesced resize appends avoid that decision scan while retained-prefix validation may still measure rows, preserving rendering and settled scrollback repair.
+
+- Skip the kitty placement scan on terminals that do not run the kitty graphics protocol, and keep the outgoing logical and raw frames by reference instead of copying them. Both removed a walk over every transcript line from every render frame; emitted bytes are unchanged.
+
+## [0.16.7] - 2026-09-13
 
 ## [0.16.6] - 2026-09-07
 

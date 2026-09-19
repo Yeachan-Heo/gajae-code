@@ -2030,6 +2030,8 @@ function losslessDetachedClone<T>(value: T): T {
 						"kind",
 						"status",
 						"code",
+						"http2RstCode",
+						"nativeErrorCode",
 						"providerCode",
 						"openaiErrorCode",
 						"anthropicErrorType",
@@ -2672,6 +2674,7 @@ class ManagedAttemptTransaction {
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
 	#committed = false;
+	#rejected = false;
 	#degradedFieldDiagnostics = new Set<string>();
 
 	constructor(
@@ -2858,6 +2861,14 @@ class ManagedAttemptTransaction {
 
 	get committed(): boolean {
 		return this.#committed;
+	}
+
+	reject(): void {
+		this.#rejected = true;
+	}
+
+	get rejected(): boolean {
+		return this.#rejected;
 	}
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
@@ -4097,7 +4108,7 @@ async function runLoopBody(
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
-				!escapedToolTransaction?.committed &&
+				(!escapedToolTransaction?.committed || escapedToolTransaction.rejected) &&
 				hasEscapedNonAsciiToolCall(message)
 			) {
 				escapedNonAsciiResampleAttempt++;
@@ -4799,10 +4810,9 @@ async function streamAssistantResponse(
 				return getResponseResult();
 			};
 
-			// Set up a single abort race: register the abort listener once for the whole
-			// stream and reuse the same race promise for every iterator.next() instead of
-			// allocating Promise.withResolvers and add/removeEventListener per event.
-			let abortRacePromise: Promise<typeof ABORTED> | undefined;
+			// Keep one listener, but race a fresh promise per read so pending abort
+			// reactions do not retain every event until the request ends.
+			let settleReadAbort: (() => void) | undefined;
 			let detachAbortListener: (() => void) | undefined;
 			if (requestSignal) {
 				if (requestSignal.aborted) {
@@ -4818,18 +4828,32 @@ async function streamAssistantResponse(
 					await finishChat(aborted);
 					return aborted;
 				}
-				const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
-				const onAbort = () => resolve(ABORTED);
+				const onAbort = () => settleReadAbort?.();
 				requestSignal.addEventListener("abort", onAbort, { once: true });
-				abortRacePromise = promise;
 				detachAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
 			}
 
 			try {
 				while (true) {
 					let next: IteratorResult<AssistantMessageEvent>;
-					if (abortRacePromise) {
-						const result = await Promise.race([responseIterator.next(), abortRacePromise]);
+					if (requestSignal) {
+						const { promise, resolve } = Promise.withResolvers<typeof ABORTED>();
+						let settled = false;
+						const settleAbort = (): void => {
+							if (settled) return;
+							settled = true;
+							resolve(ABORTED);
+							config.onAbortRaceReactionChange?.(-1);
+						};
+						config.onAbortRaceReactionChange?.(1);
+						settleReadAbort = settleAbort;
+						let result: IteratorResult<AssistantMessageEvent> | typeof ABORTED;
+						try {
+							result = requestSignal.aborted ? ABORTED : await Promise.race([responseIterator.next(), promise]);
+						} finally {
+							settleAbort();
+							settleReadAbort = undefined;
+						}
 						if (result === ABORTED) {
 							closeIterator();
 							const aborted = emitAbortedAssistantMessage(
@@ -4868,17 +4892,20 @@ async function streamAssistantResponse(
 					const event = next.value;
 
 					switch (event.type) {
-						case "start":
+						case "start": {
 							partialMessage = config.fallbackManaged
 								? managedAssistantShell(event.partial, config.model, managedDegradedFieldDiagnostics)
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
+							let acceptedStart = true;
 							if (provisionalToolTransaction) {
-								config.onProvisionalAssistantMessageEvent?.(partialMessage, event);
+								acceptedStart = config.onProvisionalAssistantMessageEvent?.(partialMessage, event) !== false;
+								if (!acceptedStart) provisionalToolTransaction.reject();
 							}
-							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
+							if (acceptedStart) stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
+						}
 
 						case "toolChoiceIncapability":
 							config.onToolChoiceIncapability?.(event);
@@ -4911,13 +4938,17 @@ async function streamAssistantResponse(
 									? managedAssistantEventSnapshot(event, partialMessage, managedDegradedFieldDiagnostics)
 									: event;
 								context.messages[context.messages.length - 1] = partialMessage;
+								let acceptedUpdate = true;
 								if (provisionalToolTransaction) {
-									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
-									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
+									acceptedUpdate =
+										config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent) !== false;
+									if (!acceptedUpdate) provisionalToolTransaction.reject();
+									if (acceptedUpdate)
+										provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
 								} else {
 									config.onAssistantMessageEvent?.(partialMessage, partialEvent);
 								}
-								if (signal?.aborted) continue;
+								if (!acceptedUpdate || signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
 									assistantMessageEvent: partialEvent,

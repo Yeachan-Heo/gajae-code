@@ -18,6 +18,7 @@ import {
 	getBundledModels,
 	getBundledProviders,
 	getEnvApiKey,
+	getMiniMaxThinkingMode,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
 	isCodexGpt56Tier,
@@ -280,6 +281,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (!modelSupportsReasoningControl(model)) return false;
+	if (getMiniMaxThinkingMode(model) === "toggle") return true;
 	if (model.provider === "openai" || model.provider === "openai-codex" || isDirectXaiReasoningEffortModel(model))
 		return true;
 	if (role === null) return false;
@@ -777,6 +779,11 @@ function filterMaterializedRegistryProfiles(
 	}
 	return filtered;
 }
+type SpecialProviderDescriptor = {
+	providerId: string;
+	resolveKey: (value: string | undefined) => string | undefined;
+	createOptions: (key: string) => ModelManagerOptions<Api>;
+};
 
 const PROVIDER_BASE_URL_ENV_ALIASES: Record<string, readonly string[]> = {
 	anthropic: ["ANTHROPIC_BASE_URL"],
@@ -3611,16 +3618,8 @@ export class ModelRegistry {
 		return discoveries.flat();
 	}
 
-	async #collectBuiltInModelManagerOptions(
-		excludedProviderIds: ReadonlySet<string> = new Set(),
-		providerFilter?: ReadonlySet<string>,
-		credentialSessionId?: string,
-	): Promise<ModelManagerDiscoveryOptions[]> {
-		const specialProviderDescriptors: Array<{
-			providerId: string;
-			resolveKey: (value: string | undefined) => string | undefined;
-			createOptions: (key: string) => ModelManagerOptions<Api>;
-		}> = [
+	#specialProviderDescriptors(credentialSessionId?: string): SpecialProviderDescriptor[] {
+		return [
 			{
 				providerId: "google-antigravity",
 				resolveKey: extractGoogleOAuthToken,
@@ -3657,6 +3656,14 @@ export class ModelRegistry {
 				},
 			},
 		];
+	}
+
+	async #collectBuiltInModelManagerOptions(
+		excludedProviderIds: ReadonlySet<string> = new Set(),
+		providerFilter?: ReadonlySet<string>,
+		credentialSessionId?: string,
+	): Promise<ModelManagerDiscoveryOptions[]> {
+		const specialProviderDescriptors = this.#specialProviderDescriptors(credentialSessionId);
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
 			descriptor =>
@@ -4765,6 +4772,25 @@ export class ModelRegistry {
 		return [...this.#configuredProviderIds];
 	}
 
+	/**
+	 * Whether this registry can serve a provider id from any active source.
+	 *
+	 * Built-in providers are backed by the bundled AI catalog, configured
+	 * providers come from models.yml, and extension registrations are retained
+	 * in the runtime provider stores below. Runtime model/override state is
+	 * included for direct registrations that do not have an extension source id.
+	 */
+	isKnownProvider(provider: string): boolean {
+		return (
+			isKnownProvider(provider) ||
+			this.#configuredProviderIds.has(provider) ||
+			this.#runtimeProviderSourceByName.has(provider) ||
+			this.#runtimeModelOverlays.some(model => model.provider === provider) ||
+			this.#runtimeProviderApiKeys.has(provider) ||
+			this.#runtimeProviderOverrides.has(provider)
+		);
+	}
+
 	#isModelAvailable(model: Model<Api>, disabledProviders?: ReadonlySet<string>): boolean {
 		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
@@ -5410,6 +5436,27 @@ export class ModelRegistry {
 		return this.#discoveryManager.providers
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);
+	}
+
+	/**
+	 * Providers whose catalogs can be filled by bounded official refresh:
+	 * configured discovery, built-in special OAuth dynamics, and standard
+	 * descriptor-backed providers. Unknown ids stay excluded. Disabled
+	 * providers are omitted. UI tabs still use getDiscoverableProviders.
+	 */
+	getRefreshableProviders(): string[] {
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const providers: string[] = [];
+		const seen = new Set<string>();
+		const add = (providerId: string) => {
+			if (disabledProviders.has(providerId) || seen.has(providerId)) return;
+			seen.add(providerId);
+			providers.push(providerId);
+		};
+		for (const provider of this.#discoveryManager.providers) add(provider.provider);
+		for (const descriptor of PROVIDER_DESCRIPTORS) add(descriptor.providerId);
+		for (const descriptor of this.#specialProviderDescriptors()) add(descriptor.providerId);
+		return providers;
 	}
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {

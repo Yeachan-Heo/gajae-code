@@ -347,6 +347,27 @@ describe("dev:link", () => {
 		expect(await Bun.file(shadow).exists()).toBe(false);
 		expect(await Bun.file(path.join(targetDir, "gjc")).exists()).toBe(true);
 	});
+	test.skipIf(process.platform === "win32")("refuses a foreign alias without touching the primary gjc link", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-alias-preflight-"));
+		tempRoots.push(root);
+		const targetDir = path.join(root, "managed-bin");
+		await fs.mkdir(targetDir, { recursive: true });
+		// A foreign alias carries no ownership receipt, so preflight must refuse it.
+		await makeExecutable(path.join(targetDir, "가재씨"), "#!/usr/bin/env sh\necho foreign\n");
+
+		const result = Bun.spawnSync([process.execPath, "scripts/dev-link.ts"], {
+			env: { ...process.env, GJC_DEV_LINK_DIR: targetDir, PATH: `${targetDir}:${process.env.PATH ?? ""}` },
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr.toString()).toContain("Refusing to replace foreign or unknown");
+		expect(result.stderr.toString()).toContain(path.join(targetDir, "가재씨"));
+		// The primary link must NOT have been created: preflight aborts before any mutation.
+		expect(await Bun.file(path.join(targetDir, "gjc")).exists()).toBe(false);
+		expect(await Bun.file(path.join(targetDir, "gjc.gjc-managed.json")).exists()).toBe(false);
+	});
 	test.skipIf(process.platform === "win32")("fails when a shadow gjc earlier on PATH would make smoke-test validate the wrong command", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-dev-link-shadow-"));
 		tempRoots.push(root);

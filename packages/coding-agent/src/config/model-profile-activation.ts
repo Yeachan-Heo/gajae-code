@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai/core";
+import { type Api, isKnownProvider, type Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
@@ -105,6 +105,7 @@ export interface PrepareModelProfileActivationOptions {
 				| "getSessionCanonicalVariant"
 				| "restoreSessionCanonicalVariant"
 				| "getConfiguredProviderIds"
+				| "isKnownProvider"
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
@@ -449,7 +450,7 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 }
 
 export class ModelProfileCredentialError extends Error {
-	readonly code = "authentication_failed";
+	readonly code: string = "authentication_failed";
 	readonly profileLabel: string;
 	readonly providers: readonly string[];
 	readonly role: string | undefined;
@@ -465,6 +466,28 @@ export class ModelProfileCredentialError extends Error {
 
 export function formatModelProfileCredentialError(profileLabel: string, providers: readonly string[]): string {
 	return `Model profile "${profileLabel}" requires credentials for: ${providers.join(", ")}. Run /login and configure the missing provider(s), then retry.`;
+}
+export function formatModelProfileUnknownProviderError(profileLabel: string, providers: readonly string[]): string {
+	return `Model profile "${profileLabel}" requires provider(s) this build does not know: ${providers.join(", ")}. The profile likely targets a newer or custom build; declare the provider(s) in models.yml or use a build that ships them.`;
+}
+
+/**
+ * A required profile provider that this build cannot know: it is neither a
+ * built-in provider id nor declared in models.yml. That is a build/config
+ * mismatch (for example a profile authored on a newer or custom build), not a
+ * credential gap, so the diagnosis must not send the user to /login.
+ *
+ * Extends {@link ModelProfileCredentialError} so existing startup recovery
+ * (interactive toast-and-continue) keeps working with the sharper message.
+ */
+export class ModelProfileUnknownProviderError extends ModelProfileCredentialError {
+	readonly code = "unknown_provider";
+
+	constructor(profileLabel: string, providers: readonly string[], role?: string) {
+		super(profileLabel, providers, role);
+		this.name = "ModelProfileUnknownProviderError";
+		this.message = formatModelProfileUnknownProviderError(profileLabel, providers);
+	}
 }
 
 /**
@@ -534,6 +557,14 @@ function rewriteBindingsProviders(
 		),
 	};
 }
+export function isModelProfileProxyConfigured(
+	provider: string,
+	configuredProviders: readonly string[] | undefined,
+	credentialless: boolean,
+): boolean {
+	return configuredProviders?.includes(provider) === true || (provider === "opencodex" && credentialless);
+}
+
 /**
  * Resolve the explicitly configured OpenAI-compatible proxy provider id for a
  * preset. Returns undefined when unset or empty. Passwords/labels are never
@@ -620,9 +651,13 @@ export function rewriteSelectorForProxy(
 	const baseSelector = suffix.selector;
 	const slash = baseSelector.indexOf("/");
 	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
+	const matchingProxyModels = (id: string): Model<Api>[] => {
+		const publicMatches = proxyModels.filter(model => model.id === id);
+		return publicMatches.length > 0 ? publicMatches : proxyModels.filter(model => model.wireModelId === id);
+	};
 	if (slash < 0) {
 		if (proxyMode === "fallback") return selector;
-		const exactMatches = proxyModels.filter(model => model.id === baseSelector);
+		const exactMatches = matchingProxyModels(baseSelector);
 		const finalSegmentMatches = proxyModels.filter(model => model.id.split("/").at(-1) === baseSelector);
 		const matches = exactMatches.length > 0 ? exactMatches : finalSegmentMatches;
 		if (matches.length !== 1) {
@@ -640,8 +675,8 @@ export function rewriteSelectorForProxy(
 		throw new Error(`Configured proxy "${proxyProvider}" cannot route its own direct selector "${baseSelector}"`);
 	}
 	const directModelId = baseSelector.substring(slash + 1);
-	const exactMatches = proxyModels.filter(model => model.id === `${directProvider}/${directModelId}`);
-	const flatMatches = proxyModels.filter(model => model.id === directModelId);
+	const exactMatches = matchingProxyModels(`${directProvider}/${directModelId}`);
+	const flatMatches = matchingProxyModels(directModelId);
 	const matches = exactMatches.length > 0 ? exactMatches : flatMatches;
 	if (matches.length === 0) {
 		throw new Error(`Configured proxy "${proxyProvider}" does not expose a model for "${baseSelector}"`);
@@ -957,6 +992,33 @@ export async function prepareModelProfileActivation(
 			...alternativeSet,
 			...deriveModelProfileMappedProviders(profile),
 		]);
+		// A required provider this build cannot know is a build/config mismatch,
+		// not a credential gap: diagnose it before any auth probing so the user
+		// is never sent to /login for a provider this binary cannot serve (for
+		// example a models.yml profile authored on a newer or custom build). A
+		// registry without provider visibility keeps the legacy
+		// credential diagnosis.
+		const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
+		if (configuredProviderIds !== undefined || options.modelRegistry.isKnownProvider !== undefined) {
+			const isProviderKnown = (provider: string): boolean =>
+				(options.modelRegistry.isKnownProvider?.(provider) ?? false) ||
+				isKnownProvider(provider) ||
+				configuredProviderIds?.includes(provider) === true;
+			const unknownRequiredProviders = new Set<string>();
+			for (const provider of requiredProviders) {
+				if (!alternativeSet.has(provider) && !isProviderKnown(provider)) unknownRequiredProviders.add(provider);
+			}
+			for (const group of alternativeGroups) {
+				if (group.some(isProviderKnown)) continue;
+				for (const provider of group) {
+					if (!isProviderKnown(provider)) unknownRequiredProviders.add(provider);
+				}
+			}
+			const unknownProviderIds = [...unknownRequiredProviders].sort();
+			if (unknownProviderIds.length > 0) {
+				throw new ModelProfileUnknownProviderError(profileLabel, unknownProviderIds);
+			}
+		}
 
 		const missingProviders: string[] = [];
 		const authenticatedProviders: string[] = [];
@@ -995,18 +1057,18 @@ export async function prepareModelProfileActivation(
 		if (proxyMode === "always" && proxyProvider === undefined) {
 			throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
 		}
+		const proxyApiKey =
+			proxyProvider === undefined
+				? undefined
+				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
 		if (proxyProvider !== undefined) {
 			const configuredProxyProviders = options.modelRegistry.getConfiguredProviderIds?.();
-			if (!configuredProxyProviders?.includes(proxyProvider)) {
+			if (!isModelProfileProxyConfigured(proxyProvider, configuredProxyProviders, proxyApiKey === kNoAuth)) {
 				throw new Error(
 					`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
 				);
 			}
 		}
-		const proxyApiKey =
-			proxyProvider === undefined
-				? undefined
-				: await options.modelRegistry.getApiKeyForProvider(proxyProvider, credentialSessionId);
 		const proxyAuthenticated =
 			proxyProvider !== undefined &&
 			proxyApiKey !== undefined &&

@@ -45,7 +45,12 @@ import {
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
-import type { AgentSession, AgentSessionEvent, AsyncJobSnapshotItem } from "../session/agent-session";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type AsyncJobSnapshotItem,
+	isSessionDisposalIncompleteError,
+} from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
@@ -1791,7 +1796,17 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Emit shutdown event to hooks
 		this.session.setSdkPlanModeHandler(null);
-		await this.session.dispose();
+		let disposalWarning: string | undefined;
+		try {
+			await this.session.dispose();
+		} catch (error) {
+			if (!isSessionDisposalIncompleteError(error)) throw error;
+			// The caller deadline does not cancel the underlying persistence drain.
+			// Own this expected failure here so /exit still restores the terminal and
+			// enters bounded cleanup, rather than the unhandled-rejection crash path.
+			disposalWarning = sanitizeText(error.message);
+			logger.warn("Interactive shutdown persistence remains incomplete", { error: error.message });
+		}
 
 		if (this.isInitialized) {
 			this.ui.requestRender(true);
@@ -1808,6 +1823,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.petWidget?.disposeAsync();
 		await this.#itermPetTransport?.dispose();
 		this.stop();
+		if (disposalWarning) {
+			process.stderr.write(`\nShutdown incomplete: ${disposalWarning}\nPending state may not be saved.\n`);
+		}
 
 		// Print resumption hint if this is a persisted session
 		const sessionId = this.sessionManager.getSessionId();
@@ -1818,7 +1836,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 		}
 
-		await postmortem.quit(0);
+		await postmortem.quit(disposalWarning ? 1 : 0);
 	}
 
 	async checkShutdownRequested(): Promise<void> {
@@ -2247,10 +2265,24 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#prepareSessionSwitch(cleanupPreviousSessionUi?: () => void): void {
-		this.#btwController.dispose();
-		if (cleanupPreviousSessionUi) cleanupPreviousSessionUi();
-		else this.#extensionUiController.clearExtensionTerminalInputListeners();
-		this.#planModeController.clearReview();
+		const errors: unknown[] = [];
+		try {
+			this.#btwController.dispose();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			if (cleanupPreviousSessionUi) cleanupPreviousSessionUi();
+			else this.#extensionUiController.clearExtensionTerminalInputListeners();
+		} catch (error) {
+			errors.push(error);
+		}
+		try {
+			this.#planModeController.clearReview();
+		} catch (error) {
+			errors.push(error);
+		}
+		if (errors.length > 0) throw new AggregateError(errors, "Previous session UI cleanup failed");
 	}
 
 	async handleClearCommand(): Promise<boolean> {
@@ -2273,7 +2305,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	handleForkCommand(): Promise<void> {
-		this.#btwController.dispose();
 		return this.#commandController.handleForkCommand();
 	}
 
@@ -2281,7 +2312,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleMoveCommand(targetPath);
 	}
 
-	handleRenameCommand(title: string): Promise<void> {
+	handleRenameCommand(title?: string): Promise<void> {
 		return this.#commandController.handleRenameCommand(title);
 	}
 
@@ -2546,7 +2577,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showUserMessageSelector(): void {
-		this.#selectorController.showUserMessageSelector();
+		const cleanupPreviousSessionUi = this.#extensionUiController.captureSessionUiCleanup();
+		this.#selectorController.showUserMessageSelector(() => this.#prepareSessionSwitch(cleanupPreviousSessionUi));
 	}
 
 	showTreeSelector(): void {

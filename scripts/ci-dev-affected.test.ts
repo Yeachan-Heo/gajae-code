@@ -1401,6 +1401,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+	test("managed-session-scope changes schedule the owner-only self-heal budget regression", () => {
+		const keys = targeted(["packages/coding-agent/src/session/internal/managed-session-scope.ts"]).map(
+			task => task.key,
+		);
+		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
+	});
 	test("extensibility sources select the bounded Function Hooks/plugin owner shard", () => {
 		const ownerTests = [
 			"packages/coding-agent/test/function-hooks.test.ts",

@@ -239,6 +239,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				content: todo.content,
 				priority: "medium" as const,
 				status: mapTodoStatus(todo.status),
+				_meta: { gjcTodoStatus: todo.status },
 			}));
 			return [toSessionNotification(sessionId, { sessionUpdate: "plan", entries })];
 		}
@@ -502,6 +503,13 @@ function toSessionNotification(sessionId: string, update: SessionUpdate): Sessio
 	return { sessionId, update };
 }
 
+/**
+ * ACP's `PlanEntryStatus` has only three members, so an `abandoned` todo has to be projected as
+ * one of them and `completed` is the one that stops a client's plan UI from showing a dropped task
+ * as outstanding work. That projection is lossy, so every plan entry also carries the internal
+ * status as `_meta.gjcTodoStatus` for readers that need the truth rather than the rendering
+ * (issue #5669).
+ */
 const todoStatusMap: Record<TodoStatus, "pending" | "in_progress" | "completed"> = {
 	pending: "pending",
 	in_progress: "in_progress",
@@ -529,6 +537,7 @@ function mapTodoWriteResultToPlanUpdate(
 			content: todo.content,
 			priority: "medium" as const,
 			status: mapTodoStatus(todo.status),
+			_meta: { gjcTodoStatus: todo.status },
 		})),
 	};
 }

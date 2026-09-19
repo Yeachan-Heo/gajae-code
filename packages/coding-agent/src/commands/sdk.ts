@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -15,7 +16,11 @@ import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { reconcileBrokerGenerationForStartup, withBrokerStartupLock } from "../sdk/broker/ensure";
+import {
+	emitBrokerStartupTestSignal,
+	reconcileBrokerGenerationForStartup,
+	withBrokerStartupLock,
+} from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -41,7 +46,7 @@ import {
 	type SdkStartupRollbackResult,
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
-import { runSdkServe } from "../sdk/transport/serve-cli";
+import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
 import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
@@ -95,6 +100,43 @@ export async function lifecycleArgs(
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
+
+async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
+	if (await Bun.file(gateFile).exists()) return;
+	const directory = path.dirname(gateFile);
+	const filename = path.basename(gateFile);
+	await new Promise<void>((resolve, reject) => {
+		let settled = false;
+		let watcher: nodeFs.FSWatcher | undefined;
+		const finish = (error?: unknown): void => {
+			if (settled) return;
+			settled = true;
+			watcher?.close();
+			if (error === undefined) resolve();
+			else reject(error);
+		};
+		try {
+			watcher = nodeFs.watch(directory, (_eventType, changed) => {
+				if (String(changed) !== filename) return;
+				void Bun.file(gateFile)
+					.exists()
+					.then(exists => {
+						if (exists) finish();
+					})
+					.catch(finish);
+			});
+		} catch (error) {
+			finish(error);
+			return;
+		}
+		void Bun.file(gateFile)
+			.exists()
+			.then(exists => {
+				if (exists) finish();
+			})
+			.catch(finish);
+	});
+}
 
 /**
  * Identity of the broker incarnation an observation describes, or `null` when
@@ -169,10 +211,10 @@ export async function watchSessionHostBrokerLiveness(deps: {
  * no client attached before treating itself as abandoned.
  *
  * This cannot fire during healthy work. "Attached" is the host's own live
- * socket-subscription count, so a client that is merely idle — an editor
- * sitting on an open ACP session, a long agent turn with nobody typing — still
- * holds a socket and resets the window on every poll. Only a client that is
- * actually gone opens it, and 30 minutes is far longer than any client
+ * demand count: observer-only sockets (such as an idle chat daemon) do not
+ * reset the window, while an in-flight turn is reported separately. Only a
+ * client that is actually demanding the host opens it, and 30 minutes is far
+ * longer than any client
  * reconnect budget (ACP's is seconds), so a crashed-and-restarted client
  * reattaches long before the window closes.
  */
@@ -198,8 +240,8 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
  * from every client for a full idle grace, or nobody has come for it at all
  * for a full first-attach grace.
  *
- * `readAttachedClients` reports the host's own live client/socket subscription
- * count; `undefined` means the SDK endpoint publishes no such evidence — before
+ * `readAttachedClients` reports the host's own live demanding-client count;
+ * `undefined` means the SDK endpoint publishes no such evidence — before
  * startup, after teardown, or when every reader itself fails. That ambiguity is
  * never instant detachment: it cannot reap on the poll that first sees it, it
  * can only open a window. Which window depends on what was already observed. A
@@ -1067,11 +1109,45 @@ class SdkGuidesCommand extends Command {
 	}
 }
 export default class Sdk extends Command {
-	static description = "SDK command runtime; public grammar and help are registry-owned.";
+	static description =
+		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
 	static hidden = false;
 	static delegateHelp = true;
+	static args = {
+		action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }),
+	};
+	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
-		if (this.argv[0] !== "broker-internal" && this.argv[0] !== "session-host-internal") {
+		const action = this.argv[0];
+		if (action !== "broker-internal" && action !== "session-host-internal") {
+			if (this.argv.includes("--help") || this.argv.includes("-h")) {
+				const helpAction =
+					action === "serve"
+						? "sdk serve"
+						: action === "search"
+							? "sdk search"
+							: action === "spawn"
+								? "sdk spawn"
+								: action === "session"
+									? "sdk session"
+									: action === "guides"
+										? "sdk guides"
+										: "sdk";
+				const helpCommand =
+					action === "serve"
+						? SdkServeHelp
+						: action === "search"
+							? SdkSearchCommand
+							: action === "spawn"
+								? SdkSpawnCommand
+								: action === "session"
+									? SdkSessionCommand
+									: action === "guides"
+										? SdkGuidesCommand
+										: Sdk;
+				renderCommandHelp("gjc", helpAction, helpCommand);
+				return;
+			}
 			const scan = scanPublicCommand("sdk", this.argv);
 			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 			const { args, flags } = scan;
@@ -1088,6 +1164,7 @@ export default class Sdk extends Command {
 					idempotencyKey: stringFlag("idempotency-key"),
 				});
 				process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
+				if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;
 				return;
 			}
 			if (action === "search") {
@@ -1101,6 +1178,7 @@ export default class Sdk extends Command {
 				process.stdout.write(
 					`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`,
 				);
+				if (search.exitCode !== 0) process.exitCode = search.exitCode;
 				return;
 			}
 			if (action === "session") {
@@ -1143,7 +1221,27 @@ export default class Sdk extends Command {
 				return;
 			}
 			if (action === "serve") {
-				await runSdkServe(scan.operationArgv.slice(1));
+				try {
+					await runSdkServe(scan.operationArgv.slice(1));
+				} catch (error) {
+					if (!(error instanceof SdkServeError)) throw error;
+					// A command invoked outside the public family dispatcher still owns its
+					// stderr envelope. The dispatcher itself keeps the typed failure for the
+					// shared JSON/text boundary so it can render the full contract.
+					if (this.config?.commands instanceof Map && this.config.commands.has("sdk")) throw error;
+					process.stderr.write(
+						`${JSON.stringify({
+							ok: false,
+							error: {
+								code: error.code,
+								message: error.message,
+								...(error.details === undefined ? {} : { details: error.details }),
+								...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
+							},
+						})}\n`,
+					);
+					process.exitCode = error.exitCode;
+				}
 				return;
 			}
 			throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
@@ -1156,7 +1254,7 @@ export default class Sdk extends Command {
 		const agentDir = path.resolve(internal.agentDir);
 		let broker: Broker | undefined;
 		try {
-			broker = await withBrokerStartupLock(agentDir, async deadline => {
+			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 				const remainingMs = Math.max(1, deadline - Date.now());
 				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
 				const watchdogMs =
@@ -1173,9 +1271,24 @@ export default class Sdk extends Command {
 						const stalled = Promise.withResolvers<void>();
 						await stalled.promise;
 					}
+					const startupGateFile = process.env.GJC_SDK_TEST_BROKER_STARTUP_GATE_FILE;
+					if (startupGateFile) {
+						await emitBrokerStartupTestSignal("startup-gate-waiting");
+						await waitForBrokerStartupTestGate(startupGateFile);
+						await emitBrokerStartupTestSignal("startup-gate-released");
+					}
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 						await Bun.sleep(startupDelayMs);
+					// The real broker-internal entry point is the only place that reads this
+					// launcher-supplied environment variable; it is validated here and handed
+					// to Broker as a typed setting, never read a second time inside broker.ts
+					// from process.env directly.
+					const restartRequestEnv = process.env.GJC_BROKER_RESTART_REQUEST;
+					const restartRequestId =
+						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
+							? restartRequestEnv
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
@@ -1190,6 +1303,7 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
 					await candidate.start();
@@ -1197,6 +1311,10 @@ export default class Sdk extends Command {
 				} finally {
 					clearTimeout(startupWatchdog);
 				}
+			};
+			broker = await withBrokerStartupLock(agentDir, startupOperation, {
+				onAcquired: () => void emitBrokerStartupTestSignal("fence-acquired"),
+				onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 			});
 		} catch (error) {
 			if (broker) {

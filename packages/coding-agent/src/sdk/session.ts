@@ -1516,6 +1516,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let processCwdClaimed = false;
 	let hasRegistered = false;
 	let asyncJobManager: AsyncJobManager | undefined;
+	let asyncJobManagerOwned = false;
 	let asyncJobManagerAdmitted = false;
 	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
@@ -2296,6 +2297,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						},
 					})
 				: options.inheritedAsyncJobManager;
+		asyncJobManagerOwned = backgroundJobsEnabled === true && !options.parentTaskPrefix;
 
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
@@ -3603,6 +3605,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// `cli/list-models.ts`. A caller-supplied `preloadedExtensions` result
 		// suppresses discovery entirely.
 		const explicitExtensionPaths = options.additionalExtensionPaths ?? [];
+		// The `extensions` setting is schema-typed as an array of paths, but a
+		// hand-edited config can hold an invalid shape; discovery must degrade to
+		// no extra paths instead of aborting startup for every session.
+		const extensionsSettingPaths = Array.isArray(settings.get("extensions")) ? settings.get("extensions") : [];
 		// Discovery must never block session creation: a filesystem or plugin-registry
 		// failure degrades to the explicit paths and then to no extensions at all, and
 		// the failure stays observable in `extensionsResult.errors`.
@@ -3611,7 +3617,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return options.disableExtensionDiscovery
 					? await loadExtensions(explicitExtensionPaths, cwd, eventBus)
 					: await discoverAndLoadExtensions(
-							[...explicitExtensionPaths, ...settings.get("extensions")],
+							[...explicitExtensionPaths, ...extensionsSettingPaths],
 							cwd,
 							eventBus,
 							settings.get("disabledExtensions"),
@@ -4146,6 +4152,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
 				eagerTasks: resolveEagerTasks(),
 				secretsEnabled,
+				taskIsolationEnabled: settings.get("task.isolation.mode") !== "none",
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
 			});
@@ -5191,15 +5198,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				// Admission happens before session construction. Any later startup
-				// failure must remove THIS manager's endpoint mapping and restore
-				// the prior global only when this manager is still global: otherwise
-				// a retry under the same endpoint is falsely rejected and an orphan
-				// redirects global-manager consumers away from the live session
-				// (review thread P1).
-				if (asyncJobManagerAdmitted && asyncJobManager) {
-					AsyncJobManager.unregisterManager(asyncJobManager);
-					if (AsyncJobManager.instance() === asyncJobManager) {
-						AsyncJobManager.setInstance(priorAsyncJobManager);
+				// failure must eventually release THIS manager's endpoint mapping
+				// through disposal and restore the prior global only when this manager
+				// is still global: otherwise a retry under the same endpoint is falsely
+				// rejected and an orphan redirects global-manager consumers away from
+				// the live session (review thread P1).
+				if (asyncJobManagerOwned && asyncJobManager) {
+					if (asyncJobManagerAdmitted) {
+						if (AsyncJobManager.instance() === asyncJobManager) {
+							AsyncJobManager.setInstance(priorAsyncJobManager);
+						}
 					}
 					await asyncJobManager.dispose({ timeoutMs: 100 });
 				}

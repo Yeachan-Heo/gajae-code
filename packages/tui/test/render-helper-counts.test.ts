@@ -1,7 +1,13 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type Component, Container, Editor, Text, TUI } from "@gajae-code/tui";
 import { Loader } from "@gajae-code/tui/components/loader";
-import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
+import {
+	encodeKittyPlacement,
+	encodeKittyPlacementDelete,
+	ImageProtocol,
+	setTerminalImageProtocol,
+	TERMINAL,
+} from "@gajae-code/tui/terminal-capabilities";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { defaultEditorTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -491,6 +497,47 @@ describe("TUI render helper counters", () => {
 			tui.stop();
 			tui.dispose();
 			term.reset();
+		}
+	});
+
+	it.each([
+		["none", null, false],
+		["iterm2", ImageProtocol.Iterm2, false],
+		["sixel", ImageProtocol.Sixel, false],
+		["kitty", ImageProtocol.Kitty, true],
+	] as const)("scans rendered rows for kitty placements only under protocol=%s", async (_label, protocol, scans) => {
+		const previousProtocol = TERMINAL.imageProtocol;
+		const placement = encodeKittyPlacement({ imageId: 7, placementId: 1, columns: 4, rows: 3 });
+		const lines = [placement, "row-0", "row-1"];
+		const component = new MutableLinesComponent(lines);
+		const term = new VirtualTerminal(20, 6);
+		const tui = new TUI(term, false, { widthSettleMs: 0 });
+		try {
+			setTerminalImageProtocol(protocol);
+			tui.addChild(component);
+			tui.start();
+			await committedFrame(tui, term, "setup");
+			TUI.resetRenderCountersForTest();
+			component.setLines(lines.map((line, index) => (index === 1 ? "row-changed" : line)));
+			await committedFrame(tui, term, "steady");
+			const scanned = TUI.getRenderCountersForTest().kittyPlacementScanRows;
+			if (scans) {
+				expect(scanned).toBeGreaterThanOrEqual(lines.length);
+				// The guard must skip the scan, not break what it returns.
+				expect(term.getWriteLog().join("")).toContain(
+					encodeKittyPlacementDelete({ imageId: 7, placementId: 1, rows: 3 }),
+				);
+			} else {
+				expect(scanned).toBe(0);
+			}
+		} finally {
+			try {
+				tui.stop();
+				tui.dispose();
+				term.reset();
+			} finally {
+				setTerminalImageProtocol(previousProtocol);
+			}
 		}
 	});
 });

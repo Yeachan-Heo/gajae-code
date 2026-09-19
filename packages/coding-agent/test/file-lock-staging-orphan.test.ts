@@ -93,6 +93,32 @@ test("malformed info is not treated as missing", async () => {
 	expect((await inspectFileLockStagingDir(staging, () => "dead", true)).removed).toBe(false);
 });
 
+test("staging removed after discovery is reported as already gone", async () => {
+	const { staging } = await fixture(DEAD_PID, null);
+	await fs.rm(staging, { recursive: true });
+	const probe = vi.fn(() => "dead" as const);
+	expect(await inspectFileLockStagingDir(staging, probe, true)).toEqual({
+		path: staging,
+		status: "unknown",
+		removed: false,
+		reason: "enoent_already_gone",
+	});
+	expect(probe).not.toHaveBeenCalled();
+});
+
+test("reaping a staging entry that vanishes after readdir does not throw", async () => {
+	const { file, staging } = await fixture(DEAD_PID, null);
+	const name = path.basename(staging);
+	await fs.rm(staging, { recursive: true });
+	vi.spyOn(fs, "readdir").mockResolvedValueOnce([name] as never);
+	deadPid();
+	const summary = await reapOrphanedLockStagingDirs(`${file}.lock`);
+	expect(summary.removed).toEqual([]);
+	expect(summary.retained).toEqual([
+		{ path: staging, status: "unknown", removed: false, reason: "enoent_already_gone" },
+	]);
+});
+
 test("acquisition succeeds despite reaper probe failure", async () => {
 	const { file, staging } = await fixture();
 	vi.spyOn(fs, "readdir").mockRejectedValueOnce(new Error("reap denied"));

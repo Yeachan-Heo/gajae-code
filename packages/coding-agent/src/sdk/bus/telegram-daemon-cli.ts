@@ -11,8 +11,10 @@ import {
 	isTelegramComplete,
 	type NotificationSettingsReader,
 	parseNotificationSettingsSnapshot,
+	tokenFingerprint,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { doctorDaemonIdentityMatches, doctorDaemonOccupancySettled } from "./doctor-daemon-restart";
 import { type NotificationDebrisSweepReport, sweepNotificationDebris } from "./notification-service";
 import {
 	type DaemonState,
@@ -26,11 +28,26 @@ import {
 	type TelegramDaemonOptions,
 	TelegramNotificationDaemon,
 } from "./telegram-daemon";
-import { clearTelegramControlRequest, readTelegramControlRequest } from "./telegram-daemon-control";
+import {
+	clearTelegramControlRequest,
+	clearTelegramDoctorControlRequest,
+	readTelegramControlRequest,
+	readTelegramDoctorControlRequest,
+} from "./telegram-daemon-control";
 
 type TelegramDaemonRunner = {
 	run(): Promise<void>;
 	requestStop(reason?: "reload" | "signal" | "stop"): void;
+	prepareDoctorRestart?(): void;
+	cancelDoctorRestart?(): void;
+	doctorOccupancy?(): {
+		attached: number;
+		inflight: number;
+		inbound: number;
+		outbound: number;
+		cleanup: number;
+	};
+	doctorRestartReady?(): boolean;
 };
 
 type TelegramDaemonConstructor = new (opts: TelegramDaemonOptions) => TelegramDaemonRunner;
@@ -254,16 +271,23 @@ function ownerProcessIsAlive(ownerId: string, deps: RunDaemonInternalDeps): bool
 
 /** Creates owner-fenced daemon control hooks for the CLI lifecycle boundary. */
 export function createDaemonControlHooks(settings: Settings) {
+	const readOwnedRequest = async (owner: string) => {
+		const req = await readTelegramControlRequest(settings);
+		return req && (!req.ownerId || req.ownerId === owner) ? req : undefined;
+	};
 	return {
 		shouldStop: async (owner: string) => {
-			const req = await readTelegramControlRequest(settings);
-			return Boolean(req && (!req.ownerId || req.ownerId === owner));
+			return (await readOwnedRequest(owner)) !== undefined;
+		},
+		requestedAction: async (owner: string): Promise<"reload" | "stop" | undefined> => {
+			const action = (await readOwnedRequest(owner))?.action;
+			return action === "reload" || action === "stop" ? action : undefined;
 		},
 		clear: async (owner: string) => {
-			const req = await readTelegramControlRequest(settings);
+			const req = await readOwnedRequest(owner);
 			// Only clear a request that targets this daemon owner, so an exiting
 			// daemon never erases a newer request meant for a different owner.
-			if (req && (!req.ownerId || req.ownerId === owner)) await clearTelegramControlRequest(settings, req.requestId);
+			if (req) await clearTelegramControlRequest(settings, req.requestId);
 		},
 	};
 }
@@ -294,6 +318,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	const initialTokenFingerprint = tokenFingerprint(cfg.botToken);
+	const initialChatId = cfg.chatId;
 	// Startup hygiene: reclaim inert quarantine/staging debris left by crashed
 	// writers so the notifications dir cannot grow unboundedly and slow every
 	// later endpoint scan. Never awaited by startup; a rejection is logged and
@@ -402,6 +428,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		toolActivity: cfg.toolActivity,
 		topics: cfg.topics,
 		btw: cfg.btw,
+		keepAliveWithoutAttachments: true,
 		pid: deps.processPid ?? process.pid,
 		control: createDaemonControlHooks(settings as Settings),
 		topicRegistryAuthority,
@@ -409,6 +436,22 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		requireTelegramTopicEligibility: true,
 		orphanReap,
 	});
+	const doctorOwnerIdentity = async (): Promise<
+		| {
+				owner: "telegram";
+				ownerId: string;
+				generation: number;
+				incarnation: string;
+		  }
+		| undefined
+	> => {
+		const current = await readState(settings as Settings);
+		if (!current || !hasSafeDaemonStateShape(current) || current.ownerId !== ownerId) return undefined;
+		const expectedIncarnation = (deps.pidIncarnation ?? processIncarnation)(deps.processPid ?? process.pid);
+		if (!expectedIncarnation || current.incarnation !== expectedIncarnation || current.generation === undefined)
+			return undefined;
+		return { owner: "telegram", ownerId, generation: current.generation, incarnation: current.incarnation };
+	};
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
 	const onSignal = (): void => daemon.requestStop("signal");
@@ -418,6 +461,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	let watchdogActive = true;
 	let watchdogTickInFlight = false;
 	let stopRequested = false;
+	let doctorPreparedRequestId: string | undefined;
+	let doctorPoll: Timer | undefined;
 	let lastHeartbeatAt: number | undefined;
 	let stalledSince: number | undefined;
 	const watchdogTick = async (): Promise<void> => {
@@ -484,6 +529,31 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				// running daemon — a stale or reused PID could match, killing a
 				// foreign process. The stall watchdog below handles non-progress.
 			}
+			// The daemon's startup settings object is intentionally lightweight and
+			// does not watch the config file. Re-resolve it only after the complete
+			// owner proof above. Unknown configuration cannot authorize continued
+			// command ingress with startup credentials.
+			try {
+				const refreshedSettings = await resolveDaemonSettings(resolvedAgentDir, deps);
+				if (!watchdogActive || stopRequested) return;
+				const refreshedCfg = getNotificationConfig(refreshedSettings);
+				if (
+					!isProviderEffectivelyEnabled(refreshedCfg, "telegram") ||
+					!isTelegramComplete(refreshedCfg) ||
+					tokenFingerprint(refreshedCfg.botToken) !== initialTokenFingerprint ||
+					refreshedCfg.chatId !== initialChatId
+				) {
+					stopRequested = true;
+					daemon.requestStop("stop");
+					return;
+				}
+			} catch {
+				if (!watchdogActive || stopRequested) return;
+				stopRequested = true;
+				daemon.requestStop("stop");
+				logger.warn("telegram-daemon: configuration verification failed; stopping command ingress");
+				return;
+			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
 				lastHeartbeatAt = heartbeatAt;
 				stalledSince = now();
@@ -495,8 +565,8 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 				daemon.requestStop("stop");
 			}
 		} catch {
-			// Missing, malformed, or temporarily unreadable state is ambiguous.
-			// Stop only on positive supersession or observed non-progress.
+			// Ambiguous ownership state does not authorize owner replacement.
+			// Configuration verification has its own fail-closed boundary above.
 		} finally {
 			watchdogTickInFlight = false;
 		}
@@ -526,8 +596,53 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		await recordOwnerStopped();
 	});
 	try {
+		const doctorTick = async (): Promise<void> => {
+			const request = await readTelegramDoctorControlRequest(settings as Settings);
+			if (!request) return;
+			const identity = await doctorOwnerIdentity();
+			// The shared predicate is the single definition of "this request addresses
+			// exactly me"; spelling the four fields out here would let this owner and the
+			// doctor client drift apart silently.
+			if (
+				!identity ||
+				!doctorDaemonIdentityMatches(request, identity) ||
+				(request.action !== "prepare" &&
+					request.action !== "commit" &&
+					request.action !== "cancel" &&
+					request.action !== "status")
+			)
+				return;
+			if (request.leaseExpiresAt !== undefined && request.leaseExpiresAt <= (deps.now ?? Date.now)()) {
+				// Expiry never reopens admission implicitly; an authorized
+				// coordinator must issue cancel after recovering the lease.
+				return;
+			}
+			if (request.action === "prepare") {
+				daemon.prepareDoctorRestart?.();
+				doctorPreparedRequestId = request.requestId;
+				return;
+			}
+			if (request.action === "cancel") {
+				if (doctorPreparedRequestId === request.requestId) daemon.cancelDoctorRestart?.();
+				await clearTelegramDoctorControlRequest(settings as Settings, request.requestId);
+				doctorPreparedRequestId = undefined;
+				return;
+			}
+			if (request.action === "commit" && doctorPreparedRequestId === request.requestId) {
+				const occupancy = daemon.doctorOccupancy?.();
+				if (!occupancy || !doctorDaemonOccupancySettled(occupancy)) return;
+				if (!daemon.doctorRestartReady?.()) return;
+				// A committed intent is durable across this owner's exit. The
+				// successor/doctor clears it only after proving old death, cleanup,
+				// and successor publication.
+				daemon.requestStop("reload");
+				doctorPreparedRequestId = undefined;
+			}
+		};
+		doctorPoll = schedule(() => void doctorTick(), 50);
 		await daemon.run();
 	} finally {
+		if (doctorPoll !== undefined) unschedule(doctorPoll);
 		watchdogActive = false;
 		unschedule(watchdog);
 		process.off("SIGTERM", onSignal);

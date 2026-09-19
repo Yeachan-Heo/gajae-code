@@ -4,6 +4,7 @@ import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import type { GjcModelAssignmentTargetId, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
+import { ThinkingSelectorComponent } from "@gajae-code/coding-agent/modes/components/thinking-selector";
 import {
 	getThemeByName,
 	setSymbolPreset,
@@ -483,7 +484,7 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterEnter.selector).toBe("claude-sonnet:medium");
 	});
 
-	test("refreshes Ollama Cloud using provider id instead of tab label", async () => {
+	test("refreshes Ollama Cloud by provider id with the credential session", async () => {
 		installTestTheme();
 		const settings = Settings.isolated({});
 		const discoveredModel = createOllamaCloudModel("deepseek-v4-pro");
@@ -524,6 +525,7 @@ describe("ModelSelector canonical model selection", () => {
 			[],
 			() => {},
 			() => {},
+			{ sessionId: "selector-refresh-session" },
 		);
 		await Bun.sleep(0);
 		installTestTheme();
@@ -536,7 +538,7 @@ describe("ModelSelector canonical model selection", () => {
 		await Bun.sleep(0);
 		installTestTheme();
 
-		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached");
+		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached", "selector-refresh-session");
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("deepseek-v4-pro");
 		expect(rendered).not.toContain("Provider has not been refreshed yet");
@@ -1288,4 +1290,72 @@ describe("ModelSelector fast-mode indicator", () => {
 		// Subagent EXECUTOR badge: glyph present (inherited intent).
 		expect(rendered).toContain(`EXECUTOR (high) ${iconFast}`);
 	});
+});
+
+describe("MiniMax reasoning menus", () => {
+	for (const provider of ["minimax", "minimax-cn", "minimax-code", "minimax-code-cn"] as const) {
+		for (const temporaryOnly of [false, true]) {
+			test(`${provider}: M3 offers on/off for ${temporaryOnly ? "temporary" : "default"} selection`, async () => {
+				installTestTheme();
+				const model = getBundledModel(provider, "MiniMax-M3");
+				let selected: SelectionCapture | undefined;
+				const selector = createSelector(
+					model,
+					Settings.isolated({}),
+					selection => {
+						selected = selection;
+					},
+					{ temporaryOnly },
+				);
+				await Bun.sleep(0);
+				installTestTheme();
+				selector.handleInput("\n");
+				if (!temporaryOnly) selector.handleInput("\n");
+				expect(selected).toBeUndefined();
+				const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+				expect(rendered).toContain("off — Disable thinking (disabled)");
+				expect(rendered).toContain("on — Enable thinking (adaptive)");
+				expect(rendered).not.toContain("Deep reasoning");
+				expect(rendered).not.toContain("~16k");
+				selector.handleInput("\x1b[B");
+				selector.handleInput("\n");
+				expect(selected?.thinkingLevel).toBe(ThinkingLevel.High);
+				expect(selected?.role).toBe(temporaryOnly ? null : "default");
+			});
+		}
+
+		test(`${provider}: M2.x explains always-on reasoning and skips effort selection`, async () => {
+			installTestTheme();
+			const model = getBundledModel(provider, "MiniMax-M2.7");
+			let selected: SelectionCapture | undefined;
+			const selector = createSelector(model, Settings.isolated({}), selection => {
+				selected = selection;
+			});
+			await Bun.sleep(0);
+			installTestTheme();
+			selector.handleInput("\n");
+			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(
+				"Reasoning: always on; effort control is unsupported",
+			);
+			selector.handleInput("\n");
+			expect(selected?.model).toBe(model);
+		});
+
+		test(`${provider}: reasoning selector labels the enabled state on, including scope confirmation`, () => {
+			installTestTheme();
+			const selector = new ThinkingSelectorComponent(
+				ThinkingLevel.High,
+				[ThinkingLevel.Off, ThinkingLevel.High],
+				() => {},
+				() => {},
+				getBundledModel(provider, "MiniMax-M3"),
+			);
+			const rendered = normalizeRenderedText(selector.render(120).join("\n"));
+			expect(rendered).toContain("on");
+			expect(rendered).toContain("adaptive");
+			expect(rendered).not.toContain("Deep reasoning");
+			selector.handleInput("\n");
+			expect(normalizeRenderedText(selector.render(120).join("\n"))).toContain("Reasoning effort: on");
+		});
+	}
 });

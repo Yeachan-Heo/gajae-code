@@ -208,6 +208,35 @@ describe("safe-cleanup verdict: filesystem-aware refusals (posix)", () => {
 		expect(refusalFor("/tmp/owned/child", world)).toBe("unowned-path");
 	});
 
+	test("allows a no-op removal when a component vanished mid-walk (#5399)", () => {
+		// A lock release renames to `<name>.removing` and unlinks it, so `statUid`
+		// throws ENOENT for a component that no longer exists. Nothing is left to
+		// delete, so this must not abort the process.
+		const fake = baseFake();
+		const world: SafeCleanupWorld = {
+			...makeWorld(fake),
+			statUid: (target: string): number => {
+				if (target === "/tmp/owned") throw new Error(`ENOENT: ${target}`);
+				return fake.owners.get(target) ?? 1000;
+			},
+			existsSync: (target: string): boolean => target !== "/tmp/owned" && fake.exists.has(target),
+		};
+		expect(approvalFor("/tmp/owned/child", world).containedRoot).toBe("/tmp");
+	});
+
+	test("still refuses a component that exists but cannot be stat'ed", () => {
+		const fake = baseFake();
+		const world: SafeCleanupWorld = {
+			...makeWorld(fake),
+			statUid: (target: string): number => {
+				if (target === "/tmp/owned") throw new Error(`EACCES: ${target}`);
+				return fake.owners.get(target) ?? 1000;
+			},
+			existsSync: (): boolean => true,
+		};
+		expect(refusalFor("/tmp/owned/child", world)).toBe("unowned-path");
+	});
+
 	test("skips the ownership check when uid is unavailable (win32-style world)", () => {
 		const world = makeWorld(baseFake(), { uid: undefined });
 		expect(approvalFor("/tmp/root-owned/child", world).containedRoot).toBe("/tmp");

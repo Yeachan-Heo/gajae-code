@@ -29,8 +29,16 @@ function managedOwnerEnvironment(overrides: Record<string, string> = {}): NodeJS
 	for (const name of managedOwnerEnvironmentKeys) delete env[name];
 	return { ...env, ...overrides };
 }
-async function admit(stateDir: string, token?: string): Promise<{ admitted: boolean; exitCode: number; root: string }> {
-	const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ admitted: admission.kind !== "blocked", exitCode: process.exitCode ?? 0 }));`;
+async function admit(
+	stateDir: string,
+	token?: string,
+	platform?: NodeJS.Platform,
+): Promise<{ admitted: boolean; exitCode: number; root: string; stderr: string }> {
+	// The stub runs after the hoisted import on purpose: admission reads the
+	// platform when it is called, while the native loader reads it while the
+	// module graph evaluates and rejects any tag this host cannot supply.
+	const stub = platform ? `Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });` : "";
+	const script = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; ${stub} const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ admitted: admission.kind !== "blocked", exitCode: process.exitCode ?? 0 }));`;
 	const child = Bun.spawn({
 		cmd: [process.execPath, "-e", script],
 		cwd: repoRoot,
@@ -46,11 +54,16 @@ async function admit(stateDir: string, token?: string): Promise<{ admitted: bool
 			...(token ? { GJC_MANAGED_OWNER_CHILD_TOKEN: token } : {}),
 		},
 	});
-	const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
 	return {
 		...(JSON.parse(stdout) as { admitted: boolean; exitCode: number }),
 		exitCode,
 		root: lifecyclePaths(stateDir, "session-2681", "generation-2681").root,
+		stderr,
 	};
 }
 
@@ -180,6 +193,37 @@ describe("managed owner admission", () => {
 				expect(rejected.admitted).toBe(false);
 				expect(rejected.exitCode).toBe(75);
 			}
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("attributes an unsupported exact binding reader to its platform while staying blocked", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-admission-platform-"));
+		try {
+			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
+			await writeBinding(root, "exact-token");
+			// The binding is valid; only the platform guard blocks it. "sunos" is never
+			// the host, so a sunos-attributed outcome also proves the stub really applied.
+			for (const platform of ["sunos", "darwin"] as const) {
+				const result = await admit(stateDir, "exact-token", platform);
+				expect(result).toMatchObject({ admitted: false, exitCode: 75 });
+				expect(result.stderr).toBe(
+					`child admission blocked: exact_child_binding_unavailable (platform ${platform}: exact binding reader unsupported)\n`,
+				);
+			}
+			const handoffs = (await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"));
+			expect(handoffs).toHaveLength(2);
+			const records = await Promise.all(
+				handoffs.map(async file => JSON.parse(await fs.readFile(path.join(root, file), "utf8"))),
+			);
+			for (const record of records)
+				expect(record).toMatchObject({
+					state: "fail_closed_handoff",
+					reason: "exact_child_binding_unavailable",
+					evidence_reader: "unsupported_platform",
+				});
+			expect(records.map(record => record.platform).sort()).toEqual(["darwin", "sunos"]);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

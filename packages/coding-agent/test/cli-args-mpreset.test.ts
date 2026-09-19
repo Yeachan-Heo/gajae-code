@@ -672,6 +672,95 @@ test("noninteractive startup keeps the exit-on-missing-credential contract", asy
 		exitSpy.mockRestore();
 	}
 });
+test("noninteractive explicit --mpreset tolerates a failing persisted default profile", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "broken-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "broken-default",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+			{
+				name: "healthy-preset",
+				requiredProviders: ["profile-provider"],
+				modelMapping: { default: "profile-provider/default" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async (provider: string) => (provider === "openai-codex" ? undefined : "key"),
+	} as never;
+
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => true) as never);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings,
+			modelRegistry: registry,
+			parsedArgs: { mpreset: "healthy-preset" },
+			startupModel: undefined,
+			startupThinkingLevel: undefined,
+		});
+
+		expect(exitSpy).not.toHaveBeenCalled();
+		const joined = stderr.join("");
+		expect(joined).toContain("Warning:");
+		expect(joined).toContain('Model profile "broken-default" requires credentials for: openai-codex');
+		expect(session.model?.provider).toBe("profile-provider");
+		expect(session.model?.id).toBe("default");
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+test("noninteractive explicit --model tolerates a failing persisted default profile", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "broken-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "broken-default",
+				requiredProviders: ["openai-codex"],
+				modelMapping: { default: "openai-codex/default:high" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async (provider: string) => (provider === "openai-codex" ? undefined : "key"),
+	} as never;
+
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => true) as never);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings,
+			modelRegistry: registry,
+			parsedArgs: { model: "cli-provider/explicit" },
+			startupModel: model("cli-provider", "explicit"),
+			startupThinkingLevel: undefined,
+		});
+
+		expect(exitSpy).not.toHaveBeenCalled();
+		expect(stderr.join("")).toContain("Warning:");
+		expect(session.model?.provider).toBe("cli-provider");
+		expect(session.model?.id).toBe("explicit");
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
 
 test("credential recovery does not mask unrelated model-profile activation errors", async () => {
 	const session = fakeSession();

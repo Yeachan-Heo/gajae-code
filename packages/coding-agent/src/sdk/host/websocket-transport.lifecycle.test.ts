@@ -151,6 +151,90 @@ describe("SDK WebSocket transport lifecycle", () => {
 			await Promise.all(roots.map(root => fs.rm(root, { recursive: true, force: true })));
 		}
 	});
+	test("live capability-gated events exclude clients without the negotiated capability", async () => {
+		const stateRoot = await tempStateRoot();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "live-capability-gate",
+			stateRoot,
+			token: "token",
+		});
+		const runtime = new SessionSdkSessionRuntime({ transport });
+		const capableFrames: Record<string, unknown>[] = [];
+		const legacyFrames: Record<string, unknown>[] = [];
+		let capable: SdkClient | undefined;
+		let legacy: SdkClient | undefined;
+		try {
+			const endpoint = await runtime.start();
+			capable = await SdkClient.connect(endpoint.url, "token", {
+				capabilities: ["tool_activity_v2"],
+				reconnectAttempts: 0,
+			});
+			legacy = await SdkClient.connect(endpoint.url, "token", {
+				capabilities: [],
+				reconnectAttempts: 0,
+			});
+			capable.onFrame(frame => capableFrames.push(frame));
+			legacy.onFrame(frame => legacyFrames.push(frame));
+			await Bun.sleep(20);
+			runtime.emitEvent({ kind: "tool_activity", payload: { phase: "started" } });
+			runtime.emitEvent({ kind: "activity", payload: { state: "idle" } });
+			await Bun.sleep(20);
+			expect(capableFrames).toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "event", kind: "tool_activity" })]),
+			);
+			expect(legacyFrames.some(frame => frame.type === "event" && frame.kind === "tool_activity")).toBe(false);
+			expect(legacyFrames).toEqual(
+				expect.arrayContaining([expect.objectContaining({ type: "event", kind: "activity" })]),
+			);
+		} finally {
+			await capable?.close();
+			await legacy?.close();
+			await runtime.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
+	test("event replay capability claims cannot authorize gated replay", async () => {
+		const stateRoot = await tempStateRoot();
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "replay-capability-claim",
+			stateRoot,
+			token: "token",
+		});
+		const runtime = new SessionSdkSessionRuntime({ transport });
+		let socket: WebSocket | undefined;
+		try {
+			const endpoint = await runtime.start();
+			runtime.emitEvent({ kind: "tool_activity", payload: { phase: "started" } });
+			socket = new WebSocket(`${endpoint.url}?token=token`);
+			const replay = new Promise<Record<string, unknown>>((resolve, reject) => {
+				socket!.addEventListener("message", event => {
+					const frame = JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>;
+					if (frame.type === "event_replay_result") resolve(frame);
+				});
+				socket!.addEventListener("error", () => reject(new Error("SDK WebSocket error")), { once: true });
+			});
+			await new Promise<void>((resolve, reject) => {
+				socket!.addEventListener("open", () => resolve(), { once: true });
+				socket!.addEventListener("error", () => reject(new Error("SDK WebSocket error")), { once: true });
+			});
+			socket.send(
+				JSON.stringify({
+					type: "event_replay",
+					id: "forged-capability-claim",
+					sinceGeneration: 1,
+					sinceSeq: 0,
+					capabilities: ["tool_activity_v2"],
+				}),
+			);
+			const frame = await replay;
+			const events = (frame.events as Array<Record<string, unknown>> | undefined) ?? [];
+			expect(events.some(event => event.kind === "tool_activity")).toBe(false);
+		} finally {
+			socket?.close();
+			await runtime.stop().catch(() => undefined);
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
+	});
 
 	test("start waits for a pending stop before publishing a probeable replacement endpoint", async () => {
 		const stateRoot = await tempStateRoot();

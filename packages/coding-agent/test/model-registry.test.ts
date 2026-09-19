@@ -1622,8 +1622,11 @@ describe("ModelRegistry", () => {
 				undefined,
 				childA,
 			);
-			expect(fallback.model).toBe(alphaModel);
-			expect(fallback.authFallbackUsed).toBe(true);
+			expect(fallback.model).toBeUndefined();
+			expect(fallback.authFallbackUsed).toBe(false);
+			expect(fallback.parentFallbackSelector).toBeUndefined();
+			expect(fallback.requestedModel).toBe(betaModel);
+			expect(fallback.skips).toEqual([{ selector: "beta/anthropic/claude-sonnet-4.5", reason: "unauthenticated" }]);
 		});
 	});
 
@@ -3342,6 +3345,51 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).toBe("http://127.0.0.1:8080");
 		});
 
+		test.each([
+			["opencode-go", "https://opencode.ai/zen/go"],
+			["opencode-zen", "https://opencode.ai/zen"],
+		] as const)("%s Union Alpha survives production discovery and offline registry reload", async (provider, baseUrl) => {
+			authStorage.setRuntimeApiKey(provider, "union-test-key");
+			let requests = 0;
+			using _hook = hookFetch(input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== `${baseUrl}/v1/models`) throw new Error(`Unexpected discovery URL: ${url}`);
+				requests++;
+				return Response.json({ data: [{ id: "union-alpha" }] });
+			});
+			const registrySettings = Settings.isolated();
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			const expected = {
+				id: "union-alpha",
+				provider,
+				name: "Union Alpha Free",
+				api: "anthropic-messages",
+				baseUrl,
+				contextWindow: 262_144,
+				maxTokens: 131_072,
+				input: ["text", "image"],
+				reasoning: true,
+			};
+			try {
+				await registry.refreshProvider(provider, "online");
+				expect(requests).toBe(1);
+				expect(registry.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(readModelCache(provider, 86_400_000, Date.now, cacheDbPath)?.dynamicModelIds).toEqual([
+					"union-alpha",
+				]);
+			} finally {
+				registry.dispose();
+			}
+			const reloaded = new ModelRegistry(authStorage, modelsJsonPath, registrySettings, { automaticRefresh: false });
+			try {
+				await reloaded.refreshProvider(provider, "offline");
+				expect(reloaded.find(provider, "union-alpha")).toMatchObject(expected);
+				expect(requests).toBe(1);
+			} finally {
+				reloaded.dispose();
+			}
+		});
+
 		test("discoverable custom compat survives refresh", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -3397,6 +3445,55 @@ describe("ModelRegistry", () => {
 				.map(model => model.id)
 				.sort();
 			expect(afterOfflineIds).toEqual(discoveredIds);
+		});
+
+		test("dynamically discovered Antigravity model survives token rotation followed by a models config change", async () => {
+			// Antigravity models outside the bundled catalog exist only through discovery. When a long-running session
+			// rebuilds its catalog after the same account's token refreshed, the discovered model must stay available.
+			const credential = (access: string, expires: number) => ({
+				type: "oauth" as const,
+				access,
+				refresh: `${access}-refresh`,
+				expires,
+				email: "rotation@example.com",
+				projectId: "rotation-project",
+			});
+			const writeConfig = (modelId: string) =>
+				writeModelsJson({ anthropic: providerConfig("https://marker-proxy.example.com/v1", [{ id: modelId }]) });
+			writeConfig("claude-rotation-marker-1");
+			await authStorage.set("google-antigravity", [credential("antigravity-access-1", Date.now() + 60 * 60 * 1000)]);
+			let discoveryFetches = 0;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url.endsWith("/v1internal:fetchAvailableModels")) {
+					discoveryFetches += 1;
+					return new Response(
+						JSON.stringify({ models: { "gemini-rotation-dynamic": { displayName: "Rotation" } } }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					);
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("google-antigravity", "online");
+			expect(registry.find("google-antigravity", "gemini-rotation-dynamic")).toBeDefined();
+			const fetchesAfterDiscovery = discoveryFetches;
+
+			await authStorage.set("google-antigravity", [
+				credential("antigravity-access-2", Date.now() + 2 * 60 * 60 * 1000),
+			]);
+			writeConfig("claude-rotation-marker-2");
+			const configChangedAt = new Date(Date.now() + 5_000);
+			fs.utimesSync(modelsJsonPath, configChangedAt, configChangedAt);
+			await registry.refresh("offline");
+
+			expect(registry.find("anthropic", "claude-rotation-marker-2")).toBeDefined();
+			// The offline rebuild must restore the model from cached discovery, not by fetching the catalog again.
+			expect(discoveryFetches).toBe(fetchesAfterDiscovery);
+			expect(registry.find("google-antigravity", "gemini-rotation-dynamic")).toBeDefined();
 		});
 
 		test("modelOverrides still apply after discoverable refresh", async () => {
@@ -8163,7 +8260,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
@@ -8199,7 +8296,7 @@ describe("ModelRegistry", () => {
 				if (url === "http://127.0.0.1:10201/healthz") {
 					return new Response(JSON.stringify({ ok: true, version: "opencodex", port: 10201 }), { status: 200 });
 				}
-				if (url === "http://127.0.0.1:10201/api/models") {
+				if (url === "http://127.0.0.1:10201/v1/models") {
 					return new Response(JSON.stringify([{ id: "provider/model", name: "Provider Model" }]), { status: 200 });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
@@ -8993,10 +9090,6 @@ describe("ModelRegistry", () => {
 					email: "oauth@example.com",
 				},
 			]);
-			let oauthRefreshGeneration = 0;
-			const getOAuthRefreshGenerationSpy = vi
-				.spyOn(authStorage, "getProviderOAuthRefreshGeneration")
-				.mockImplementation(() => oauthRefreshGeneration);
 			const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockImplementationOnce(async () => {
 				await authStorage.set("oauth-discovery", [
 					{
@@ -9007,7 +9100,6 @@ describe("ModelRegistry", () => {
 						email: "oauth@example.com",
 					},
 				]);
-				oauthRefreshGeneration += 1;
 				authStorage.setRuntimeApiKey("oauth-discovery", "runtime-access");
 				return "refreshed-access";
 			});
@@ -9022,9 +9114,10 @@ describe("ModelRegistry", () => {
 				expect(getApiKeySpy).toHaveBeenCalledTimes(1);
 				expect(registry.find("oauth-discovery", "oauth-model")).toBeUndefined();
 				expect(readModelCache("oauth-discovery", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)).toBeNull();
+				// A same-account token refresh does not bump configuration, so it leaves nothing to discount.
+				expect(authStorage.getProviderOAuthRefreshGeneration("oauth-discovery")).toBe(0);
 			} finally {
 				getApiKeySpy.mockRestore();
-				getOAuthRefreshGenerationSpy.mockRestore();
 			}
 		});
 		test("keeps configured discovery provider-local when OAuth preflight fails", async () => {

@@ -9,6 +9,7 @@ import {
 	type SessionReconcileUncertainTarget,
 	validateSessionReconcileUncertainTarget,
 } from "../lifecycle/service";
+import { ACP_PROMPT_INACTIVITY_TIMEOUT_MS } from "../prompt-watchdog";
 import {
 	validateAdapterControl,
 	validateAdapterSecretFields,
@@ -18,6 +19,35 @@ import { OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
 import { ACP_SESSION_RECONNECT, SESSION_ABORT_TIMEOUT_MS } from "../session-reconnect";
 import type { SessionLifecycleMcpServer } from "./mcp";
+
+/**
+ * Registration rounds one provider activation may spend chasing a moving attachment.
+ *
+ * The activation loop restarts whenever the Router attachment changes identity while it
+ * is registering, because the leases it just took belong to a connection that no longer
+ * exists. One reconnect costs one restart, so a handful covers any churn that is actually
+ * converging; beyond that the attachment is rotating faster than registration completes
+ * and another round only re-takes leases that will be invalidated again. Bounding this is
+ * what turns "many session hosts contend for one agent dir" from an unbounded spin into a
+ * reported failure (issue #5658).
+ */
+export const PROVIDER_ACTIVATION_MAX_ATTEMPTS = 8;
+
+/**
+ * Wall-clock budget for the same loop.
+ *
+ * The attempt cap alone bounds rounds, not time: every round is a `#requestSession` round
+ * trip per provider, so under lease contention attempts are slow rather than fast-spinning
+ * and eight of them can still outlast the caller. The budget is sized to a third of
+ * {@link ACP_PROMPT_INACTIVITY_TIMEOUT_MS} so a prompt stalled in provider preflight fails
+ * with this error — which names the contended capability — with room to spare before the
+ * ACP prompt watchdog reports the same stall as undifferentiated silence.
+ *
+ * It gates *starting* another round, never interrupting one in flight: a single slow but
+ * healthy registration keeps whatever time it needs, and only a retry decided after the
+ * deadline is refused.
+ */
+export const PROVIDER_ACTIVATION_BUDGET_MS = Math.floor(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 3);
 
 type JsonObject = Record<string, unknown>;
 function object(value: unknown): JsonObject | undefined {
@@ -600,7 +630,12 @@ export class AcpSdkAdapter {
 		}
 
 		const activation = (async () => {
-			for (;;) {
+			const startedAt = Date.now();
+			// Exhaustion is checked here, outside the try below, so the throw cannot be caught
+			// by the same `continue` branch that spent the budget.
+			for (let attempt = 1; ; attempt++) {
+				if (attempt > PROVIDER_ACTIVATION_MAX_ATTEMPTS || Date.now() - startedAt >= PROVIDER_ACTIVATION_BUDGET_MS)
+					throw this.#providerActivationExhausted(attempt - 1, startedAt);
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
@@ -650,6 +685,33 @@ export class AcpSdkAdapter {
 		} finally {
 			if (this.#providerActivation === activation) this.#providerActivation = undefined;
 		}
+	}
+
+	/**
+	 * Names what the exhausted activation loop was still fighting over, so a stalled
+	 * preflight is attributable to a capability instead of surfacing as generic silence.
+	 */
+	#providerActivationExhausted(attempts: number, startedAt: number): AcpSdkAdapterError {
+		const elapsedMs = Date.now() - startedAt;
+		const contended = this.#providers
+			.filter(provider => !this.#leases.has(provider.capability))
+			.map(provider => provider.capability);
+		const detail =
+			contended.length > 0
+				? `still unleased: ${contended.join(", ")}`
+				: "the SDK session attachment changed identity on every attempt";
+		logger.error("acp_provider_activation_exhausted", {
+			sessionId: this.#sessionId,
+			attempts,
+			elapsedMs,
+			contended,
+			leaseCount: this.#leases.size,
+		});
+		return new AcpSdkAdapterError(
+			"provider_activation_exhausted",
+			`SDK provider activation did not converge after ${attempts} attempts over ${Math.round(elapsedMs / 1_000)}s ` +
+				`(${detail}). The session host is contending for provider leases it cannot hold.`,
+		);
 	}
 
 	#assertGenericDisposition(kind: "control" | "global", sdkId: string): void {

@@ -66,6 +66,17 @@ const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effo
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const ALIBABA_GLM_53_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const ALIBABA_DEEPSEEK_V4_PINNED_IDS = new Set([
+	"deepseek-v4-flash-0731",
+	"deepseek-v4-pro-0813",
+	"deepseek-v4.1-flash",
+]);
+const ALIBABA_DEEPSEEK_V4_PINNED_NAMES: Record<string, string> = {
+	"deepseek-v4-flash-0731": "DeepSeek V4 Flash 0731",
+	"deepseek-v4-pro-0813": "DeepSeek V4 Pro 0813",
+	"deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+};
 const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GROK_4_20_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
@@ -181,7 +192,7 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
 	if (cached !== undefined) {
 		return cached as ApiModel<TApi>;
 	}
-	const normalizedThinking = normalizeThinkingConfig(model.thinking);
+	const normalizedThinking = getMiniMaxThinkingMode(model) ? undefined : normalizeThinkingConfig(model.thinking);
 	let result: ApiModel<TApi>;
 	if (isGroqCompoundReasoningUnsupported(model)) {
 		result =
@@ -229,19 +240,60 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
 }
 
 /**
+ * Native MiniMax thinking semantics, scoped to first-party regional routes.
+ * M3 supports adaptive/disabled; M2.x always thinks, even when disabled is sent.
+ * https://platform.minimax.io/docs/api-reference/text-openai-api#thinking-control
+ * https://platform.minimax.io/docs/api-reference/text-anthropic-api#thinking-control
+ */
+export function getMiniMaxThinkingMode(
+	model: ApiModel<Api>,
+	resolvedBaseUrl?: string,
+): "toggle" | "always-on" | undefined {
+	const isDirectRoute =
+		(model.api === "anthropic-messages" && (model.provider === "minimax" || model.provider === "minimax-cn")) ||
+		(model.api === "openai-completions" &&
+			(model.provider === "minimax-code" || model.provider === "minimax-code-cn"));
+	if (!isDirectRoute) return undefined;
+	// Provider identity survives baseUrl overrides. Only the normalized native
+	// endpoint, not a provider label or a matching hostname suffix, proves this contract.
+	try {
+		const endpoint = new URL(resolvedBaseUrl ?? model.baseUrl);
+		const host = model.provider.endsWith("-cn") ? "api.minimaxi.com" : "api.minimax.io";
+		const path = endpoint.pathname.replace(/\/+$/, "");
+		const validPath =
+			model.api === "anthropic-messages" ? path === "/anthropic" || path === "/anthropic/v1" : path === "/v1";
+		if (
+			endpoint.origin !== `https://${host}` ||
+			!validPath ||
+			endpoint.username ||
+			endpoint.password ||
+			endpoint.search ||
+			endpoint.hash
+		)
+			return undefined;
+	} catch {
+		return undefined;
+	}
+	if (model.id === "MiniMax-M3" || model.id === "MiniMax-M3[1m]") return "toggle";
+	if (/^MiniMax-M2(?:[.\-[]|$)/.test(model.id)) return "always-on";
+	return undefined;
+}
+
+/**
  * Returns whether the configured transport has an audited user-facing reasoning control.
- *
- * Custom OpenAI-compatible endpoints fail closed: declaring a model as reasoning-capable
- * is not enough to prove that the proxy accepts OpenAI reasoning parameters. Unknown
- * endpoints must opt in with `compat.supportsReasoningEffort: true`; providers using a
- * non-OpenAI request shape must also declare `compat.thinkingFormat`. Bundled providers
- * remain governed by their catalog and compatibility metadata.
+ * Custom OpenAI-compatible endpoints must opt in with supportsReasoningEffort and,
+ * for non-OpenAI request shapes, thinkingFormat. Native MiniMax switches are
+ * separate from reasoning_effort, which those endpoints do not support.
  */
 export function modelSupportsReasoningControl<TApi extends Api>(
 	model: ApiModel<TApi>,
 	resolvedBaseUrl?: string,
 ): boolean {
 	if (!model.reasoning) return false;
+	// MiniMax's native thinking switch is not OpenAI reasoning_effort. M2.x
+	// always thinks; M3 supports adaptive/disabled, but no effort or budget.
+	const miniMaxMode = getMiniMaxThinkingMode(model, resolvedBaseUrl);
+	if (miniMaxMode) return miniMaxMode === "toggle";
 	if (model.api === "openai-completions") {
 		const completionsModel = model as ApiModel<"openai-completions">;
 		const explicitSupport = completionsModel.compat?.supportsReasoningEffort;
@@ -279,9 +331,13 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
 			source.reasoning = true;
 		}
-		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
+		if (source.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(source.id)) {
 			source.reasoning = true;
-			source.name = "DeepSeek V4 Flash 0731";
+			source.name = ALIBABA_DEEPSEEK_V4_PINNED_NAMES[source.id] ?? source.name;
+		}
+		if (source.provider === "alibaba-token-plan" && source.id === "glm-5.3") {
+			source.reasoning = true;
+			source.name = "GLM-5.3";
 		}
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
@@ -628,7 +684,7 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
-	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+	if (model.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(model.id)) {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 384_000;
 		model.compat = {
@@ -637,6 +693,24 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			supportsReasoningEffort: true,
 			reasoningContentField: "reasoning_content",
 			requiresReasoningContentForToolCalls: true,
+		};
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "glm-5.3") {
+		model.contextWindow = 1_000_000;
+		model.maxTokens = 131_072;
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			reasoningContentField: "reasoning_content",
+			requiresReasoningContentForToolCalls: true,
+		};
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
 	if (model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6")) {
@@ -777,6 +851,11 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 }
 
 function inferModelThinking<TApi extends Api>(model: ApiModel<TApi>): ThinkingConfig {
+	if (getMiniMaxThinkingMode(model) === "toggle") {
+		// The existing persisted effort value represents the single enabled state;
+		// UI consumers label it "on", and transports send no effort or budget.
+		return { mode: "effort", minLevel: Effort.High, maxLevel: Effort.High };
+	}
 	const parsedModel = parseKnownModel(model.id);
 	const efforts = inferSupportedEfforts(parsedModel, model);
 	const minLevel = efforts[0];
@@ -852,8 +931,11 @@ function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
 	}
-	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
+	if (model.provider === "alibaba-token-plan" && ALIBABA_DEEPSEEK_V4_PINNED_IDS.has(model.id)) {
 		return DEEPSEEK_V4_FLASH_0731_EFFORTS;
+	}
+	if (model.provider === "alibaba-token-plan" && model.id === "glm-5.3") {
+		return ALIBABA_GLM_53_EFFORTS;
 	}
 	switch (parsedModel.family) {
 		case "openai":

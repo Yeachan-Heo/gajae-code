@@ -12,7 +12,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import type * as winston from "winston";
-import { getLogsDir } from "./dirs";
+import { getEffectiveLogsDir } from "./dirs";
 
 /** Ensure a logs directory exists; return the resolved path. */
 function ensureDir(dir: string): string {
@@ -73,10 +73,22 @@ function makeLogFormat(winston: WinstonModule): winston.Logform.Format {
 	);
 }
 
-/** Build a rotating file transport, materializing the target directory lazily. */
+/**
+ * Build a rotating file transport, materializing the target directory lazily.
+ *
+ * Destination precedence:
+ *   1. `dir` — an explicit path from {@link setTransports}(`{ file: "<path>" }`).
+ *   2. {@link getEffectiveLogsDir} — the provenance-checked `GJC_LOG_DIR`
+ *      override, else the real config root (`~/.gjc/logs`).
+ *
+ * The resolution is centralized in `dirs.ts` rather than read from the
+ * environment here: the log *readers* (report bundles, the debug log view, the
+ * HTTP dump directory) call the same helper, and a second env read in this file
+ * is what let the transport write somewhere the readers never looked.
+ */
 function makeFileTransport(DailyRotateFile: DailyRotateFileCtor, dir?: string): Transport {
 	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? getLogsDir()),
+		dirname: ensureDir(dir ?? getEffectiveLogsDir()),
 		filename: "gjc.%DATE%.log",
 		datePattern: "YYYY-MM-DD",
 		maxSize: "10m",
@@ -94,6 +106,7 @@ function applyTransports(
 	modules: { winston: WinstonModule; DailyRotateFile: DailyRotateFileCtor },
 ): void {
 	logger.clear();
+	logger.silent = !transportOptions.console && !transportOptions.file;
 	if (transportOptions.file) {
 		logger.add(
 			makeFileTransport(

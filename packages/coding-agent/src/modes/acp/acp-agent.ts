@@ -46,14 +46,20 @@ import {
 	AcpSdkAdapterError,
 	acpMcpLaunchFailure,
 } from "../../sdk/acp";
-import { resolveAcpFinalText } from "../../sdk/acp/final-text";
-import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
+import { hasAcpFinalTextContent, resolveAcpFinalText } from "../../sdk/acp/final-text";
+import type { SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
-import { failedPromptOutcome, isSdkPromptFailurePhase } from "../../sdk/prompt-failure";
+import {
+	failedPromptOutcome,
+	isSafePromptFailureCode,
+	isSdkPromptFailurePhase,
+	promptFailureRetryability,
+	rephaseFailedOutcome,
+} from "../../sdk/prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
@@ -103,15 +109,52 @@ const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
  */
 const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 /**
+ * Wall-clock ceiling an external ACP client grants a `session/new` before it
+ * abandons the connection (paseo's daemon uses 60s). gjc must return a
+ * `session.create` response — a launched session or a terminal launch error —
+ * inside this window, or the client reports a dead provider while gjc is still
+ * healthily spawning the host. See issue #5565.
+ */
+export const ACP_EXTERNAL_CONNECT_TIMEOUT_MS = 60_000;
+/**
  * Readiness budget every ACP session launch requests, independent of MCP.
  *
- * Host cold start costs the same whether or not the client declared MCP servers,
- * so leaving the MCP-less path on the broker's 10s default made it the only ACP
- * launch that fails under ordinary concurrency: a second host starting beside the
- * first measurably crosses that deadline, and the broker then reports the launch
- * as `terminal_uncertain`, which an external client surfaces as a dead provider.
+ * Two constraints bound this value:
+ *
+ * 1. Floor — host cold start costs the same whether or not the client declared
+ *    MCP servers, so leaving the MCP-less path on the broker's 10s default made
+ *    it the only ACP launch that failed under ordinary concurrency: a second
+ *    host starting beside the first measurably crosses that deadline, the broker
+ *    reports the launch as `terminal_uncertain`, and an external client surfaces
+ *    a dead provider.
+ * 2. Ceiling — the broker may park a startup in its admission queue for a whole
+ *    readiness budget before the readiness clock even starts, so the ACP adapter
+ *    sizes its client-side wait at `lifecycleStartupBudgetMs(R)` = queue wait +
+ *    readiness = `2·R`, plus caller slack. With R = 30.5s that wait reached ~62s
+ *    — past paseo's 60s connect timeout — so a queued or slow-cold-start launch
+ *    let paseo abandon the connection before gjc could answer `session/new` at
+ *    all (#5565). R must keep `2·R + slack` safely under
+ *    {@link ACP_EXTERNAL_CONNECT_TIMEOUT_MS}.
+ *
+ * 22s satisfies both: comfortably above the ~16s cold starts observed on slow
+ * hosts (and the 10s concurrency floor) while holding the client-side lifecycle
+ * budget near 45s — a ~15s margin under the 60s ceiling.
  */
-const ACP_SESSION_READINESS_TIMEOUT_MS = ACP_MCP_LIFECYCLE_TIMEOUT_MS;
+export const ACP_SESSION_READINESS_TIMEOUT_MS = 22_000;
+
+/**
+ * A freshly created session host can accept the first turn before it has finished
+ * coming up (provider stream, tool registry, MCP wiring), so the very first prompt
+ * can terminalize as `prompt_failed` — surfaced to an ACP client as an opaque
+ * `-32603` with no usable result (issue #5574). The failed turn produced no answer,
+ * so re-submitting the same first prompt a bounded number of times recovers the
+ * startup race instead of ending the session on its first turn. Only the first
+ * logical prompt of a session retries, and only an `agent_failed` `prompt_failed`
+ * terminal (never a deadline, a client cancel, or a clean stop) is retried.
+ */
+const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
+/** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
+const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -140,10 +183,22 @@ interface PromptWaiter {
 	lastFrameAt: number;
 	/** Type of that prompt-owned frame, reported when the watchdog expires. */
 	lastFrameType: string;
+	/** True while the prompt is blocked in provider preflight, before the turn is dispatched. */
+	awaitingProviderPreflight: boolean;
 	/** Cancels the armed inactivity watchdog; re-armed by prompt-owned frames. */
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
 	activity: PromptActivity;
+	/** True once a prompt-owned progress frame (agent_start / message / tool) was observed; gates first-turn retries. */
+	observedTurnActivity: boolean;
+	/** True once a prompt-owned tool execution frame was observed; vetoes a first-turn retry that would re-run it. */
+	observedToolExecution: boolean;
+	/**
+	 * Newest `plan` update published for this prompt, retained so an abandoned turn can report
+	 * what it had left to do (issue #5669). Absent means no plan was ever observed, which is
+	 * evidence of nothing — distinct from an observed plan whose entries are all `completed`.
+	 */
+	planSnapshot?: AcpPlanSnapshot;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
@@ -200,7 +255,77 @@ type SessionRecord = {
 	activePrompt?: PromptWaiter;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
+	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
+	firstPromptDone?: boolean;
+	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
+	promptObservedActivity?: boolean;
+	/** Whether the current prompt attempt executed a tool; reset per attempt, vetoes a first-turn retry that would re-run it. */
+	promptObservedToolExecution?: boolean;
+	/** Whether the current prompt attempt published assistant text/thought output; reset per attempt, vetoes a first-turn retry that would re-emit it. */
+	promptObservedAssistantOutput?: boolean;
+	/** Owner token held across the first-turn retry backoff; a non-owner prompt is rejected as a conflict (review P1). */
+	pendingFirstPromptRetry?: FirstPromptRetryReservation;
 };
+
+/**
+ * Identity token proving a caller owns an in-progress first-turn retry. While it is held on the
+ * session record, `#submitPrompt` rejects any prompt that is not this owner, so a concurrent
+ * request cannot slip into the gap between `#settlePrompt` clearing `activePrompt` on the failed
+ * first attempt and the retry resubmitting after its backoff (review P1, issue #5574).
+ */
+type FirstPromptRetryReservation = {
+	readonly firstPromptRetry: true;
+	/**
+	 * Set once `#submitPrompt` dispatched a turn for this prompt. Distinguishes a prompt that
+	 * genuinely owned the session's first turn from a preflight rejection, so only the former
+	 * settles `firstPromptDone` (review P2).
+	 */
+	admitted?: boolean;
+	/**
+	 * Terminal settlement recorded by a teardown that won the backoff gap. The failed attempt
+	 * already cleared `activePrompt`, so `#teardownSession` has no waiter to settle for this
+	 * caller and nothing else carries the outcome across the sleep. Without it the retry wakes
+	 * to a deleted record and resubmits into `not_found`, where a client-driven close/delete
+	 * owes the ACP `cancelled` stop reason (review P1).
+	 */
+	settlement?: { kind: "cancelled" } | { kind: "rejected"; error: AcpSdkAdapterError };
+};
+
+/**
+ * Prompt-owned frame types that prove the turn is underway (as opposed to a
+ * terminal or a bare failure diagnostic). Observing one is the first-turn
+ * readiness-race fingerprint the retry gate keys on.
+ */
+function isTurnProgressEventType(type: string | undefined): boolean {
+	switch (type) {
+		case "agent_start":
+		case "message_start":
+		case "message_update":
+		case "message_end":
+		case "tool_execution_start":
+		case "tool_execution_update":
+		case "tool_execution_end":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * Prompt-owned frame types that prove a tool actually executed. A turn that ran a tool did
+ * side-effecting work, so it must never be re-run by the first-turn readiness retry (issue
+ * #5574 / review P1): a re-submit is an independent turn that would repeat those side effects.
+ */
+function isTurnToolExecutionEventType(type: string | undefined): boolean {
+	switch (type) {
+		case "tool_execution_start":
+		case "tool_execution_update":
+		case "tool_execution_end":
+			return true;
+		default:
+			return false;
+	}
+}
 
 function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boolean {
 	return waiter.settled || record.activePrompt !== waiter;
@@ -496,6 +621,142 @@ function logDroppedPromptTerminal(
 		...(expected?.commandId ? { expectedCommandId: expected.commandId } : {}),
 		...(expected?.turnId ? { expectedTurnId: expected.turnId } : {}),
 	});
+}
+
+type SdkPromptFailedOutcome = Extract<SdkPromptTerminalOutcome, { kind: "failed" }>;
+
+/**
+ * A prompt rejection that still carries the terminal's structured failure classification.
+ * The ACP client sees only the code and message, but the first-turn retry gate must decide on
+ * what the terminal actually proved — the failure's execution phase and its bounded origin
+ * category — so settlement carries that classification instead of discarding it into a bare
+ * `AcpSdkAdapterError` (review P1, issue #5574).
+ */
+export class AcpPromptFailureError extends AcpSdkAdapterError {
+	readonly failure: SdkPromptFailedOutcome;
+	constructor(failure: SdkPromptFailedOutcome) {
+		super(failure.code, failure.message);
+		this.failure = failure;
+	}
+}
+
+/**
+ * The wire projection of a prompt terminal's classification (issue #5615).
+ *
+ * `super(failure.code, failure.message)` above narrows the error to the generic
+ * `prompt_failed` plus its fixed redacted message, so the classification the
+ * terminal already computed used to die at the JSON-RPC boundary: an ACP client
+ * saw only `-32603 {code, details}` and could not tell a transient provider blip
+ * from a dead session without parsing English. These fields carry it across.
+ *
+ * `providerCode` is re-checked against the safe-token rule rather than trusted:
+ * `terminalOutcome` accepts the host's `providerCode` on a `typeof` check alone,
+ * and this is the first path that puts it on the wire, so an unbounded value is
+ * dropped instead of becoming a leak of provider text (the redaction contract in
+ * `sanitizePromptFailure`). A dropped or absent code is omitted, never nulled.
+ */
+function promptFailureWireData(failure: SdkPromptFailedOutcome): Record<string, string> {
+	return {
+		phase: failure.phase,
+		category: failure.category,
+		retryability: promptFailureRetryability(failure.category),
+		...(isSafePromptFailureCode(failure.providerCode) ? { providerCode: failure.providerCode } : {}),
+	};
+}
+
+/**
+ * What an ACP `plan` update said the turn intended to do. Structural rather than the SDK's
+ * `PlanEntry` so only the fields this evidence reads are depended on.
+ */
+type AcpPlanSnapshot = Array<{
+	content: string;
+	status: "pending" | "in_progress" | "completed";
+	_meta?: { gjcTodoStatus?: unknown } | null;
+}>;
+
+/**
+ * An abandoned prompt that still carries the plan its turn was working through (issue #5669).
+ *
+ * The watchdog settles a prompt whose host stopped producing frames, and that rejection used to
+ * be a bare `AcpSdkAdapterError`: `{code, details}` and nothing else. A wrapper could not tell
+ * "the agent finished" from "the agent stopped with work left", so an abandoned turn's unverified
+ * diff was published as if it were complete. The last observed plan is the evidence that settles
+ * that question, so settlement carries it instead of dropping it at the JSON-RPC boundary.
+ */
+export class AcpPromptAbandonedError extends AcpSdkAdapterError {
+	readonly plan: AcpPlanSnapshot | undefined;
+	constructor(code: string, message: string, plan: AcpPlanSnapshot | undefined) {
+		super(code, message);
+		this.plan = plan;
+	}
+}
+
+/** Most pending plan entries that may reach the wire. */
+const ACP_ABANDON_PLAN_MAX_ENTRIES = 10;
+/** Longest one pending entry's text may be on the wire. */
+const ACP_ABANDON_PLAN_MAX_CONTENT_CHARS = 200;
+
+/**
+ * Whether a plan entry describes work the turn never finished (issue #5669).
+ *
+ * An entry whose ACP status is `completed` can still be unfinished: ACP's `PlanEntryStatus` has no
+ * `abandoned` member, so a task dropped via `/todo drop` is projected as `completed` for the
+ * client's plan UI while the mapper keeps the internal status in `_meta.gjcTodoStatus`. Completion
+ * evidence has to read that internal truth — reading the wire status alone would report a plan of
+ * nothing but dropped tasks as a finished turn. `_meta` crosses a JSON boundary, so the internal
+ * status is compared as `unknown` rather than asserted into a type.
+ */
+function planEntryUnfinished(entry: AcpPlanSnapshot[number]): boolean {
+	return entry.status !== "completed" || entry._meta?.gjcTodoStatus === "abandoned";
+}
+
+/**
+ * The wire projection of an abandoned prompt's plan (issue #5669).
+ *
+ * Plan text is model-authored, so it is bounded the same way `promptFailureWireData` bounds a
+ * provider classifier: a capped number of entries, each capped in length, and never restated in
+ * the human message. The counts are what a wrapper actually gates on; the contents are there so
+ * the reader can name the unfinished steps without a log dive.
+ *
+ * An absent plan yields no keys at all. "No plan was ever observed" is not the same claim as
+ * "the plan was complete", and a client must be able to tell them apart, so the fields are
+ * omitted rather than nulled or reported as unknown.
+ */
+function promptAbandonWireData(plan: AcpPlanSnapshot | undefined): Record<string, string> {
+	if (!plan) return {};
+	const pending = plan.filter(planEntryUnfinished);
+	return {
+		planIncomplete: pending.length > 0 ? "true" : "false",
+		planPendingCount: String(pending.length),
+		planTotalCount: String(plan.length),
+		planPending: JSON.stringify(
+			pending
+				.slice(0, ACP_ABANDON_PLAN_MAX_ENTRIES)
+				.map(entry => entry.content.slice(0, ACP_ABANDON_PLAN_MAX_CONTENT_CHARS)),
+		),
+	};
+}
+
+/**
+ * The startup-readiness failure class (issue #5574): the turn failed AFTER it started, with a
+ * bounded provider/transport classifier — the signature of a host that accepted the turn before
+ * its provider stream had finished coming up.
+ *
+ * Every other failure a `prompt_failed` terminal can carry is a genuine failure of this turn and
+ * is surfaced rather than re-submitted, even when it happened to publish nothing: a provider
+ * rejection (quota, refusal, 4xx), an agent runtime failure, a submission-phase rejection, or a
+ * deadline. Without this class check, "started, no output" alone authorized a retry, so any such
+ * rejection was silently re-run as a second turn (review P1).
+ */
+function isStartupReadinessFailure(error: unknown): boolean {
+	if (!(error instanceof AcpPromptFailureError)) return false;
+	const { failure } = error;
+	return (
+		failure.code === "prompt_failed" &&
+		failure.provenance === "agent_failed" &&
+		failure.phase === "post_start" &&
+		failure.category === "provider_transport"
+	);
 }
 
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
@@ -1101,9 +1362,21 @@ export function acpRequestFailure(error: unknown): unknown {
 	const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 	if (typeof code !== "string") return error;
 	const message = error instanceof Error ? error.message : code;
+	// A prompt terminal additionally publishes its classification (issue #5615). The
+	// spread is empty for every other error, so their payloads are byte-identical to
+	// before. `code`/`details` and the JSON-RPC code itself are untouched either way:
+	// this enriches `data`, it does not restate the redacted message.
+	const data =
+		error instanceof AcpPromptFailureError
+			? { code, details: message, ...promptFailureWireData(error.failure) }
+			: { code, details: message };
+	// An abandoned prompt additionally publishes the plan it never finished (issue #5669).
+	// Same rule as above: `code`/`details` and the JSON-RPC code are untouched, and an abandon
+	// that observed no plan adds no keys, so its payload stays byte-identical to before.
+	if (error instanceof AcpPromptAbandonedError) Object.assign(data, promptAbandonWireData(error.plan));
 	switch (code) {
 		case "authentication_failed":
-			return RequestError.authRequired({ code, details: message }, message);
+			return RequestError.authRequired(data, message);
 		// `not_found` stays -32603 with its discriminator in `data`: ACP's
 		// `resourceNotFound` (-32002) is a URI-addressed resource error, and an unknown
 		// session id is not a resource URI. Pinned ACP core-v1 conformance also requires
@@ -1111,12 +1384,15 @@ export function acpRequestFailure(error: unknown): unknown {
 		case "invalid_input":
 		case "unsupported":
 		case "unsupported_content":
-			return RequestError.invalidParams({ code, details: message }, message);
+			return RequestError.invalidParams(data, message);
 		default:
 			// The remaining internal codes (conflict, unavailable, busy, …) have no ACP
 			// counterpart and stay -32603. Keep the discriminator in `data` so a client can
-			// branch on retry/reconnect instead of parsing an English message.
-			return RequestError.internalError({ code, details: message }, message);
+			// branch on retry/reconnect instead of parsing an English message. `prompt_failed`
+			// and `prompt_deadline_exceeded` land here and keep -32603 by design: pinned ACP
+			// core-v1 conformance expects -32603/-32000 for this class, so the added
+			// classification travels in `data` rather than in a renumbered code.
+			return RequestError.internalError(data, message);
 	}
 }
 
@@ -1656,7 +1932,167 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#sessions.get(params.sessionId);
+		// An unknown session must still report not_found; the retry loop only guards a
+		// live session's first turn against a startup readiness race (issue #5574).
+		if (!record) return await this.#submitPrompt(params, true);
+		// Identity of THIS caller's first-turn retry. Held on the record across the backoff so a
+		// concurrent prompt racing the gap is rejected as a conflict rather than admitted (review P1).
+		const retryReservation: FirstPromptRetryReservation = { firstPromptRetry: true };
+		try {
+			let echoUserMessage = true;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await this.#submitPrompt(params, echoUserMessage, retryReservation);
+				} catch (error) {
+					if (!this.#shouldRetryFirstPrompt(record, error, attempt)) throw error;
+					// The user's message was already echoed on the first attempt; re-echoing
+					// would duplicate it in the client transcript.
+					echoUserMessage = false;
+					// Reserve the session BEFORE the backoff sleep. `#settlePrompt` already cleared
+					// `activePrompt` when it rejected this attempt, so without the reservation the
+					// backoff gap admits a competing prompt that steals the first turn (review P1).
+					record.pendingFirstPromptRetry = retryReservation;
+					logger.warn("ACP first-turn prompt failed; retrying after readiness backoff", {
+						sessionId: params.sessionId,
+						attempt: attempt + 1,
+						maxRetries: ACP_FIRST_PROMPT_MAX_RETRIES,
+					});
+					await this.#delayFirstPromptRetry(attempt);
+					// The failed attempt publishes its final text and its failure diagnostic on async
+					// tails, and `#submitPrompt` rejects any prompt while one of them is still in
+					// flight. A slow or backpressured ACP client keeps a tail running well past a
+					// 250/500ms backoff, so an authorized retry would lose its own turn to a
+					// `conflict` raised by its own predecessor's publications. Wait the tails out
+					// here instead of weakening those guards, which still have to reject prompts
+					// racing in from other callers (review P1).
+					await this.#drainPromptPublicationTails(params.sessionId);
+					// A session/close or session/delete that won the backoff gap tore the record
+					// down without a waiter to settle, leaving its outcome on this reservation.
+					// Honor it here: resubmitting would only reach `#submitPrompt`'s not_found,
+					// which is not what a client-driven teardown owes the caller (review P1).
+					const settlement = retryReservation.settlement;
+					if (settlement) {
+						if (settlement.kind === "cancelled") return { stopReason: "cancelled" };
+						throw settlement.error;
+					}
+					// A session/cancel that arrived during the backoff gap (activePrompt already
+					// cleared by the failed attempt, retry not yet resubmitted) must settle the
+					// retry as `cancelled` instead of dispatching a fresh turn the client no
+					// longer wants. The check lives here, before resubmission, because
+					// `#submitPrompt` unconditionally clears `cancelRequested` for the new turn
+					// it is about to start, so a later check would miss it (review P1).
+					if (record.cancelRequested) {
+						record.cancelRequested = false;
+						return { stopReason: "cancelled" };
+					}
+				}
+			}
+		} finally {
+			// Release the reservation on retry completion (success), cancellation, or final
+			// failure. Guarded so a later prompt that took ownership is never cleared by this caller.
+			if (record.pendingFirstPromptRetry === retryReservation) record.pendingFirstPromptRetry = undefined;
+			// Only a turn that was actually admitted (dispatched to the host) settles the
+			// session's first prompt. A preflight rejection — validation, auth/preflight, a
+			// stale-state conflict, an oversize frame, or an ensureProviders() failure — never
+			// owned a turn, so it must not consume the one-shot first-turn retry budget: a later
+			// valid first prompt that hits the startup readiness race must still be retryable
+			// (review P2).
+			if (retryReservation.admitted) record.firstPromptDone = true;
+		}
+	}
+
+	/**
+	 * The readiness-race signature (issue #5574): the session's first turn was accepted
+	 * and started producing frames (an `agent_start`), then failed as `prompt_failed` before
+	 * ever completing. Re-submitting the same first prompt a bounded number of times lets a
+	 * host that has since finished coming up answer it, instead of ending the session on its
+	 * first turn.
+	 *
+	 * A retry re-submits the prompt as a fresh, INDEPENDENT `turn.prompt` — `AcpSdkAdapter`
+	 * assigns a new request id per call — so it must never re-run a turn that already did
+	 * side-effecting work. If the failed turn executed a tool, re-submitting would run the
+	 * user's instruction, and its side effects, a second time (review P1). A turn that only
+	 * started (agent_start / streamed text) but ran no tool produced no external effect, so
+	 * recovering it is safe.
+	 *
+	 * Every gate is deliberately narrow so a genuine failure is still surfaced:
+	 * - only the first logical prompt of the session (`!firstPromptDone`);
+	 * - only the startup-readiness failure class the terminal itself classified
+	 *   (`isStartupReadinessFailure`): a post-start `agent_failed` `prompt_failed` with a
+	 *   provider/transport classifier — never a client cancel, a `prompt_deadline_exceeded`,
+	 *   a provider rejection, an agent runtime failure, a transport error, or a preflight
+	 *   rejection, however little output they happened to produce;
+	 * - only after the turn was observed starting (`promptObservedActivity`), the race's
+	 *   fingerprint, which a turn rejected before it ever started never has;
+	 * - but NEVER once the turn executed a tool (`promptObservedToolExecution`), so a
+	 *   progressed, side-effecting turn is never re-run as a second turn;
+	 * - but NEVER once the turn published assistant text/thought output
+	 *   (`promptObservedAssistantOutput`), so a re-submit cannot expose duplicated output
+	 *   from both attempts to the live ACP update stream — including a failed terminal's own
+	 *   `finalText`, which is published on an async tail after this gate runs;
+	 * - never once the client has asked to cancel.
+	 */
+	#shouldRetryFirstPrompt(record: SessionRecord, error: unknown, attempt: number): boolean {
+		if (attempt >= ACP_FIRST_PROMPT_MAX_RETRIES) return false;
+		// The primary gate: only the failure class the terminal classified as a startup
+		// readiness race is recoverable. The activity/tool/output gates below stay as secondary
+		// safety checks on top of it — they bound what may be re-run, not what is worth re-running.
+		if (!isStartupReadinessFailure(error)) return false;
+		if (record.firstPromptDone) return false;
+		if (record.cancelRequested) return false;
+		if (!record.promptObservedActivity) return false;
+		// Never re-run a turn that already executed a tool: a re-submit is a new, independent
+		// turn.prompt, so repeating a tool-executing turn would run the user's instruction and
+		// its side effects a second time (review P1).
+		if (record.promptObservedToolExecution) return false;
+		// Never re-run a turn that already published — or has committed to publishing —
+		// assistant text/thought output: a re-submit is a new, independent turn.prompt whose
+		// output would be delivered to ACP consumers on top of the failed attempt's chunks or
+		// its terminal's final text, duplicating or corrupting the assistant stream.
+		if (record.promptObservedAssistantOutput) return false;
+		return true;
+	}
+
+	/**
+	 * Settles the publication tails a finished turn left running: its terminal's final text, its
+	 * end-of-turn metadata, and its failure diagnostic. Each tail owns one of `#submitPrompt`'s
+	 * conflict guards, and a tail can start another (the failure diagnostic awaits the final text),
+	 * so this drains until none is left rather than sampling once.
+	 */
+	async #drainPromptPublicationTails(id: string): Promise<void> {
+		for (;;) {
+			const tails = [
+				this.#finalTextTails.get(id),
+				this.#terminalMetadataTails.get(id),
+				this.#failureDiagnosticTails.get(id),
+			].filter((tail): tail is Promise<void> => tail !== undefined);
+			if (tails.length === 0) return;
+			// A publication failure is the tail's own business; it is logged where it happens and
+			// must not decide the retry.
+			await Promise.allSettled(tails);
+		}
+	}
+
+	/** Backoff between first-prompt retries, on the injectable watchdog clock so tests can advance it. */
+	#delayFirstPromptRetry(attempt: number): Promise<void> {
+		const delayMs = ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS * (attempt + 1);
+		return new Promise<void>(resolve => {
+			this.#promptWatchdogClock.schedule(resolve, delayMs);
+		});
+	}
+
+	async #submitPrompt(
+		params: PromptRequest,
+		echoUserMessage: boolean,
+		retryReservation?: FirstPromptRetryReservation,
+	): Promise<PromptResponse> {
+		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
+		// A first-turn retry holds the session across its backoff gap. Any prompt that is not the
+		// retry owner is rejected here, before any state mutation or dispatch, so it cannot steal
+		// the first turn while the authorized retry is still pending (review P1, issue #5574).
+		if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
+			throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
@@ -1725,6 +2161,11 @@ export class AcpAgent implements Agent {
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
 		record.publicationGeneration++;
+		// Reset per attempt: a first-turn readiness retry keys on whether THIS attempt was
+		// observed doing work, never a prior attempt's activity.
+		record.promptObservedActivity = false;
+		record.promptObservedToolExecution = false;
+		record.promptObservedAssistantOutput = false;
 		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
 		const waiter: PromptWaiter = {
 			acknowledged: false,
@@ -1740,7 +2181,10 @@ export class AcpAgent implements Agent {
 			deferredActivityFrames: [],
 			lastFrameAt: this.#promptWatchdogClock.now(),
 			lastFrameType: "prompt_dispatch",
+			awaitingProviderPreflight: true,
 			activity: new PromptActivity(),
+			observedTurnActivity: false,
+			observedToolExecution: false,
 			resolve,
 			reject,
 		};
@@ -1749,9 +2193,24 @@ export class AcpAgent implements Agent {
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		// Silence has to be bounded from the moment the prompt owns the session: a host that
+		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Provider preflight is part of that window — it awaits a lease the host may never win
+		// — so the bound is armed before it, not after (issue #5658). The arm below re-arms
+		// this same waiter once preflight clears, and #armPromptWatchdog cancels the previous
+		// timer first, so only one timer is ever live.
+		this.#armPromptWatchdog(params.sessionId, record, waiter);
+		// The watchdog settles `response`, not this await, so a preflight that never returns
+		// would pin session/prompt open with the caller's promise already rejected. Racing the
+		// settlement lets the re-checks below hand that rejection back to the caller.
+		const settlement = response.then(
+			() => undefined,
+			() => undefined,
+		);
 		try {
-			await record.adapter.ensureProviders();
+			await Promise.race([record.adapter.ensureProviders(), settlement]);
 		} catch (error) {
+			waiter.awaitingProviderPreflight = false;
 			if (waiter.settled || record.activePrompt !== waiter) {
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				return await response;
@@ -1764,11 +2223,13 @@ export class AcpAgent implements Agent {
 			if (record.activePrompt === waiter) {
 				record.activePrompt = undefined;
 				record.busy = record.backgroundBusy;
+				clearPromptWatchdog(waiter);
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
 				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			}
 			throw error;
 		}
+		waiter.awaitingProviderPreflight = false;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
 			return await response;
@@ -1779,27 +2240,35 @@ export class AcpAgent implements Agent {
 			return await response;
 		}
 
-		// Silence has to be bounded from the moment the prompt owns the session: a host that
-		// dies before it ever answers is exactly the failure that leaves the client running.
+		// Re-arm now that preflight is behind us: the bound armed before it already covered
+		// this prompt's ownership window, and this call replaces that timer rather than
+		// racing it, so the dispatched turn gets the full inactivity bound of its own.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
 		// Echo the user's own message back as `user_message_chunk`. Clients render their
 		// transcript from session/update, so without this a prompt's text and any attached
 		// image never appear in the client UI — only the agent's reply does. Replay
 		// (session/load) already emits these; a live turn must too, and the image blocks
 		// must be published verbatim so attachments are visible, not just fed to the model.
-		for (const block of params.prompt) {
-			if (block.type !== "text" && block.type !== "image") continue;
-			if (block.type === "text" && block.text.length === 0) continue;
-			await this.#publishSessionUpdate(
-				params.sessionId,
-				{
-					sessionId: params.sessionId,
-					update: { sessionUpdate: "user_message_chunk", content: block },
-				},
-				record.adapter,
-			);
-		}
+		// A first-turn readiness retry (issue #5574) skips the echo: the message was already
+		// published on the first attempt and re-echoing would duplicate it in the transcript.
+		if (echoUserMessage)
+			for (const block of params.prompt) {
+				if (block.type !== "text" && block.type !== "image") continue;
+				if (block.type === "text" && block.text.length === 0) continue;
+				await this.#publishSessionUpdate(
+					params.sessionId,
+					{
+						sessionId: params.sessionId,
+						update: { sessionUpdate: "user_message_chunk", content: block },
+					},
+					record.adapter,
+				);
+			}
 		waiter.dispatched = true;
+		// The turn is now dispatched to the host: this prompt owned the session's first turn,
+		// so it — not a preflight rejection that threw before this point — is what settles
+		// `firstPromptDone` in `prompt()` (review P2).
+		if (retryReservation) retryReservation.admitted = true;
 		if (waiter.settled || record.activePrompt !== waiter) {
 			return await response;
 		}
@@ -1884,6 +2353,8 @@ export class AcpAgent implements Agent {
 				}
 				if (matchesWaiter) {
 					this.#observePromptActivity(waiter, deferredFrame);
+					if (waiter.observedTurnActivity) record.promptObservedActivity = true;
+					if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
 					observedDeferredActivity = true;
 				}
 			}
@@ -2070,7 +2541,11 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			if (!waiter) record.cancelRequested = false;
+			// With no active prompt the cancel intent normally clears — except when a first-turn
+			// retry is reserved across its backoff gap. That reservation owner has not yet observed
+			// the cancel; clearing it here would let the retry resubmit a turn the client cancelled
+			// (review P1). Leave the flag for the retry's post-backoff check to settle as cancelled.
+			if (!waiter && !record.pendingFirstPromptRetry) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
 			// every attempt of this wave failed, RE-ARM the aggregate: a later
@@ -2460,6 +2935,12 @@ export class AcpAgent implements Agent {
 				backgroundCorrelations: [],
 				toolArgs: new Map(),
 			};
+			// Preserve first-turn state across reattachment (issue #5574). The startup-readiness
+			// retry only guards a session's very first logical prompt; a fresh record built on
+			// reconnect/reattach would otherwise reset that guard and let a later prompt take the
+			// retry — and re-run — path. Reattachment retains the session's settled prompt
+			// correlations, so a non-empty set proves at least one prompt has already completed.
+			if (record.settledPromptCorrelations.length > 0) record.firstPromptDone = true;
 			record.unsubscribe = adapter.onFrame(frame => this.#enqueueSdkFrame(id, adapter!, frame));
 			record.reconnectUnsubscribe = adapter.onReconnectFailed(error =>
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
@@ -2646,18 +3127,35 @@ export class AcpAgent implements Agent {
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				record.activePrompt = undefined;
-				// `session/close` is the client asking to end its own work, so the pending turn
-				// settles as `cancelled` rather than surfacing a spurious error. ACP: "Agents
-				// MUST catch these errors and return the semantically meaningful `cancelled`
-				// stop reason." Involuntary teardown (transport loss) still rejects.
+				const voluntary = reason === "closed" || reason === "discarded" || reason === "deleted";
+				// `session/close` and `session/delete` are the client asking to end its own work, so
+				// the pending turn settles as `cancelled` rather than surfacing a spurious error.
+				// ACP: "Agents MUST catch these errors and return the semantically meaningful
+				// `cancelled` stop reason." Involuntary teardown (transport loss) still rejects.
 				if (waiter && !waiter.settled) {
 					clearPromptWatchdog(waiter);
-					if (reason === "closed" || reason === "discarded") {
+					if (voluntary) {
 						waiter.settled = true;
 						waiter.resolve({ stopReason: "cancelled" });
 					} else {
 						waiter.reject(new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`));
 					}
+				}
+				// A first-turn retry sleeping out its backoff owns no waiter — its failed attempt
+				// already cleared `activePrompt` — so the settlement above cannot reach it. Record
+				// the teardown on its reservation instead, with the same voluntary/involuntary
+				// split, and release the reservation: otherwise the retry wakes to a deleted
+				// record and resubmits, surfacing `not_found` where the client's close/delete owes
+				// `cancelled` (review P1).
+				const reservation = record.pendingFirstPromptRetry;
+				if (reservation) {
+					reservation.settlement ??= voluntary
+						? { kind: "cancelled" }
+						: {
+								kind: "rejected",
+								error: new AcpSdkAdapterError("connection_closed", `ACP session was ${reason}.`),
+							};
+					record.pendingFirstPromptRetry = undefined;
 				}
 			}
 
@@ -2869,6 +3367,8 @@ export class AcpAgent implements Agent {
 		}
 		if (!correlationsExactlyMatch(waiter.correlation, correlation)) return;
 		this.#observePromptActivity(waiter, frame);
+		if (waiter.observedTurnActivity) record.promptObservedActivity = true;
+		if (waiter.observedToolExecution) record.promptObservedToolExecution = true;
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
@@ -2877,6 +3377,10 @@ export class AcpAgent implements Agent {
 		waiter.lastFrameAt = this.#promptWatchdogClock.now();
 		waiter.lastFrameType =
 			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
+		if (isTurnProgressEventType(typeof event?.type === "string" ? event.type : undefined))
+			waiter.observedTurnActivity = true;
+		if (isTurnToolExecutionEventType(typeof event?.type === "string" ? event.type : undefined))
+			waiter.observedToolExecution = true;
 		waiter.activity.observe(
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
@@ -2898,15 +3402,32 @@ export class AcpAgent implements Agent {
 	async #expirePromptWatchdog(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		if (record.activePrompt !== waiter || waiter.settled || waiter.terminalReserved) return;
 		const silenceMs = Math.max(0, this.#promptWatchdogClock.now() - waiter.lastFrameAt);
-		const cause = this.#promptTransportGone(id, record) ?? "the SDK session host stopped producing frames";
+		// A prompt still in preflight has never reached the host, so "stopped producing frames"
+		// would point the reader at the wrong phase: nothing was ever dispatched to produce them.
+		const cause =
+			this.#promptTransportGone(id, record) ??
+			(waiter.awaitingProviderPreflight
+				? "the SDK session host never finished provider preflight"
+				: "the SDK session host stopped producing frames");
+		// Counts only: the plan's contents are model-authored and belong on the bounded wire
+		// projection, not in the log line (issue #5669).
+		const plan = waiter.planSnapshot;
 		logger.error("acp_prompt_watchdog_expired", {
 			sessionId: id,
 			cause,
 			silenceMs,
 			lastFrameType: waiter.lastFrameType,
+			awaitingProviderPreflight: waiter.awaitingProviderPreflight,
 			inactivityBoundMs: waiter.activity.inactivityBoundMs,
 			toolRunning: waiter.activity.running,
 			awaitingModel: waiter.activity.awaitingModel,
+			...(plan
+				? {
+						planIncomplete: plan.some(planEntryUnfinished),
+						planPendingCount: plan.filter(planEntryUnfinished).length,
+						planTotalCount: plan.length,
+					}
+				: {}),
 			...(waiter.correlation.commandId ? { commandId: waiter.correlation.commandId } : {}),
 			...(waiter.correlation.turnId ? { turnId: waiter.correlation.turnId } : {}),
 		});
@@ -2914,11 +3435,12 @@ export class AcpAgent implements Agent {
 			record,
 			id,
 			waiter,
-			new AcpSdkAdapterError(
+			new AcpPromptAbandonedError(
 				"prompt_abandoned",
 				`ACP prompt was abandoned after ${Math.round(silenceMs / 1_000)}s of silence: ${cause}. Last frame was ` +
 					`"${waiter.lastFrameType}" (${describeCorrelation(waiter.correlation)}). The turn was settled so the ` +
 					`client stops waiting; the session still accepts the next prompt.`,
+				plan,
 			),
 		);
 	}
@@ -3091,7 +3613,28 @@ export class AcpAgent implements Agent {
 				);
 				return;
 			}
-			activePrompt.terminal = { outcome, correlation };
+			// When a client cancel has been requested, a trailing stopped terminal may
+			// still carry the normal `end_turn` reason (the model finished its response as
+			// the cancel arrived mid-stream, or the cancel was processed before the prompt
+			// was acknowledged). The client's cancellation is the authoritative cause;
+			// remap only `end_turn` — deliberate host reasons (e.g. `refusal`, `max_tokens`)
+			// remain authoritative and must NOT be overridden.
+			const settledOutcome =
+				record.cancelRequested && outcome.kind === "stopped" && outcome.reason === "end_turn"
+					? { ...outcome, reason: "cancelled" as const, provenance: "client_cancel" as const }
+					: outcome;
+			activePrompt.terminal = { outcome: settledOutcome, correlation };
+			// A terminal carrying final text still publishes it as an assistant chunk, on the
+			// async tail `#scheduleTerminalUpdates` starts below. A failed terminal can carry it
+			// with no preceding stream chunks at all, so the streamed-chunk flag stays false and
+			// the first-turn retry gate — which the settlement below releases — would see
+			// "started, no output", resubmit, and let BOTH this terminal's final text and the
+			// retry's answer reach ACP consumers. Record the output before settling (review P1).
+			// Whitespace-only final text carries no assistant content. `hasAcpFinalTextContent` is the
+			// single presence predicate shared with the terminal publication gate below, so a terminal
+			// this gate treats as "no output" can never publish a chunk alongside the retry's answer.
+			if (typeof event.finalText === "string" && hasAcpFinalTextContent(event.finalText))
+				record.promptObservedAssistantOutput = true;
 			// Failure diagnostics are useful but advisory. Settle before any mapped
 			// session update can await a backpressured client transport; otherwise an
 			// already-decided failure can still lose to the inactivity watchdog.
@@ -3158,6 +3701,22 @@ export class AcpAgent implements Agent {
 				notification.update.content.type === "text"
 			)
 				promptOwner.emittedAssistantText += notification.update.content.text;
+			// The newest plan REPLACES the retained one: a plan update is the whole list, not a
+			// delta, so `todo_auto_clear`'s empty `entries` correctly leaves no pending work behind
+			// (issue #5669). Retained here rather than at frame ingress because this is where the
+			// mapper has already decided what the client is being told the plan is.
+			if (promptOwner && notification.update.sessionUpdate === "plan")
+				promptOwner.planSnapshot = notification.update.entries;
+			// A live assistant text/thought chunk for this prompt owner has now been exposed to
+			// ACP consumers. Record it so the first-turn readiness retry is vetoed: a re-submit
+			// would deliver a second attempt's output on top of these chunks (issue #5574).
+			if (
+				promptOwner &&
+				event.type !== "agent_failed" &&
+				(notification.update.sessionUpdate === "agent_message_chunk" ||
+					notification.update.sessionUpdate === "agent_thought_chunk")
+			)
+				record.promptObservedAssistantOutput = true;
 			// The prompt rejection carries the sanitized failure diagnostic. Publishing
 			// a second session update after settlement would be stale as soon as the client
 			// starts a replacement turn, and an in-flight transport write cannot be revoked.
@@ -3242,7 +3801,7 @@ export class AcpAgent implements Agent {
 		if (promptOwner) this.#flushFailureDiagnostics(id, promptOwner, adapter);
 		let decorationStart = Promise.resolve();
 		const finalText = typeof event.finalText === "string" ? event.finalText : "";
-		if (promptOwner && finalText) {
+		if (promptOwner && hasAcpFinalTextContent(finalText)) {
 			const finalTextTask = (async () => {
 				await Bun.sleep(0);
 				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
@@ -3404,7 +3963,16 @@ export class AcpAgent implements Agent {
 			waiter.resolve({ stopReason: outcome.reason });
 			return;
 		}
-		waiter.reject(new AcpSdkAdapterError(outcome.code, outcome.message));
+		// `phase` is the host's own claim, and a host that omits it leaves `terminalOutcome`
+		// deriving the phase with no evidence at all — `submission`, even for a turn this
+		// connection watched start. Upgrade it from the frames this prompt actually owned, never
+		// downgrade a terminal that already reported `post_start`, and carry the whole
+		// classification on the rejection so the first-turn retry gate can read it (review P1).
+		const failure =
+			outcome.phase === "post_start"
+				? outcome
+				: (rephaseFailedOutcome(outcome, { hasActivity: waiter.observedTurnActivity }) as SdkPromptFailedOutcome);
+		waiter.reject(new AcpPromptFailureError(failure));
 	}
 
 	async #emitEndOfTurnUpdates(id: string, adapter: AcpSdkAdapter, publicationGeneration: number): Promise<void> {
@@ -3842,6 +4410,10 @@ export class AcpAgent implements Agent {
 					);
 				}
 				const messageId = typeof message.id === "string" ? message.id : undefined;
+				// A replayed user turn is proof the loaded session already had a prompt, so the
+				// next live prompt is not its first — keep the first-turn readiness retry (issue
+				// #5574) off for a resumed/loaded session that has prior history.
+				if (message.role === "user") record.firstPromptDone = true;
 				const richContent = Array.isArray(message.content) ? message.content : undefined;
 				if ((message.role === "user" || message.role === "assistant") && richContent) {
 					for (const rawBlock of richContent) {

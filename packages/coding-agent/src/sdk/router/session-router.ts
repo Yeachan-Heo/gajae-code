@@ -25,6 +25,7 @@ import {
 	readSdkSessionEndpoint,
 	type SdkSessionEndpoint,
 } from "../client/discovery";
+import { SESSION_HOST_OBSERVER_CAPABILITY } from "../host/host";
 import {
 	type ActivatedPreparedSession,
 	type PreparedSessionActivationClient,
@@ -33,6 +34,7 @@ import {
 } from "../session-activation";
 import type { SessionBindingAuthority } from "../session-authority";
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+import { rememberReplayRetentionGap } from "./replay-retention-gap-cache";
 
 export type { SessionBindingAuthority, SessionEndpointAuthority } from "../session-authority";
 
@@ -285,6 +287,8 @@ export interface SessionRouterOptions {
 	agentDir: string;
 	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
 	sessionIds?: readonly string[];
+	/** Marks default SDK clients as notification-only observers; demanding by default. */
+	observer?: boolean;
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
@@ -611,6 +615,7 @@ type AdoptedSession = {
 export class SessionRouter {
 	readonly #agentDir: string;
 	readonly #sessionIds: ReadonlySet<string> | undefined;
+	readonly #observer: boolean;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
@@ -627,6 +632,8 @@ export class SessionRouter {
 	>();
 	readonly #reviving = new Set<string>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
+	/** Recent retention-gap coordinates already reported at warning level. */
+	readonly #concededReplayGaps = new Map<string, number>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#reconcilePending: { readonly runEpoch: number; force: boolean } | undefined;
@@ -650,6 +657,7 @@ export class SessionRouter {
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
 		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
+		this.#observer = options.observer === true;
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
@@ -1516,7 +1524,10 @@ export class SessionRouter {
 				endpointMtimeMs,
 			});
 		} else {
-			const defaultClient = new SdkClient(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
+			const defaultClient = new SdkClient(endpoint.url, endpoint.token, {
+				...ACP_SESSION_RECONNECT,
+				...(this.#observer ? { capabilities: [SESSION_HOST_OBSERVER_CAPABILITY] } : {}),
+			});
 			transport = defaultClient;
 			connection = defaultClient.connect().then(() => defaultClient);
 		}
@@ -2203,6 +2214,24 @@ export class SessionRouter {
 			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
 		);
 	}
+
+	#logReplayRetentionGap(
+		attached: AttachedSession,
+		gap: Readonly<{ fromSeq: number; toSeq: number }>,
+		recoveredNote: string,
+	): void {
+		const key = JSON.stringify([attached.sessionId, attached.generation, gap.fromSeq, gap.toSeq]);
+		const repeat = rememberReplayRetentionGap(this.#concededReplayGaps, key);
+		if (repeat !== undefined) {
+			logger.debug(
+				`chat daemon replay retention gap repeated (sequences ${gap.fromSeq}-${gap.toSeq}); suppressed warning ${repeat} for session ${attached.sessionId} generation ${attached.generation}.`,
+			);
+			return;
+		}
+		logger.warn(
+			`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
+		);
+	}
 	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
 		const previous = this.#undelivered.get(attached.sessionId);
 		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
@@ -2503,9 +2532,7 @@ export class SessionRouter {
 				held.splice(0, held.length, ...carried);
 				const recoveredNote =
 					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
-				logger.warn(
-					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
-				);
+				this.#logReplayRetentionGap(attached, gap, recoveredNote);
 				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
 				if (!(await this.#deliverRecoveredFrames(attached))) return;
 				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;

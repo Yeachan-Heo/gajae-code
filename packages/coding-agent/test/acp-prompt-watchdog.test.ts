@@ -5,6 +5,7 @@ import { getProviderFirstEventTimeoutFallbackMs } from "@gajae-code/ai/utils/idl
 import { logger, TempDir } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
@@ -570,6 +571,68 @@ test("a session accepts a new prompt after a watchdog rejection", async () => {
 	}
 });
 
+test("a prompt stalled in provider preflight is rejected at the bound instead of hanging", async () => {
+	const fixture = await createFixture();
+	const preflightEntered = Promise.withResolvers<void>();
+	const releasePreflight = Promise.withResolvers<void>();
+	// The session is already established, so this wedges only the per-prompt preflight:
+	// the window between the waiter taking ownership and the turn reaching the host.
+	const ensureProviders = vi.spyOn(AcpSdkAdapter.prototype, "ensureProviders").mockImplementation(async () => {
+		preflightEntered.resolve();
+		await releasePreflight.promise;
+	});
+	const diagnostic = vi.spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const deliveriesBefore = fixture.promptDeliveryCount();
+		const pending = prompt(fixture, "stalled provider preflight");
+		await bounded(preflightEntered.promise, "provider preflight");
+		// Nothing reached the host, so no frame can ever refresh this prompt.
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore);
+		// The bound is live while the preflight is still wedged; without it the advance
+		// below would settle nothing and this prompt would run forever.
+		expect(fixture.clock.pending).toBe(1);
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+
+		const error = await bounded(
+			pending.then(
+				() => undefined,
+				(reason: unknown) => reason,
+			),
+			"preflight watchdog rejection",
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).toMatchObject({ code: "prompt_abandoned" });
+		const message = (error as Error).message;
+		expect(message).toContain("ACP prompt was abandoned");
+		expect(message).toContain(`${Math.round(ACP_PROMPT_INACTIVITY_TIMEOUT_MS / 1_000)}s of silence`);
+		// The phase is named: a preflight stall is not a host that went quiet mid-turn.
+		expect(message).toContain("never finished provider preflight");
+		expect(message).toContain('"prompt_dispatch"');
+		expect(
+			diagnostic.mock.calls.some(
+				call =>
+					call[0] === "acp_prompt_watchdog_expired" &&
+					(call[1] as { awaitingProviderPreflight?: boolean })?.awaitingProviderPreflight === true,
+			),
+		).toBe(true);
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore);
+
+		// The rejection releases the session rather than poisoning it.
+		releasePreflight.resolve();
+		ensureProviders.mockRestore();
+		const { pending: recovered } = await startTurn(fixture);
+		expect(fixture.promptDeliveryCount()).toBe(deliveriesBefore + 1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(recovered, "prompt after preflight stall")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		releasePreflight.resolve();
+		ensureProviders.mockRestore();
+		diagnostic.mockRestore();
+		fixture.dispose();
+	}
+});
+
 test("a normal agent_end settles the prompt once and disarms the watchdog", async () => {
 	const fixture = await createFixture();
 	try {
@@ -734,6 +797,97 @@ test("a turn silent after agent_start is not killed while the model is still ans
 		await waitFor(() => textChunks(fixture.updates) > chunks, "assistant chunk");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a turn silent after message_update is not killed at the narrow bound while streaming is ongoing", async () => {
+	const fixture = await createFixture();
+	try {
+		const { pending } = await startTurn(fixture);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+
+		// A `message_update` is a streaming chunk, not the end of the response (issue #5571):
+		// the model is still producing output, so the gap after it is an inference gap. The
+		// host went quiet mid-stream — clearing inference state here would have dropped the
+		// turn to the narrow idle bound and killed a slow next chunk at 340s.
+		const { commandId, turnId } = fixture.correlation();
+		const chunks = textChunks(fixture.updates);
+		fixture.send({
+			type: "event",
+			kind: "message_update",
+			sessionId: fixture.sessionId,
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_update",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "streaming chunk" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "streaming chunk", contentIndex: 0 },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > chunks, "streaming chunk ingress");
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		// Still one tick short of the inference bound after the whole gap.
+		fixture.clock.advance(ACP_PROMPT_INFERENCE_TIMEOUT_MS - ACP_PROMPT_INACTIVITY_TIMEOUT_MS - 2);
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		fixture.sendAssistantText("done streaming");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("cancelling during message_update streaming settles as cancelled and permits a follow-up", async () => {
+	const fixture = await createFixture({ cancelSettlementGraceMs: 25 });
+	try {
+		const { pending } = await startTurn(fixture);
+		const { commandId, turnId } = fixture.correlation();
+		fixture.send({
+			type: "event",
+			kind: "message_update",
+			sessionId: fixture.sessionId,
+			commandId,
+			turnId,
+			payload: {
+				event_type: "message_update",
+				event: {
+					type: "message_update",
+					message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+					assistantMessageEvent: { type: "text_delta", delta: "partial", contentIndex: 0 },
+				},
+			},
+		});
+		await waitFor(() => textChunks(fixture.updates) > 0, "streaming chunk ingress");
+
+		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "streaming cancel acknowledgement");
+		// A streamed host can report its normal stopped reason after acknowledging the
+		// abort. The client-visible cause must remain the cancellation.
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "streaming cancellation settlement")).toEqual({ stopReason: "cancelled" });
+
+		const followUp = prompt(fixture, "follow-up after streaming cancel");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "follow-up prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(followUp, "follow-up completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}

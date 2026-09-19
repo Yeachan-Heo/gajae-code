@@ -112,6 +112,116 @@ describe("SessionSdkHost", () => {
 		expect(registered).toEqual([1, 2]);
 	});
 
+	test("reports the idle host state and only records activity transitions", async () => {
+		const activity: Array<{ state: "active" | "idle"; at: number }> = [];
+		const host = new SessionSdkHost({
+			sessionId: "activity",
+			stateRoot: "/tmp/activity",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.start();
+		await host.registerWithBroker({
+			register: () => {},
+			heartbeat: input => {
+				activity.push(input.activity);
+			},
+		});
+		await Bun.sleep(0);
+		await host.reportActivity("active", 100);
+		await host.reportActivity("active", 200);
+		await host.reportActivity("idle", 300);
+		await host.stop();
+
+		expect(activity).toEqual([
+			{ state: "idle", at: expect.any(Number) },
+			{ state: "active", at: 100 },
+			{ state: "idle", at: 300 },
+		]);
+	});
+
+	test("serializes a held active report before the successor idle transition", async () => {
+		const activity: Array<{ state: "active" | "idle"; at: number }> = [];
+		const activeStarted = Promise.withResolvers<void>();
+		const releaseActive = Promise.withResolvers<void>();
+		let holdActive = true;
+		const host = new SessionSdkHost({
+			sessionId: "activity-active-idle",
+			stateRoot: "/tmp/activity-active-idle",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			heartbeat: async input => {
+				activity.push(input.activity);
+				if (holdActive && input.activity.state === "active") {
+					holdActive = false;
+					activeStarted.resolve();
+					await releaseActive.promise;
+				}
+			},
+		});
+		await host.start();
+		const active = host.reportActivity("active", 100);
+		await activeStarted.promise;
+		const idle = host.reportActivity("idle", 200);
+		releaseActive.resolve();
+		await Promise.all([active, idle]);
+		await host.reportActivity("idle", 300);
+		await host.stop();
+
+		expect(activity).toEqual([
+			{ state: "idle", at: expect.any(Number) },
+			{ state: "active", at: 100 },
+			{ state: "idle", at: 200 },
+		]);
+	});
+
+	test("serializes a held idle report before the successor active transition", async () => {
+		const activity: Array<{ state: "active" | "idle"; at: number }> = [];
+		const idleStarted = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		let holdIdle = false;
+		const host = new SessionSdkHost({
+			sessionId: "activity-idle-active",
+			stateRoot: "/tmp/activity-idle-active",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			heartbeat: async input => {
+				activity.push(input.activity);
+				if (holdIdle && input.activity.state === "idle") {
+					holdIdle = false;
+					idleStarted.resolve();
+					await releaseIdle.promise;
+				}
+			},
+		});
+		await host.start();
+		await host.reportActivity("active", 100);
+		holdIdle = true;
+		const idle = host.reportActivity("idle", 200);
+		await idleStarted.promise;
+		const successorActive = host.reportActivity("active", 300);
+		releaseIdle.resolve();
+		await Promise.all([idle, successorActive]);
+		await host.reportActivity("active", 400);
+		await host.stop();
+
+		expect(activity).toEqual([
+			{ state: "idle", at: expect.any(Number) },
+			{ state: "active", at: 100 },
+			{ state: "idle", at: 200 },
+			{ state: "active", at: 300 },
+		]);
+	});
+
 	test("retries broker unregister after a fail-once owner release", async () => {
 		let unsubscribeAttempts = 0;
 		let unregisterAttempts = 0;

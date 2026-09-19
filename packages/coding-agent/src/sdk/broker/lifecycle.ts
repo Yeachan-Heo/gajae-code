@@ -79,6 +79,7 @@ import type {
 	LifecycleWorktreeIntent,
 } from "./lifecycle-ledger";
 import {
+	observeProcessIncarnation,
 	type ProcessIncarnationCommandRunner,
 	type ProcessIncarnationOptions,
 	parseDarwinProcessIncarnation,
@@ -2404,6 +2405,7 @@ async function executeUncertainRetirement(
 					...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 					...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+					...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 				});
 				const verifiedIndexSeq = broker.index.findSessionClosedEvidence(record);
@@ -2537,6 +2539,13 @@ function validateLifecycleMetadataReplay(cleanup: CleanupEvidence): BrokerRespon
 				return fail("terminal_uncertain", "Lifecycle metadata candidate could not be safely inspected.");
 			}
 			if (!current) continue;
+			if (
+				file.completed &&
+				path.resolve(candidate) === path.resolve(file.plannedPath) &&
+				current.identity.size === 0n &&
+				current.identity.nlink === 1n
+			)
+				continue;
 			if (!sameLifecycleCleanupIdentity(current.identity, file.identity))
 				return fail("terminal_uncertain", "Lifecycle metadata candidate lacks exact replay authority.");
 			// A completed file's recorded retained quarantine is receipt-bound durable
@@ -2876,14 +2885,11 @@ async function reconcileLifecycleCleanup(
 				// A completed file's recorded retained quarantine is durable evidence,
 				// not a survivor — accept it only at its receipt-bound path and identity.
 				if (
-					file.detachedPath &&
-					path.resolve(candidate) === path.resolve(file.detachedPath) &&
-					stat.isFile() &&
-					!stat.isSymbolicLink() &&
-					stat.nlink === 1 &&
-					stat.size === 0
-				)
-					continue;
+					(file.detachedPath && path.resolve(candidate) === path.resolve(file.detachedPath)) ||
+					path.resolve(candidate) === path.resolve(file.plannedPath)
+				) {
+					if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size === 0) continue;
+				}
 				return fail(
 					"terminal_uncertain",
 					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
@@ -3411,6 +3417,22 @@ async function removeOwnedLifecycleArtifacts(
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
 		if (!lifecycleProofWithinDeadline(proofBudget)) return false;
+		if (endpointRemoval.ok) {
+			// POSIX exact-unlink scrubs the detached exchange payload and may retain
+			// its zero-byte quarantine name as durable internal evidence even when
+			// the canonical removal itself succeeded. Carry that known placeholder
+			// into the enclosing close reconciliation so it is not mistaken for a
+			// live endpoint payload.
+			for (const candidate of [plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
+				try {
+					const metadata = fsSync.lstatSync(candidate);
+					if (metadata.isFile() && metadata.nlink === 1 && metadata.size === 0)
+						onDurablePlaceholder?.(path.resolve(candidate));
+				} catch {
+					// A missing quarantine alias carries no retained authority.
+				}
+			}
+		}
 		if (!endpointRemoval.ok) {
 			if (endpointRemoval.retainedUnknownPath) {
 				onRetainedUnknown?.();
@@ -3499,6 +3521,14 @@ async function recordTerminalUncertain(
 			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
 			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			...(registered.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registered.endpointMtimeMs }),
+			...(registered.endpointFileId !== undefined &&
+			registered.pid === pid &&
+			path.resolve(registered.locator.stateRoot) === path.resolve(root) &&
+			expected !== undefined &&
+			registered.lifecycleRequestId === expected.effectMarker &&
+			(registered.hostIncarnation ?? registered.processIncarnation) === expected.incarnation
+				? { endpointFileId: registered.endpointFileId }
+				: {}),
 			...(registered.lifecycleRequestId === undefined
 				? expected?.effectMarker === undefined
 					? {}
@@ -3515,6 +3545,70 @@ async function recordTerminalUncertain(
 			pid,
 			terminalUncertain: true,
 		});
+}
+
+/**
+ * Release the worktree held by a forced stop of a stale-endpoint session, bound to
+ * the exact stale identity the caller already validated against the requested close
+ * authority. A successor incarnation can re-register under this session id in the
+ * window between that authority check and this claim, so refresh once and append a
+ * terminal-uncertain marker ONLY when the current row is still that captured
+ * identity and its owning process is not observably alive. A rotated successor no
+ * longer matches, so it is left untouched and nothing is released — the strict
+ * "uncertain counts as occupied" rule keeps protecting it.
+ *
+ * Unlike `recordTerminalUncertain`, the compare and the append share one refresh
+ * boundary and the marker is keyed to the captured generation/pid/incarnation
+ * rather than to whatever row a second refresh happens to read. A successor that
+ * rotates in while the append is in flight therefore cannot be marked terminal:
+ * the claim targets the old generation, whose row never outranks the successor's
+ * higher generation in the projection (#5581).
+ */
+async function releaseForcedStaleWorktree(broker: Broker, id: string, expected: IndexedSession): Promise<void> {
+	await broker.index.refresh();
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (
+		!current ||
+		current.endpointGeneration !== expected.endpointGeneration ||
+		current.pid !== expected.pid ||
+		(current.hostIncarnation ?? current.processIncarnation) !==
+			(expected.hostIncarnation ?? expected.processIncarnation)
+	)
+		return;
+	// For a force-stopped stale-endpoint session, release the worktree unless the
+	// owning process is provably alive. An `alive` process still owns its checkout,
+	// so it stays occupied even under force. Both `exited` (proven gone) and
+	// `uncertain` (the pid-reuse case, which can never be proven exited) are treated
+	// as terminal here: otherwise the row stays occupied forever and follow-up
+	// delegate launches into the same checkout are refused with worktree_in_use
+	// indefinitely. The identity guards above (generation/PID/incarnation) already
+	// ensure a live successor that rotated in under the same id is never released.
+	const observation = observeProcess(current.pid, current.hostIncarnation ?? current.processIncarnation, value =>
+		processIncarnationForBroker(broker, value),
+	);
+	if (observation === "alive") return;
+	if (observation === "uncertain")
+		logger.warn("sdk broker recording forced stale-worktree release under uncertain process state", {
+			sessionId: id,
+			pid: current.pid,
+			endpointGeneration: current.endpointGeneration,
+		});
+	await broker.index.append({
+		type: "lifecycle_terminal",
+		sessionId: id,
+		locator: current.locator,
+		endpointGeneration: current.endpointGeneration,
+		pid: current.pid,
+		...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+		...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+		...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
+		...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
+		terminalUncertain: true,
+		// Marks this claim as the forced release, which is the only terminal-uncertain
+		// claim that frees the worktree. The fail-closed teardown tail writes
+		// `terminalUncertain` without it and keeps its checkout (see `worktreeOccupant`).
+		forcedStaleRelease: true,
+	});
 }
 
 async function waitUntil(timing: LifecycleTiming, deadline: number): Promise<void> {
@@ -3734,13 +3828,20 @@ async function signalVerifiedSession(
 	signal: NodeJS.Signals,
 	expected?: EffectMarker,
 ): Promise<boolean> {
-	if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
+	// An exited process may remain a zombie until its parent reaps it. Its
+	// incarnation is intentionally unavailable at that point, but native
+	// observation positively classifies the pid as absent. Treat that as a
+	// successful no-op so close can continue with endpoint/index cleanup rather
+	// than escalating to an unverifiable signal and reporting terminal uncertainty.
+	if (!(await hasDurableProcessIdentity(record, id, expected)))
+		return observeProcessIncarnation(record.pid).status === "absent";
 	try {
-		if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
+		if (!(await hasDurableProcessIdentity(record, id, expected)))
+			return observeProcessIncarnation(record.pid).status === "absent";
 		process.kill(record.pid, signal);
 		return true;
 	} catch {
-		return false;
+		return observeProcessIncarnation(record.pid).status === "absent";
 	}
 }
 
@@ -3912,6 +4013,12 @@ async function hasOwnedEndpointPayload(
 ): Promise<boolean> {
 	const directory = path.join(root, "sdk");
 	const endpointName = `${id}.json`;
+	const knownScrubbedPlaceholders = new Set([
+		`.gjc-delete-endpoint-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-retry-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-final-${effectMarker}-${endpointName}`,
+		`.gjc-delete-endpoint-detached-${effectMarker}-${endpointName}`,
+	]);
 	let names: string[];
 	try {
 		names = await fs.readdir(directory);
@@ -3927,7 +4034,9 @@ async function hasOwnedEndpointPayload(
 			if (
 				!metadata.isFile() ||
 				metadata.size > 0 ||
-				(metadata.size === 0 && !durablePlaceholders.has(path.resolve(candidate)))
+				(metadata.size === 0 &&
+					!durablePlaceholders.has(path.resolve(candidate)) &&
+					!knownScrubbedPlaceholders.has(name))
 			)
 				return true;
 		} catch (error) {
@@ -4218,6 +4327,15 @@ export function worktreeOccupantForTest(
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
 	return worktreeOccupant(sessions, worktreePath, observe);
+}
+
+/** Test seam for the forced stale-worktree release boundary. */
+export async function releaseForcedStaleWorktreeForTest(
+	broker: Broker,
+	id: string,
+	expected: IndexedSession,
+): Promise<void> {
+	await releaseForcedStaleWorktree(broker, id, expected);
 }
 
 async function preparePlannedWorktree(
@@ -5532,6 +5650,14 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// A forced stop of a session whose endpoint is already stale (its coordinator
+		// service went away mid-run) cannot reach the runtime to prove teardown. The
+		// caller has explicitly requested force, so when the endpoint proves stale
+		// below and the owning process is no longer observably alive, record a
+		// terminal-uncertain claim before surfacing endpoint_stale — otherwise the
+		// row keeps holding its worktree forever, since an OS probe of a reused pid
+		// returns `uncertain` and never `exited` (#5581).
+		const forceReleaseStaleWorktree = input.forceReleaseStaleWorktree === true;
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		if (!isSessionAuthorityEligible(record))
@@ -5576,7 +5702,26 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
+			if (endpointResult.error.code === "endpoint_stale") {
+				// `record` matched the requested close authority above, so it is the exact
+				// stale identity the forced stop targeted — never a live successor, which
+				// would have failed that authority check. Release its worktree bound to
+				// that identity so a rotated successor is left untouched (#5581).
+				// Best-effort: the endpoint_stale outcome is already proven and must be
+				// returned. A release failure (index/broker write error) must not mask it;
+				// the stale-endpoint recovery paths retry the release later.
+				if (forceReleaseStaleWorktree) {
+					try {
+						await releaseForcedStaleWorktree(broker, id, record);
+					} catch (error) {
+						logger.warn("sdk broker forced stale-worktree release failed; returning endpoint_stale", {
+							sessionId: id,
+							error: String(error),
+						});
+					}
+				}
+				return endpointResult;
+			}
 			if (endpointResult.error.code !== "resource_gone") return endpointResult;
 			usedSignalFallback = true;
 		} else {
@@ -6709,8 +6854,9 @@ export async function executeLifecycle(
 }
 
 /**
- * The live client/socket subscription count of the SDK session endpoint this
- * process serves, or `undefined` while this process serves no endpoint.
+ * The live SDK demand count of the session endpoint this process serves, or
+ * `undefined` while this process serves no endpoint. Observer-only sockets are
+ * excluded by {@link SessionHostRuntimeEvidence.observerClients}.
  *
  * Only the SDK session runtime owns the real socket table, so it publishes a
  * reader here instead of every consumer re-deriving attachment from the OS.
@@ -6722,6 +6868,8 @@ export type SessionHostAttachmentReader = () => number;
 export interface SessionHostRuntimeEvidence {
 	/** This runtime's own live SDK client/socket subscription count. */
 	attachedClients: SessionHostAttachmentReader;
+	/** Optional subset of attached sockets that only observes the host. */
+	observerClients?: SessionHostAttachmentReader;
 	/** Whether this runtime currently has agent work in flight. */
 	workInFlight: () => boolean;
 }
@@ -6762,14 +6910,14 @@ export function publishSessionHostRuntimeEvidence(evidence: SessionHostRuntimeEv
 }
 
 /**
- * This process's currently attached SDK client count, summed across every
+ * This process's currently demanding SDK client count, summed across every
  * serving runtime, or `undefined` when no runtime publishes a readable count
  * (before startup, after teardown, or when every reader itself fails). Never
  * guesses: absence of a reader is absence of evidence.
  */
 export function sessionHostAttachedClients(): number | undefined {
 	let total: number | undefined;
-	for (const { attachedClients } of sessionHostRuntimes) {
+	for (const { attachedClients, observerClients } of sessionHostRuntimes) {
 		let count: number;
 		try {
 			count = attachedClients();
@@ -6777,7 +6925,17 @@ export function sessionHostAttachedClients(): number | undefined {
 			continue;
 		}
 		if (!Number.isSafeInteger(count) || count < 0) continue;
-		total = (total ?? 0) + count;
+		let observers = 0;
+		if (observerClients) {
+			try {
+				const observed = observerClients();
+				if (Number.isSafeInteger(observed) && observed >= 0) observers = Math.min(count, observed);
+			} catch {
+				// If the observer subset is unavailable, retain the full attachment
+				// count. Losing positive demand evidence is fail-closed.
+			}
+		}
+		total = (total ?? 0) + count - observers;
 	}
 	return total;
 }

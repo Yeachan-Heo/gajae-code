@@ -31,10 +31,10 @@ export interface SkillDiscoveryToolDetails {
 	/**
 	 * Present only when zero candidates were returned. Either discovery config
 	 * gates (`skills.enabled` / `skills.trustProjectSkills` /
-	 * `skills.trustUserSkills`) prevented some or all of the requested scope
-	 * from being searched, or a non-empty query conjunctively filtered out every
-	 * scanned skill. Without this, both cases are indistinguishable from
-	 * "no skills exist".
+	 * `skills.trustUserSkills`) prevented some or all of the requested scope from
+	 * being searched, a non-empty query filtered out every scanned skill, or
+	 * diagnostics were produced for observed skills that were skipped or filtered.
+	 * Without this, these cases are indistinguishable from "no skills exist".
 	 */
 	notice?: string;
 	/**
@@ -49,7 +49,7 @@ export interface SkillDiscoveryToolDetails {
 export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema, SkillDiscoveryToolDetails> {
 	readonly name = "skill_discovery";
 	readonly label = "SkillDiscovery";
-	readonly summary = "Discover project and user runtime skills by thin metadata";
+	readonly summary = "Discover bundled GJC workflow, project, and user runtime skills by thin metadata";
 	readonly loadMode = "essential";
 	readonly description: string;
 	readonly parameters = skillDiscoverySchema;
@@ -102,7 +102,10 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 			if (result.candidates.length === 0) {
 				const notice =
 					describeDisabledSkillScopes(source, this.#getRuntimeSkillPolicy()) ??
-					describeNoSkillMatch(input.query, result.scanned);
+					describeNoSkillMatch(input.query, result.scanned) ??
+					(result.scanned > 0 || result.diagnostics.messages.length > 0
+						? `No skill candidates were returned (${result.scanned} skill${result.scanned === 1 ? "" : "s"} scanned); see diagnostics for filtered or skipped skills.`
+						: undefined);
 				if (notice) details.notice = notice;
 			}
 			return {

@@ -31,10 +31,27 @@ export function acpFinalTextFromMessage(message: unknown): BoundedAcpFinalText {
 	return boundAcpFinalText(parts.join(""));
 }
 
+/**
+ * Assistant-content presence is trimmed everywhere in the prompt pipeline: whitespace carries no
+ * assistant content. The ACP retry gate, prompt reconciliation
+ * (`sdk/bus/prompt-reconciliation.ts`) and terminal publication must agree, otherwise a terminal
+ * the retry gate treats as "no output" can still publish a whitespace chunk alongside the retry's
+ * real answer (review P2 on #5628).
+ */
+export function hasAcpFinalTextContent(value: string): boolean {
+	return value.trim().length > 0;
+}
+
 export function resolveAcpFinalText(streamed: string, finalText: string): AcpFinalTextResolution {
 	const final = boundAcpFinalText(finalText);
-	if (!final.text || streamed === final.text || streamed.includes(final.text)) return { kind: "none", final };
+	if (!hasAcpFinalTextContent(final.text) || streamed === final.text || streamed.includes(final.text))
+		return { kind: "none", final };
 	if (!streamed) return { kind: "emit", final, text: final.text };
-	if (final.text.startsWith(streamed)) return { kind: "emit", final, text: final.text.slice(streamed.length) };
+	if (final.text.startsWith(streamed)) {
+		// A pure-whitespace delta is the same defect class as whitespace-only final text: it adds no
+		// assistant content, so it must not reach consumers either.
+		const tail = final.text.slice(streamed.length);
+		return hasAcpFinalTextContent(tail) ? { kind: "emit", final, text: tail } : { kind: "none", final };
+	}
 	return { kind: "divergent", final };
 }

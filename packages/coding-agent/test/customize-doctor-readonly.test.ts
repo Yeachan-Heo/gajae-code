@@ -513,7 +513,10 @@ describe("customize doctor read-only contract (#4406)", () => {
 		const report = JSON.parse(result.stdout);
 		expect(report.schemaVersion).toBe(1);
 		expect(report.command).toBe("customize doctor");
-		expect(report.cwd).toBe(projectDir);
+		// Compare canonical paths: macOS `$TMPDIR` lives under the `/var` ->
+		// `/private/var` symlink, so the report's working directory and the
+		// `mkdtemp` path can name the same directory through different prefixes.
+		expect(await fs.realpath(report.cwd)).toBe(await fs.realpath(projectDir));
 		expect(report.policy).toBeDefined();
 		expect(report.policy.sourceClasses).toBeDefined();
 		expect(Array.isArray(report.surfaces)).toBe(true);

@@ -4,6 +4,7 @@ import {
 	type Api,
 	type AuthCredentialSelector,
 	type CredentialRemovalTarget,
+	getMiniMaxThinkingMode,
 	isSqliteCorruptionError,
 	isSqliteError,
 	type Model,
@@ -155,6 +156,7 @@ import {
 	MODEL_ONBOARDING_SETUP_COMMAND,
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
+import { getThinkingLevelMetadata } from "../../thinking";
 import {
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
@@ -1847,6 +1849,11 @@ export class SelectorController {
 	}
 
 	showEffortSelector(): void {
+		const model = this.ctx.session.model;
+		if (model && getMiniMaxThinkingMode(model) === "always-on") {
+			this.ctx.showStatus("Reasoning is always on for MiniMax M2.x; disabling and effort control are unsupported.");
+			return;
+		}
 		const availableLevels = [
 			ThinkingLevel.Inherit,
 			ThinkingLevel.Off,
@@ -1871,9 +1878,14 @@ export class SelectorController {
 
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
 					const requestedLabel =
-						level === ThinkingLevel.Inherit ? `${level} (configured default: ${configuredDefault})` : level;
+						level === ThinkingLevel.Inherit
+							? `${level} (configured default: ${configuredDefault})`
+							: getThinkingLevelMetadata(level, model).label;
+					const effectiveLabel = getThinkingLevelMetadata(effectiveLevel, model).label;
 					const clampedSuffix =
-						effectiveLevel === levelToApply ? "" : ` Requested ${levelToApply}; effective ${effectiveLevel}.`;
+						effectiveLevel === levelToApply
+							? ""
+							: ` Requested ${getThinkingLevelMetadata(levelToApply, model).label}; effective ${effectiveLabel}.`;
 
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorBorderColor();
@@ -1882,13 +1894,14 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 					const scopeLabel = persistDefault ? "Default reasoning effort" : "Reasoning effort";
 					this.ctx.showStatus(
-						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLabel}.${clampedSuffix}`,
 					);
 				},
 				() => {
 					done();
 					this.ctx.ui.requestRender();
 				},
+				model,
 			);
 			return { component: selector, focus: selector };
 		});
@@ -2947,6 +2960,8 @@ export class SelectorController {
 				},
 				{
 					...options,
+					// The selector replaces the composer, outside the anchored transcript.
+					renderScope: "layout",
 					sessionId: this.ctx.session.credentialSessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
@@ -3055,36 +3070,138 @@ export class SelectorController {
 		});
 	}
 
-	showUserMessageSelector(): void {
-		const userMessages = this.ctx.session.getUserMessagesForBranching();
+	#forkBusyReason(): string | undefined {
+		if (this.ctx.session.isStreaming) {
+			return "Wait for the current response to finish or abort it before forking.";
+		}
+		if (this.ctx.session.isCompacting) {
+			return "Wait for compaction to finish or abort it before forking.";
+		}
+		if (this.ctx.hasPendingSubmission()) {
+			return "Wait for the pending message to be submitted or cancel it before forking.";
+		}
+		if (this.ctx.bashComponent || this.ctx.pythonComponent) {
+			return "Wait for the foreground command to finish or cancel it before forking.";
+		}
+		return undefined;
+	}
 
+	showUserMessageSelector(onCommitted?: () => void): void {
+		const openedSessionId = this.ctx.sessionManager.getSessionId();
+		const openedSessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!openedSessionFile) {
+			this.ctx.showError("Fork requires a persisted session");
+			return;
+		}
+		const busyReason = this.#forkBusyReason();
+		if (busyReason) {
+			this.ctx.showWarning(busyReason);
+			return;
+		}
+
+		const userMessages = this.ctx.session.getUserMessagesForBranching();
 		if (userMessages.length === 0) {
 			this.ctx.showStatus("No messages to branch from");
 			return;
 		}
 
+		this.ctx.goalModeController.cancelContinuation();
+		// Close the side-chat composer before the picker takes ownership, including
+		// paths that cancel, fail, or stop while branch() is pending.
+		if (this.ctx.hasActiveBtw()) this.ctx.handleBtwEscape();
+
 		this.showSelector(done => {
+			let selectionInFlight = false;
+			const closeWithoutBranch = (message: string, error = false): void => {
+				done();
+				if (error) {
+					this.ctx.showError(message);
+				} else {
+					this.ctx.showStatus(message);
+				}
+				this.ctx.goalModeController.scheduleContinuation();
+				this.ctx.ui.requestRender();
+			};
 			const selector = new UserMessageSelectorComponent(
 				userMessages.map(m => ({ id: m.entryId, text: m.text })),
 				async entryId => {
-					const result = await this.ctx.session.branch(entryId);
-					if (result.cancelled) {
-						// Hook cancelled the branch
-						done();
-						this.ctx.ui.requestRender();
+					if (selectionInFlight) return;
+					selectionInFlight = true;
+
+					if (
+						this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+						this.ctx.sessionManager.getSessionFile() !== openedSessionFile
+					) {
+						closeWithoutBranch("Fork cancelled because the active session changed", true);
 						return;
 					}
-					this.ctx.resetIrcSidebarSession();
+					const busyReason = this.#forkBusyReason();
+					if (busyReason) {
+						closeWithoutBranch(busyReason);
+						return;
+					}
 
-					this.ctx.rebuildInitialMessages("replace-identity");
-					this.ctx.editor.setText(result.selectedText);
+					let selectedText = userMessages.find(message => message.entryId === entryId)!.text;
+					let branchFailure: unknown;
+					try {
+						const result = await this.ctx.session.branch(entryId);
+						if (this.ctx.isStopped?.()) return;
+						if (result.cancelled) {
+							closeWithoutBranch("Fork cancelled");
+							return;
+						}
+						selectedText = result.selectedText;
+					} catch (error) {
+						if (this.ctx.isStopped?.()) return;
+						const committed =
+							this.ctx.sessionManager.getSessionId() !== openedSessionId ||
+							this.ctx.sessionManager.getSessionFile() !== openedSessionFile;
+						if (!committed) {
+							closeWithoutBranch(`Fork failed: ${error instanceof Error ? error.message : String(error)}`, true);
+							return;
+						}
+						// The successor is already durable. Never describe this as a
+						// cancelled transition or roll it back to the parent's UI.
+						branchFailure = error;
+					}
+
+					try {
+						onCommitted?.();
+					} catch (error) {
+						branchFailure ??= error;
+					}
+					try {
+						this.ctx.resetIrcSidebarSession();
+						this.ctx.resetObserverRegistry();
+						this.#refreshSessionTerminalTitle();
+						this.ctx.statusLine.invalidate();
+						this.ctx.statusLine.setSessionStartTime(Date.now());
+						this.ctx.updateEditorTopBorder();
+						this.ctx.updateEditorBorderColor();
+						this.ctx.rebuildInitialMessages("replace-identity");
+						await this.ctx.reloadTodos();
+					} catch (error) {
+						branchFailure ??= error;
+					}
+					if (this.ctx.isStopped?.()) return;
+					this.ctx.editor.setText(selectedText);
 					done();
-					this.ctx.showStatus("Branched to new session");
+					if (branchFailure !== undefined) {
+						this.ctx.showError(
+							`Fork created, but session setup failed: ${branchFailure instanceof Error ? branchFailure.message : String(branchFailure)}`,
+						);
+					} else {
+						this.ctx.showStatus("Forked to a new session; edit the selected prompt to continue");
+					}
+					// Do not schedule goal continuation over the selected prompt draft.
+					this.ctx.ui.requestRender();
 				},
 				() => {
 					done();
+					this.ctx.goalModeController.scheduleContinuation();
 					this.ctx.ui.requestRender();
 				},
+				() => this.ctx.ui.terminal.rows,
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
@@ -3259,6 +3376,9 @@ export class SelectorController {
 						});
 					}
 				},
+				undefined,
+				undefined,
+				(session, starred) => this.ctx.sessionManager.setSessionStarredForPicker(session, starred),
 			);
 			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
 			return { component: selector, focus: selector };

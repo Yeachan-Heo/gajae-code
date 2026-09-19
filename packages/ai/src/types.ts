@@ -556,6 +556,15 @@ export interface AttemptScopeRef {
 	readonly lineage: string;
 }
 
+/**
+ * Runaway-repetition guard thresholds, per stream channel. A number sets the
+ * consecutive-repeat threshold; `false` disables that channel's guard.
+ */
+export interface RepetitionGuardOptions {
+	thinking?: number | false;
+	text?: number | false;
+}
+
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
 	reasoning?: Effort;
@@ -592,6 +601,14 @@ export interface SimpleStreamOptions extends StreamOptions {
 	syntheticApiFormat?: "openai" | "anthropic";
 	/** Hint that websocket transport should be preferred when supported by the provider implementation. */
 	preferWebsockets?: boolean;
+	/**
+	 * Runaway-repetition guard thresholds, per stream channel. Honoured by the
+	 * openai-completions transport; ignored by providers without a guard.
+	 * Defaults: thinking = DEFAULT_REPETITION_THRESHOLD, text = false — visible
+	 * output is a deliverable and intentional repetition there (logs, fixtures,
+	 * tables, generated code) must survive byte for byte (#5627).
+	 */
+	repetitionGuard?: RepetitionGuardOptions;
 }
 
 // Generic StreamFunction with typed options

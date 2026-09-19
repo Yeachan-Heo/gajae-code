@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -39,6 +39,7 @@ import {
 	createCoordinatorMcpServer,
 	readCoordinatorArtifact,
 } from "../src/coordinator-mcp/server";
+import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
@@ -76,6 +77,19 @@ import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-author
 // Coordinator state writes serialize on a lock whose removals go through identity-bound
 // native primitives; point them at a working implementation.
 installExactIdentityNatives();
+
+/**
+ * Resolution time for the stubbed workflow gate. It MUST stay inside the
+ * coordinator's compaction retention window and therefore MUST NOT be a literal.
+ *
+ * The product stamps this remote-supplied value onto the answer request's
+ * `updated_at`, and `compactTransaction` deletes a `completed` request whose
+ * `updated_at` is older than `RETENTION_MS` (30 days). A hardcoded date silently
+ * turns these cases red exactly 30 days after the day it names, with no code
+ * change and nothing in git history to point at: the previous literal
+ * `2026-08-20T00:00:00.000Z` expired at `2026-09-19T00:00:00Z`.
+ */
+const GATE_RESOLVED_AT = new Date(Date.now() - 60_000).toISOString();
 
 const tempDirs: string[] = [];
 
@@ -182,6 +196,12 @@ type SdkControlServerOptions = {
 	eventWebhookDelivery?: NonNullable<
 		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
 	>["eventWebhookDelivery"];
+	onCoordinatorEventWatchReady?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWatchReady"];
+	onCoordinatorEventWake?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["onCoordinatorEventWake"];
 	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
 	eventWebhookEnv?: Record<string, string>;
 	/** Injectable host model resolver for coordinator `model` pin tests. */
@@ -435,6 +455,8 @@ async function createSdkControlServer(
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
+			onCoordinatorEventWatchReady: serverOptions.onCoordinatorEventWatchReady,
+			onCoordinatorEventWake: serverOptions.onCoordinatorEventWake,
 			afterPromptReceiptPersisted: serverOptions.afterPromptReceiptPersisted,
 			afterAnswerRemoteStarted: serverOptions.afterAnswerRemoteStarted,
 			afterCanonicalTurnCommit: serverOptions.afterCanonicalTurnCommit,
@@ -3665,15 +3687,15 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: "managed-worktree-reap",
 				allow_mutation: true,
 			}),
-		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		).resolves.toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1", ephemeral: true },
+		});
 		const recordPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
 		const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		// Persist the requested coordinator cwd separately from the broker-returned
 		// managed-worktree workspace, matching the delegate creation binding.
-		await Bun.write(
-			recordPath,
-			JSON.stringify({ ...record, cwd: root, broker_workspace: worktree, ephemeral: true }, null, 2),
-		);
+		await Bun.write(recordPath, JSON.stringify({ ...record, cwd: root, broker_workspace: worktree }, null, 2));
 		const record2 = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
 		expect(record2.cwd).toBe(root);
 		expect(record2.broker_workspace).toBe(worktree);
@@ -3913,6 +3935,131 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 	});
 
+	it("admits a complete empty Q12 snapshot for an authenticated running turn", async () => {
+		const root = await tempRoot();
+		const queries: string[] = [];
+		const server = await createSdkControlServer(root, [], queries, () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "1" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "continue working",
+			idempotency_key: "empty-live-q12",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "1", reason: null },
+		});
+		expect(queries).toContain("Q12");
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({
+			turn: { status: "active" },
+		});
+	});
+
+	it("does not admit an empty Q12 snapshot when cancellation races the query", async () => {
+		const root = await tempRoot();
+		const queryStarted = Promise.withResolvers<void>();
+		const releaseQuery = Promise.withResolvers<void>();
+		const server = await createSdkControlServer(root, [], [], async () => {
+			queryStarted.resolve();
+			await releaseQuery.promise;
+			return { ok: true, page: { items: [], complete: true, revision: "empty-after-cancel" } };
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty cancellation race",
+			idempotency_key: "empty-cancel-race-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		const listed = server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		await queryStarted.promise;
+		await expect(
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: sent.turn_id,
+				status: "cancelled",
+				summary: "cancelled while Q12 was in flight",
+				idempotency_key: "empty-cancel-race-report",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, turn: { status: "cancelled" } });
+		releaseQuery.resolve();
+		await expect(listed).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+		await expect(
+			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
+		).resolves.toMatchObject({ turn: { status: "cancelled" } });
+	});
+
+	it.each([
+		["stale writer receipt", { stripWriterIdentity: true, currentTurnId: null }],
+		["replayed turn association", { stripWriterIdentity: false, currentTurnId: "replayed-turn" }],
+	] as const)("keeps an empty Q12 snapshot fail-closed for a %s", async (_name, mutation) => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], () => ({
+			ok: true,
+			page: { items: [], complete: true, revision: "empty-stale-or-replay" },
+		}));
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "empty stale or replay control",
+			idempotency_key: `empty-${mutation.stripWriterIdentity ? "stale" : "replay"}`,
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: mutation.currentTurnId ?? sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+		if (mutation.stripWriterIdentity) {
+			const stateFile = coordinatorSessionStatePath(root, "visible-session");
+			const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
+			delete state.sidecar_key_id;
+			delete state.sidecar_signature;
+			await fs.writeFile(stateFile, JSON.stringify(state));
+		}
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			questions: [],
+			reconciliation: { attempted: false, complete: false, reason: "terminal_uncertain" },
+		});
+	});
+
 	it("admits a live ask while the agent-session sidecar is still running", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -4002,7 +4149,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
-	it("does not admit a forged live running sidecar without exact writer identity", async () => {
+	it.each([
+		false,
+		true,
+	])("does not admit a forged live running sidecar without exact writer identity (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4011,7 +4161,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("forged-live-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("forged-live-ask", runtimeTurnId)],
 							complete: true,
 							revision: "forged-live-ask",
 						},
@@ -4197,7 +4347,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "workflow.gate_answer")).toHaveLength(0);
 	});
 
-	it("keeps an uncertain terminal boundary fail-closed despite a pending gate row", async () => {
+	it.each([
+		false,
+		true,
+	])("keeps an uncertain terminal boundary fail-closed despite a Q12 snapshot (empty=%s)", async empty => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		let runtimeTurnId = "unbound";
@@ -4206,7 +4359,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				? {
 						ok: true,
 						page: {
-							items: [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
+							items: empty ? [] : [sharedAskGate("uncertain-terminal-ask", runtimeTurnId)],
 							complete: true,
 							revision: "uncertain-terminal",
 						},
@@ -7177,6 +7330,185 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
 	});
+
+	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			{
+				sessionId: "orphan-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 202,
+				endpointMtimeMs: 2,
+			},
+		];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "orphan-session",
+				cwd: root,
+				idempotency_key: "register-orphan",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const nsDir = coordinatorNamespace(root);
+		const sessionsDir = path.join(nsDir, "sessions");
+		const sessionFile = path.join(sessionsDir, "orphan-session.json");
+
+		// Seed a retained (undelivered) public delivery so the durable footprint
+		// includes an unacknowledged outbox event plus a retained_sessions hint —
+		// state that projection-only removal would orphan.
+		const beforeSeed = await readSessionTransaction(paths, "orphan-session");
+		expect(beforeSeed).not.toBeNull();
+		await injectPendingDeliveryForTest(
+			server,
+			"orphan-session",
+			"orphan-retained-1",
+			(beforeSeed?.revision ?? 1) + 1,
+		);
+
+		// Make the session idle + ephemeral so the reaper selects it. Keep the
+		// projection's applied revisions ahead of the WAL revision so projection
+		// repair never runs and re-materializes the incarnation we strip below.
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		await withSessionTransaction(paths, "orphan-session", async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+
+		// Reproduce the missing-authority case: a crash/partial-write or a
+		// malformed/legacy projection dropped endpoint_incarnation while the
+		// canonical WAL still carries it.
+		const idle = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
+		const { endpoint_incarnation: _dropped, ...withoutIncarnation } = idle;
+		await Bun.write(sessionFile, JSON.stringify({ ...withoutIncarnation, ephemeral: true, created_at: staleAt }));
+
+		// The broker endpoint has genuinely rotated away: the live row now advertises a
+		// newer generation than the canonical WAL recorded, so recovering the WAL
+		// authority proves the stored endpoint is stale. Force eviction must PROVE
+		// absence/mismatch against the WAL authority before any destructive cleanup —
+		// a missing projection field alone is not proof (see the live-broker guard test).
+		brokerSessions[0]!.endpointGeneration = 2;
+
+		// Preconditions: WAL carries the recoverable incarnation, and the retained
+		// delivery hint is present.
+		const before = await readSessionTransaction(paths, "orphan-session");
+		const walIncarnation = before?.endpoint?.incarnation;
+		expect(walIncarnation).toMatch(/^[a-f0-9]{64}$/);
+		expect(
+			await withNamespaceRegistry(paths, async registry => registry.retained_sessions?.["orphan-session"] ?? null),
+		).not.toBeNull();
+
+		// The reap fails endpoint_stale each sweep (stripped incarnation); force
+		// eviction fires on the MAX_REAP_FAILURES-th sweep.
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// WAL retired.
+		expect(await readSessionTransaction(paths, "orphan-session")).toBeNull();
+		await expect(Bun.file(transactionPath(paths, "orphan-session")).exists()).resolves.toBe(false);
+
+		// Registry retired: roster + retained hints gone, deletion recorded completed
+		// under the WAL-recovered incarnation.
+		const registry = (await withNamespaceRegistry(paths, async r => JSON.parse(JSON.stringify(r)))) as {
+			roster?: Record<string, unknown>;
+			retained_sessions?: Record<string, unknown>;
+			deletions?: Record<string, { phase?: string; cleanup?: Record<string, unknown> }>;
+		};
+		expect(registry.roster?.["orphan-session"]).toBeUndefined();
+		expect(registry.retained_sessions?.["orphan-session"]).toBeUndefined();
+		expect(registry.deletions?.[`force-evict:orphan-session:${walIncarnation}`]).toMatchObject({
+			phase: "completed",
+			cleanup: { wal: true, turns: true, reports: true, session: true, events: true },
+		});
+
+		// Retained deliveries retired: the WAL delivery authority is gone.
+		await expect(claimPublicDelivery(paths, "orphan-session", { limit: 8 })).rejects.toThrow(/resource_gone/);
+
+		// Projections retired.
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(nsDir, "session-states", "orphan-session.json")).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(nsDir, "active-turns", "orphan-session.json")).exists()).resolves.toBe(false);
+	});
+
+	it("does NOT force-evict a session with a missing projection incarnation while the broker endpoint is still live, leaving durable state for safe repair", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			{
+				sessionId: "live-orphan",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+				pid: 303,
+				endpointMtimeMs: 3,
+			},
+		];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "live-orphan",
+				cwd: root,
+				idempotency_key: "register-live-orphan",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const nsDir = coordinatorNamespace(root);
+		const sessionsDir = path.join(nsDir, "sessions");
+		const sessionFile = path.join(sessionsDir, "live-orphan.json");
+
+		// Make the session idle + ephemeral so the reaper selects it, and keep the
+		// projection revisions ahead of the WAL so projection repair never runs.
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		await withSessionTransaction(paths, "live-orphan", async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+
+		// Partial-write corruption dropped endpoint_incarnation from the projection,
+		// but the broker session (generation 1) is still live and matches the WAL.
+		const idle = JSON.parse(await fs.readFile(sessionFile, "utf8")) as Record<string, unknown>;
+		const { endpoint_incarnation: _dropped, ...withoutIncarnation } = idle;
+		await Bun.write(sessionFile, JSON.stringify({ ...withoutIncarnation, ephemeral: true, created_at: staleAt }));
+
+		// Every sweep fails endpoint_stale (stripped projection incarnation), so the
+		// counter reaches the eviction boundary repeatedly — but the WAL-authority
+		// guard proves the broker is still live/matching, so nothing is retired.
+		for (let i = 0; i < MAX_REAP_FAILURES + 2; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// Durable state is preserved for the safe repair path: the WAL and projection
+		// both remain, and no force-evict deletion was recorded against the session.
+		expect(await readSessionTransaction(paths, "live-orphan")).not.toBeNull();
+		await expect(Bun.file(transactionPath(paths, "live-orphan")).exists()).resolves.toBe(true);
+		const registry = (await withNamespaceRegistry(paths, async r => JSON.parse(JSON.stringify(r)))) as {
+			deletions?: Record<string, unknown>;
+		};
+		expect(Object.keys(registry.deletions ?? {}).some(id => id.startsWith("force-evict:live-orphan:"))).toBe(false);
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+	});
 	describe("Coordinator MCP real broker lifecycle", () => {
 		for (const discoveryState of [
 			"no discovery",
@@ -8197,18 +8529,34 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const controls: SdkControl[] = [];
 		let gateAvailable = false;
 		let runtimeTurnId = "unbound";
-		const server = await createSdkControlServer(root, controls, [], query => {
-			if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
-			if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
-			return {
-				ok: true,
-				page: {
-					items: [sharedAskGate("wake-gate", runtimeTurnId)],
-					complete: true,
-					revision: "q12-open",
-				},
-			};
-		});
+		const watchReady = Promise.withResolvers<void>();
+		const wakeObserved = Promise.withResolvers<void>();
+		const realSetTimeout = setTimeout;
+		const realClearTimeout = clearTimeout;
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			query => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				if (!gateAvailable) return { ok: true, page: { items: [], complete: true, revision: "q12-empty" } };
+				return {
+					ok: true,
+					page: {
+						items: [sharedAskGate("wake-gate", runtimeTurnId)],
+						complete: true,
+						revision: "q12-open",
+					},
+				};
+			},
+			undefined,
+			undefined,
+			undefined,
+			{
+				onCoordinatorEventWatchReady: () => watchReady.resolve(),
+				onCoordinatorEventWake: () => wakeObserved.resolve(),
+			},
+		);
 		await registerSdkSession(server, root);
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -8235,24 +8583,44 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		});
 		const initial = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0, timeout_ms: 0 });
 		const cursor = Number(initial.next_after_seq);
-		gateAvailable = true;
-		const pending = server.callTool("gjc_coordinator_watch_events", {
-			session_id: "visible-session",
-			after_seq: cursor,
-			timeout_ms: 500,
-		});
-		await appendCoordinatorEventForTest(coordinatorNamespace(root), {
-			kind: "session.state_changed",
-			sessionId: "visible-session",
-			summary: "wake",
-		});
-		const result = await pending;
-		expect(result).toMatchObject({
-			ok: true,
-			events: expect.arrayContaining([
-				expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
-			]),
-		});
+		const namespaceDir = coordinatorNamespace(root);
+		const wakeBudgetMs = 500;
+		// Keep the protocol's 500ms fallback budget without charging CI scheduling to
+		// setup. Success is gated by the product's watcher-wake signal below; the real
+		// timer only provides an outer failure guard when that signal never arrives.
+		vi.useFakeTimers();
+		let wakeSafetyTimer: ReturnType<typeof realSetTimeout> | undefined;
+		try {
+			const pending = server.callTool("gjc_coordinator_watch_events", {
+				session_id: "visible-session",
+				event_types: ["question.opened"],
+				after_seq: cursor,
+				timeout_ms: wakeBudgetMs,
+			});
+			wakeSafetyTimer = realSetTimeout(
+				() => wakeObserved.reject(new Error("Coordinator event wake was not observed.")),
+				2_000,
+			);
+			await watchReady.promise;
+			gateAvailable = true;
+			await appendCoordinatorEventForTest(namespaceDir, {
+				kind: "session.state_changed",
+				sessionId: "visible-session",
+				summary: "wake",
+			});
+			await wakeObserved.promise;
+			const result = await pending;
+			expect(result).toMatchObject({
+				ok: true,
+				timed_out: false,
+				events: expect.arrayContaining([
+					expect.objectContaining({ kind: "question.opened", question_id: "wake-gate" }),
+				]),
+			});
+		} finally {
+			if (wakeSafetyTimer !== undefined) realClearTimeout(wakeSafetyTimer);
+			vi.useRealTimers();
+		}
 	});
 
 	it("imports a pre-WAL active Q12 turn into canonical admission, listing, and answer handling", async () => {
@@ -8589,7 +8957,7 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			{
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);
@@ -8900,45 +9268,48 @@ describe("Coordinator MCP deep-audit regressions", () => {
 	});
 
 	it("advertises Linux-only artifact capability consistently across platform discovery", async () => {
-		const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
-		if (!originalPlatform?.configurable) throw new Error("process_platform_not_configurable");
-		try {
-			for (const [platform, available] of [
-				["linux", true],
-				["darwin", false],
-				["win32", false],
-			] as const) {
-				Object.defineProperty(process, "platform", { ...originalPlatform, value: platform });
-				const server = await createSdkControlServer(
-					await tempRoot(),
-					[],
-					[],
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{
-						platform,
-					},
-				);
-				const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
-				const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
-					tool => tool.name === "gjc_coordinator_read_artifact",
-				);
-				expect(artifact?.description).toContain(
-					available ? "Read one bounded artifact" : "Unavailable on this platform",
-				);
-				if (!available) {
-					await expect(
-						server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" }),
-					).resolves.toEqual({
-						ok: false,
-						error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
-					});
-				}
+		for (const [platform, available] of [
+			["linux", true],
+			["darwin", false],
+			["win32", false],
+		] as const) {
+			const server = await createSdkControlServer(
+				await tempRoot(),
+				[],
+				[],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					platform,
+				},
+			);
+			// Namespace setup uses the real host addon; only artifact capability
+			// discovery and refusal below simulate another platform.
+			expect(await server.callTool("gjc_coordinator_list_artifacts")).toMatchObject({ ok: true });
+			const discovery = await server.handleJsonRpc({ jsonrpc: "2.0", id: platform, method: "tools/list" });
+			const artifact = (discovery.result as { tools: Array<Record<string, unknown>> }).tools.find(
+				tool => tool.name === "gjc_coordinator_read_artifact",
+			);
+			expect(artifact?.description).toContain(
+				available ? "Read one bounded artifact" : "Unavailable on this platform",
+			);
+			if (!available) {
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" })).resolves.toEqual({
+					ok: false,
+					error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+				});
 			}
-		} finally {
-			Object.defineProperty(process, "platform", originalPlatform);
+			if (available && process.platform !== "linux") {
+				// The injected platform may only ADD a refusal; the real-host gate in
+				// safeOpenCoordinatorArtifact refuses here regardless of the injected value.
+				// Skipped on linux hosts where the injected and host platforms agree.
+				await expect(server.callTool("gjc_coordinator_read_artifact", { path: "/unsupported" })).resolves.toEqual({
+					ok: false,
+					error: { code: "artifact_unavailable", message: "Coordinator artifact could not be read." },
+				});
+			}
 		}
 	});
 
@@ -10172,7 +10543,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 					answerCalls += 1;
 					return answerCalls === 1
 						? { ok: true, result: { status: "rejected" } }
-						: { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } };
+						: { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } };
 				},
 			},
 		);
@@ -10252,7 +10623,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				},
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);

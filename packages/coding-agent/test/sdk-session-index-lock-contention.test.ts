@@ -436,11 +436,6 @@ describe("SDK session index lock contention (#4544)", () => {
 					indexSeq: appended.indexSeq,
 					processIncarnation: appended.processIncarnation,
 					hostIncarnation: appended.hostIncarnation,
-					identityProvenance: "composite",
-					ambiguous: false,
-					live: true,
-					terminal: false,
-					terminalUncertain: false,
 				}),
 			).toBe(true);
 			expect(incarnation).toHaveBeenCalled();
@@ -473,11 +468,6 @@ describe("SDK session index lock contention (#4544)", () => {
 					indexSeq: live.indexSeq,
 					processIncarnation: live.processIncarnation,
 					hostIncarnation: live.hostIncarnation,
-					identityProvenance: "composite",
-					ambiguous: false,
-					live: true,
-					terminal: false,
-					terminalUncertain: false,
 				}),
 			).toBe(true);
 			expect(incarnation).not.toHaveBeenCalledWith(deadPid);

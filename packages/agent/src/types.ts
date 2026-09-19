@@ -260,6 +260,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * next tool/turn boundary either way.
 	 */
 	toolInterruptPolicy?: "abort_tools" | "finish_tools";
+	/** Test-only diagnostic for bounding pending per-read abort-race reactions. */
+	onAbortRaceReactionChange?: (delta: 1 | -1) => void;
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.
@@ -485,8 +487,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Callers may abort synchronously to stop consuming buffered provider events.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
-	/** Observe unmanaged provisional assistant deltas before public publication. */
-	onProvisionalAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** Observe unmanaged provisional assistant deltas before public publication. Return false to reject the turn. */
+	onProvisionalAssistantMessageEvent?: (
+		message: AssistantMessage,
+		event: AssistantMessageEvent,
+	) => boolean | undefined;
 	/** True when the host consumes provisional assistant events for live safety checks. */
 	hasProvisionalAssistantMessageEventConsumer?: boolean;
 

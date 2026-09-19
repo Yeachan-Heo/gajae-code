@@ -9,7 +9,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getLogPath } from "@gajae-code/utils";
+import { getEffectiveLogPath } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { ensureWorkflowSettingsMigrated, Settings, SettingsMigrationTestHooks } from "../../src/config/settings";
 
@@ -133,10 +133,10 @@ process.stdout.write(
  */
 async function readMigrationLog(): Promise<string> {
 	if (process.env.GJC_PROBE_LOG !== "1") return "";
-	// winston's DailyRotateFile names files by LOCAL date while getLogPath()
+	// winston's DailyRotateFile names files by LOCAL date while getEffectiveLogPath()
 	// uses the UTC date, so scan every gjc.*.log in the logs dir instead of
 	// guessing the file name.
-	const logsDir = path.dirname(getLogPath());
+	const logsDir = path.dirname(getEffectiveLogPath());
 	for (let attempt = 0; attempt < 20; attempt++) {
 		try {
 			const files = (await fs.readdir(logsDir)).filter(name => name.startsWith("gjc.") && name.endsWith(".log"));

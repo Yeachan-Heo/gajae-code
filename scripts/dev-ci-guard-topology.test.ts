@@ -9,6 +9,7 @@ import { parse } from "yaml";
 // aggregate.
 interface WorkflowStep {
 	name?: string;
+	if?: string;
 	uses?: string;
 	run?: string;
 	env?: Record<string, string>;
@@ -19,6 +20,7 @@ interface WorkflowJob {
 	name: string;
 	needs?: string[];
 	if?: string;
+	permissions?: Record<string, "read" | "write" | "none">;
 	env?: Record<string, string>;
 	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
 	steps: WorkflowStep[];
@@ -124,7 +126,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 				if (enabled) scheduled.push(name);
 				needs[name] = { result: enabled ? "success" : "skipped", outputs: enabled ? { relevant: "true", has_native: "true", has_tasks: "true" } : {} };
 			}
-			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap"] });
+			// The contract lane is both bootstrap jobs: the verdict line lives in the body,
+			// so a metadata edit must re-evaluate the contract AND the merge approval it
+			// reports. Neither is code evidence.
+			if (scenario.skip) expect({ scenario: scenario.name, scheduled }).toEqual({ scenario: scenario.name, scheduled: ["pr-contract-bootstrap", "merge-approval-bootstrap"] });
 			else if (headOnlyDispatch) expect(scheduled).toEqual(["virtual-integration"]);
 			else {
 				expect(scheduled).toContain("affected-plan");
@@ -203,17 +208,41 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		for (const changedPath of [
 			"packages/coding-agent/src/capability/fs.ts",
 			"packages/coding-agent/test/pr-4834-home-isolation.test.ts",
+			// Doctor's journal-backed repair refusal is a win32-only contract (the Rust
+			// journal authority is #[cfg(unix)]), so every doctor implementation change
+			// must both run and require this job rather than only the Ubuntu shards.
+			"packages/coding-agent/src/cli/doctor",
+			"packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
 		]) {
 			expect(eligibility).toContain(changedPath);
 			expect(producerRequired).toContain(changedPath);
 			expect(affectedRequired).toContain(changedPath);
 		}
+		expect(namedStep(requiredJob(d, "windows-dev-doctor"), "Verify Windows workspace shim and doctor").run).toContain(
+			"bun test ./packages/coding-agent/test/doctor-windows-repair-gate.test.ts",
+		);
+	});
+
+	test("keeps real DrvFS qualification manual, default-off, and independently source-bound", async () => {
+		const d = await workflow();
+		expect(d.on.workflow_dispatch.inputs.wsl_drvfs).toMatchObject({ type: "boolean", default: false, required: false });
+		const qualification = requiredJob(d, "wsl-drvfs-qualification");
+		expect(qualification.if).toBe("${{ github.event_name == 'workflow_dispatch' && inputs.wsl_drvfs == true }}");
+		expect(qualification.permissions).toEqual({ contents: "read" });
+		expect(requiredEnvValue(qualification, "QUALIFY_HEAD_SHA")).toBe("${{ inputs.head_sha }}");
+		const harness = namedStep(qualification, "Checkout workflow harness independently");
+		const source = namedStep(qualification, "Checkout exact qualification source");
+		expect(harness.with).toMatchObject({ ref: "${{ github.workflow_sha }}", "persist-credentials": false });
+		expect(source.with).toMatchObject({ ref: "${{ inputs.head_sha }}", repository: "${{ github.repository }}", "persist-credentials": false });
+		const upload = namedStep(qualification, "Upload qualification evidence even on failure");
+		expect(upload.if).toBe("${{ always() }}");
+		expect(upload.with).toMatchObject({ name: "wsl-drvfs-${{ github.run_id }}", "if-no-files-found": "error" });
 	});
 
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
-		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override"]);
+		expect(dispatchInputs).toEqual(["base_ref", "base_sha", "base_repository", "head_sha", "base_sha_override", "wsl_drvfs"]);
 		expect(dispatchInputs).not.toContain("head_ref");
 		expect(dispatchInputs).not.toContain("head_repository");
 

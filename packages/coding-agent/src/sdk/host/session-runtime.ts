@@ -4,13 +4,14 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isContinuingMidRunMaintenanceOutcome, ThinkingLevel } from "@gajae-code/agent-core";
+import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
+	isModelProfileProxyConfigured,
 	requiresQualifiedModelProfileRoleResolution,
 	resolveProxyMode,
 	rewriteSelectorForProxy,
@@ -47,6 +48,7 @@ import {
 	type MasterRoleAttestationV2,
 	resolveSessionLocator,
 	SessionIndex,
+	type SessionIndexEvent,
 	type SessionLocatorV2,
 } from "../broker/session-index";
 import {
@@ -194,6 +196,13 @@ export function verifyMasterCapabilityFrame(input: {
 
 /** Maximum time a replaced runtime may retain a lifecycle persistence task. */
 const LIFECYCLE_QUIESCENCE_MS = 1_000;
+/**
+ * Keep a live session's broker discovery recoverable well inside the session
+ * index's two-minute heartbeat freshness window. `ensureBroker` has its own
+ * bounded startup/recovery budget; the in-flight guard below prevents those
+ * budgets from stacking when one attempt outlives this cadence.
+ */
+export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -416,6 +425,11 @@ export class SessionSdkSessionRuntime {
 		return this.host.getProviderDefinitions(capability);
 	}
 
+	/** Persist the host's current observable activity for broker/session-list consumers. */
+	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
+		await this.host.reportActivity(state, at);
+	}
+
 	emitEvent(frame: SdkFrame): void {
 		const eventInput =
 			typeof frame.kind === "string"
@@ -556,6 +570,11 @@ export interface CreateSdkSessionRuntimeOptions {
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
+	/** Timer seams for deterministic broker-recovery lifecycle tests. */
+	setIntervalImpl?: typeof setInterval;
+	clearIntervalImpl?: typeof clearInterval;
+	/** Test-only broker ensure seam; production always uses the owner-fenced helper. */
+	ensureBrokerImpl?: typeof ensureBroker;
 	/** Test-only observation of a genuinely timed-out lifecycle drain. */
 	onLifecycleDrainTimeoutForTests?: () => void;
 	/** Test-only observation of bounded failure-diagnostic deduplication state. */
@@ -1644,18 +1663,18 @@ function createQuerySurface(
 		};
 		try {
 			const proxyMode = profile.source === "user" ? "fallback" : resolveProxyMode(profileSettings);
-			if (profile.source !== "user") {
-				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.() ?? [];
-				if (proxyProvider !== undefined && !configuredProviders.includes(proxyProvider))
+			if (proxyProvider !== undefined) {
+				const configuredProviders = ctx.modelRegistry.getConfiguredProviderIds?.();
+				const credentialless =
+					proxyProvider === "opencodex" &&
+					!configuredProviders?.includes(proxyProvider) &&
+					(await ctx.modelRegistry.getApiKeyForProvider(proxyProvider, getProfileCredentialSessionId())) ===
+						kNoAuth;
+				if (!isModelProfileProxyConfigured(proxyProvider, configuredProviders, credentialless))
 					return { available: false };
 			}
 			if (profile.source !== "user" && proxyMode === "always") {
-				if (
-					proxyProvider === undefined ||
-					!proxyAuthenticated ||
-					!(ctx.modelRegistry.getConfiguredProviderIds?.() ?? []).includes(proxyProvider)
-				)
-					return { available: false };
+				if (proxyProvider === undefined || !proxyAuthenticated) return { available: false };
 			}
 			const bindings = resolveProfileBindings(profile);
 			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];
@@ -4165,6 +4184,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					sdkRunToken: string;
 				}>;
 				registerBroker: () => Promise<void>;
+				stopBrokerRecovery: () => void;
 				quiesceInput: () => void;
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
@@ -4377,6 +4397,78 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	let nextLifecycleEpoch = 0;
 	const skillTerminalRecoveryKeys = new Set<string>();
+	/**
+	 * Exactly one correlated terminal BOUNDARY (agent_end) may reach the wire per
+	 * correlation. The provider agent_end handler and the prompt-deadline expiry can both
+	 * reach their emission after the other has already published: the handler captures its
+	 * transitions synchronously and then awaits durable writes, while the deadline callback
+	 * fires only after its own claim/finalize awaits have settled. Neither can be stopped by
+	 * removing lifecycle references, and noteTransition is a no-op once the record is
+	 * terminal, so durable state would record one outcome while clients received two. This
+	 * claim is the shared arbiter, taken synchronously -- no await between the check and the
+	 * set -- by whoever is about to publish the boundary.
+	 *
+	 * The key is never removed at cleanup: dropping it when the correlation retires would
+	 * re-open the window, and would stop a late real boundary from being idempotent for an
+	 * already-retired correlation. Growth is bounded by FIFO eviction instead (a Set
+	 * preserves insertion order). A correlation displaced by 1024 later boundaries is long
+	 * retired, and its durable record stays authoritative for anything a consumer missed.
+	 *
+	 * Eviction must never reach a correlation that can still be published (review P1). A
+	 * handler captures its transitions, awaits durable writes, and claims only immediately
+	 * before its emit; parked on those awaits, 1024 later boundaries would otherwise evict
+	 * its key and let its delayed agent_end publish a SECOND boundary for a correlation the
+	 * deadline already terminalized. Every would-be publisher therefore RETAINS its
+	 * correlations for as long as it can still reach a claim, and a retained key is skipped
+	 * as an eviction victim.
+	 */
+	const MAX_PUBLISHED_TERMINAL_BOUNDARIES = 1024;
+	const publishedTerminalBoundaries = new Set<string>();
+	/** Correlations with at least one publisher still able to reach a claim. */
+	const retainedTerminalBoundaries = new Map<string, number>();
+	/**
+	 * Protect every correlation this publisher may still claim, and return its release.
+	 * Callers MUST release on every exit path -- published, claim lost, or threw -- so a
+	 * failure cannot leak a permanent protection.
+	 */
+	const retainTerminalBoundaries = (
+		invocations: ReadonlyArray<{ correlation: InvocationCorrelation }>,
+	): (() => void) => {
+		const keys = invocations.map(({ correlation }) => lifecycleCorrelationKey(correlation));
+		for (const key of keys) retainedTerminalBoundaries.set(key, (retainedTerminalBoundaries.get(key) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			for (const key of keys) {
+				const retained = retainedTerminalBoundaries.get(key);
+				if (retained === undefined) continue;
+				if (retained > 1) retainedTerminalBoundaries.set(key, retained - 1);
+				else retainedTerminalBoundaries.delete(key);
+			}
+		};
+	};
+	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean => {
+		const key = lifecycleCorrelationKey(correlation);
+		if (publishedTerminalBoundaries.has(key)) return false;
+		publishedTerminalBoundaries.add(key);
+		while (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
+			let victim: string | undefined;
+			for (const candidate of publishedTerminalBoundaries) {
+				if (retainedTerminalBoundaries.has(candidate)) continue;
+				victim = candidate;
+				break;
+			}
+			// Every key is still publishable: exceed the bound rather than evict a live
+			// one. Correctness beats the bound, and the excess is bounded by the live
+			// lifecycles the session already bounds.
+			if (victim === undefined) break;
+			publishedTerminalBoundaries.delete(victim);
+		}
+		return true;
+	};
+	const hasClaimedTerminalBoundary = (correlation: InvocationCorrelation): boolean =>
+		publishedTerminalBoundaries.has(lifecycleCorrelationKey(correlation));
 	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
 		if (!owner) return Promise.resolve();
 		let task: Promise<void>;
@@ -4727,6 +4819,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
+		// Retained BEFORE the first durable await: from here this publisher can still
+		// reach the claim below, so no later boundary may evict its correlations while
+		// it is parked. A start retains too -- its keys are not published yet, so the
+		// protection is inert, and one unconditional release path cannot leak.
+		const releaseTerminalRetention = retainTerminalBoundaries(transitions);
 		try {
 			for (const invocation of transitions) {
 				try {
@@ -4808,6 +4905,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 				);
 				for (const invocation of transitions) {
+					// A correlation whose terminal boundary is already published was
+					// terminalized by the deadline, which emitted its own diagnostic together
+					// with the pair; a second correlated agent_failed would duplicate it. The
+					// check is READ-ONLY: the claim is taken by would-be agent_end publishers
+					// alone, because the real path emits its agent_failed and its agent_end
+					// from two SEPARATE emitLifecycle invocations, so claiming here would make
+					// the publisher block its own boundary. In the ordinary flow this changes
+					// nothing -- agent_failed precedes agent_end and the claim is untaken.
+					if (hasClaimedTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({
 							type,
@@ -4855,6 +4961,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// above with the one uncorrelated frame, so it cannot settle a live prompt.
 				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
 				for (const invocation of transitions) {
+					// Claim synchronously, immediately before the emit: the durable awaits
+					// above give the deadline expiry room to publish this correlation's
+					// boundary first. On a lost claim skip ONLY this frame -- every durable
+					// write, diagnostic cleanup, batch retirement and waiter resolution below
+					// still runs. `observed` deliberately stays true: it means "the correlated
+					// publication reached the wire", and it did, the deadline put it there.
+					// Flipping it would make a terminal abort's durable row refuse to claim
+					// terminalPublished for a boundary that IS on the wire.
+					if (!claimTerminalBoundary(invocation.correlation)) continue;
 					try {
 						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
 					} catch {
@@ -4871,6 +4986,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		} catch {
 			observed = false;
+		} finally {
+			// Every exit path -- published, claim lost, or threw -- releases: this
+			// publisher can no longer reach a claim.
+			releaseTerminalRetention();
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
@@ -4930,7 +5049,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		return trackLifecycle(
+		// The activity checkpoint is already fire-and-forget and does not depend on
+		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+			?.reportActivity("active")
+			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
+		// Interactive/skill turns must not wait on durable start persist. Keep
+		// trackLifecycle so drain, persist-then-publish, content-hold release, and
+		// shutdown still run; do not return that promise to the extension runner
+		// (EXTENSION_HANDLER_TIMEOUT_MS would otherwise stall the prompt).
+		void trackLifecycle(
 			async () =>
 				emitLifecycle(
 					"agent_start",
@@ -4946,12 +5074,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					event.sdkRunTokens,
 				),
 			owner,
-		);
+		).catch(error => {
+			logger.error("SDK agent_start lifecycle task failed", {
+				error: sanitizePromptFailure(error),
+			});
+		});
 	});
 	api.on("agent_end", (event, ctx) => {
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
 		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_end")?.runtime)
+			?.reportActivity("idle")
+			.catch(error => logger.warn(`sdk: idle activity checkpoint failed: ${String(error)}`));
 		// Capture the oldest unmatched batch synchronously. A successor may start
 		// while the failed diagnostic persists; that must not retarget the
 		// predecessor's reason or terminal boundary to the successor invocation.
@@ -5054,7 +5189,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
 	// false-fire prompt_deadline_exceeded during a long shared run.
-	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
+	const renewAttributableProgress = (
+		eventType: "tool_execution_start" | "tool_execution_update" | "tool_execution_end",
+		event: AgentSessionEvent,
+		ctx: ExtensionContext,
+	): void => {
+		// Pairing-only tool boundaries synthesized while an abort unwinds never
+		// entered a tool. Treating them as progress lets a deadline renew its own
+		// lease after claiming the terminal outcome, leaving that claim pending
+		// instead of durably finalizing it.
+		if (isNonDispatchedToolEvent(event)) return;
 		// Tool events do not carry an SDK run token. Prefer the lifecycle-active
 		// runtime for the current session so a retained predecessor cannot make a
 		// live replacement look ambiguous and suppress its lease renewal.
@@ -5165,11 +5309,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		publishContentFrames(current, event as AgentSessionEvent, invocations);
 	};
-	api.on("tool_execution_start", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_start", ctx);
+	api.on("tool_execution_start", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_start", event as AgentSessionEvent, ctx);
 	});
-	api.on("tool_execution_end", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_end", ctx);
+	api.on("tool_execution_update", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_update", event as AgentSessionEvent, ctx);
+	});
+	api.on("tool_execution_end", async (event, ctx) => {
+		renewAttributableProgress("tool_execution_end", event as AgentSessionEvent, ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -5178,6 +5325,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		typeof (error as { code?: unknown }).code === "string"
 			? (error as { code: string }).code
 			: undefined;
+	const brokerDiagnosticCode = (error: unknown): string => {
+		const code = errorCode(error);
+		return code !== undefined && /^[A-Za-z0-9_.-]{1,64}$/u.test(code) ? code : "unavailable";
+	};
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -5210,11 +5361,69 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
 			},
-			onExpired: correlation => {
+			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
-				if (!owner) return;
-				removeLifecycleReferences(owner, correlation);
-				maybeRetireLifecycleOwner(owner);
+				if (deadlineOutcome === undefined) {
+					if (!owner) return;
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+					return;
+				}
+				const failure = sanitizePromptFailure(
+					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
+				);
+				// The deadline publishes a failed/end PAIR and owns it atomically, so the
+				// boundary claim is taken once, here, covering both frames. Losing it means
+				// a real agent_end already reached the wire for this correlation: emit
+				// NEITHER frame, but still run the cleanup below, and still let #expire
+				// finish its durable reconciliation. Losing the boundary must not skip
+				// cleanup.
+				//
+				// Retained for the whole publication: this path owns the correlation from
+				// here, so a concurrent boundary must not evict its key mid-flight.
+				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
+				try {
+					if (claimTerminalBoundary(correlation)) {
+						// Each required frame is emitted INDEPENDENTLY (review P2): a throwing
+						// diagnostic must never suppress the boundary, which is the frame this
+						// path exists to deliver. Both failures are reported, never rethrown --
+						// the cleanup below still has to run.
+						try {
+							runtime.emitEvent({
+								type: "agent_failed",
+								sessionId,
+								...correlation,
+								error: failure,
+							});
+						} catch (error) {
+							logger.warn("sdk: deadline correlated diagnostic publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
+						try {
+							runtime.emitEvent({
+								type: "agent_end",
+								sessionId,
+								...correlation,
+								outcome: canonicalFailedOutcome(failure, "deadline"),
+							});
+						} catch (error) {
+							logger.error("sdk: deadline correlated boundary publication failed", {
+								commandId: correlation.commandId,
+								turnId: correlation.turnId,
+								error: sanitizePromptFailure(error),
+							});
+						}
+					}
+				} finally {
+					releaseTerminalRetention();
+				}
+				if (owner) {
+					removeLifecycleReferences(owner, correlation);
+					maybeRetireLifecycleOwner(owner);
+				}
 			},
 		});
 		const pending: Array<{
@@ -5854,77 +6063,167 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
+		let brokerRegistrationInFlight: Promise<void> | undefined;
+		let brokerRecoveryStopped = false;
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
-			try {
-				if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
-					throw new Error("Lifecycle broker registration requires a request identity.");
-				await ensureBroker({ agentDir: options.agentDir });
-				const index = await new SessionIndex(options.agentDir).open();
-				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
-				const effectiveIncarnation = processIncarnation(process.pid);
-				const direct = await reattestMasterSessionIdentity({
-					index,
-					locator,
-					masterCapability: options.masterCapability,
-					attestationEpoch: options.masterAttestationEpoch,
-					ownerSessionId: options.masterOwnerSessionId,
-					sessionId,
-					pid: process.pid,
-					processIncarnation: effectiveIncarnation,
-				});
-				await runtime.registerWithBroker({
-					register: async input => {
-						if (publishedEndpointUrl === undefined)
-							throw new Error("SDK transport endpoint was not published before broker registration.");
-						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
-						const file = await readEndpointFile(endpointPath);
-						if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
-						const endpoint = JSON.parse(file.source) as Record<string, unknown>;
-						if (
-							endpoint.sessionId !== input.sessionId ||
-							endpoint.pid !== process.pid ||
-							endpoint.url !== publishedEndpointUrl ||
-							endpoint.token !== transport.token
-						)
-							throw new Error("SDK endpoint did not match the published transport authority.");
-						const endpointMtimeMs = file.mtimeMs;
-						const endpointFileId = `${file.dev}:${file.ino}`;
-						const masterRole = masterAttestationForEffectiveHost({
-							masterCapability: options.masterCapability,
-							attestationEpoch: options.masterAttestationEpoch,
-							ownerSessionId: options.masterOwnerSessionId,
-							sessionId: input.sessionId,
-							pid: process.pid,
-							processIncarnation: effectiveIncarnation,
-							direct,
-						});
-						await index.append({
-							type: "host_registered",
-							...input,
-							locator,
-							pid: process.pid,
-							endpointMtimeMs,
-							endpointFileId,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-							...(masterRole ? { masterRole } : {}),
-						});
-					},
-					unregister: async input => {
-						await index.append({
-							type: "host_unregistered",
-							...input,
-							locator,
-							pid: process.pid,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-						});
-					},
-				});
-				brokerRegistered = true;
-			} catch (error) {
-				if (options.brokerRegistrationRequired) throw error;
-				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
+			if (brokerRegistrationInFlight !== undefined) {
+				await brokerRegistrationInFlight;
+				return;
 			}
+			const registration = (async (): Promise<void> => {
+				try {
+					if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
+						throw new Error("Lifecycle broker registration requires a request identity.");
+					await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+					if (brokerRecoveryStopped) return;
+					const index = await new SessionIndex(options.agentDir).open();
+					if (brokerRecoveryStopped) return;
+					const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+					const effectiveIncarnation = processIncarnation(process.pid);
+					const direct = await reattestMasterSessionIdentity({
+						index,
+						locator,
+						masterCapability: options.masterCapability,
+						attestationEpoch: options.masterAttestationEpoch,
+						ownerSessionId: options.masterOwnerSessionId,
+						sessionId,
+						pid: process.pid,
+						processIncarnation: effectiveIncarnation,
+					});
+					if (brokerRecoveryStopped) return;
+					let brokerRegistrationEvent: SessionIndexEvent | undefined;
+					await runtime.registerWithBroker({
+						register: async input => {
+							if (publishedEndpointUrl === undefined)
+								throw new Error("SDK transport endpoint was not published before broker registration.");
+							const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+							const file = await readEndpointFile(endpointPath);
+							if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
+							const endpoint = JSON.parse(file.source) as Record<string, unknown>;
+							if (
+								endpoint.sessionId !== input.sessionId ||
+								endpoint.pid !== process.pid ||
+								endpoint.url !== publishedEndpointUrl ||
+								endpoint.token !== transport.token
+							)
+								throw new Error("SDK endpoint did not match the published transport authority.");
+							const endpointMtimeMs = file.mtimeMs;
+							const endpointFileId = `${file.dev}:${file.ino}`;
+							const masterRole = masterAttestationForEffectiveHost({
+								masterCapability: options.masterCapability,
+								attestationEpoch: options.masterAttestationEpoch,
+								ownerSessionId: options.masterOwnerSessionId,
+								sessionId: input.sessionId,
+								pid: process.pid,
+								processIncarnation: effectiveIncarnation,
+								direct,
+							});
+							const published = await index.append({
+								type: "host_registered",
+								...input,
+								locator,
+								pid: process.pid,
+								endpointMtimeMs,
+								endpointFileId,
+								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
+								...(masterRole ? { masterRole } : {}),
+							});
+							brokerRegistrationEvent = published;
+							if (brokerRecoveryStopped) {
+								// Teardown may have run before append returned its ownership proof.
+								await index.unregisterIfCurrent(published);
+								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
+							}
+						},
+						heartbeat: async input => {
+							// Heartbeat only ever speaks for the publication this host proved it
+							// owns. A stale or foreign generation must not renew liveness.
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.append({
+								type: "host_heartbeat",
+								sessionId: expected.sessionId,
+								locator: expected.locator,
+								endpointGeneration: expected.endpointGeneration,
+								pid: expected.pid,
+								...(expected.processIncarnation === undefined
+									? {}
+									: { processIncarnation: expected.processIncarnation }),
+								...(expected.hostIncarnation === undefined
+									? {}
+									: { hostIncarnation: expected.hostIncarnation }),
+								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+								activity: input.activity,
+								ts: input.activity.at,
+							});
+						},
+						unregister: async input => {
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							// Use the successful publication's proof, never a teardown-time file read.
+							await index.unregisterIfCurrent(expected);
+							if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
+						},
+					});
+					if (brokerRecoveryStopped) return;
+					brokerRegistered = true;
+				} catch (error) {
+					if (options.brokerRegistrationRequired) throw error;
+					logger.warn("sdk broker registration unavailable", { code: brokerDiagnosticCode(error) });
+				}
+			})();
+			brokerRegistrationInFlight = registration;
+			try {
+				await registration;
+			} finally {
+				if (brokerRegistrationInFlight === registration) brokerRegistrationInFlight = undefined;
+			}
+		};
+		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
+		let brokerRecoveryInFlight: Promise<void> | undefined;
+		const runBrokerRecovery = async (): Promise<void> => {
+			if (brokerRecoveryStopped || brokerRecoveryInFlight !== undefined) return;
+			const recovery = (async (): Promise<void> => {
+				if (brokerRecoveryStopped) return;
+				if (brokerRegistered) await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+				else await registerBroker();
+			})();
+			brokerRecoveryInFlight = recovery;
+			try {
+				await recovery;
+			} catch (error) {
+				logger.warn("sdk broker recovery unavailable", { code: brokerDiagnosticCode(error) });
+			} finally {
+				if (brokerRecoveryInFlight === recovery) brokerRecoveryInFlight = undefined;
+			}
+		};
+		const startBrokerRecovery = (): void => {
+			if (brokerRecoveryStopped || brokerRecoveryTimer !== undefined) return;
+			const timer = (options.setIntervalImpl ?? setInterval)(
+				() => void runBrokerRecovery(),
+				SESSION_BROKER_RECOVERY_INTERVAL_MS,
+			) as NodeJS.Timeout;
+			brokerRecoveryTimer = timer;
+			timer.unref?.();
+		};
+		const stopBrokerRecovery = (): void => {
+			brokerRecoveryStopped = true;
+			if (brokerRecoveryTimer === undefined) return;
+			(options.clearIntervalImpl ?? clearInterval)(brokerRecoveryTimer);
+			brokerRecoveryTimer = undefined;
 		};
 		const runtimeOwner: RuntimeState = {
 			sessionId,
@@ -5938,6 +6237,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			pending,
 			openLifecycleBatches,
 			registerBroker,
+			stopBrokerRecovery,
 			quiesceInput: () => {
 				inputGate.quiescing = true;
 				lifecycleOwnerHolder.quiescing = true;
@@ -5958,8 +6258,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			publishedEndpointUrl = (await runtime.start()).url;
 			await registerBroker();
+			if (!brokerRecoveryStopped) startBrokerRecovery();
 		} catch (error) {
 			active = undefined;
+			stopBrokerRecovery();
 			disposeGate?.();
 			try {
 				await runtime.stop();
@@ -5980,6 +6282,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pending,
 					openLifecycleBatches,
 					registerBroker,
+					stopBrokerRecovery,
 					quiesceInput: () => {
 						inputGate.quiescing = true;
 						lifecycleOwnerHolder.quiescing = true;
@@ -6013,6 +6316,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
+		current.stopBrokerRecovery();
 		current.quiesceInput();
 		current.fenceGateResolutions();
 		try {

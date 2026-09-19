@@ -361,18 +361,48 @@ test("attributable tool progress renews the accepted prompt deadline on the bus 
 	}
 }, 30_000);
 
-test("non-attributable bus events never renew the accepted prompt deadline", async () => {
-	// AC-1 + AC-3: streaming chatter and tool updates are not progress, so the
-	// zero-activity expiry at acceptedAt + leaseMs is preserved.
-	const session = await acceptPrompt("chatter", LEASE_MS, 60_000);
+test("tool_execution_update renews the accepted prompt deadline on the bus route", async () => {
+	// #5575: periodic output from a long-running tool is attributable progress, so
+	// a `tool_execution_update` at ~60% of the lease renews the terminal deadline
+	// past the original acceptance-anchored fixed point.
+	const session = await acceptPrompt("update-renew", LEASE_MS, 60_000);
 	try {
 		await Bun.sleep(600);
 		session.handlers.get("tool_execution_update")?.(
-			{ type: "tool_execution_update", toolCallId: "chatter-tool", output: "tick" },
+			{ type: "tool_execution_update", toolCallId: "update-renew-tool", output: "tick" },
 			session.sessionContext,
 		);
+
+		// Past the ORIGINAL fixed deadline, with margin for timer jitter.
+		await waitFor(() => Date.now() - session.acceptedAt > LEASE_MS + 250, "original fixed deadline to pass");
+		expect(session.deadlineTerminals()).toHaveLength(0);
+
+		// The renewed deadline still terminalizes exactly once: renewal bounds, it
+		// does not disable.
+		await waitFor(() => session.deadlineTerminals().length > 0, "renewed deadline terminal");
+		expect(Date.now() - session.acceptedAt).toBeGreaterThan(LEASE_MS + 300);
+		await Bun.sleep(200);
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+test("non-attributable bus events never renew the accepted prompt deadline", async () => {
+	// AC-1 + AC-3: streaming text chatter is not progress, so the zero-activity
+	// expiry at acceptedAt + leaseMs is preserved. Tool boundaries — including
+	// `tool_execution_update` — ARE attributable now, so they are covered by the
+	// renewal cases, not here.
+	const session = await acceptPrompt("chatter", LEASE_MS, 60_000);
+	try {
+		await Bun.sleep(600);
 		session.handlers.get("message_update")?.(
 			{ type: "message_update", messageId: "chatter-message", delta: "still thinking" },
+			session.sessionContext,
+		);
+		session.handlers.get("message_end")?.(
+			{ type: "message_end", messageId: "chatter-message", message: { role: "assistant", content: [] } },
 			session.sessionContext,
 		);
 
@@ -694,14 +724,23 @@ test("a deadline expiry attempt in flight is superseded by real progress during 
 	}
 }, 30_000);
 
-test("a deadline expiry attempt in flight is superseded by real progress during fencing", async () => {
+test("progress during fencing is attributed to the deadline's own abort and never supersedes", async () => {
 	// HIGH: after the durable claim, terminal fencing still awaits the run's
-	// settlement proof. Attributable progress in that window must renew the
-	// lease and prevent the deadline terminal from being published.
+	// settlement proof. Progress in THAT window arrives after the attempt has
+	// already aborted the run, so it is the abort's own teardown, not evidence
+	// of a live prompt: it must be discounted and the terminal published. The
+	// pre-abort window is the one that still backs off on real progress — see
+	// the durable-claim supersession case above.
 	const fenceStarted = Promise.withResolvers<void>();
 	const releaseFence = Promise.withResolvers<void>();
+	// The abort count is the discriminator: both behaviours eventually publish
+	// exactly one terminal, but a superseding attempt gets there only by backing
+	// off, re-arming and aborting the run a SECOND time.
+	let aborts = 0;
 	const session = await acceptPrompt("fence-supersede", 400, 60_000, {
 		abortPromptAndWait: async () => {
+			aborts += 1;
+			if (aborts > 1) return { status: "settled", terminalScope: {} };
 			fenceStarted.resolve();
 			await releaseFence.promise;
 			return { status: "settled", terminalScope: {} };
@@ -716,11 +755,13 @@ test("a deadline expiry attempt in flight is superseded by real progress during 
 		);
 		await Bun.sleep(50);
 		releaseFence.resolve();
-		await Bun.sleep(300);
-		expect(session.terminals(session.correlation)).toHaveLength(0);
-		expect(session.deadlineTerminals()).toHaveLength(0);
-		await waitFor(() => session.deadlineTerminals().length > 0, "rescheduled fencing deadline terminal");
+		await waitFor(() => session.deadlineTerminals().length > 0, "post-fencing deadline terminal");
 		expect(session.deadlineTerminals()).toHaveLength(1);
+		// One abort: the post-fence progress was discounted, not treated as
+		// evidence of a live prompt.
+		expect(aborts).toBe(1);
+		await Bun.sleep(200);
+		expect(session.terminals(session.correlation)).toHaveLength(1);
 	} finally {
 		releaseFence.resolve();
 		await shutdown(session);
@@ -750,6 +791,100 @@ test("pairing-only synthetic tool progress never renews the bus deadline", async
 		// Had the pairing-only events renewed, the terminal could not land this early.
 		expect(Date.now() - session.acceptedAt).toBeLessThan(600 + LEASE_MS);
 		expect(session.deadlineTerminals()).toHaveLength(1);
+	} finally {
+		await shutdown(session);
+	}
+}, 30_000);
+
+/** Poll for a condition on a bounded budget WITHOUT throwing, so the caller asserts. */
+async function settleWithin(predicate: () => boolean, budgetMs: number): Promise<void> {
+	const deadline = Date.now() + budgetMs;
+	while (!predicate() && Date.now() < deadline) await Bun.sleep(10);
+}
+
+/** Read the session's durable reconciliation records straight off disk. */
+function reconciliationRecords(cwd: string): Record<string, unknown>[] {
+	const found: Record<string, unknown>[] = [];
+	const walk = (dir: string) => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				walk(full);
+				continue;
+			}
+			if (path.basename(dir) !== ".sdk-reconciliation" || !entry.name.endsWith(".json")) continue;
+			const document = JSON.parse(fs.readFileSync(full, "utf8")) as { records?: Record<string, unknown>[] };
+			found.push(...(document.records ?? []));
+		}
+	};
+	walk(cwd);
+	return found;
+}
+
+test("a deadline that aborts a genuinely dispatched tool still publishes its terminal frame", async () => {
+	// AC-1/AC-2, and the live `--mode acp` hang this PR is about. The expiry
+	// attempt fences the run through `abortPromptAndWaitWithTerminal`; that abort
+	// tears down the tool that was actually running, and agent-loop emits its
+	// `tool_execution_end` WITHOUT the non-dispatched marker, because the tool
+	// really started (`const dispatched = record.started`, agent-loop.ts:5173).
+	// So the abort's own teardown reaches `renewPromptDeadline` as ordinary
+	// attributable progress and bumps the lease generation of the very lease the
+	// attempt is expiring. Before the fix the post-fence check then read
+	// "superseded", the attempt backed off, re-armed, and the re-armed attempt
+	// walked into the identical trap — the durable record stayed frozen on its
+	// pending claim and the client's `session/prompt` never saw a terminal frame.
+	// Comfortably longer than acceptance so the expiry cannot fire before the
+	// harness has wired the abort-time emitter below.
+	const leaseMs = 1_500;
+	let aborts = 0;
+	let abortProgress = 0;
+	let live: BusSession | undefined;
+	const session = await acceptPrompt("self-abort", leaseMs, 60_000, {
+		abortPromptAndWait: async () => {
+			aborts += 1;
+			// The aborted turn pairs off its still-pending tool here. Deliberately
+			// NOT marked non-dispatched: that marker is reserved for calls the loop
+			// never dispatched, and this one ran.
+			if (live) {
+				abortProgress += 1;
+				live.handlers.get("tool_execution_end")?.(
+					{ type: "tool_execution_end", toolCallId: "self-abort-tool", toolName: "bash", isError: false },
+					live.sessionContext,
+				);
+			}
+			return { status: "settled", terminalScope: {} };
+		},
+	});
+	live = session;
+	try {
+		// Generous relative to the 1.5 s lease, but bounded: a self-superseding
+		// attempt never converges, so this must fail as a missing frame rather
+		// than as a suite timeout.
+		await settleWithin(() => session.deadlineTerminals().length > 0, 8_000);
+		// The premise of the case: the abort really did emit the aborted tool's
+		// attributable end event. Without this the assertions below are vacuous.
+		expect(abortProgress).toBeGreaterThan(0);
+		// AC-1: the terminal frame reached the wire, carrying the deadline code.
+		expect(session.deadlineTerminals()).toHaveLength(1);
+		expect((session.deadlineTerminals()[0]?.error as { message?: string }).message).toBe("Prompt deadline exceeded.");
+		// The first attempt settled it: no back-off/re-arm churn.
+		expect(aborts).toBe(1);
+
+		// AC-2: the durable record is finalized, not frozen mid-claim. The e2e
+		// fingerprint of the bug was exactly `status:"in_flight"` +
+		// `pendingReceiptState:"missing"` with the pending claim still set.
+		const record = reconciliationRecords(session.cwd).find(
+			entry =>
+				entry.kind === "prompt" &&
+				entry.commandId === session.correlation.commandId &&
+				entry.turnId === session.correlation.turnId,
+		);
+		expect(record).toBeDefined();
+		expect(record?.status).toBe("failed");
+		expect(typeof record?.terminalAt).toBe("number");
+		expect(record?.pendingOutcome).toBeUndefined();
+		expect(record?.pendingReceiptState).toBeUndefined();
+		expect((record?.error as { code?: string } | undefined)?.code).toBe("prompt_deadline_exceeded");
 	} finally {
 		await shutdown(session);
 	}

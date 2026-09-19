@@ -140,6 +140,7 @@ import {
 	reconcileCreationRemoteVerifier,
 	recordCreationRetirementBrokerProof,
 	recordCreationRetirementIntent,
+	recordDeletionIntent,
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
@@ -306,6 +307,9 @@ interface CoordinatorServices {
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
+	/** Observable transitions for consumers coordinating with the filesystem-backed event wait. */
+	onCoordinatorEventWatchReady?: () => void;
+	onCoordinatorEventWake?: () => void;
 	/** Test barrier invoked after an accepted prompt receipt is durable and before turn finalization. */
 	afterPromptReceiptPersisted?: (sessionId: string) => void | Promise<void>;
 	/** Test barrier invoked after an answer dispatch is claimed and before its final admission check. */
@@ -543,7 +547,10 @@ function textResult(
 	};
 }
 
-function toolSchema(name: CoordinatorToolName): {
+function toolSchema(
+	name: CoordinatorToolName,
+	platform: NodeJS.Platform,
+): {
 	name: CoordinatorToolName;
 	description: string;
 	inputSchema: Record<string, unknown>;
@@ -685,7 +692,7 @@ function toolSchema(name: CoordinatorToolName): {
 		return {
 			name,
 			description:
-				"Close and reap a coordinator delegate-created (ephemeral) SDK session through broker lifecycle control. Non-ephemeral user-registered sessions require both force and the force-stop capability.",
+				"Close and reap a coordinator-created (ephemeral) SDK session through broker lifecycle control. Non-ephemeral user-registered sessions require both force and the force-stop capability.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -804,7 +811,9 @@ function toolSchema(name: CoordinatorToolName): {
 	if (name === "gjc_coordinator_read_artifact") {
 		return {
 			name,
-			description: coordinatorArtifactCapability().available
+			// Controllers detect capability from tools/list (docs/hermes-mcp-bridge.md), so the
+			// advertisement must use the same resolved platform as the handler refusal.
+			description: coordinatorArtifactCapability(platform).available
 				? "Read one bounded artifact from configured safe roots."
 				: "Unavailable on this platform: artifact reads require Linux identity-bound handle authorization.",
 			inputSchema: { type: "object", properties: { path: pathField }, required: ["path"] },
@@ -3182,18 +3191,24 @@ function waitForTurnStateChange(namespaceDir: string, turn: TurnRecord, timeoutM
 	return deferred.promise;
 }
 
-async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number): Promise<void> {
+async function waitForCoordinatorEvents(
+	namespaceDir: string,
+	timeoutMs: number,
+	onWatchReady?: () => void,
+	onWake?: () => void,
+): Promise<void> {
 	const deferred = Promise.withResolvers<void>();
 	const watchers: nodeFs.FSWatcher[] = [];
 	let settled = false;
-	const finish = () => {
+	const finish = (woke: boolean) => {
 		if (settled) return;
 		settled = true;
 		for (const watcher of watchers) watcher.close();
 		clearTimeout(timer);
+		if (woke) onWake?.();
 		deferred.resolve();
 	};
-	const timer = setTimeout(finish, Math.max(timeoutMs, 0));
+	const timer = setTimeout(() => finish(false), Math.max(timeoutMs, 0));
 	timer.unref?.();
 	const eventDir = eventsDir(namespaceDir);
 	const watchedDirs = [
@@ -3207,16 +3222,17 @@ async function waitForCoordinatorEvents(namespaceDir: string, timeoutMs: number)
 		try {
 			const watcher = nodeFs.watch(dir, (_eventType, filename) => {
 				if (dir === eventDir) {
-					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish();
+					if (filename === "event-journal.jsonl" || filename === "latest-seq.json") finish(true);
 					return;
 				}
-				if (typeof filename === "string" && filename.endsWith(".json")) finish();
+				if (typeof filename === "string" && filename.endsWith(".json")) finish(true);
 			});
 			watchers.push(watcher);
 		} catch {
 			// Directory may not be watchable on this platform; the timeout remains a bounded fallback.
 		}
 	}
+	onWatchReady?.();
 	return deferred.promise;
 }
 
@@ -4451,6 +4467,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					const liveTurn = admission.active_turn_id
 						? transaction.canonical.turns[admission.active_turn_id]
 						: undefined;
+					// The Q12 query runs outside this transaction. Re-check the turn that
+					// admission observed so cancellation or terminal reconciliation cannot
+					// make an in-flight empty snapshot look like a healthy running result.
+					if (
+						admission.active_turn_id &&
+						(!liveTurn || TERMINAL_TURN_STATUSES.has(liveTurn.status as TurnStatus))
+					) {
+						q12Admitted = false;
+						return;
+					}
 					// A headless ask opens a durable Q12 gate before the runtime has a
 					// distinct needs_user_input lifecycle marker. Admit that narrow,
 					// observable in-flight state only when the sidecar, active turn, and
@@ -4762,7 +4788,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 				options,
 			);
-			if (!q12Admitted || (liveInFlightCandidate && !liveInFlightAskAdmitted))
+			// A complete empty Q12 snapshot proves no pending gate at this revision,
+			// even while an authenticated, acknowledged turn is still running.
+			// Nonempty snapshots still require an admitted ask; all writer, waiting
+			// token and terminal fences above remain authoritative.
+			if (!q12Admitted || (liveInFlightCandidate && items.length > 0 && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,
@@ -5926,6 +5956,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 		return true;
 	}
+	/**
+	 * True when the broker row for this session is the terminal-uncertain claim a
+	 * forced stale-worktree release recorded against exactly this authority. The
+	 * claim is only accepted as close proof while the row is still that identity:
+	 * a rotated successor, an ambiguous row, or an unreadable listing all fall
+	 * back to the ordinary close.
+	 */
+	async function forcedStaleReleaseProven(
+		sessionId: string,
+		workspace: string | null,
+		endpointGeneration: number,
+		endpointIncarnation: string,
+	): Promise<boolean> {
+		if (!workspace) return false;
+		let matches: Array<Record<string, unknown>>;
+		try {
+			const canonicalWorkspace = await canonicalBrokerWorkspace(workspace);
+			const listing = await paginatedBrokerSessionList(canonicalWorkspace, { cwd: canonicalWorkspace });
+			matches = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).filter(
+				row => brokerSessionId(row) === sessionId,
+			);
+		} catch {
+			return false;
+		}
+		if (matches.length !== 1) return false;
+		const row = matches[0]!;
+		return (
+			row.ambiguous !== true &&
+			(row.terminalUncertain === true || row.terminal_uncertain === true) &&
+			(row.forcedStaleRelease === true || row.forced_stale_release === true) &&
+			brokerEndpointGeneration(row) === endpointGeneration &&
+			brokerEndpointIncarnation(row, sessionId) === endpointIncarnation
+		);
+	}
+
 	async function recoverIntentDeletion(entry: NamespaceDeletionEntryV1): Promise<void> {
 		const session = asRecord(await readJsonFile(sessionFile(entry.session_id)));
 		if (!session) throw new SdkClientError("state_corrupt", "Close intent has no session authority record.");
@@ -5938,19 +6003,33 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				: null;
 		if (!cwd || endpointGeneration === null)
 			throw new SdkClientError("state_corrupt", "Close intent authority is incomplete.");
-		strictBrokerSessionClose(
-			await brokerSession(
-				cwd,
-				"session.close",
-				{
-					sessionId: entry.session_id,
-					endpointGeneration,
-					endpointIncarnation: entry.endpoint_incarnation,
-				},
-				`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
-			),
-			entry.session_id,
-		);
+		// #5581: a forced stop that admitted this deletion and then lost its endpoint
+		// already released the worktree by recording a terminal-uncertain claim bound
+		// to this exact authority. The broker refuses an ordinary `session.close`
+		// against such a row (`terminal_uncertain`), so retrying one here would park
+		// the manifest at `intent` forever. The claim is itself the teardown proof:
+		// advance on it instead, exactly as the success path does.
+		if (
+			!(await forcedStaleReleaseProven(
+				entry.session_id,
+				optionalString(session.broker_workspace),
+				endpointGeneration,
+				entry.endpoint_incarnation,
+			))
+		)
+			strictBrokerSessionClose(
+				await brokerSession(
+					cwd,
+					"session.close",
+					{
+						sessionId: entry.session_id,
+						endpointGeneration,
+						endpointIncarnation: entry.endpoint_incarnation,
+					},
+					`coordinator-reap:${entry.session_id}:${entry.endpoint_incarnation}`,
+				),
+				entry.session_id,
+			);
 		await advanceDeletion(questionPaths, entry.deletion_id, "broker_closed", undefined, {
 			ok: true,
 			closed: true,
@@ -6047,6 +6126,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const persistedIncarnation = optionalString(session.endpoint_incarnation);
 			if (!cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
 				return { ok: false, reason: "endpoint_stale", closed: false };
+			// #5581: a forced stop of a session whose endpoint has gone stale (its
+			// coordinator service vanished mid-run) cannot prove teardown, so it
+			// returns endpoint_stale below. The worktree release must still happen
+			// first: ask the broker to record a terminal-uncertain claim so the row
+			// stops holding its checkout. Best-effort — the endpoint_stale signal the
+			// caller depends on is returned regardless of whether release succeeds.
+			// The persisted endpoint authority is passed so the broker acts on exactly
+			// this stale identity: a live successor incarnation fails the close
+			// authority check and is never touched, so a legitimately re-held worktree
+			// stays occupied.
+			const releaseStaleWorktreeOnForce = async (): Promise<void> => {
+				if (opts.force !== true) return;
+				try {
+					await brokerSession(cwd, "session.close", {
+						sessionId: id,
+						endpointGeneration: persistedGeneration,
+						endpointIncarnation: persistedIncarnation,
+						forceReleaseStaleWorktree: true,
+					});
+				} catch {
+					// Advisory release; a later launch simply re-observes the row and retries.
+				}
+			};
 			// Endpoint identity is the authority for any lifecycle mutation. Check it
 			// before consulting a possibly stale active-turn projection so a successor
 			// incarnation cannot be blocked by old local state.
@@ -6058,11 +6160,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 					authority.endpointGeneration !== persistedGeneration ||
 					authority.endpointIncarnation !== persistedIncarnation
-				)
+				) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 			} catch (error) {
-				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale")) {
+					await releaseStaleWorktreeOnForce();
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 				throw error;
 			}
 			if (session.ephemeral !== true && opts.force !== true)
@@ -6164,8 +6270,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 						authority.endpointGeneration !== persistedGeneration ||
 						authority.endpointIncarnation !== persistedIncarnation
-					)
+					) {
+						await releaseStaleWorktreeOnForce();
 						return { ok: false, reason: "endpoint_stale", closed: false };
+					}
 				}
 				await ensureQuestionStateReady();
 				await ensureQuestionTransaction(id);
@@ -6205,6 +6313,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					});
 				}
 			} catch (error) {
+				// #5581: a forced stop can clear the second authority check yet lose the
+				// endpoint before `session.close` reaches the broker, so the close throws
+				// a stale/absent code. The deletion is already admitted as remote_started
+				// but never proven closed, leaving the indexed row holding its worktree.
+				// Record the same identity-bound terminal-uncertain claim before surfacing
+				// the unproven close. Only stale/absent codes qualify: a live endpoint
+				// failing transiently must keep its checkout.
+				if (error instanceof SdkClientError && (error.code === "endpoint_stale" || error.code === "not_found"))
+					await releaseStaleWorktreeOnForce();
 				return {
 					ok: false,
 					reason: "close_failed",
@@ -6289,6 +6406,164 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		});
 	}
 
+	/**
+	 * Prove a stored endpoint identity (workspace + generation + incarnation) is no
+	 * longer current against the live broker index. Returns true only when the
+	 * broker row is absent (not_found) or its generation/incarnation/workspace has
+	 * rotated away from the stored triple. A transient authority-read failure
+	 * returns false: we cannot prove the endpoint recovered, but we also must not
+	 * force-evict on a flake — the normal reap path will retry.
+	 */
+	async function brokerEndpointIdentityStale(
+		id: string,
+		persistedWorkspace: string,
+		persistedGeneration: number,
+		persistedIncarnation: string,
+	): Promise<boolean> {
+		try {
+			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
+			const authority = await exactBrokerSessionAuthority(id, workspace);
+			return (
+				!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+				authority.endpointGeneration !== persistedGeneration ||
+				authority.endpointIncarnation !== persistedIncarnation
+			);
+		} catch (error) {
+			if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
+				return true;
+			return false;
+		}
+	}
+
+	/**
+	 * True when the session's endpoint authority can no longer be proven current.
+	 * Mirrors the reap preflight so force eviction only fires against a genuinely
+	 * stale endpoint. When the projection carries a full endpoint identity we prove
+	 * staleness against it directly. When the projection identity is missing/corrupt
+	 * (or the projection is absent), an absent field is NOT itself proof of a stale
+	 * endpoint: a partial write can drop `endpoint_incarnation` while the broker
+	 * session is still live. We therefore recover the canonical WAL's own broker
+	 * identity and prove absence/mismatch against that authority instead. If neither
+	 * the projection nor the WAL yields a usable identity, we return false and leave
+	 * the state for the safe repair path rather than destructively evicting a
+	 * possibly-live session.
+	 */
+	async function isSessionEndpointStale(session: Record<string, unknown> | null, id: string): Promise<boolean> {
+		const persistedWorkspace = optionalString(session?.broker_workspace);
+		const persistedGeneration =
+			typeof session?.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session?.endpoint_incarnation);
+		if (persistedWorkspace && persistedGeneration !== null && persistedIncarnation)
+			return await brokerEndpointIdentityStale(id, persistedWorkspace, persistedGeneration, persistedIncarnation);
+		// Projection identity is missing — fall back to the canonical WAL authority.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const broker = canonicalTransaction?.canonical.session.broker;
+		const walWorkspace = optionalString(broker?.workspace);
+		const walGeneration =
+			typeof broker?.endpoint_generation === "number" &&
+			Number.isSafeInteger(broker.endpoint_generation) &&
+			broker.endpoint_generation > 0
+				? broker.endpoint_generation
+				: null;
+		const walIncarnation = optionalString(broker?.endpoint_incarnation);
+		if (!walWorkspace || walGeneration === null || !walIncarnation) return false;
+		return await brokerEndpointIdentityStale(id, walWorkspace, walGeneration, walIncarnation);
+	}
+
+	/**
+	 * Confirm no turn is active for the session, reading the durable authority
+	 * (canonical WAL) and the legacy active-turn projection. `listSessions`
+	 * captures reap candidates before the per-session transition lock is held, so
+	 * a turn can begin in the gap before eviction — this must be re-checked under
+	 * the lock immediately before any irreversible removal.
+	 */
+	async function sessionHasActiveTurn(id: string): Promise<boolean> {
+		const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+		const canonicalActiveTurn = canonicalTransaction
+			? Object.values(canonicalTransaction.canonical.turns).some(turn =>
+					ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+				)
+			: false;
+		return canonicalActiveTurn || (await readActiveTurn(namespaceDir, id)) !== null;
+	}
+
+	/**
+	 * Recovery-safe force eviction for a session whose endpoint is stale. A stale
+	 * endpoint has no live broker to close against, but the session's durable
+	 * footprint must not be orphaned: removing only the projection rows would leak
+	 * the canonical WAL, retained public-delivery claims, and the scheduler/index
+	 * registry hints. We instead write a durable deletion (retirement) record and
+	 * run the same cleanup the normal reap path uses — drain retained deliveries,
+	 * remove the WAL (which also deregisters roster/retained scheduler hints),
+	 * remove projections, and emit the reaped event. If any step cannot finish yet
+	 * the record stays in `cleanup_pending`, so a subsequent reapSession() for this
+	 * id (selected by session_id, not deletion_id) resumes and completes it.
+	 */
+	async function forceEvictStaleSession(sessionId: string): Promise<void> {
+		await ensureQuestionStateReady();
+		// Recover the session by id from the canonical WAL — not just the projection.
+		// A crash/partial-write, or a malformed/legacy projection, can leave canonical
+		// state committed while the projection has lost its endpoint_incarnation.
+		// Keying force eviction off the projection alone would then retire only the
+		// projection files and orphan the WAL, retained public-delivery claims,
+		// registry (roster/retained) hints, and scheduler markers indefinitely: after
+		// three stale sweeps the projection disappears and the normal
+		// deletion-intent/completeDeletionCleanup path can no longer select the id.
+		const canonicalTransaction = await readSessionTransaction(questionPaths, sessionId);
+		if (!canonicalTransaction) {
+			// Canonical state confirmed absent (this also covers the malformed/absent
+			// projection case): the only durable footprint left is the projection, so
+			// best-effort projection removal is all that remains.
+			await removeReapedProjection(sessionId, [], []);
+			return;
+		}
+		// Endpoint authority for the durable retirement comes from the canonical WAL,
+		// never the projection: removeSessionTransaction fences the delete on
+		// `canonicalTransaction.endpoint.incarnation`, so a present-but-stale
+		// projection incarnation would make cleanup fail with endpoint_stale and
+		// orphan the WAL, retained deliveries, and registry state. Using the WAL's
+		// own incarnation guarantees the fence matches.
+		const persistedIncarnation = optionalString(canonicalTransaction.endpoint?.incarnation);
+		if (!persistedIncarnation) {
+			// The WAL exists but never observed an endpoint incarnation, so there is
+			// no authority to fence a durable retirement against. Leave the state for
+			// the normal reap path rather than orphaning the WAL with a
+			// projection-only delete.
+			return;
+		}
+		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
+		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		const now = new Date().toISOString();
+		const entry: NamespaceDeletionEntryV1 = {
+			deletion_id: deletionId,
+			session_id: sessionId,
+			endpoint_incarnation: persistedIncarnation,
+			operation_id: deletionId,
+			key_digest: deletionKey,
+			request_digest: deletionKey,
+			close_key: deletionId,
+			phase: "cleanup_pending",
+			cleanup: {
+				wal: false,
+				turns: false,
+				reports: false,
+				session: false,
+				events: false,
+				turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
+				report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+			},
+			authority_digest: deletionKey,
+			created_at: now,
+			updated_at: now,
+		};
+		await recordDeletionIntent(questionPaths, entry);
+		await completeDeletionCleanup(entry, "idle_reaper_force_evict", true);
+	}
+
 	const sessionReaper: SessionReaper = createSessionReaper(
 		{
 			listSessions: async (): Promise<ReapableSession[]> => {
@@ -6338,6 +6613,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			reapSession: async (sessionId: string): Promise<void> => {
 				const result = await reapSession(sessionId, { reason: "idle_reaper" });
 				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
+			},
+			markSessionDead: async (sessionId: string): Promise<void> => {
+				// Force-evict a session that cannot be reaped normally (endpoint_stale
+				// repeated MAX_REAP_FAILURES times). The candidate was selected before
+				// this transition acquired its per-session lock, so revalidate the
+				// durable authority under the lock: a turn may have started, or the
+				// endpoint may have recovered, since listSessions() ran.
+				await withSessionTransition(sessionId, async () => {
+					if (await sessionHasActiveTurn(sessionId)) return;
+					const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+					// Prove endpoint staleness before any destructive eviction, even when the
+					// projection is absent: isSessionEndpointStale falls back to the canonical
+					// WAL authority to confirm broker absence/mismatch, so a missing or
+					// partially-written projection can no longer force-evict a live broker.
+					if (!(await isSessionEndpointStale(session, sessionId))) return;
+					await forceEvictStaleSession(sessionId);
+				});
 			},
 			now: () => Date.now(),
 		},
@@ -8066,8 +8358,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_list_questions") return await listQuestions(args);
 			if (name === "gjc_coordinator_list_artifacts") return { ok: true, roots: config.allowedRoots };
-			if (name === "gjc_coordinator_read_artifact")
+			if (name === "gjc_coordinator_read_artifact") {
+				// Advertised capability (tools/list) and refusal must agree on the resolved
+				// platform. This can only add a refusal: safeOpenCoordinatorArtifact keeps
+				// the host-real capability and /proc/self/fd identity checks.
+				if (!coordinatorArtifactCapability(platform).available)
+					return publicError(new Error("artifact_unavailable"));
 				return await readCoordinatorArtifact(config, { path: args.path });
+			}
 			if (name === "gjc_coordinator_read_coordination_status") {
 				const scopedSessionId = args.session_id == null ? null : safeExternalId("session", args.session_id);
 				if (scopedSessionId) await ensureQuestionTransaction(scopedSessionId);
@@ -8357,7 +8655,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (matched.length === 0 && timeoutMs > 0) {
 					const deadline = absoluteDeadline;
 					while (matched.length === 0 && Date.now() < deadline && !watchController.signal.aborted) {
-						await waitForCoordinatorEvents(namespaceDir, Math.min(50, Math.max(1, deadline - Date.now())));
+						await waitForCoordinatorEvents(
+							namespaceDir,
+							Math.min(50, Math.max(1, deadline - Date.now())),
+							services.onCoordinatorEventWatchReady,
+							services.onCoordinatorEventWake,
+						);
 						if (Date.now() >= deadline || watchController.signal.aborted) break;
 						try {
 							await exportRetainedDeliveries(32, watchController.signal);
@@ -9120,6 +9423,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session = normalizeSession({
 									session_id: sessionId,
 									cwd: sessionCwd,
+									ephemeral: true,
 									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
 									...(modelResolution.model ? { model: modelResolution.model } : {}),
 									broker_workspace: binding.workspace,
@@ -10696,7 +11000,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { jsonrpc: "2.0", id, result: {} };
 		}
 		if (request.method === "tools/list") {
-			return { jsonrpc: "2.0", id, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
+			return {
+				jsonrpc: "2.0",
+				id,
+				result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(name => toolSchema(name, platform)) },
+			};
 		}
 		if (request.method === "prompts/list") {
 			return { jsonrpc: "2.0", id, result: { prompts: [] } };
@@ -10750,7 +11058,11 @@ export async function handleCoordinatorMcpRequest(
 		};
 	}
 	if (request.method === "tools/list") {
-		return { jsonrpc: "2.0", id: request.id ?? null, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
+		return {
+			jsonrpc: "2.0",
+			id: request.id ?? null,
+			result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(name => toolSchema(name, process.platform)) },
+		};
 	}
 	if (request.method === "prompts/list") {
 		return { jsonrpc: "2.0", id: request.id ?? null, result: { prompts: [] } };

@@ -166,9 +166,10 @@ import { createInterface } from "node:readline/promises";
 // Trusted-local procedural policy only. The Broker and SessionRouter retain session lifecycle and attachment authority.
 
 // Long-running prompts: the SDK deadline is a progress-aware lease (sdk.promptDeadlineMs is
-// an inactivity lease renewed only by attributable tool_execution_start/end for the exact
-// accepted commandId/turnId, bounded by sdk.promptMaxRuntimeMs). Persist session_id/turn_id
-// and reconcile via turn.result (Q26) rather than blindly replaying; heartbeats/streaming/
+// an inactivity lease renewed only by attributable tool_execution_start/update/end for the exact
+// accepted commandId/turnId, bounded by sdk.promptMaxRuntimeMs; a running tool's partial-result
+// tool_execution_update keeps a long-running tool alive mid-run). Persist session_id/turn_id
+// and reconcile via turn.result (Q26) rather than blindly replaying; heartbeats/assistant-text/thinking/
 // retries/other-turn activity do not renew. Distinguish the bounded await_turn poll timeout
 // from the SDK terminal deadline.
 
@@ -348,9 +349,10 @@ import sys
 from typing import Any, NoReturn
 
 # Long-running prompts: the SDK deadline is a progress-aware lease (sdk.promptDeadlineMs is
-# an inactivity lease renewed only by attributable tool_execution_start/end for the exact
-# accepted commandId/turnId, bounded by sdk.promptMaxRuntimeMs). Persist session_id/turn_id
-# and reconcile via turn.result (Q26) rather than blindly replaying; heartbeats/streaming/
+# an inactivity lease renewed only by attributable tool_execution_start/update/end for the exact
+# accepted commandId/turnId, bounded by sdk.promptMaxRuntimeMs; a running tool's partial-result
+# tool_execution_update keeps a long-running tool alive mid-run). Persist session_id/turn_id
+# and reconcile via turn.result (Q26) rather than blindly replaying; heartbeats/assistant-text/thinking/
 # retries/other-turn activity do not renew. Distinguish the bounded await_turn poll timeout
 # from the SDK terminal deadline.
 

@@ -504,6 +504,36 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "src/foo.ts" }]);
 	});
 
+	it("keeps a dropped todo's internal status in plan entry _meta (issue #5669)", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "todo_reminder",
+				todos: [
+					{ content: "rewrite the parser", status: "abandoned" },
+					{ content: "run tests", status: "pending" },
+				],
+				attempt: 1,
+				maxAttempts: 3,
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		// The schema check is half the contract: `_meta` must ride along without putting an
+		// off-spec status on the wire, since `PlanEntryStatus` has only three members.
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			sessionUpdate: string;
+			entries: Array<{ content: string; status: string; _meta?: { gjcTodoStatus?: unknown } }>;
+		};
+		expect(update.sessionUpdate).toBe("plan");
+		// A dropped task renders as `completed` so a client's plan UI stops showing it as
+		// outstanding, while `_meta` keeps the internal truth completion evidence reads.
+		expect(update.entries[0]).toMatchObject({ status: "completed", _meta: { gjcTodoStatus: "abandoned" } });
+		// Emitted for every status, so the field's presence never itself encodes a classification.
+		expect(update.entries[1]).toMatchObject({ status: "pending", _meta: { gjcTodoStatus: "pending" } });
+	});
+
 	it("preserves command text when a command tool update replaces content", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{

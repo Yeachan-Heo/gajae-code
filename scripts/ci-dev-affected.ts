@@ -99,6 +99,21 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
 	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	// Making this module asynchronous (e.g. a top-level `await import(...)`)
+	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
+	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a
+	// non-async module initializer containing `await`, so every compiled binary dies
+	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
+	// Basename matching would never reach that test from this file, which is how
+	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
+	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
+	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
+		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
+		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
+	],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",
@@ -113,11 +128,22 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	// The prompt-deadline docs guard derives its expected figure from this schema's
+	// default, so a change to the default must run it here rather than surfacing as
+	// stale prose after merge (#5637).
+	"packages/coding-agent/src/config/settings-schema.ts": ["scripts/sdk-deadline-docs-parity.test.ts"],
 	"packages/coding-agent/src/session/agent-session.ts": [
 		"packages/coding-agent/test/agent-session-concurrent.test.ts",
 		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+	],
+	// The managed-scope owner-only self-heal budget/latency contract is verified by
+	// a dedicated suite that exercises the bounded walk, targeted repair, and
+	// deferred tail directly (prepare only runs the walk behind a Linux-only
+	// retained authority), so basename matching would miss it.
+	"packages/coding-agent/src/session/internal/managed-session-scope.ts": [
+		"packages/coding-agent/test/managed-scope-self-heal-budget.test.ts",
 	],
 	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
 		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",

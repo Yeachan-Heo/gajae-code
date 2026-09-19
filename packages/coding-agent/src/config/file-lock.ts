@@ -27,6 +27,7 @@ export interface FileLockOptions {
 	retryDelayMs?: number;
 	signal?: AbortSignal;
 	onAcquired?: () => void;
+	onContended?: () => void;
 	/** Stable host identity required to safely reclaim locks on a shared volume. */
 	ownerHostId?: string;
 	/** Previous local host identities accepted only when deciding stale-owner reclamation. */
@@ -84,7 +85,7 @@ export function isFileLockAcquireTimeout(error: unknown): error is FileLockAcqui
 }
 
 const DEFAULT_OPTIONS: Required<
-	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired">
+	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired" | "onContended">
 > = {
 	staleMs: 10_000,
 	retries: 50,
@@ -1363,6 +1364,28 @@ function ownerLiveness(pid: number): OwnerLiveness {
 	}
 }
 
+/**
+ * Does this owner record belong to a machine other than the acquirer's?
+ *
+ * A host-qualified record is foreign unless the acquirer can prove it is its own:
+ * either the identity matches, or it matches an identity this installation used
+ * before. An acquirer carrying no host identity can prove nothing, so every
+ * host-qualified record stays foreign to it. Foreign records fail closed — their
+ * PID values and clocks are not meaningful here, so they are neither reclaimable
+ * nor locally probeable for liveness.
+ *
+ * Shared by the reclamation verdict and the exhaustion diagnostic so the two can
+ * never disagree about whose pid a record names.
+ */
+function lockRecordIsForeignHost(
+	info: LockInfo,
+	ownerHostId: string | undefined,
+	previousOwnerHostIds: readonly string[],
+): boolean {
+	if (ownerHostId === undefined) return info.owner_host_id !== undefined;
+	return info.owner_host_id !== ownerHostId && !previousOwnerHostIds.includes(info.owner_host_id ?? "");
+}
+
 async function staleLockSnapshot(
 	lockPath: string,
 	_staleMs: number,
@@ -1402,13 +1425,7 @@ async function staleLockSnapshot(
 	// A host-qualified lock may only be reclaimed after proving that its owner is
 	// local. Foreign and malformed host-qualified records fail closed: PID values
 	// and clocks are not meaningful across hosts.
-	if (
-		ownerHostId !== undefined &&
-		info.owner_host_id !== ownerHostId &&
-		!previousOwnerHostIds.includes(info.owner_host_id ?? "")
-	)
-		return { stale: false };
-	if (ownerHostId === undefined && info.owner_host_id !== undefined) return { stale: false };
+	if (lockRecordIsForeignHost(info, ownerHostId, previousOwnerHostIds)) return { stale: false };
 	if (ownerIncarnationChanged(info, startTimeCache)) {
 		if (!judgedIdentity) return { stale: false };
 		let currentIdentity: GenericFileLockDirIdentity | null;
@@ -1962,14 +1979,22 @@ async function lockHolderDescription(
 			info = bytes === null ? null : parseLockInfoBytes(bytes);
 		}
 		if (info) {
-			// A lock record carrying a foreign owner_host_id belongs to another
+			// A lock record carrying a FOREIGN owner_host_id belongs to another
 			// machine (shared-volume topic registry): its pid is meaningful only
 			// on that host, so probing the same numeric pid here could mislabel a
 			// coincident local process as the holder. Report the owner host with
-			// unknown liveness instead.
-			if (info.owner_host_id !== undefined) {
+			// unknown liveness instead. The same predicate that decides whether
+			// the record is reclaimable decides whether its pid is probeable, so a
+			// holder this acquirer *may* reclaim is never described as opaque.
+			if (lockRecordIsForeignHost(info, ownerHostId, previousOwnerHostIds)) {
+				// An unqualified record carries no host provenance at all. A host-aware
+				// acquirer still fails closed on it — its pid is never probed and its
+				// lock is never reclaimed — but the diagnostic must say the provenance
+				// is missing instead of naming a host it does not have.
+				const provenance =
+					info.owner_host_id === undefined ? "on an unrecorded host" : `on host ${info.owner_host_id}`;
 				return (
-					`held by pid ${info.pid} on host ${info.owner_host_id} (liveness unknown from this host)` +
+					`held by pid ${info.pid} ${provenance} (liveness unknown from this host)` +
 					` since ${new Date(info.timestamp).toISOString()}`
 				);
 			}
@@ -1977,13 +2002,18 @@ async function lockHolderDescription(
 			// record carries a start_time, the start-time identity match) so a dead
 			// holder whose pid was already reused is not mislabeled "(live)".
 			const alive = ownerIsAlive(info);
+			const liveness = alive
+				? "live"
+				: ownerLiveness(info.pid) === "dead"
+					? "dead but not reaped"
+					: "liveness unknown";
 			return (
 				`held by pid ${info.pid}` +
-				(alive
-					? " (live)"
-					: ownerLiveness(info.pid) === "dead"
-						? " (dead but not reaped)"
-						: " (liveness unknown)") +
+				// Keep the host on a host-qualified local record: on a shared volume the
+				// same pathname is contended from several hosts, so naming the one whose
+				// pid space this verdict came from is what makes it actionable.
+				(info.owner_host_id === undefined ? "" : " on this host") +
+				` (${liveness})` +
 				` since ${new Date(info.timestamp).toISOString()}`
 			);
 		}
@@ -2022,6 +2052,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
+	let contentionObserved = false;
 	let staleRemovalFailure: RecordedStaleRemovalFailure | undefined;
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
@@ -2051,6 +2082,10 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		if (result) {
 			localLockStates.set(localKey, { owner: result, status: "held" });
 			return () => releaseLock(lockPath, result, localKey);
+		}
+		if (!contentionObserved) {
+			contentionObserved = true;
+			opts.onContended?.();
 		}
 		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
 		const localState = localLockStates.get(pendingKey ?? localKey);
@@ -2162,7 +2197,15 @@ export async function inspectFileLockStagingDir(
 	const namePid = fileLockStagingOwnerPid(path.basename(stagingPath));
 	if (namePid === null) return kept;
 	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
-	const root = await fs.lstat(canonical, { bigint: true });
+	// A winning acquirer publishes (renames) its staging directory concurrently, so the
+	// candidate can disappear between the caller's readdir and this observation.
+	let root: BigIntStats;
+	try {
+		root = await fs.lstat(canonical, { bigint: true });
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return { ...kept, reason: "enoent_already_gone" };
+	}
 	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
 	const captured = nativeFileLockBindings().snapshotDirectoryTree(canonical);
 	if (
@@ -2222,14 +2265,24 @@ export async function inspectFileLockStagingDir(
 		!removal.retainedPlaceholderPath &&
 		!removal.retainedUnknownPath
 	) {
-		const detached = await fs.lstat(removal.detachedPath, { bigint: true });
+		let detached: BigIntStats | null;
+		try {
+			detached = await fs.lstat(removal.detachedPath, { bigint: true });
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			detached = null;
+		}
 		if (
-			detached.isDirectory() &&
+			detached?.isDirectory() &&
 			!detached.isSymbolicLink() &&
 			detached.dev.toString() === captured.snapshot.rootDev &&
 			detached.ino.toString() === captured.snapshot.rootIno
 		) {
-			await fs.rmdir(removal.detachedPath);
+			try {
+				await fs.rmdir(removal.detachedPath);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
 			return { ...result, removed: true, reason: "removed" };
 		}
 	}

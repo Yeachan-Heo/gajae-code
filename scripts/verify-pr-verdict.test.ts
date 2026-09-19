@@ -6,6 +6,7 @@ import {
 	authenticatedApproval,
 	canonicalDiffSha256,
 	fetchIndependentReviewerEvidence,
+	gateExitCode,
 	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
@@ -25,7 +26,15 @@ const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} rev
 
 describe("authenticated approval API evidence", () => {
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
-	const review = (state: string, commit = head) => ({ state, commit_id: commit, user: { login: "review-agent" } });
+	// Reviews are submitted after the head commit; a submission that predates the head is a
+	// force-push re-bind and is covered by its own case below (#5692).
+	const headCommittedAt = "2026-09-18T06:00:00Z";
+	const review = (state: string, commit = head, submitted = "2026-09-18T07:00:00Z") => ({
+		state,
+		commit_id: commit,
+		user: { login: "review-agent" },
+		submitted_at: submitted,
+	});
 
 	test.each([
 		{ name: "valid exact-head approval", reviews: [review("APPROVED")], permission: "write", approved: true },
@@ -33,6 +42,8 @@ describe("authenticated approval API evidence", () => {
 		{ name: "dismissed approval", reviews: [review("APPROVED"), review("DISMISSED")], permission: "write", approved: false },
 		{ name: "revoked collaborator permission", reviews: [review("APPROVED")], permission: "read", approved: false },
 		{ name: "stale-head approval", reviews: [review("APPROVED", "d".repeat(40))], permission: "write", approved: false },
+		// #5692: reports this exact head, but submitted before the head commit existed.
+		{ name: "approval re-bound by a force-push", reviews: [review("APPROVED", head, "2026-09-18T02:00:00Z")], permission: "write", approved: false },
 	])("$name", async scenario => {
 		const requests: string[] = [];
 		const originalFetch = globalThis.fetch;
@@ -41,6 +52,8 @@ describe("authenticated approval API evidence", () => {
 			requests.push(endpoint);
 			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-token");
 			if (endpoint === "https://api.github.com/repos/owner/repo/pulls/5416/reviews?per_page=100&page=1") return Response.json(scenario.reviews);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -49,7 +62,10 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			expect(requests.length).toBe(scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission" ? 2 : 1);
+			// Every case now also reads the head commit date; the permission call only
+			// follows a surviving approval.
+			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
+			expect(requests.length).toBe(expectsPermission ? 3 : 2);
 		} finally {
 			spy.mockRestore();
 		}
@@ -167,7 +183,10 @@ describe("review-event mutable PR body refresh", () => {
 		const body = verdict ? approved.replace("merge-approved", verdict) : verdict;
 		const resolved = await resolvePullRequestEvent(event, "pull_request_review", "token", async () => Response.json({ ...event.pull_request, body }));
 		expect(resolved.pull_request?.body).toBe(body);
-		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).ok).toBe(false);
+		// A revoked or empty body can never merge. A blocking verdict is now a withheld
+		// authorization rather than a contract defect, so the invariant is stated on
+		// mergeAuthorized, which covers both halves.
+		expect(validatePrContract(validInput({ body: resolved.pull_request?.body ?? "" })).mergeAuthorized).toBe(false);
 	});
 
 	test("rejects every live authority drift rather than replacing the captured target", async () => {
@@ -272,7 +291,11 @@ describe("validatePrContract", () => {
 	test("local preflight permits blocking verdicts but server merge gate rejects them", () => {
 		const body = approved.replace("merge-approved", "needs-human");
 		expect(validatePrContract(validInput({ body, requireMergeApproved: false })).ok).toBe(true);
-		expect(validatePrContract(validInput({ body, requireMergeApproved: true })).diagnostics[0]).toContain("intentionally blocks merge");
+		// The server still rejects it; the rejection is reported as a withheld merge
+		// authorization instead of a contract defect.
+		const server = validatePrContract(validInput({ body, requireMergeApproved: true }));
+		expect(server.mergeAuthorized).toBe(false);
+		expect(server.authorizationDiagnostics[0]).toContain("intentionally blocks merge");
 	});
 
 	test("server merge approval requires an authenticated exact-head GitHub review", () => {
@@ -284,6 +307,80 @@ describe("validatePrContract", () => {
 		const result = validatePrContract(validInput({ baseSha: "HEAD", headSha: "head", computedDiffSha256: "sha" }));
 		expect(result.diagnostics.join("\n")).toContain("40-hex");
 		expect(result.diagnostics.join("\n")).toContain("lowercase SHA-256");
+	});
+});
+
+/**
+ * The merge-approval gate is reported on its own channel so one red check stops meaning both
+ * "your PR is malformed" and "your PR is waiting for a reviewer". The authorization predicate
+ * itself is unchanged: only which result field carries it moved.
+ */
+describe("merge authorization reported separately from contract validity", () => {
+	const blocked = approved.replace("merge-approved", "needs-human");
+
+	test("needs-human is a valid contract with the merge authorization withheld", () => {
+		const result = validatePrContract(validInput({ body: `## GJC verdict\n\n${blocked}\n` }));
+		expect(result.ok).toBe(true);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.mergeAuthorized).toBe(false);
+		expect(result.authorizationDiagnostics).toHaveLength(1);
+		expect(result.authorizationDiagnostics[0]).toContain("Verdict needs-human intentionally blocks merge.");
+	});
+
+	test("an authenticated exact-head merge-approved authorizes the merge", () => {
+		const result = validatePrContract(validInput());
+		expect(result.ok).toBe(true);
+		expect(result.mergeAuthorized).toBe(true);
+		expect(result.authorizationDiagnostics).toEqual([]);
+	});
+
+	// Forgery and false claims are NOT "waiting for a human": each stays a contract defect
+	// on the contract check, and each still withholds the merge authorization.
+	test.each([
+		["merge-approved claimed with reviewer-id == author", { body: `## GJC verdict\n\n${approved.replace("reviewer-id:review-agent", "reviewer-id:author")}\n`, authenticatedReviewerLogin: "author" }, "cannot be self-approved"],
+		["merge-approved without an authenticated review", { authenticatedReviewerLogin: undefined }, "not backed by an authenticated"],
+		["merge-approved approved on another head", { authenticatedReviewHeadSha: "d".repeat(40) }, "must target exact PR head"],
+		["stale verdict digest", { computedDiffSha256: "d".repeat(64) }, "is stale"],
+		["base not an ancestor of head", { baseIsAncestor: false }, "does not contain immutable event base"],
+		["failed repository fast gate", { fastGatePassed: false }, "Repository fast gate failed"],
+	])("%s stays a contract failure", (_name, overrides, message) => {
+		const result = validatePrContract(validInput(overrides));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain(message);
+		expect(result.authorizationDiagnostics).toEqual([]);
+		// Invariant: a malformed contract can never report an authorized merge.
+		expect(result.mergeAuthorized).toBe(false);
+	});
+
+	test("an invalid contract never authorizes a merge, whatever the verdict says", () => {
+		for (const body of [`## GJC verdict\n\n${approved}\n`, `## GJC verdict\n\n${blocked}\n`, "no verdict at all"]) {
+			for (const overrides of [{}, { fastGatePassed: false }, { baseIsAncestor: false }, { computedDiffSha256: "d".repeat(64) }]) {
+				const result = validatePrContract(validInput({ body, ...overrides }));
+				if (!result.ok) expect(result.mergeAuthorized).toBe(false);
+			}
+		}
+	});
+
+	// Back-compat: every existing caller (--push-preflight, --preflight-command, the local
+	// pre-push hook) passes no --gate and must keep the single combined exit code.
+	test.each([
+		["all", { ok: true, mergeAuthorized: false }, 1],
+		["all", { ok: true, mergeAuthorized: true }, 0],
+		["all", { ok: false, mergeAuthorized: false }, 1],
+		["contract", { ok: true, mergeAuthorized: false }, 0],
+		["contract", { ok: false, mergeAuthorized: false }, 1],
+		["approval", { ok: true, mergeAuthorized: false }, 1],
+		["approval", { ok: true, mergeAuthorized: true }, 0],
+		["approval", { ok: false, mergeAuthorized: false }, 1],
+	] as const)("--gate %s exits %p for %p", (gate, result, code) => {
+		expect(gateExitCode(gate, result)).toBe(code);
+	});
+
+	test("the default gate still fails a needs-human PR exactly as before the split", () => {
+		const result = validatePrContract(validInput({ body: `## GJC verdict\n\n${blocked}\n` }));
+		expect(gateExitCode("all", result)).toBe(1);
+		expect(gateExitCode("contract", result)).toBe(0);
+		expect(gateExitCode("approval", result)).toBe(1);
 	});
 });
 
@@ -1078,9 +1175,14 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		author_association: "OWNER",
 		body: selfReviewRecord({ ...context, risk: "regression-risk", extra: "independent:review-bot" }),
 	}];
-	const reviewerApproval = (context: PushPreflightContext, state = "APPROVED") => [
-		{ author: { login: "review-bot" }, state, commit: { oid: context.headSha } },
-	];
+	// Submitted well after any commit this harness creates, so a genuine approval is never
+	// mistaken for one GitHub re-bound onto a new head by a force-push (#5692). The re-bound
+	// case below uses an epoch-old submission instead.
+	const reviewerApproval = (
+		context: PushPreflightContext,
+		state = "APPROVED",
+		submittedAt = "2099-01-01T00:00:00Z",
+	) => [{ author: { login: "review-bot" }, state, commit: { oid: context.headSha }, submittedAt }];
 
 	test("a risk-classified record is authorized by the named reviewer's exact-head approval and permission", async () => {
 		const result = await runSelfReviewPushPreflight({
@@ -1124,7 +1226,8 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 			comments: riskClassifiedComments,
 			reviews: context => [
 				...reviewerApproval(context),
-				{ author: { login: "review-bot" }, state: "CHANGES_REQUESTED", commit: { oid: context.headSha } },
+				// Later than the approval above, so it supersedes it; both postdate the head.
+				...reviewerApproval(context, "CHANGES_REQUESTED", "2099-01-02T00:00:00Z"),
 			],
 			permission: "write",
 		});
@@ -1132,6 +1235,21 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 		expect(result.stderr).toContain("is not satisfied");
 	});
 
+	test("an approval GitHub re-bound onto the new head after a force-push does not authorize (#5692)", async () => {
+		// The review reports the exact head, but was submitted long before that commit could
+		// have existed. `commit_id` tracks the branch tip across a force-push, so this is the
+		// shape a rebase leaves behind on an unprotected base with no stale-review dismissal.
+		const result = await runSelfReviewPushPreflight({
+			body: riskClassifiedBody,
+			comments: riskClassifiedComments,
+			reviews: context => reviewerApproval(context, "APPROVED", "1970-01-01T00:00:00Z"),
+			permission: "write",
+		});
+		expect(result.exitCode).toBe(1);
+		// Must read as a re-bound stale approval, NOT as a missing one: the remedies differ.
+		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
+		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
+	});
 	test("unreadable independent-review evidence is reported as unread, not as unauthorized", async () => {
 		const result = await runSelfReviewPushPreflight({
 			body: riskClassifiedBody,
@@ -1159,7 +1277,17 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 
 describe("server independent-reviewer evidence (issue #5483 review)", () => {
 	const event = { repository: { full_name: "owner/repo" }, pull_request: { number: 5416 } };
-	const review = (login: string, state: string, commit = head) => ({ state, commit_id: commit, user: { login } });
+	// The head commit's committer date; every genuine review below is submitted after it.
+	const headCommittedAt = "2026-09-18T06:00:00Z";
+	const afterHead = "2026-09-18T07:00:00Z";
+	/** Submitted BEFORE the head existed — only reachable via a force-push re-bind (#5692). */
+	const beforeHead = "2026-09-18T02:00:00Z";
+	const review = (login: string, state: string, commit = head, submitted = afterHead) => ({
+		state,
+		commit_id: commit,
+		user: { login },
+		submitted_at: submitted,
+	});
 
 	test.each([
 		{ name: "approval only", reviews: [review("review-bot", "APPROVED")], approved: true },
@@ -1168,6 +1296,21 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		{ name: "commented review never counts", reviews: [review("review-bot", "COMMENTED")], approved: false },
 		{ name: "approval on another head", reviews: [review("review-bot", "APPROVED", "d".repeat(40))], approved: false },
 		{ name: "another identity's approval", reviews: [review("someone-else", "APPROVED")], approved: false },
+		// #5692: GitHub re-points commit_id onto the new tip after a force-push, so an
+		// approval of older code arrives reporting this exact head. It must not count, and it
+		// must be distinguishable from having no approval at all.
+		{
+			name: "approval re-bound onto this head by a force-push does not count",
+			reviews: [review("review-bot", "APPROVED", head, beforeHead)],
+			approved: false,
+			rebound: true,
+		},
+		{
+			name: "an approval with no submission time fails closed",
+			reviews: [{ state: "APPROVED", commit_id: head, user: { login: "review-bot" } }],
+			approved: false,
+			rebound: true,
+		},
 	]) ("$name", async scenario => {
 		const originalFetch = globalThis.fetch;
 		const previousToken = Bun.env.GITHUB_TOKEN;
@@ -1175,13 +1318,20 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
 			const endpoint = String(input);
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews")) return Response.json(scenario.reviews);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
 		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
-			expect(evidence).toEqual({ permission: "write", approvedHead: scenario.approved, approvedLogin: "review-bot" });
+			expect(evidence).toEqual({
+				permission: "write",
+				approvedHead: scenario.approved,
+				approvedLogin: "review-bot",
+				...(scenario.approved ? {} : { reboundStaleApproval: scenario.rebound === true }),
+			});
 		} finally {
 			spy.mockRestore();
 			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
@@ -1350,6 +1500,39 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("Self-review is stale: base/head/digest do not match this exact PR");
 	expect(workflow).toContain("not the repository owner");
 	expect(workflow).toContain("does not match the PR body risk classification");
+});
+
+test("the merge-approval gate is a separate, fail-closed check in both workflows", async () => {
+	const prContract = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
+	// The contract check keeps its required context name and now reports contract
+	// validity alone; the approval verdict travels as a job output.
+	expect(prContract).toContain("name: Validate exact-head PR contract");
+	expect(prContract).toContain("--gate contract");
+	expect(prContract).toContain("merge_authorized: ${{ steps.validate.outputs.merge_authorized }}");
+	expect(prContract).toContain("name: Merge approval");
+	expect(prContract).toContain('-f name="Merge approval"');
+	expect(devCi).toContain("name: PR contract bootstrap");
+	expect(devCi).toContain("name: Merge approval bootstrap");
+	expect(devCi).toContain("merge_authorized: ${{ steps.contract.outputs['gjc-merge-authorized'] }}");
+	expect(devCi).toContain("gjc-merge-authorized=${mergeAuthorized}");
+	// The pending-approval branch no longer aborts the bootstrap job; every other
+	// failure in that script is still a throw that fails the CONTRACT check.
+	expect(devCi).not.toContain("throw new Error(`Verdict ${verdict} intentionally blocks merge.`)");
+	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
+	expect(devCi).toContain("throw new Error(`Stale verdict digest");
+	expect(devCi).toContain("merge-approved cannot be self-approved");
+	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
+	// job as Success for required checks, so `needs:` alone would publish a green
+	// approval check for a red contract; always() plus an explicit result test cannot.
+	expect(prContract).toContain("needs: [validate]");
+	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+		expect(workflow).toContain(guard);
+		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
+		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');
+		expect(workflow).toContain("https://docs.github.com/en/pull-requests/reference/status-checks");
+	}
 });
 
 test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {

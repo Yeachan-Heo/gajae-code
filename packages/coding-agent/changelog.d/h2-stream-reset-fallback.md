@@ -1,0 +1,3 @@
+### Fixed
+
+- A pre-response HTTP/2 `RST_STREAM` no longer surfaces as a bare `Error: HTTP2StreamReset fetching "…". For more information, pass \`verbose: true\` in the second argument to fetch()`. `HTTP2StreamReset` joins the h2-fetch fallback codes, with HTTP/1.1 replay limited to genuinely bodyless replay-safe methods such as GET, HEAD, and OPTIONS because a pre-response reset does not prove that a non-idempotent request was not processed. Requests with a body preserve the original reset error, which is classified as a transport failure so the surfaced message names the failing host (`transport=HTTP2StreamReset url=…`) instead of Bun's context-free hint.
