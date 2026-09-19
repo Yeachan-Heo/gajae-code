@@ -154,7 +154,17 @@ Inspect what is discoverable and why from the CLI:
 ```sh
 gjc skills discover                # project + user skills with diagnostics
 gjc skills discover --source project --json
+gjc skills discover --query ego-browser      # filter by name/description/source/use conditions
+gjc skills discover --limit 10               # clamped to 1-50; the CLI defaults to 50
+gjc skills discover --offset 50              # zero-based start of the page
 ```
+
+Discovery pages are stateless: when more skills match than fit on one page, the
+diagnostics name the shown range and the total, and the text output prints the
+exact `--offset` command for the next page (with your `--limit`/`--query`/`--source`
+echoed back). The final page prints no continuation; in `--json` that is the
+absent `nextOffset` field, alongside `matching` (skills left after the query
+filter) and `scanned` (skills the filter ran against).
 
 ## Custom directories
 
