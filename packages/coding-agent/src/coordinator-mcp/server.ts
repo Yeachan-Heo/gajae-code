@@ -8329,14 +8329,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 					await reconcileSessionRuntime(canonicalSessionId, { observeQuestions: false });
 					try {
-						const brokerWorkspace = optionalString(session.broker_workspace) ?? cwd;
+						// A projection can be partially written after its canonical WAL commit.
+						// Recover the durable broker identity before proving the live endpoint so
+						// a missing projection field does not turn an indexed session into a
+						// false `not_indexed` result.
+						const canonicalBroker = (await readSessionTransaction(questionPaths, canonicalSessionId))?.canonical
+							.session.broker;
+						const brokerWorkspace =
+							optionalString(session.broker_workspace) ?? optionalString(canonicalBroker?.workspace) ?? cwd;
 						const persistedEndpointGeneration =
 							typeof session.endpoint_generation === "number" &&
 							Number.isSafeInteger(session.endpoint_generation) &&
 							session.endpoint_generation > 0
 								? session.endpoint_generation
-								: null;
-						const persistedEndpointIncarnation = optionalString(session.endpoint_incarnation);
+								: typeof canonicalBroker?.endpoint_generation === "number" &&
+										Number.isSafeInteger(canonicalBroker.endpoint_generation) &&
+										canonicalBroker.endpoint_generation > 0
+									? canonicalBroker.endpoint_generation
+									: null;
+						const persistedEndpointIncarnation =
+							optionalString(session.endpoint_incarnation) ??
+							optionalString(canonicalBroker?.endpoint_incarnation);
 						const expectedAuthority = {
 							sessionId: canonicalSessionId,
 							workspace: brokerWorkspace,
