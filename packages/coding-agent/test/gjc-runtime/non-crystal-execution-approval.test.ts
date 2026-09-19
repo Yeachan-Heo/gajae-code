@@ -55,7 +55,7 @@ async function withSession(fn: (cwd: string, manager: SessionManager, sessionId:
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "ordinary-execution-approval-"));
 	const oldId = process.env.GJC_SESSION_ID;
 	const oldFile = process.env.GJC_SESSION_FILE;
-	const manager = SessionManager.create(cwd, SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")));
+	const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd));
 	try {
 		await initTheme(false);
 		process.env.GJC_SESSION_ID = manager.getSessionId();
@@ -63,6 +63,7 @@ async function withSession(fn: (cwd: string, manager: SessionManager, sessionId:
 		await manager.ensureOnDisk();
 		await manager.flush();
 		process.env.GJC_SESSION_FILE = manager.getSessionFile()!;
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    autoHandoff: off\n");
 		await fn(cwd, manager, manager.getSessionId());
 	} finally {
