@@ -989,7 +989,7 @@ Request shaping:
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
 - `disableReasoningOnForcedToolChoice` — drop `reasoning_effort` / OpenRouter `reasoning` whenever `tool_choice` forces a call. Default: auto (Kimi/Anthropic-fronted endpoints).
-- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
+- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.). A `tool_choice` here acts as an endpoint default rather than an override: it applies only on a turn that offers tools and resolved no directive of its own, so forced-tool directives are preserved and deliberate no-tools turns are left untouched.
 
 Reasoning / thinking:
 
