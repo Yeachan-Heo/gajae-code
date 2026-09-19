@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink, type NativeExactFileIdentity } from "@gajae-code/natives";
-import { canDeliverSdkEvent } from "./host";
+import { canDeliverSdkEvent, TOOL_ACTIVITY_CAPABILITY } from "./host";
 import type { SessionSdkTransport } from "./session-runtime";
 import type { SdkFrame } from "./types";
 
@@ -192,7 +192,14 @@ export async function createSdkWebSocketTransport(
 						websocket: {
 							open(socket) {
 								sockets.set(socket.data.connectionId, socket);
-								socket.send(JSON.stringify({ type: "hello", connectionId: socket.data.connectionId }));
+								socket.send(
+									JSON.stringify({
+										type: "hello",
+										protocolVersion: 3,
+										connectionId: socket.data.connectionId,
+										capabilities: [TOOL_ACTIVITY_CAPABILITY, "turn_stream"],
+									}),
+								);
 							},
 							message(socket, message) {
 								if (sockets.get(socket.data.connectionId) !== socket) return;

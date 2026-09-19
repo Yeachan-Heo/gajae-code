@@ -34,6 +34,41 @@ export type RelayWebSocket = {
 	removeEventListener(type: string, listener: (event: RelayWebSocketEvent) => void): void;
 };
 
+type ServerHello = {
+	type: "hello";
+	protocolVersion?: unknown;
+	capabilities?: unknown;
+};
+
+/**
+ * The relay is an SDK client on its upstream WebSocket leg. Mirror the
+ * endpoint's advertised v3 capabilities back as the client hello so a raw
+ * JSONL consumer (including `sdk serve --stdio`) receives the same gated event
+ * families as a direct SDK client.
+ */
+function relayCapabilitiesFromServerHello(text: string): string[] | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+	const hello = parsed as ServerHello;
+	if (hello.type !== "hello" || hello.protocolVersion !== 3 || !Array.isArray(hello.capabilities)) return undefined;
+	const capabilities = new Set<string>();
+	for (const capability of hello.capabilities)
+		if (typeof capability === "string" && capability.length > 0) capabilities.add(capability);
+	return [...capabilities];
+}
+
+/** Exported for transport tests and consumers that inspect relay negotiation. */
+export function relayClientHelloFromServerHello(text: string): string | undefined {
+	const capabilities = relayCapabilitiesFromServerHello(text);
+	if (capabilities === undefined) return undefined;
+	return JSON.stringify({ type: "hello", protocolVersion: 3, capabilities });
+}
+
 export type RelayOptions = {
 	url: string;
 	token: string;
@@ -112,6 +147,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	let pendingToDownstream = 0;
 	let writingWs = false;
 	let writingDownstream = false;
+	let upstreamHelloRelayed = false;
 
 	const settle = (error?: Error): void => {
 		if (completed) return;
@@ -232,6 +268,13 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		if (typeof event.data !== "string") {
 			fail({ type: "transport_error", code: "protocol_error", direction: "ws->downstream" });
 			return;
+		}
+		if (!upstreamHelloRelayed) {
+			const clientHello = relayClientHelloFromServerHello(event.data);
+			if (clientHello !== undefined) {
+				upstreamHelloRelayed = true;
+				enqueue(toWs, "downstream->ws", Buffer.from(clientHello, "utf8"));
+			}
 		}
 		enqueue(toDownstream, "ws->downstream", Buffer.concat([Buffer.from(event.data, "utf8"), Buffer.from("\n")]));
 	};
