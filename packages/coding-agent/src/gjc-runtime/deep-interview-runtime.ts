@@ -4,14 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
-import {
-	type FileEntry,
-	isProjectSessionTranscriptPath,
-	listProjectSessionTranscriptFiles,
-	parseSessionEntries,
-	RESUME_TRANSCRIPT_MAX_BYTES,
-	readAuthorizedProjectSessionTranscript,
-} from "../session/session-manager";
+import { type FileEntry, parseSessionEntries, RESUME_TRANSCRIPT_MAX_BYTES } from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -671,21 +664,6 @@ function validateTranscriptRecords(records: unknown[]): void {
 	}
 }
 
-/**
- * Crystallization treats a project transcript as authoritative conversation
- * evidence, so only transcripts written by the session manager's managed
- * containers (`agent-session/`, `sessions/`) are eligible. The shared project
- * classifier additionally accepts legacy root-level `.gjc/*.jsonl` files, which
- * any repository content can forge with a matching header; those are rejected
- * here before evidence or approval binding.
- */
-function isManagedProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
-	if (!isProjectSessionTranscriptPath(projectGjcDir, filePath)) return false;
-	const relative = path.relative(projectGjcDir, filePath);
-	const segments = relative.split(path.sep);
-	return segments.length >= 2;
-}
-
 export async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
@@ -698,7 +676,6 @@ export async function authoritativeConversationSnapshot(
 	transcriptSha256: string;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
-	let explicitProjectTranscript = false;
 	if (sessionFile) {
 		sessionFile = path.resolve(cwd, sessionFile);
 		try {
@@ -708,54 +685,35 @@ export async function authoritativeConversationSnapshot(
 			const explicitRealPath = await fs.realpath(sessionFile);
 			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
 			sessionFile = explicitRealPath;
-			explicitProjectTranscript = isManagedProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
-			if (
-				explicitProjectTranscript &&
-				!readAuthorizedProjectSessionTranscript(
-					path.resolve(cwd, ".gjc"),
-					explicitRealPath,
-					RESUME_TRANSCRIPT_MAX_BYTES,
-				)
-			)
-				throw new Error("unauthorized project transcript");
 		} catch {
-			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
+			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a canonical transcript file");
 		}
 	}
 	const canonicalCandidates = new Set<string>();
 	const managedCandidates = new Set<string>();
 	const lexicalCandidates = new Set<string>();
-	if (!sessionFile) {
-		const projectGjcDir = path.resolve(cwd, ".gjc");
-		for (const candidate of listProjectSessionTranscriptFiles(cwd)) {
-			const resolved = path.resolve(candidate);
-			// Legacy root-level `.gjc/*.jsonl` files are listed for session resume
-			// compatibility, but they are not trusted-writer provenance, so they can
-			// never become authoritative crystallization evidence.
-			if (isManagedProjectSessionTranscriptPath(projectGjcDir, resolved)) lexicalCandidates.add(resolved);
-		}
-	}
-	if (!explicitProjectTranscript) {
-		const managedScope = await resolveManagedSessionScope({ cwd });
-		if (managedScope.kind === "error")
-			throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
-		if (managedScope.kind === "resolved") {
-			const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
-			if (managedListing.kind === "error")
-				throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
-			for (const candidate of managedListing.owned) {
-				const resolved = path.resolve(candidate.path);
-				managedCandidates.add(resolved);
-				lexicalCandidates.add(resolved);
-			}
+	const managedScope = await resolveManagedSessionScope({ cwd });
+	if (managedScope.kind === "error")
+		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
+	if (managedScope.kind === "resolved") {
+		const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
+		if (managedListing.kind === "error")
+			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
+		for (const candidate of managedListing.owned) {
+			const resolved = path.resolve(candidate.path);
+			managedCandidates.add(resolved);
+			lexicalCandidates.add(resolved);
 		}
 	}
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
-	// workspace so transcript identity and content cannot drift with process launch location.
+	// so transcript identity and content cannot drift with process launch location.
 	if (sessionFile) {
-		if (!explicitProjectTranscript && !managedCandidates.has(sessionFile))
-			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
+		if (!managedCandidates.has(sessionFile))
+			throw new DeepInterviewCommandError(
+				2,
+				`GJC_SESSION_FILE points to an unmanaged transcript (${sessionFile}); use the managed session directory instead`,
+			);
 	} else {
 		if (lexicalCandidates.size > 1000)
 			throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
@@ -770,12 +728,9 @@ export async function authoritativeConversationSnapshot(
 		}
 		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
-				const projectGjcDir = path.resolve(cwd, ".gjc");
-				const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, candidate)
-					? readAuthorizedProjectSessionTranscript(projectGjcDir, candidate, RESUME_TRANSCRIPT_MAX_BYTES)
-					: await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
-							allowMissing: true,
-						});
+				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
+					allowMissing: true,
+				});
 				if (!bytes) continue;
 				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
 					string,
@@ -795,10 +750,7 @@ export async function authoritativeConversationSnapshot(
 	if (!sessionFile)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
-		const projectGjcDir = path.resolve(cwd, ".gjc");
-		const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, sessionFile)
-			? readAuthorizedProjectSessionTranscript(projectGjcDir, sessionFile, RESUME_TRANSCRIPT_MAX_BYTES)
-			: await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
 		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
 		const text = boundedUtf8(bytes, "live session transcript");
 		const records: unknown[] = [];
