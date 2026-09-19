@@ -1,7 +1,7 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
-import { decideLogDirIsolation } from "./test-log-dir-isolation";
+import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -59,6 +59,29 @@ if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 // behaviour changes.
 const projectEnv = projectEnvSnapshot(process.cwd());
 
+// Capture the operator's canonical user-state decision before replacing the
+// agent directory with a per-process temp profile. Importing the resolver here
+// is safe because it is immediately rebuilt after the isolation variables are
+// installed; the pre-isolation snapshot is needed to identify an inherited
+// XDG sink that belongs to the operator's default profile.
+const {
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	resetAgentDirFromEnvironment,
+} = await import("../packages/utils/src/dirs");
+const preIsolationHome = getTrustedHomeDir();
+const profileMarker = process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY;
+const preIsolationXdgEligible = profileMarker
+	? profileMarker === "default"
+	: getAgentProfileAuthority() === "default";
+process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
+const preIsolationLogEnv = {
+	GJC_LOG_DIR: process.env.GJC_LOG_DIR,
+	GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+	PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+	XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+};
+
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -76,7 +99,7 @@ const projectEnv = projectEnvSnapshot(process.cwd());
 // would silently run the suite against the operator's live agent dir, which is
 // the exact destructive regression this preload exists to prevent.
 const isolation = decideAgentDirIsolation({
-	home: os.homedir(),
+	home: preIsolationHome,
 	env: {
 		GJC_CODING_AGENT_DIR: process.env.GJC_CODING_AGENT_DIR,
 		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
@@ -98,6 +121,11 @@ if (isolation.action === "isolate") {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 }
 
+// `dirs.ts` was loaded above to capture the operator profile. Rebuild its
+// resolver after the agent isolation variables change so production consumers
+// in this test process resolve the isolated profile, not the pre-isolation one.
+resetAgentDirFromEnvironment();
+
 // Isolate the log sink for every test process (issue #5618). The agent-dir
 // isolation above does not cover logging: `getLogsDir()` resolves
 // `rootSubdir("logs", "state")` — the REAL config root — so fixtures that drive
@@ -110,11 +138,12 @@ if (isolation.action === "isolate") {
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so that is honored untouched — but only when the pin is
-// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
-// `cwd/.env` into `process.env` before any module runs, so a checkout that
-// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
-// happen. The decision (including that distrust rule) lives in
+// on log content), so that is honored untouched — but only when that pin is
+// trusted and does not resolve to the canonical shared user sink. A nonblank
+// value is not evidence of intent on its own: Bun overlays `cwd/.env` into
+// `process.env` before any module runs, so a checkout that declares GJC_LOG_DIR
+// would otherwise be honored here and isolation would never happen. The
+// decision (including that distrust rule and the shared-sink guard) lives in
 // ./test-log-dir-isolation.ts so it is unit-testable without importing this
 // preload's side effects.
 //
@@ -124,8 +153,14 @@ if (isolation.action === "isolate") {
 // run the suite against the operator's live log sink, which is the regression
 // this exists to prevent.
 const logIsolation = decideLogDirIsolation({
-	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
+	env: preIsolationLogEnv,
 	projectEnv,
+	sharedLogDir: defaultLogDirFor({
+		home: preIsolationHome,
+		env: preIsolationLogEnv,
+		projectEnv,
+		xdgEligible: preIsolationXdgEligible,
+	}),
 });
 if (logIsolation.action === "fail") {
 	throw new Error(
