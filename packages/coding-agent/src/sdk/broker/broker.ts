@@ -1818,6 +1818,14 @@ export class Broker {
 				worktrees: auth.worktrees,
 				...(auth.aliases ? { aliases: auth.aliases } : {}),
 			});
+			let rootWasEnrolled = false;
+			try {
+				rootWasEnrolled = (await loadManagedEnrollmentRecord(this.settings.agentDir)).controlRoots.includes(
+					binding.controlRoot,
+				);
+			} catch {
+				throw new Error("native managed evidence exists");
+			}
 			// Publish the enrollment before the first domain snapshot.  The index is
 			// the recovery root list, so this ordering leaves only a recoverable
 			// stale index entry if the process dies before the state publication.
@@ -1836,7 +1844,7 @@ export class Broker {
 									} catch {
 										throw new Error("native managed evidence exists");
 									}
-									if ((enrolled.byRoot[binding.controlRoot] ?? []).length > 0)
+									if (rootWasEnrolled || (enrolled.byRoot[binding.controlRoot] ?? []).length > 0)
 										throw new Error("native managed evidence exists");
 									const enrolledNatives = new Set(enrolled.nativeIdentities);
 									if (
