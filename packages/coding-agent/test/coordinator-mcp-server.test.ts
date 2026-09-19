@@ -72,6 +72,7 @@ import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import { resolveSdkHostModel, type SdkHostModelRegistryLoader } from "../src/sdk/host/model-pin";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import { writeDurableCoordinatorSession } from "./helpers/coordinator-session-fixture";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
