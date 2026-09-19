@@ -333,6 +333,27 @@ curl_github() {
     fi
 }
 
+# api.github.com allows only 60 unauthenticated requests/hour per IP, and a
+# shared/NAT'd host can arrive with that budget already spent. The github.com
+# web route 302s /releases/latest to /releases/tag/<tag> without touching the
+# API limit, and it is the same origin the binaries download from.
+resolve_stable_tag_via_web() {
+    location=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+        -A "gjc-install" \
+        --retry 3 --retry-delay 1 \
+        "https://github.com/${REPO}/releases/latest" 2>/dev/null) || return 1
+    case "$location" in
+        "https://github.com/${REPO}/releases/tag/"*) ;;
+        *) return 1 ;;
+    esac
+    tag=${location#"https://github.com/${REPO}/releases/tag/"}
+    case "$tag" in
+        */* | "") return 1 ;;
+    esac
+    is_stable_release_tag "$tag" || return 1
+    printf '%s' "$tag"
+}
+
 curl_github_optional() {
     url="$1"
     out="$2"
@@ -609,10 +630,15 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
         fi
     else
         echo "Fetching latest stable GitHub release..."
-        if ! curl_github "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"; then
-            die "Failed to fetch the latest GitHub release"
+        if curl_github "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"; then
+            LATEST=$(extract_json_string "$json_tmp" "tag_name")
+        else
+            LATEST=$(resolve_stable_tag_via_web) || LATEST=""
+            if [ -z "$LATEST" ]; then
+                die "Failed to fetch the latest GitHub release. If api.github.com is rate limited, set GITHUB_TOKEN or GH_TOKEN and retry."
+            fi
+            echo "api.github.com was unavailable; resolved ${LATEST} through github.com instead."
         fi
-        LATEST=$(extract_json_string "$json_tmp" "tag_name")
     fi
 
     if [ -n "$REF" ]; then
