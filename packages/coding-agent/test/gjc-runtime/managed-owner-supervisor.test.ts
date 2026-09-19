@@ -448,6 +448,27 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("records a child exit code 75 as unexpected owner loss", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "process.exit(75)"],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+			);
+			expect(result.exitCode).toBe(75);
+			expect(await Bun.file(lifecyclePaths(stateDir, "session-2681", "generation-2681").verdictFile).json()).toMatchObject({
+				signal: "EXIT",
+				exit_code: 75,
+				result: "unknown_terminal",
+				classification: "unexpected_owner_loss",
+				reason: "terminal_observation",
+			});
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 	it("publishes clean EXIT evidence without stranding the next replacement", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		const sessionId = "session-2681";

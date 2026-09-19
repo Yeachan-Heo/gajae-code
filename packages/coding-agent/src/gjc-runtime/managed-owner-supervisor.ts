@@ -558,7 +558,6 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		}
 	} else if (
 		child.signalCode !== "SIGABRT" &&
-		exitCode !== 75 &&
 		(sigtermRelayed || child.signalCode || exitCode !== 0)
 	) {
 		try {
