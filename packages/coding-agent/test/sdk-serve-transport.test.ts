@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -13,7 +13,12 @@ import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
-import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
+import {
+	DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS,
+	type RelayWebSocket,
+	startRelayPair,
+	type TransportError,
+} from "../src/sdk/transport/relay.js";
 import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
@@ -486,6 +491,52 @@ describe("SDK serve raw relay", () => {
 		} finally {
 			await pair.close();
 			server.stop(true);
+		}
+	});
+
+	test("bounds the upstream hello wait and closes a silent upstream", async () => {
+		vi.useFakeTimers();
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+				},
+				message(ws, message) {
+					connections.find(connection => connection.ws === ws)?.messages.push(String(message));
+				},
+			},
+		});
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const errors: TransportError[] = [];
+		const pair = await startRelayPair({
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: error => errors.push(error),
+		});
+		try {
+			await waitFor(() => connections[0], "silent upstream connection");
+			input.write('{"queued":true}\n');
+			vi.advanceTimersByTime(DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS);
+			expect(errors[0]).toMatchObject({
+				code: "protocol_error",
+				direction: "ws->downstream",
+			});
+			await expect(pair.done).rejects.toThrow("protocol_error");
+			expect(connections[0]?.messages).toEqual([]);
+		} finally {
+			await pair.close();
+			server.stop(true);
+			vi.useRealTimers();
 		}
 	});
 

@@ -3,6 +3,7 @@ import type { Readable, Writable } from "node:stream";
 export const REQUEST_FRAME_BYTES = 256 * 1024;
 export const DEFAULT_PENDING_CEILING_BYTES = 8 * 1024 * 1024;
 export const MIN_PENDING_CEILING_BYTES = REQUEST_FRAME_BYTES;
+export const DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS = 10_000;
 
 export type RelayDirection = "downstream->ws" | "ws->downstream";
 export type TransportError = {
@@ -131,6 +132,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	let upstreamHelloReceived = false;
 	let preHelloToWs: Buffer[] = [];
 	let preHelloToWsBytes = 0;
+	let upstreamHelloTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const settle = (error?: Error): void => {
 		if (completed) return;
@@ -140,6 +142,8 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	};
 	void finished.promise.catch(() => undefined);
 	const detach = (): void => {
+		if (upstreamHelloTimer !== undefined) clearTimeout(upstreamHelloTimer);
+		upstreamHelloTimer = undefined;
 		options.downstream.removeListener("data", onData);
 		options.downstream.removeListener("end", onEnd);
 		options.downstream.removeListener("error", onDownstreamError);
@@ -261,6 +265,8 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		}
 		if (!upstreamHelloReceived && isServerHello(event.data)) {
 			upstreamHelloReceived = true;
+			if (upstreamHelloTimer !== undefined) clearTimeout(upstreamHelloTimer);
+			upstreamHelloTimer = undefined;
 			const queued = preHelloToWs;
 			preHelloToWs = [];
 			preHelloToWsBytes = 0;
@@ -272,6 +278,13 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	const onWebSocketError = (): void => void close(new Error("upstream_error"));
 	const onOpen = (): void => {
 		cleanupOpening();
+		if (!upstreamHelloReceived) {
+			upstreamHelloTimer = setTimeout(() => {
+				if (!upstreamHelloReceived && !closed)
+					fail({ type: "transport_error", code: "protocol_error", direction: "ws->downstream" });
+			}, DEFAULT_UPSTREAM_HELLO_TIMEOUT_MS);
+			upstreamHelloTimer.unref?.();
+		}
 		opened.resolve();
 	};
 	const onOpenError = (): void => {
