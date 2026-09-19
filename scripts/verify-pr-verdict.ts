@@ -116,13 +116,20 @@ interface EffectiveReview {
  * writes and the contributor cannot.
  *
  * Both timestamps must be readable and parseable; an unknown time is never treated as fresh.
+ *
+ * A TIE is refused, not admitted. GitHub serializes both values at second granularity, so a
+ * review submitted at `12:00:00.9` and a force-push recorded at `12:00:00.1` are
+ * indistinguishable — the review predates the head it claims and would still be accepted by
+ * a strict `<`. No legitimate review is submitted in the same second as the force-push that
+ * created the head it reviews, since the reviewer has to fetch and read it first, so
+ * rejecting ties costs nothing real (#5692 review).
  */
 function reviewPrecedesHead(submittedAt: string | undefined, headKnownAt: string | undefined): boolean {
 	if (submittedAt === undefined || headKnownAt === undefined) return true;
 	const submitted = Date.parse(submittedAt);
 	const known = Date.parse(headKnownAt);
 	if (!Number.isFinite(submitted) || !Number.isFinite(known)) return true;
-	return submitted < known;
+	return submitted <= known;
 }
 
 /**
@@ -207,7 +214,7 @@ function refusedApprovalKind(
 	if (!Number.isFinite(headMs)) return "unreadable";
 	if (bound.some(review => {
 		const submitted = review.submittedAt === undefined ? Number.NaN : Date.parse(review.submittedAt);
-		return Number.isFinite(submitted) && submitted < headMs;
+		return Number.isFinite(submitted) && submitted <= headMs;
 	}))
 		return "rebound";
 	return "unreadable";
