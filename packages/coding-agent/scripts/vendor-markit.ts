@@ -91,11 +91,14 @@ async function verifyContents(directory: string): Promise<void> {
 		throw new Error("Converter must use vendored Markit and pinned mupdf@1.28.0");
 	}
 	const extract = await Bun.file(path.join(directory, "dist/converters/pdf/extract.js")).text();
+	const mupdfLoader = await Bun.file(path.join(directory, "dist/converters/pdf/mupdf-loader.js")).text();
 	const markit = await Bun.file(path.join(directory, "dist/markit.js")).text();
 	if (
 		/require\(["']mupdf["']\)/u.test(extract) ||
 		!extract.includes("\nlet mupdf;\n") ||
-		!extract.includes('mupdf = await import("mupdf")') ||
+		!extract.includes('import { loadMuPdf } from "./mupdf-loader.js";') ||
+		!extract.includes("mupdf = await loadMuPdf()") ||
+		!mupdfLoader.includes('import("mupdf")') ||
 		!extract.includes('new Error("MuPDF module initialization failed", { cause })') ||
 		!markit.includes("new AggregateError(errors.map((entry) => entry.error)") ||
 		!markit.includes("{ cause: errors[0].error }")

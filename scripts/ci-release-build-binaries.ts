@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildReleaseCompileArgs } from "../packages/coding-agent/scripts/compile-args";
 import { generateMuPdfAsset, resetMuPdfAsset } from "../packages/coding-agent/scripts/embed-mupdf";
+import { verifyMuPdfReleaseMaterials } from "./mupdf-release-materials";
 import { signMacOSBinary } from "./macos-code-signing";
 
 interface BinaryTarget {
@@ -193,7 +194,11 @@ async function main(): Promise<void> {
 	try {
 		await generateBundle();
 		if (isDryRun) console.log("DRY RUN bun packages/coding-agent/scripts/embed-mupdf.ts");
-		else await generateMuPdfAsset();
+		else {
+			const materials = await verifyMuPdfReleaseMaterials();
+			console.log(`Verified MuPDF corresponding-source materials: ${materials}`);
+			await generateMuPdfAsset();
+		}
 		for (const target of selectedTargets) {
 			await buildBinary(target);
 		}

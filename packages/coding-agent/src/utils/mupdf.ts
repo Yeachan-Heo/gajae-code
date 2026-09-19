@@ -9,6 +9,16 @@ let wasmAsset: string | undefined;
 let initializationFailure: unknown;
 let preparation: Promise<void> | undefined;
 
+interface MuPdfModuleConfiguration {
+	wasmBinary?: Uint8Array;
+	locateFile?: (filename?: string) => string;
+	onAbort?: (error: unknown) => void;
+}
+
+type MuPdfGlobal = typeof globalThis & {
+	$libmupdf_wasm_Module?: MuPdfModuleConfiguration;
+};
+
 function resolveWasmAsset(): string {
 	if (wasmAsset) return wasmAsset;
 	let moduleMapping: string;
@@ -29,36 +39,64 @@ function resolveWasmAsset(): string {
 
 // The official Emscripten hook is consumed by markit-ai's lazy MuPDF import.
 // Capture initialization aborts while preserving the import error's cause chain.
-const configuration: {
-	wasmBinary?: Uint8Array;
-	locateFile: () => string;
-	onAbort: (error: unknown) => void;
-} = {
+const globalScope = globalThis as MuPdfGlobal;
+const hostConfiguration = globalScope.$libmupdf_wasm_Module;
+const configuration: MuPdfModuleConfiguration = hostConfiguration ?? {
 	locateFile: resolveWasmAsset,
 	onAbort(error: unknown) {
 		initializationFailure = error;
 	},
 };
 
-Object.assign(globalThis, { $libmupdf_wasm_Module: configuration });
+if (hostConfiguration === undefined) {
+	globalScope.$libmupdf_wasm_Module = configuration;
+} else {
+	// Reuse an SDK host's configuration and hooks. Only fill absent fields; do
+	// not replace locateFile/onAbort or discard caller-owned settings.
+	if (configuration.locateFile === undefined) configuration.locateFile = resolveWasmAsset;
+	if (configuration.onAbort === undefined) {
+		configuration.onAbort = error => {
+			initializationFailure = error;
+		};
+	}
+}
+
+function preparationAsset(): string {
+	const configuredPath = configuration.locateFile?.("mupdf-wasm.wasm");
+	return configuredPath ?? resolveWasmAsset();
+}
 
 export function prepareMuPdf(): Promise<void> {
-	preparation ??= Promise.resolve().then(async () => {
-		const bytes = await Bun.file(resolveWasmAsset()).bytes();
-		// Reject corrupt assets before Emscripten starts: its abort path can also
-		// reject a secondary promise even when the module import is caught.
-		await WebAssembly.compile(bytes);
-		configuration.wasmBinary = bytes;
-	});
+	// A new conversion attempt must not inherit an abort from a prior attempt.
+	initializationFailure = undefined;
+	const previousWasmBinary = configuration.wasmBinary;
+	preparation ??= Promise.resolve()
+		.then(async () => {
+			const bytes = await Bun.file(preparationAsset()).bytes();
+			// Reject corrupt assets before Emscripten starts: its abort path can also
+			// reject a secondary promise even when the module import is caught.
+			await WebAssembly.compile(bytes);
+			if (configuration.wasmBinary === undefined) configuration.wasmBinary = bytes;
+		})
+		.catch(error => {
+			preparation = undefined;
+			configuration.wasmBinary = previousWasmBinary;
+			throw error;
+		});
 	return preparation;
 }
 
 export function withMuPdfDiagnostic(error: unknown): Error {
-	const cause = initializationFailure ?? error;
+	const capturedInitializationFailure = initializationFailure;
+	initializationFailure = undefined;
+	const cause = capturedInitializationFailure ?? error;
 	logger.debug("MuPDF conversion failed", {
-		mapping: mupdfAssetMapping,
-		error: util.inspect(error, { depth: null, colors: false }),
-		initializationFailure: util.inspect(initializationFailure, { depth: null, colors: false }),
+		asset: embeddedMuPdfWasm ? "embedded" : "package",
+		error: sanitizeMuPdfDiagnostic(util.inspect(error, { depth: null, colors: false })),
+		initializationFailure:
+			capturedInitializationFailure === undefined
+				? "undefined"
+				: sanitizeMuPdfDiagnostic(util.inspect(capturedInitializationFailure, { depth: null, colors: false })),
 	});
 	const asset = embeddedMuPdfWasm ? "embedded asset" : "package asset";
 	return new Error(`PDF conversion failed [MuPDF; ${asset}; mupdf-wasm.wasm]`, { cause });

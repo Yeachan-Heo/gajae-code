@@ -7,6 +7,7 @@
  *
  * Coordinate system: PDF native (origin = bottom-left, Y increases upward).
  */
+import { loadMuPdf } from "./mupdf-loader.js";
 // ---------------------------------------------------------------------------
 // Text extraction
 // ---------------------------------------------------------------------------
@@ -455,7 +456,7 @@ export function renderImageRegion(input, region) {
  */
 export async function extractPages(input) {
     try {
-        mupdf = await import("mupdf");
+        mupdf = await loadMuPdf();
     }
     catch (cause) {
         throw new Error("MuPDF module initialization failed", { cause });

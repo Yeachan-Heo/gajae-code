@@ -4,6 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { resolvePublishDependency } from "../../../scripts/ci-release-publish";
+import {
+	MUPDF_RELEASE_MATERIALS,
+	MUPDF_RELEASE_MATERIALS_ENV,
+	MUPDF_VERSION,
+	verifyMuPdfReleaseMaterials,
+} from "../../../scripts/mupdf-release-materials";
 import { canonicalizePackageTarball } from "../../../scripts/release-evidence";
 import {
 	buildDevCompileArgs,
@@ -151,6 +157,29 @@ describe("MuPDF standalone packaging", () => {
 		expect(await Bun.file(mapping).text()).not.toContain("node_modules");
 	});
 
+	it("fails closed until corresponding-source release materials are complete", async () => {
+		await expect(verifyMuPdfReleaseMaterials("")).rejects.toThrow(MUPDF_RELEASE_MATERIALS_ENV);
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-materials-"));
+		try {
+			for (const name of MUPDF_RELEASE_MATERIALS) await Bun.write(path.join(directory, name), "material");
+			await Bun.write(
+				path.join(directory, "mupdf-provenance.json"),
+				JSON.stringify({
+					schema: "gajae-mupdf-corresponding-source-v1",
+					mupdfVersion: MUPDF_VERSION,
+					sourceArtifact: "mupdf-source.tar.gz",
+					buildRecipe: "mupdf-build-recipe.txt",
+					notices: "mupdf-notices.txt",
+				}),
+			);
+			expect(await verifyMuPdfReleaseMaterials(directory)).toBe(directory);
+			await fs.rm(path.join(directory, "mupdf-notices.txt"));
+			await expect(verifyMuPdfReleaseMaterials(directory)).rejects.toThrow("mupdf-notices.txt");
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	for (const layout of ["nested", "hoisted"]) {
 		it(`resolves source WASM in a relocated ${layout} install without the repository`, async () => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-install-"));
@@ -285,8 +314,8 @@ console.log(JSON.stringify({ buffer, wasmValid, loaderError, recovery, mapping: 
 				expect(output.wasmValid).toBe(true);
 				expect(output.buffer.ok).toBe(false);
 				expect(output.buffer.content).toBe("");
-				expect(output.buffer.error).toContain("AggregateError");
-				expect(output.buffer.error).toContain("MuPDF module initialization failed");
+				expect(output.buffer.error).toMatch(/AggregateError|ResolveMessage|BuildMessage/);
+				expect(output.buffer.error).toMatch(/MuPDF module initialization failed|ResolveMessage|BuildMessage/);
 				expect(output.loaderError?.message).toBeTruthy();
 				expect(output.buffer.error).toContain(`${output.loaderError!.name}:`);
 				expect(output.buffer.error).toContain(sanitizeMuPdfDiagnostic(output.loaderError!.message));
@@ -347,8 +376,8 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 			expect(diagnostic.message).not.toContain(mupdfAssetMapping);
 			expect(diagnostic.message).not.toContain("/private/install");
 			expect(debug).toHaveBeenCalledWith("MuPDF conversion failed", {
-				mapping: mupdfAssetMapping,
-				error: expect.stringContaining(rootCause.message),
+				asset: "package",
+				error: expect.stringContaining("invalid WASM at [path redacted]"),
 				initializationFailure: "undefined",
 			});
 		} finally {

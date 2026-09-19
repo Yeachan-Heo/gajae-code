@@ -1,5 +1,5 @@
 import { untilAborted } from "@gajae-code/utils";
-import { Markit, type StreamInfo } from "../../vendor/markit-ai/dist/index.js";
+import type { Markit, StreamInfo } from "../../vendor/markit-ai/dist/index.js";
 import { ToolAbortError } from "../tools/tool-errors";
 import { prepareMuPdf, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "./mupdf";
 
@@ -10,6 +10,22 @@ export interface MarkitConversionResult {
 }
 
 let instance: Markit | undefined;
+let instancePromise: Promise<Markit> | undefined;
+
+async function loadMarkit(): Promise<Markit> {
+	if (instancePromise === undefined) {
+		instancePromise = import("../../vendor/markit-ai/dist/index.js")
+			.then(({ Markit: MarkitConstructor }) => {
+				instance = new MarkitConstructor();
+				return instance;
+			})
+			.catch(error => {
+				instancePromise = undefined;
+				throw error;
+			});
+	}
+	return instancePromise;
+}
 
 function normalizeExtension(extension: string): string {
 	const trimmed = extension.trim().toLowerCase();
@@ -36,8 +52,7 @@ function normalizeError(error: unknown, pdf = false): string {
 
 async function runMarkitConversion<T>(task: (markit: Markit) => Promise<T>, signal?: AbortSignal): Promise<T> {
 	try {
-		instance ??= new Markit();
-		const markit = instance;
+		const markit = instance ?? (await loadMarkit());
 		return signal ? await untilAborted(signal, () => task(markit)) : await task(markit);
 	} catch (error) {
 		if (error instanceof ToolAbortError) {
@@ -60,8 +75,8 @@ function finalizeConversion(markdown?: string): MarkitConversionResult {
 
 export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
 	try {
+		if (filePath.toLowerCase().endsWith(".pdf")) await prepareMuPdf();
 		const result = await runMarkitConversion(async markit => {
-			if (filePath.toLowerCase().endsWith(".pdf")) await prepareMuPdf();
 			return markit.convertFile(filePath);
 		}, signal);
 		return finalizeConversion(result.markdown);
@@ -91,8 +106,8 @@ export async function convertBufferWithMarkit(
 	};
 
 	try {
+		if (normalizedExtension === ".pdf") await prepareMuPdf();
 		const result = await runMarkitConversion(async markit => {
-			if (normalizedExtension === ".pdf") await prepareMuPdf();
 			return markit.convert(Buffer.from(buffer), streamInfo);
 		}, signal);
 		return finalizeConversion(result.markdown);

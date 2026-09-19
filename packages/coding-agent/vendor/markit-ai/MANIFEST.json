@@ -166,7 +166,7 @@
 		},
 		{
 			"path": "dist/converters/pdf/extract.js",
-			"sha256": "66f5b6ae4c49b4c158fe1616afe2c251c47d3499f4ba748b6b3103abf23581f8"
+			"sha256": "d361c2685f5684e64d1ffd2c8f64d5e2cb3931aae67cd154f12576cee14b9b84"
 		},
 		{
 			"path": "dist/converters/pdf/grid.d.ts",
@@ -191,6 +191,10 @@
 		{
 			"path": "dist/converters/pdf/index.js",
 			"sha256": "903c55e04f31366e28e454abb96d99f7d058368672b1bfe2a79052e90a2d452a"
+		},
+		{
+			"path": "dist/converters/pdf/mupdf-loader.js",
+			"sha256": "f15708fa360fc9e678d0d511ae4d634dc5a15da9bfa47d3e335857315f87660a"
 		},
 		{
 			"path": "dist/converters/pdf/render.d.ts",

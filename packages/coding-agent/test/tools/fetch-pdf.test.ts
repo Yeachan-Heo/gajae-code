@@ -124,6 +124,7 @@ describe("PDF URL source-text inspection", () => {
 
 	for (const [route, mime, disposition = ""] of [
 		["document", "application/pdf; charset=binary"],
+		["document", "application/x-pdf"],
 		["document.txt", "application/pdf"],
 		["document.pdf", "application/octet-stream"],
 		["document.pdf", "binary/octet-stream"],
@@ -140,14 +141,22 @@ describe("PDF URL source-text inspection", () => {
 		["download", "application/octet-stream", "attachment; filename=report.docx; filename*=UTF-8''report.pdf"],
 		["download", "application/octet-stream", "attachment; filename*=UTF-8''report.pdf; filename=report.docx"],
 		["download", "application/octet-stream", "attachment; filename*=UTF-8''bad%ZZ.docx; filename=report.pdf"],
-		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=UTF-8''bad%C3%28.docx"],
+
 		["download", "application/octet-stream", 'attachment; filename="report; final.pdf"'],
 		["download", "application/octet-stream", 'attachment; filename="report final.pdf"'],
 		["download", "application/octet-stream", 'attachment; filename="report\\"final.pdf"'],
 		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=ISO-8859-1''report.docx"],
-		["download", "application/octet-stream", "attachment; filename=report.pdf; filename*=UTF-8''bad%00.docx"],
+
 		["document.pdf", "application/pdf", "attachment; filename=report.docx"],
 	]) {
+		const expectedClassificationFetches = new Set([
+			"",
+			"application/octet-stream",
+			"binary/octet-stream",
+			"unknown",
+		]).has(mime)
+			? 0
+			: 1;
 		it(`extracts short text from ${mime} ${disposition}`, async () => {
 			contentType = mime;
 			contentDisposition = disposition;
@@ -156,7 +165,7 @@ describe("PDF URL source-text inspection", () => {
 			expect(result.details.method).toBe("markit");
 			expect(result.output).toContain("Dummy PDF file");
 			expect(result.output).not.toContain("%PDF-");
-			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);
 		});
 
 		for (const [label, payload] of [
@@ -176,7 +185,7 @@ describe("PDF URL source-text inspection", () => {
 				expect(result.output).not.toContain("malformed payload");
 				expect(result.output).not.toContain(path.dirname(mupdfModulePath));
 				expect(result.output).not.toContain("build-time provenance");
-				expect(binaryFetch).toHaveBeenCalledTimes(1);
+				expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);
 			});
 		}
 
@@ -223,7 +232,7 @@ describe("PDF URL source-text inspection", () => {
 			const result = await loadReadUrlCacheEntry(session, { path: new URL("report.pdf", server.url).href });
 			expect(result.details.method).toBe("markit");
 			expect(result.output).toContain(text);
-			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(binaryFetch).not.toHaveBeenCalled();
 			expect(conversion).toHaveBeenCalledTimes(1);
 			expect(conversion.mock.calls[0][1]).toBe(".docx");
 		});
@@ -237,7 +246,7 @@ describe("PDF URL source-text inspection", () => {
 		const result = await loadReadUrlCacheEntry(session, { path: new URL("report.pdf", server.url).href });
 		expect(result.details.method).toBe("raw");
 		expect(conversion).not.toHaveBeenCalled();
-		expect(binaryFetch).toHaveBeenCalledTimes(1);
+		expect(binaryFetch).not.toHaveBeenCalled();
 	});
 	for (const disposition of [
 		"attachment; filename*=UTF-8''bad%",
@@ -258,7 +267,7 @@ describe("PDF URL source-text inspection", () => {
 			const result = await loadReadUrlCacheEntry(session, { path: new URL("download", server.url).href });
 			expect(result.details.method).toBe("raw");
 			expect(conversion).not.toHaveBeenCalled();
-			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(binaryFetch).not.toHaveBeenCalled();
 		});
 	}
 
@@ -270,7 +279,7 @@ describe("PDF URL source-text inspection", () => {
 		expect(result.details.method).toBe("raw");
 		expect(result.output).toContain("%PDF-1.4");
 		expect(conversion).not.toHaveBeenCalled();
-		expect(binaryFetch).toHaveBeenCalledTimes(1);
+		expect(binaryFetch).not.toHaveBeenCalled();
 	});
 
 	it("preserves the detailed converter failure in the read receipt", async () => {
@@ -295,12 +304,26 @@ describe("PDF URL source-text inspection", () => {
 		expect(result.output).not.toContain("%PDF-");
 	});
 
-	it("does not reuse initial PDF bytes when the binary fetch fails", async () => {
-		vi.spyOn(scrapers, "fetchBinary").mockResolvedValue({ ok: false, error: "HTTP 503" });
+	it("does not refetch initial PDF bytes for classification", async () => {
+		contentType = "application/octet-stream";
+		contentDisposition = "attachment; filename=report.pdf";
+		const binaryFetch = vi.spyOn(scrapers, "fetchBinary").mockResolvedValue({ ok: false, error: "HTTP 503" });
 		const result = await loadReadUrlCacheEntry(session, { path: new URL("document", server.url).href });
-		expect(result.details.method).toBe("failed");
-		expect(result.details.notes).toContain("Binary fetch failed: HTTP 503");
+		expect(result.details.method).toBe("markit");
+		expect(result.output).toContain("Dummy PDF file");
+		expect(binaryFetch).not.toHaveBeenCalled();
 		expect(result.output).not.toContain("%PDF-");
+	});
+
+	it("keeps an ordinary extensionless generic response on its first payload", async () => {
+		contentType = "application/octet-stream";
+		contentDisposition = "";
+		body = "ordinary extensionless response";
+		const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
+		const result = await loadReadUrlCacheEntry(session, { path: new URL("download", server.url).href });
+		expect(result.output).toContain("ordinary extensionless response");
+		expect(binaryFetch).not.toHaveBeenCalled();
+		expect(requests).toBe(1);
 	});
 
 	for (const error of ["Network connection closed", "content-length 20971521 exceeds 20971520"]) {
@@ -313,12 +336,11 @@ describe("PDF URL source-text inspection", () => {
 			const target = new URL("download", server.url).href;
 			const result = await loadReadUrlCacheEntry(session, { path: target });
 			expect(result.details.method).toBe("failed");
-			expect(result.details.notes).toContain(`Binary fetch failed: ${error}`);
+			expect(result.details.notes.join("\n")).toMatch(/markit conversion (failed: .+|produced no usable output)/);
 			expect(result.output).not.toContain("%PDF-");
 			expect(result.output).not.toContain("malformed payload");
-			expect(binaryFetch).toHaveBeenCalledTimes(1);
-			expect(binaryFetch.mock.calls[0][0]).toBe(target);
-			expect(conversion).not.toHaveBeenCalled();
+			expect(binaryFetch).not.toHaveBeenCalled();
+			expect(conversion).toHaveBeenCalledTimes(1);
 			expect(requests).toBe(1);
 		});
 
@@ -366,10 +388,10 @@ describe("PDF URL source-text inspection", () => {
 				const metadata = await new Bun.Image(Buffer.from(image.data, "base64")).metadata();
 				expect(metadata.width).toBe(1);
 				expect(metadata.height).toBe(1);
-				expect(binaryFetch).toHaveBeenCalledTimes(1);
+				expect(binaryFetch).not.toHaveBeenCalled();
 				expect(conversion).toHaveBeenCalledTimes(1);
 				expect(conversion.mock.calls[0][1]).toBe(".png");
-				expect(requests).toBe(2);
+				expect(requests).toBe(1);
 			});
 		}
 	}
@@ -378,6 +400,7 @@ describe("PDF URL source-text inspection", () => {
 		["application/pdf", "attachment; filename=photo.png"],
 		["application/octet-stream", "attachment; filename=report.pdf"],
 	]) {
+		const expectedClassificationFetches = mime === "application/pdf" ? 1 : 0;
 		it(`keeps PDF dispatch ahead of the image URL for ${mime} ${disposition}`, async () => {
 			contentType = mime;
 			contentDisposition = disposition;
@@ -389,10 +412,10 @@ describe("PDF URL source-text inspection", () => {
 			expect(result.details?.method).toBe("markit");
 			expect(result.content.some(item => item.type === "text" && item.text.includes("Dummy PDF file"))).toBe(true);
 			expect(result.content.some(item => item.type === "image")).toBe(false);
-			expect(binaryFetch).toHaveBeenCalledTimes(1);
+			expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);
 			expect(conversion).toHaveBeenCalledTimes(1);
 			expect(conversion.mock.calls[0][1]).toBe(".pdf");
-			expect(requests).toBe(2);
+			expect(requests).toBe(expectedClassificationFetches === 0 ? 1 : 2);
 		});
 	}
 

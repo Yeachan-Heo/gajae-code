@@ -49,6 +49,7 @@ const FETCH_DEFAULT_MAX_LINES = 300;
 // Convertible document types handled by markit.
 const CONVERTIBLE_MIMES = new Set([
 	"application/pdf",
+	"application/x-pdf",
 	"application/msword",
 	"application/vnd.ms-powerpoint",
 	"application/vnd.ms-excel",
@@ -780,7 +781,8 @@ async function renderUrl(
 	const { finalUrl, content: rawContent } = response;
 	const mime = normalizeMime(response.contentType);
 	const extHint = getExtensionHint(finalUrl);
-	let isPdf = mime === "application/pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
+	let isPdf =
+		mime === "application/pdf" || mime === "application/x-pdf" || (extHint === ".pdf" && isGenericMimeType(mime));
 
 	// Raw PDF inspection is explicit; never substitute PDF bytes for failed text extraction.
 	if (raw && isPdf) {
@@ -799,7 +801,12 @@ async function renderUrl(
 
 	// Classify generic downloads from the bounded binary response before dispatch.
 	// Both image rendering and document conversion reuse these bytes.
-	const dispositionBinary = !raw && isGenericMimeType(mime) ? await fetchBinary(finalUrl, timeout, signal) : undefined;
+	const dispositionBinary =
+		!raw && isGenericMimeType(mime)
+			? response.buffer
+				? { ok: true as const, buffer: response.buffer, contentDisposition: response.contentDisposition }
+				: await fetchBinary(finalUrl, timeout, signal)
+			: undefined;
 	if (dispositionBinary && !dispositionBinary.ok) {
 		notes.push(dispositionBinary.error ? `Binary fetch failed: ${dispositionBinary.error}` : "Binary fetch failed");
 		return {
@@ -816,7 +823,10 @@ async function renderUrl(
 	const effectiveExt = dispositionBinary?.ok
 		? getExtensionHint(finalUrl, dispositionBinary.contentDisposition)
 		: extHint;
-	isPdf = mime === "application/pdf" || (effectiveExt === ".pdf" && isGenericMimeType(mime));
+	isPdf =
+		mime === "application/pdf" ||
+		mime === "application/x-pdf" ||
+		(effectiveExt === ".pdf" && isGenericMimeType(mime));
 	const imageMimeType = isPdf ? undefined : resolveImageMimeType(mime, effectiveExt);
 	let skipConvertibleBinaryRetry = false;
 	if (imageMimeType) {
@@ -946,7 +956,7 @@ async function renderUrl(
 	if (!skipConvertibleBinaryRetry && (isPdf || isConvertible(mime, effectiveExt))) {
 		const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 		if (binary.ok) {
-			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition);
+			const ext = isPdf ? ".pdf" : getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 			const converted = await convertWithMarkit(binary.buffer, ext, timeout, signal);
 			if (converted.ok) {
 				// Any non-empty markit conversion is preferable to a raw-bytes
