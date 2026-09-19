@@ -5211,6 +5211,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response.error)?.code === "ambiguous";
 	}
 
+	function isTransientDelegateAuthorityFailure(response: Record<string, unknown>): boolean {
+		if (response.ok !== false) return false;
+		return asRecord(response.error)?.code === "unavailable";
+	}
+
 	function publicErrorCode(code: unknown): string {
 		return typeof code === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, code) ? code : "unavailable";
 	}
@@ -9265,7 +9270,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								let bindingWorkspace: string;
 								try {
 									bindingWorkspace = await canonicalBrokerWorkspace(persistedBrokerWorkspace);
-								} catch {
+								} catch (error) {
+									if (!(error instanceof SdkClientError) || error.code !== "not_found") throw error;
 									return {
 										ok: false,
 										error: {
@@ -9276,6 +9282,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								}
 								const binding = await exactBrokerSessionBinding(sessionId, bindingWorkspace);
 								if (
+									// The caller cwd guard above prevents cross-workspace reuse; this
+									// comparison fences the persisted endpoint identity itself.
 									!sameCanonicalPath(binding.workspace, persistedBrokerWorkspace, platform) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
@@ -9590,6 +9598,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					true,
 					response =>
 						(!delegateResponseComplete && (creationRemoteStarted || delegateEffectStarted)) ||
+						isTransientDelegateAuthorityFailure(response) ||
 						isRouterRequestAmbiguous(response),
 				);
 			}

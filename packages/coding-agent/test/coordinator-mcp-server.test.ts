@@ -3909,6 +3909,73 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
 		}
 	}, 20_000);
+	it("does not seal transient managed-worktree canonicalization failures", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		await fs.mkdir(worktree, { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let failCanonicalization = false;
+		const canonicalizePath = async (value: string): Promise<string> => {
+			if (failCanonicalization && value === worktree)
+				throw Object.assign(new Error("temporary canonicalization failure"), { code: "EACCES" });
+			return fs.realpath(value);
+		};
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{ canonicalizePath },
+		);
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-transient",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after transient canonicalization failure",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-transient",
+			allow_mutation: true,
+		};
+		failCanonicalization = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
+		const receipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(receipt.state).toBe("in_progress");
+		expect(receipt.response).toBeUndefined();
+		failCanonicalization = false;
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				...retryArgs,
+				idempotency_key: "managed-worktree-delegate-transient-fresh",
+			}),
+		).resolves.toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1" },
+		});
+	}, 20_000);
 	it("keeps endpoint authority separated across two actual managed worktrees", async () => {
 		const root = await tempRoot();
 		await Bun.$`git init -q -b main`.cwd(root);
