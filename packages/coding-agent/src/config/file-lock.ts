@@ -965,12 +965,7 @@ function isSuccessfulNativePublication(value: unknown, operation: "primary" | "d
 }
 
 function isCommittedDirectoryVerificationFailure(value: unknown): value is NativeNoReplaceResult {
-	return (
-		process.platform === "linux" &&
-		isValidNativeNoReplaceResult(value) &&
-		!value.ok &&
-		value.mutationState === "committed"
-	);
+	return isValidNativeNoReplaceResult(value) && !value.ok && value.mutationState === "committed";
 }
 
 /**

@@ -234,9 +234,7 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 			"windows_rename_noreplace",
 		]);
 		const invalidResults: [string, NativeNoReplaceResult][] = primitives
-			.filter(primitive =>
-				operation === "primary" ? !primaryPrimitives.has(primitive) : primitive !== expected,
-			)
+			.filter(primitive => (operation === "primary" ? !primaryPrimitives.has(primitive) : primitive !== expected))
 			.map(primitive => [`wrong primitive ${primitive}`, successfulPublication(primitive)]);
 		const valid = successfulPublication(expected ?? "unsupported");
 		invalidResults.push(
@@ -343,6 +341,24 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 });
 
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {
+	test("accepts a committed fallback receipt when ambient platform metadata is spoofed", async () => {
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!descriptor?.configurable) throw new Error("process_platform_not_configurable");
+		const { file, lock } = await makeFixture();
+		const publication = installPublicationFailure();
+		let entered = 0;
+		try {
+			Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+			await expect(withFileLock(file, async () => ++entered, quickAcquire)).resolves.toBe(1);
+		} finally {
+			Object.defineProperty(process, "platform", descriptor);
+		}
+		expect(entered).toBe(1);
+		expect(publication.primary).toBe(1);
+		expect(publication.fallback).toBe(1);
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("enters once, releases the real tree, and reacquires a new generation", async () => {
 		const { root, file, lock } = await makeFixture();
 		const publication = installPublicationFailure();
