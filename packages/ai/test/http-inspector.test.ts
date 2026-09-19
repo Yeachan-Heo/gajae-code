@@ -267,6 +267,15 @@ describe("transport failure context", () => {
 		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
 	});
 
+	it("names the host for a refused stream before surfacing the replay decision", async () => {
+		const error = bunTransportError("h2 stream refused", "HTTP2RefusedStream");
+
+		const message = await finalizeErrorMessage(error, codexDump());
+
+		expect(message).toContain("transport=HTTP2RefusedStream");
+		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
+	});
+
 	it("reads the transport failure through a wrapped cause", () => {
 		const error = Object.assign(new Error("fetch failed"), {
 			cause: bunTransportError(

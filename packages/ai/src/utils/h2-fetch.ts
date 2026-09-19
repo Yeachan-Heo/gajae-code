@@ -54,13 +54,14 @@ export function installH2Fetch(): void {
 	]);
 	const wrapper = async function h2fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (!isHttps(input)) return original(input, init);
+		const snapshot = snapshotRequest(input, init);
 		try {
-			return await original(input, { ...init, protocol: "http2" });
+			return await original(snapshot.input, { ...snapshot.init, protocol: "http2" });
 		} catch (err) {
 			const code = (err as { code?: string }).code ?? "";
 			if (!h2FallbackCodes.has(code)) throw err;
-			if (code === "HTTP2RefusedStream" && !isReplayableRequest(input, init)) throw err;
-			return original(input, init);
+			if (code === "HTTP2RefusedStream" && !isReplayableRequest(snapshot.input, snapshot.init)) throw err;
+			return original(snapshot.input, snapshot.init);
 		}
 	} as typeof fetch & PatchedFetch;
 
@@ -68,6 +69,33 @@ export function installH2Fetch(): void {
 	Object.assign(wrapper, original);
 	wrapper[installed] = true;
 	globalThis.fetch = wrapper;
+}
+
+function snapshotRequest(
+	input: string | URL | Request,
+	init?: RequestInit,
+): { input: string | URL | Request; init?: RequestInit } {
+	const snapshotInput = input instanceof URL ? new URL(input.href) : input;
+	const requestLike = typeof input !== "string" && !(input instanceof URL);
+	if (init === undefined && !requestLike) {
+		return { input: snapshotInput };
+	}
+
+	const snapshotInit: RequestInit = { ...(init ?? {}) };
+	if (init?.headers !== undefined) {
+		snapshotInit.headers = snapshotHeaders(init.headers);
+	} else if (requestLike) {
+		snapshotInit.headers = new Headers(input.headers);
+	}
+	return { input: snapshotInput, init: snapshotInit };
+}
+
+function snapshotHeaders(headers: NonNullable<RequestInit["headers"]>): NonNullable<RequestInit["headers"]> {
+	if (headers instanceof Headers) return new Headers(headers);
+	if (Array.isArray(headers)) {
+		return headers.map(([name, value]) => [name, value] as [string, string]);
+	}
+	return { ...headers };
 }
 
 function isHttps(input: string | URL | Request): boolean {
@@ -95,11 +123,11 @@ function isReplayableRequest(input: string | URL | Request, init?: RequestInit):
 	}
 }
 
-function isReplayableBody(body: BodyInit | null): boolean {
+function isReplayableBody(body: RequestInit["body"]): boolean {
 	if (body === null || typeof body === "string") return true;
-	if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return true;
 	if (typeof Blob !== "undefined" && body instanceof Blob) return true;
-	if (typeof FormData !== "undefined" && body instanceof FormData) return true;
-	if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return true;
+	// ArrayBuffer/views, FormData, and URLSearchParams are mutable caller-owned
+	// values. Fail closed instead of replaying a potentially changed payload if
+	// the asynchronous refusal arrives after the caller mutates one.
 	return false;
 }
