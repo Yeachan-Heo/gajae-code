@@ -3004,6 +3004,7 @@ test("ACP activity idle alone does not settle a prompt", async () => {
 async function createRecoveryFixture(
 	acknowledgement: "held" | "rejected" | "accepted",
 	blockedAgentMessageText?: string,
+	options: { controlledRetryBackoff?: boolean } = {},
 ): Promise<Fixture & { notify(code?: string): void }> {
 	let notify: ((error: SdkClientError) => void) | undefined;
 	const original = AcpSdkAdapter.prototype.onReconnectFailed;
@@ -3021,6 +3022,7 @@ async function createRecoveryFixture(
 			uncertainPromptAcknowledgement: acknowledgement === "rejected",
 			blockedAgentMessageText,
 			cancelSettlementGraceMs: 25,
+			controlledRetryBackoff: options.controlledRetryBackoff,
 		});
 		const callback = notify;
 		if (!callback) throw new Error("Expected session reconnect failure subscription");
@@ -3096,6 +3098,119 @@ for (const kind of ["prompt", "skill"] as const) {
 		});
 	}
 }
+
+test("ACP preserves the retained truncation flag when publishing recovered text", async () => {
+	const fixture = await createRecoveryFixture("rejected");
+	try {
+		const pending = prompt(fixture, "recover truncated report");
+		await bounded(fixture.promptDelivered, "recovery mutation delivery");
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		fixture.releaseRecoveryResult({
+			...retainedTerminal(fixture),
+			content: { version: 1, type: "text", text: "retained prefix", truncated: true },
+		});
+		expect(await bounded(pending, "truncated retained terminal settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk"),
+			"truncated retained text publication",
+		);
+		const chunk = fixture.updates.find(update => update.update.sessionUpdate === "agent_message_chunk");
+		expect(chunk?.update).toMatchObject({ _meta: { gjcFinalTextTruncated: true } });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP publishes retained truncation metadata even when the retained prefix was streamed", async () => {
+	const fixture = await createRecoveryFixture("accepted");
+	try {
+		const pending = prompt(fixture, "recover streamed truncated report");
+		await bounded(fixture.promptDelivered, "recovery mutation delivery");
+		fixture.sendAssistantMessage("retained prefix", true);
+		await waitFor(
+			() => fixture.updates.some(update => update.update.sessionUpdate === "agent_message_chunk"),
+			"streamed retained prefix publication",
+		);
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		fixture.releaseRecoveryResult({
+			...retainedTerminal(fixture),
+			content: { version: 1, type: "text", text: "retained prefix", truncated: true },
+		});
+		expect(await bounded(pending, "streamed truncated retained terminal settlement")).toEqual({
+			stopReason: "end_turn",
+		});
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						(update.update as { _meta?: { gjcFinalTextTruncated?: boolean } })._meta?.gjcFinalTextTruncated ===
+							true,
+				),
+			"streamed retained truncation metadata",
+		);
+		const chunks = fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk");
+		expect(chunks).toHaveLength(2);
+		expect(chunks.at(-1)?.update).toMatchObject({
+			content: { type: "text", text: "" },
+			_meta: { gjcFinalTextTruncated: true },
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP does not retry a recovered startup-readiness failure that carries final text", async () => {
+	const fixture = await createRecoveryFixture("accepted", undefined, { controlledRetryBackoff: true });
+	try {
+		const pending = prompt(fixture, "recover startup failure with final text");
+		await bounded(fixture.promptDelivered, "recovery mutation delivery");
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: fixture.sessionId,
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
+				),
+			"recovered prompt activity",
+		);
+		fixture.notify();
+		await waitFor(() => fixture.recoveryInputs.length === 1, "recovery query");
+		fixture.releaseRecoveryResult({
+			...retainedTerminal(fixture),
+			status: "failed",
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "startup readiness failure",
+				provenance: "agent_failed",
+				providerCode: "provider_unavailable",
+				phase: "post_start",
+			},
+			content: { version: 1, type: "text", text: "retained failure answer" },
+		});
+		const settlement = await Promise.race([
+			pending.then(
+				value => ({ kind: "resolved" as const, value }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			fixture.retryBackoffScheduled.then(() => ({ kind: "retried" as const })),
+		]);
+		expect(settlement.kind).toBe("rejected");
+		if (settlement.kind === "rejected") expect(settlement.error).toMatchObject({ code: "prompt_failed" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
 
 const unusableRecoveryPages: Array<[string, Record<string, unknown>]> = [
 	["missing kind", { kind: undefined }],

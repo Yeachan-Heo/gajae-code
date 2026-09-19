@@ -3306,6 +3306,10 @@ export class AcpAgent implements Agent {
 				record.busy = record.backgroundBusy;
 				this.#advanceTerminalGeneration(record);
 				waiter.terminal = { outcome, correlation };
+				// Recovered final text is published on the async terminal tail below. Record it
+				// before settling so a first-turn startup-readiness failure cannot be retried
+				// after this retained answer has already been committed for publication.
+				if (readableText) record.promptObservedAssistantOutput = true;
 				this.#settlePrompt(id, record, waiter);
 				this.#scheduleTerminalUpdates(
 					id,
@@ -3315,6 +3319,7 @@ export class AcpAgent implements Agent {
 						type: outcome.kind === "failed" ? "agent_failed" : "agent_end",
 						outcome,
 						finalText: readableText ? content.text : undefined,
+						finalTextTruncated: content?.truncated === true,
 					},
 					waiter,
 				);
@@ -4126,7 +4131,9 @@ export class AcpAgent implements Agent {
 							update: {
 								sessionUpdate: "agent_message_chunk",
 								content: { type: "text", text: resolution.text },
-								...(resolution.final.truncated ? { _meta: { gjcFinalTextTruncated: true } } : {}),
+								...(resolution.final.truncated || event.finalTextTruncated === true
+									? { _meta: { gjcFinalTextTruncated: true } }
+									: {}),
 							},
 						},
 						adapter,
@@ -4140,6 +4147,24 @@ export class AcpAgent implements Agent {
 						streamedLength: promptOwner.emittedAssistantText.length,
 						finalLength: resolution.final.text.length,
 					});
+				}
+				if (resolution.kind !== "emit" && event.finalTextTruncated === true) {
+					// A retained prefix may already equal the streamed text, leaving no suffix for
+					// `resolveAcpFinalText` to emit. Still publish a metadata-only chunk so the
+					// caller can distinguish an incomplete retained result from a complete answer.
+					await this.#publishSessionUpdate(
+						id,
+						{
+							sessionId: id,
+							update: {
+								sessionUpdate: "agent_message_chunk",
+								content: { type: "text", text: "" },
+								_meta: { gjcFinalTextTruncated: true },
+							},
+						},
+						adapter,
+						publicationGeneration,
+					);
 				}
 			})();
 			let finalTextTail: Promise<void>;
