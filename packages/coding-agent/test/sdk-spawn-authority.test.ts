@@ -664,9 +664,9 @@ describe("Broker spawn flow driver", () => {
 			expect(verifyCalls).toBe(1);
 			expect(closeCalls).toBe(1);
 			expect(await latestClaim(agentDir)).toMatchObject({
-			state: "uncertain",
-			failure: { code: "child_registration_release_unproven" },
-			substrateProof: { providerIdentity: "retry-provider" },
+				state: "uncertain",
+				failure: { code: "child_registration_release_unproven" },
+				substrateProof: { providerIdentity: "retry-provider" },
 			});
 			const retry = await broker.handleRequest("session.spawn", spawnInput(), "retry-registration-key");
 			expect(retry).toMatchObject({

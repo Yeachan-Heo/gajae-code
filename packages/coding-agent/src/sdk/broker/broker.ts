@@ -1621,10 +1621,7 @@ export class Broker {
 	}
 
 	/** Re-prove an unbound launch on an idempotent retry instead of fencing it forever. */
-	async #reconcileUncertainRegistration(
-		lifecycleIdentity: string,
-		claim: SpawnClaimV2,
-	): Promise<BrokerResponse> {
+	async #reconcileUncertainRegistration(lifecycleIdentity: string, claim: SpawnClaimV2): Promise<BrokerResponse> {
 		const proof = claim.substrateProof;
 		if (claim.state !== "uncertain" || claim.authorityRef !== undefined || !claim.childId || proof === undefined)
 			return error("terminal_uncertain", "session.spawn registration authority is unavailable for reconciliation");
@@ -1745,8 +1742,26 @@ export class Broker {
 						code: "substrate_proof_failed",
 						message: "session.spawn substrate lacks lifecycle process authority",
 					};
-					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "unresolved") {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "child_registration_release_unproven",
+									message: "session.spawn child registration could not prove substrate release",
+								},
+							})
+						).claim;
+						launchedProof = undefined;
+						return error(
+							"terminal_uncertain",
+							"session.spawn substrate release could not be proven after the launch proof failed",
+						);
+					}
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1755,6 +1770,7 @@ export class Broker {
 							failure,
 						})
 					).claim;
+					launchedProof = undefined;
 					return spawnFailureError(failure);
 				}
 				current = (
@@ -1776,7 +1792,6 @@ export class Broker {
 				if (!registration.ok) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
 					if (release === "closed" || release === "gone") {
 						const failure: SpawnSubstrateFailure = {
 							substrateKind: launched.proof.substrateKind,
@@ -1794,6 +1809,7 @@ export class Broker {
 								failure,
 							})
 						).claim;
+						launchedProof = undefined;
 						return spawnFailureError(failure);
 					}
 					const unresolvedRelease: SpawnSubstrateFailure = {
@@ -1809,6 +1825,7 @@ export class Broker {
 							failure: unresolvedRelease,
 						})
 					).claim;
+					launchedProof = undefined;
 					return error(
 						"terminal_uncertain",
 						"session.spawn child registration is uncertain (substrate release could not be proven)" +
@@ -1977,7 +1994,7 @@ export class Broker {
 		} catch {
 			// Once a substrate exists the outcome is ambiguous even before handoff:
 			// reporting an ordinary failure would downgrade retained uncertainty.
-			const ambiguous = handedOff || launchedProof !== undefined;
+			let ambiguous = handedOff || launchedProof !== undefined;
 			// A launched substrate with no persisted authority is invisible to the
 			// reaper, so in-process cleanup is its only chance. This must run on
 			// EVERY post-launch failure exit, not just a returned registration
@@ -1998,6 +2015,7 @@ export class Broker {
 							to: "pre_send_rejected",
 							failure,
 						});
+						launchedProof = undefined;
 						return spawnFailureError(failure);
 					} catch {
 						// The substrate is closed, but a failed terminal write still leaves
@@ -2017,14 +2035,31 @@ export class Broker {
 								},
 							})
 						).claim;
+						launchedProof = undefined;
 					} catch {
 						// Preserve the generic durable-state uncertainty if the reason itself
 						// cannot be appended.
 					}
+				} else if (release === "absent" && current.state === "substrate_starting") {
+					try {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+							})
+						).claim;
+						ambiguous = true;
+					} catch {
+						// Keep the generic failure when even the uncertainty transition cannot be written.
+					}
 				}
 			}
 			return ambiguous
-				? error("terminal_uncertain", current.failure?.message ?? "session.spawn state could not be advanced durably")
+				? error(
+						"terminal_uncertain",
+						current.failure?.message ?? "session.spawn state could not be advanced durably",
+					)
 				: error("spawn_failed", "session.spawn could not be advanced durably");
 		}
 	}
@@ -2038,8 +2073,10 @@ export class Broker {
 	async #releaseUnownedSubstrate(
 		provider: SpawnSubstrateProvider,
 		proof: SpawnSubstrateProof | undefined,
-	): Promise<"closed" | "gone" | "unresolved"> {
-		if (!proof) return "gone";
+	): Promise<"closed" | "gone" | "absent" | "unresolved"> {
+		// A launch that throws before returning proof has no substrate identity to
+		// classify as gone; keep the claim uncertain instead of fabricating a kind.
+		if (!proof) return "absent";
 		let verdict: "verified" | "mismatch" | "gone";
 		try {
 			verdict = await provider.verify(proof);
