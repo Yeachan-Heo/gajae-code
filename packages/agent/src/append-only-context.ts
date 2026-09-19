@@ -272,18 +272,19 @@ export class AppendOnlyContextManager {
 			seededPrefixLength > 0 && !includesSeedPrefix
 				? [...this.log.entries().slice(0, seededPrefixLength), ...normalizedMessages]
 				: normalizedMessages;
+		const hashes = this.#hashRange(messagesToSync, 0, messagesToSync.length);
 
 		// Detect in-place rewrites of already-synced messages via per-message content
 		// hashes (no retained full serialized-history string; F5).
 		if (
 			this.#lastSyncCount > 0 &&
 			this.#lastSyncCount <= messagesToSync.length &&
-			this.#prefixChanged(messagesToSync, this.#lastSyncCount)
+			this.#prefixChanged(hashes, this.#lastSyncCount)
 		) {
 			if (this.#seededPrefixCount > 0) {
 				// F9: a seeded fork whose inherited prefix changed (e.g. after compaction)
 				// rebases onto the new provider context instead of throwing.
-				this.#rebaseToBaseline(messagesToSync, seededPrefixLength);
+				this.#rebaseToBaseline(messagesToSync, hashes, seededPrefixLength);
 				return;
 			}
 			this.log.clear();
@@ -296,7 +297,7 @@ export class AppendOnlyContextManager {
 		// while a seed prefix is active; a genuine seeded compaction rebases (F9).
 		if (messagesToSync.length < this.#lastSyncCount) {
 			if (this.#seededPrefixCount > 0) {
-				this.#rebaseToBaseline(messagesToSync, seededPrefixLength);
+				this.#rebaseToBaseline(messagesToSync, hashes, seededPrefixLength);
 				return;
 			}
 			this.log.clear();
@@ -310,7 +311,7 @@ export class AppendOnlyContextManager {
 		}
 
 		this.#lastSyncCount = messagesToSync.length;
-		this.#syncedHashes = this.#hashRange(messagesToSync, 0, messagesToSync.length);
+		this.#syncedHashes = hashes;
 	}
 
 	seedNormalizedMessages(messages: readonly Message[], options?: { reset?: boolean }): void {
@@ -393,21 +394,21 @@ export class AppendOnlyContextManager {
 	}
 
 	/** True when any of the first `count` already-synced messages changed content (in-place rewrite). */
-	#prefixChanged(messages: readonly unknown[], count: number): boolean {
+	#prefixChanged(hashes: readonly (number | bigint)[], count: number): boolean {
 		if (count > this.#syncedHashes.length) return false;
 		for (let i = 0; i < count; i++) {
-			if (this.#hashMessage(messages[i]) !== this.#syncedHashes[i]) return true;
+			if (hashes[i] !== this.#syncedHashes[i]) return true;
 		}
 		return false;
 	}
 
 	/** F9: reset the log to a new provider-visible baseline after seeded compaction/rebase. */
-	#rebaseToBaseline(messages: readonly unknown[], seededPrefixCount = 0): void {
+	#rebaseToBaseline(messages: readonly unknown[], hashes: (number | bigint)[], seededPrefixCount: number): void {
 		this.log.clear();
 		this.log.extend(messages.map(message => cloneJson(message)));
 		this.#lastSyncCount = messages.length;
 		this.#seededPrefixCount = seededPrefixCount;
-		this.#syncedHashes = this.#hashRange(messages, 0, messages.length);
+		this.#syncedHashes = hashes;
 	}
 }
 

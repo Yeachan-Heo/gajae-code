@@ -60,6 +60,7 @@ packages/ai/test/.temp-images/
 .gjc/rlm/
 **/.gjc/state/
 .gjc/_session-*/
+.gjc/backlog-*/
 .gjc/rss-checkpoints/
 .gjc/metrics.json
 **/.gjc/settings.json.fallback-invalid
