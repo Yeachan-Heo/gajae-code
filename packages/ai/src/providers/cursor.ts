@@ -4172,6 +4172,23 @@ function cursorNativeToolName(kindKey: string): string {
 const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
 const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
 
+interface CursorJsonSafeOptions {
+	stripTypeName: boolean;
+	maxNodes?: number;
+	maxDepth?: number;
+}
+
+const CURSOR_NATIVE_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
+	stripTypeName: true,
+	maxNodes: CURSOR_JSON_SAFE_MAX_NODES,
+	maxDepth: CURSOR_JSON_SAFE_MAX_DEPTH,
+};
+
+/** Generic JSON boundaries must preserve every schema/context entry losslessly. */
+const CURSOR_GENERIC_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
+	stripTypeName: false,
+};
+
 /**
  * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
  *
@@ -4189,11 +4206,21 @@ const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
  * and over-depth values collapse to null, and containers stop accepting
  * entries once the shared node budget is exhausted.
  */
-function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }, depth = 0): unknown {
+function cursorJsonSafeValue(value: unknown): unknown {
+	return cursorJsonSafeValueWithOptions(value, CURSOR_NATIVE_JSON_SAFE_OPTIONS);
+}
+
+function cursorJsonSafeValueWithOptions(
+	value: unknown,
+	options: CursorJsonSafeOptions,
+	path?: Set<object>,
+	budget?: { remaining: number },
+	depth = 0,
+): unknown {
 	const seen = path ?? new Set<object>();
-	const nodes = budget ?? { remaining: CURSOR_JSON_SAFE_MAX_NODES };
-	if (nodes.remaining-- <= 0) return null;
-	if (depth >= CURSOR_JSON_SAFE_MAX_DEPTH) return null;
+	const nodes = options.maxNodes === undefined ? undefined : (budget ?? { remaining: options.maxNodes });
+	if (nodes && nodes.remaining-- <= 0) return null;
+	if (options.maxDepth !== undefined && depth >= options.maxDepth) return null;
 	if (typeof value === "bigint") {
 		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
 			? Number(value)
@@ -4211,16 +4238,16 @@ function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { rema
 		if (Array.isArray(value)) {
 			const array: unknown[] = [];
 			for (const entry of value) {
-				if (nodes.remaining <= 0) break;
-				array.push(cursorJsonSafeValue(entry, seen, nodes, depth + 1));
+				if (nodes && nodes.remaining <= 0) break;
+				array.push(cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1));
 			}
 			return array;
 		}
 		const record: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
-			if (key === "$typeName") continue;
-			if (nodes.remaining <= 0) break;
-			record[key] = cursorJsonSafeValue(entry, seen, nodes, depth + 1);
+			if (options.stripTypeName && key === "$typeName") continue;
+			if (nodes && nodes.remaining <= 0) break;
+			record[key] = cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1);
 		}
 		return record;
 	} catch {
@@ -4235,9 +4262,9 @@ export function cursorJsonSafeValueForTest(value: unknown): unknown {
 	return cursorJsonSafeValue(value);
 }
 
-/** Serialize a Cursor payload after normalizing values that JSON cannot encode. */
+/** Serialize a generic Cursor JSON boundary without dropping keys or truncating containers. */
 function cursorJsonSafeStringify(value: unknown): string {
-	return JSON.stringify(cursorJsonSafeValue(value)) ?? "";
+	return JSON.stringify(cursorJsonSafeValueWithOptions(value, CURSOR_GENERIC_JSON_SAFE_OPTIONS)) ?? "";
 }
 
 /** Exported for direct regression coverage of the Cursor serialization boundary. */
@@ -4620,7 +4647,10 @@ function buildCursorWireToolIdentities(tools: Tool[] | undefined): CursorWireToo
 	return tools
 		.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name))
 		.map(tool => {
-			const jsonSchema = cursorJsonSafeValue(flattenToolRootCombinators(toolWireSchema(tool)));
+			const jsonSchema = cursorJsonSafeValueWithOptions(
+				flattenToolRootCombinators(toolWireSchema(tool)),
+				CURSOR_GENERIC_JSON_SAFE_OPTIONS,
+			);
 			return {
 				name: tool.name,
 				description: tool.description || "",
@@ -4927,6 +4957,18 @@ export function buildCursorUsageToolsKeyForTest(tools: Tool[]): string {
 	return buildCursorUsageToolsKey(tools);
 }
 
+/** Exported for regression coverage of the generic tool-schema wire boundary. */
+export function buildCursorWireToolIdentitiesForTest(
+	tools: Tool[],
+): Array<{ name: string; description: string; inputSchema: JsonValue }> {
+	return buildCursorWireToolIdentities(tools);
+}
+
+/** Exported for regression coverage of lossless conversation identity hashing. */
+export function hashCursorConversationValueForTest(value: unknown): string {
+	return hashCursorConversationValue(value);
+}
+
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
@@ -5008,9 +5050,7 @@ function hashCursorConversationMessage(message: { role: string; content: unknown
 }
 
 function hashCursorConversationValue(value: unknown): string {
-	return createHash("sha256")
-		.update(cursorJsonSafeStringify(value))
-		.digest("hex");
+	return createHash("sha256").update(cursorJsonSafeStringify(value)).digest("hex");
 }
 
 function canReuseCursorConversationContext(

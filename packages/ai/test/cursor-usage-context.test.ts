@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
-import { buildCursorUsageToolsKeyForTest } from "../src/providers/cursor";
+import {
+	buildCursorUsageToolsKeyForTest,
+	buildCursorWireToolIdentitiesForTest,
+	hashCursorConversationValueForTest,
+} from "../src/providers/cursor";
 import type { Tool } from "../src/types";
 
 class SessionBackedTool implements Tool {
@@ -34,6 +38,49 @@ describe("Cursor usage-context tool identity", () => {
 
 		expect(() => buildCursorUsageToolsKeyForTest([tool])).not.toThrow();
 		expect(buildCursorUsageToolsKeyForTest([tool])).toBe(buildCursorUsageToolsKeyForTest([tool]));
+	});
+
+	it("preserves a legal $typeName property in advertised tool schemas", () => {
+		const tool = {
+			name: "schema_probe",
+			description: "Accept a schema field named $typeName",
+			parameters: {
+				type: "object",
+				properties: { $typeName: { type: "string" } },
+				required: ["$typeName"],
+			},
+		} as unknown as Tool;
+
+		const [identity] = buildCursorWireToolIdentitiesForTest([tool]);
+		expect(identity?.inputSchema).toEqual({
+			type: "object",
+			properties: { $typeName: { type: "string" } },
+			required: ["$typeName"],
+		});
+	});
+
+	it("preserves advertised schemas beyond the native payload node budget", () => {
+		const properties = Object.fromEntries(
+			Array.from({ length: 10_050 }, (_, index) => [`field${index}`, { type: "string" }]),
+		);
+		const tool = {
+			name: "large_schema_probe",
+			description: "Advertise a large schema without truncation",
+			parameters: { type: "object", properties },
+		} as unknown as Tool;
+
+		const [identity] = buildCursorWireToolIdentitiesForTest([tool]);
+		const advertisedProperties = (identity?.inputSchema as { properties?: Record<string, unknown> }).properties;
+		expect(Object.keys(advertisedProperties ?? {})).toHaveLength(Object.keys(properties).length);
+		expect(advertisedProperties?.field10049).toEqual({ type: "string" });
+	});
+
+	it("keeps distinct conversation values distinct after the native payload budget", () => {
+		const prefix = Array.from({ length: 10_001 }, (_, index) => index);
+
+		expect(hashCursorConversationValueForTest([...prefix, "first"])).not.toBe(
+			hashCursorConversationValueForTest([...prefix, "second"]),
+		);
 	});
 
 	it("hashes the wire tool definition without traversing session-backed runtime state", () => {
