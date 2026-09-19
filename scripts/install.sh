@@ -338,7 +338,7 @@ curl_github() {
 # web route 302s /releases/latest to /releases/tag/<tag> without touching the
 # API limit, and it is the same origin the binaries download from.
 resolve_stable_tag_via_web() {
-    location=$(curl -fsS -o /dev/null -w '%{redirect_url}' \
+    location=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
         -A "gjc-install" \
         --retry 3 --retry-delay 1 \
         "https://github.com/${REPO}/releases/latest" 2>/dev/null) || return 1
@@ -352,6 +352,27 @@ resolve_stable_tag_via_web() {
     esac
     is_stable_release_tag "$tag" || return 1
     printf '%s' "$tag"
+}
+
+curl_github_status() {
+    url="$1"
+    out="$2"
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ] && trusted_github_url "$url"; then
+        prepare_github_auth_header "$token"
+        curl -sSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "@${AUTH_HDR}" \
+            -o "$out" -w "%{http_code}" "$url"
+    else
+        curl -sSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "$out" -w "%{http_code}" "$url"
+    fi
 }
 
 curl_github_optional() {
@@ -630,14 +651,29 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
         fi
     else
         echo "Fetching latest stable GitHub release..."
-        if curl_github "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"; then
-            LATEST=$(extract_json_string "$json_tmp" "tag_name")
+        api_status=""
+        if api_status=$(curl_github_status "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"); then
+            case "$api_status" in
+                200)
+                    LATEST=$(extract_json_string "$json_tmp" "tag_name")
+                    ;;
+                403|429) LATEST="" ;;
+                *)
+                    LATEST=""
+                    ;;
+            esac
         else
+            api_status="transport"
+            LATEST=""
+        fi
+        if [ "$api_status" = "403" ] || [ "$api_status" = "429" ]; then
             LATEST=$(resolve_stable_tag_via_web) || LATEST=""
             if [ -z "$LATEST" ]; then
                 die "Failed to fetch the latest GitHub release. If api.github.com is rate limited, set GITHUB_TOKEN or GH_TOKEN and retry."
             fi
             echo "api.github.com was unavailable; resolved ${LATEST} through github.com instead."
+        elif [ -z "$LATEST" ]; then
+            die "Failed to fetch the latest GitHub release. If api.github.com is rate limited, set GITHUB_TOKEN or GH_TOKEN and retry."
         fi
     fi
 
