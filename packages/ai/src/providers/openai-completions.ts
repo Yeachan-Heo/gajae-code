@@ -1931,10 +1931,8 @@ function buildParams(
 		// directives — forced tools, retry reminders — stay untouched, and
 		// turns that deliberately carry no tools keep their stripped shape
 		// instead of re-adding tool_choice with an empty tools list.
-		const { max_tokens, max_completion_tokens, max_output_tokens, tool_choice, ...restExtra } = compat.extraBody as Record<
-			string,
-			unknown
-		>;
+		const { max_tokens, max_completion_tokens, max_output_tokens, tool_choice, ...restExtra } =
+			compat.extraBody as Record<string, unknown>;
 		if (
 			tool_choice !== undefined &&
 			params.tool_choice === undefined &&
