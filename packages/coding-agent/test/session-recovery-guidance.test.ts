@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import { commands } from "../src/cli-main";
 import {
 	SESSION_LIMIT_RECOVERY_ACTIONS,
@@ -114,38 +115,90 @@ describe("session recovery guidance references runnable commands", () => {
 		expect(cliCommandNames).not.toContain("export");
 	});
 
+	/**
+	 * Every file that can render session-limit guidance, not just the one that regressed.
+	 *
+	 * Scoped by directory rather than by a hand-listed set so a new file under
+	 * `src/session/` is covered the day it is added.
+	 */
+	async function sessionSurfaceSources(): Promise<Array<[string, string]>> {
+		const dir = new URL("../src/session/", import.meta.url);
+		const names = (await fs.readdir(dir)).filter(name => name.endsWith(".ts") && !name.endsWith(".test.ts"));
+		return Promise.all(
+			names.map(async name => [name, await Bun.file(new URL(name, dir)).text()] as [string, string]),
+		);
+	}
+
+	/** Source with block and line comments removed, so prose cannot satisfy or trip a check. */
+	function withoutComments(source: string): string {
+		return source
+			.replaceAll(/\/\*[\s\S]*?\*\//g, "")
+			.split("\n")
+			.filter(line => !line.trimStart().startsWith("//"))
+			.join("\n");
+	}
+
 	test("every near-limit error class interpolates the shared advice (#5732)", async () => {
 		// The family matrix above only covers classes someone remembered to add, and a
 		// substring check only catches verbatim copies. `#5691` wrote its own PARAPHRASE
 		// of the advice, which both of those miss, and that is how `gjc export` returned.
 		//
-		// Close the shape structurally instead: find every near-limit error class in the
-		// source and require its constructor to interpolate SESSION_LIMIT_RECOVERY_ACTIONS.
-		// A class added tomorrow fails this the moment it writes its own wording.
-		const source = await Bun.file(new URL("../src/session/session-manager.ts", import.meta.url)).text();
-		const classes = [...source.matchAll(/export class (SessionNearLimit\w*Error) extends Error \{/g)];
-		// Guard the detector: if the classes are ever renamed, this must fail loudly
-		// rather than silently vacuously pass.
-		expect(classes.length).toBeGreaterThanOrEqual(2);
-		for (const match of classes) {
-			const start = match.index ?? 0;
-			const body = source.slice(start, source.indexOf("\n}", start));
-			expect({
-				class: match[1],
-				// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the literal interpolation token in source text is the point of this check.
-				interpolatesSharedAdvice: body.includes("${SESSION_LIMIT_RECOVERY_ACTIONS}"),
-			}).toEqual({ class: match[1], interpolatesSharedAdvice: true });
+		// Close the shape structurally: scan every session source file for near-limit
+		// error declarations, in any declaration form and over any base class, and
+		// require each to interpolate SESSION_LIMIT_RECOVERY_ACTIONS.
+		const declaration =
+			/(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w*NearLimit\w*)\b|(?:const|let|var)\s+(\w*NearLimit\w*)\s*=\s*class\b/g;
+		let found = 0;
+		for (const [name, source] of await sessionSurfaceSources()) {
+			for (const match of source.matchAll(declaration)) {
+				const identifier = match[1] ?? match[2];
+				const start = match.index ?? 0;
+				const end = source.indexOf("\n}", start);
+				const body = source.slice(start, end === -1 ? source.length : end);
+				found++;
+				expect({
+					file: name,
+					class: identifier,
+					// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the literal interpolation token in source text is the point of this check.
+					interpolatesSharedAdvice: body.includes("${SESSION_LIMIT_RECOVERY_ACTIONS}"),
+				}).toEqual({ file: name, class: identifier, interpolatesSharedAdvice: true });
+			}
+		}
+		// Fail loudly rather than vacuously if the classes are renamed out of the pattern.
+		expect(found).toBeGreaterThanOrEqual(2);
+	});
+
+	test("no session source names the nonexistent export command (#5732)", async () => {
+		// Scoped to the whole session directory, not just the file that regressed:
+		// `agent-session.ts` renders this guidance too, and a hardcoded paraphrase there
+		// would have been invisible to a session-manager-only scan.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			expect({ file: name, namesExport: withoutComments(source).includes("gjc export") }).toEqual({
+				file: name,
+				namesExport: false,
+			});
 		}
 	});
 
-	test("no session-manager code path names the nonexistent export command (#5732)", async () => {
-		const source = await Bun.file(new URL("../src/session/session-manager.ts", import.meta.url)).text();
-		const withoutComments = source
-			.replaceAll(/\/\*[\s\S]*?\*\//g, "")
-			.split("\n")
-			.filter(line => !line.trimStart().startsWith("//"))
-			.join("\n");
-		expect(withoutComments).not.toContain("gjc export");
+	test("every gjc command advised anywhere in session source is registered (#5732)", async () => {
+		// The two checks above are still name-shaped: they key off `NearLimit` in an
+		// identifier. `SessionTranscriptOversizedError` and `SessionContextTooLargeError`
+		// do not match that pattern, and a class added tomorrow need not either. The
+		// residual gap is an error that advises some OTHER nonexistent command.
+		//
+		// This closes the defect CLASS instead of the classes: whatever the surrounding
+		// code is called, a `gjc <verb>` named in session source must resolve to a real
+		// registered command. That is the invariant #5621 actually violated.
+		for (const [name, source] of await sessionSurfaceSources()) {
+			const advised = [...withoutComments(source).matchAll(/`gjc ([a-z][a-z0-9-]*)/g)].map(match => match[1]);
+			for (const verb of new Set(advised)) {
+				expect({ file: name, verb, registered: cliCommandNames.has(verb) }).toEqual({
+					file: name,
+					verb,
+					registered: true,
+				});
+			}
+		}
 	});
 
 	test("the slash detector catches un-backticked mentions", () => {
