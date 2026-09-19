@@ -648,6 +648,53 @@ describe("ultragoal succession — offer preserves the source and requires bound
 		await expectSuccessionError(offer(source, source, ["G002"]), "unsafe_target");
 	});
 
+	it("rejects a symlink alias of the source worktree as a self-transfer", async () => {
+		const source = await tempRepo("source-alias");
+		await seedSourcePlan(source);
+
+		const alias = path.join(path.dirname(source), `${path.basename(source)}-alias`);
+		tempRoots.push(alias);
+		await fs.symlink(source, alias, "dir");
+
+		await expectSuccessionError(offer(source, alias, ["G002"]), "unsafe_target");
+	});
+
+	it("rejects a persisted source-binding alias of the source worktree", async () => {
+		const source = await tempRepo("persisted-source-alias");
+		await seedSourcePlan(source);
+
+		const alias = path.join(path.dirname(source), `${path.basename(source)}-persisted-alias`);
+		tempRoots.push(alias);
+		await fs.symlink(source, alias, "dir");
+
+		const goalsPath = sourceArtifactPaths(source).goals;
+		const persistedPlan = JSON.parse(await fs.readFile(goalsPath, "utf-8")) as {
+			repositoryBinding?: { worktreeRoot: string };
+		};
+		if (!persistedPlan.repositoryBinding) throw new Error("seeded source plan has no repository binding");
+		persistedPlan.repositoryBinding.worktreeRoot = alias;
+		await Bun.write(goalsPath, `${JSON.stringify(persistedPlan, null, 2)}\n`);
+
+		await expectSuccessionError(offer(source, source, ["G002"]), "unsafe_target");
+	});
+
+	it("fails closed when the persisted source worktree root is missing", async () => {
+		const source = await tempRepo("missing-source-root");
+		const target = await tempRepo("target");
+		await seedSourcePlan(source);
+
+		const goalsPath = sourceArtifactPaths(source).goals;
+		const persistedPlan = JSON.parse(await fs.readFile(goalsPath, "utf-8")) as {
+			repositoryBinding?: { worktreeRoot: string };
+		};
+		if (!persistedPlan.repositoryBinding) throw new Error("seeded source plan has no repository binding");
+		persistedPlan.repositoryBinding.worktreeRoot = path.join(source, "missing-source-worktree");
+		await Bun.write(goalsPath, `${JSON.stringify(persistedPlan, null, 2)}\n`);
+
+		const error = await expectSuccessionError(offer(source, target, ["G002"]), "unsafe_target");
+		expect(error.message).toContain("source worktree root");
+	});
+
 	it("refuses a selection that takes only part of a source validation batch", async () => {
 		const source = await tempRepo("source");
 		const target = await tempRepo("target");
@@ -759,6 +806,39 @@ describe("ultragoal succession — offer preserves the source and requires bound
 });
 
 describe("ultragoal succession — adoption establishes fresh target authority", () => {
+	it("offers and adopts between sibling linked worktrees without changing the source ledger", async () => {
+		const source = await tempRepo("linked-source");
+		await seedSourcePlan(source);
+
+		const sibling = path.join(path.dirname(source), `${path.basename(source)}-sibling`);
+		const wrongSibling = path.join(path.dirname(source), `${path.basename(source)}-wrong-sibling`);
+		tempRoots.push(sibling, wrongSibling);
+		await Bun.$`git worktree add -q -b succession-sibling ${sibling}`.cwd(source).quiet();
+		await Bun.$`git worktree add -q -b succession-wrong-sibling ${wrongSibling}`.cwd(source).quiet();
+
+		const before = await sourceDigests(source);
+		const ledgerBefore = await fs.readFile(sourceArtifactPaths(source).ledger, "utf-8");
+		const offered = await offer(source, sibling, ["G002"]);
+		expect(offered.offer.source.repository.commonDir).toBe(offered.offer.target.repository.commonDir);
+		expect(offered.offer.source.repository.worktreeRoot).not.toBe(offered.offer.target.repository.worktreeRoot);
+
+		// Repository identity still admits the family, but exact named-target
+		// pinning rejects another sibling before it can claim or publish anything.
+		await expectSuccessionError(adopt(wrongSibling, offered.offerPath), "target_mismatch");
+		expect(await readUltragoalPlan(wrongSibling, TARGET_SESSION)).toBeNull();
+
+		const adopted = await adopt(sibling, offered.offerPath);
+		expect(adopted.reconciled).toBe(false);
+		const successor = await readUltragoalPlan(sibling, TARGET_SESSION);
+		expect(successor?.repositoryBinding?.worktreeRoot).toBe(sibling);
+		expect(await sourceDigests(source)).toEqual(before);
+		expect(await fs.readFile(sourceArtifactPaths(source).ledger, "utf-8")).toBe(ledgerBefore);
+
+		// A second target session cannot acquire another owner for the same
+		// operation, even though the source and target are linked worktrees.
+		await expectSuccessionError(adopt(sibling, offered.offerPath, `${TARGET_SESSION}-second`), "duplicate_adoption");
+	});
+
 	it("publishes a successor plan bound to the target repository with fresh pending goals", async () => {
 		const source = await tempRepo("source");
 		const target = await tempRepo("target");

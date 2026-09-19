@@ -17,7 +17,7 @@ export async function deleteSessionPickerCandidate(sessionPath: string, explicit
 	await new FileSessionStorage().deleteSessionWithArtifacts(target);
 }
 
-/** Show the read-only TUI session picker and return the user's consent intent. */
+/** Show the session picker and return the user's resume consent intent. */
 export async function selectSession(
 	sessions: SessionInfo[],
 	explicitSessionDir?: string,
@@ -43,6 +43,7 @@ export async function selectSession(
 		},
 		SessionManager.inspectSessionTailReadOnly,
 		settle,
+		(session, starred) => SessionManager.setSessionStarredForPicker(session, starred, explicitSessionDir),
 	);
 	selector.setOnRequestRender(() => ui.requestRender());
 	ui.addChild(selector);

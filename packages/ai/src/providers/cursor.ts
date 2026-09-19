@@ -1288,6 +1288,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalDrainStarted = false;
 		let execQueuePrefix: Promise<void> | undefined;
 		let terminalPendingError: unknown;
+		let requestCloseError: (Error & { http2RstCode?: number; nativeErrorCode?: string }) | undefined;
+		// Native errors may be frozen; keep observations separate from their identity.
+		const requestErrorResetCodes = new WeakMap<Error, number | undefined>();
 		let terminalBoundarySeen = false;
 		// Lookahead can validate turnEnded while an exec handler holds the normal
 		// parser. Close new exec admission immediately, but leave the validated
@@ -1595,6 +1598,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			h2RequestErrorHandler = error => {
 				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
+				// Enrich only the synthetic reset diagnostic with the first observed
+				// native code. Never replace its message, priority, or retry class.
+				if (requestCloseError && !requestCloseError.nativeErrorCode) {
+					requestCloseError.nativeErrorCode = transportFailureFacts(error)?.nativeErrorCode;
+				}
+				if (!requestErrorResetCodes.has(error)) requestErrorResetCodes.set(error, h2Request?.rstCode);
 				terminalize(error, "drainable");
 			};
 			h2Request.on("error", h2RequestErrorHandler);
@@ -1637,7 +1646,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				responseEnded = true;
-				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), "drainable");
+				requestCloseError = Object.assign(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), {
+					http2RstCode: h2Request?.rstCode,
+				});
+				terminalize(requestCloseError, "drainable");
 			};
 			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
 			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
@@ -2333,6 +2345,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			output.stopReason = callerAbortError || options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.transportFailure = transportFailureFacts(mappedError);
+			if (mappedError instanceof Error && requestErrorResetCodes.has(mappedError)) {
+				output.transportFailure = transportFailureFacts({
+					...output.transportFailure,
+					// The native error can precede the request's reset observation.
+					// Fill a missing observation at settlement, after terminal draining;
+					// local teardown may supply it, so this is not remote-cause evidence.
+					http2RstCode: requestErrorResetCodes.get(mappedError) ?? h2Request?.rstCode,
+				});
+			}
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			finalizeCursorUsage(output, usageState);
 			calculateCost(model, output.usage);

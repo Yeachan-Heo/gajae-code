@@ -47,13 +47,20 @@ function parseWaitDurationMs(value: string | undefined): number {
 interface JobSnapshot {
 	id: string;
 	type: "bash" | "task";
-	status: "running" | "completed" | "failed" | "cancelled";
+	// Mirrors the manager's job statuses, including "paused": a folded subagent
+	// stays listed and resumable, so its snapshot is paused rather than terminal.
+	status: "running" | "paused" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;
 	/** Present when the job was folded out of a foreground wait. */
 	foldReason?: FoldReason;
 	resultText?: string;
 	errorText?: string;
+}
+
+/** Terminal statuses are the ones a consumer may treat as finished work. */
+function isTerminalJobStatus(status: JobSnapshot["status"]): boolean {
+	return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 type CancelStatus = "cancelled" | "not_found" | "already_completed" | "already_cancelled";
@@ -396,9 +403,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		// — otherwise a scope:"owned" abort could find an empty causal set and
 		// report stopped_owned while the job remains visibly paused (review
 		// thread P2).
-		const terminalJobs = jobResults.filter(
-			j => j.status === "completed" || j.status === "failed" || j.status === "cancelled",
-		);
+		const terminalJobs = jobResults.filter(j => isTerminalJobStatus(j.status));
 		manager.acknowledgeDeliveries(terminalJobs.map(j => j.id));
 		// A terminal job whose deliveries were just acknowledged is
 		// synchronously consumed: its owned registration is settled and must
@@ -417,8 +422,11 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			if (registration) unregisterOwnedRegistration(registration);
 		}
 
-		const completed = jobResults.filter(j => j.status !== "running");
-		const running = jobResults.filter(j => j.status === "running");
+		const runningJobs = jobResults.filter(j => j.status === "running");
+		// Paused work (a folded or queued-resume subagent) and any status this build
+		// does not know are non-terminal: reporting them under ## Completed would
+		// tell consumers that resumable work finished.
+		const waitingJobs = jobResults.filter(j => !isTerminalJobStatus(j.status) && j.status !== "running");
 
 		const lines: string[] = [];
 
@@ -428,9 +436,9 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			lines.push("");
 		}
 
-		if (completed.length > 0) {
-			lines.push(`## Completed (${completed.length})\n`);
-			for (const j of completed) {
+		if (terminalJobs.length > 0) {
+			lines.push(`## Completed (${terminalJobs.length})\n`);
+			for (const j of terminalJobs) {
 				lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 				lines.push(`Label: ${j.label}`);
 				if (j.resultText) {
@@ -443,10 +451,17 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			}
 		}
 
-		if (running.length > 0) {
-			lines.push(`## Still Running (${running.length})\n`);
-			for (const j of running) {
+		if (runningJobs.length > 0) {
+			lines.push(`## Still Running (${runningJobs.length})\n`);
+			for (const j of runningJobs) {
 				lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}`);
+			}
+		}
+
+		if (waitingJobs.length > 0) {
+			lines.push(`## Waiting (${waitingJobs.length})\n`);
+			for (const j of waitingJobs) {
+				lines.push(`- \`${j.id}\` [${j.type}] — ${j.label} (${j.status})`);
 			}
 		}
 
@@ -498,6 +513,12 @@ function statusToIcon(status: JobSnapshot["status"]): ToolUIStatus {
 			return "aborted";
 		case "running":
 			return "running";
+		case "paused":
+			return "pending";
+		// Snapshot details are read back from persisted sessions, so a status this
+		// build does not know must still render instead of dropping the component.
+		default:
+			return "pending";
 	}
 }
 
@@ -511,6 +532,12 @@ function statusToColor(status: JobSnapshot["status"]): ToolUIColor {
 			return "warning";
 		case "running":
 			return "accent";
+		case "paused":
+			return "muted";
+		// Never fall through to undefined: theme.fg() throws on an undefined color
+		// and would take the whole job list render down with it.
+		default:
+			return "muted";
 	}
 }
 
@@ -554,19 +581,36 @@ export const jobToolRenderer = {
 			return new Text([header, formatEmptyMessage(fallback, uiTheme)].join("\n"), 0, 0);
 		}
 
-		const counts = { completed: 0, failed: 0, cancelled: 0, running: 0 };
-		for (const job of jobs) counts[job.status]++;
+		const counts: Record<JobSnapshot["status"], number> = {
+			running: 0,
+			paused: 0,
+			completed: 0,
+			failed: 0,
+			cancelled: 0,
+		};
+		// Snapshots are read back from persisted sessions, so a status this build
+		// does not know must stay out of the typed counts instead of becoming NaN.
+		let unknownStatusCount = 0;
+		for (const job of jobs) {
+			if (job.status in counts) counts[job.status] += 1;
+			else unknownStatusCount += 1;
+		}
 
 		const meta: string[] = [];
 		if (counts.completed > 0) meta.push(uiTheme.fg("success", `${counts.completed} done`));
 		if (counts.failed > 0) meta.push(uiTheme.fg("error", `${counts.failed} failed`));
 		if (counts.cancelled > 0) meta.push(uiTheme.fg("warning", `${counts.cancelled} cancelled`));
+		if (counts.paused > 0) meta.push(uiTheme.fg("muted", `${counts.paused} paused`));
 		if (counts.running > 0) meta.push(uiTheme.fg("accent", `${counts.running} running`));
+		if (unknownStatusCount > 0) meta.push(uiTheme.fg("muted", `${unknownStatusCount} unknown`));
 
-		const headerIcon: ToolUIStatus = counts.failed > 0 ? "warning" : counts.running > 0 ? "info" : "success";
+		// Paused and unknown-status rows are unsettled work: reporting success and a
+		// "settled" description for a resumable snapshot would contradict the rows.
+		const pendingCount = counts.running + counts.paused + unknownStatusCount;
+		const headerIcon: ToolUIStatus = counts.failed > 0 ? "warning" : pendingCount > 0 ? "info" : "success";
 		const description =
-			counts.running > 0
-				? `waiting on ${counts.running} of ${jobs.length}`
+			pendingCount > 0
+				? `waiting on ${pendingCount} of ${jobs.length}`
 				: `${jobs.length} ${jobs.length === 1 ? "job" : "jobs"} settled`;
 
 		const header = renderStatusLine(
@@ -580,15 +624,18 @@ export const jobToolRenderer = {
 			uiTheme,
 		);
 
-		// Sort: running first (so user sees what's still pending), then failed, then completed/cancelled.
+		// Sort: running first (so user sees what's still pending), then paused, then
+		// failed, then completed/cancelled.
 		const statusOrder: Record<JobSnapshot["status"], number> = {
 			running: 0,
-			failed: 1,
-			cancelled: 2,
-			completed: 3,
+			paused: 1,
+			failed: 2,
+			cancelled: 3,
+			completed: 4,
 		};
+		const statusRank = (status: JobSnapshot["status"]): number => statusOrder[status] ?? Number.MAX_SAFE_INTEGER;
 		const sortedJobs = [...jobs].sort((a, b) => {
-			const diff = statusOrder[a.status] - statusOrder[b.status];
+			const diff = statusRank(a.status) - statusRank(b.status);
 			if (diff !== 0) return diff;
 			return b.durationMs - a.durationMs;
 		});

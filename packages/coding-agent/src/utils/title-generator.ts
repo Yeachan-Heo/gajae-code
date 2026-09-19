@@ -3,6 +3,7 @@
  */
 import * as path from "node:path";
 
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { type Api, type AssistantMessage, completeSimple, type Model, type Tool } from "@gajae-code/ai/core";
 import { logger, prompt } from "@gajae-code/utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -17,6 +18,9 @@ const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 const DEFAULT_TERMINAL_TITLE = "GJC";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
+const MAX_TITLE_CONVERSATION_MESSAGES = 6;
+const MAX_TITLE_MESSAGE_CHARS = 400;
+
 const MAX_INPUT_CHARS = 2000;
 const TITLE_MAX_TOKENS = 30;
 const REASONING_SAFE_MAX_TOKENS = 1024;
@@ -28,6 +32,44 @@ const SET_TITLE_TOOL_NAME = "set_title";
 // Beyond the cap we treat the response as a non-title hallucination and reject it.
 const MAX_TITLE_CHARS = 80;
 const MAX_TITLE_WORDS = 12;
+
+/**
+ * Build a bounded conversation digest for title regeneration. Regeneration
+ * reads several messages so a throwaway first prompt can be corrected, while
+ * the automatic first-message path intentionally uses only its initial input.
+ */
+export function buildConversationTitleInput(messages: readonly AgentMessage[]): string | undefined {
+	const userMessages: string[] = [];
+	for (const message of messages) {
+		if (message.role !== "user") continue;
+		const content = message.content;
+		const text =
+			typeof content === "string"
+				? content
+				: content
+						.filter(block => block.type === "text")
+						.map(block => block.text)
+						.join("\n");
+		const trimmed = text.trim();
+		if (trimmed) userMessages.push(trimmed);
+	}
+
+	if (userMessages.length === 0) return undefined;
+
+	const keptMessages =
+		userMessages.length > MAX_TITLE_CONVERSATION_MESSAGES
+			? [userMessages[0]!, ...userMessages.slice(-(MAX_TITLE_CONVERSATION_MESSAGES - 1))]
+			: userMessages;
+	// Reserve separator and ellipsis room so the digest is already within the
+	// generator's MAX_INPUT_CHARS bound; its existing truncation is a no-op here.
+	const maxMessageChars = Math.min(
+		MAX_TITLE_MESSAGE_CHARS,
+		Math.floor((MAX_INPUT_CHARS - (keptMessages.length - 1) - keptMessages.length) / keptMessages.length),
+	);
+	return keptMessages
+		.map(message => (message.length > maxMessageChars ? `${message.slice(0, maxMessageChars)}…` : message))
+		.join("\n");
+}
 
 const setTitleTool: Tool = {
 	name: SET_TITLE_TOOL_NAME,
@@ -58,9 +100,11 @@ function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel
 }
 
 /**
- * Generate a title for a session based on the first user message.
+ * Generate a title for a session based on the provided user-message input.
+ * Automatic titles pass the first user message; regeneration passes a bounded
+ * conversation digest.
  *
- * @param firstMessage The first user message
+ * @param firstMessage The first user message or bounded conversation digest
  * @param registry Model registry
  * @param settings Settings used to resolve the smol role
  * @param sessionId Optional session id for sticky API key selection

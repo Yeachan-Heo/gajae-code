@@ -45,8 +45,14 @@ let sandbox: Sandbox;
 
 interface CurlFixture {
 	latestJson?: string;
+	latestStatus?: number;
+	latestTransportFailure?: boolean;
 	tagJson?: Record<string, string>;
 	releasesJson?: string;
+	webRedirect?: string;
+	webInitialStatus?: number;
+	webFinalStatus?: number;
+	callsFile?: string;
 	assets: Record<string, string | Buffer>;
 	missingAssets?: string[];
 	failDownload?: boolean;
@@ -59,6 +65,8 @@ function writeCurlShim(dir: string, fixture: CurlFixture): void {
 		fixturePath,
 		JSON.stringify({
 			latestJson: fixture.latestJson ?? JSON.stringify({ tag_name: TAG, draft: false, prerelease: false }),
+			latestStatus: fixture.latestStatus ?? 200,
+			latestTransportFailure: fixture.latestTransportFailure === true,
 			tagJson: fixture.tagJson ?? {},
 			releasesJson:
 				fixture.releasesJson ??
@@ -76,6 +84,10 @@ function writeCurlShim(dir: string, fixture: CurlFixture): void {
 					Buffer.isBuffer(body) ? body.toString("base64") : Buffer.from(body).toString("base64"),
 				]),
 			),
+			webRedirect: fixture.webRedirect ?? `https://github.com/Yeachan-Heo/gajae-code/releases/tag/${TAG}`,
+			webInitialStatus: fixture.webInitialStatus ?? 302,
+			webFinalStatus: fixture.webFinalStatus ?? 200,
+			callsFile: fixture.callsFile ?? "",
 			missingAssets: fixture.missingAssets ?? [],
 			failDownload: fixture.failDownload === true,
 			emptyDownload: fixture.emptyDownload === true,
@@ -86,25 +98,59 @@ FIXTURE="${fixturePath}"
 out=""
 url=""
 prev=""
+follow="0"
+fail="0"
+write_fmt=""
 for arg in "$@"; do
   if [ "$prev" = "-o" ]; then out="$arg"; fi
+  if [ "$prev" = "-w" ]; then write_fmt="$arg"; fi
+  case "$arg" in
+    -*L*) follow="1" ;;
+    -*f*) fail="1" ;;
+    -w*) write_fmt="\${arg#-w}" ;;
+  esac
   case "$arg" in
     https://*|http://*) url="$arg" ;;
   esac
   prev="$arg"
 done
-python3 - "$FIXTURE" "$url" "$out" <<'PY'
+python3 - "$FIXTURE" "$url" "$out" "$follow" "$fail" "$write_fmt" <<'PY'
 import json, os, sys
 fixture = json.load(open(sys.argv[1]))
 url = sys.argv[2]
 out = sys.argv[3] if len(sys.argv) > 3 else ""
-def write(data: bytes, code: int = 0, http: str = "200"):
+follow = sys.argv[4] == "1" if len(sys.argv) > 4 else False
+fail = sys.argv[5] == "1" if len(sys.argv) > 5 else False
+write_fmt = sys.argv[6] if len(sys.argv) > 6 else ""
+calls_file = fixture.get("callsFile")
+if calls_file:
+    with open(calls_file, "a") as calls:
+        calls.write(url + "\\n")
+def write(data: bytes, code: int = 0, http: str = "200", stdout = None):
     if out:
         open(out, "wb").write(data)
-    sys.stdout.write(http)
+    sys.stdout.write(http if stdout is None else stdout)
     sys.exit(code)
 if "api.github.com" in url and "/releases/latest" in url:
-    write(fixture["latestJson"].encode())
+    if fixture.get("latestTransportFailure"):
+        sys.exit(6)
+    status = int(fixture.get("latestStatus", 200))
+    code = 22 if fail and status >= 400 else 0
+    write(fixture["latestJson"].encode(), code, str(status))
+if "github.com" in url and "/releases/latest" in url:
+    initial_status = int(fixture.get("webInitialStatus", 302))
+    final_status = int(fixture.get("webFinalStatus", 200))
+    status = final_status if follow else initial_status
+    location = fixture["webRedirect"]
+    effective = location
+    if write_fmt == "%{url_effective}":
+        output = effective if follow else url
+    elif write_fmt == "%{redirect_url}":
+        output = location if not follow else ""
+    else:
+        output = None
+    code = 22 if fail and status >= 400 else 0
+    write(b"", code, str(status), output)
 if "api.github.com" in url and "/releases?per_page" in url:
     write(fixture["releasesJson"].encode())
 if "api.github.com" in url and "/releases/tags/" in url:
@@ -1086,6 +1132,46 @@ exec /bin/cp "$@"
 		expect(installer).toContain("exit 130");
 		expect(installer).toContain("Unsupported libc: musl");
 		expect(installer).toContain("SOURCE_CLONE_DIR");
+	});
+
+	for (const status of [403, 429]) {
+		test(`falls back through a followed 302 to 200 for API rate limit ${status}`, async () => {
+			const callsFile = path.join(sandbox.root, "curl-calls.log");
+			const payload = fakeGjcScript({ version: VERSION });
+			const redirect = `https://github.com/Yeachan-Heo/gajae-code/releases/tag/${TAG}`;
+			writeCurlShim(sandbox.shimDir, {
+				latestStatus: status,
+				webRedirect: redirect,
+				webInitialStatus: 302,
+				webFinalStatus: 200,
+				callsFile,
+				assets: {
+					[hostBinaryName()]: payload,
+					"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+				},
+			});
+
+			const result = await runInstaller([]);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain(`resolved ${TAG} through github.com instead`);
+			expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+			const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
+			expect(calls.filter((url) => url === "https://github.com/Yeachan-Heo/gajae-code/releases/latest")).toHaveLength(1);
+		}, 20_000);
+	}
+
+	test.each([
+		["HTTP 500", { latestStatus: 500 }],
+		["transport failure", { latestTransportFailure: true }],
+	] as const)("does not use the web fallback after an API %s", async (_label, fixture) => {
+		const callsFile = path.join(sandbox.root, "curl-calls.log");
+		writeCurlShim(sandbox.shimDir, { ...fixture, callsFile, assets: {} });
+
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Failed to fetch the latest GitHub release");
+		const calls = fs.readFileSync(callsFile, "utf8").trim().split("\n");
+		expect(calls).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest"]);
 	});
 
 	test("rejects unofficial GitHub origin overrides", async () => {

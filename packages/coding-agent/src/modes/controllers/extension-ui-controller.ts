@@ -146,31 +146,55 @@ export class ExtensionUiController {
 		const widgetsBelow = [...this.#hookWidgetsBelow.entries()];
 		const activeHookCustomComponent = this.#activeHookCustomComponent;
 		const activeHookCustomOverlay = this.#activeHookCustomOverlay;
+		const activeHookCustomCancel = this.#activeHookCustomCancel;
 		return () => {
+			const errors: unknown[] = [];
+			const attempt = (cleanup: () => void): void => {
+				try {
+					cleanup();
+				} catch (error) {
+					errors.push(error);
+				}
+			};
 			for (const unsubscribe of terminalInputUnsubscribers) {
-				unsubscribe();
-				this.#extensionTerminalInputUnsubscribers.delete(unsubscribe);
+				if (!this.#extensionTerminalInputUnsubscribers.delete(unsubscribe)) continue;
+				attempt(unsubscribe);
 			}
 			let widgetsChanged = false;
 			for (const [key, widget] of widgetsAbove) {
 				if (this.#hookWidgetsAbove.get(key) !== widget) continue;
 				this.#hookWidgetsAbove.delete(key);
-				widget.dispose?.();
+				attempt(() => widget.dispose?.());
 				widgetsChanged = true;
 			}
 			for (const [key, widget] of widgetsBelow) {
 				if (this.#hookWidgetsBelow.get(key) !== widget) continue;
 				this.#hookWidgetsBelow.delete(key);
-				widget.dispose?.();
+				attempt(() => widget.dispose?.());
 				widgetsChanged = true;
 			}
 			if (
 				this.#activeHookCustomComponent === activeHookCustomComponent &&
-				this.#activeHookCustomOverlay === activeHookCustomOverlay
+				this.#activeHookCustomOverlay === activeHookCustomOverlay &&
+				this.#activeHookCustomCancel === activeHookCustomCancel
 			) {
-				this.#clearActiveHookCustom();
+				this.#activeHookCustomComponent = undefined;
+				this.#activeHookCustomOverlay = undefined;
+				this.#activeHookCustomCancel = undefined;
+				attempt(() => activeHookCustomCancel?.());
+				attempt(() => activeHookCustomComponent?.dispose?.());
+				attempt(() => activeHookCustomOverlay?.hide());
 			}
-			if (widgetsChanged) this.#rebuildHookWidgets();
+			if (widgetsChanged) {
+				attempt(() =>
+					this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerAbove, this.#hookWidgetsAbove, true),
+				);
+				attempt(() =>
+					this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerBelow, this.#hookWidgetsBelow, false),
+				);
+				attempt(() => this.ctx.ui.requestRender());
+			}
+			if (errors.length > 0) throw new AggregateError(errors, "Previous session extension UI cleanup failed");
 		};
 	}
 

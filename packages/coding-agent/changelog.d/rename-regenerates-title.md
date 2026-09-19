@@ -1,0 +1,3 @@
+### Added
+
+- `/rename` with no argument now regenerates the session title from the conversation instead of printing a usage error. The automatic title is generated exactly once, from the first user message, so a throwaway opening prompt (`tmp`, a typo, a pasted stack trace) permanently named the session and `/resume` showed that name forever. Regeneration builds a bounded digest — user messages only, the first plus the five most recent, each capped at 400 characters or at an equal share of the 2,000-character input budget when that is smaller (331 characters for a six-message digest) — and persists the result as a user-set title. With nothing to summarize, or when the model returns no usable title, it reports that and leaves the existing name untouched.

@@ -33,6 +33,7 @@ import {
 	locatePastedImageReferenceAroundCursor,
 	parsePastedImagePaths,
 } from "../../utils/pasted-image-path";
+import { invalidateSessionTitleGeneration } from "../../utils/session-title-generation";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -1146,6 +1147,7 @@ export class InputController {
 
 		// Queue input during compaction
 		if (this.ctx.session.isCompacting) {
+			invalidateSessionTitleGeneration(this.ctx.sessionManager);
 			if ((inputImages?.length ?? 0) > 0) {
 				this.ctx.showStatus("Compaction in progress. Retry after it completes to send images.");
 				return;
@@ -1159,6 +1161,7 @@ export class InputController {
 		// prompt to run after the active turn completes (in submission order).
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.ctx.session.isStreaming) {
+			invalidateSessionTitleGeneration(this.ctx.sessionManager);
 			if (this.#canModifyComposer(composer)) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
@@ -1183,6 +1186,7 @@ export class InputController {
 		}
 
 		// Normal message submission
+		invalidateSessionTitleGeneration(this.ctx.sessionManager);
 		// First, move any pending bash components to chat
 		this.ctx.flushPendingBashComponents();
 

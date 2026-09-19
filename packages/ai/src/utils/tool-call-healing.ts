@@ -35,6 +35,10 @@ const TOKENS = [TOK_SECTION_BEGIN, TOK_SECTION_END, TOK_CALL_BEGIN, TOK_CALL_END
 /** Maximum buffered partial-token length before we give up holding back. */
 const MAX_PARTIAL_HOLD = 64;
 
+// Re-exported so other streaming filters (e.g. the thinking-channel fence
+// stripper) share this token list instead of duplicating the literals.
+export { MAX_PARTIAL_HOLD as MAX_TOOL_FENCE_PARTIAL_HOLD, TOKENS as TOOL_FENCE_TOKENS };
+
 export interface HealedToolCall {
 	readonly id: string;
 	readonly name: string;

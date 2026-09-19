@@ -67,6 +67,8 @@ export interface SdkClientOptions {
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline shared by connect, hello, retry, and request work. */
 	deadline?: number;
+	/** Optional client capabilities sent in the protocol hello handshake. */
+	capabilities?: readonly string[];
 
 	reconnectAttempts?: number;
 	reconnectBackoffMs?: number;
@@ -288,6 +290,7 @@ export class SdkClient {
 	 */
 	readonly #closeGraceMs: number;
 	readonly #deadline?: number;
+	readonly #capabilities?: readonly string[];
 	#currentSocketRecord: Incarnation | null = null;
 	#opening: Cycle | null = null;
 	#cycleGeneration = 0;
@@ -309,6 +312,7 @@ export class SdkClient {
 		this.#closeGraceMs = Math.max(1, Math.min(this.#timeoutMs, 1_000));
 		this.#deadline =
 			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
+		this.#capabilities = options.capabilities;
 
 		this.#reconnectAttempts = options.reconnectAttempts ?? 3;
 		this.#reconnectBackoffMs = options.reconnectBackoffMs ?? 25;
@@ -831,6 +835,20 @@ export class SdkClient {
 					incarnation.resolveOpen = undefined;
 					incarnation.rejectOpen = undefined;
 					this.#beginHello(incarnation);
+					if (this.#capabilities !== undefined) {
+						try {
+							socket.send(
+								JSON.stringify({
+									type: "hello",
+									protocolVersion: 3,
+									capabilities: [...this.#capabilities],
+								}),
+							);
+						} catch (error) {
+							this.#onSocketFailure(incarnation, error as Event);
+							return;
+						}
+					}
 					const earlyHello = incarnation.earlyHello;
 					if (earlyHello) {
 						incarnation.earlyHello = undefined;

@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
@@ -238,6 +240,132 @@ describe("AgentSession retry delay cap", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		expect(waitSpy).toHaveBeenCalled();
 		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("stop");
+	});
+});
+
+/**
+ * Contract: a streamed-repetition-guard stop is terminal. It carries no
+ * transport facts, so without an explicit branch it falls through to "unknown"
+ * — which is admitted for bounded retry — and the session would replay a
+ * deterministic decode loop, re-billing the full context each attempt (#5627).
+ */
+describe("AgentSession retry admission: repetition guard", () => {
+	const REPETITION_TRIP_MESSAGE =
+		'Stopped the turn: the model repeated the same thinking output 12 times ("0.0.1 done").';
+
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
+	let session: AgentSession | undefined;
+
+	beforeEach(async () => {
+		tempDir = TempDir.createSync("@pi-retry-repetition-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
+		modelRegistry = new ModelRegistry(authStorage);
+	});
+
+	afterEach(async () => {
+		if (session) {
+			await session.dispose();
+			session = undefined;
+		}
+		authStorage.close();
+		tempDir.removeSync();
+		vi.restoreAllMocks();
+	});
+
+	/** A terminal provider error with no transport facts, exactly as the guard emits it. */
+	function repetitionTripStream(model: Model, errorCode: string | undefined): AssistantMessageEventStream {
+		const stream = new AssistantMessageEventStream();
+		queueMicrotask(() => {
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "error",
+				errorMessage: REPETITION_TRIP_MESSAGE,
+				...(errorCode ? { errorCode } : {}),
+				timestamp: Date.now(),
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "error", reason: "error", error: message });
+		});
+		return stream;
+	}
+
+	/** Drives one turn that fails as above; any retry recovers, so a retry is observable. */
+	async function runTurn(errorCode: string | undefined): Promise<AutoRetryStartEvent[]> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const recovered = createMockModel({ responses: [{ content: ["recovered after retry"] }] });
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls += 1;
+				return calls === 1
+					? repetitionTripStream(requestedModel, errorCode)
+					: recovered.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+		});
+
+		await session.prompt("trigger a repetition-guard stop");
+		await session.waitForIdle();
+		return retryStartEvents;
+	}
+
+	it("does not retry a turn the repetition guard stopped", async () => {
+		const retryStartEvents = await runTurn(REPETITION_GUARD_ERROR_CODE);
+
+		expect(retryStartEvents).toEqual([]);
+		const last = lastAssistant(session!);
+		expect(last.stopReason).toBe("error");
+		expect(last.errorCode).toBe(REPETITION_GUARD_ERROR_CODE);
+	});
+
+	// Pins the delta rather than just the new branch: the identical message
+	// without the guard's error code is still admitted for retry as it is today.
+	it("still retries the same error when it is not a repetition trip", async () => {
+		const retryStartEvents = await runTurn(undefined);
+
+		expect(retryStartEvents).toHaveLength(1);
+		const last = lastAssistant(session!);
 		expect(last.stopReason).toBe("stop");
 	});
 });

@@ -209,10 +209,10 @@ export async function watchSessionHostBrokerLiveness(deps: {
  * no client attached before treating itself as abandoned.
  *
  * This cannot fire during healthy work. "Attached" is the host's own live
- * socket-subscription count, so a client that is merely idle — an editor
- * sitting on an open ACP session, a long agent turn with nobody typing — still
- * holds a socket and resets the window on every poll. Only a client that is
- * actually gone opens it, and 30 minutes is far longer than any client
+ * demand count: observer-only sockets (such as an idle chat daemon) do not
+ * reset the window, while an in-flight turn is reported separately. Only a
+ * client that is actually demanding the host opens it, and 30 minutes is far
+ * longer than any client
  * reconnect budget (ACP's is seconds), so a crashed-and-restarted client
  * reattaches long before the window closes.
  */
@@ -238,8 +238,8 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
  * from every client for a full idle grace, or nobody has come for it at all
  * for a full first-attach grace.
  *
- * `readAttachedClients` reports the host's own live client/socket subscription
- * count; `undefined` means the SDK endpoint publishes no such evidence — before
+ * `readAttachedClients` reports the host's own live demanding-client count;
+ * `undefined` means the SDK endpoint publishes no such evidence — before
  * startup, after teardown, or when every reader itself fails. That ambiguity is
  * never instant detachment: it cannot reap on the poll that first sees it, it
  * can only open a window. Which window depends on what was already observed. A

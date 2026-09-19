@@ -40,6 +40,7 @@ import type {
 } from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { REPETITION_GUARD_ERROR_CODE } from "../utils/stream-repetition-guard";
 import {
 	captureRequestHeaders,
 	corsHeaders,
@@ -520,6 +521,38 @@ function classifyGatewayError(err: unknown): { status: number; type: string; mes
 	return { status: 502, type: "upstream_error", message };
 }
 
+/**
+ * Fixed envelope for a turn the streamed repetition guard stopped. The message
+ * is a literal on purpose: {@link classifyGatewayError} keyword-matches on
+ * message text (`invalid`, `quota`, `rate`, `forbidden`, …) and the guard's
+ * diagnostic carries a sample of raw model output, so routing it through that
+ * regex would let a repeated word in the sample pick the HTTP status (#5627).
+ */
+const REPETITION_GUARD_GATEWAY_ERROR = {
+	status: 502,
+	type: "upstream_error",
+	message: "Upstream model produced runaway repeated output and the turn was stopped",
+} as const;
+
+/**
+ * Classify a terminal {@link AssistantMessage} that failed into a wire envelope.
+ *
+ * Shared by both non-streaming handlers so a repetition stop cannot be reported
+ * as a client cancellation on one path and an upstream error on the other.
+ * Exported for tests.
+ */
+export function classifyGatewayMessageFailure(
+	message: Pick<AssistantMessage, "stopReason" | "errorCode">,
+	safeErrorMessage: string,
+): { status: number; type: string; message: string } {
+	// Checked before `aborted` as well as before the keyword classifier: a
+	// local decode-loop stop is never a user cancellation, whatever stop reason
+	// the provider chose to carry it on.
+	if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return { ...REPETITION_GUARD_GATEWAY_ERROR };
+	if (message.stopReason === "aborted") return { status: 499, type: "request_aborted", message: safeErrorMessage };
+	return classifyGatewayError(new Error(safeErrorMessage));
+}
+
 function redactGatewayError(error: unknown): Error {
 	const redacted = new Error(cleanReason(error) ?? "Upstream request failed");
 	if (error instanceof Error) {
@@ -531,6 +564,14 @@ function redactGatewayError(error: unknown): Error {
 }
 
 function redactGatewayMessage(message: AssistantMessage): AssistantMessage {
+	// A repetition stop is replaced wholesale, before `cleanReason` ever sees it.
+	// `cleanReason` only strips credential-shaped text, so ordinary model prose
+	// survives it verbatim — and this message's free-form half is a sample of raw
+	// model output. Reuses the fixed envelope the non-streaming path already
+	// returns, so both paths publish the same bounded string (#5627 review r5).
+	if (message.errorCode === REPETITION_GUARD_ERROR_CODE) {
+		return { ...message, errorMessage: REPETITION_GUARD_GATEWAY_ERROR.message };
+	}
 	if (message.errorMessage === undefined) return message;
 	return { ...message, errorMessage: cleanReason(message.errorMessage) ?? "Upstream request failed" };
 }
@@ -539,8 +580,12 @@ function redactGatewayMessage(message: AssistantMessage): AssistantMessage {
  * Protect all gateway SSE encoders from upstream error text. Provider wire
  * modules format `error` events themselves, so sanitize at this boundary and
  * also convert iterator failures to bounded errors before their catch blocks.
+ *
+ * Exported for tests: this is the only place the streaming path scrubs error
+ * text, so the assertion that a repetition sample never reaches the wire has to
+ * drive it directly.
  */
-function redactGatewayStream(events: AssistantMessageEventStream): AssistantMessageEventStream {
+export function redactGatewayStream(events: AssistantMessageEventStream): AssistantMessageEventStream {
 	async function* redactedEvents(): AsyncGenerator<AssistantMessageEvent> {
 		try {
 			for await (const event of events) {
@@ -914,10 +959,7 @@ async function handleFormatEndpoint(
 					error: safeErrorMessage,
 					peer,
 				});
-				if (message.stopReason === "aborted") {
-					return route.module.formatError(499, "request_aborted", safeErrorMessage);
-				}
-				const classified = classifyGatewayError(new Error(safeErrorMessage));
+				const classified = classifyGatewayMessageFailure(message, safeErrorMessage);
 				return route.module.formatError(classified.status, classified.type, classified.message);
 			}
 			return json(200, route.module.encodeResponse(message, parsed.modelId));
@@ -1130,10 +1172,7 @@ async function handlePiNative(
 					error: safeErrorMessage,
 					peer,
 				});
-				if (message.stopReason === "aborted") {
-					return piNative.formatError(499, "request_aborted", safeErrorMessage);
-				}
-				const classified = classifyGatewayError(new Error(safeErrorMessage));
+				const classified = classifyGatewayMessageFailure(message, safeErrorMessage);
 				return piNative.formatError(classified.status, classified.type, classified.message);
 			}
 			return json(200, { message });

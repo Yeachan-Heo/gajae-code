@@ -7,6 +7,7 @@ import { FileLockTestHooks } from "../src/config/file-lock";
 import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	canonicalSessionCwd,
+	SESSION_HEARTBEAT_INTERVAL_MS,
 	SessionIndex,
 	type SessionIndexEvent,
 	sessionIndexChecksum,
@@ -1487,6 +1488,33 @@ describe("SDK session index", () => {
 			terminalUncertain: true,
 		});
 		expect(index.listSessions().sessions[0]).toMatchObject({ terminalUncertain: true, live: false });
+	});
+	it("preserves an idle host activity state across broker liveness checkpoints", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-activity-"));
+		try {
+			const index = await new SessionIndex(dir).open();
+			const registration = await index.append({ ...event("idle"), ts: 1 });
+			await index.append({
+				type: "host_heartbeat",
+				sessionId: registration.sessionId,
+				locator: registration.locator,
+				endpointGeneration: registration.endpointGeneration,
+				pid: registration.pid,
+				...(registration.processIncarnation === undefined
+					? {}
+					: { processIncarnation: registration.processIncarnation }),
+				activity: { state: "idle", at: 2 },
+				ts: 2,
+			});
+			const now = 2 + 2 * SESSION_HEARTBEAT_INTERVAL_MS;
+			expect(await index.checkpointLiveHeartbeats(now)).toBe(1);
+			expect(index.listSessions().sessions[0]).toMatchObject({
+				activity: { state: "idle", at: 2 },
+				lastHeartbeatAt: now,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 	it("fences unresolved state roots, then projects either surviving root as authority", async () => {
 		for (const terminateHigherGeneration of [false, true]) {

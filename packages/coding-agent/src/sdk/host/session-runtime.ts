@@ -26,7 +26,12 @@ import {
 import { isAuthenticated, kNoAuth } from "../../config/model-registry";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
-import { type Settings, validateSettingPatch } from "../../config/settings";
+import {
+	resolveSdkPromptDeadlineMs,
+	resolveSdkPromptMaxRuntimeMs,
+	type Settings,
+	validateSettingPatch,
+} from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import type { AgentEndEvent } from "../../extensibility/shared-events";
 import { normalizeGoal } from "../../goals/state";
@@ -196,6 +201,13 @@ export function verifyMasterCapabilityFrame(input: {
 
 /** Maximum time a replaced runtime may retain a lifecycle persistence task. */
 const LIFECYCLE_QUIESCENCE_MS = 1_000;
+/**
+ * Keep a live session's broker discovery recoverable well inside the session
+ * index's two-minute heartbeat freshness window. `ensureBroker` has its own
+ * bounded startup/recovery budget; the in-flight guard below prevents those
+ * budgets from stacking when one attempt outlives this cadence.
+ */
+export const SESSION_BROKER_RECOVERY_INTERVAL_MS = 30_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -357,6 +369,17 @@ export interface SdkOnlyTerminalAbortSeams {
 			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
 		},
 	) => Promise<{ status: string; terminalScope?: unknown }>;
+	/**
+	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
+	 * ledger holds for an execution handle (#5637). Strictly read-only: it
+	 * never claims, reserves, seals or quarantines ledger state. Declared here
+	 * so both hosts expose ONE seam contract — the bus route consumes it for its
+	 * deadline tool-boundary wait, and this route threads it so a future boundary
+	 * wait or deadline abort reads the ledger rather than silently falling back
+	 * to the event-derived set. Optional so an older host that does not thread it
+	 * degrades to that fallback instead of failing to construct.
+	 */
+	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
 	maxDurableTerminalReservationsForTests?: number;
 }
@@ -416,6 +439,11 @@ export class SessionSdkSessionRuntime {
 
 	getProviderDefinitions(capability: string): unknown | undefined {
 		return this.host.getProviderDefinitions(capability);
+	}
+
+	/** Persist the host's current observable activity for broker/session-list consumers. */
+	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
+		await this.host.reportActivity(state, at);
 	}
 
 	emitEvent(frame: SdkFrame): void {
@@ -558,6 +586,11 @@ export interface CreateSdkSessionRuntimeOptions {
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
+	/** Timer seams for deterministic broker-recovery lifecycle tests. */
+	setIntervalImpl?: typeof setInterval;
+	clearIntervalImpl?: typeof clearInterval;
+	/** Test-only broker ensure seam; production always uses the owner-fenced helper. */
+	ensureBrokerImpl?: typeof ensureBroker;
 	/** Test-only observation of a genuinely timed-out lifecycle drain. */
 	onLifecycleDrainTimeoutForTests?: () => void;
 	/** Test-only observation of bounded failure-diagnostic deduplication state. */
@@ -4167,6 +4200,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					sdkRunToken: string;
 				}>;
 				registerBroker: () => Promise<void>;
+				stopBrokerRecovery: () => void;
 				quiesceInput: () => void;
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
@@ -5031,6 +5065,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+		// The activity checkpoint is already fire-and-forget and does not depend on
+		// the handler awaiting trackLifecycle, so it composes with #5683 unchanged.
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_start")?.runtime)
+			?.reportActivity("active")
+			.catch(error => logger.warn(`sdk: active activity checkpoint failed: ${String(error)}`));
 		// Interactive/skill turns must not wait on durable start persist. Keep
 		// trackLifecycle so drain, persist-then-publish, content-hold release, and
 		// shutdown still run; do not return that promise to the extension runner
@@ -5061,6 +5100,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const tokenBinding =
 			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
 		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+		void (owner?.runtime ?? lifecycleStateForContext(ctx, "agent_end")?.runtime)
+			?.reportActivity("idle")
+			.catch(error => logger.warn(`sdk: idle activity checkpoint failed: ${String(error)}`));
 		// Capture the oldest unmatched batch synchronously. A successor may start
 		// while the failed diagnostic persists; that must not retarget the
 		// predecessor's reason or terminal boundary to the successor invocation.
@@ -5299,6 +5341,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		typeof (error as { code?: unknown }).code === "string"
 			? (error as { code: string }).code
 			: undefined;
+	const brokerDiagnosticCode = (error: unknown): string => {
+		const code = errorCode(error);
+		return code !== undefined && /^[A-Za-z0-9_.-]{1,64}$/u.test(code) ? code : "unavailable";
+	};
 	const startRuntime = async (ctx: ExtensionContext): Promise<void> => {
 		if (active) return;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -5323,14 +5369,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await steerReconciliation.hydrateFromStore();
 		const deadlineManager = new PromptDeadlineManager({
 			reconciliation,
-			getLeaseMs: () => {
-				const v = options.settings?.get("sdk.promptDeadlineMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 1_800_000;
-			},
-			getMaxMs: () => {
-				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
-				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
-			},
+			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
+			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {
@@ -6033,82 +6073,167 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
+		let brokerRegistrationInFlight: Promise<void> | undefined;
+		let brokerRecoveryStopped = false;
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
-			try {
-				if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
-					throw new Error("Lifecycle broker registration requires a request identity.");
-				await ensureBroker({ agentDir: options.agentDir });
-				const index = await new SessionIndex(options.agentDir).open();
-				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
-				const effectiveIncarnation = processIncarnation(process.pid);
-				const direct = await reattestMasterSessionIdentity({
-					index,
-					locator,
-					masterCapability: options.masterCapability,
-					attestationEpoch: options.masterAttestationEpoch,
-					ownerSessionId: options.masterOwnerSessionId,
-					sessionId,
-					pid: process.pid,
-					processIncarnation: effectiveIncarnation,
-				});
-				let registration: SessionIndexEvent | undefined;
-				await runtime.registerWithBroker({
-					register: async input => {
-						if (publishedEndpointUrl === undefined)
-							throw new Error("SDK transport endpoint was not published before broker registration.");
-						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
-						const file = await readEndpointFile(endpointPath);
-						if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
-						const endpoint = JSON.parse(file.source) as Record<string, unknown>;
-						if (
-							endpoint.sessionId !== input.sessionId ||
-							endpoint.pid !== process.pid ||
-							endpoint.url !== publishedEndpointUrl ||
-							endpoint.token !== transport.token
-						)
-							throw new Error("SDK endpoint did not match the published transport authority.");
-						const endpointMtimeMs = file.mtimeMs;
-						const endpointFileId = `${file.dev}:${file.ino}`;
-						const masterRole = masterAttestationForEffectiveHost({
-							masterCapability: options.masterCapability,
-							attestationEpoch: options.masterAttestationEpoch,
-							ownerSessionId: options.masterOwnerSessionId,
-							sessionId: input.sessionId,
-							pid: process.pid,
-							processIncarnation: effectiveIncarnation,
-							direct,
-						});
-						registration = await index.append({
-							type: "host_registered",
-							...input,
-							locator,
-							pid: process.pid,
-							endpointMtimeMs,
-							endpointFileId,
-							...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
-							...(masterRole ? { masterRole } : {}),
-						});
-					},
-					unregister: async input => {
-						const expected = registration;
-						if (
-							!expected ||
-							expected.sessionId !== input.sessionId ||
-							expected.endpointGeneration !== input.endpointGeneration ||
-							path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
-						)
-							return;
-						// Use the successful publication's proof, never a teardown-time file read.
-						await index.unregisterIfCurrent(expected);
-						if (registration === expected) registration = undefined;
-					},
-				});
-				brokerRegistered = true;
-			} catch (error) {
-				if (options.brokerRegistrationRequired) throw error;
-				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
+			if (brokerRegistrationInFlight !== undefined) {
+				await brokerRegistrationInFlight;
+				return;
 			}
+			const registration = (async (): Promise<void> => {
+				try {
+					if (options.brokerRegistrationRequired && !options.lifecycleRequestId)
+						throw new Error("Lifecycle broker registration requires a request identity.");
+					await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+					if (brokerRecoveryStopped) return;
+					const index = await new SessionIndex(options.agentDir).open();
+					if (brokerRecoveryStopped) return;
+					const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
+					const effectiveIncarnation = processIncarnation(process.pid);
+					const direct = await reattestMasterSessionIdentity({
+						index,
+						locator,
+						masterCapability: options.masterCapability,
+						attestationEpoch: options.masterAttestationEpoch,
+						ownerSessionId: options.masterOwnerSessionId,
+						sessionId,
+						pid: process.pid,
+						processIncarnation: effectiveIncarnation,
+					});
+					if (brokerRecoveryStopped) return;
+					let brokerRegistrationEvent: SessionIndexEvent | undefined;
+					await runtime.registerWithBroker({
+						register: async input => {
+							if (publishedEndpointUrl === undefined)
+								throw new Error("SDK transport endpoint was not published before broker registration.");
+							const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+							const file = await readEndpointFile(endpointPath);
+							if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
+							const endpoint = JSON.parse(file.source) as Record<string, unknown>;
+							if (
+								endpoint.sessionId !== input.sessionId ||
+								endpoint.pid !== process.pid ||
+								endpoint.url !== publishedEndpointUrl ||
+								endpoint.token !== transport.token
+							)
+								throw new Error("SDK endpoint did not match the published transport authority.");
+							const endpointMtimeMs = file.mtimeMs;
+							const endpointFileId = `${file.dev}:${file.ino}`;
+							const masterRole = masterAttestationForEffectiveHost({
+								masterCapability: options.masterCapability,
+								attestationEpoch: options.masterAttestationEpoch,
+								ownerSessionId: options.masterOwnerSessionId,
+								sessionId: input.sessionId,
+								pid: process.pid,
+								processIncarnation: effectiveIncarnation,
+								direct,
+							});
+							const published = await index.append({
+								type: "host_registered",
+								...input,
+								locator,
+								pid: process.pid,
+								endpointMtimeMs,
+								endpointFileId,
+								...(options.lifecycleRequestId ? { lifecycleRequestId: options.lifecycleRequestId } : {}),
+								...(masterRole ? { masterRole } : {}),
+							});
+							brokerRegistrationEvent = published;
+							if (brokerRecoveryStopped) {
+								// Teardown may have run before append returned its ownership proof.
+								await index.unregisterIfCurrent(published);
+								if (brokerRegistrationEvent === published) brokerRegistrationEvent = undefined;
+							}
+						},
+						heartbeat: async input => {
+							// Heartbeat only ever speaks for the publication this host proved it
+							// owns. A stale or foreign generation must not renew liveness.
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							await index.append({
+								type: "host_heartbeat",
+								sessionId: expected.sessionId,
+								locator: expected.locator,
+								endpointGeneration: expected.endpointGeneration,
+								pid: expected.pid,
+								...(expected.processIncarnation === undefined
+									? {}
+									: { processIncarnation: expected.processIncarnation }),
+								...(expected.hostIncarnation === undefined
+									? {}
+									: { hostIncarnation: expected.hostIncarnation }),
+								...(expected.masterRole === undefined ? {} : { masterRole: expected.masterRole }),
+								activity: input.activity,
+								ts: input.activity.at,
+							});
+						},
+						unregister: async input => {
+							const expected = brokerRegistrationEvent;
+							if (
+								!expected ||
+								expected.sessionId !== input.sessionId ||
+								expected.endpointGeneration !== input.endpointGeneration ||
+								path.resolve(expected.locator.stateRoot) !== path.resolve(input.stateRoot)
+							)
+								return;
+							// Use the successful publication's proof, never a teardown-time file read.
+							await index.unregisterIfCurrent(expected);
+							if (brokerRegistrationEvent === expected) brokerRegistrationEvent = undefined;
+						},
+					});
+					if (brokerRecoveryStopped) return;
+					brokerRegistered = true;
+				} catch (error) {
+					if (options.brokerRegistrationRequired) throw error;
+					logger.warn("sdk broker registration unavailable", { code: brokerDiagnosticCode(error) });
+				}
+			})();
+			brokerRegistrationInFlight = registration;
+			try {
+				await registration;
+			} finally {
+				if (brokerRegistrationInFlight === registration) brokerRegistrationInFlight = undefined;
+			}
+		};
+		let brokerRecoveryTimer: NodeJS.Timeout | undefined;
+		let brokerRecoveryInFlight: Promise<void> | undefined;
+		const runBrokerRecovery = async (): Promise<void> => {
+			if (brokerRecoveryStopped || brokerRecoveryInFlight !== undefined) return;
+			const recovery = (async (): Promise<void> => {
+				if (brokerRecoveryStopped) return;
+				if (brokerRegistered) await (options.ensureBrokerImpl ?? ensureBroker)({ agentDir: options.agentDir });
+				else await registerBroker();
+			})();
+			brokerRecoveryInFlight = recovery;
+			try {
+				await recovery;
+			} catch (error) {
+				logger.warn("sdk broker recovery unavailable", { code: brokerDiagnosticCode(error) });
+			} finally {
+				if (brokerRecoveryInFlight === recovery) brokerRecoveryInFlight = undefined;
+			}
+		};
+		const startBrokerRecovery = (): void => {
+			if (brokerRecoveryStopped || brokerRecoveryTimer !== undefined) return;
+			const timer = (options.setIntervalImpl ?? setInterval)(
+				() => void runBrokerRecovery(),
+				SESSION_BROKER_RECOVERY_INTERVAL_MS,
+			) as NodeJS.Timeout;
+			brokerRecoveryTimer = timer;
+			timer.unref?.();
+		};
+		const stopBrokerRecovery = (): void => {
+			brokerRecoveryStopped = true;
+			if (brokerRecoveryTimer === undefined) return;
+			(options.clearIntervalImpl ?? clearInterval)(brokerRecoveryTimer);
+			brokerRecoveryTimer = undefined;
 		};
 		const runtimeOwner: RuntimeState = {
 			sessionId,
@@ -6122,6 +6247,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			pending,
 			openLifecycleBatches,
 			registerBroker,
+			stopBrokerRecovery,
 			quiesceInput: () => {
 				inputGate.quiescing = true;
 				lifecycleOwnerHolder.quiescing = true;
@@ -6142,8 +6268,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			publishedEndpointUrl = (await runtime.start()).url;
 			await registerBroker();
+			if (!brokerRecoveryStopped) startBrokerRecovery();
 		} catch (error) {
 			active = undefined;
+			stopBrokerRecovery();
 			disposeGate?.();
 			try {
 				await runtime.stop();
@@ -6164,6 +6292,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pending,
 					openLifecycleBatches,
 					registerBroker,
+					stopBrokerRecovery,
 					quiesceInput: () => {
 						inputGate.quiescing = true;
 						lifecycleOwnerHolder.quiescing = true;
@@ -6197,6 +6326,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		activePromptOwnerHolder.connectionIds = undefined;
 		activePromptOwnerHolder.lifecycleEpoch = undefined;
+		current.stopBrokerRecovery();
 		current.quiesceInput();
 		current.fenceGateResolutions();
 		try {

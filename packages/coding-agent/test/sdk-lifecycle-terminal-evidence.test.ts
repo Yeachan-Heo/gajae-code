@@ -41,8 +41,8 @@ it("reads the owner's terminal record after a concurrent recovery stamps its in-
 		await owner.transition("create", "terminal_ok", { response, resultSessionId: "slow-session" });
 
 		expect(await owner.readTerminal("create", "request-hash")).toMatchObject({
-			state: "terminal_ok",
-			response,
+			kind: "terminal",
+			entry: { state: "terminal_ok", response },
 		});
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -61,8 +61,8 @@ it("reads back a durable terminal_uncertain record instead of reporting it unper
 		await ledger.transition("uncertain", "terminal_uncertain", { response });
 
 		expect(await ledger.readTerminal("uncertain", "request-hash")).toMatchObject({
-			state: "terminal_uncertain",
-			response,
+			kind: "terminal",
+			entry: { state: "terminal_uncertain", response },
 		});
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -80,7 +80,10 @@ it("withholds proof when a persisted terminal row cannot be reproduced", async (
 		rows[rows.length - 1]!.responseDigest = "0".repeat(64);
 		await fs.writeFile(ledgerFile(agentDir), `${rows.map(row => JSON.stringify(row)).join("\n")}\n`);
 
-		expect(await new LifecycleLedger(agentDir).readTerminal("tampered", "request-hash")).toBeUndefined();
+		expect(await new LifecycleLedger(agentDir).readTerminal("tampered", "request-hash")).toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -96,7 +99,10 @@ it("withholds proof when a row follows a proven terminal outcome", async () => {
 		});
 		await fs.appendFile(ledgerFile(agentDir), `${JSON.stringify({ ...terminal, ts: terminal.ts + 1 })}\n`);
 
-		expect(await new LifecycleLedger(agentDir).readTerminal("successor", "request-hash")).toBeUndefined();
+		expect(await new LifecycleLedger(agentDir).readTerminal("successor", "request-hash")).toEqual({
+			kind: "rejected",
+			reason: "row-not-attributable",
+		});
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}

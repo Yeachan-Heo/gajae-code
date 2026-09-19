@@ -2877,7 +2877,7 @@ describe("Editor component", () => {
 			editor.insertText("!");
 			const edited = editor.render(40);
 			expect(stripVTControlCharacters(edited.join("\n"))).toContain("gamma!");
-			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(3);
+			expect(__editorPerfCounters.layoutLogicalLinesProcessed).toBe(1);
 
 			__editorPerfCounters.reset();
 			const resized = editor.render(20);

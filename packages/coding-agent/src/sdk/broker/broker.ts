@@ -52,6 +52,7 @@ import {
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
+	type TerminalReadBack,
 } from "./lifecycle-ledger";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { sdkInternalRuntimeImage } from "./runtime";
@@ -725,9 +726,45 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
 		.sort()
 		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 		.join(",")}}`;
+}
+
+type TerminalPersistenceVerification =
+	| { kind: "unverified" }
+	| { kind: "verified" }
+	| { kind: "uncertain"; mismatches: readonly string[] };
+
+function verifyTerminalPersistence(
+	readBack: TerminalReadBack,
+	storedResponse: BrokerResponse,
+	durableEffects: LifecycleDurableEffectsReceipt | undefined,
+	startupFailure: LifecycleStartupFailureReceipt | undefined,
+): TerminalPersistenceVerification {
+	// An absent read-back is a verification failure, not evidence that the
+	// operation itself is ambiguous. The terminal transition was already synced
+	// before this read, so preserve its settled outcome and let a later reader
+	// reconcile the durable row.
+	if (readBack.kind === "absent") return { kind: "unverified" };
+	// A *rejected* row is the opposite: the ledger holds something for this request
+	// and refused it. That is damaged durable state, which previously fenced the
+	// session and must keep fencing it — treating it as "not yet written" would let
+	// a corrupt row clear the fence it exists to raise.
+	if (readBack.kind === "rejected") return { kind: "uncertain", mismatches: [`readBack:${readBack.reason}`] };
+	const persisted = readBack.entry;
+	const optionalReceiptJson = (value: unknown): string | undefined =>
+		value === undefined || value === null ? undefined : canonicalJson(value);
+	// The field name is always present; only the two compared receipt renderings are
+	// optional. Naming that shape keeps the mismatch list a plain string list.
+	const comparisons: readonly (readonly [string, string | undefined, string | undefined])[] = [
+		["response", canonicalJson(persisted.response), canonicalJson(storedResponse)],
+		["durableEffects", optionalReceiptJson(persisted.durableEffects), optionalReceiptJson(durableEffects)],
+		["startupFailure", optionalReceiptJson(persisted.startupFailure), optionalReceiptJson(startupFailure)],
+	];
+	const mismatches = comparisons.filter(([, actual, expected]) => actual !== expected).map(([field]) => field);
+	return mismatches.length === 0 ? { kind: "verified" } : { kind: "uncertain", mismatches };
 }
 
 function credentialFreeLifecycleResponse(value: unknown): unknown {
@@ -3710,12 +3747,21 @@ export class Broker {
 			});
 			if (isCleanupPending(response)) return response;
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
-			const persistenceVerified =
-				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
-				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
-				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
-			if (!persistenceVerified) {
+			const persistenceVerification = verifyTerminalPersistence(
+				persisted,
+				storedResponse,
+				outcome.durableEffects,
+				outcome.startupFailure,
+			);
+			if (persistenceVerification.kind === "unverified") {
+				logger.warn("sdk broker terminal persistence read-back was unavailable; preserving settled outcome", {
+					identity,
+				});
+			} else if (persistenceVerification.kind === "uncertain") {
+				logger.warn("sdk broker terminal persistence verification found conflicting evidence", {
+					identity,
+					mismatches: persistenceVerification.mismatches,
+				});
 				const uncertain = error(
 					"terminal_uncertain",
 					"Lifecycle terminal evidence could not be verified after persistence; retained artifacts require reconciliation.",

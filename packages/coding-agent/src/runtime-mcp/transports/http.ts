@@ -8,6 +8,7 @@
  * no sessions, no standalone stream, no replay. See ../protocol.ts.
  */
 import { logger, readSseJson, Snowflake } from "@gajae-code/utils";
+import { isResourceOwnerDisposalActive, registerResourceOwner } from "../../runtime/process-lifecycle";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -29,6 +30,51 @@ import {
 } from "../content-limits";
 import { fetchPluginMcpRequest, isPluginMcpPublicNetworkBound } from "../plugin-network-boundary";
 import { buildModernMcpHeaders, type MCPModernClientContext, type MCPProtocolEra, withModernMeta } from "../protocol";
+
+/**
+ * Postmortem release of live HTTP/SSE MCP sessions.
+ *
+ * A stdio server dies with the agent because it is a `spawnOwnedProcess` child, but an
+ * HTTP/SSE server is a separate, already-running process that only learns a client is gone
+ * from the session-termination `DELETE`. A signal kill (`SIGINT`/`SIGTERM`/`SIGHUP`) or a
+ * fatal exit bypasses session dispose, so without this sweep the server keeps the
+ * `Mcp-Session-Id` and everything hanging off it for every agent run that ever died -
+ * unbounded growth on the server side. Mirrors the LSP/Python/browser owners.
+ */
+const liveHttpTransports = new Set<HttpTransport>();
+let httpTransportOwnerRelease: (() => void) | undefined;
+/** Exit must not wait on a wedged endpoint; the per-request timeout is up to 30s. */
+const POSTMORTEM_CLOSE_TIMEOUT_MS = 2_000;
+
+function trackHttpTransport(transport: HttpTransport): void {
+	liveHttpTransports.add(transport);
+	httpTransportOwnerRelease ??= registerResourceOwner("mcp:http-transports", closeLiveHttpTransports);
+}
+
+function untrackHttpTransport(transport: HttpTransport): void {
+	if (!liveHttpTransports.delete(transport) || liveHttpTransports.size > 0) return;
+	// Nothing left to release: drop the registration so a long-lived host does not
+	// retain dead transports through the owner map.
+	httpTransportOwnerRelease?.();
+	httpTransportOwnerRelease = undefined;
+}
+
+async function closeLiveHttpTransports(): Promise<void> {
+	await Promise.all(
+		[...liveHttpTransports].map(async transport => {
+			try {
+				await transport.releaseForPostmortem(AbortSignal.timeout(POSTMORTEM_CLOSE_TIMEOUT_MS));
+			} catch (error) {
+				logger.debug("MCP HTTP postmortem release failed", { error });
+			}
+		}),
+	);
+}
+
+/** Live HTTP/SSE MCP transports awaiting postmortem release. Exposed for leak assertions/tests. */
+export function liveHttpTransportCount(): number {
+	return liveHttpTransports.size;
+}
 
 /** Best-effort JSON parse of an error body for structured era classification. */
 function tryParseJsonBody(text: string): unknown {
@@ -101,7 +147,11 @@ export class HttpTransport implements MCPTransport {
 	 */
 	async connect(): Promise<void> {
 		if (this.#connected) return;
+		if (isResourceOwnerDisposalActive()) {
+			throw new Error("Cannot connect MCP HTTP transport during process resource disposal");
+		}
 		this.#connected = true;
+		trackHttpTransport(this);
 	}
 
 	#fetch(init: BunFetchRequestInit): Promise<Response> {
@@ -601,11 +651,8 @@ export class HttpTransport implements MCPTransport {
 		}
 	}
 
-	async close(): Promise<void> {
-		const wasConnected = this.#connected;
-		this.#connected = false;
-
-		// Abort all SSE/background readers and wait for them to settle.
+	/** Abort every SSE/background reader. Does not wait for them to settle. */
+	#abortStreams(): void {
 		for (const controller of this.#streamControllers) {
 			controller.abort();
 		}
@@ -613,30 +660,66 @@ export class HttpTransport implements MCPTransport {
 			this.#sseConnection.abort();
 			this.#sseConnection = null;
 		}
+	}
+
+	/**
+	 * Send session termination (legacy era only; the modern era has no protocol
+	 * session to terminate). This DELETE is the only signal an already-running
+	 * HTTP/SSE server gets that its session may be dropped.
+	 */
+	async #terminateSession(signal?: AbortSignal): Promise<void> {
+		if (this.#era === "modern") return;
+		const sessionId = this.#sessionId;
+		if (!sessionId) return;
+		// Claim the server session before awaiting the wire request. Graceful close
+		// and postmortem disposal can overlap during shutdown; only the caller that
+		// detached this id may emit its termination DELETE.
+		this.#sessionId = null;
+		try {
+			const timeout = this.config.timeout ?? 30000;
+			const headers: Record<string, string> = {
+				...this.config.headers,
+				"Mcp-Session-Id": sessionId,
+			};
+
+			const timeoutSignal = AbortSignal.timeout(timeout);
+			await this.#fetch({
+				method: "DELETE",
+				headers,
+				signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+			});
+		} catch {
+			// Ignore termination errors
+		}
+	}
+
+	/**
+	 * Terminate the server-side session on a signal or fatal exit, without the
+	 * reader drain `close()` does: postmortem runs inside the signal handler,
+	 * where an aborted SSE body read is never observed by JS, so awaiting the
+	 * readers there never settles and the DELETE stays unreachable. `onClose` is
+	 * deliberately not fired - the manager reacts to it by reconnecting, which
+	 * would open a fresh server session on the way out.
+	 */
+	async releaseForPostmortem(signal: AbortSignal): Promise<void> {
+		untrackHttpTransport(this);
+		this.#connected = false;
+		this.#abortStreams();
+		await this.#terminateSession(signal);
+	}
+
+	async close(): Promise<void> {
+		untrackHttpTransport(this);
+		const wasConnected = this.#connected;
+		this.#connected = false;
+
+		// Abort all SSE/background readers and wait for them to settle.
+		this.#abortStreams();
 		await Promise.allSettled(Array.from(this.#streamReaders));
 
 		if (!wasConnected && !this.#sessionId) return;
 
-		// Send session termination if we have a session (legacy era only;
-		// the modern era has no protocol session to terminate)
-		if (this.#era !== "modern" && this.#sessionId) {
-			try {
-				const timeout = this.config.timeout ?? 30000;
-				const headers: Record<string, string> = {
-					...this.config.headers,
-					"Mcp-Session-Id": this.#sessionId,
-				};
-
-				await this.#fetch({
-					method: "DELETE",
-					headers,
-					signal: AbortSignal.timeout(timeout),
-				});
-			} catch {
-				// Ignore termination errors
-			}
-			this.#sessionId = null;
-		}
+		await this.#terminateSession();
 
 		this.onClose?.();
 		this.onClose = undefined;

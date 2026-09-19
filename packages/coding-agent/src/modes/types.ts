@@ -409,7 +409,7 @@ export interface InteractiveModeContext {
 	handleHandoffCommand(customInstructions?: string): Promise<void>;
 	handleContributionPrepCommand(customInstructions?: string): Promise<void>;
 	handleMoveCommand(targetPath: string): Promise<void>;
-	handleRenameCommand(title: string): Promise<void>;
+	handleRenameCommand(title?: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
 	handleSTTToggle(): Promise<void>;
 	executeCompaction(
@@ -490,7 +490,7 @@ export interface InteractiveModeContext {
 	>;
 	goalModeController: Pick<
 		import("./controllers/goal-mode-controller").GoalModeController,
-		"enabled" | "paused" | "handleCommand"
+		"enabled" | "paused" | "handleCommand" | "cancelContinuation" | "scheduleContinuation"
 	>;
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void;
 	setHookStatus(key: string, text: string | undefined): void;

@@ -1,8 +1,10 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 
 import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
+import { UserMessageSelectorComponent } from "@gajae-code/coding-agent/modes/components/user-message-selector";
 import { CommandController } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
+import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getWelcomeTranscriptReservedRows } from "@gajae-code/coding-agent/modes/interactive-mode";
 import {
 	IRC_OBSERVATION_LEDGER_MAX_RECORDS,
@@ -12,25 +14,61 @@ import {
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
+import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { Container, Text } from "@gajae-code/tui";
 
-function createForkContext(fork: () => Promise<boolean>) {
+async function dispatchAndSelectFork(ctx: InteractiveModeContext): Promise<void> {
+	await new CommandController(ctx).handleForkCommand();
+	const selector = ctx.editorContainer.children.find(child => child instanceof UserMessageSelectorComponent);
+	if (!(selector instanceof UserMessageSelectorComponent)) throw new Error("Expected fork prompt selector");
+	selector.getMessageList().handleInput("\r");
+	for (let attempt = 0; attempt < 20; attempt++) {
+		if (ctx.editorContainer.children.length === 1 && ctx.editorContainer.children[0] === ctx.editor) return;
+		await Promise.resolve();
+	}
+	throw new Error("Timed out waiting for fork selection");
+}
+
+function createForkContext(branch: () => Promise<boolean>, committedFailure = false) {
 	const chatContainer = new Container();
+	const editor = new Text("", 0, 0);
+	const editorContainer = new Container();
+	editorContainer.addChild(editor);
 	const ledger = new IrcObservationLedger();
 	let sidebarRequestedVisible = true;
 	const panelVisible = true;
+	let sessionFile = "/tmp/sessions/parent.jsonl";
+	vi.spyOn(titleGenerator, "setSessionTerminalTitle").mockImplementation(() => {});
 
 	const ctx = {
 		session: {
 			isStreaming: false,
-			fork,
-			sessionFile: "/tmp/sessions/fork.jsonl",
+			getUserMessagesForBranching: () => [{ entryId: "selected-prompt", text: "selected prompt" }],
+			branch: async () => {
+				if (committedFailure) sessionFile = "/tmp/sessions/child.jsonl";
+				const accepted = await branch();
+				if (accepted) sessionFile = "/tmp/sessions/child.jsonl";
+				return { selectedText: "selected prompt", cancelled: !accepted };
+			},
+			get sessionFile() {
+				return sessionFile;
+			},
 		},
+		sessionManager: {
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionFile,
+			getCwd: () => "/tmp",
+		},
+		editor,
+		editorContainer,
 		isInitialized: true,
 		loadingAnimation: undefined,
 		statusContainer: { clear: vi.fn() },
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), setSessionStartTime: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		updateEditorBorderColor: vi.fn(),
+		resetObserverRegistry: vi.fn(),
+		reloadTodos: vi.fn(async () => {}),
 		chatContainer,
 		pendingTools: new Map<string, never>(),
 		pendingBashComponents: [],
@@ -38,11 +76,22 @@ function createForkContext(fork: () => Promise<boolean>) {
 		bashComponent: undefined,
 		pythonComponent: undefined,
 		streamingComponent: undefined,
+		hasPendingSubmission: () => false,
+		hasActiveBtw: () => false,
+		handleBtwEscape: vi.fn(),
 
 		ircLedger: ledger,
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), setFocus: vi.fn() },
+		showStatus: vi.fn(),
 		showError: vi.fn(),
 		showWarning: vi.fn(),
+		goalModeController: {
+			enabled: false,
+			paused: false,
+			handleCommand: vi.fn(),
+			cancelContinuation: vi.fn(),
+			scheduleContinuation: vi.fn(),
+		},
 		captureIrcArrivalSnapshot: () => ({
 			panelVisible,
 
@@ -51,6 +100,9 @@ function createForkContext(fork: () => Promise<boolean>) {
 			resolvedToggleKey: "Ctrl+I",
 		}),
 	} as unknown as InteractiveModeContext;
+	const selectorController = new SelectorController(ctx);
+	ctx.showUserMessageSelector = () => selectorController.showUserMessageSelector();
+	ctx.rebuildInitialMessages = vi.fn();
 	const helpers = new UiHelpers(ctx);
 	ctx.addLiveIrcObservationToChat = (message, arrival) => helpers.addLiveIrcObservationToChat(message, arrival);
 	ctx.removeRenderedIrcInlineComponents = observationId => helpers.removeRenderedIrcInlineComponents(observationId);
@@ -73,7 +125,10 @@ function createForkContext(fork: () => Promise<boolean>) {
 	};
 }
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+	vi.useRealTimers();
+	vi.restoreAllMocks();
+});
 
 beforeAll(async () => {
 	const theme = await getThemeByName("red-claw");
@@ -166,7 +221,7 @@ describe("IRC lifecycle resets", () => {
 		}
 		expect(fixture.ledger.getSidebarRecords().some(record => record.observationId === "before-fork")).toBe(false);
 
-		await new CommandController(fixture.ctx).handleForkCommand();
+		await dispatchAndSelectFork(fixture.ctx);
 		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
 		expect(Bun.stripANSI(fixture.chatContainer.render(100).join("\n"))).not.toContain("before fork");
 		expect(fixture.helpers.getRenderedIrcInlineComponents()).toEqual(new Map());
@@ -201,7 +256,7 @@ describe("IRC lifecycle resets", () => {
 		};
 		const cancelled = createForkContext(async () => false);
 		await cancelled.controller.handleEvent({ type: "irc_message", message });
-		await new CommandController(cancelled.ctx).handleForkCommand();
+		await dispatchAndSelectFork(cancelled.ctx);
 		expect(cancelled.ledger.getSidebarRecords()).toHaveLength(1);
 		expect(cancelled.chatContainer.children).toHaveLength(2);
 		expect(cancelled.isSidebarRequestedVisible()).toBe(true);
@@ -211,10 +266,36 @@ describe("IRC lifecycle resets", () => {
 			type: "irc_message",
 			message: { ...message, details: { ...message.details, observationId: "failed" } },
 		});
-		await expect(new CommandController(failed.ctx).handleForkCommand()).rejects.toThrow("disk failure");
+		await dispatchAndSelectFork(failed.ctx);
 		expect(failed.ledger.getSidebarRecords()).toHaveLength(1);
 		expect(failed.chatContainer.children).toHaveLength(2);
 		expect(failed.isSidebarRequestedVisible()).toBe(true);
+	});
+
+	it("retires parent IRC ownership when a fork rejects after committing a child", async () => {
+		const fixture = createForkContext(async () => {
+			throw new Error("post-commit setup failed");
+		}, true);
+		const message = {
+			role: "custom" as const,
+			customType: "irc:incoming" as const,
+			content: "parent-only message",
+			display: true,
+			attribution: "agent" as const,
+			timestamp: 0,
+			details: { observationId: "parent-only", from: "peer", to: "you", message: "parent-only message" },
+		};
+		await fixture.controller.handleEvent({ type: "irc_message", message });
+		await dispatchAndSelectFork(fixture.ctx);
+		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
+		expect(fixture.isSidebarRequestedVisible()).toBe(false);
+		expect(fixture.helpers.getRenderedIrcInlineComponents()).toEqual(new Map());
+		expect(fixture.ctx.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+		expect(fixture.ctx.showError).toHaveBeenCalledWith(
+			"Fork created, but session setup failed: post-commit setup failed",
+		);
+		await fixture.controller.handleEvent({ type: "irc_message", message });
+		expect(fixture.ledger.getSidebarRecords()).toEqual([]);
 	});
 
 	it("expires only ephemeral inline owners while retaining the sidebar observation and dedup identity", async () => {
@@ -450,7 +531,7 @@ describe("IRC lifecycle resets", () => {
 		helpers.addLiveIrcObservationToChat(incoming, eligibleArrival);
 		expect(transcriptIncludesHint(chatContainer)).toBe(true);
 
-		await new CommandController(ctx).handleForkCommand();
+		await dispatchAndSelectFork(ctx);
 		chatContainer.clear();
 		helpers.addLiveIrcObservationToChat({ ...incoming, observationId: "hint-after-fork" }, eligibleArrival);
 		expect(transcriptIncludesHint(chatContainer)).toBe(true);

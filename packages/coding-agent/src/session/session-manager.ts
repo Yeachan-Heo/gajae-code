@@ -67,6 +67,7 @@ import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
 import type { ManagedLegacyLocalMigrationSource } from "../internal-urls/local-protocol";
 import * as git from "../utils/git";
+import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutResult,
@@ -2162,8 +2163,47 @@ export const RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 export const BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES = 2 * 1024 * 1024 * 1024 + 1024 * 1024;
 const EAGER_RESUME_TRANSCRIPT_MAX_BYTES = MANAGED_ARTIFACT_MAX_FILE_BYTES;
 
+/**
+ * Recovery actions offered when a live transcript is at or past the managed
+ * per-file cap.
+ *
+ * Constrained three ways, and every command named here satisfies all three:
+ *
+ * 1. **It must exist.** `gjc export <session-file>` was advised for both limits
+ *    and is not a subcommand, so following it literally started a fresh agent
+ *    that read "export" as a prompt while the session stayed unwritable. (The
+ *    root `--export` flag renders HTML and exits; it yields no resumable
+ *    session.)
+ * 2. **It must be reachable on every surface that renders the message.** These
+ *    strings reach ACP/text consumers through `AgentSession`, and the ACP
+ *    registry is filtered to definitions carrying `handle`
+ *    (`slash-commands/acp-builtins.ts`), so a `handleTui`-only command such as
+ *    `/new` is a different dead end rather than a fix.
+ * 3. **It must not drop the retained near-limit entries.** A failed append is
+ *    kept in memory with a full rewrite armed, and a rejected managed rewrite
+ *    likewise retains its resident entries; both messages promise the work
+ *    persists on the next successful write. `/compact` and `/clear` keep the
+ *    manager — and therefore that pending debt — alive; a session switch closes
+ *    the writer without paying it.
+ *
+ * Every near-limit error class MUST interpolate this constant rather than
+ * restate the advice. `SessionNearLimitRewriteError` restated it and thereby
+ * reintroduced `gjc export <session-file>` after #5621 removed it (#5691).
+ *
+ * `session-recovery-guidance.test.ts` pins all three constraints against the
+ * CLI, builtin, and ACP registries, for every near-limit error class.
+ */
+export const SESSION_LIMIT_RECOVERY_ACTIONS =
+	"compact the session (`/compact`), or clear its context (`/clear`) if compaction cannot reclaim enough";
+
+/**
+ * Oversized-resume guidance. This surface is reached *before* a session is
+ * opened, so it deliberately does not reuse {@link SESSION_LIMIT_RECOVERY_ACTIONS}:
+ * an in-session command there would act on whichever session the user resumes
+ * next, never on the transcript that was just rejected.
+ */
 export const SESSION_OVERSIZED_RECOVERY_MESSAGE =
-	"The selected session transcript is too large to resume safely. Use `gjc export <session-file>` to export its content into a new session, or remove/archive it after confirming its content is no longer needed.";
+	"The selected session transcript is too large to resume safely. Resume a different session, or remove/archive this transcript after confirming its content is no longer needed.";
 
 export class SessionAppendPersistenceError extends Error {
 	readonly phase: SessionAppendPersistenceFailurePhase;
@@ -2210,8 +2250,8 @@ export class SessionNearLimitAppendError extends Error {
 			[
 				`near_limit_append: entry (${details.entryBytes} B) plus live transcript (${details.liveBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
 				details.entryRetained
-					? "The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. Compact the session (`/compact`) or export to a fresh session (`gjc export <session-file>`) before continuing."
-					: "The appended entry was rolled back from memory; re-issue it after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+					? `The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}.`
+					: `The appended entry was rolled back from memory; ${SESSION_LIMIT_RECOVERY_ACTIONS}, then re-issue it.`,
 			].join(" "),
 		);
 		this.name = "SessionNearLimitAppendError";
@@ -2220,6 +2260,54 @@ export class SessionNearLimitAppendError extends Error {
 		this.capBytes = details.capBytes;
 		this.entryRetained = details.entryRetained;
 	}
+}
+
+/**
+ * Typed near-limit rewrite outcome (follow-up to #4566).
+ *
+ * A managed atomic rewrite (`#writeEntriesAtomicallySync`) whose serialized
+ * transcript crosses the per-file cap cannot be published: the managed store
+ * rejects the bytes with `content_too_large`. Unlike the append path there is
+ * no appended entry here — the whole live transcript is the payload — so this
+ * error carries the rejected rewrite size and the cap instead of append
+ * fields, and every rewrite/flush/close caller can point at compaction or
+ * export as the continuation path.
+ */
+export class SessionNearLimitRewriteError extends Error {
+	readonly code = "near_limit_rewrite" as const;
+	/** Serialized transcript size (bytes) rejected by the managed store. */
+	readonly transcriptBytes: number;
+	/** Managed per-file cap in force when the rewrite was rejected. */
+	readonly capBytes: number;
+
+	constructor(details: { transcriptBytes: number; capBytes: number }) {
+		super(
+			[
+				`near_limit_rewrite: live transcript (${details.transcriptBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
+				// Must reuse SESSION_LIMIT_RECOVERY_ACTIONS rather than restate the advice:
+				// this error class reintroduced `gjc export <session-file>` (#5691) after
+				// #5621 removed it, because it hardcoded its own copy of the guidance.
+				`The rewrite was rejected and the resident entries are retained in memory; the transcript persists again once you ${SESSION_LIMIT_RECOVERY_ACTIONS}.`,
+			].join(" "),
+		);
+		this.name = "SessionNearLimitRewriteError";
+		this.transcriptBytes = details.transcriptBytes;
+		this.capBytes = details.capBytes;
+	}
+}
+
+/**
+ * Near-limit rejection from the managed transcript store.
+ *
+ * The store raises a bare `content_too_large` for any payload above the per-file
+ * cap, and `#writeEntriesAtomicallySync` converts that same condition on the
+ * rewrite lane into `SessionNearLimitRewriteError`. Both shapes mean the live
+ * transcript crossed the cap and share one recovery path in `_persist`.
+ */
+function isManagedNearLimitFailure(error: unknown): boolean {
+	return (
+		(error instanceof Error && error.message === "content_too_large") || error instanceof SessionNearLimitRewriteError
+	);
 }
 
 export class SessionManagedStorageError extends Error {
@@ -2418,6 +2506,8 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 }
+
+const pickerDiskIdentities = new WeakMap<SessionInfo, SessionStorageStat>();
 // =============================================================================
 // Strict ACP authorization inventory (fail-closed, never partial authority)
 // =============================================================================
@@ -3617,6 +3707,38 @@ function sameResumeStat(left: SessionStorageStat, right: SessionStorageStat): bo
 		left.mtimeNs === right.mtimeNs &&
 		left.ctimeNs === right.ctimeNs
 	);
+}
+
+function pickerDiskIdentityMatchesStorageStat(expected: SessionStorageStat, observed: SessionStorageStat): boolean {
+	return (
+		expected.isFile &&
+		observed.isFile &&
+		expected.dev === observed.dev &&
+		expected.ino === observed.ino &&
+		expected.nlink === observed.nlink &&
+		expected.size === observed.size &&
+		expected.mtimeNs === observed.mtimeNs &&
+		expected.ctimeNs === observed.ctimeNs
+	);
+}
+
+function pickerDiskIdentityMatchesManagedSnapshot(
+	expected: SessionStorageStat,
+	observed: Pick<SessionStorageStat, "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">,
+): boolean {
+	return (
+		expected.isFile &&
+		expected.dev === observed.dev &&
+		expected.ino === observed.ino &&
+		expected.nlink === observed.nlink &&
+		expected.size === observed.size &&
+		expected.mtimeNs === observed.mtimeNs &&
+		expected.ctimeNs === observed.ctimeNs
+	);
+}
+
+function pickerDiskIdentityMatchesDescriptor(expected: SessionStorageStat, observed: DescriptorSnapshot): boolean {
+	return pickerDiskIdentityMatchesManagedSnapshot(expected, observed);
 }
 
 function resumeIdentityMatchesDescriptor(identity: ResumeSessionIdentity, descriptor: DescriptorSnapshot): boolean {
@@ -6948,7 +7070,7 @@ async function collectSessionFromFile(
 		firstMessage ||= extractFirstUserMessageFromPrefix(content) ?? "";
 		const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
 		const stats = storage.statSync(file);
-		return {
+		const session: SessionInfo = {
 			path: file,
 			id: header.id,
 			cwd: header.cwd ?? "",
@@ -6963,6 +7085,8 @@ async function collectSessionFromFile(
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 		};
+		pickerDiskIdentities.set(session, stats);
+		return session;
 	} catch {
 		return undefined;
 	}
@@ -7081,6 +7205,7 @@ export const SessionManagerTestHooks: {
 	afterForkTranscriptPublished?: () => void | Promise<void>;
 	beforeEphemeralArtifactManagerInstall?: (dir: string) => void | Promise<void>;
 	beforePersistPatchFence?: (attempt: number) => void;
+	beforeLivePickerStarFence?: () => void;
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
@@ -15615,18 +15740,36 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
-				if (this.#managedPersistExpectedIdentity) {
-					try {
-						store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
-					} catch (err) {
-						// A confirmed missing predecessor can be recreated from the complete
-						// resident transcript. Any present-but-different identity still fails
-						// closed so a concurrent successor is never overwritten.
-						if (!isEnoent(err)) throw err;
-						this.#managedPersistExpectedIdentity = undefined;
-						store.replaceSync(relativePath, bytes);
+				try {
+					if (this.#managedPersistExpectedIdentity) {
+						try {
+							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+						} catch (err) {
+							// A confirmed missing predecessor can be recreated from the complete
+							// resident transcript. Any present-but-different identity still fails
+							// closed so a concurrent successor is never overwritten.
+							if (!isEnoent(err)) throw err;
+							this.#managedPersistExpectedIdentity = undefined;
+							store.replaceSync(relativePath, bytes);
+						}
+					} else store.replaceSync(relativePath, bytes);
+				} catch (err) {
+					// A live transcript that no longer fits the managed per-file cap is
+					// a typed near-limit outcome, not an unclassified abort: surface a
+					// rewrite-scoped error instead of leaking a raw `content_too_large`
+					// rejection to callers with no entry context. Resident entries stay
+					// in memory, so the transcript persists again once the user runs one
+					// of the actions in SESSION_LIMIT_RECOVERY_ACTIONS. Do not name the
+					// commands here — a second copy of the advice is how `gjc export`
+					// came back (#5732).
+					if (err instanceof Error && err.message === "content_too_large") {
+						throw new SessionNearLimitRewriteError({
+							transcriptBytes: bytes.byteLength,
+							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						});
 					}
-				} else store.replaceSync(relativePath, bytes);
+					throw err;
+				}
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
 				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
@@ -17316,6 +17459,190 @@ export class SessionManager {
 		}
 	}
 
+	async setSessionStarredForPicker(session: SessionInfo, starred: boolean): Promise<void> {
+		if (this.#sessionFile && canonicalizeTrustedPath(session.path) === canonicalizeTrustedPath(this.#sessionFile)) {
+			await this.#setLivePickerStar(session, starred);
+			return;
+		}
+		await SessionManager.setSessionStarredForPicker(
+			session,
+			starred,
+			this.destination.kind === "explicit" ? this.destination.directory : undefined,
+		);
+	}
+
+	#assertPickerSessionIsCurrent(session: SessionInfo): void {
+		if (
+			!this.#sessionFile ||
+			canonicalizeTrustedPath(session.path) !== canonicalizeTrustedPath(this.#sessionFile) ||
+			session.id !== this.#sessionId
+		)
+			throw new Error("Selected session identity changed. Reopen the session picker.");
+		if (session.cwd !== this.cwd) throw new Error("Selected session workspace changed. Reopen the session picker.");
+		const expectedDiskIdentity = pickerDiskIdentities.get(session);
+		if (expectedDiskIdentity) {
+			let observed: SessionStorageStat;
+			try {
+				observed = this.#storage.statSync(this.#sessionFile);
+			} catch {
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+			}
+			if (!pickerDiskIdentityMatchesStorageStat(expectedDiskIdentity, observed))
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+		}
+	}
+
+	async #setLivePickerStar(session: SessionInfo, starred: boolean): Promise<void> {
+		this.#assertRecoveryHydrationWritable();
+		this.#assertPickerSessionIsCurrent(session);
+		const operation = this.#persistChain.then(() => {
+			if (this.#persistError) throw this.#persistError;
+			SessionManagerTestHooks.beforeLivePickerStarFence?.();
+			this.#withSessionPersistenceFenceSync(() => {
+				this.#assertRecoveryHydrationWritable();
+				this.#assertPickerSessionIsCurrent(session);
+				const sessionFile = this.#sessionFile!;
+				const directory = path.dirname(sessionFile);
+				const relativePath = path.basename(sessionFile);
+				const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
+				try {
+					const descriptor = authority.descriptorExpected(relativePath);
+					if (!descriptor) throw new Error("Selected session no longer exists.");
+					if (descriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES)
+						throw new Error("Session is too large to star from the picker. Use /star or /unstar in the session.");
+					const snapshot = authority.readExpected(relativePath);
+					if (!snapshot) throw new Error("Selected session no longer exists.");
+					const expectedDiskIdentity = pickerDiskIdentities.get(session);
+					if (
+						expectedDiskIdentity &&
+						!pickerDiskIdentityMatchesManagedSnapshot(expectedDiskIdentity, snapshot.identity)
+					)
+						throw new Error("Selected session identity changed. Reopen the session picker.");
+					const content = snapshot.bytes.toString("utf8");
+					const newline = content.indexOf("\n");
+					const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
+					if (!isRecord(rawHeader) || rawHeader.type !== "session" || rawHeader.id !== session.id)
+						throw new Error("Selected session identity changed. Reopen the session picker.");
+					const entries = parseSessionEntries(content);
+					const diskHeader = entries[0];
+					if (diskHeader?.type !== "session" || diskHeader.cwd !== session.cwd)
+						throw new Error("Selected session workspace changed. Reopen the session picker.");
+					if ((diskHeader.version ?? 1) < 4)
+						throw new Error("Session format requires an upgrade. Resume it before changing its star.");
+					if ((diskHeader.starredPatchVersion === 1 && diskHeader.starred === true) === starred) return;
+
+					const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
+					const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
+					let bytes: Uint8Array;
+					if (appendOnly) bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
+					else {
+						rawHeader.starredPatchVersion = 1;
+						delete rawHeader.starred;
+						const body = newline === -1 ? "" : content.slice(newline + 1);
+						bytes = Buffer.from(
+							`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
+						);
+					}
+
+					this.#closePersistWriterInternalSync();
+					if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+					else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+					const committedDescriptor = authority.descriptorExpected(relativePath);
+					if (!committedDescriptor) throw new Error("Selected session no longer exists after star mutation.");
+					const committedIdentity = this.#storage.statSync(sessionFile);
+					if (!pickerDiskIdentityMatchesDescriptor(committedIdentity, committedDescriptor))
+						throw new Error("Selected session identity changed after star mutation.");
+					pickerDiskIdentities.set(session, committedIdentity);
+					const liveHeader = this.#fileEntries.find(entry => entry.type === "session") as
+						| SessionHeader
+						| undefined;
+					if (!liveHeader) throw new Error("Selected session identity changed. Reopen the session picker.");
+					liveHeader.starredPatchVersion = 1;
+					applyHeaderPatch(liveHeader, { starred });
+					this.#headerExportRevision++;
+					if (this.destination.kind === "managed") {
+						this.#adoptManagedPersistIdentity(sessionFile);
+						this.#publishCommitMarkerFromCurrentTranscriptSync();
+					}
+				} finally {
+					authority.close();
+				}
+			});
+		});
+		this.#persistChain = operation.catch(() => {});
+		await operation;
+	}
+
+	/** Update only a picker candidate's metadata, without opening a runtime or publishing a resume breadcrumb. */
+	static async setSessionStarredForPicker(
+		session: SessionInfo,
+		starred: boolean,
+		explicitSessionDir?: string,
+	): Promise<void> {
+		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
+		const directory = await fs.promises.realpath(path.dirname(session.path));
+		const sessionPath = path.join(directory, path.basename(session.path));
+		if (explicitSessionDir) {
+			const root = await fs.promises.realpath(explicitSessionDir);
+			if (!pathIsWithin(root, sessionPath)) throw new Error("Session is outside the configured session directory.");
+		} else if (
+			!isProjectSessionTranscriptPath(path.join(canonicalizeTrustedPath(session.cwd), ".gjc"), sessionPath)
+		) {
+			const sessionsRoot = path.dirname(directory);
+			const resolved = resolveManagedScope({ cwd: session.cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+			if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
+			const listing = listManagedCandidates(resolved.scope);
+			if (
+				listing.kind !== "complete" ||
+				!listing.owned.some(candidate => path.resolve(candidate.path) === sessionPath)
+			)
+				throw new Error("Session is not an authorized managed candidate.");
+		}
+		const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
+		try {
+			const relativePath = path.basename(session.path);
+			const descriptor = authority.descriptorExpected(relativePath);
+			if (!descriptor) throw new Error("Selected session no longer exists.");
+			if (descriptor.size > EAGER_RESUME_TRANSCRIPT_MAX_BYTES)
+				throw new Error("Session is too large to star from the picker. Use /star or /unstar in the session.");
+			const snapshot = authority.readExpected(relativePath);
+			if (!snapshot) throw new Error("Selected session no longer exists.");
+			const content = snapshot.bytes.toString("utf8");
+			const newline = content.indexOf("\n");
+			const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
+			if (!isRecord(rawHeader) || rawHeader.type !== "session" || rawHeader.id !== session.id)
+				throw new Error("Selected session identity changed. Reopen the session picker.");
+			const entries = parseSessionEntries(content);
+			const header = entries[0];
+			if (header?.type !== "session" || header.cwd !== session.cwd)
+				throw new Error("Selected session workspace changed. Reopen the session picker.");
+			if ((header.version ?? 1) < 4)
+				throw new Error("Session format requires an upgrade. Resume it before changing its star.");
+			if ((header.starredPatchVersion === 1 && header.starred === true) === starred) return;
+
+			const patch = `${JSON.stringify({ type: "header_patch", patch: { starred } })}\n`;
+			const appendOnly = rawHeader.starredPatchVersion === 1 && Number(rawHeader.version) >= 4;
+			let bytes: Uint8Array;
+			if (appendOnly) {
+				bytes = Buffer.from(`${content.endsWith("\n") ? "" : "\n"}${patch}`);
+			} else {
+				rawHeader.starredPatchVersion = 1;
+				delete rawHeader.starred;
+				const body = newline === -1 ? "" : content.slice(newline + 1);
+				bytes = Buffer.from(
+					`${JSON.stringify(rawHeader)}\n${body}${body && !body.endsWith("\n") ? "\n" : ""}${patch}`,
+				);
+			}
+			if (appendOnly) authority.appendExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+			else authority.replaceExpectedIdentitySync(relativePath, bytes, snapshot.identity);
+			const committedDescriptor = authority.descriptorExpected(relativePath);
+			if (!committedDescriptor) throw new Error("Selected session no longer exists after star mutation.");
+			pickerDiskIdentities.set(session, descriptorSnapshotAsStorageStat(committedDescriptor));
+		} finally {
+			authority.close();
+		}
+	}
+
 	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
 		if (header.starredPatchVersion === 1) return;
 		const previousStarred = header.starred;
@@ -17363,6 +17690,7 @@ export class SessionManager {
 		const sanitized = SessionManager.#sanitizeName(name);
 		if (!sanitized) return false;
 
+		invalidateSessionTitleGeneration(this);
 		this.#sessionName = sanitized;
 		this.#titleSource = source;
 		await this.#appendHeaderPatch({ title: sanitized, titleSource: source });
@@ -17558,21 +17886,24 @@ export class SessionManager {
 			if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
-			// content_too_large on the managed append hot path means the append-only
-			// transcript file has reached the per-file storage limit (64 MiB). The
-			// on-disk file is append-only and grew past the limit even though the
-			// in-memory entry list may be much smaller (compaction evicts old
-			// content but the append-only file never shrinks until a full rewrite).
-			// Fall back to a full rewrite (replaceSync) which writes only the live
-			// in-memory entries, shrinking the file below the limit. The entry has
-			// already been added to #fileEntries by #appendEntryWithinPersistenceFence.
-			if (err instanceof Error && err.message === "content_too_large") {
-				// Typed near-limit contract (#4566): recover by rewriting only the
-				// live in-memory entries, then verify the recovered file actually
-				// holds the just-appended entry. When even the rewrite cannot fit
-				// the entry (live content alone is at the cap), surface the typed
-				// near-limit outcome instead of silently succeeding without the
-				// receipt for an effect that already committed (e.g. a source edit).
+			// Near-limit failure on the managed append hot path. Two shapes reach here,
+			// both meaning the managed transcript can no longer grow at its per-file cap:
+			//  - the appended bytes alone exceed the cap (`content_too_large` from the
+			//    store's append, #4566); or
+			//  - the ENOENT / missing-predecessor recovery rewrite inside
+			//    #appendManagedRecordsSync raised SessionNearLimitRewriteError because the
+			//    resident transcript itself no longer fits.
+			// Recovery is the same for both: rewrite only the live in-memory entries (the
+			// append-only file grew past the limit even though the in-memory entry list
+			// may be much smaller, since compaction evicts old content but the file never
+			// shrinks until a full rewrite) and verify the just-appended entry is actually
+			// durable. The entry has already been added to #fileEntries by
+			// #appendEntryWithinPersistenceFence.
+			if (isManagedNearLimitFailure(err)) {
+				// Typed near-limit contract (#4566): when even the rewrite cannot fit the
+				// entry (live content alone is at the cap), surface the typed near-limit
+				// outcome instead of silently succeeding without the receipt for an effect
+				// that already committed (e.g. a source edit).
 				const entryBytes = (() => {
 					try {
 						const materialized = materializeResidentEntryForPersistenceSync(
@@ -17588,7 +17919,23 @@ export class SessionManager {
 						return 0;
 					}
 				})();
-				const liveBytesBefore = this.getTranscriptFileBytes();
+				const nearLimit = (liveBytes: number) =>
+					new SessionNearLimitAppendError({
+						entryBytes,
+						liveBytes,
+						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						entryRetained: this.#byId.has(entry.id),
+					});
+				// A rewrite-scoped overflow reports the rejected live-transcript size and
+				// proves the rewrite already ran and failed, so it is not repeated: the
+				// on-disk size is authoritative only for a rejected append, where the
+				// recovery rewrite has not run yet.
+				const liveBytesBefore =
+					err instanceof SessionNearLimitRewriteError ? err.transcriptBytes : this.getTranscriptFileBytes();
+				if (err instanceof SessionNearLimitRewriteError) {
+					this.#needsFullRewriteOnNextPersist = true;
+					throw nearLimit(liveBytesBefore);
+				}
 				try {
 					this.#rewriteFileSync();
 				} catch (rewriteError) {
@@ -17596,14 +17943,9 @@ export class SessionManager {
 					// the resident list (its effect, including any committed source
 					// edit, is not lost), but the receipt is not durable yet: report
 					// the typed near-limit outcome instead of an unclassified abort.
-					if (rewriteError instanceof Error && rewriteError.message === "content_too_large") {
+					if (rewriteError instanceof SessionNearLimitRewriteError) {
 						this.#needsFullRewriteOnNextPersist = true;
-						throw new SessionNearLimitAppendError({
-							entryBytes,
-							liveBytes: liveBytesBefore,
-							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
-							entryRetained: this.#byId.has(entry.id),
-						});
+						throw nearLimit(liveBytesBefore);
 					}
 					throw rewriteError;
 				}
@@ -17616,12 +17958,7 @@ export class SessionManager {
 				const entryRetained = liveBytesAfter <= MANAGED_ARTIFACT_MAX_FILE_BYTES && this.#byId.has(entry.id);
 				if (!entryRetained) {
 					this.#needsFullRewriteOnNextPersist = true;
-					throw new SessionNearLimitAppendError({
-						entryBytes,
-						liveBytes: liveBytesAfter || liveBytesBefore,
-						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
-						entryRetained: this.#byId.has(entry.id),
-					});
+					throw nearLimit(liveBytesAfter || liveBytesBefore);
 				}
 				return;
 			}
@@ -17887,6 +18224,7 @@ export class SessionManager {
 			| PythonExecutionMessage
 			| FileMentionMessage,
 	): string {
+		if (message.role === "user") invalidateSessionTitleGeneration(this);
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: this.#generateEntryId(),

@@ -191,6 +191,25 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 	});
 });
 
+test("SdkClient sends configured capabilities in the client hello", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", {
+			capabilities: ["session_host_observer_v1"],
+		});
+		const connecting = client.connect();
+		const socket = FakeWebSocket.instances[0]!;
+		socket.open();
+		expect(sent(socket)).toEqual({
+			type: "hello",
+			protocolVersion: 3,
+			capabilities: ["session_host_observer_v1"],
+		});
+		socket.message({ type: "hello", connectionId: "observer" });
+		await connecting;
+		await client.close();
+	});
+});
+
 test("SdkClient accepts hello that races ahead of the open handler", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token");

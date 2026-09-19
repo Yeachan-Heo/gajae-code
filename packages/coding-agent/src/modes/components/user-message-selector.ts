@@ -14,14 +14,19 @@ interface UserMessageItem {
  */
 class UserMessageList implements Component {
 	#selectedIndex: number = 0;
+	#selectionInFlight = false;
 	onSelect?: (entryId: string) => void;
 	onCancel?: () => void;
-	#maxVisible: number = 10; // Max messages visible
+	#availableRows = Number.POSITIVE_INFINITY;
 
 	constructor(private readonly messages: UserMessageItem[]) {
 		// Store messages in chronological order (oldest to newest)
 		// Start with the last (most recent) message selected
 		this.#selectedIndex = Math.max(0, this.messages.length - 1);
+	}
+
+	setAvailableRows(rows: number): void {
+		this.#availableRows = Math.max(3, rows);
 	}
 
 	invalidate(): void {
@@ -36,12 +41,15 @@ class UserMessageList implements Component {
 			return lines;
 		}
 
-		// Calculate visible range with scrolling
+		// Each entry uses two content rows plus a separator. Leave one row for
+		// the scroll position whenever the full history does not fit.
+		const needsScrollIndicator = this.messages.length * 3 > this.#availableRows;
+		const maxVisible = Math.max(1, Math.floor((this.#availableRows - (needsScrollIndicator ? 1 : 0)) / 3));
 		const startIndex = Math.max(
 			0,
-			Math.min(this.#selectedIndex - Math.floor(this.#maxVisible / 2), this.messages.length - this.#maxVisible),
+			Math.min(this.#selectedIndex - Math.floor(maxVisible / 2), this.messages.length - maxVisible),
 		);
-		const endIndex = Math.min(startIndex + this.#maxVisible, this.messages.length);
+		const endIndex = Math.min(startIndex + maxVisible, this.messages.length);
 
 		// Render visible messages (2 lines per message + blank line)
 		for (let i = startIndex; i < endIndex; i++) {
@@ -77,6 +85,7 @@ class UserMessageList implements Component {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#selectionInFlight) return;
 		// Up arrow - go to previous (older) message, wrap to bottom when at top
 		if (matchesKey(keyData, "up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.messages.length - 1 : this.#selectedIndex - 1;
@@ -89,6 +98,7 @@ class UserMessageList implements Component {
 		else if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
 			const selected = this.messages[this.#selectedIndex];
 			if (selected && this.onSelect) {
+				this.#selectionInFlight = true;
 				this.onSelect(selected.id);
 			}
 		}
@@ -102,21 +112,43 @@ class UserMessageList implements Component {
 }
 
 /**
- * Component that renders a user message selector for branching
+ * Component that renders a prompt selector for creating a new session
  */
 export class UserMessageSelectorComponent extends Container {
 	#messageList: UserMessageList;
+	#header: Container;
+	#footer: Container;
 
-	constructor(messages: UserMessageItem[], onSelect: (entryId: string) => void, onCancel: () => void) {
+	constructor(
+		messages: UserMessageItem[],
+		onSelect: (entryId: string) => void,
+		onCancel: () => void,
+		private readonly getViewportRows: () => number,
+	) {
 		super();
 
 		// Add header
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.bold("Branch from Message"), 1, 0));
-		this.addChild(new Text(theme.fg("muted", "Select a message to create a new branch from that point"), 1, 0));
-		this.addChild(new Spacer(1));
-		this.addChild(new DynamicBorder());
-		this.addChild(new Spacer(1));
+		this.#header = new Container();
+		this.#header.addChild(new Spacer(1));
+		this.#header.addChild(new Text(theme.bold("Fork from Prompt"), 1, 0));
+		this.#header.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					"Creates a new session with history before the prompt; shared files stay in the same cwd.",
+				),
+				1,
+				0,
+			),
+		);
+		this.#header.addChild(
+			new Text(theme.fg("muted", "The selected prompt is restored for editing, not submitted."), 1, 0),
+		);
+		this.#header.addChild(new Text(theme.fg("muted", "↑/↓ move · Enter select · Esc cancel"), 1, 0));
+		this.#header.addChild(new Spacer(1));
+		this.#header.addChild(new DynamicBorder());
+		this.#header.addChild(new Spacer(1));
+		this.addChild(this.#header);
 
 		// Create message list
 		this.#messageList = new UserMessageList(messages);
@@ -126,13 +158,23 @@ export class UserMessageSelectorComponent extends Container {
 		this.addChild(this.#messageList);
 
 		// Add bottom border
-		this.addChild(new Spacer(1));
-		this.addChild(new DynamicBorder());
+		this.#footer = new Container();
+		this.#footer.addChild(new Spacer(1));
+		this.#footer.addChild(new DynamicBorder());
+		this.addChild(this.#footer);
 
 		// Auto-cancel if no messages
 		if (messages.length === 0) {
 			setTimeout(() => onCancel(), 100);
 		}
+	}
+
+	render(width: number): string[] {
+		const chromeRows = this.#header.render(width).length + this.#footer.render(width).length;
+		// Reserve the pinned status/composer rows outside the overlay. Recompute
+		// against current terminal rows and wrapped header height on every render.
+		this.#messageList.setAvailableRows(this.getViewportRows() - chromeRows - 2);
+		return super.render(width);
 	}
 
 	getMessageList(): UserMessageList {

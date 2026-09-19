@@ -123,6 +123,7 @@ function canonicalFirstEventTimeoutStream(
 	model: Model,
 	content: AssistantMessage["content"] = [],
 	transportFailure?: AssistantMessage["transportFailure"],
+	errorMessage = "Error: Provider stream timed out while waiting for the first event",
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -141,7 +142,7 @@ function canonicalFirstEventTimeoutStream(
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "error",
-			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+			errorMessage,
 			...(transportFailure === undefined ? {} : { transportFailure }),
 			timestamp: Date.now(),
 		};
@@ -1254,6 +1255,61 @@ describe("AgentSession retry fallback", () => {
 			errorMessage: "Error: Provider stream timed out while waiting for the first event",
 			transportFailure: { kind: "transport", providerCode: "stream_first_event_timeout" },
 		});
+	});
+
+	it.each([
+		{ managed: false, degraded: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{ managed: true, degraded: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{
+			managed: false,
+			degraded: true,
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		},
+		{
+			managed: true,
+			degraded: true,
+			errorMessage: "Error: Provider stream timed out while waiting for the first event",
+		},
+		{ managed: false, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{ managed: true, errorMessage: "Cursor HTTP/2 request aborted before turnEnded" },
+		{ managed: false, errorMessage: "Error: Provider stream timed out while waiting for the first event" },
+		{ managed: true, errorMessage: "Error: Provider stream timed out while waiting for the first event" },
+	])("keeps HTTP/2 diagnostics terminal: %j", async ({ managed, degraded = false, errorMessage }) => {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected bundled test model");
+		const model = bundled;
+		const requestedModels: string[] = [];
+		const facts = { kind: "transport" as const, http2RstCode: 8, nativeErrorCode: "ERR_HTTP2_STREAM_ERROR" };
+		const providerFacts = degraded ? { ...facts, nonCloneable: () => {} } : facts;
+		if (degraded) expect(() => structuredClone(providerFacts)).toThrow();
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				// Exercise real session admission with Cursor’s terminal abort diagnostic.
+				return canonicalFirstEventTimeoutStream(requestedModel, [], providerFacts, errorMessage);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 2,
+			"retry.baseDelayMs": 1,
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		if (managed)
+			session.setConfiguredModelChain("default", [`${model.provider}/${model.id}`, "openai/gpt-4o"], "test");
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+		const switches: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") switches.push(event);
+		});
+		await session.prompt("do not replay diagnostic-only failures");
+		await session.waitForIdle();
+		expect(requestedModels).toEqual([`${model.provider}/${model.id}`]);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(retryEndEvents).toHaveLength(0);
+		expect(switches).toHaveLength(0);
+		expect(getLastAssistantMessage(session).transportFailure).toEqual(facts);
 	});
 
 	it("keeps wrapped terminal-provider timeouts out of managed fallback", async () => {

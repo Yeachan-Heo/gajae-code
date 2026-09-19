@@ -12,6 +12,7 @@ import {
 } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
+import { classifyFallbackTrigger, transportFailureFacts } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { attachUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
@@ -1268,6 +1269,85 @@ describe("managed attempt transaction", () => {
 		expect(outcomeCalls).toBe(0);
 		expect(agent.state.error).toBe("Agent run failed.");
 		expect(agent.state.messages.find(message => message.role === "assistant")).toBeDefined();
+	});
+
+	it.each([
+		{ managed: false, damaged: undefined },
+		{ managed: true, damaged: undefined },
+		{ managed: false, damaged: "http2RstCode" },
+		{ managed: false, damaged: "nativeErrorCode" },
+	])("retains HTTP/2 diagnostics through degraded snapshots: %j", async ({ managed, damaged }) => {
+		const mock = createMockModel();
+		const expected = {
+			kind: "transport" as const,
+			http2RstCode: 8,
+			nativeErrorCode: "ERR_HTTP2_STREAM_ERROR",
+		};
+		const transportFailure = { ...expected, nonCloneable: () => {}, extra: "not a transport fact" };
+		let getterCalls = 0;
+		// Non-enumerable accessors cannot be dispatched by structuredClone;
+		// the salvage walk must likewise skip them rather than reading values.
+		Object.defineProperty(transportFailure, "hostileExtra", {
+			get() {
+				getterCalls++;
+				throw new Error("hostile transport getter");
+			},
+		});
+		if (damaged === "http2RstCode") {
+			Object.defineProperty(transportFailure, damaged, { value: () => {} });
+		}
+		if (damaged === "nativeErrorCode") {
+			Object.defineProperty(transportFailure, damaged, {
+				enumerable: false,
+				get() {
+					getterCalls++;
+					throw new Error("hostile diagnostic getter");
+				},
+			});
+		}
+		expect(() => structuredClone(transportFailure)).toThrow();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: {
+							...assistantMessage(mock.model),
+							stopReason: "error",
+							errorMessage: "Cursor HTTP/2 request aborted before turnEnded",
+							transportFailure,
+						},
+					});
+				});
+				return stream;
+			},
+		});
+		let fallbackCalls = 0;
+		await agent.prompt("run", {
+			fallbackManaged: managed,
+			onManagedAttemptOutcome: () => {
+				fallbackCalls++;
+				return { type: "terminal", terminal: { stopReason: "exhausted" } };
+			},
+		});
+		await agent.waitForIdle();
+		const message = agent.state.messages.findLast(message => message.role === "assistant");
+		const retained = message?.role === "assistant" ? message.transportFailure : undefined;
+		const expectedRetained = {
+			kind: "transport" as const,
+			...(damaged === "http2RstCode" ? {} : { http2RstCode: expected.http2RstCode }),
+			...(damaged === "nativeErrorCode" ? {} : { nativeErrorCode: expected.nativeErrorCode }),
+		};
+		expect(retained).toEqual(expectedRetained);
+		expect(transportFailureFacts(retained)).toEqual(expectedRetained);
+		expect(classifyFallbackTrigger(transportFailureFacts(retained))).toEqual({ class: "other" });
+		expect(JSON.parse(JSON.stringify(retained))).toEqual(expectedRetained);
+		// Normalization safely reads the diagnostic once; salvage never re-reads it.
+		if (!managed) expect(getterCalls).toBe(damaged === "nativeErrorCode" ? 1 : 0);
+		expect(fallbackCalls).toBe(0);
 	});
 
 	it("stages a non-cloneable provider failure without masking it as a DataCloneError", async () => {
