@@ -105,7 +105,7 @@ describe("broker lock artifact reaper", () => {
 		expect(result.retained).toEqual([{ path: live, reason: "owner-alive" }]);
 		expect(await exists(path.join(live, "owner.json"))).toBe(true);
 		expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
-			"sdk broker: retained stale lock artifact .broker.lock.stale-live (owner-alive)",
+			"sdk broker: retained 1 stale lock artifact(s) (owner-alive: 1)",
 		]);
 	});
 
@@ -129,12 +129,49 @@ describe("broker lock artifact reaper", () => {
 		const now = Date.now();
 		const agentDir = await makeAgentDir();
 		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-orphan", "no-record", 30 * HOUR_MS, now);
+		await Bun.write(path.join(orphan, "leftover.txt"), "quarantined state");
+		await ageTo(orphan, 30 * HOUR_MS, now);
 
 		const result = await reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: () => false });
 
 		expect(result.removed).toEqual([]);
 		expect(result.retained).toEqual([{ path: orphan, reason: "owner-record-missing" }]);
 		expect(await exists(orphan)).toBe(true);
+	});
+
+	it("removes an empty tombstone whose owner record is missing", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-empty", "no-record", 30 * HOUR_MS, now);
+
+		const result = await reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: () => false });
+
+		expect(result.removed).toEqual([orphan]);
+		expect(result.retained).toEqual([]);
+		expect(await exists(orphan)).toBe(false);
+	});
+
+	it("aggregates retained stale-artifact warnings by reason", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const live = await writeArtifact(agentDir, ".broker.lock.stale-live", { pid: process.pid }, 30 * HOUR_MS, now);
+		const broken = await writeArtifact(agentDir, ".broker.lock.stale-broken", "unparseable", 30 * HOUR_MS, now);
+		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-orphan", "no-record", 30 * HOUR_MS, now);
+		await Bun.write(path.join(orphan, "leftover.txt"), "quarantined state");
+		await ageTo(orphan, 30 * HOUR_MS, now);
+
+		const result = await reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: pid => pid === process.pid });
+
+		expect(result.removed).toEqual([]);
+		expect(result.retained.toSorted((left, right) => left.path.localeCompare(right.path))).toEqual([
+			{ path: broken, reason: "owner-record-unreadable" },
+			{ path: live, reason: "owner-alive" },
+			{ path: orphan, reason: "owner-record-missing" },
+		]);
+		expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
+			"sdk broker: retained 3 stale lock artifact(s) (owner-alive: 1, owner-record-missing: 1, owner-record-unreadable: 1)",
+		]);
 	});
 
 	it.skipIf(isRoot)("keeps a permission-denied entry, logs it, and still reaps the rest of the pass", async () => {
