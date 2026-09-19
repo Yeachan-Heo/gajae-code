@@ -22,6 +22,7 @@ import {
 	selectBrokerSession,
 } from "../src/sdk/transport/serve-cli.js";
 import { startSocketServe } from "../src/sdk/transport/socket.js";
+import { startStdioServe } from "../src/sdk/transport/stdio.js";
 
 const token = "test-token";
 const waitFor = async <T>(read: () => T | undefined, label: string): Promise<T> => {
@@ -355,6 +356,125 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 }
 
 describe("SDK serve raw relay", () => {
+	test("stdio transport relays a capability-gated mid-turn frame", async () => {
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+					ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: 3,
+							capabilities: ["tool_activity_v2", "turn_stream"],
+						}),
+					);
+				},
+				message(ws, message) {
+					const connection = connections.find(candidate => candidate.ws === ws);
+					if (!connection) return;
+					const text = String(message);
+					connection.messages.push(text);
+					const frame = JSON.parse(text) as { type?: unknown; capabilities?: unknown };
+					if (
+						frame.type === "hello" &&
+						Array.isArray(frame.capabilities) &&
+						frame.capabilities.includes("tool_activity_v2")
+					)
+						ws.send(JSON.stringify({ type: "tool_activity", toolCallId: "call-stdio", phase: "started" }));
+				},
+			},
+		});
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const handle = await startStdioServe(
+			{ url: `ws://127.0.0.1:${server.port}`, token, pendingCeilingBytes: 256 * 1024 },
+			{ input, output },
+		);
+		try {
+			const connection = await waitFor(() => connections[0], "stdio upstream connection");
+			const hello = await waitFor(() => connection.messages[0], "stdio relay capability hello");
+			expect(JSON.parse(hello)).toEqual({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: ["tool_activity_v2", "turn_stream"],
+			});
+			const activity = await waitFor(
+				() =>
+					received
+						.map(chunk => chunk.toString("utf8").trim())
+						.map(line => {
+							try {
+								return JSON.parse(line) as { type?: unknown };
+							} catch {
+								return undefined;
+							}
+						})
+						.find(frame => frame?.type === "tool_activity"),
+				"stdio tool_activity frame",
+			);
+			expect(activity).toMatchObject({ type: "tool_activity", toolCallId: "call-stdio", phase: "started" });
+		} finally {
+			await handle.close();
+			server.stop(true);
+		}
+	});
+
+	test("negotiates advertised capabilities on the upstream leg", async () => {
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+					ws.send(
+						JSON.stringify({
+							type: "hello",
+							protocolVersion: 3,
+							capabilities: ["tool_activity_v2", "turn_stream"],
+						}),
+					);
+				},
+				message(ws, message) {
+					connections.find(connection => connection.ws === ws)?.messages.push(String(message));
+				},
+			},
+		});
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const pair = await startRelayPair({
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: () => {},
+		});
+		try {
+			const connection = await waitFor(() => connections[0], "upstream connection");
+			const hello = await waitFor(() => connection.messages[0], "relay capability hello");
+			expect(JSON.parse(hello)).toEqual({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: ["tool_activity_v2", "turn_stream"],
+			});
+		} finally {
+			await pair.close();
+			server.stop(true);
+		}
+	});
+
 	test("preserves non-canonical JSON bytes in both directions", async () => {
 		const fixture = await relayFixture();
 		try {
@@ -508,6 +628,32 @@ describe("SDK serve raw relay", () => {
 });
 
 describe("SDK socket serve", () => {
+	test("matches stdio capability negotiation on the Unix-socket relay", async () => {
+		const fake = upstream();
+		const dir = await tempDir();
+		const socketPath = path.join(dir, "serve.sock");
+		const handle = await startSocketServe({ url: fake.url, token, pendingCeilingBytes: 256 * 1024, socketPath });
+		const client = await socketConnect(socketPath);
+		try {
+			client.write(`gjc-sdk-transport/1 token=${token}\n`);
+			const connection = await waitFor(() => fake.connections[0], "socket upstream connection");
+			connection.ws.send(
+				JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
+			);
+			await readLine(client);
+			const hello = await waitFor(() => connection.messages[0], "socket relay capability hello");
+			expect(JSON.parse(hello)).toEqual({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: ["tool_activity_v2", "turn_stream"],
+			});
+		} finally {
+			await closeSocket(client);
+			await handle.close();
+			fake.stop();
+		}
+	});
+
 	test("auth failures emit a single error and never dial upstream", async () => {
 		const fake = upstream();
 		const dir = await tempDir();

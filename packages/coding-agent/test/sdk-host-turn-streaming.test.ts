@@ -96,6 +96,7 @@ interface ControlResponse {
 interface HostHarness {
 	control(operation: string, input: Record<string, unknown>, connectionId?: string): Promise<ControlResponse>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	setCapabilities(connectionId: string, capabilities: readonly string[]): void;
 	setIdle(idle: boolean): void;
 	/** Promote every queued (non-idle) submission whose promotion was deferred by `deferPromotion`. */
 	promoteQueued(): void;
@@ -137,6 +138,7 @@ async function createHostHarness(
 	const sent: Array<{ connectionId: string; frame: SdkFrame }> = [];
 	const broadcasts: SdkFrame[] = [];
 	let receive: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	let negotiatedCapabilities: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
 	let nextId = 0;
 	let idle = true;
 	const deferredPromotions: Array<() => void> = [];
@@ -195,6 +197,12 @@ async function createHostHarness(
 			broadcastFrame(frame) {
 				broadcasts.push(frame);
 			},
+			onNegotiatedCapabilities(handler) {
+				negotiatedCapabilities = handler;
+				return () => {
+					if (negotiatedCapabilities === handler) negotiatedCapabilities = undefined;
+				};
+			},
 			start: async () => ({ url: "ws://127.0.0.1:1" }),
 			stop: async () => {},
 		}),
@@ -233,6 +241,7 @@ async function createHostHarness(
 			for (const listener of listeners) listener(payload as AgentSessionEvent);
 			await handlers.get(event)?.(payload, ctx);
 		},
+		setCapabilities: (connectionId, capabilities) => negotiatedCapabilities?.(connectionId, capabilities),
 		clearFrames: () => {
 			sent.length = 0;
 			broadcasts.length = 0;
@@ -327,6 +336,37 @@ describe("streamed turn frames", () => {
 });
 
 describe("SDK host turn streaming", () => {
+	test("streams content to a capability observer that did not submit the turn", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-observer-"));
+		const harness = await createHostHarness(SESSION_ID, cwd);
+		try {
+			harness.setCapabilities("observer", ["tool_activity_v2"]);
+			const accepted = await harness.control("turn.prompt", { text: "observe this" }, "owner");
+			expect(accepted.ok).toBe(true);
+			harness.clearFrames();
+			await harness.emit("agent_start");
+			await waitForStartOnWire(harness);
+			harness.clearFrames();
+			await harness.emit("tool_execution_start", toolStart());
+			await harness.emit("message_update", textDelta("observer-visible"));
+			const frames = harness.sent.filter(entry => entry.frame.type === "event");
+			expect(frames.map(entry => entry.connectionId)).toEqual(["owner", "observer", "owner", "observer"]);
+			expect(frames.filter(entry => entry.connectionId === "observer").map(entry => entry.frame.kind)).toEqual([
+				"tool_execution_start",
+				"message_update",
+			]);
+			expect(
+				frames.find(entry => entry.connectionId === "observer" && entry.frame.kind === "message_update")?.frame,
+			).toMatchObject({
+				type: "event",
+				payload: { event: { assistantMessageEvent: { delta: "observer-visible" } } },
+			});
+		} finally {
+			await harness.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("preserves producer order while a message_update extension handler is blocked", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-stream-order-"));
 		const gate = Promise.withResolvers<void>();
