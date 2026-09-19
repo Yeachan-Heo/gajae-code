@@ -1030,7 +1030,20 @@ test("the bus deadline path autosaves the dirty worktree before ownership teardo
 	// terminalization path, so the host wiring in `session-runtime` never sees this
 	// expiry. Without the bus-side flush an active notification-bus session loses
 	// its dirty edits on a deadline — the exact work-loss this change prevents.
-	const session = await acceptPrompt("autosave", LEASE_MS, 60_000, { prepareCwd: initDirtyGitRepo });
+	const session = await acceptPrompt("autosave", LEASE_MS, 60_000, {
+		prepareCwd: initDirtyGitRepo,
+		settings: cwd =>
+			({
+				get: (key: string) => {
+					if (key === "sdk.promptDeadlineMs") return LEASE_MS;
+					if (key === "sdk.promptMaxRuntimeMs") return 60_000;
+					if (key === "sdk.flushWorktreeOnDeadline") return true;
+					return undefined;
+				},
+				has: (key: string) => key === "sdk.flushWorktreeOnDeadline",
+				getAgentDir: () => cwd,
+			}) as unknown as Settings,
+	});
 	try {
 		await waitFor(() => session.deadlineTerminals().length > 0, "deadline terminal");
 
@@ -1232,7 +1245,6 @@ test("a tool the ledger reports running is not killed while its start event is s
 		expect((session.deadlineTerminals()[0]?.error as { code?: string }).code).toBe("prompt_deadline_exceeded");
 	} finally {
 		forced.restore();
-		errorSpy.mockRestore();
 		await shutdown(session);
 	}
 }, 40_000);

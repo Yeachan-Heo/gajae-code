@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -86,7 +85,7 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		await fsp.writeFile(path.join(root, "README.md"), "edited by the agent\n");
 		await fsp.writeFile(path.join(root, "new-file.ts"), "export const answer = 42;\n");
 
-		const result = await flushWorktreeOnPromptDeadline(root);
+		const result = await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true });
 
 		expect(result).toBeDefined();
 		expect(result?.branch).toBe("work");
@@ -106,7 +105,7 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		const root = await initRepo("gjc-deadline-flush-clean-");
 		const headBefore = (await run(root, ["rev-parse", "HEAD"])).trim();
 
-		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeUndefined();
 
 		expect((await run(root, ["rev-parse", "HEAD"])).trim()).toBe(headBefore);
 		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
@@ -117,7 +116,7 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		tempRoots.push(root);
 		await fsp.writeFile(path.join(root, "scratch.txt"), "not versioned\n");
 
-		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeUndefined();
 		expect(await fsp.exists(path.join(root, ".git"))).toBe(false);
 	});
 
@@ -127,7 +126,9 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		const controller = new AbortController();
 		controller.abort(new Error("bound elapsed"));
 
-		expect(await flushWorktreeOnPromptDeadline(root, controller.signal)).toBeUndefined();
+		expect(
+			await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true, signal: controller.signal }),
+		).toBeUndefined();
 
 		// No commit was created and the work is still in the worktree, untouched.
 		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe("1");
@@ -147,7 +148,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 			getMaxMs: () => 60_000,
 			onDeadlineExceeded: async () => {
 				order.push("flush");
-				await flushWorktreeOnPromptDeadline(root);
+				await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true });
 			},
 			onExpired: () => {
 				order.push("retire");
@@ -257,7 +258,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 			deadlineFlushTimeoutMs: 2_000,
 			onDeadlineExceeded: async (_correlation, signal) => {
 				await Bun.sleep(40);
-				await flushWorktreeOnPromptDeadline(root, signal);
+				await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true, signal });
 				order.push("flush");
 			},
 			onExpired: () => {
@@ -293,7 +294,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 			now: () => now,
 			onDeadlineExceeded: async () => {
 				flushes += 1;
-				await flushWorktreeOnPromptDeadline(root);
+				await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true });
 			},
 		});
 		const correlation = { commandId: "live-cmd", turnId: "live-turn" };
@@ -344,9 +345,10 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		manager.onAccepted(correlation);
 		now = 20;
 
-		// The flush is in flight and the deadline outcome is already finalized.
+		// The flush is in flight and the durable outcome is still pending: the
+		// terminal must not become visible before the worktree checkpoint finishes.
 		await flushStarted.promise;
-		expect(finalized).toContain("prompt_deadline_exceeded");
+		expect(finalized).toEqual([]);
 		// Progress renews the same lease object and bumps its generation.
 		now = 30;
 		manager.onProgress(correlation, 30);
@@ -356,6 +358,7 @@ describe("PromptDeadlineManager deadline flush wiring (#5583)", () => {
 		// The post-flush fence backs this stale expiry off instead of tearing down
 		// a renewed prompt, and reschedules so it keeps a live deadline.
 		expect(expired).toBe(0);
+		expect(finalized).toEqual([]);
 		expect(manager.has(correlation)).toBe(true);
 		expect(manager.deadlineAt(correlation)).toBe(50);
 		manager.clearAll();
@@ -420,52 +423,36 @@ describe("deadline autosave index rollback (#5623)", () => {
 		return stdout.trim();
 	}
 
-	test("a failing commit hook leaves the index exactly as the user had it", async () => {
+	test("a failing commit hook cannot block the isolated-index autosave", async () => {
 		const root = await initMixedIndexRepo("gjc-deadline-hook-fail-");
 		await writePreCommitHook(root, "#!/bin/sh\nexit 1\n");
-		const before = await indexState(root);
 		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
 
-		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeDefined();
 
-		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
+		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(String(Number(commitsBefore) + 1));
 		const after = await indexState(root);
-		// `--cached` is the assertion that actually pins the bug: a status-only
-		// check passes while the index is wrong.
-		expect(after.cached).toEqual(before.cached);
-		expect(after.status).toEqual(before.status);
+		// The plumbing commit bypasses hooks and adopts the isolated index only
+		// after the ref move, leaving no staged or unstaged residue.
+		expect(after.cached).toEqual([]);
+		expect(after.status).toEqual([]);
 	});
 
-	test("an abort between staging and the commit rolls the index back", async () => {
+	test("an aborted mixed-index autosave leaves the user's index untouched", async () => {
 		const root = await initMixedIndexRepo("gjc-deadline-abort-mid-");
-		// The sentinel lives under .git/ so it never shows up in `git status`.
-		// The hook SUCCEEDS after its delay on purpose: that makes the abort the
-		// only way this run can end without a commit, so the assertions below
-		// cannot be satisfied by a hook failure instead.
-		const started = path.join(root, ".git", "hook-started");
-		await writePreCommitHook(root, `#!/bin/sh\ntouch ${JSON.stringify(started)}\nsleep 3\nexit 0\n`);
 		const before = await indexState(root);
 		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
 
 		const controller = new AbortController();
-		const flushing = flushWorktreeOnPromptDeadline(root, controller.signal);
-		// Abort only once the hook is demonstrably running, which proves
-		// `git add -A` has already staged everything.
-		await waitFor(() => existsSync(started), "the pre-commit hook to start");
 		controller.abort(new Error("deadline flush bound elapsed"));
-
-		// Aborting kills `git commit` but not the hook it already spawned, and the
-		// hook holds the inherited stdout pipe, so the call settles only once the
-		// hook exits. Teardown does not wait on this — `runBoundedDeadlineFlush`
-		// abandons the promise — but the rollback still has to land when it does.
-		expect(await flushing).toBeUndefined();
+		expect(
+			await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true, signal: controller.signal }),
+		).toBeUndefined();
 		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
 		const after = await indexState(root);
-		// The rollback ran under its own signal: `bound` is already aborted here,
-		// so a restore composed with it could never have run.
 		expect(after.cached).toEqual(before.cached);
 		expect(after.status).toEqual(before.status);
-	}, 30_000);
+	});
 
 	test("never stages an index it cannot snapshot", async () => {
 		const root = await initMixedIndexRepo("gjc-deadline-unmerged-");
@@ -484,7 +471,7 @@ describe("deadline autosave index rollback (#5623)", () => {
 		const before = await indexState(root);
 		const commitsBefore = (await run(root, ["rev-list", "--count", "HEAD"])).trim();
 
-		expect(await flushWorktreeOnPromptDeadline(root)).toBeUndefined();
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeUndefined();
 
 		expect((await run(root, ["rev-list", "--count", "HEAD"])).trim()).toBe(commitsBefore);
 		const after = await indexState(root);
@@ -495,7 +482,7 @@ describe("deadline autosave index rollback (#5623)", () => {
 	test("still commits the whole mixed index on the success path", async () => {
 		const root = await initMixedIndexRepo("gjc-deadline-mixed-success-");
 
-		expect(await flushWorktreeOnPromptDeadline(root)).toBeDefined();
+		expect(await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true })).toBeDefined();
 
 		// A clean tree also proves the snapshot was NOT restored after a commit
 		// that landed: doing so would leave a phantom "revert everything" staged.
