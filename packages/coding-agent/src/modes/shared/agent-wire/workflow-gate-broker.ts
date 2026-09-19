@@ -24,6 +24,7 @@ import type {
 	WorkflowGateOption,
 	WorkflowGateQueryRecord,
 	WorkflowGateResolution,
+	WorkflowGateResolutionDiagnostic,
 	WorkflowGateResponse,
 	WorkflowGateValidationError,
 	WorkflowStage,
@@ -152,7 +153,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 	readonly #emitterHooks: Pick<BrokerHooks, "advance">;
 	#runtimeTurnProvider: (() => string | undefined) | undefined;
 
-	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance"> = {}) {
+	constructor(runId: string, store: GateStore, emitterHooks: Pick<BrokerHooks, "advance" | "continuationLost"> = {}) {
 		this.#runId = runId;
 		this.#store = store;
 		this.#emitterHooks = emitterHooks;
@@ -164,6 +165,7 @@ export class BrokerWorkflowGateEmitter implements WorkflowGateEmitter {
 			completeAccepted: record => this.#completeAccepted(record),
 			finalizeAccepted: record => this.#finalizeAccepted(record),
 			terminalizeAccepted: record => this.#terminalizeAccepted(record),
+			continuationLost: record => emitterHooks.continuationLost?.(record),
 		});
 	}
 
@@ -1173,6 +1175,8 @@ export interface BrokerHooks {
 	terminalizeAccepted?(record: PersistedGate): WorkflowGateTerminalProof | Promise<WorkflowGateTerminalProof>;
 	/** Runs only after a successful advance has been durably marked advanced. */
 	completeAccepted?(record: PersistedGate): void | Promise<void>;
+	/** Notifies the owning runtime when the accepted answer cannot reach its continuation. */
+	continuationLost?(record: PersistedGate): void;
 	/** Append-only audit sink. */
 	audit?(event: GateAuditEvent): void;
 }
@@ -1433,7 +1437,10 @@ export class WorkflowGateBroker {
 			.filter(
 				(
 					record,
-				): record is PersistedGate & { status: "quarantined"; lifecycle: WorkflowGateDiagnostic["lifecycle"] } =>
+				): record is PersistedGate & {
+					status: "quarantined";
+					lifecycle: WorkflowGateDiagnostic["lifecycle"];
+				} =>
 					record.status === "quarantined" && record.lifecycle !== undefined,
 			)
 			.sort(
@@ -1446,6 +1453,7 @@ export class WorkflowGateBroker {
 				id: `diagnostic:${record.gate.gate_id}`,
 				tag: "quarantined",
 				lifecycle: record.lifecycle,
+				answer_recorded: Object.hasOwn(record, "answer"),
 			}));
 	}
 
@@ -1459,8 +1467,37 @@ export class WorkflowGateBroker {
 					this.hasLiveContinuation(record.gate.gate_id),
 			)
 			.sort(compareGates)
-			.map(record => ({ ...record.gate, id: `pending:${record.gate.gate_id}`, tag: "pending" }));
-		return [...pending, ...this.listGateDiagnostics()];
+			.map(record => ({
+				...record.gate,
+				id: `pending:${record.gate.gate_id}`,
+				tag: "pending" as const,
+				answer_recorded: false as const,
+			}));
+		const accepted: WorkflowGateResolutionDiagnostic[] = this.store
+			.list()
+			.filter((record): record is PersistedGate & { status: "accepted" } => record.status === "accepted")
+			.sort((left, right) =>
+				(left.resolution?.resolved_at ?? "").localeCompare(right.resolution?.resolved_at ?? "") ||
+				left.gate.gate_id.localeCompare(right.gate.gate_id),
+			)
+			.map(record => ({
+				...record.gate,
+				id: `diagnostic:${record.gate.gate_id}`,
+				tag: "accepted" as const,
+				answer_recorded: true as const,
+				resolved_at: record.resolution?.resolved_at ?? record.gate.created_at,
+				post_accept_disposition:
+					this.#continuationLost.has(record.gate.gate_id)
+						? "continuation_lost"
+						: record.advanced
+							? record.ownerInstanceId === this.instanceId
+								? "advanced"
+								: "unknown"
+							: record.terminalized === true
+								? "terminalized"
+								: "accepted",
+			}));
+		return [...pending, ...accepted, ...this.listGateDiagnostics()];
 	}
 
 	/** Open and emit a gate. The pending record is persisted BEFORE emission. */
@@ -1666,6 +1703,14 @@ export class WorkflowGateBroker {
 			await this.hooks.completeAccepted?.(this.store.get(response.gate_id) as PersistedGate);
 		} catch (error) {
 			this.#continuationLost.add(response.gate_id);
+			const lost = this.store.get(response.gate_id);
+			if (lost) {
+				try {
+					this.hooks.continuationLost?.(lost);
+				} catch {
+					// A settlement notification must never replace the original resolution error.
+				}
+			}
 			throw error;
 		}
 		this.continuations.get(response.gate_id)?.release?.(response.gate_id);

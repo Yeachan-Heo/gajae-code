@@ -2424,6 +2424,17 @@ type CoordinatorRuntimeStatePersistContext = {
 	sessionFile: string | undefined;
 	stateFile: string | null;
 };
+
+/** A lost continuation may only settle the emitter/session pair that opened it. */
+export function isCurrentWorkflowGateContinuation(
+	currentSessionId: string,
+	expectedSessionId: string,
+	currentEmitter: WorkflowGateEmitter | undefined,
+	expectedEmitter: WorkflowGateEmitter,
+): boolean {
+	return currentSessionId === expectedSessionId && currentEmitter === expectedEmitter;
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -11503,7 +11514,26 @@ export class AgentSession {
 						path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"),
 					)
 				: new MemoryGateStore();
-		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
+		let emitter: BrokerWorkflowGateEmitter;
+		emitter = new BrokerWorkflowGateEmitter(sessionId, gateStore, {
+			continuationLost: () => {
+				if (
+					!isCurrentWorkflowGateContinuation(
+						this.sessionManager.getSessionId(),
+						sessionId,
+						this.#workflowGateEmitter,
+						emitter,
+					)
+				)
+					return;
+				void this.abort({ cause: "internal", silent: true }).catch(error => {
+					logger.warn("Failed to settle a workflow gate turn after continuation loss", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			},
+		});
+		return emitter;
 	}
 
 	/**
