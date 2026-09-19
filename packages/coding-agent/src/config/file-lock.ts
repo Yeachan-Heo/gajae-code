@@ -92,6 +92,15 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
+/**
+ * Windows can transiently deny a no-replace publication while another handle still
+ * has the staged or destination path open without delete sharing. The native result
+ * is explicitly pre-mutation in this case, so retrying the same source name cannot
+ * publish twice or clean up a committed namespace change.
+ */
+const PUBLICATION_SHARING_RETRY_ATTEMPTS = 3;
+const PUBLICATION_SHARING_RETRY_DELAY_MS = 10;
+
 /** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
 export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
 export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
@@ -879,6 +888,7 @@ function isValidNativeNoReplaceResult(value: unknown): value is NativeNoReplaceR
 				"interrupted",
 				"identity_violation",
 				"durability_not_provable",
+				"sharing_violation",
 				"unknown",
 			] as const
 		).includes(value.reason as never) ||
@@ -994,6 +1004,31 @@ function isPreMutationUnsupportedRenameResult(value: unknown): value is NativeNo
 	)
 		return false;
 	return true;
+}
+
+function isPreMutationSharingViolation(value: unknown): value is NativeNoReplaceResult {
+	return (
+		isValidNativeNoReplaceResult(value) &&
+		!value.ok &&
+		value.code === "sharing_violation" &&
+		value.mutationState === "not_committed" &&
+		value.durabilityState === "not_attempted" &&
+		value.reason === "sharing_violation" &&
+		value.phase === "rename"
+	);
+}
+
+async function publishNoReplaceWithSharingRetry(
+	publish: (sourcePath: string, destinationPath: string) => Promise<NativeNoReplaceResult>,
+	sourcePath: string,
+	destinationPath: string,
+): Promise<NativeNoReplaceResult> {
+	let result = await publish(sourcePath, destinationPath);
+	for (let attempt = 1; attempt < PUBLICATION_SHARING_RETRY_ATTEMPTS && isPreMutationSharingViolation(result); attempt++) {
+		await Bun.sleep(PUBLICATION_SHARING_RETRY_DELAY_MS * attempt);
+		result = await publish(sourcePath, destinationPath);
+	}
+	return result;
 }
 
 async function localLockKey(lockPath: string): Promise<string> {
@@ -1636,12 +1671,20 @@ async function tryAcquireLock(
 			renameNoReplacePathAsync,
 			renameDirectoryNoReplacePathAsync,
 		};
-		const published = await publication.renameNoReplacePathAsync(canonicalPendingPath, destinationPath);
+		const published = await publishNoReplaceWithSharingRetry(
+			publication.renameNoReplacePathAsync,
+			canonicalPendingPath,
+			destinationPath,
+		);
 		let publishedSuccessfully = isSuccessfulNativePublication(published, "primary");
 		if (published.ok && !publishedSuccessfully)
 			throw new Error("Failed to publish file lock: invalid primary success receipt.");
 		if (!published.ok && isPreMutationUnsupportedRenameResult(published)) {
-			const fallback = await publication.renameDirectoryNoReplacePathAsync(canonicalPendingPath, destinationPath);
+			const fallback = await publishNoReplaceWithSharingRetry(
+				publication.renameDirectoryNoReplacePathAsync,
+				canonicalPendingPath,
+				destinationPath,
+			);
 			const fallbackSuccessfully = isSuccessfulNativePublication(fallback, "directory");
 			if (fallback.ok && !fallbackSuccessfully)
 				throw new Error("Failed to publish file lock: invalid directory success receipt.");
