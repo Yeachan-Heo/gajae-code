@@ -10,7 +10,8 @@ import type { UpdateChannel } from "../config/update-channel";
 
 export const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 export const GITHUB_API_ORIGIN = "https://api.github.com";
-export const GITHUB_RELEASE_DOWNLOAD_ORIGIN = `https://github.com/${RELEASE_REPO}/releases/download`;
+export const GITHUB_WEB_ORIGIN = "https://github.com";
+export const GITHUB_RELEASE_DOWNLOAD_ORIGIN = `${GITHUB_WEB_ORIGIN}/${RELEASE_REPO}/releases/download`;
 export const BINARY_SHA256_ASSET = "gajae-release-binaries.sha256";
 export const BINARY_MANIFEST_ASSET = "gajae-release-binaries-v1.json";
 
@@ -34,9 +35,29 @@ export interface GithubReleaseLookupOptions {
 	fetchImpl?: GithubFetch;
 	lookupEnv?: (name: string) => string | undefined;
 	apiOrigin?: string;
+	webOrigin?: string;
 	timeoutMs?: number;
 	useAmbientToken?: boolean;
 }
+
+/** A GitHub REST response that failed, carrying the status the caller must branch on. */
+export class GithubApiStatusError extends Error {
+	constructor(
+		readonly url: string,
+		readonly status: number,
+	) {
+		super(`${url} responded ${status}`);
+		this.name = "GithubApiStatusError";
+	}
+
+	/** 403/429 is how api.github.com reports an exhausted unauthenticated budget. */
+	get isRateLimited(): boolean {
+		return this.status === 403 || this.status === 429;
+	}
+}
+
+const TOKEN_HINT =
+	"Set GITHUB_TOKEN or GH_TOKEN to raise the api.github.com rate limit (60 requests/hour per IP when unauthenticated).";
 
 interface GithubReleaseJson {
 	tag_name?: unknown;
@@ -79,7 +100,7 @@ async function readGithubJson(url: string, options: GithubReleaseLookupOptions):
 		redirect: "follow",
 	});
 	if (!response.ok) {
-		throw new Error(`${url} responded ${response.status}`);
+		throw new GithubApiStatusError(url, response.status);
 	}
 	return await response.json();
 }
@@ -109,12 +130,57 @@ function parseRelease(value: unknown, expectedChannel: UpdateChannel): GithubRel
 	};
 }
 
+/**
+ * Resolve the stable tag through the `github.com` web route, which 302s from
+ * `/releases/latest` to `/releases/tag/<tag>`. That origin serves the binary
+ * downloads too and is not bound by the api.github.com rate limit, so it keeps
+ * `gjc update` working on a shared IP whose unauthenticated budget is spent.
+ */
+export async function resolveStableReleaseTagFromWeb(options: GithubReleaseLookupOptions = {}): Promise<string> {
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const webOrigin = options.webOrigin ?? GITHUB_WEB_ORIGIN;
+	const url = `${webOrigin}/${RELEASE_REPO}/releases/latest`;
+	const response = await fetchImpl(url, {
+		method: "HEAD",
+		headers: { "User-Agent": "gjc-update" },
+		signal: AbortSignal.timeout(options.timeoutMs ?? 20_000),
+		redirect: "manual",
+	});
+	// `redirect: "manual"` keeps the 302 and its Location; a runtime that follows
+	// it anyway still exposes the resolved tag URL through `response.url`.
+	const location = response.headers.get("location") ?? (response.redirected ? response.url : undefined);
+	if (!location) {
+		throw new Error(`${url} responded ${response.status} without a release redirect`);
+	}
+	const target = new URL(location, url);
+	// The redirect decides which tag gets installed, so it must stay on the
+	// release origin and repository it was issued for; an off-origin Location
+	// would let a hijacked hop name any tag and choose the downloaded binary.
+	const expectedPrefix = `/${RELEASE_REPO}/releases/tag/`;
+	if (target.origin !== new URL(webOrigin).origin || !target.pathname.startsWith(expectedPrefix)) {
+		throw new Error(`Refusing a GitHub release redirect outside ${webOrigin}${expectedPrefix}: ${target.href}`);
+	}
+	const tag = decodeURIComponent(target.pathname.slice(expectedPrefix.length));
+	if (!isSafeReleaseTag(tag)) throw new Error(`Refusing unsafe GitHub release tag: ${tag || "<empty>"}`);
+	if (!STABLE_VERSION_RE.test(versionFromTag(tag))) {
+		throw new Error(`GitHub release ${tag} is not a stable vX.Y.Z release`);
+	}
+	return tag;
+}
+
 export async function fetchGithubChannelRelease(options: GithubReleaseLookupOptions = {}): Promise<GithubReleaseInfo> {
 	const channel = options.channel ?? "stable";
 	const apiOrigin = options.apiOrigin ?? GITHUB_API_ORIGIN;
 	if (channel === "nightly") {
 		const url = `${apiOrigin}/repos/${RELEASE_REPO}/releases?per_page=40`;
-		const payload = await readGithubJson(url, options);
+		// Nightly has no unauthenticated web listing to fall back to, so a spent
+		// budget can only be answered with the token hint.
+		const payload = await readGithubJson(url, options).catch((error: unknown) => {
+			if (error instanceof GithubApiStatusError && error.isRateLimited) {
+				throw new Error(`${error.message}. ${TOKEN_HINT}`);
+			}
+			throw error;
+		});
 		if (!Array.isArray(payload)) {
 			throw new Error(`${url} did not return a release list`);
 		}
@@ -139,8 +205,24 @@ export async function fetchGithubChannelRelease(options: GithubReleaseLookupOpti
 		);
 	}
 	const url = `${apiOrigin}/repos/${RELEASE_REPO}/releases/latest`;
-	const payload = await readGithubJson(url, options);
-	return parseRelease(payload, "stable");
+	try {
+		return parseRelease(await readGithubJson(url, options), "stable");
+	} catch (error) {
+		if (!(error instanceof GithubApiStatusError) || !error.isRateLimited) throw error;
+		try {
+			const tag = await resolveStableReleaseTagFromWeb(options);
+			return {
+				tag,
+				version: versionFromTag(tag),
+				channel: "stable",
+				htmlUrl: `${options.webOrigin ?? GITHUB_WEB_ORIGIN}/${RELEASE_REPO}/releases/tag/${tag}`,
+				warnings: [`${error.message}; resolved the latest stable tag through github.com instead. ${TOKEN_HINT}`],
+			};
+		} catch (fallbackError) {
+			const detail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+			throw new Error(`${error.message}, and the github.com fallback failed: ${detail}. ${TOKEN_HINT}`);
+		}
+	}
 }
 
 export function parseChecksumForAsset(text: string, assetName: string): string | undefined {

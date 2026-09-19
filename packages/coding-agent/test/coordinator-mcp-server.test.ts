@@ -78,6 +78,19 @@ import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-author
 // native primitives; point them at a working implementation.
 installExactIdentityNatives();
 
+/**
+ * Resolution time for the stubbed workflow gate. It MUST stay inside the
+ * coordinator's compaction retention window and therefore MUST NOT be a literal.
+ *
+ * The product stamps this remote-supplied value onto the answer request's
+ * `updated_at`, and `compactTransaction` deletes a `completed` request whose
+ * `updated_at` is older than `RETENTION_MS` (30 days). A hardcoded date silently
+ * turns these cases red exactly 30 days after the day it names, with no code
+ * change and nothing in git history to point at: the previous literal
+ * `2026-08-20T00:00:00.000Z` expired at `2026-09-19T00:00:00Z`.
+ */
+const GATE_RESOLVED_AT = new Date(Date.now() - 60_000).toISOString();
+
 const tempDirs: string[] = [];
 
 async function tempRoot(): Promise<string> {
@@ -8944,7 +8957,7 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 			{
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);
@@ -10530,7 +10543,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 					answerCalls += 1;
 					return answerCalls === 1
 						? { ok: true, result: { status: "rejected" } }
-						: { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } };
+						: { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } };
 				},
 			},
 		);
@@ -10610,7 +10623,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				},
 				controlResult: control =>
 					control.operation === "workflow.gate_answer"
-						? { ok: true, result: { status: "accepted", resolved_at: "2026-08-20T00:00:00.000Z" } }
+						? { ok: true, result: { status: "accepted", resolved_at: GATE_RESOLVED_AT } }
 						: undefined,
 			},
 		);

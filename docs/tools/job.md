@@ -26,12 +26,13 @@ The tool returns one text block plus `details`.
 
 - `content[0].text`: markdown-like plain text sections assembled by `#buildResult(...)`:
   - `## Cancelled (N)` for cancel outcomes.
-  - `## Completed (N)` for non-running jobs, including stored `resultText` and `errorText`.
+  - `## Completed (N)` for terminal jobs (`completed`, `failed`, `cancelled`), including stored `resultText` and `errorText`.
   - `## Still Running (N)` for jobs still in `running`.
+  - `## Waiting (N)` for non-terminal jobs that are not running: `paused` (a folded or queued-resume subagent that stays listed and resumable) and any status this build does not know, each bullet labelled with its raw status.
 - `details.jobs`: array of snapshots:
   - `id: string`
   - `type: "bash" | "task"`
-  - `status: "running" | "completed" | "failed" | "cancelled"`
+  - `status: "running" | "paused" | "completed" | "failed" | "cancelled"`
   - `label: string`
   - `durationMs: number`
   - optional `resultText`, `errorText`
@@ -68,8 +69,8 @@ Read-only snapshot path:
 9. Before waiting, it calls `manager.watchJobs(watchedJobIds)`. This suppresses automatic completion delivery for those ids while they are being watched.
 10. If `onUpdate` exists, a 500 ms interval sends progress snapshots from `#snapshotJobs(...)`; one snapshot is emitted immediately before entering the race.
 11. In `finally`, the tool always calls `manager.unwatchJobs(...)`, clears the timeout, and stops the progress interval.
-12. `#buildResult(...)` deduplicates jobs, snapshots current manager state, then calls `manager.acknowledgeDeliveries(...)` for every non-running job in the result. That suppresses later automatic follow-up delivery for the same completions and removes queued deliveries for those ids.
-13. The final text groups jobs by non-running vs still-running state. A timeout is not an error path; it simply returns the current snapshot.
+12. `#buildResult(...)` deduplicates jobs, snapshots current manager state, then calls `manager.acknowledgeDeliveries(...)` for every terminal job (`completed`, `failed`, `cancelled`) in the result. That suppresses later automatic follow-up delivery for the same completions and removes queued deliveries for those ids; a `paused` job is left unsuppressed and resumable.
+13. The final text partitions jobs by terminal (`## Completed`), still-running (`## Still Running`), and non-terminal non-running (`## Waiting`) state. A timeout is not an error path; it simply returns the current snapshot.
 
 ## Modes / Variants
 - Poll all running jobs: call with neither `poll` nor `cancel`.
@@ -92,8 +93,8 @@ Spawn paths that produce jobs:
   - when `async.enabled` is on, the chosen agent is not blocking, and `tasks.length > 0`, each task item is registered as a `type: "task"` job.
 
 Lifecycle and exact state names:
-- Conceptual scheduling path: `pending` (only task-progress bookkeeping before work starts) → `running` → `completed` / `failed`; cancellation changes a running async job to `cancelled`.
-- Exact `AsyncJob.status` values in `packages/coding-agent/src/async/job-manager.ts`: `"running" | "completed" | "failed" | "cancelled"`.
+- Conceptual scheduling path: `pending` (only task-progress bookkeeping before work starts) → `running` → `completed` / `failed`; cancellation changes a running async job to `cancelled`; a run that returns `{ kind: "paused" }` (subagent safe-boundary pause, folded work awaiting resume) leaves the job non-terminal and resumable as `paused`.
+- Exact `AsyncJob.status` values in `packages/coding-agent/src/async/job-manager.ts`: `"running" | "paused" | "completed" | "failed" | "cancelled"`.
 - Exact per-task progress values in `packages/coding-agent/src/task/types.ts`: `"pending" | "running" | "completed" | "failed" | "aborted"`.
 
 ## Side Effects

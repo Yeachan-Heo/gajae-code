@@ -19,6 +19,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"agent_session:abortPromptAndWaitWithTerminal":
 		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
+	"agent_session:pendingToolExecutions":
+		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
@@ -366,6 +368,10 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"slash_command:login": "auth.login",
 	"slash_command:clear": "context.clear",
 	"slash_command:new": "session.new",
+	// `/fork` opens the user-prompt selector, which commits via
+	// `session.branch(entryId)` (selector-controller.ts). Despite the command and
+	// keybinding name, it is NOT the exact-state `session.fork` operation.
+	"slash_command:fork": "session.branch",
 	"slash_command:compact": "compaction.run",
 	"slash_command:handoff": "session.handoff",
 	"slash_command:resume": "session.resume",

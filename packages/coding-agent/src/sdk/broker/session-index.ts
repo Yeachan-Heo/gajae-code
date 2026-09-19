@@ -26,7 +26,7 @@ export type SessionIndexEventType =
 	| "record_reconciled";
 
 export type SessionActivityState = "active" | "idle";
-/** Coalesced broker-owned heartbeat checkpoint (C2): state plus the observation time. */
+/** Host-reported or broker-coalesced heartbeat: state plus the observation time. */
 export interface SessionActivity {
 	state: SessionActivityState;
 	at: number;
@@ -2323,7 +2323,10 @@ export class SessionIndex {
 						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
 						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
 						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
-						activity: { state: "active", at: now },
+						// Preserve the host's last observed activity state while this
+						// broker-owned heartbeat only renews liveness. A live idle host
+						// must not be rewritten as active merely because its pid is alive.
+						activity: row.activity ?? { state: "active", at: now },
 						ts: now,
 					};
 					events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });

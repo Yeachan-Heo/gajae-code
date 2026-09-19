@@ -146,6 +146,110 @@ describe("h2-fetch wrapper (issue #5178)", () => {
 		patched.restore();
 	});
 
+	it("does not replay a consumed POST after an h2 stream reset", async () => {
+		const streamReset = Object.assign(
+			new Error(
+				'HTTP2StreamReset fetching "https://chatgpt.com/backend-api/codex/responses". For more information, pass `verbose: true` in the second argument to fetch()',
+			),
+			{ code: "HTTP2StreamReset" },
+		);
+
+		let serverProcessed = 0;
+		const patched = withPatchedFetch((_input, init) => {
+			if ((init as { protocol?: string } | undefined)?.protocol === "http2") {
+				// Model the request body reaching the peer before the server resets the
+				// stream. A wrapper-level reset is not proof that the request was unseen.
+				serverProcessed++;
+				throw streamReset;
+			}
+			serverProcessed++;
+			return Promise.resolve(new Response("ok-h1", { status: 200 }));
+		});
+		installH2Fetch();
+
+		let caught: unknown;
+		try {
+			await fetch("https://chatgpt.com/backend-api/codex/responses", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ stream: true }),
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBe(streamReset);
+		expect(serverProcessed).toBe(1);
+
+		const h1Attempts = patched.calls.filter(
+			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+		);
+		expect(h1Attempts).toHaveLength(0);
+		patched.restore();
+	});
+
+	it("falls back to h1 for an idempotent GET after an h2 stream reset", async () => {
+		const streamReset = Object.assign(new Error("HTTP/2 stream reset"), { code: "HTTP2StreamReset" });
+
+		const patched = withPatchedFetch((_input, init) => {
+			if ((init as { protocol?: string } | undefined)?.protocol === "http2") throw streamReset;
+			return Promise.resolve(new Response("ok-h1", { status: 200 }));
+		});
+		installH2Fetch();
+
+		const response = await fetch("https://chatgpt.com/backend-api/codex/responses");
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe("ok-h1");
+
+		const h1Attempts = patched.calls.filter(
+			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+		);
+		expect(h1Attempts).toHaveLength(1);
+		expect(h1Attempts[0]?.init?.method).toBeUndefined();
+		patched.restore();
+	});
+
+	it("does not replay a consumed OPTIONS stream body after an h2 stream reset", async () => {
+		const streamReset = Object.assign(new Error("HTTP/2 stream reset"), { code: "HTTP2StreamReset" });
+		const requestBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("one-shot"));
+				controller.close();
+			},
+		});
+		let bodyConsumed = false;
+
+		const patched = withPatchedFetch(async (_input, init) => {
+			if ((init as { protocol?: string } | undefined)?.protocol === "http2") {
+				const body = init?.body;
+				if (!(body instanceof ReadableStream)) throw new Error("test body was not a stream");
+				await body.getReader().read();
+				bodyConsumed = true;
+				throw streamReset;
+			}
+			if (bodyConsumed) throw new TypeError("Body is unusable");
+			throw new Error("unexpected h1 retry");
+		});
+		installH2Fetch();
+
+		let caught: unknown;
+		try {
+			await fetch("https://chatgpt.com/backend-api/codex/responses", {
+				method: "OPTIONS",
+				body: requestBody,
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBe(streamReset);
+		expect(bodyConsumed).toBe(true);
+
+		const h1Attempts = patched.calls.filter(
+			c => (c.init as { protocol?: string } | undefined)?.protocol === undefined,
+		);
+		expect(h1Attempts).toHaveLength(0);
+		patched.restore();
+	});
+
 	it("does not fall back for application-level failures", async () => {
 		const patched = withPatchedFetch(() => Promise.resolve(new Response("boom", { status: 500 })));
 		installH2Fetch();
