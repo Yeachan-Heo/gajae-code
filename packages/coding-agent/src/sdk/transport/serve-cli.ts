@@ -1,10 +1,10 @@
 import { getAgentDir } from "@gajae-code/utils";
+import { CliParseError } from "@gajae-code/utils/cli";
 import {
 	normalizePublicCommandFailure,
 	type PublicCommandDiagnosticCode,
 	PublicCommandFailure,
 } from "../../cli/public-command-errors";
-import { CliParseError } from "@gajae-code/utils/cli";
 import type { BrokerDiscovery } from "../broker/discovery";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError, SdkDiscoveryError } from "../client";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
@@ -323,10 +323,7 @@ export interface SdkServeDependencies {
  * and `session.get_endpoint` mints the exact credential — never a direct
  * endpoint-file read. A missing or unreachable broker fails closed.
  */
-export async function runSdkServe(
-	argv: string[],
-	dependencies?: SdkServeDependencies,
-): Promise<void> {
+export async function runSdkServe(argv: string[], dependencies?: SdkServeDependencies): Promise<void> {
 	if (dependencies !== undefined) {
 		await runSdkServePublic(argv, dependencies);
 		return;

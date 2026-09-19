@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
+import type { CommandEntry } from "@gajae-code/utils/cli";
 /** Lightweight CLI bootstrap. Heavy command registration is loaded only after
  * security admission; `gjc doctor` stays reachable when normal startup breaks. */
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { startTiming } from "@gajae-code/utils/logger";
-import type { CommandEntry } from "@gajae-code/utils/cli";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
