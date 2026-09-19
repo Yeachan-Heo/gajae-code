@@ -361,6 +361,20 @@ export async function createSdkWebSocketTransport(
 				}
 			}
 		},
+		broadcastUnpositionedFrame(frame, excludedConnectionIds = []) {
+			const excluded = new Set(excludedConnectionIds);
+			const json = JSON.stringify(frame);
+			for (const socket of sockets.values()) {
+				if (excluded.has(socket.data.connectionId)) continue;
+				const capabilities = negotiatedCapabilities.get(socket.data.connectionId);
+				if (!canDeliverSdkEvent(String(frame.kind), capabilities)) continue;
+				try {
+					socket.send(json);
+				} catch {
+					// Unpositioned content is best effort; a dead observer cannot affect the turn.
+				}
+			}
+		},
 		onConnectionClose(handler) {
 			connectionCloseHandler = handler;
 			return () => {

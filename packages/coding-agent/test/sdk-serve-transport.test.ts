@@ -13,7 +13,12 @@ import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
-import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
+import {
+	relayClientHelloFromServerHello,
+	type RelayWebSocket,
+	startRelayPair,
+	type TransportError,
+} from "../src/sdk/transport/relay.js";
 import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
@@ -355,6 +360,95 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstream
 }
 
 describe("SDK serve raw relay", () => {
+	test("negotiates upstream capabilities so a mid-turn tool_activity reaches stdio", async () => {
+		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
+		const server = Bun.serve<unknown>({
+			port: 0,
+			fetch(_request, instance) {
+				if (instance.upgrade(_request, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					connections.push({ ws, messages: [] });
+				},
+				message(ws, message) {
+					const connection = connections.find(candidate => candidate.ws === ws);
+					if (!connection) return;
+					const text = String(message);
+					connection.messages.push(text);
+					const frame = JSON.parse(text) as { type?: unknown; capabilities?: unknown };
+					if (
+						frame.type === "hello" &&
+						Array.isArray(frame.capabilities) &&
+						frame.capabilities.includes("tool_activity_v2")
+					)
+						ws.send(
+							JSON.stringify({
+								type: "tool_activity",
+								sessionId: "session",
+								toolCallId: "call-1",
+								toolName: "read",
+								phase: "started",
+							}),
+						);
+				},
+			},
+		});
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const pair = await startRelayPair({
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: () => {},
+		});
+		try {
+			await waitFor(() => connections[0], "upstream connection");
+			connections[0]!.ws.send(
+				JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
+			);
+			const toolActivity = await waitFor(
+				() =>
+					received
+						.map(chunk => chunk.toString("utf8").trim())
+						.map(line => {
+							try {
+								return JSON.parse(line) as { type?: unknown };
+							} catch {
+								return undefined;
+							}
+						})
+						.find(frame => frame?.type === "tool_activity"),
+				"tool_activity downstream frame",
+			);
+			expect(toolActivity).toMatchObject({ type: "tool_activity", toolCallId: "call-1", phase: "started" });
+			expect(JSON.parse(connections[0]!.messages[0]!)).toEqual({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: ["tool_activity_v2", "turn_stream"],
+			});
+		} finally {
+			await pair.close();
+			server.stop(true);
+		}
+	});
+
+	test("derives the relay hello capability list from the upstream advertisement", () => {
+		const serverHello = JSON.stringify({
+			type: "hello",
+			protocolVersion: 3,
+			capabilities: ["tool_activity_v2", "turn_stream", "tool_activity_v2"],
+		});
+		expect(relayClientHelloFromServerHello(serverHello)).toBe(
+			JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2", "turn_stream"] }),
+		);
+	});
+
 	test("preserves non-canonical JSON bytes in both directions", async () => {
 		const fixture = await relayFixture();
 		try {

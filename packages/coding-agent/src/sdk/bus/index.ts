@@ -7123,6 +7123,21 @@ export function createNotificationsExtension(
 				start: async () => await server.start(),
 				stop: async () => await server.stopAndWait(),
 				broadcastFrame: frame => broadcastEventFrame(frame),
+				broadcastUnpositionedFrame: (frame, excludedConnectionIds) => {
+					const excluded = new Set(excludedConnectionIds ?? []);
+					const json = JSON.stringify(frame);
+					for (const connectionId of hostAttachedConnections) {
+						if (excluded.has(connectionId) || fencedConnections.has(connectionId)) continue;
+						const capabilities = liveHostCapabilities(connectionId);
+						if (!canDeliverSdkEvent(String(frame.kind), capabilities)) continue;
+						try {
+							server.sendTo(connectionId, json);
+						} catch {
+							// High-frequency content is best effort; a dead observer cannot
+							// affect the turn producing it.
+						}
+					}
+				},
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
@@ -7704,11 +7719,13 @@ export function createNotificationsExtension(
 				const tuple = Array.isArray(connectionId) ? (connectionId as unknown[]) : undefined;
 				const id = tuple?.[0] ?? connectionId;
 				const negotiated = tuple?.[1] ?? capabilities;
-				if (typeof id === "string" && Array.isArray(negotiated))
+				if (typeof id === "string" && Array.isArray(negotiated)) {
 					rememberHostCapabilities(
 						id,
 						negotiated.filter((capability): capability is string => typeof capability === "string"),
 					);
+					if (liveHostCapabilities(id) !== undefined) hostAttachedConnections.add(id);
+				}
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
