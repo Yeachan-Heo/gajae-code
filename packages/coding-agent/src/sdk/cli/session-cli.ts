@@ -86,6 +86,8 @@ export interface SdkSessionCliArgs {
 	strict?: boolean;
 	untilIdle?: boolean;
 	allEvents?: boolean;
+	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
+	afterTranscriptId?: string;
 	page?: boolean;
 	repo?: string;
 	scope?: string;
@@ -97,7 +99,8 @@ export interface SdkSessionCliArgs {
 
 type JsonRecord = Record<string, unknown>;
 type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
-type TailExitReason = "idle" | "close";
+/** Why a tail call returned: the turn went idle, the session closed, or the caller's wait window closed (non-terminal). */
+type TailExitReason = "idle" | "close" | "timeout";
 export interface RetainedTranscriptTailReader {
 	readonly size: number;
 	readRange(start: number, end: number): Promise<Uint8Array>;
@@ -1391,6 +1394,7 @@ async function offlineTailReplay(
 	agentDir: string,
 	sessionId: string,
 	row: SdkSessionRowV1,
+	afterTranscriptId?: string,
 ): Promise<unknown> {
 	const lifecycle = createBrokerSessionLifecycleService(agentDir);
 	const outcome = await lifecycle.list({
@@ -1423,15 +1427,21 @@ async function offlineTailReplay(
 			reason: retained.reason,
 		});
 	}
+	const items = entries.map((entry, index) =>
+		toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
+	);
+	// The same contract as a live resume: rows up to and including the id the
+	// caller already has are omitted, so a session that stopped between two
+	// polls does not replay processed history on the next one. Unknown
+	// boundary keeps everything (a duplicate is recoverable; a missing row is not).
+	const boundary = afterTranscriptId === undefined ? -1 : items.findIndex(item => item.id === afterTranscriptId);
 	return {
 		ok: true,
 		result: {
 			version: SESSION_ROWS_VERSION,
 			source: "offline",
 			session: row,
-			items: entries.map((entry, index) =>
-				toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
-			),
+			items: boundary >= 0 ? items.slice(boundary + 1) : items,
 			terminal: true,
 		},
 	};
@@ -1585,7 +1595,54 @@ async function runLiveTail(
 					gap,
 				);
 
+			// Which snapshot to page. A fresh tail pages the checkpoint it was just
+			// handed. A resumed tail (`--cursor`) must NOT page the exchanged cursor:
+			// that one is pinned to the OLD snapshot at offset 0, so it would replay
+			// every row the caller already processed. It pages a fresh snapshot
+			// instead and drops rows up to the caller's `--after-transcript-id`, so
+			// the result is exactly the transcript delta since the last tail - the
+			// rows that carry tool calls and interim assistant text.
 			let cursor = extraction.cursor;
+			if (args.cursor !== undefined) {
+				// The exchange handed back a live pin on the OLD snapshot. Its rows are
+				// not wanted (see above), but the pin must go: `transcript.list` is the
+				// only release the query surface exposes, and each page that is not the
+				// last grants a continuation pin of its own. Drain to `complete`, discard
+				// every page. Left pinned, a poller leaked one pin per poll and hit
+				// snapshot_capacity_exceeded (128) within minutes.
+				let drain = cursor;
+				while (drain !== undefined) {
+					try {
+						const page = extractTranscriptPage(
+							await router.request(
+								sessionId,
+								{ type: "query_request", query: "transcript.list", input: {}, cursor: drain },
+								attachment.generation,
+								attachment,
+								args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+							),
+						);
+						drain = page.complete ? undefined : page.cursor;
+					} catch {
+						// Releasing is best-effort; a pin that cannot be drained expires with its TTL.
+						drain = undefined;
+					}
+				}
+				cursor = undefined;
+				try {
+					const fresh = await router.request(
+						sessionId,
+						{ type: "query_request", query: "session.checkpoint", input: {} },
+						attachment.generation,
+						attachment,
+						args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+					);
+					cursor = extractCheckpoint(fresh).cursor;
+				} catch {
+					cursor = undefined;
+				}
+			}
+			const transcriptStart = transcriptItems.length;
 			while (cursor !== undefined) {
 				const response = await router.request(
 					sessionId,
@@ -1612,6 +1669,34 @@ async function runLiveTail(
 				);
 				if (page.complete || page.cursor === undefined) break;
 				cursor = page.cursor;
+			}
+			if (args.cursor !== undefined && args.afterTranscriptId !== undefined) {
+				// Drop the rows the caller already has. Unknown boundary (row rotated
+				// out, or a different session) → keep everything: a duplicate is
+				// recoverable downstream, a silently missing row is not.
+				const boundary = transcriptItems.findIndex(
+					(item, index) => index >= transcriptStart && item.id === args.afterTranscriptId,
+				);
+				if (boundary >= 0) transcriptItems.splice(transcriptStart, boundary + 1 - transcriptStart);
+			}
+
+			// The checkpoint's own token was just spent walking the transcript
+			// (`transcript.list` consumes and releases it), so it is no longer a
+			// valid resume point. Mint a fresh, unconsumed checkpoint for the caller
+			// to hand back on the next tail. Best-effort: a caller that cannot get
+			// one falls back to a cursorless tail exactly as before.
+			let resumeCursor: string | undefined;
+			try {
+				const fresh = await router.request(
+					sessionId,
+					{ type: "query_request", query: "session.checkpoint", input: {} },
+					attachment.generation,
+					attachment,
+					args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+				);
+				resumeCursor = extractCheckpoint(fresh).cursor;
+			} catch {
+				resumeCursor = undefined;
 			}
 
 			const replayResponse = await router.request(
@@ -1677,18 +1762,14 @@ async function runLiveTail(
 				resolveLive = completion.resolve;
 				rejectLive = completion.reject;
 				const timeoutMs = args.timeoutMs ?? 10_000;
-				const timer = setTimeout(
-					() =>
-						completion.reject(
-							new SdkSessionCliError(
-								"tail_timeout",
-								"Tail did not reach an exit condition within the wait window.",
-								1,
-								{ sessionId, timeoutMs },
-							),
-						),
-					timeoutMs,
-				);
+				// The wait window closing is not a failure: it is the caller's bound on
+				// one tail call, and everything collected inside it (transcript rows,
+				// replayed and live events) is a valid, non-terminal observation.
+				// Throwing here discarded that observation, so a poller watching a
+				// running turn with `--until-idle` saw nothing until the turn ended -
+				// every mid-turn tool call and interim line was lost, and the poll
+				// itself blocked for the whole window. `terminal: false` says the rest.
+				const timer = setTimeout(() => completion.resolve("timeout"), timeoutMs);
 				try {
 					liveReason = await completion.promise;
 				} finally {
@@ -1704,6 +1785,13 @@ async function runLiveTail(
 					source: "session",
 					session: row,
 					...(checkpoint === undefined ? {} : { checkpoint }),
+					// A signed, UNCONSUMED checkpoint cursor to resume from. Carried as
+					// `cursor`, not `checkpointToken`: output passes through
+					// stripSecretFields, whose /token/i matches the latter by name, so a
+					// caller never saw it and no tail could ever be resumed (every poll
+					// replayed the whole session). It is an opaque per-grant cursor, not a
+					// credential - the same shape `list`/`transcript` already return.
+					...(resumeCursor === undefined ? {} : { cursor: resumeCursor }),
 					...(gap === undefined ? {} : { gap }),
 					items: tailItems(),
 					terminal: liveReason === "idle" || liveReason === "close",
@@ -1727,7 +1815,8 @@ export async function runTail(
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)
 		throw new SdkSessionCliError("session_deleted", `Session ${sessionId} was deleted and has no tail.`, 1);
-	if (!row.live || row.terminalUncertain === true) return await offlineTailReplay(repo, agentDir, sessionId, row);
+	if (!row.live || row.terminalUncertain === true)
+		return await offlineTailReplay(repo, agentDir, sessionId, row, args.afterTranscriptId);
 	return await runLiveTail(agentDir, sessionId, row, args);
 }
 
