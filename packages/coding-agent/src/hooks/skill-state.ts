@@ -601,7 +601,10 @@ export async function ensureWorkflowSkillActivationSeed(
 		let merged: { predecessor: SkillActiveEntry | undefined; result: GuardedWriteResult };
 		let mergedWrite: GuardedStateWriteReceipt | undefined;
 		while (true) {
-			if (!input.activeSubskills?.length || Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)) {
+			if (
+				input.activeSubskills === undefined ||
+				Bun.deepEquals(existingEntry.active_subskills, input.activeSubskills)
+			) {
 				return { state: existing, seeded: false, rollback: noRollback };
 			}
 			merged = await mergeActiveEntrySubskills(
