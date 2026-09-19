@@ -229,7 +229,8 @@ async function recordExecutionApproval(
 	} else {
 		// GJC_SESSION_ID selects workflow state; create() only adopts it for lifecycle launches.
 		// Open an explicit header so transcript authority never depends on inherited lifecycle env.
-		const sessionDir = path.join(cwd, ".gjc", "sessions");
+		const destination = SessionManager.managedDestination(cwd);
+		const sessionDir = destination.directory;
 		transcriptPath = path.join(sessionDir, `${TEST_SESSION_ID}.jsonl`);
 		await fs.mkdir(sessionDir, { recursive: true });
 		await fs.writeFile(
@@ -243,7 +244,7 @@ async function recordExecutionApproval(
 			})}\n`,
 			{ mode: 0o600, flag: "wx" },
 		);
-		const manager = await SessionManager.open(transcriptPath, SessionManager.explicitDestination(sessionDir));
+		const manager = await SessionManager.open(transcriptPath, destination);
 		try {
 			expect(manager.getSessionId()).toBe(TEST_SESSION_ID);
 			manager.appendMessage({ role: "user", content: "Build the approved feature.", timestamp: 1 });
@@ -260,10 +261,7 @@ async function recordExecutionApproval(
 		}
 	}
 	if (typeof existingRecord?.transcript_path === "string") {
-		const manager = await SessionManager.open(
-			transcriptPath,
-			SessionManager.explicitDestination(path.dirname(transcriptPath)),
-		);
+		const manager = await SessionManager.open(transcriptPath, SessionManager.managedDestination(cwd));
 		try {
 			manager.appendMessage(
 				persistedApprovalAssistant([{ type: "toolCall", id: questionId, name: "ask", arguments: {} }]),
@@ -287,10 +285,7 @@ async function recordExecutionApproval(
 		approvalStage,
 		presentation: await captureExecutionApprovalPresentation(cwd, TEST_SESSION_ID, approvalStage),
 	});
-	const manager = await SessionManager.open(
-		transcriptPath,
-		SessionManager.explicitDestination(path.dirname(transcriptPath)),
-	);
+	const manager = await SessionManager.open(transcriptPath, SessionManager.managedDestination(cwd));
 	try {
 		manager.appendMessage({
 			role: "toolResult",
@@ -365,10 +360,7 @@ async function withPersistedApprovalSession(
 	await withTempCwd(async cwd => {
 		await initTheme(false);
 		const previousFile = process.env.GJC_SESSION_FILE;
-		const manager = SessionManager.create(
-			cwd,
-			SessionManager.explicitDestination(path.join(cwd, ".gjc", "sessions")),
-		);
+		const manager = SessionManager.create(cwd, SessionManager.managedDestination(cwd));
 		const sessionId = manager.getSessionId();
 		process.env.GJC_SESSION_ID = sessionId;
 		try {

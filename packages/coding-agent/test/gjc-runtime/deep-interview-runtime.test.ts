@@ -21,6 +21,7 @@ import {
 	sessionPlansDir,
 	sessionSpecsDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { resetSettingsForTest } from "../../src/config/settings";
@@ -34,6 +35,10 @@ const originalSessionId = process.env.GJC_SESSION_ID;
 const originalSessionFile = process.env.GJC_SESSION_FILE;
 const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+
+function managedSessionPath(root: string, fileName: string): string {
+	return path.join(SessionManager.managedDestination(root).directory, fileName);
+}
 async function tempDir(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(process.cwd(), ".tmp-deep-interview-runtime-"));
 	tempRoots.push(dir);
@@ -41,7 +46,7 @@ async function tempDir(): Promise<string> {
 }
 
 async function crystallizeBoundedTranscript(root: string, count: number, start = 0) {
-	const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+	const sessionPath = managedSessionPath(root, `${TEST_SESSION_ID}.jsonl`);
 	const messages = Array.from({ length: count }, (_, index) => ({
 		index,
 		role: index === 0 || index === 199 || index === 200 ? ("user" as const) : ("assistant" as const),
@@ -498,7 +503,7 @@ describe("native gjc deep-interview runtime", () => {
 
 	it("projects synthetic user messages as developer-authored transcript entries", async () => {
 		const root = await tempDir();
-		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const sessionPath = managedSessionPath(root, `${TEST_SESSION_ID}.jsonl`);
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
 		const messages: Array<{ index: number; role: "developer" | "user" | "assistant"; content: string }> = [
 			{ index: 0, role: "developer", content: "Synthetic context" },
@@ -566,7 +571,7 @@ describe("native gjc deep-interview runtime", () => {
 
 	it("requires transcript-tail coverage for Deep approval but permits post-plan Ralplan evidence", async () => {
 		const root = await tempDir();
-		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const sessionPath = managedSessionPath(root, `${TEST_SESSION_ID}.jsonl`);
 		const messages = [{ index: 0, role: "user" as const, content: "Build a report." }];
 		const snapshot = {
 			revision: 1,
@@ -636,7 +641,7 @@ describe("native gjc deep-interview runtime", () => {
 
 	it("rejects a transcript path replaced after the bounded descriptor read", async () => {
 		const root = await tempDir();
-		const sessionPath = path.join(root, ".gjc", "sessions", `${TEST_SESSION_ID}.jsonl`);
+		const sessionPath = managedSessionPath(root, `${TEST_SESSION_ID}.jsonl`);
 		const transcript = `${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Preserve replay safety." } })}\n`;
 		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
 		await fs.writeFile(sessionPath, transcript, "utf8");
