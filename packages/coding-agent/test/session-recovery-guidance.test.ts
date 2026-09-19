@@ -114,6 +114,40 @@ describe("session recovery guidance references runnable commands", () => {
 		expect(cliCommandNames).not.toContain("export");
 	});
 
+	test("every near-limit error class interpolates the shared advice (#5732)", async () => {
+		// The family matrix above only covers classes someone remembered to add, and a
+		// substring check only catches verbatim copies. `#5691` wrote its own PARAPHRASE
+		// of the advice, which both of those miss, and that is how `gjc export` returned.
+		//
+		// Close the shape structurally instead: find every near-limit error class in the
+		// source and require its constructor to interpolate SESSION_LIMIT_RECOVERY_ACTIONS.
+		// A class added tomorrow fails this the moment it writes its own wording.
+		const source = await Bun.file(new URL("../src/session/session-manager.ts", import.meta.url)).text();
+		const classes = [...source.matchAll(/export class (SessionNearLimit\w*Error) extends Error \{/g)];
+		// Guard the detector: if the classes are ever renamed, this must fail loudly
+		// rather than silently vacuously pass.
+		expect(classes.length).toBeGreaterThanOrEqual(2);
+		for (const match of classes) {
+			const start = match.index ?? 0;
+			const body = source.slice(start, source.indexOf("\n}", start));
+			expect({
+				class: match[1],
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: matching the literal interpolation token in source text is the point of this check.
+				interpolatesSharedAdvice: body.includes("${SESSION_LIMIT_RECOVERY_ACTIONS}"),
+			}).toEqual({ class: match[1], interpolatesSharedAdvice: true });
+		}
+	});
+
+	test("no session-manager code path names the nonexistent export command (#5732)", async () => {
+		const source = await Bun.file(new URL("../src/session/session-manager.ts", import.meta.url)).text();
+		const withoutComments = source
+			.replaceAll(/\/\*[\s\S]*?\*\//g, "")
+			.split("\n")
+			.filter(line => !line.trimStart().startsWith("//"))
+			.join("\n");
+		expect(withoutComments).not.toContain("gjc export");
+	});
+
 	test("the slash detector catches un-backticked mentions", () => {
 		expect(referencedSlashCommands("Run /compact or `/clear` to continue.")).toEqual(["compact", "clear"]);
 	});
