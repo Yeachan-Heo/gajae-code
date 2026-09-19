@@ -1151,10 +1151,10 @@ export default class Sdk extends Command {
 			const scan = scanPublicCommand("sdk", this.argv);
 			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 			const { args, flags } = scan;
-			const action = scan.descriptor.command[1];
+			const operation = scan.descriptor.command[1];
 			const stringFlag = (name: string): string | undefined => flags[name] as string | undefined;
 			const timeoutMs = flags["timeout-ms"] === undefined ? undefined : Number(flags["timeout-ms"]);
-			if (action === "spawn") {
+			if (operation === "spawn") {
 				const spawn = await runSdkSpawn({
 					cwd: stringFlag("cwd"),
 					prompt: stringFlag("prompt"),
@@ -1167,7 +1167,7 @@ export default class Sdk extends Command {
 				if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;
 				return;
 			}
-			if (action === "search") {
+			if (operation === "search") {
 				const search = await runSdkSearch({
 					agentDir: stringFlag("agent-dir"),
 					repo: stringFlag("repo"),
@@ -1181,7 +1181,7 @@ export default class Sdk extends Command {
 				if (search.exitCode !== 0) process.exitCode = search.exitCode;
 				return;
 			}
-			if (action === "session") {
+			if (operation === "session") {
 				await runSdkSessionCli({
 					action: scan.descriptor.command[2],
 					rawAction: scan.descriptor.command[3],
@@ -1210,7 +1210,7 @@ export default class Sdk extends Command {
 				});
 				return;
 			}
-			if (action === "guides") {
+			if (operation === "guides") {
 				await runSdkGuidesCli({
 					action: scan.descriptor.command[2],
 					guideId: args.guideId as string | undefined,
@@ -1220,7 +1220,7 @@ export default class Sdk extends Command {
 				});
 				return;
 			}
-			if (action === "serve") {
+			if (operation === "serve") {
 				try {
 					await runSdkServe(scan.operationArgv.slice(1));
 				} catch (error) {
