@@ -7,6 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
+import { dispatchPublicCommand } from "../src/cli/public-command-entry";
 import {
 	PUBLIC_COMMAND_DIAGNOSTICS,
 	PublicCommandFailure,
@@ -1233,7 +1234,7 @@ describe("SDK serve CLI and discovery", () => {
 		}
 	});
 
-	test("surfaces a cleanup-only broker failure as a typed serve_cleanup_failed", async () => {
+	test("reports a cleanup-only broker failure through the transport diagnostic channel", async () => {
 		const fake = upstream();
 		const broker = fakeBroker(operation =>
 			operation === "session.list"
@@ -1244,27 +1245,28 @@ describe("SDK serve CLI and discovery", () => {
 				: { ok: true, result: { url: fake.url, token } },
 		);
 		const socketPath = path.join(await tempDir(), "serve.sock");
+		const diagnostics: string[] = [];
+		const realStderr = process.stderr.write;
+		const previousExitCode = process.exitCode;
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			diagnostics.push(String(value));
+			return true;
+		};
 		try {
-			const failure = await withServeAgentDir(broker.url, async () =>
+			const result = await withServeAgentDir(broker.url, async () =>
 				withRejectingBrokerClose(async () => {
 					const before = process.listeners("SIGINT");
-					// Resolve rather than reject, so a serve that fails early cannot
-					// surface as an unhandled rejection while we wait for its handler.
-					const served = runSdkServe(["--socket", socketPath]).then(
-						() => undefined,
-						(error: unknown) => error,
-					);
+					const served = runSdkServe(["--socket", socketPath]);
 					await stopServeViaSignalHandler(before);
 					return await served;
 				}),
 			);
-			expect(failure).toBeInstanceOf(SdkServeError);
-			expect(failure).toMatchObject({
-				code: "serve_cleanup_failed",
-				exitCode: 1,
-				details: { code: "timeout", message: closeFailureMessage },
-			});
+			expect(result).toBeUndefined();
+			expect(process.exitCode).toBe(1);
+			expect(diagnostics).toEqual(['{"type":"transport_error","code":"serve_failed"}\n']);
 		} finally {
+			process.stderr.write = realStderr;
+			process.exitCode = previousExitCode ?? 0;
 			broker.stop();
 			fake.stop();
 		}
@@ -1319,6 +1321,63 @@ describe("SDK serve CLI and discovery", () => {
 			expect("cleanupError" in clean.error).toBe(false);
 		} finally {
 			broker.stop();
+		}
+	});
+
+	test("keeps post-start stdio failures out of the relay frame channel", async () => {
+		const upstreamServer = upstream();
+		const broker = fakeBroker(operation =>
+			operation === "session.list"
+				? {
+						ok: true,
+						result: { sessions: [{ sessionId: "sess-live", live: true, ambiguous: false }], warnings: [] },
+					}
+				: { ok: true, result: { url: upstreamServer.url, token } },
+		);
+		const stdoutChunks: string[] = [];
+		const stderrChunks: string[] = [];
+		const input = new PassThrough();
+		const stdinDescriptor = Object.getOwnPropertyDescriptor(process, "stdin");
+		const realStdout = process.stdout.write;
+		const realStderr = process.stderr.write;
+		const previousExitCode = process.exitCode;
+		Object.defineProperty(process, "stdin", { value: input, configurable: true });
+		(process.stdout as unknown as { write(value: string): boolean }).write = value => {
+			stdoutChunks.push(String(value));
+			return true;
+		};
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			stderrChunks.push(String(value));
+			return true;
+		};
+		try {
+			const before = process.listeners("SIGINT");
+			const served = withRejectingBrokerClose(async () =>
+				withServeAgentDir(broker.url, async () =>
+					dispatchPublicCommand(["serve", "--stdio", "--json"], {
+						bin: "gjc",
+						version: "test",
+						command: "sdk",
+						load: async () => Sdk,
+					}),
+				),
+			);
+			await waitFor(() => upstreamServer.connections[0], "stdio relay upstream");
+			const frame = '{"type":"relay","ok":true}';
+			upstreamServer.connections[0]!.ws.send(frame);
+			await waitFor(() => (stdoutChunks.length ? stdoutChunks.join("") : undefined), "stdio relay frame");
+			await stopServeViaSignalHandler(before);
+			await served;
+			expect(stdoutChunks.join("")).toBe(`${frame}\n`);
+			expect(stderrChunks.join("")).toBe('{"type":"transport_error","code":"serve_failed"}\n');
+		} finally {
+			(process.stdout as unknown as { write: typeof realStdout }).write = realStdout;
+			(process.stderr as unknown as { write: typeof realStderr }).write = realStderr;
+			if (stdinDescriptor) Object.defineProperty(process, "stdin", stdinDescriptor);
+			input.destroy();
+			process.exitCode = previousExitCode ?? 0;
+			broker.stop();
+			upstreamServer.stop();
 		}
 	});
 

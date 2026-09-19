@@ -396,6 +396,7 @@ async function runSdkServeTyped(argv: string[]): Promise<void> {
 		throw new SdkServeError("broker_unavailable", "SDK broker is not reachable", 1);
 	}
 	let primary: Error | undefined;
+	let transport: ServeHandle | undefined;
 	try {
 		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
@@ -406,26 +407,23 @@ async function runSdkServeTyped(argv: string[]): Promise<void> {
 		// connection failure and this stable malformed-endpoint code is lost.
 		if (!url || !token) throw new SdkServeError("unavailable", "broker returned an invalid endpoint record", 1);
 		const options = { url, token, pendingCeilingBytes };
-		const handle =
+		transport =
 			parsed.mode.kind === "stdio"
 				? await startStdioServe(options)
 				: await startSocketServe({ ...options, socketPath: parsed.mode.socketPath });
-		const stop = (): void => {
-			void handle.close();
-		};
-		process.once("SIGINT", stop);
-		process.once("SIGTERM", stop);
-		try {
-			await handle.done;
-		} finally {
-			process.removeListener("SIGINT", stop);
-			process.removeListener("SIGTERM", stop);
-		}
 	} catch (error) {
 		primary = toServeError(error);
 	}
+	if (transport) {
+		// Once the relay owns stdout, post-start failures must never cross back into
+		// the public command renderer. That boundary writes JSON to stdout, which is
+		// the stdio frame channel; the transport owner reports only a fixed stderr
+		// diagnostic and exit status instead.
+		await ownSdkServeTransport(transport, () => broker.close());
+		return;
+	}
 	// Teardown always runs, but never through a `finally` throw: a rejected
-	// `broker.close()` there would replace the typed failure with its own.
+	// broker.close() there would replace the typed failure with its own.
 	const failure = resolveServeOutcome(primary, await brokerCloseFailure(broker));
 	if (failure) throw failure;
 }
