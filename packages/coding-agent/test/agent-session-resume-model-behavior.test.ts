@@ -433,6 +433,50 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(setConfiguredChain).not.toHaveBeenCalled();
 	});
 
+	it("does not silently substitute when no durable default is configured", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			[`${sonnet.provider}/${sonnet.id}`],
+			"profile-activation",
+			"removed-profile",
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([]);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([]);
+		const notice = vi.spyOn(session, "emitNotice");
+
+		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(notice).not.toHaveBeenCalledWith(
+			"warning",
+			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"fallback",
+		);
+		expect(notice).toHaveBeenCalledWith(
+			"error",
+			expect.stringContaining("Could not restore session model"),
+			"fallback",
+		);
+		expect(targetSession!.getConfiguredModelChainState("default")).toEqual({
+			entries: [`${sonnet.provider}/${sonnet.id}`],
+			origin: "profile-activation",
+			identity: "removed-profile",
+			explicitHead: true,
+		});
+	});
+
 	it("does not recover a saved selector that still exists in the full catalog", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const settings = Settings.isolated({
