@@ -47,7 +47,10 @@ export function resolveCanonicalLogsDir(input: CanonicalLogDirInput): string {
 		sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", input)) ??
 		sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", input)) ??
 		DEFAULT_CONFIG_DIR_NAME;
-	const xdgStateHome = input.xdgEligible ? trustedValue("XDG_STATE_HOME", input)?.trim() : undefined;
+	const xdgStateHome =
+		input.xdgEligible && (process.platform === "linux" || process.platform === "darwin")
+			? trustedValue("XDG_STATE_HOME", input)?.trim()
+			: undefined;
 	if (xdgStateHome) {
 		const xdgRoot = path.join(xdgStateHome, APP_NAME);
 		if (input.pathExists?.(xdgRoot) === true) return path.join(xdgRoot, "logs");
