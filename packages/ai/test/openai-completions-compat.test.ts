@@ -900,10 +900,10 @@ describe("openai-completions compatibility", () => {
 		// An endpoint whose tool_choice default is "none" (IO Intelligence)
 		// injects {tool_choice:"auto"} via extraBody so ordinary agent turns
 		// can still call tools. Side-channel turns that deliberately opt out
-		// of tools (context.tools unset with toolChoice "none") strip their
-		// tool_choice; the extraBody merge must not resurrect it, or the
-		// payload carries tool_choice with an empty tools list — the exact
-		// shape strict backends reject.
+		// of tools (context.tools set to an empty list with toolChoice
+		// "none") strip their tool_choice; the extraBody merge must not
+		// resurrect it, or the payload carries tool_choice with an empty
+		// tools list — the exact shape strict backends reject.
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
@@ -914,9 +914,14 @@ describe("openai-completions compatibility", () => {
 			},
 		};
 
+		const context: Context = {
+			...baseContext(),
+			tools: [],
+		};
+
 		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
 		global.fetch = createMockFetch(["[DONE]"]);
-		streamOpenAICompletions(model, baseContext(), {
+		streamOpenAICompletions(model, context, {
 			apiKey: "test-key",
 			toolChoice: "none",
 			signal: createAbortedSignal(),
