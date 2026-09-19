@@ -3437,7 +3437,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}),
 		);
 		const sdkHostEligible =
-			shouldHostSdk(notificationCfg, isTopLevelSdkSession) && (options.sdkHostModeSupported ?? true);
+		sessionFile !== undefined &&
+			shouldHostSdk(notificationCfg, isTopLevelSdkSession) &&
+			(options.sdkHostModeSupported ?? true);
 		const notificationAdapterService = createLazyService({
 			id: "sdk.notifications.adapters",
 			enabled: () => notificationsExtensionEligible || sdkHostEligible,
