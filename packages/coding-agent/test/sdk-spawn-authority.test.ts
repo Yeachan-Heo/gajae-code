@@ -3,9 +3,10 @@ import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
+import { Broker, spawnRegistrationMatches } from "../src/sdk/broker/broker";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { setLifecycleCommandResolverForTest } from "../src/sdk/broker/lifecycle";
+import type { IndexedSession } from "../src/sdk/broker/session-index";
 import {
 	isSpawnClaimV2,
 	type SeedDeliveryV2,
@@ -336,6 +337,45 @@ describe("Broker spawn flow driver", () => {
 		return (JSON.parse(last) as { claim: SpawnClaimV2 }).claim;
 	}
 
+	it("admits a macOS-shaped /var registration when the child publishes /private/var", async () => {
+		const agentDir = await temp();
+		const physical = path.join(agentDir, "private", "var", "folders", "workspace");
+		const lexical = path.join(agentDir, "var", "folders", "workspace");
+		await fs.mkdir(path.join(physical, ".gjc", "state"), { recursive: true });
+		await fs.symlink(path.join(agentDir, "private", "var"), path.join(agentDir, "var"), "dir");
+		const candidate = {
+			sessionId: "child-macos",
+			endpointGeneration: 1,
+			pid: process.pid,
+			live: true,
+			terminal: false,
+			terminalUncertain: false,
+			locator: {
+				cwd: physical,
+				worktreeRoot: physical,
+				stateRoot: path.join(physical, ".gjc", "state"),
+			},
+		} as IndexedSession;
+		try {
+			expect(
+				spawnRegistrationMatches(candidate, {
+					childId: "child-macos",
+					cwd: lexical,
+					stateRoot: path.join(lexical, ".gjc", "state"),
+				}),
+			).toBe(true);
+			expect(
+				spawnRegistrationMatches(candidate, {
+					childId: "child-macos",
+					cwd: lexical,
+					stateRoot: path.join(agentDir, "other", ".gjc", "state"),
+				}),
+			).toBe(false);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("fences every effect behind a durable transition and dispatches exactly once", async () => {
 		const agentDir = await temp();
 		const observed: {
@@ -568,9 +608,73 @@ describe("Broker spawn flow driver", () => {
 		await broker.start();
 		try {
 			const response = await broker.handleRequest("session.spawn", spawnInput(), "leak-key");
-			expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+			});
 			expect(closes).toBe(1);
-			expect((await latestClaim(agentDir))?.state).toBe("uncertain");
+			expect((await latestClaim(agentDir))?.state).toBe("pre_send_rejected");
+			const replay = await broker.handleRequest("session.spawn", spawnInput(), "leak-key");
+			expect(replay).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", details: { code: "child_registration_timeout" } },
+			});
+			expect(closes).toBe(1);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("re-drives an uncertain registration to a deterministic failure on retry", async () => {
+		const agentDir = await temp();
+		let verifyCalls = 0;
+		let closeCalls = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "retry-provider",
+						pid: 992,
+						processIncarnation: "inc-992",
+					},
+				}),
+				verify: async () => {
+					verifyCalls += 1;
+					return verifyCalls === 1 ? ("verified" as const) : ("gone" as const);
+				},
+				close: async () => {
+					closeCalls += 1;
+					return { ok: false, code: "close_pending" };
+				},
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => ({ kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 }),
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const first = await broker.handleRequest("session.spawn", spawnInput(), "retry-registration-key");
+			expect(first).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(verifyCalls).toBe(1);
+			expect(closeCalls).toBe(1);
+			expect(await latestClaim(agentDir)).toMatchObject({
+			state: "uncertain",
+			failure: { code: "child_registration_release_unproven" },
+			substrateProof: { providerIdentity: "retry-provider" },
+			});
+			const retry = await broker.handleRequest("session.spawn", spawnInput(), "retry-registration-key");
+			expect(retry).toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed", details: { code: "child_registration_reconciled_failed" } },
+			});
+			expect(verifyCalls).toBe(2);
+			expect(closeCalls).toBe(1);
 		} finally {
 			await broker.stop();
 		}
@@ -1306,7 +1410,7 @@ describe("Broker spawn close and orphan reaper", () => {
 			await broker.start();
 			try {
 				const response = await broker.handleRequest("session.spawn", spawnInput(), `exit-${exit.registration}`);
-				expect(response, exit.name).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(response, exit.name).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 				expect(closes, exit.name).toBe(1);
 			} finally {
 				await broker.stop();
