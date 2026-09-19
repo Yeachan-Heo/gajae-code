@@ -900,7 +900,7 @@ describe("openai-completions compatibility", () => {
 		// An endpoint whose tool_choice default is "none" (IO Intelligence)
 		// injects {tool_choice:"auto"} via extraBody so ordinary agent turns
 		// can still call tools. Side-channel turns that deliberately opt out
-		// of tools (context.tools = [] with toolChoice "none") strip their
+		// of tools (context.tools unset with toolChoice "none") strip their
 		// tool_choice; the extraBody merge must not resurrect it, or the
 		// payload carries tool_choice with an empty tools list — the exact
 		// shape strict backends reject.
