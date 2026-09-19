@@ -4455,6 +4455,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				questionId: string;
 				eventId: string;
 			}> = [];
+			let pendingGateCount = 0;
 			let q12Admitted = true;
 			let liveInFlightAskAdmitted = false;
 			let liveInFlightCandidate = false;
@@ -4544,10 +4545,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						byRuntimeTurn.set(runtimeTurnId, owners);
 					}
 					for (const row of items as WorkflowGateQueryRecord[]) {
-						if (!row || typeof row !== "object" || row.tag !== "pending" || typeof row.gate_id !== "string") {
+						if (!row || typeof row !== "object" || typeof row.gate_id !== "string") {
 							diagnostic("invalid_gate_row");
 							continue;
 						}
+						// Accepted and quarantined rows are durable diagnostics, not actionable
+						// questions. They remain in Q12 so SDK clients can explain a completed or
+						// lost gate, but reconciliation must not classify them as malformed.
+						if (row.tag === "accepted" || row.tag === "quarantined") continue;
+						if (row.tag !== "pending") {
+							diagnostic("invalid_gate_row");
+							continue;
+						}
+						pendingGateCount++;
 						const gate = row as WorkflowGateQueryRecord & WorkflowGate;
 						const authorityId = createHash("sha256")
 							.update(
@@ -4793,7 +4803,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// even while an authenticated, acknowledged turn is still running.
 			// Nonempty snapshots still require an admitted ask; all writer, waiting
 			// token and terminal fences above remain authoritative.
-			if (!q12Admitted || (liveInFlightCandidate && items.length > 0 && !liveInFlightAskAdmitted))
+			if (!q12Admitted || (liveInFlightCandidate && pendingGateCount > 0 && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,

@@ -427,6 +427,36 @@ describe("WorkflowGateBroker", () => {
 		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
 	});
 
+	it("notifies the owner when recovery loses the continuation", async () => {
+		const store = new MemoryGateStore();
+		let failAdvance = true;
+		const continuationLost: PersistedGate[] = [];
+		const broker = new WorkflowGateBroker("run-recovery-loss", store, {
+			terminalizeAccepted: () => "not_published",
+			advance: () => {
+				if (failAdvance) throw new Error("temporary advance failure");
+			},
+			completeAccepted: record => {
+				throw new Error(`workflow gate ${record.gate.gate_id} lost its continuation owner`);
+			},
+			continuationLost: record => continuationLost.push(record),
+		});
+		const gate = broker.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string", enum: ["go"] } },
+			liveContinuation(),
+		);
+
+		await expect(broker.resolve({ gate_id: gate.gate_id, answer: "go" })).rejects.toThrow(
+			"temporary advance failure",
+		);
+		expect(continuationLost).toEqual([]);
+
+		failAdvance = false;
+		await expect(broker.recover()).rejects.toThrow("lost its continuation owner");
+		expect(store.get(gate.gate_id)).toMatchObject({ status: "accepted", advanced: true });
+		expect(continuationLost).toMatchObject([{ gate: { gate_id: gate.gate_id }, status: "accepted", advanced: true }]);
+	});
+
 	it("fails closed on a malformed but valid FileGateStore document before exposure", () => {
 		const dir = mkdtempSync(path.join(tmpdir(), "gate-invalid-document-"));
 		const file = path.join(dir, "gates.json");
@@ -685,9 +715,7 @@ describe("WorkflowGateBroker", () => {
 			},
 		);
 		const before = broker.listWorkflowGateQueryRecords();
-		expect(before).toMatchObject([
-			{ gate_id: gate.gate_id, tag: "pending", answer_recorded: false },
-		]);
+		expect(before).toMatchObject([{ gate_id: gate.gate_id, tag: "pending", answer_recorded: false }]);
 
 		await broker.resolve({ gate_id: gate.gate_id, answer: brokerAnswer, idempotency_key: "diag-5599" });
 		expect(await continuation.promise).toBe(brokerAnswer);

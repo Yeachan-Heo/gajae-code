@@ -4115,6 +4115,59 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 	});
 
+	it("ignores accepted Q12 diagnostics during coordinator reconciliation", async () => {
+		const root = await tempRoot();
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [
+								{
+									...sharedAskGate("accepted-q12", runtimeTurnId, "ralplan", "approval"),
+									id: "diagnostic:accepted-q12",
+									tag: "accepted" as const,
+									answer_recorded: true as const,
+									resolved_at: GATE_RESOLVED_AT,
+									post_accept_disposition: "advanced" as const,
+								},
+							],
+							complete: true,
+							revision: "accepted-diagnostic",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "ignore accepted diagnostic",
+			idempotency_key: "accepted-diagnostic-prompt",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-diagnostic", reason: null },
+		});
+	});
+
 	it("does not admit an empty Q12 snapshot when cancellation races the query", async () => {
 		const root = await tempRoot();
 		const queryStarted = Promise.withResolvers<void>();

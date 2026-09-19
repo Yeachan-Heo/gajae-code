@@ -1353,6 +1353,17 @@ export class WorkflowGateBroker {
 		return this.continuations.get(gateId)?.isLive(gateId) === true;
 	}
 
+	private recordContinuationLoss(gateId: string): void {
+		this.#continuationLost.add(gateId);
+		const lost = this.store.get(gateId);
+		if (!lost) return;
+		try {
+			this.hooks.continuationLost?.(lost);
+		} catch {
+			// A settlement notification must never replace the original resolution error.
+		}
+	}
+
 	hasRecoverableAcceptedGate(): boolean {
 		return this.store
 			.list()
@@ -1440,8 +1451,7 @@ export class WorkflowGateBroker {
 				): record is PersistedGate & {
 					status: "quarantined";
 					lifecycle: WorkflowGateDiagnostic["lifecycle"];
-				} =>
-					record.status === "quarantined" && record.lifecycle !== undefined,
+				} => record.status === "quarantined" && record.lifecycle !== undefined,
 			)
 			.sort(
 				(left, right) =>
@@ -1476,9 +1486,10 @@ export class WorkflowGateBroker {
 		const accepted: WorkflowGateResolutionDiagnostic[] = this.store
 			.list()
 			.filter((record): record is PersistedGate & { status: "accepted" } => record.status === "accepted")
-			.sort((left, right) =>
-				(left.resolution?.resolved_at ?? "").localeCompare(right.resolution?.resolved_at ?? "") ||
-				left.gate.gate_id.localeCompare(right.gate.gate_id),
+			.sort(
+				(left, right) =>
+					(left.resolution?.resolved_at ?? "").localeCompare(right.resolution?.resolved_at ?? "") ||
+					left.gate.gate_id.localeCompare(right.gate.gate_id),
 			)
 			.map(record => ({
 				...record.gate,
@@ -1486,16 +1497,15 @@ export class WorkflowGateBroker {
 				tag: "accepted" as const,
 				answer_recorded: true as const,
 				resolved_at: record.resolution?.resolved_at ?? record.gate.created_at,
-				post_accept_disposition:
-					this.#continuationLost.has(record.gate.gate_id)
-						? "continuation_lost"
-						: record.advanced
-							? record.ownerInstanceId === this.instanceId
-								? "advanced"
-								: "unknown"
-							: record.terminalized === true
-								? "terminalized"
-								: "accepted",
+				post_accept_disposition: this.#continuationLost.has(record.gate.gate_id)
+					? "continuation_lost"
+					: record.advanced
+						? record.ownerInstanceId === this.instanceId
+							? "advanced"
+							: "unknown"
+						: record.terminalized === true
+							? "terminalized"
+							: "accepted",
 			}));
 		return [...pending, ...accepted, ...this.listGateDiagnostics()];
 	}
@@ -1702,15 +1712,7 @@ export class WorkflowGateBroker {
 		try {
 			await this.hooks.completeAccepted?.(this.store.get(response.gate_id) as PersistedGate);
 		} catch (error) {
-			this.#continuationLost.add(response.gate_id);
-			const lost = this.store.get(response.gate_id);
-			if (lost) {
-				try {
-					this.hooks.continuationLost?.(lost);
-				} catch {
-					// A settlement notification must never replace the original resolution error.
-				}
-			}
+			this.recordContinuationLoss(response.gate_id);
 			throw error;
 		}
 		this.continuations.get(response.gate_id)?.release?.(response.gate_id);
@@ -1768,7 +1770,7 @@ export class WorkflowGateBroker {
 					try {
 						await this.hooks.completeAccepted?.(this.store.get(latest.gate.gate_id) as PersistedGate);
 					} catch (error) {
-						this.#continuationLost.add(latest.gate.gate_id);
+						this.recordContinuationLoss(latest.gate.gate_id);
 						throw error;
 					}
 					this.continuations.get(latest.gate.gate_id)?.release?.(latest.gate.gate_id);
