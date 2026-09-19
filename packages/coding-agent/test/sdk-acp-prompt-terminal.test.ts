@@ -111,6 +111,7 @@ async function createFixture(
 		observeTerminalReservation?: boolean;
 		controlledRetryBackoff?: boolean;
 		priorTranscriptUserTurn?: boolean;
+		promptAcknowledgementError?: { code: string; message: string };
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -341,6 +342,17 @@ async function createFixture(
 								outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 							},
 						);
+				}
+				if (frame.operation === "turn.prompt" && options.promptAcknowledgementError) {
+					socket.send(
+						JSON.stringify({
+							type: "control_response",
+							id: frame.id,
+							ok: false,
+							error: options.promptAcknowledgementError,
+						}),
+						);
+					return;
 				}
 				const response = JSON.stringify({
 					type: "control_response",
@@ -642,6 +654,36 @@ test("ACP prompt rejects prompt_failed terminal outcomes with their code", async
 		await expect(bounded(pending, "prompt failure")).rejects.toMatchObject({
 			code: "prompt_failed",
 			message: "Prompt submission failed.",
+		});
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP projects a direct prompt_failed request rejection with retryability", async () => {
+	const fixture = await createFixture({
+		promptAcknowledgementError: { code: "prompt_failed", message: "Prompt submission failed." },
+	});
+	try {
+		const pending = prompt(fixture, "direct prompt rejection");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		const rejection = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			"direct prompt failure",
+		);
+
+		const failure = acpRequestFailure(rejection) as RequestError;
+		expect(failure).toBeInstanceOf(RequestError);
+		expect(failure.code).toBe(-32603);
+		expect(failure.data).toMatchObject({
+			code: "prompt_failed",
+			details: "Prompt submission failed.",
+			phase: "submission",
+			category: "agent_runtime",
+			retryability: "terminal",
 		});
 	} finally {
 		fixture.dispose();
