@@ -6,6 +6,7 @@ import * as url from "node:url";
 import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import {
 	assertDeepInterviewCrystalCoversLiveTranscript,
+	authoritativeConversationSnapshot,
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
@@ -668,7 +669,38 @@ describe("native gjc deep-interview runtime", () => {
 			);
 			expect(result.status).toBe(2);
 			expect(result.stderr).toMatch(
-				/live session transcript changed during recovery read|crystallize snapshot is malformed/,
+				/live session transcript changed (?:during recovery read|after authorization)|crystallize snapshot is malformed/,
+			);
+		} finally {
+			lstatSpy.mockRestore();
+		}
+	});
+
+	it("rejects a managed transcript replaced after candidate authentication", async () => {
+		const root = await tempDir();
+		const sessionPath = managedSessionPath(root, `${TEST_SESSION_ID}.jsonl`);
+		const trustedTranscript = `${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Trusted evidence." } })}\n`;
+		const forgedTranscript = `${JSON.stringify({ type: "session", version: 1, id: TEST_SESSION_ID, cwd: root })}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Forged evidence." } })}\n`;
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await fs.writeFile(sessionPath, trustedTranscript, "utf8");
+		delete process.env.GJC_SESSION_FILE;
+
+		const originalLstat = fs.lstat;
+		let replaced = false;
+		const lstatImplementation = (async (file: PathLike, options?: StatOptions) => {
+			const result = await originalLstat(file, options as never);
+			const target = typeof file === "string" ? path.resolve(file) : String(file);
+			if (!replaced && target === sessionPath) {
+				replaced = true;
+				await fs.rename(sessionPath, `${sessionPath}.trusted`);
+				await fs.writeFile(sessionPath, forgedTranscript, "utf8");
+			}
+			return result;
+		}) as typeof fs.lstat;
+		const lstatSpy = spyOn(fs, "lstat").mockImplementation(lstatImplementation);
+		try {
+			await expect(authoritativeConversationSnapshot(root, TEST_SESSION_ID)).rejects.toThrow(
+				/live session transcript changed|authenticated session transcript/,
 			);
 		} finally {
 			lstatSpy.mockRestore();
