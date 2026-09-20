@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { processStartTime } from "../src/config/file-lock";
+import { probeLinuxProcPidSync } from "../src/gjc-runtime/linux-proc";
 import { SessionStateLockTestHooks, withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 
 /**
@@ -155,6 +156,88 @@ describe("coordinator session state lock under cross-process contention", () => 
 
 		await expect(withSessionStateFileLock(stateFile, async () => "recovered")).resolves.toBe("recovered");
 	});
+
+	/**
+	 * The same crashed holder, observed before its parent has reaped it. Linux keeps the
+	 * killed pid in `/proc` as a zombie and `kill(pid, 0)` still succeeds for it, so a
+	 * liveness probe that trusts the signal alone refuses the reclaim and burns the whole
+	 * claim budget. A zombie cannot hold a lock, so the record must be reclaimed at once.
+	 */
+	it.skipIf(process.platform !== "linux")(
+		"recovers a lock whose killed owner is still an unreaped zombie",
+		async () => {
+			const root = await tempRoot();
+			const stateFile = path.join(root, "zombie-owner.json");
+			const lockFile = `${stateFile}.lock`;
+			await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+
+			// A LIVE holder, so `kill(pid, 0)` genuinely succeeds and the signal probe alone
+			// cannot authorize the reclaim. Only the `/proc` state distinguishes the two.
+			const holder = Bun.spawn([process.execPath, PROBE, stateFile, "zombie", "1", "60000"], {
+				cwd: REPO_ROOT,
+				env: { ...process.env, NO_COLOR: "1" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			try {
+				const lockDeadline = Date.now() + 20_000;
+				while (!fsSync.existsSync(lockFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+				expect((JSON.parse(await Bun.file(lockFile).text()) as { pid: number }).pid).toBe(holder.pid);
+				expect(() => process.kill(holder.pid, 0)).not.toThrow();
+
+				// When a parent has not yet reaped a killed child, this is what `/proc` reports.
+				// Reaping is the parent's schedule, not the test's, so the state is injected.
+				const real = probeLinuxProcPidSync(holder.pid);
+				if (real.kind !== "live") throw new Error(`expected a live /proc entry for the holder, got ${real.kind}`);
+				SessionStateLockTestHooks.probeLinuxProcPid = pid =>
+					pid === holder.pid ? { ...real, state: "Z" } : probeLinuxProcPidSync(pid);
+
+				await expect(withSessionStateFileLock(stateFile, async () => "recovered")).resolves.toBe("recovered");
+			} finally {
+				holder.kill("SIGKILL");
+				await holder.exited;
+			}
+		},
+	);
+
+	/**
+	 * The zombie verdict must not widen into every `/proc` answer: an owner that is merely
+	 * sleeping is still holding the lock, and an unreadable `/proc` entry proves nothing.
+	 */
+	it.skipIf(process.platform !== "linux")(
+		"never reclaims an owner whose /proc state is live or unreadable",
+		async () => {
+			for (const probe of [
+				{ label: "sleeping", result: { kind: "live", state: "S", startTime: "1", ttyDevice: "0" } as const },
+				{ label: "unreadable", result: { kind: "unverifiable", reason: "permission_denied" } as const },
+			]) {
+				const root = await tempRoot();
+				const stateFile = path.join(root, `live-proc-${probe.label}.json`);
+				const lockFile = `${stateFile}.lock`;
+				await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+
+				const holder = Bun.spawn([process.execPath, PROBE, stateFile, probe.label, "1", "60000"], {
+					cwd: REPO_ROOT,
+					env: { ...process.env, NO_COLOR: "1" },
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				try {
+					const lockDeadline = Date.now() + 20_000;
+					while (!fsSync.existsSync(lockFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+					expect((JSON.parse(await Bun.file(lockFile).text()) as { pid: number }).pid).toBe(holder.pid);
+
+					SessionStateLockTestHooks.probeLinuxProcPid = pid =>
+						pid === holder.pid ? probe.result : probeLinuxProcPidSync(pid);
+
+					await expect(withSessionStateFileLock(stateFile, async () => "stolen")).rejects.toThrow();
+				} finally {
+					holder.kill("SIGKILL");
+					await holder.exited;
+				}
+			}
+		},
+	);
 
 	/**
 	 * The stale verdict must rest on a real liveness probe, not on elapsed time: a lock
