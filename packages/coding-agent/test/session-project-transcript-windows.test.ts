@@ -96,10 +96,21 @@ describe("Windows bounded project transcript reads", () => {
 		expect(capture).not.toHaveBeenCalled();
 	});
 
-	it("rejects paths outside the project transcript containers", () => {
+	it("rejects paths outside the project transcript containers", async () => {
+		await fs.promises.writeFile(path.join(root, "private.jsonl"), transcript);
+		await fs.promises.mkdir(path.join(root, "nested", "sessions"), { recursive: true });
+		await fs.promises.writeFile(path.join(root, "nested", "sessions", "events.jsonl"), transcript);
+		await fs.promises.writeFile(path.join(root, "sessions", "events.txt"), transcript);
 		expect(readAuthorizedProjectSessionTranscript(root, path.join(cwd, "outside.jsonl"), 4096)).toBeUndefined();
 		expect(
 			readAuthorizedProjectSessionTranscript(root, path.join(root, "audit", "events.jsonl"), 4096),
+		).toBeUndefined();
+		expect(readAuthorizedProjectSessionTranscript(root, path.join(root, "private.jsonl"), 4096)).toBeUndefined();
+		expect(
+			readAuthorizedProjectSessionTranscript(root, path.join(root, "nested", "sessions", "events.jsonl"), 4096),
+		).toBeUndefined();
+		expect(
+			readAuthorizedProjectSessionTranscript(root, path.join(root, "sessions", "events.txt"), 4096),
 		).toBeUndefined();
 	});
 
