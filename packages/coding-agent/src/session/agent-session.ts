@@ -20332,9 +20332,29 @@ export class AgentSession {
 			});
 		}
 	}
+	async #resolveCompactionCandidate(
+		candidate: Model,
+		previousCandidate: Model | undefined,
+		previousFailure: unknown,
+	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
+		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
+		if (previousCandidate) {
+			await this.#emitCompactionModelSubstitution(
+				previousCandidate,
+				candidate,
+				this.#compactionFailureReason(previousFailure),
+			);
+		}
+		return { apiKey, authError: undefined };
+	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
-		if (/stream stalled while waiting for the next event|timed? out while waiting for the first event/i.test(error.message)) {
+		if (
+			/stream stalled while waiting for the next event|timed? out while waiting for the first event/i.test(
+				error.message,
+			)
+		) {
 			return false;
 		}
 		return /auth_unavailable|no auth available/i.test(error.message);
@@ -20395,17 +20415,14 @@ export class AgentSession {
 		let previousFailure: unknown;
 
 		for (const candidate of candidates) {
-			if (previousCandidate) {
-				await this.#emitCompactionModelSubstitution(
-					previousCandidate,
-					candidate,
-					this.#compactionFailureReason(previousFailure),
-				);
-			}
-			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-			if (!apiKey) {
+			const { apiKey, authError } = await this.#resolveCompactionCandidate(
+				candidate,
+				previousCandidate,
+				previousFailure,
+			);
+			if (apiKey === undefined) {
 				previousCandidate = candidate;
-				previousFailure = this.#buildCompactionAuthError(candidate);
+				previousFailure = authError;
 				continue;
 			}
 
@@ -20430,7 +20447,7 @@ export class AgentSession {
 			}
 		}
 
-		throw (previousFailure instanceof Error ? previousFailure : this.#buildCompactionAuthError());
+		throw previousFailure instanceof Error ? previousFailure : this.#buildCompactionAuthError();
 	}
 
 	async #prepareCompactionFromHooks(
@@ -20673,30 +20690,14 @@ export class AgentSession {
 			}
 
 			if (!this.model) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw new Error("No model selected");
 			}
 
 			const availableModels = this.#modelRegistry.getAvailable();
 			if (availableModels.length === 0) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw this.#buildCompactionAuthError(this.model);
 			}
 
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -20892,16 +20893,12 @@ export class AgentSession {
 				let previousFailure: unknown;
 
 				for (const candidate of candidates) {
-					if (previousCandidate) {
-						await this.#emitCompactionModelSubstitution(
-							previousCandidate,
-							candidate,
-							this.#compactionFailureReason(previousFailure),
-						);
-					}
-					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-					if (!apiKey) {
-						const authError = this.#buildCompactionAuthError(candidate);
+					const { apiKey, authError } = await this.#resolveCompactionCandidate(
+						candidate,
+						previousCandidate,
+						previousFailure,
+					);
+					if (apiKey === undefined) {
 						lastError = authError;
 						previousCandidate = candidate;
 						previousFailure = authError;

@@ -155,7 +155,8 @@ describe("issue #986 compaction auth fallback", () => {
 
 	it("surfaces an SSE stall without dispatching an implicit model fallback", async () => {
 		const { currentModel } = await createSession();
-		const stall = "Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
+		const stall =
+			"Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error(stall));
 
 		const error = await session.compact().catch(err => err);
@@ -175,7 +176,8 @@ describe("issue #986 compaction auth fallback", () => {
 		session.subscribe(event => {
 			if (event.type === "auto_compaction_end") endEvents.push(event);
 		});
-		const stall = "Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
+		const stall =
+			"Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error(stall));
 
 		await session.runIdleCompaction();
@@ -185,5 +187,68 @@ describe("issue #986 compaction auth fallback", () => {
 		expect(`${dispatchedModel.provider}/${dispatchedModel.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
 		expect(endEvents).toHaveLength(1);
 		expect(endEvents[0]?.errorMessage).toContain("OpenAI Codex SSE stream stalled while waiting for the next event");
+	});
+
+	it("reports an active model with no authenticated registry candidates as a recovery failure", async () => {
+		const { currentModel } = await createSession();
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([]);
+		const endEvents: Array<{
+			type: "auto_compaction_end";
+			action: string;
+			aborted: boolean;
+			willRetry: boolean;
+			errorMessage?: string;
+			skipped?: boolean;
+		}> = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") endEvents.push(event);
+		});
+
+		await session.runIdleCompaction();
+
+		expect(endEvents).toHaveLength(1);
+		expect(endEvents[0]).toMatchObject({
+			type: "auto_compaction_end",
+			action: "context-full",
+			aborted: false,
+			willRetry: false,
+			errorMessage: expect.stringContaining(
+				`Compaction requires usable credentials for ${currentModel.provider}/${currentModel.id}`,
+			),
+		});
+		expect(endEvents[0]?.skipped).toBeUndefined();
+	});
+
+	it("does not announce a credentialless fallback candidate as used", async () => {
+		const { currentModel, fallbackModel } = await createSession({
+			fallbackModelRole: "default",
+			configureFallbackAuth: true,
+		});
+		const events: Array<{
+			type: string;
+			source?: string;
+			message?: string;
+			errorMessage?: string;
+			skipped?: boolean;
+		}> = [];
+		session.subscribe(event => events.push(event as (typeof events)[number]));
+		vi.spyOn(compactionModule, "compact").mockRejectedValue(
+			new Error("Summarization failed: 503 auth_unavailable: no auth available"),
+		);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async model => {
+			if (model.provider === currentModel.provider && model.id === currentModel.id) return "codex-token";
+			return undefined;
+		});
+
+		await session.runIdleCompaction();
+
+		const endEvent = events.find(event => event.type === "auto_compaction_end");
+		expect(endEvent).toMatchObject({
+			errorMessage: expect.stringContaining(
+				`Compaction requires usable credentials for ${fallbackModel.provider}/${fallbackModel.id}`,
+			),
+		});
+		expect(endEvent?.skipped).toBeUndefined();
+		expect(events.some(event => event.type === "notice" && event.source === "compaction-recovery")).toBe(false);
 	});
 });
