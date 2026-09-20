@@ -377,9 +377,14 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 			expect(diagnostic.message).not.toContain("/private/install");
 			expect(debug).toHaveBeenCalledWith("MuPDF conversion failed", {
 				asset: "package",
-				error: expect.stringContaining("invalid WASM at [path redacted]"),
-				initializationFailure: "undefined",
+				error: expect.stringContaining(
+					"Error: asset initialization failed; caused by: CompileError: invalid WASM at [path redacted]",
+				),
 			});
+			const debugContext = debug.mock.calls[0]?.[1];
+			expect(debugContext).not.toHaveProperty("initializationFailure");
+			expect(debugContext).not.toHaveProperty("mapping");
+			expect(debugContext?.error).not.toContain("/private/install");
 		} finally {
 			debug.mockRestore();
 		}

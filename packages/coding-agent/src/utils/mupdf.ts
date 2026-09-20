@@ -90,16 +90,32 @@ export function withMuPdfDiagnostic(error: unknown): Error {
 	const capturedInitializationFailure = initializationFailure;
 	initializationFailure = undefined;
 	const cause = capturedInitializationFailure ?? error;
-	logger.debug("MuPDF conversion failed", {
+	const debugDetails: Record<string, unknown> = {
 		asset: embeddedMuPdfWasm ? "embedded" : "package",
-		error: sanitizeMuPdfDiagnostic(util.inspect(error, { depth: null, colors: false })),
-		initializationFailure:
-			capturedInitializationFailure === undefined
-				? "undefined"
-				: sanitizeMuPdfDiagnostic(util.inspect(capturedInitializationFailure, { depth: null, colors: false })),
-	});
+		error: formatMuPdfCauseChain(error),
+	};
+	if (capturedInitializationFailure !== undefined) {
+		debugDetails.initializationFailure = formatMuPdfCauseChain(capturedInitializationFailure);
+	}
+	logger.debug("MuPDF conversion failed", debugDetails);
 	const asset = embeddedMuPdfWasm ? "embedded asset" : "package asset";
 	return new Error(`PDF conversion failed [MuPDF; ${asset}; mupdf-wasm.wasm]`, { cause });
+}
+
+function formatMuPdfCauseChain(error: unknown): string {
+	const messages: string[] = [];
+	const seen = new Set<unknown>();
+	while (error !== undefined && !seen.has(error)) {
+		seen.add(error);
+		if (error instanceof Error) {
+			messages.push(sanitizeMuPdfDiagnostic(`${error.name}: ${error.message}`));
+			error = error.cause;
+		} else {
+			messages.push(sanitizeMuPdfDiagnostic(String(error)));
+			break;
+		}
+	}
+	return messages.join("; caused by: ") || "Conversion failed";
 }
 
 // Only the model-facing rendering is redacted; Error.cause remains intact for
