@@ -1789,6 +1789,10 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
 	// instead of failing the job on the 404.
 	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// Closed PR comments are also outside the approval contract and must not publish
+	// a verdict for their historical head.
+	expect(workflow).toContain('pr_state="$(printf \'%s\' "$pr_json" | jq -r \'.state\')"');
+	expect(workflow).toContain('if [[ "$pr_state" != "open" ]]; then');
 	// A trusted base missing ANY required validator capability can never authorize.
 	// One marker was not enough: `main` carried the self-review validator but not the
 	// approval freshness rule, so a comment-triggered re-validation ran the old
@@ -1882,6 +1886,21 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
 	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
+});
+
+test("issue_comment events with no PR context publish no merge-approval verdict", async () => {
+	const workflow = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { outputs?: Record<string, string>; if?: string }>;
+	};
+	const validate = workflow.jobs?.validate;
+	const mergeApproval = workflow.jobs?.["merge-approval"];
+
+	// An issue_comment run has no pull_request payload (and its run metadata has
+	// pull_requests: []), so the resolver marks the validation job as skipped.
+	expect(validate?.outputs?.skipped).toBe("${{ steps.pr.outputs.skip }}");
+	// Keep always() for evaluated contract failures, but do not turn a deliberate
+	// non-PR skip into a failing approval check against the default branch.
+	expect(mergeApproval?.if).toBe("${{ always() && needs.validate.outputs.skipped != 'true' }}");
 });
 
 test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
@@ -2489,12 +2508,13 @@ test("the merge-approval gate is a separate, fail-closed check in both workflows
 	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
 	expect(devCi).toContain("throw new Error(`Stale verdict digest");
 	expect(devCi).toContain("merge-approved cannot be self-approved");
-	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
-	// job as Success for required checks, so `needs:` alone would publish a green
-	// approval check for a red contract; always() plus an explicit result test cannot.
+	// Fail closed on a failed/cancelled upstream job. GitHub reports a SKIPPED job as
+	// Success for required checks, so `needs:` alone would publish a green approval
+	// check for a red contract; always() plus an explicit result test cannot. A
+	// non-PR issue comment is a deliberate skip and must not publish any approval.
 	expect(prContract).toContain("needs: [validate]");
 	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
-	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() && needs.validate.outputs.skipped != 'true' }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
 		expect(workflow).toContain(guard);
 		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
 		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');
