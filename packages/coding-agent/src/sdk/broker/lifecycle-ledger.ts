@@ -707,13 +707,18 @@ export class LifecycleLedger {
 				entry.operationKey === operationKey && (fingerprint === undefined || entry.fingerprint === fingerprint),
 		);
 	}
+	findAnyByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
+	}
 	/**
 	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
 	 * must reject rather than create a second admission.
 	 */
-	hasLegacyIdentity(): boolean {
-		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>): boolean {
+		return [...this.#byIdentity.values()].some(
+			entry => entry.operationKey === undefined && !excludedIdentities?.has(entry.identity),
+		);
 	}
 	async migrateIdentity(
 		from: string,
@@ -781,7 +786,7 @@ export class LifecycleLedger {
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string } = {},
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string } = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -789,7 +794,7 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string },
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string },
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -801,6 +806,7 @@ export class LifecycleLedger {
 					requestHash,
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
+					intendedSessionId: metadata.intendedSessionId,
 					state: "accepted",
 					ts: Date.now(),
 				}),

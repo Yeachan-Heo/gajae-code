@@ -141,6 +141,9 @@ test("a terminal close error can be retried for the current authority without re
 		ok: false,
 		error: { code: "endpoint_stale" },
 	});
+	expect(broker.ledger.findAnyByOperationKey(`session.close\0${closeKey}`)).toMatchObject({
+		intendedSessionId: "terminal-error-close",
+	});
 	await expect(broker.handleRequest("session.close", host.authority, closeKey)).resolves.toMatchObject({
 		ok: true,
 		result: { sessionId },
@@ -165,4 +168,28 @@ test("a repeated close for one host generation remains idempotent", async () => 
 	expect(first).toMatchObject({ ok: true, result: { sessionId } });
 	expect(duplicate).toEqual(first);
 	await waitForExit(host.child);
+});
+
+test("an explicit close key cannot be reused for a different target authority", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-close-cross-target-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	brokers.push(broker);
+	await broker.start();
+
+	const first = await registerHost(broker, root, stateRoot, "cross-target-first", 1);
+	const second = await registerHost(broker, root, stateRoot, "cross-target-second", 1);
+	const closeKey = "explicit-cross-target-close-key";
+	await expect(broker.handleRequest("session.close", first.authority, closeKey)).resolves.toMatchObject({
+		ok: true,
+		result: { sessionId: "cross-target-first" },
+	});
+	await waitForExit(first.child);
+
+	await expect(broker.handleRequest("session.close", second.authority, closeKey)).resolves.toMatchObject({
+		ok: false,
+		error: { code: "idempotency_conflict" },
+	});
 });

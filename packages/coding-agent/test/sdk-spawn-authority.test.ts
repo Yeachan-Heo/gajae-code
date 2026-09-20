@@ -316,6 +316,40 @@ describe("SpawnAuthorityStore", () => {
 			}
 		});
 	});
+
+	it("does not let a completed spawn mirror fence an unrelated lifecycle request", async () => {
+		const agentDir = await temp();
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: { verifyMasterCapability: async () => ({ allowed: true }) },
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
+		await broker.start();
+		try {
+			await expect(
+				broker.handleRequest(
+					"session.spawn",
+					{
+						task: "spawn-mirror-task",
+						masterCapability: "spawn-mirror-capability",
+						ownerSessionId: "spawn-mirror-owner",
+						attestationEpoch: "spawn-mirror-epoch",
+						cwd: agentDir,
+					},
+					"spawn-mirror-key",
+				),
+			).resolves.toMatchObject({
+				ok: true,
+				result: { code: "spawn_accepted" },
+			});
+			await expect(
+				broker.handleRequest("session.delete", { sessionId: "unrelated-session" }, "unrelated-delete-key"),
+			).resolves.toEqual({ ok: true, result: { sessionId: "unrelated-session" } });
+		} finally {
+			await broker.stop();
+		}
+	});
 });
 
 describe("Broker spawn flow driver", () => {
