@@ -6515,11 +6515,12 @@ export function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: 
 	if (isStagedSessionPath(filePath)) return false;
 	const relative = path.relative(projectGjcDir, filePath);
 	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
-	const segments = relative.split(path.sep);
+	const segments = relative.split(path.sep).filter(Boolean);
 	if (segments.includes(SESSION_STAGING_DIRNAME)) return false;
-	if (segments.length === 1) return true;
-	const parent = segments.at(-2);
-	return parent === "agent-session" || segments.includes("sessions");
+	if (segments.length < 2) return false;
+	if (segments[0] !== "agent-session" && segments[0] !== "sessions") return false;
+	const fileName = segments.at(-1);
+	return Boolean(fileName && !fileName.startsWith(".") && fileName.endsWith(".jsonl"));
 }
 
 export function readAuthorizedProjectSessionTranscript(
