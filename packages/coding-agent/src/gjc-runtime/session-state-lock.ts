@@ -14,7 +14,7 @@ import {
 	readFileLockObservationForGc,
 } from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
-import { readLinuxProcStartTimeSync } from "./linux-proc";
+import { probeLinuxProcPidSync, readLinuxProcStartTimeSync } from "./linux-proc";
 
 /** SHA-256 of the empty payload; the constant identity of every verified-empty receipt. */
 const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -990,7 +990,17 @@ function probeOwnerProcess(pid: number): OwnerProcessLiveness {
 	try {
 		const probe = SessionStateLockTestHooks.probeProcessSignal;
 		if (probe) probe(pid);
-		else process.kill(pid, 0);
+		else {
+			// Linux keeps a killed child as a zombie until its parent reaps it. `kill(pid, 0)`
+			// still succeeds for that zombie even though it can no longer hold the lock, so
+			// inspect `/proc` first and treat the terminal `Z` state as proof of death.
+			if (process.platform === "linux") {
+				const proc = probeLinuxProcPidSync(pid);
+				if (proc.kind === "absent") return "dead";
+				if (proc.kind === "live" && proc.state === "Z") return "dead";
+			}
+			process.kill(pid, 0);
+		}
 		return "alive";
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
