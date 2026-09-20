@@ -1,4 +1,5 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
+import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
@@ -60,20 +61,34 @@ if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 const projectEnv = projectEnvSnapshot(process.cwd());
 
 // Capture the operator's canonical user-state decision before replacing the
-// agent directory with a per-process temp profile. Importing the resolver here
-// is safe because it is immediately rebuilt after the isolation variables are
-// installed; the pre-isolation snapshot is needed to identify an inherited
-// XDG sink that belongs to the operator's default profile.
-const {
-	getAgentProfileAuthority,
-	getTrustedHomeDir,
-	resetAgentDirFromEnvironment,
-} = await import("../packages/utils/src/dirs");
+// agent directory with a per-process temp profile. The static import above
+// initializes the resolver before this preload mutates isolation variables; the
+// pre-isolation snapshot is needed to identify an inherited XDG sink that
+// belongs to the operator's default profile.
 const preIsolationHome = getTrustedHomeDir();
-const profileMarker = process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY;
-const preIsolationXdgEligible = profileMarker
-	? profileMarker === "default"
-	: getAgentProfileAuthority() === "default";
+const profileMarkerKey = "GJC_TEST_PRELOAD_PROFILE_AUTHORITY";
+const profileMarker = process.env[profileMarkerKey];
+const profileMarkerDeclared = Object.hasOwn(projectEnv.values, profileMarkerKey);
+const profileMarkerUntrusted = profileMarkerDeclared || projectEnv.dynamic.has(profileMarkerKey);
+const profileMarkerTrusted =
+	!profileMarkerUntrusted &&
+	(profileMarker === "default" || profileMarker === "custom");
+// A marker supplied by the checkout is not evidence about the ancestor
+// process: Bun overlays dotenv values before this preload runs. Treat any such
+// marker (and any malformed ambient value) as the default profile, which is the
+// fail-closed direction for shared-sink detection. A recognized marker is
+// trusted only when it was inherited from another preload; otherwise the
+// resolver's current profile is authoritative.
+let preIsolationXdgEligible: boolean;
+if (profileMarkerUntrusted) {
+	preIsolationXdgEligible = true;
+} else if (profileMarkerTrusted) {
+	preIsolationXdgEligible = profileMarker === "default";
+} else if (profileMarker !== undefined) {
+	preIsolationXdgEligible = true;
+} else {
+	preIsolationXdgEligible = getAgentProfileAuthority() === "default";
+}
 process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
 const preIsolationLogEnv = {
 	GJC_LOG_DIR: process.env.GJC_LOG_DIR,

@@ -241,7 +241,16 @@ describe("preload log-sink behavior (real preload path)", () => {
 	function childEnv(overrides: Record<string, string>): Record<string, string | undefined> {
 		const env: Record<string, string | undefined> = { ...process.env };
 		delete env.GJC_LOG_DIR;
-		return { ...env, ...overrides };
+		// Keep nested preload probes independent from the parent test process's
+		// temporary profile and ambient XDG state. Tests that exercise XDG pass it
+		// explicitly below; the marker is pinned so that inherited agent-dir state
+		// cannot silently turn that path comparison into the custom-profile lane.
+		delete env.XDG_STATE_HOME;
+		return {
+			...env,
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			...overrides,
+		};
 	}
 
 	/**
@@ -460,6 +469,45 @@ describe("preload log-sink behavior (real preload path)", () => {
 			await Promise.all([
 				fs.promises.rm(home, { recursive: true, force: true }),
 				fs.promises.rm(xdgStateHome, { recursive: true, force: true }),
+			]);
+		}
+	}, 30_000);
+
+	test("ignores a project-planted profile marker when guarding an inherited XDG pin", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-marker-home-"));
+		const xdgStateHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-marker-xdg-"));
+		const cwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-marker-cwd-"));
+		const shared = path.join(xdgStateHome, "gjc", "logs");
+		await fs.promises.mkdir(shared, { recursive: true });
+		await fs.promises.writeFile(path.join(cwd, ".env"), "GJC_TEST_PRELOAD_PROFILE_AUTHORITY=custom\n");
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, PROBE],
+				cwd,
+				env: childEnv({
+					HOME: home,
+					XDG_STATE_HOME: xdgStateHome,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "custom",
+					GJC_PROBE_WRITE: "1",
+				}),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stdout = probe.stdout.toString();
+			expect(probe.exitCode, probe.stderr.toString()).toBe(0);
+			const resolved = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+				effectiveLogsDir: string | null;
+				markerDir: string | null;
+			};
+			expect(resolved.effectiveLogsDir).not.toBe(shared);
+			expect(path.basename(resolved.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
+			expect(resolved.markerDir).toBe(resolved.effectiveLogsDir);
+		} finally {
+			await Promise.all([
+				fs.promises.rm(home, { recursive: true, force: true }),
+				fs.promises.rm(xdgStateHome, { recursive: true, force: true }),
+				fs.promises.rm(cwd, { recursive: true, force: true }),
 			]);
 		}
 	}, 30_000);

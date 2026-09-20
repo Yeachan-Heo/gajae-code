@@ -97,6 +97,12 @@ test("a test process does not write watchdog errors into the operator log sink",
 	// known keys only, so `delete` on the spread result does not type-check.
 	const env: Record<string, string | undefined> = { ...process.env, HOME: home };
 	delete env.GJC_LOG_DIR;
+	// Keep the nested preload independent from the parent test process's
+	// temporary profile and ambient XDG state. The child has no log pin of its
+	// own, so the marker is pinned to the default lane for deterministic sink
+	// comparison.
+	delete env.XDG_STATE_HOME;
+	env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = "default";
 
 	const proc = Bun.spawn([process.execPath, "test", WATCHDOG_TEST, "-t", WATCHDOG_CASE], {
 		cwd: REPO_ROOT,
