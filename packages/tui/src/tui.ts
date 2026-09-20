@@ -4652,8 +4652,11 @@ export class TUI extends Container {
 			}
 			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
 			for (let lineIndex = 0; lineIndex < rendered.lines.length; lineIndex++) {
-				for (const placement of kittyPlacements[lineIndex] ?? []) {
-					placementOwners.set(this.#kittyPlacementKey(placement), owner);
+				const placements = kittyPlacements[lineIndex];
+				if (placements !== undefined) {
+					for (const placement of placements) {
+						placementOwners.set(this.#kittyPlacementKey(placement), owner);
+					}
 				}
 				renderedLines.push(safeLines[lineIndex] ?? rendered.lines[lineIndex]!);
 			}
