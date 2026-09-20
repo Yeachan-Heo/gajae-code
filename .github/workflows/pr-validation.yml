@@ -45,6 +45,9 @@ jobs:
     outputs:
       # Fail closed: absent means the validator never reported an authorized merge.
       merge_authorized: ${{ steps.validate.outputs.merge_authorized }}
+      # Issue comments that are not on a dev-based PR are deliberately skipped and
+      # must not publish a verdict against the event's default-branch commit.
+      skipped: ${{ steps.pr.outputs.skip }}
     steps:
       - name: Resolve PR head/base from the event or the comment's PR
         id: pr
@@ -319,12 +322,13 @@ jobs:
   merge-approval:
     name: Merge approval
     needs: [validate]
-    # always() is load-bearing. GitHub reports a SKIPPED job as Success for required
-    # checks (https://docs.github.com/en/pull-requests/reference/status-checks), so a
+    # always() is load-bearing whenever the contract was evaluated. GitHub reports a
+    # SKIPPED job as Success for required checks
+    # (https://docs.github.com/en/pull-requests/reference/status-checks), so a
     # plain `needs:` would skip this job when the contract job fails and publish a GREEN
-    # merge-approval check for a red contract — the precise hole this must not open.
-    # The job therefore always runs and decides from the upstream result plus its output.
-    if: ${{ always() }}
+    # merge-approval check for a red contract. A deliberate issue_comment skip has no
+    # PR head to protect, so it must not publish a verdict against the default branch.
+    if: ${{ always() && needs.validate.outputs.skipped != 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     # Reads only the upstream job's result and output: no checkout, no bun, no token.
