@@ -67,6 +67,20 @@ describe("cursor native toolCall JSON safety", () => {
 		expect(() => JSON.stringify(cursorJsonSafeValueForTest(deep))).not.toThrow();
 	});
 
+	it("rejects generic values beyond the explicit depth limit instead of truncating them", () => {
+		const deep: Record<string, unknown> = {};
+		let cursor = deep;
+		for (let index = 0; index < 2_000; index++) {
+			const next: Record<string, unknown> = {};
+			cursor.next = next;
+			cursor = next;
+		}
+
+		expect(() => cursorJsonSafeStringifyForTest(deep)).toThrow(
+			"Cursor JSON-safe conversion exceeded the maximum depth of 1,000.",
+		);
+	});
+
 	it("contains unreadable payload objects at the provider boundary", () => {
 		const unreadable = new Proxy(
 			{},

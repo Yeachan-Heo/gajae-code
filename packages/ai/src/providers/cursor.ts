@@ -4171,11 +4171,15 @@ function cursorNativeToolName(kindKey: string): string {
 /** Hard node budget for one native-payload conversion; bounds hostile or cyclic graphs. */
 const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
 const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
+/** Generic boundaries remain lossless within explicit resource limits. */
+const CURSOR_GENERIC_JSON_SAFE_MAX_NODES = 100_000;
+const CURSOR_GENERIC_JSON_SAFE_MAX_DEPTH = 1_000;
 
 interface CursorJsonSafeOptions {
 	stripTypeName: boolean;
 	maxNodes?: number;
 	maxDepth?: number;
+	throwOnLimit?: boolean;
 }
 
 const CURSOR_NATIVE_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
@@ -4187,7 +4191,22 @@ const CURSOR_NATIVE_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
 /** Generic JSON boundaries must preserve every schema/context entry losslessly. */
 const CURSOR_GENERIC_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
 	stripTypeName: false,
+	maxNodes: CURSOR_GENERIC_JSON_SAFE_MAX_NODES,
+	maxDepth: CURSOR_GENERIC_JSON_SAFE_MAX_DEPTH,
+	throwOnLimit: true,
 };
+
+class CursorJsonSafeLimitError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CursorJsonSafeLimitError";
+	}
+}
+
+function cursorJsonSafeLimit(options: CursorJsonSafeOptions, message: string): null {
+	if (options.throwOnLimit) throw new CursorJsonSafeLimitError(message);
+	return null;
+}
 
 /**
  * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
@@ -4200,11 +4219,13 @@ const CURSOR_GENERIC_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
  * all of which require `JSON.stringify`-safe values. Attaching the raw payload
  * is exactly the local-snapshot producer defect class behind issue #4578.
  *
- * Rules: `$typeName` is stripped, safe-range bigints become numbers (decimal
- * strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64
- * strings, dates become ISO strings, functions/symbols are dropped, cycles
- * and over-depth values collapse to null, and containers stop accepting
- * entries once the shared node budget is exhausted.
+ * Native payload rules: `$typeName` is stripped, safe-range bigints become
+ * numbers (decimal strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays
+ * become base64 strings, dates become ISO strings, functions/symbols are
+ * dropped, cycles and over-depth values collapse to null, and containers stop
+ * accepting entries once the shared node budget is exhausted. Generic payload
+ * boundaries use the same conversion with their own explicit limits and reject
+ * limit exhaustion instead of returning a truncated value.
  */
 function cursorJsonSafeValue(value: unknown): unknown {
 	return cursorJsonSafeValueWithOptions(value, CURSOR_NATIVE_JSON_SAFE_OPTIONS);
@@ -4219,8 +4240,18 @@ function cursorJsonSafeValueWithOptions(
 ): unknown {
 	const seen = path ?? new Set<object>();
 	const nodes = options.maxNodes === undefined ? undefined : (budget ?? { remaining: options.maxNodes });
-	if (nodes && nodes.remaining-- <= 0) return null;
-	if (options.maxDepth !== undefined && depth >= options.maxDepth) return null;
+	if (nodes && nodes.remaining-- <= 0) {
+		return cursorJsonSafeLimit(
+			options,
+			`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+		);
+	}
+	if (options.maxDepth !== undefined && depth >= options.maxDepth) {
+		return cursorJsonSafeLimit(
+			options,
+			`Cursor JSON-safe conversion exceeded the maximum depth of ${options.maxDepth.toLocaleString("en-US")}.`,
+		);
+	}
 	if (typeof value === "bigint") {
 		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
 			? Number(value)
@@ -4238,7 +4269,13 @@ function cursorJsonSafeValueWithOptions(
 		if (Array.isArray(value)) {
 			const array: unknown[] = [];
 			for (const entry of value) {
-				if (nodes && nodes.remaining <= 0) break;
+				if (nodes && nodes.remaining <= 0) {
+					cursorJsonSafeLimit(
+						options,
+						`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+					);
+					break;
+				}
 				array.push(cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1));
 			}
 			return array;
@@ -4246,11 +4283,23 @@ function cursorJsonSafeValueWithOptions(
 		const record: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
 			if (options.stripTypeName && key === "$typeName") continue;
-			if (nodes && nodes.remaining <= 0) break;
-			record[key] = cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1);
+			if (nodes && nodes.remaining <= 0) {
+				cursorJsonSafeLimit(
+					options,
+					`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+				);
+				break;
+			}
+			Object.defineProperty(record, key, {
+				value: cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 		}
 		return record;
-	} catch {
+	} catch (error) {
+		if (error instanceof CursorJsonSafeLimitError) throw error;
 		return null;
 	} finally {
 		seen.delete(value);

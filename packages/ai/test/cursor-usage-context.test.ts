@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildCursorUsageToolsKeyForTest,
 	buildCursorWireToolIdentitiesForTest,
+	cursorJsonSafeStringifyForTest,
 	hashCursorConversationValueForTest,
 } from "../src/providers/cursor";
 import type { Tool } from "../src/types";
@@ -57,6 +58,29 @@ describe("Cursor usage-context tool identity", () => {
 			properties: { $typeName: { type: "string" } },
 			required: ["$typeName"],
 		});
+	});
+
+	it("preserves own __proto__ entries in generic schemas and identity values", () => {
+		const expectedSchema = JSON.parse(
+			'{"type":"object","properties":{"__proto__":{"type":"string"}},"required":["__proto__"]}',
+		);
+		const schema = JSON.parse(JSON.stringify(expectedSchema)) as Tool["parameters"];
+		const tool = {
+			name: "proto_probe",
+			description: "Accept an own __proto__ schema property",
+			parameters: schema,
+		} as unknown as Tool;
+
+		const [identity] = buildCursorWireToolIdentitiesForTest([tool]);
+		expect(identity?.inputSchema).toEqual(expectedSchema);
+		const inputSchema = identity?.inputSchema as { properties?: Record<string, unknown> } | undefined;
+		expect(Object.hasOwn(inputSchema?.properties ?? {}, "__proto__")).toBe(true);
+
+		const primitiveProto = JSON.parse('{"__proto__":"literal"}');
+		expect(JSON.parse(cursorJsonSafeStringifyForTest(primitiveProto))).toEqual(primitiveProto);
+		expect(hashCursorConversationValueForTest(JSON.parse('{"__proto__":{"value":"first"}}'))).not.toBe(
+			hashCursorConversationValueForTest(JSON.parse('{"__proto__":{"value":"second"}}')),
+		);
 	});
 
 	it("preserves advertised schemas beyond the native payload node budget", () => {
