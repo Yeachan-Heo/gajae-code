@@ -203,6 +203,29 @@ fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
 	state.acks.lock().begin_dispatch(request.request_id())
 }
 
+/// Extract a safe protocol kind for diagnostics without retaining payload data.
+fn directed_frame_kind(json: &str) -> String {
+	let Some(value) = serde_json::from_str::<serde_json::Value>(json).ok() else {
+		return "invalid".to_owned();
+	};
+	let Some(kind) = value
+		.as_object()
+		.and_then(|object| object.get("type"))
+		.and_then(serde_json::Value::as_str)
+	else {
+		return "unknown".to_owned();
+	};
+	if kind.is_empty()
+		|| kind.len() > 64
+		|| !kind
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+	{
+		return "invalid".to_owned();
+	}
+	kind.to_owned()
+}
+
 /// Validate the host-to-client directed envelope before it enters a connection
 /// writer. The host can only direct typed v3 envelopes; raw WebSocket text is
 /// deliberately not an escape hatch around transport policy.
@@ -503,6 +526,68 @@ impl std::fmt::Display for PushFrameError {
 }
 
 impl std::error::Error for PushFrameError {}
+
+/// Cause of a rejected directed frame delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectedDeliveryErrorKind {
+	/// The connection id is not currently registered, or its writer is closed.
+	ConnectionUnavailable,
+	/// The JSON envelope does not satisfy the directed-frame protocol shape.
+	InvalidFrame,
+	/// The serialized envelope exceeds the response frame ceiling.
+	OversizedFrame,
+	/// The connection has not negotiated the capability required by the frame.
+	Unauthorized,
+	/// The connection's bounded writer queue has reached its capacity.
+	WriterBacklogFull,
+}
+
+impl std::fmt::Display for DirectedDeliveryErrorKind {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let name = match self {
+			Self::ConnectionUnavailable => "connection_unavailable",
+			Self::InvalidFrame => "invalid_frame",
+			Self::OversizedFrame => "oversized_frame",
+			Self::Unauthorized => "unauthorized",
+			Self::WriterBacklogFull => "writer_backlog_full",
+		};
+		formatter.write_str(name)
+	}
+}
+
+/// Context-rich rejection of a directed frame before it reaches a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectedDeliveryError {
+	/// The session whose endpoint rejected the frame.
+	pub session_id:    String,
+	/// The requested destination connection id.
+	pub connection_id: String,
+	/// Safe protocol kind extracted from the envelope, never the payload.
+	pub frame_kind:    String,
+	/// Serialized frame size in bytes.
+	pub frame_bytes:   usize,
+	/// Queue depth when the writer backlog was full.
+	pub backlog_depth: Option<usize>,
+	/// Why the frame was rejected.
+	pub kind:          DirectedDeliveryErrorKind,
+}
+
+impl std::fmt::Display for DirectedDeliveryError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"sdk directed delivery rejected: cause={} sessionId={} connectionId={} frameKind={} \
+			 frameBytes={}",
+			self.kind, self.session_id, self.connection_id, self.frame_kind, self.frame_bytes,
+		)?;
+		if let Some(depth) = self.backlog_depth {
+			write!(formatter, " backlogDepth={depth} backlogLimit={MAX_QUEUED_DIRECTED_FRAMES}")?;
+		}
+		Ok(())
+	}
+}
+
+impl std::error::Error for DirectedDeliveryError {}
 
 type AckOrigin = (String, String);
 type FinishedAck = (String, Option<AckOrigin>, bool);
@@ -922,7 +1007,7 @@ impl ServerHandle {
 		let json = serde_json::to_string(&msg).expect("ServerMessage serialization cannot fail");
 		let mut accepted = false;
 		for connection_id in recipients {
-			accepted |= self.send_to(&connection_id, json.clone());
+			accepted |= self.send_to(&connection_id, json.clone()).is_ok();
 		}
 		Ok(accepted)
 	}
@@ -1035,22 +1120,46 @@ impl ServerHandle {
 		self.capability_rx.lock().take()
 	}
 
-	/// Send a validated JSON envelope to one connected v3 SDK client. Returns
-	/// false when the destination is no longer current, the envelope is invalid,
-	/// it exceeds the transport frame bound, or the connection's bounded writer
-	/// backlog is full.
-	pub fn send_to(&self, connection_id: &str, json: String) -> bool {
-		self.enqueue_directed_frame(connection_id, json).is_some()
+	/// Send a validated JSON envelope to one connected v3 SDK client.
+	///
+	/// The error preserves the destination and frame metadata without retaining
+	/// or formatting the payload, so a caller can identify the dropped delivery
+	/// without exposing secrets.
+	pub fn send_to(&self, connection_id: &str, json: String) -> Result<(), DirectedDeliveryError> {
+		self.enqueue_directed_frame(connection_id, json).map(|_| ())
 	}
 
 	/// Send one directed frame and return an opaque, server-authenticated
 	/// receipt for the exact connection generation that accepted it. The
 	/// receipt carries no authority outside this server and must be passed to
 	/// [`Self::queue_idle_after_directed`].
-	pub fn send_to_with_receipt(&self, connection_id: &str, json: String) -> Option<String> {
-		let prerequisite_digest = directed_prerequisite_digest(&json)?;
+	pub fn send_to_with_receipt(
+		&self,
+		connection_id: &str,
+		json: String,
+	) -> Result<String, DirectedDeliveryError> {
+		let frame_bytes = json.len();
+		let frame_kind = directed_frame_kind(&json);
+		if frame_bytes > RESPONSE_CEILING_BYTES {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::OversizedFrame,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		let prerequisite_digest = directed_prerequisite_digest(&json).ok_or_else(|| {
+			self.directed_delivery_error(
+				DirectedDeliveryErrorKind::InvalidFrame,
+				connection_id,
+				frame_kind.clone(),
+				frame_bytes,
+				None,
+			)
+		})?;
 		let generation = self.enqueue_directed_frame(connection_id, json)?;
-		Some(sign_directed_delivery_receipt(
+		Ok(sign_directed_delivery_receipt(
 			connection_id.to_owned(),
 			generation,
 			prerequisite_digest,
@@ -1058,36 +1167,103 @@ impl ServerHandle {
 		))
 	}
 
-	fn enqueue_directed_frame(&self, connection_id: &str, json: String) -> Option<String> {
-		let (json, requires_tool_activity) = validate_directed_frame(json)?;
-		let sender = self
-			.state
-			.connections
-			.lock()
-			.get(connection_id)
-			.map(|connection| {
-				(
-					connection.tx.clone(),
-					connection.generation.clone(),
-					Arc::clone(&connection.queued_directed_frames),
-				)
-			});
-		sender.and_then(|(sender, connection_generation, queued_directed_frames)| {
-			if !reserve_directed_frame(&queued_directed_frames) {
-				return None;
-			}
-			let sent = sender
-				.send(DirectCommand::DirectedFrame {
-					json,
-					connection_generation: connection_generation.clone(),
-					requires_tool_activity,
-				})
-				.is_ok();
-			if !sent {
-				release_directed_frame(&queued_directed_frames);
-			}
-			sent.then_some(connection_generation)
-		})
+	fn directed_delivery_error(
+		&self,
+		kind: DirectedDeliveryErrorKind,
+		connection_id: &str,
+		frame_kind: String,
+		frame_bytes: usize,
+		backlog_depth: Option<usize>,
+	) -> DirectedDeliveryError {
+		DirectedDeliveryError {
+			session_id: self.session_id.clone(),
+			connection_id: connection_id.to_owned(),
+			frame_kind,
+			frame_bytes,
+			backlog_depth,
+			kind,
+		}
+	}
+
+	fn enqueue_directed_frame(
+		&self,
+		connection_id: &str,
+		json: String,
+	) -> Result<String, DirectedDeliveryError> {
+		let frame_bytes = json.len();
+		let frame_kind = directed_frame_kind(&json);
+		if frame_bytes > RESPONSE_CEILING_BYTES {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::OversizedFrame,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		let (json, requires_tool_activity) = validate_directed_frame(json).ok_or_else(|| {
+			self.directed_delivery_error(
+				DirectedDeliveryErrorKind::InvalidFrame,
+				connection_id,
+				frame_kind.clone(),
+				frame_bytes,
+				None,
+			)
+		})?;
+		let connections = self.state.connections.lock();
+		let Some(connection) = connections.get(connection_id) else {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::ConnectionUnavailable,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		};
+		if requires_tool_activity
+			&& !connection
+				.capabilities
+				.iter()
+				.any(|capability| capability == capabilities::TOOL_ACTIVITY_V1)
+		{
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::Unauthorized,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		let sender = connection.tx.clone();
+		let connection_generation = connection.generation.clone();
+		let queued_directed_frames = Arc::clone(&connection.queued_directed_frames);
+		if !reserve_directed_frame(&queued_directed_frames) {
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::WriterBacklogFull,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				Some(queued_directed_frames.load(Ordering::Relaxed)),
+			));
+		}
+		let sent = sender
+			.send(DirectCommand::DirectedFrame {
+				json,
+				connection_generation: connection_generation.clone(),
+				requires_tool_activity,
+			})
+			.is_ok();
+		if !sent {
+			release_directed_frame(&queued_directed_frames);
+			return Err(self.directed_delivery_error(
+				DirectedDeliveryErrorKind::ConnectionUnavailable,
+				connection_id,
+				frame_kind,
+				frame_bytes,
+				None,
+			));
+		}
+		Ok(connection_generation)
 	}
 
 	/// Queue an idle action behind an identity prerequisite for one exact
@@ -2712,10 +2888,13 @@ mod tests {
 			assert!(
 				handle
 					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+					.is_ok()
 			);
 		}
 		assert!(
-			!handle.send_to("slow", r#"{"type":"query_response","id":"overflow","ok":true}"#.into(),)
+			handle
+				.send_to("slow", r#"{"type":"query_response","id":"overflow","ok":true}"#.into(),)
+				.is_err()
 		);
 		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
 
@@ -2725,8 +2904,132 @@ mod tests {
 		};
 		release_directed_frame(&queued);
 		assert!(
-			handle.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
+			handle
+				.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
+				.is_ok()
 		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_diagnostics_identify_each_rejection_cause() {
+		fn assert_context(
+			error: &DirectedDeliveryError,
+			cause: DirectedDeliveryErrorKind,
+			connection_id: &str,
+			frame_kind: &str,
+			frame_bytes: usize,
+		) {
+			let diagnostic = error.to_string();
+			assert!(diagnostic.contains(&format!("cause={cause}")));
+			assert!(diagnostic.contains("sessionId=session-5758"));
+			assert!(diagnostic.contains(&format!("connectionId={connection_id}")));
+			assert!(diagnostic.contains(&format!("frameKind={frame_kind}")));
+			assert!(diagnostic.contains(&format!("frameBytes={frame_bytes}")));
+		}
+
+		let handle = start(ServerConfig::new("session-5758", "secret"))
+			.await
+			.unwrap();
+		let invalid_json = "{";
+		let invalid = handle
+			.send_to("missing", invalid_json.into())
+			.expect_err("malformed JSON must be rejected");
+		assert_context(
+			&invalid,
+			DirectedDeliveryErrorKind::InvalidFrame,
+			"missing",
+			"invalid",
+			invalid_json.len(),
+		);
+
+		let oversized_json = format!(
+			r#"{{"type":"query_response","id":"oversized","ok":true,"result":"{}"}}"#,
+			"x".repeat(RESPONSE_CEILING_BYTES),
+		);
+		let oversized_bytes = oversized_json.len();
+		let oversized = handle
+			.send_to("missing", oversized_json)
+			.expect_err("oversized JSON must be rejected");
+		assert_context(
+			&oversized,
+			DirectedDeliveryErrorKind::OversizedFrame,
+			"missing",
+			"query_response",
+			oversized_bytes,
+		);
+
+		let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel();
+		let unauthorized_queue = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("unauthorized".into(), Connection {
+				generation:             "generation".into(),
+				capabilities:           Vec::new(),
+				negotiation:            Negotiation::Negotiated,
+				delivered:              None,
+				queued_directed_frames: Arc::clone(&unauthorized_queue),
+				tx:                     unauthorized_tx,
+			});
+		let unauthorized_json =
+			r#"{"type":"tool_activity","toolCallId":"call-1","toolName":"read","phase":"started"}"#;
+		let unauthorized = handle
+			.send_to("unauthorized", unauthorized_json.into())
+			.expect_err("capability-gated JSON must be rejected");
+		assert_context(
+			&unauthorized,
+			DirectedDeliveryErrorKind::Unauthorized,
+			"unauthorized",
+			"tool_activity",
+			unauthorized_json.len(),
+		);
+
+		let (backlog_tx, _backlog_rx) = mpsc::unbounded_channel();
+		let backlog_queue = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("backlog".into(), Connection {
+				generation:             "generation".into(),
+				capabilities:           vec![capabilities::TOOL_ACTIVITY_V1.into()],
+				negotiation:            Negotiation::Negotiated,
+				delivered:              None,
+				queued_directed_frames: Arc::clone(&backlog_queue),
+				tx:                     backlog_tx,
+			});
+		let backlog_json = r#"{"type":"query_response","id":"backlog","ok":true}"#;
+		for _ in 0..MAX_QUEUED_DIRECTED_FRAMES {
+			handle
+				.send_to("backlog", backlog_json.into())
+				.expect("backlog fixture should accept its bounded capacity");
+		}
+		let backlog = handle
+			.send_to("backlog", backlog_json.into())
+			.expect_err("full writer backlog must be rejected");
+		assert_context(
+			&backlog,
+			DirectedDeliveryErrorKind::WriterBacklogFull,
+			"backlog",
+			"query_response",
+			backlog_json.len(),
+		);
+		assert!(backlog.to_string().contains("backlogDepth=256"));
+
+		let unavailable_json = r#"{"type":"query_response","id":"unavailable","ok":true}"#;
+		let unavailable = handle
+			.send_to("unavailable", unavailable_json.into())
+			.expect_err("missing connection must be rejected");
+		assert_context(
+			&unavailable,
+			DirectedDeliveryErrorKind::ConnectionUnavailable,
+			"unavailable",
+			"query_response",
+			unavailable_json.len(),
+		);
+
 		handle.stop();
 	}
 
@@ -2944,6 +3247,7 @@ mod tests {
 			assert!(
 				handle
 					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+					.is_ok()
 			);
 		}
 		let identity = ServerMessage::IdentityHeader(IdentityHeader {
@@ -2970,7 +3274,7 @@ mod tests {
 					"slow",
 					serde_json::to_string(&identity).expect("identity serialization"),
 				)
-				.is_none()
+				.is_err()
 		);
 
 		for sequence in 0..8 {
@@ -4794,7 +5098,9 @@ mod tests {
 		assert_eq!(source, a_id);
 		assert_eq!(raw, r#"{"type":"register_provider","id":"r1"}"#);
 		assert!(
-			handle.send_to(&a_id, r#"{"type":"register_provider_result","leaseId":"l1"}"#.into())
+			handle
+				.send_to(&a_id, r#"{"type":"register_provider_result","leaseId":"l1"}"#.into())
+				.is_ok()
 		);
 		let directed = tokio::time::timeout(std::time::Duration::from_secs(2), a.next())
 			.await
@@ -4828,13 +5134,13 @@ mod tests {
 
 		let frame =
 			r#"{"type":"tool_activity","toolCallId":"c1","toolName":"read","phase":"started"}"#;
-		assert!(handle.send_to(&legacy_id, frame.into()));
+		assert!(handle.send_to(&legacy_id, frame.into()).is_err());
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(300), legacy.next())
 				.await
 				.is_err()
 		);
-		assert!(handle.send_to(&capable_id, frame.into()));
+		assert!(handle.send_to(&capable_id, frame.into()).is_ok());
 		let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), capable.next())
 			.await
 			.expect("directed send timeout")

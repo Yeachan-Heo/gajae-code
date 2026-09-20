@@ -733,14 +733,9 @@ impl NotificationServer {
 	#[napi]
 	pub fn send_to(&self, connection_id: String, json: String) -> Result<()> {
 		let handle = self.handle()?;
-		if handle.send_to(&connection_id, json) {
-			Ok(())
-		} else {
-			Err(Error::from_reason(
-				"SDK connection is unavailable or directed frame is invalid, oversized, or \
-				 unauthorized, or its writer backlog is full",
-			))
-		}
+		handle
+			.send_to(&connection_id, json)
+			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
 	/// Send a directed frame and return an opaque receipt bound to the exact
@@ -750,12 +745,7 @@ impl NotificationServer {
 		self
 			.handle()?
 			.send_to_with_receipt(&connection_id, json)
-			.ok_or_else(|| {
-				Error::from_reason(
-					"SDK connection is unavailable or directed frame is invalid, oversized, or \
-					 unauthorized, or its writer backlog is full",
-				)
-			})
+			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
 	/// Queue an idle action only on writer generations that also accepted its
