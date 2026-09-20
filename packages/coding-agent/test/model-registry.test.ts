@@ -7,6 +7,7 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getBundledModels,
 	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
@@ -1150,6 +1151,66 @@ describe("ModelRegistry", () => {
 
 			settings.setDisabledProviders(["anthropic"]);
 			expect(registry.getAvailable()).not.toBe(initial);
+		});
+
+		test("uses successful LiteLLM discovery as authoritative for available models", async () => {
+			const liveIds = ["openai/gpt-5.4", "proxy-only-model"];
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			expect(bundledIds).toContain("openai/gpt-5.4");
+			expect(bundledIds).toContain("abacusai/Dracarys-72B-Instruct");
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+
+			using _hook = mockOpenAiCompatibleModels("http://localhost:4000/v1/models", liveIds);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...liveIds].sort());
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("falls back to the bundled LiteLLM catalog when discovery is unavailable", async () => {
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+			using _hook = hookFetch(input => {
+				const requestUrl = String(input);
+				if (requestUrl === "http://localhost:4000/v1/models") {
+					return new Response("proxy unavailable", { status: 503 });
+				}
+				throw new Error(`Unexpected URL: ${requestUrl}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...bundledIds].sort());
+			} finally {
+				await registry.dispose();
+			}
 		});
 
 		test("invalidates available models when a runtime API-key override is set", async () => {
