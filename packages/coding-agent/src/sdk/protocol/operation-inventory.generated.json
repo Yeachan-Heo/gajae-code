@@ -2145,6 +2145,17 @@
 		]
 	},
 	{
+		"sourceId": "slash_command:mcp",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "terminal-only exact-config MCP controls (status/list/suspend/resume/reconnect) for root interactive --mcp-config sessions; the builtin declares no handle, so the ACP dispatcher neither advertises nor routes it, and the public SDK has no MCP server control operation to map it onto",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:agents",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",
@@ -3219,6 +3230,28 @@
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
 		]
+	},
+	{
+		"sourceId": "agent_session:getExactMcpStatusSnapshot",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "backing accessor for the terminal-only /mcp status surface; the public SDK has no MCP server control operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:controlExactMcpServer",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "backing seam for the terminal-only /mcp suspend/resume/reconnect surface; the public SDK has no MCP server control operation",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
 	},
 	{
 		"sourceId": "agent_session:getSelectedMCPToolNames",

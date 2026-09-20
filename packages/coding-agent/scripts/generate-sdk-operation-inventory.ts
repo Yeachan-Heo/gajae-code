@@ -52,6 +52,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"interactive local customization dashboard mutates trusted local skill, hook, and MCP configuration (including filesystem import/removal); ACP and local headless cannot dispatch it, while SDK extension list/enable operations do not expose this dashboard authority",
 	"slash_command:credential":
 		"interactive session credential selector; not a credential-free public SDK operation or independent control seam",
+	"slash_command:mcp":
+		"terminal-only exact-config MCP controls (status/list/suspend/resume/reconnect) for root interactive --mcp-config sessions; the builtin declares no handle, so the ACP dispatcher neither advertises nor routes it, and the public SDK has no MCP server control operation to map it onto",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:tutorial": "visual/local-only onboarding selector, not a user-facing SDK control seam",
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
@@ -93,6 +95,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal restored-or-live workflow guard for session rescope, not a user-facing SDK control seam",
 	"agent_session:replaceOwnedMcpManager":
 		"internal cwd-rebinding helper for owned MCP authority after move_session, not a user-facing SDK control seam",
+	"agent_session:getExactMcpStatusSnapshot":
+		"backing accessor for the terminal-only /mcp status surface; the public SDK has no MCP server control operation",
+	"agent_session:controlExactMcpServer":
+		"backing seam for the terminal-only /mcp suspend/resume/reconnect surface; the public SDK has no MCP server control operation",
 	"agent_session:replaceNamedCustomTools":
 		"internal cwd-rebinding helper for named custom tools after move_session, not a user-facing SDK control seam",
 	"agent_session:replaceSkills":
