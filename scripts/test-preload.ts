@@ -68,27 +68,13 @@ const projectEnv = projectEnvSnapshot(process.cwd());
 const preIsolationHome = getTrustedHomeDir();
 const profileMarkerKey = "GJC_TEST_PRELOAD_PROFILE_AUTHORITY";
 const profileMarker = process.env[profileMarkerKey];
-const profileMarkerDeclared = Object.hasOwn(projectEnv.values, profileMarkerKey);
-const profileMarkerUntrusted = profileMarkerDeclared || projectEnv.dynamic.has(profileMarkerKey);
-const profileMarkerTrusted =
-	!profileMarkerUntrusted &&
-	(profileMarker === "default" || profileMarker === "custom");
-// A marker supplied by the checkout is not evidence about the ancestor
-// process: Bun overlays dotenv values before this preload runs. Treat any such
-// marker (and any malformed ambient value) as the default profile, which is the
-// fail-closed direction for shared-sink detection. A recognized marker is
-// trusted only when it was inherited from another preload; otherwise the
-// resolver's current profile is authoritative.
-let preIsolationXdgEligible: boolean;
-if (profileMarkerUntrusted) {
-	preIsolationXdgEligible = true;
-} else if (profileMarkerTrusted) {
-	preIsolationXdgEligible = profileMarker === "default";
-} else if (profileMarker !== undefined) {
-	preIsolationXdgEligible = true;
-} else {
-	preIsolationXdgEligible = getAgentProfileAuthority() === "default";
-}
+// Environment variables provide no authenticated provenance: the initial
+// operator or CI environment can forge this marker just as easily as an
+// ancestor preload can set it. Treat any marker as the default-profile lane,
+// which may isolate a custom profile unnecessarily but cannot mistake its
+// inherited XDG sink for an unrelated path and append to the operator sink.
+// Only an absent marker lets the resolver classify the current profile.
+const preIsolationXdgEligible = profileMarker !== undefined ? true : getAgentProfileAuthority() === "default";
 process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
 const preIsolationLogEnv = {
 	GJC_LOG_DIR: process.env.GJC_LOG_DIR,
