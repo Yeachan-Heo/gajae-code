@@ -3170,8 +3170,12 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
 		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+			// Provider-registration requests share this transport error. Recover only when the
+			// prompt's own dispatched acknowledgement is still pending; an acknowledged turn
+			// must continue until its terminal frame arrives.
 			const waiter = record.activePrompt;
-			if (waiter) this.#startUncertainPromptRecovery(id, record, waiter);
+			if (waiter?.dispatched && waiter.acknowledgementPending && !waiter.acknowledged)
+				this.#startUncertainPromptRecovery(id, record, waiter);
 			return;
 		}
 		if (

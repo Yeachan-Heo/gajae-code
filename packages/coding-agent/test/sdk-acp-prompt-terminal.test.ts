@@ -3041,7 +3041,8 @@ async function createRecoveryFixture(
 		if (!callback) throw new Error("Expected session reconnect failure subscription");
 		return {
 			...fixture,
-			notify: (code = "uncertain_after_send") => callback(new SdkClientError(code, "fixture observation lost")),
+			notify: (code = acknowledgement === "accepted" ? "reconnect_exhausted" : "uncertain_after_send") =>
+				callback(new SdkClientError(code, "fixture observation lost")),
 		};
 	} finally {
 		registration.mockRestore();
@@ -3245,6 +3246,37 @@ test("ACP does not retry a recovered startup-readiness failure that carries fina
 		expect(settlement.kind).toBe("rejected");
 		if (settlement.kind === "rejected") expect(settlement.error).toMatchObject({ code: "prompt_failed" });
 		expect(fixture.promptDeliveryCount()).toBe(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP ignores unrelated uncertain-after-send failures while an acknowledged prompt runs", async () => {
+	const fixture = await createRecoveryFixture("accepted");
+	try {
+		const pending = prompt(fixture, "unrelated provider uncertainty");
+		await bounded(fixture.promptDelivered, "acknowledged mutation delivery");
+		fixture.sendAssistantMessage("running output", true);
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text === "running output",
+				),
+			"acknowledged prompt activity",
+		);
+
+		fixture.notify("uncertain_after_send");
+		await Bun.sleep(50);
+		expect(fixture.recoveryInputs).toHaveLength(0);
+		expect(fixture.promptDeliveryCount()).toBe(1);
+
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "unrelated uncertainty prompt completion")).toEqual({
+			stopReason: "end_turn",
+		});
 	} finally {
 		fixture.dispose();
 	}
