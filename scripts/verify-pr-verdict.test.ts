@@ -1787,8 +1787,11 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The branch-protection rollout contract is documented in the workflow.
 	expect(workflow).toContain("Branch-protection rollout contract");
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
-	// instead of failing the job on the 404.
-	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// instead of failing the job on the 404. Every other lookup failure must fail
+	// validation, rather than preserving an old approval as if this were an issue.
+	expect(workflow).toContain('if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then');
+	expect(workflow).toContain('grep -qF "HTTP 404" "$lookup_error"');
+	expect(workflow).toContain('exit "$lookup_status"');
 	// The resolver's deliberate skip must flow to the approval job so a comment on an
 	// ordinary issue or a PR targeting another base publishes no default-branch verdict.
 	expect(workflow).toContain("skipped: ${{ steps.pr.outputs.skip }}");
@@ -1886,6 +1889,68 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure"');
 	expect(workflow).toContain('output[title]="Merge approval (re-validating)"');
+});
+
+test("issue-comment PR lookup skips only confirmed 404 and fails closed for other errors", async () => {
+	const document = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+	};
+	const resolver = document.jobs?.validate?.steps?.find(step => step.name === "Resolve PR head/base from the event or the comment's PR");
+	if (!resolver?.run) throw new Error("Missing PR resolver run block");
+	// Exercise the checked-in resolver itself with only the event expressions bound to
+	// fixture values. The fake gh command returns a real 404-shaped failure or a
+	// transient non-404 failure; no duplicate classifier is used in the test.
+	const script = resolver.run
+		.replaceAll("${{ github.event.pull_request.number }}", "")
+		.replaceAll("${{ github.event.pull_request.head.repo.full_name }}", "owner/repo")
+		.replaceAll("${{ github.event.pull_request.head.sha }}", "b".repeat(40))
+		.replaceAll("${{ github.event.pull_request.base.sha }}", "a".repeat(40))
+		.replaceAll("${{ github.event.issue.number }}", "123")
+		.replaceAll("${{ github.repository }}", "owner/repo");
+
+	async function runResolver(errorText: string, status: number): Promise<{ exitCode: number; output: string; stderr: string }> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pr-validation-lookup-"));
+		try {
+			const bin = path.join(root, "bin");
+			await fs.mkdir(bin);
+			const gh = path.join(bin, "gh");
+			await fs.writeFile(gh, `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(errorText)} >&2\nexit ${status}\n`, { mode: 0o755 });
+			const output = path.join(root, "github-output");
+			await fs.writeFile(output, "");
+			const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+			const child = Bun.spawn(["bash", "-e", "-u", "-o", "pipefail", "-c", script], {
+				cwd: root,
+				env: {
+					...inheritedEnv,
+					PATH: `${bin}:${inheritedEnv.PATH ?? ""}`,
+					RUNNER_TEMP: root,
+					GITHUB_OUTPUT: output,
+					COMMENT_BODY: "",
+					COMMENT_PREVIOUS_BODY: "",
+					COMMENT_AUTHOR: "",
+					PR_AUTHOR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			return { exitCode: await child.exited, output: await Bun.file(output).text(), stderr: `${stdout}${stderr}` };
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	const notFound = await runResolver("gh: Not Found (HTTP 404)", 1);
+	expect(notFound.exitCode).toBe(0);
+	expect(notFound.output).toContain("skip=true");
+
+	const transientFailure = await runResolver("gh: Service Unavailable (HTTP 503)", 1);
+	expect(transientFailure.exitCode).not.toBe(0);
+	expect(transientFailure.output).not.toContain("skip=true");
+	expect(transientFailure.stderr).toContain("HTTP 503");
 });
 
 test("issue_comment events without a dev PR publish no merge-approval verdict", async () => {

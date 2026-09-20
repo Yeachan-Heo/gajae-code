@@ -74,10 +74,22 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then
-            echo "::notice::issue #$number is not a pull request; the PR contract does not apply"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # A confirmed HTTP 404 means this issue is not a pull request and is the
+          # only lookup failure that may safely skip. Any other error leaves the PR
+          # identity unknown; fail the validation job so the always-running approval
+          # gate cannot preserve a prior authorization.
+          lookup_error="$RUNNER_TEMP/gjc-pr-lookup.err"
+          if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then
+            :
+          else
+            lookup_status=$?
+            if grep -qF "HTTP 404" "$lookup_error"; then
+              echo "::notice::issue #$number is not a pull request; the PR contract does not apply"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::could not resolve issue #$number as a pull request (gh api exited $lookup_status): $(tr '\n' ' ' < "$lookup_error")"
+            exit "$lookup_status"
           fi
           base_ref="$(printf '%s' "$pr_json" | jq -r '.base.ref')"
           if [[ "$base_ref" != "dev" ]]; then
