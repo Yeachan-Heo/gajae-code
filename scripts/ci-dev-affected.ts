@@ -108,7 +108,12 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
-	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": [
+		"packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		// This module owns the general-vs-profile-activation availability split, so a
+		// change here must also exercise the suite that asserts that split.
+		"packages/coding-agent/test/model-profile-activation.test.ts",
+	],
 	// Making this module asynchronous (e.g. a top-level `await import(...)`)
 	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
 	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a

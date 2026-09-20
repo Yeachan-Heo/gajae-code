@@ -153,6 +153,7 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
 		sessionId: "session-1",
+		modelRegistry: undefined as ModelRegistry | undefined,
 		setModelTemporaryCalls: [] as Array<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 		configuredModelChains: new Map<string, readonly string[]>(),
 		configuredModelChainStates: new Map<
@@ -348,6 +349,40 @@ describe("model profile activation", () => {
 			authStorage.close();
 			tempDir.removeSync();
 		}
+	});
+
+	test("materialization resolves a bare assignment against the profile-activation catalog, not the broadened general one", () => {
+		const opus5 = model("anthropic", "claude-opus-5");
+		const opus46 = model("anthropic", "claude-opus-4-6");
+		const baseRegistry = fakeRegistry();
+		const registry = {
+			...baseRegistry,
+			getAll: () => [opus5, opus46, ...baseRegistry.getAll()],
+			// Fresh live descriptor evidence omitted the bundled Opus 5, so the
+			// profile-activation catalog is narrower than the general catalog.
+			getAvailable: () => [opus5, opus46],
+			getAvailableForProfileActivation: () => [opus46],
+			lookupAliasExists: (alias: string) => alias === "opus",
+			resolveModelByLookupAlias: (alias: string, lookupOptions?: { candidates?: readonly Model[] }) =>
+				alias === "opus"
+					? (lookupOptions?.candidates ?? []).find(candidate => candidate.provider === "anthropic")
+					: undefined,
+		} as unknown as ModelRegistry;
+		const session = fakeSession();
+		session.modelRegistry = registry;
+		const settings = Settings.isolated({ "modelProfile.default": "live-narrow" });
+
+		const materialized = materializeActiveModelProfileAssignments({
+			session,
+			settings,
+			assignments: new Map([["default", "opus"]]),
+		});
+
+		expect(materialized).toBe(true);
+		// The broadened general catalog still lists Opus 5, but the assignment is
+		// persisted for later profile execution, so it must resolve against the
+		// catalog that fresh live profile evidence narrowed.
+		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
