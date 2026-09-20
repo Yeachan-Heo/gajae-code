@@ -1043,29 +1043,32 @@ describe("deep-interview staged transitions", () => {
 		}
 	});
 
-	it("self-heals a poisoned intent contract in persisted state instead of bricking", async () => {
+	it("fails closed on a poisoned intent contract without deleting persisted policy", async () => {
 		const root = await tempDir();
 		await seed(root);
-		// Simulate the pre-guard poisoned write: an unverifiable contract already
-		// persisted (as happened in the dogfood run before the sanitizer existed).
+		// Simulate a tampered locked contract already persisted.
 		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
 		const current = await readState(root);
-		(current.state as Record<string, unknown>).intent_contract = {
+		const poisonedContract = {
 			version: 1,
 			status: "confirmed",
 			items: [{ id: "artifact:roadmap", category: "artifact", statement: "roadmap" }],
 		};
+		(current.state as Record<string, unknown>).intent_contract = poisonedContract;
 		await fs.writeFile(statePath, `${JSON.stringify(current, null, 2)}\n`, "utf-8");
-		// Any later delta write must succeed, not fail with `invalid intent contract`.
-		const written = parse(
-			(await run(root, ["write", "--input", JSON.stringify({ state: { note: "after poison" } }), "--json"])).stdout,
-		);
-		expect(written.ok).toBe(true);
+		const result = await run(root, [
+			"write",
+			"--input",
+			JSON.stringify({ state: { note: "after poison" } }),
+			"--json",
+		]);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("persisted intent contract is invalid");
 		const after = await readState(root);
 		const state = after.state as Record<string, unknown>;
-		expect(state.intent_contract).toBeUndefined();
-		expect(state.note).toBe("after poison");
-		expect(typeof after.intent_contract_healed_at).toBe("string");
+		expect(state.intent_contract).toEqual(poisonedContract);
+		expect(state.note).toBeUndefined();
+		expect(after.intent_contract_healed_at).toBeUndefined();
 	});
 
 	it("accepts the documented initialize payload with null prose markers first try", async () => {
