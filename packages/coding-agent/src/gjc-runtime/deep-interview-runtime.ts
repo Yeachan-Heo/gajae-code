@@ -242,6 +242,16 @@ interface CrystalJournalRecord extends WorkflowTransactionJournal {
 	artifact_sha256?: unknown;
 }
 
+interface ExpectedFileIdentity {
+	dev: bigint;
+	ino: bigint;
+	size: number;
+	mtimeNs: bigint;
+	ctimeNs?: bigint;
+	nlink?: bigint;
+	sha256?: string;
+}
+
 function isErrnoCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
 }
@@ -258,6 +268,27 @@ function sameFileIdentity(left: Stats, right: Stats): boolean {
 	);
 }
 
+function sameExpectedFileIdentity(
+	stat: {
+		dev: bigint;
+		ino: bigint;
+		size: bigint;
+		mtimeNs: bigint;
+		ctimeNs: bigint;
+		nlink: bigint;
+	},
+	expected: ExpectedFileIdentity,
+): boolean {
+	return (
+		stat.dev === expected.dev &&
+		stat.ino === expected.ino &&
+		stat.size === BigInt(expected.size) &&
+		stat.mtimeNs === expected.mtimeNs &&
+		(expected.ctimeNs === undefined || stat.ctimeNs === expected.ctimeNs) &&
+		(expected.nlink === undefined || stat.nlink === expected.nlink)
+	);
+}
+
 function isPathWithin(root: string, target: string): boolean {
 	const relative = path.relative(path.resolve(root), path.resolve(target));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
@@ -267,7 +298,7 @@ async function readBoundedFileBytes(
 	filePath: string,
 	maxBytes: number,
 	label: string,
-	options: { allowMissing?: boolean; rejectSymlink?: boolean } = {},
+	options: { allowMissing?: boolean; rejectSymlink?: boolean; expectedIdentity?: ExpectedFileIdentity } = {},
 ): Promise<Buffer | undefined> {
 	let lexicalStat: Stats;
 	try {
@@ -280,6 +311,20 @@ async function readBoundedFileBytes(
 	if (options.rejectSymlink !== false && lexicalStat.isSymbolicLink())
 		throw new DeepInterviewCommandError(2, `${label} must not be a symlink`);
 	if (!lexicalStat.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
+	if (options.expectedIdentity) {
+		let expectedStat: Awaited<ReturnType<typeof fs.lstat>>;
+		try {
+			expectedStat = await fs.lstat(filePath, { bigint: true });
+		} catch {
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+		}
+		if (
+			!expectedStat.isFile() ||
+			expectedStat.isSymbolicLink() ||
+			!sameExpectedFileIdentity(expectedStat, options.expectedIdentity)
+		)
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+	}
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(filePath, READ_NOFOLLOW_FLAGS);
@@ -301,6 +346,20 @@ async function readBoundedFileBytes(
 		const finalPath = await fs.lstat(filePath);
 		if (!finalPath.isFile() || finalPath.isSymbolicLink() || !sameFileIdentity(final, finalPath))
 			throw new DeepInterviewCommandError(2, `${label} changed during recovery read`);
+		if (options.expectedIdentity) {
+			const finalExpected = await fs.lstat(filePath, { bigint: true });
+			if (
+				!finalExpected.isFile() ||
+				finalExpected.isSymbolicLink() ||
+				!sameExpectedFileIdentity(finalExpected, options.expectedIdentity)
+			)
+				throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+			if (
+				options.expectedIdentity.sha256 !== undefined &&
+				createHash("sha256").update(output).digest("hex") !== options.expectedIdentity.sha256
+			)
+				throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+		}
 		return output;
 	} catch (error) {
 		if (error instanceof DeepInterviewCommandError) throw error;
@@ -691,6 +750,7 @@ export async function authoritativeConversationSnapshot(
 	}
 	const canonicalCandidates = new Set<string>();
 	const managedCandidates = new Set<string>();
+	const managedIdentities = new Map<string, ExpectedFileIdentity>();
 	const lexicalCandidates = new Set<string>();
 	const managedScope = await resolveManagedSessionScope({ cwd });
 	if (managedScope.kind === "error")
@@ -702,6 +762,7 @@ export async function authoritativeConversationSnapshot(
 		for (const candidate of managedListing.owned) {
 			const resolved = path.resolve(candidate.path);
 			managedCandidates.add(resolved);
+			managedIdentities.set(resolved, candidate.identity);
 			lexicalCandidates.add(resolved);
 		}
 	}
@@ -730,6 +791,7 @@ export async function authoritativeConversationSnapshot(
 			try {
 				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
 					allowMissing: true,
+					expectedIdentity: managedIdentities.get(candidate),
 				});
 				if (!bytes) continue;
 				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
@@ -750,7 +812,9 @@ export async function authoritativeConversationSnapshot(
 	if (!sessionFile)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
-		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript", {
+			expectedIdentity: managedIdentities.get(sessionFile),
+		});
 		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
 		const text = boundedUtf8(bytes, "live session transcript");
 		const records: unknown[] = [];
