@@ -20572,12 +20572,21 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			if (autoCompactionSignal.aborted) return await emitAborted();
-			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
-			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
-				return await emitAborted();
-			}
+			// Start the workflow projection in parallel with the synchronous compaction
+			// preparation. Overflow recovery often has no eligible history after the
+			// failed assistant is removed; waiting for this filesystem projection before
+			// discovering that no-op would delay the terminal auto_compaction_end event.
+			// The promise is still awaited below so zero-progress tracking remains a
+			// completed side effect for every compaction observation.
+			const compactionStateSnapshotPromise = this.#compactionStateSnapshot({
+				trackWorkflowRecoveryProgress: true,
+			});
 
 			if (compactionSettings.strategy === "handoff" && reason !== "overflow") {
+				await compactionStateSnapshotPromise;
+				if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+					return await emitAborted();
+				}
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
 				const handoffResult = await this.handoff(handoffFocus, {
 					autoTriggered: true,
@@ -20630,6 +20639,7 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
+				await compactionStateSnapshotPromise;
 				return { kind: "skipped" };
 			}
 
@@ -20643,6 +20653,7 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
+				await compactionStateSnapshotPromise;
 				return { kind: "skipped" };
 			}
 
@@ -20691,6 +20702,7 @@ export class AgentSession {
 					skipped: true,
 					continuationSkipReason,
 				});
+				await compactionStateSnapshotPromise;
 				if (overflowNoopWouldReplay) {
 					if (continueAfterMaintenance && this.agent.hasQueuedMessages()) {
 						this.#scheduleAgentContinue({
@@ -20729,6 +20741,11 @@ export class AgentSession {
 					this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 				}
 				return { kind: "skipped" };
+			}
+
+			const compactionStateSnapshot = await compactionStateSnapshotPromise;
+			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+				return await emitAborted();
 			}
 
 			let hookCompaction: CompactionResult | undefined;
