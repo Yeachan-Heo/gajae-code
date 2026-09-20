@@ -224,16 +224,19 @@ function canonicalSerialization(fields: readonly string[]): Buffer {
 	return Buffer.concat(parts);
 }
 
-/** Compute the v1 fingerprint of an already-captured fatal diagnostic. */
-export function computeCrashFingerprint(
+function computeFingerprint(
 	input: CrashFingerprintInput,
-	options: CrashFingerprintOptions = {},
+	options: CrashFingerprintOptions,
+	includeMessage: boolean,
 ): CrashFingerprint {
 	const errorName = truncateUtf8(normalizeCrashMessage(input.name, options) || "Error", 128);
 	const messageClass = normalizeCrashMessage(input.message, options);
 	const frames = normalizeCrashFrames(input.stack, options);
+	const identity = includeMessage
+		? ["gjc-crash-fp.v1", errorName, messageClass, ...frames]
+		: ["gjc-crash-fp.v1", "handled", errorName, frames[0] ?? NO_APP_FRAME];
 	const digest = createHash("sha256")
-		.update(canonicalSerialization(["gjc-crash-fp.v1", errorName, messageClass, ...frames]))
+		.update(canonicalSerialization(identity))
 		.digest();
 	return {
 		fingerprint: digest.subarray(0, CRASH_FINGERPRINT_HEX_LENGTH / 2).toString("hex"),
@@ -242,6 +245,29 @@ export function computeCrashFingerprint(
 		messageClass,
 		frames,
 	};
+}
+
+/** Compute the v1 fingerprint of an already-captured fatal diagnostic. */
+export function computeCrashFingerprint(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, true);
+}
+
+/**
+ * Compute the stable identity used for a handled tool error.
+ *
+ * Tool failures often carry command output or other per-occurrence detail in
+ * their message. That text is useful in the record body but is not the failure
+ * identity: handled errors group by error class and the first in-app frame
+ * where the failure originated, rather than the full wrapper stack.
+ */
+export function computeHandledErrorFingerprint(
+	input: CrashFingerprintInput,
+	options: CrashFingerprintOptions = {},
+): CrashFingerprint {
+	return computeFingerprint(input, options, false);
 }
 
 /** The machine-readable identity line appended to every new crash record. */

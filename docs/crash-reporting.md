@@ -235,9 +235,11 @@ invisible to both `gjc crash list` and the relay.
 
 Handled tool errors are captured at `finishExecuteToolSpan`, which already holds the live
 `Error` with an intact stack. Capture is deliberately narrow: only `status === "error"`
-with an `Error` carrying a non-empty stack is recorded. Aborted calls, blocked calls, and
-non-`Error` throws are not, because without a stack the v1 fingerprint degrades to
-`<no-app-frame>` and every unrelated failure would collapse into one meaningless group.
+with an unexpected `Error` carrying a non-empty stack is recorded. Designed tool outcomes
+(`ToolError`/`ToolAbortError`, including permission refusals, policy denials, command
+failures, and rejected edit anchors) are marked before they cross into the generic agent
+runtime and never enter the crash recorder. Aborted calls, blocked calls, and non-`Error`
+throws are also not recorded.
 
 The same reasoning rules out hooking `logger.error`: of its call sites, nearly all pass
 `String(error)` or `error.message`, so the stack is already gone by the time the logger
@@ -246,9 +248,11 @@ sees it.
 Handled errors get their own files -- `gjc-error.log`, `gjc-error-events.jsonl`,
 `gjc-error-index.json` -- rather than sharing the fatal store. They are high-volume and
 fatal crashes are rare and precious; under a shared cap the noisy class would evict the
-signal and break `gjc crash report`. Everything else is reused verbatim: the same record
-format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint, the same
-`sanitizeExternalCrashV1` egress contract.
+signal and break `gjc crash report`. Their fingerprint uses the error class and first
+normalized in-app frame, not the full wrapper stack, so recurring failures group together
+even when call-site frames or command output change. Everything else is reused verbatim:
+the same record format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint,
+the same `sanitizeExternalCrashV1` egress contract.
 
 Two bounds keep the capture path cheap enough to run inside a live turn. A fingerprint is
 recorded at most once while it stays hot, so a tool failing in a loop writes one record rather

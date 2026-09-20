@@ -6,6 +6,7 @@ export * from "./crash-fingerprint";
 export * from "./crash-journal";
 export * from "./crash-redaction";
 export * from "./dirs";
+export * from "./error-classification";
 export * from "./env";
 export * from "./fetch-retry";
 export * from "./format";

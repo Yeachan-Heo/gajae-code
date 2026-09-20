@@ -1,3 +1,5 @@
+import { markDesignedError } from "@gajae-code/utils/error-classification";
+
 /**
  * Standardized error types for tool execution.
  *
@@ -16,6 +18,7 @@ export class ToolError extends Error {
 	) {
 		super(message);
 		this.name = "ToolError";
+		markDesignedError(this);
 	}
 
 	/** Render error for LLM consumption. Override for custom formatting. */
@@ -33,6 +36,7 @@ export class ToolAbortError extends Error {
 	constructor(message: string = ToolAbortError.MESSAGE) {
 		super(message);
 		this.name = "ToolAbortError";
+		markDesignedError(this);
 	}
 }
 

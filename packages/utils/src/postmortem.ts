@@ -12,11 +12,17 @@ import inspector from "node:inspector";
 import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
-import { type CrashFingerprint, computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
+import {
+	type CrashFingerprint,
+	computeCrashFingerprint,
+	computeHandledErrorFingerprint,
+	formatCrashRecordMarker,
+} from "./crash-fingerprint";
 import type { CrashProvenance } from "./crash-journal";
 import { appendCrashEvent, appendFatalCrashEvent, detectCrashProvenance } from "./crash-journal";
 import { redactCrashSecrets } from "./crash-redaction";
 import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
+import { isDesignedError } from "./error-classification";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -512,9 +518,15 @@ export function recordHandledError(
 	options: HandledErrorRecordOptions = {},
 ): string | undefined {
 	try {
-		if (!(error instanceof Error) || typeof error.stack !== "string" || error.stack.length === 0) return undefined;
+		if (
+			!(error instanceof Error) ||
+			isDesignedError(error) ||
+			typeof error.stack !== "string" ||
+			error.stack.length === 0
+		)
+			return undefined;
 		const fatal = describeFatal(error);
-		const fingerprint = computeCrashFingerprint(fatal).fingerprint;
+		const fingerprint = computeHandledErrorFingerprint(fatal).fingerprint;
 		if (handledErrorFingerprints.has(fingerprint)) {
 			// Still hot: dedupe, but refresh recency so an actively failing class
 			// is not the one evicted under pressure.
@@ -530,6 +542,7 @@ export function recordHandledError(
 		const written = writeCrashRecord(label, fatal, {
 			path: options.path ?? getHandledErrorLogPath(),
 			now: options.now,
+			fingerprint: computeHandledErrorFingerprint(fatal),
 		});
 		if (!written) {
 			handledErrorFingerprints.delete(fingerprint);
@@ -562,6 +575,7 @@ interface CrashRecordOptions {
 	path?: string;
 	now?: Date;
 	provenance?: CrashProvenance;
+	fingerprint?: CrashFingerprint;
 }
 
 interface WrittenCrashRecord {
@@ -595,7 +609,7 @@ function writeCrashRecord(
 		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
 		// Identity is computed from the already-captured diagnostic text only; the
 		// throwable is never read again here.
-		const fingerprint = computeCrashFingerprint(fatal);
+		const fingerprint = options.fingerprint ?? computeCrashFingerprint(fatal);
 		const recordId = randomBytes(8).toString("hex");
 		const markerLine = `${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, recordId)}\n`;
 		// The marker is the record's identity, so it is budgeted first and appended
