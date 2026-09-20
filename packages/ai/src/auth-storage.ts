@@ -481,6 +481,10 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
+	/** Atomically claim a cross-process usage poll lease for a bounded interval. */
+	tryAcquireUsageFetchLease?(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined;
+	/** Release a usage poll lease owned by this process. */
+	releaseUsageFetchLease?(key: string, owner: string): void;
 	/** Atomically allocate a durable sequence for broker restart epochs. */
 	allocateMonotonicSequence(key: string, expiresAtSec: number): number;
 	deleteCachePrefix?(prefix: string): void;
@@ -945,6 +949,9 @@ const USAGE_FAILURE_BACKOFF_MS = 10_000;
 // Bumped from 3s — Anthropic model usage retries up to 3 times with exponential backoff
 // (~3.5s total worst case); a tight per-request budget aborts retries mid-cycle.
 const DEFAULT_USAGE_REQUEST_TIMEOUT_MS = 10_000;
+/** Maximum time a process may own an aggregate usage poll before peers retry. */
+const USAGE_FETCH_LEASE_MS = DEFAULT_USAGE_REQUEST_TIMEOUT_MS + 5_000;
+const USAGE_FETCH_WAIT_POLL_MS = 25;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 10_000;
 /** Maximum provider ownership window; expiry recovers a crashed process without indefinite blocking. */
 const OAUTH_REFRESH_LEASE_MS = DEFAULT_OAUTH_REFRESH_TIMEOUT_MS + 5_000;
@@ -2009,6 +2016,7 @@ export class AuthStorage {
 		this.#usageRequestInFlight.clear();
 		this.#usageReportsInFlight.clear();
 		this.#usageCache.deletePrefix?.(`report:${storageProvider}:`);
+		this.#usageCache.deletePrefix?.("reports:");
 		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
 			const selector = selectors.get(storageProvider);
 			const selected = selector
@@ -3111,6 +3119,7 @@ export class AuthStorage {
 		this.#usageRequestInFlight.clear();
 		this.#usageReportsInFlight.clear();
 		this.#usageCache.deletePrefix?.(`report:${provider}:`);
+		this.#usageCache.deletePrefix?.("reports:");
 	}
 
 	/**
@@ -4080,6 +4089,33 @@ export class AuthStorage {
 		return promise;
 	}
 
+	#readAggregateUsageCache(cacheKey: string): UsageReport[] | undefined {
+		const cached = this.#usageCache.get<UsageReport[]>(cacheKey);
+		if (!cached || cached.expiresAt <= Date.now() || !Array.isArray(cached.value)) return undefined;
+		return cached.value;
+	}
+
+	#tryAcquireUsageFetchLease(cacheKey: string): boolean | undefined {
+		const claim = this.#store.tryAcquireUsageFetchLease;
+		if (!claim) return undefined;
+		return claim.call(this.#store, cacheKey, this.#oauthRefreshLeaseOwner, Date.now(), USAGE_FETCH_LEASE_MS);
+	}
+
+	async #waitForAggregateUsagePoll(cacheKey: string): Promise<UsageReport[] | undefined> {
+		const deadline = Date.now() + USAGE_FETCH_LEASE_MS;
+		while (Date.now() < deadline) {
+			const cached = this.#readAggregateUsageCache(cacheKey);
+			if (cached) return cached;
+			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return undefined;
+			await Bun.sleep(USAGE_FETCH_WAIT_POLL_MS);
+		}
+		return this.#readAggregateUsageCache(cacheKey);
+	}
+
+	#releaseUsageFetchLease(cacheKey: string): void {
+		this.#store.releaseUsageFetchLease?.(cacheKey, this.#oauthRefreshLeaseOwner);
+	}
+
 	#collectUsageRequests(options?: {
 		provider?: Provider;
 		baseUrlResolver?: (provider: Provider) => string | undefined;
@@ -4340,63 +4376,78 @@ export class AuthStorage {
 		const requests = this.#collectUsageRequests(options);
 		if (requests.length === 0) return [];
 
-		if (options?.logDetails !== false) {
-			this.#usageLogger?.debug("Usage fetch requested", {
-				providers: [...new Set(requests.map(request => request.provider))].sort(),
-			});
-		}
-
 		// Per-credential caching with jitter lives in #fetchUsageCached, so we
-		// don't store the aggregated result here — doing so locks the widget to
-		// a single decorrelation snapshot for 30s, defeating the jitter (some
-		// accounts can be missing from one fetch and present in the next; the
-		// aggregate cache freezes whichever set landed first).
+		// also retain the completed aggregate in the durable store. The aggregate
+		// cache is what lets another process reuse this poll instead of starting a
+		// second provider fan-out while the first process is still collecting rows.
 		const cacheKey = this.#buildUsageReportsCacheKey(requests);
+		const aggregate = this.#readAggregateUsageCache(cacheKey);
+		if (aggregate !== undefined) return raceUsageWithSignal(Promise.resolve(aggregate), options?.signal);
 
 		const inFlight = this.#usageReportsInFlight.get(cacheKey);
 		if (inFlight) return raceUsageWithSignal(inFlight, options?.signal);
 
 		const promise = (async () => {
-			if (options?.logDetails !== false) {
-				for (const request of requests) {
-					this.#usageLogger?.debug("Usage fetch queued", {
-						provider: request.provider,
-						credentialType: request.credential.type,
-						baseUrl: request.baseUrl,
-						accountId: request.credential.accountId,
-						email: request.credential.email,
+			let leaseOwned = false;
+			try {
+				const initialLeaseClaim = this.#tryAcquireUsageFetchLease(cacheKey);
+				const leaseSupported = initialLeaseClaim !== undefined;
+				if (leaseSupported) {
+					leaseOwned = initialLeaseClaim === true;
+					if (!leaseOwned) {
+						const shared = await this.#waitForAggregateUsagePoll(cacheKey);
+						if (shared !== undefined) return shared;
+						leaseOwned = this.#tryAcquireUsageFetchLease(cacheKey) === true;
+					}
+				}
+
+				if (options?.logDetails !== false) {
+					this.#usageLogger?.debug("Usage fetch requested", {
+						providers: [...new Set(requests.map(request => request.provider))].sort(),
+					});
+					for (const request of requests) {
+						this.#usageLogger?.debug("Usage fetch queued", {
+							provider: request.provider,
+							credentialType: request.credential.type,
+							baseUrl: request.baseUrl,
+							accountId: request.credential.accountId,
+							email: request.credential.email,
+						});
+					}
+				}
+
+				const results = await Promise.all(
+					requests.map(request =>
+						this.#fetchUsageCached(request, this.#usageRequestTimeoutMs, options?.logDetails !== false),
+					),
+				);
+				const reports = results.filter((report): report is UsageReport => report !== null);
+				const resolved = this.#dedupeUsageReports(reports);
+				if (resolved.length > 0) {
+					this.#usageCache.set(cacheKey, { value: resolved, expiresAt: Date.now() + USAGE_REPORT_TTL_MS });
+				}
+				if (options?.logDetails !== false) {
+					this.#usageLogger?.debug("Usage fetch resolved", {
+						reports: resolved.map(report => {
+							const accountLabel =
+								this.#getUsageReportMetadataValue(report, "email") ??
+								this.#getUsageReportMetadataValue(report, "accountId") ??
+								this.#getUsageReportMetadataValue(report, "account") ??
+								this.#getUsageReportMetadataValue(report, "user") ??
+								this.#getUsageReportMetadataValue(report, "username") ??
+								this.#getUsageReportScopeAccountId(report);
+							return {
+								provider: report.provider,
+								limits: report.limits.length,
+								account: accountLabel,
+							};
+						}),
 					});
 				}
+				return resolved;
+			} finally {
+				if (leaseOwned) this.#releaseUsageFetchLease(cacheKey);
 			}
-
-			const results = await Promise.all(
-				requests.map(request =>
-					this.#fetchUsageCached(request, this.#usageRequestTimeoutMs, options?.logDetails !== false),
-				),
-			);
-			const reports = results.filter((report): report is UsageReport => report !== null);
-			const deduped = this.#dedupeUsageReports(reports);
-			// no outer cache write — see comment above.
-			const resolved = deduped;
-			if (options?.logDetails !== false) {
-				this.#usageLogger?.debug("Usage fetch resolved", {
-					reports: resolved.map(report => {
-						const accountLabel =
-							this.#getUsageReportMetadataValue(report, "email") ??
-							this.#getUsageReportMetadataValue(report, "accountId") ??
-							this.#getUsageReportMetadataValue(report, "account") ??
-							this.#getUsageReportMetadataValue(report, "user") ??
-							this.#getUsageReportMetadataValue(report, "username") ??
-							this.#getUsageReportScopeAccountId(report);
-						return {
-							provider: report.provider,
-							limits: report.limits.length,
-							account: accountLabel,
-						};
-					}),
-				});
-			}
-			return resolved;
 		})().finally(() => {
 			if (this.#usageReportsInFlight.get(cacheKey) === promise) {
 				this.#usageReportsInFlight.delete(cacheKey);
@@ -6669,6 +6720,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#getCacheStmt: Statement;
 	#getCacheIncludingExpiredStmt: Statement;
 	#upsertCacheStmt: Statement;
+	#claimUsageFetchLeaseStmt: Statement;
+	#releaseUsageFetchLeaseStmt: Statement;
 	#deleteCachePrefixStmt: Statement;
 	#deleteExpiredCacheStmt: Statement;
 	#closed = false;
@@ -6718,6 +6771,10 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#upsertCacheStmt = this.#db.prepare(
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
+		this.#claimUsageFetchLeaseStmt = this.#db.prepare(
+			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at WHERE cache.expires_at <= ?",
+		);
+		this.#releaseUsageFetchLeaseStmt = this.#db.prepare("DELETE FROM cache WHERE key = ? AND value = ?");
 		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
 		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
 	}
@@ -7428,6 +7485,27 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, value, expiresAtSec);
 		} catch {
 			// Ignore cache set failures
+		}
+	}
+
+	tryAcquireUsageFetchLease(key: string, owner: string, nowMs: number, leaseMs: number): boolean | undefined {
+		try {
+			const nowSec = Math.floor(nowMs / 1000);
+			const expiresAtSec = Math.ceil((nowMs + leaseMs) / 1000);
+			const result = this.#claimUsageFetchLeaseStmt.run(`usage_fetch_lease:${key}`, owner, expiresAtSec, nowSec) as {
+				changes: number;
+			};
+			return result.changes === 1;
+		} catch {
+			return undefined;
+		}
+	}
+
+	releaseUsageFetchLease(key: string, owner: string): void {
+		try {
+			this.#releaseUsageFetchLeaseStmt.run(`usage_fetch_lease:${key}`, owner);
+		} catch {
+			// Ignore cache lease cleanup failures; the bounded expiry recovers it.
 		}
 	}
 

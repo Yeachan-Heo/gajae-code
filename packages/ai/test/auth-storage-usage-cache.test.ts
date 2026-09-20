@@ -11,10 +11,13 @@
  *      the next poll retries on the next request.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
 import type { UsageProvider, UsageReport } from "../src/usage";
@@ -387,6 +390,57 @@ describe("AuthStorage usage cache: jitter", () => {
 		} finally {
 			storage.close();
 			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe("AuthStorage usage cache: cross-process coordination", () => {
+	it("coalesces concurrent aggregate polls across SQLite-backed processes", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-usage-coordination-"));
+		const dbPath = path.join(root, "agent.db");
+		const firstStore = await SqliteAuthCredentialStore.open(dbPath);
+		firstStore.saveOAuth("anthropic", {
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 3_600_000,
+			accountId: "account-a",
+			email: "a@example.com",
+		});
+		const secondStore = await SqliteAuthCredentialStore.open(dbPath);
+		const first = new AuthStorage(firstStore, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		const second = new AuthStorage(secondStore, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		await Promise.all([first.reload(), second.reload()]);
+
+		const gate = Promise.withResolvers<UsageReport | null>();
+		let calls = 0;
+		const report = makeReport("a@example.com");
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
+			calls += 1;
+			return gate.promise;
+		});
+		let firstPoll: Promise<UsageReport[] | null> | undefined;
+		let secondPoll: Promise<UsageReport[] | null> | undefined;
+		try {
+			firstPoll = first.fetchUsageReports();
+			await waitFor(() => calls === 1);
+			secondPoll = second.fetchUsageReports();
+			await Bun.sleep(50);
+			expect(calls).toBe(1);
+
+			gate.resolve(report);
+			expect((await firstPoll)?.map(item => item.provider)).toEqual(["anthropic"]);
+			expect((await secondPoll)?.map(item => item.provider)).toEqual(["anthropic"]);
+		} finally {
+			gate.resolve(report);
+			await Promise.allSettled([firstPoll ?? Promise.resolve(), secondPoll ?? Promise.resolve()]);
+			fetchSpy.mockRestore();
+			first.close();
+			second.close();
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -13,7 +13,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
 import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
@@ -354,6 +354,36 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	it("does not warn again for an MCP startup timeout already returned as an error", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					stuck: { type: "stdio", command: process.execPath },
+				},
+			}),
+		);
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [],
+			errors: new Map([["stuck", "MCP server connection timed out during startup: stuck"]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		});
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(warnSpy.mock.calls.some(([message]) => String(message).includes("GJC plugin MCP connect failed"))).toBe(
+				false,
+			);
+		} finally {
+			await session.dispose();
+			warnSpy.mockRestore();
 		}
 	}, 30_000);
 

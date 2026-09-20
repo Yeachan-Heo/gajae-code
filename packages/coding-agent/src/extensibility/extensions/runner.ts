@@ -328,6 +328,7 @@ export class ExtensionRunner {
 	#reloadHandler: () => Promise<void> = async () => {};
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
+	#commandAliases = new Map<string, RegisteredCommand>();
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -701,16 +702,20 @@ export class ExtensionRunner {
 
 	getRegisteredCommands(reserved?: Set<string>): RegisteredCommand[] {
 		this.#commandDiagnostics = [];
+		this.#commandAliases.clear();
 
 		const commands = new Map<string, RegisteredCommand>();
 		for (const ext of this.extensions) {
 			for (const command of ext.commands.values()) {
 				if (reserved?.has(command.name)) {
-					const message = `Extension command '${command.name}' from ${ext.path} conflicts with built-in commands. Skipping.`;
-					this.#commandDiagnostics.push({ type: "warning", message, path: ext.path });
-					if (!this.hasUI()) {
-						logger.warn(message);
-					}
+					let alias = `extension:${command.name}`;
+					while (reserved.has(alias) || commands.has(alias) || this.#commandAliases.has(alias))
+						alias = `extension:${alias}`;
+					const namespaced = { ...command, name: alias };
+					this.#commandAliases.set(alias, namespaced);
+					commands.set(alias, namespaced);
+					const message = `Extension command '${command.name}' from ${ext.path} was renamed to '${alias}' to avoid a built-in command collision.`;
+					this.#commandDiagnostics.push({ type: "info", message, path: ext.path });
 					continue;
 				}
 
@@ -725,6 +730,8 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): RegisteredCommand | undefined {
+		const aliased = this.#commandAliases.get(name);
+		if (aliased) return aliased;
 		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
 			const command = this.extensions[index]?.commands.get(name);
 			if (command) {

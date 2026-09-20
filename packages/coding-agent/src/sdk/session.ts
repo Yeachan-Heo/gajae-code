@@ -145,7 +145,7 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import { isMCPStartupTimeoutError, loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -3179,10 +3179,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// consumed (publication happens before the starter can run), which is
 				// acceptable only because deferral never carries plugin-bundle servers.
 				gjcProducersComplete = false;
-				logger.warn("GJC plugin MCP connect failed", {
-					path: `mcp:${server}`,
-					error: safeErrorForLog(err),
-				});
+				if (!isMCPStartupTimeoutError(err)) {
+					logger.warn("GJC plugin MCP connect failed", {
+						path: `mcp:${server}`,
+						error: safeErrorForLog(err),
+					});
+				}
 			}
 			const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
 			// Retain while any conventional server is still live: "connecting"
