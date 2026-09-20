@@ -152,6 +152,9 @@ describe("SDK session CLI", () => {
 	let trackCheckpointWatermarks = false;
 	let checkpointWatermarks = new Map<string, { revision: number; generation: number; seq: number; idle: boolean }>();
 	let failNextFreshCheckpoint: "error" | "transport" | undefined;
+	let failFinalCheckpoint: "error" | "transport" | undefined;
+	let finalCheckpointLiveEvents: Record<string, unknown>[] = [];
+	let cursorlessCheckpointRequests = 0;
 	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
 	// test can prove a raw coordinate claim really was transmitted.
 	let lastReplayPayload = "";
@@ -181,6 +184,9 @@ describe("SDK session CLI", () => {
 		trackCheckpointWatermarks = false;
 		checkpointWatermarks = new Map();
 		failNextFreshCheckpoint = undefined;
+		failFinalCheckpoint = undefined;
+		finalCheckpointLiveEvents = [];
+		cursorlessCheckpointRequests = 0;
 		lastReplayPayload = "";
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		await initializeTestRepository(root);
@@ -376,6 +382,8 @@ describe("SDK session CLI", () => {
 						}
 						if (frame.query === "session.checkpoint") {
 							const inputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
+							if (inputToken === undefined) cursorlessCheckpointRequests++;
+							const isFinalCheckpoint = inputToken === undefined && cursorlessCheckpointRequests >= 2;
 							// Only the FIRST checkpoint of a resumed tail carries the caller's token;
 							// the CLI mints a fresh (cursorless) checkpoint afterwards for the
 							// caller to resume from, exactly like the real host allows.
@@ -409,6 +417,20 @@ describe("SDK session CLI", () => {
 								);
 								return;
 							}
+							if (isFinalCheckpoint && failFinalCheckpoint !== undefined) {
+								const failure = failFinalCheckpoint;
+								failFinalCheckpoint = undefined;
+								if (failure === "transport") return;
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: false,
+										error: { code: "unavailable", message: "final checkpoint unavailable" },
+									}),
+								);
+								return;
+							}
 							for (const event of preCheckpointLiveEvents) {
 								socket.send(JSON.stringify(event));
 								wireLog.push(`pre_checkpoint_live_sent:${event.kind}:${event.seq}`);
@@ -424,10 +446,23 @@ describe("SDK session CLI", () => {
 								trackCheckpointWatermarks && inputToken !== undefined
 									? (checkpointWatermarks.get(String(inputToken)) ?? checkpointRecord)
 									: checkpointRecord;
-							if (trackCheckpointWatermarks && transcriptRows.length > 0) {
+							const shouldReturnCursor =
+								transcriptRows.length > 0 || inputToken !== undefined || isFinalCheckpoint;
+							if (trackCheckpointWatermarks && shouldReturnCursor) {
 								checkpointWatermarks.set(minted, checkpointForResponse);
 							}
-							if (transcriptRows.length > 0 && inputToken === undefined) freshTokens.add(minted);
+							if (shouldReturnCursor && inputToken === undefined) freshTokens.add(minted);
+							// A host can capture the checkpoint watermark and then publish a frame
+							// before the checkpoint response reaches the client. This is the race
+							// the final-cursor test models; the client must leave the frame for the
+							// next poll rather than include it behind the returned cursor.
+							if (isFinalCheckpoint) {
+								for (const event of finalCheckpointLiveEvents) {
+									socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
+									wireLog.push(`final_checkpoint_live_sent:${event.kind}:${event.seq}`);
+								}
+								finalCheckpointLiveEvents = [];
+							}
 							socket.send(
 								JSON.stringify({
 									type: "query_response",
@@ -435,7 +470,7 @@ describe("SDK session CLI", () => {
 									ok: true,
 									result: {
 										checkpoint: checkpointForResponse,
-										...(transcriptRows.length > 0 ? { checkpointToken: minted } : {}),
+										...(shouldReturnCursor ? { checkpointToken: minted } : {}),
 										...(signedExchange === undefined ? {} : { cursor: "legacy-must-not-win" }),
 									},
 								}),
@@ -950,6 +985,111 @@ describe("SDK session CLI", () => {
 			...firstResult.items.filter(item => item.kind === "turn_end").map(item => item.seq),
 			...secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq),
 		]).toEqual([1, 2]);
+	}, 60_000);
+
+	it("resumes event replay from the fresh paging checkpoint", async () => {
+		trackCheckpointWatermarks = true;
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+		replayEvents = [{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } }];
+
+		const first = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(first.exitCode, first.stderr).toBe(0);
+		const firstResult = JSON.parse(first.stdout).result as { cursor?: string };
+		expect(firstResult.cursor).toBeString();
+
+		// The exchanged cursor is pinned at seq 1, while the fresh paging
+		// checkpoint observes seq 2. Event seq 2 is already covered by the fresh
+		// snapshot and must not be replayed; only seq 3 is new to this poll.
+		checkpointRecord = { revision: 1, generation: 1, seq: 2, idle: true };
+		replayEvents = [
+			{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } },
+			{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } },
+			{ type: "event", generation: 1, seq: 3, kind: "turn_end", payload: { type: "turn_end" } },
+		];
+		const second = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			firstResult.cursor!,
+			"--after-transcript-id",
+			"boundary",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(second.exitCode, second.stderr).toBe(0);
+		const secondResult = JSON.parse(second.stdout).result as { items: Array<{ kind: string; seq?: number }> };
+		expect(secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([3]);
+	}, 60_000);
+
+	for (const failure of ["error", "transport"] as const) {
+		it(`does not return resumable success when final checkpoint mint fails by ${failure}`, async () => {
+			checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+			transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+			failFinalCheckpoint = failure;
+			const tail = await runCli(root, agentDir, [
+				"tail",
+				"live",
+				"--until-idle",
+				"--timeout-ms",
+				failure === "transport" ? "100" : "1000",
+			]);
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+			const output = JSON.parse(tail.stdout) as { ok?: boolean; result?: unknown; error?: { code?: string } };
+			expect(output.ok).toBe(false);
+			expect(output.result).toBeUndefined();
+			expect(output.error?.code).toBeString();
+		});
+	}
+
+	it("freezes live frame collection before minting the returned cursor", async () => {
+		trackCheckpointWatermarks = true;
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+		finalCheckpointLiveEvents = [
+			{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } },
+		];
+
+		const first = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(first.exitCode, first.stderr).toBe(0);
+		const firstResult = JSON.parse(first.stdout).result as {
+			cursor?: string;
+			items: Array<{ kind: string; seq?: number }>;
+		};
+		expect(firstResult.cursor).toBeString();
+		expect(firstResult.items.filter(item => item.kind === "turn_end")).toEqual([]);
+
+		// The frame published after the captured watermark belongs to the next
+		// poll, where it must be observed exactly once.
+		replayEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } }];
+		const second = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			firstResult.cursor!,
+			"--after-transcript-id",
+			"boundary",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(second.exitCode, second.stderr).toBe(0);
+		const secondResult = JSON.parse(second.stdout).result as { items: Array<{ kind: string; seq?: number }> };
+		expect(secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([2]);
+	}, 60_000);
+
+	it("rejects --after-transcript-id without --cursor for a live tail", async () => {
+		const tail = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--after-transcript-id",
+			"boundary",
+			"--timeout-ms",
+			"100",
+		]);
+		expect(tail.exitCode, tail.stderr).toBe(2);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "usage" } });
 	}, 60_000);
 
 	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {
@@ -1732,6 +1872,26 @@ describe("SDK session CLI", () => {
 				readRange: async (start, end) => corrupt.slice(start, end),
 			}),
 		).rejects.toThrow("Retained transcript history contains unparseable entries");
+	});
+
+	it("accepts an offline boundary with exactly 200 newer retained rows", async () => {
+		const encoder = new TextEncoder();
+		const retained = encoder.encode(
+			`${[
+				JSON.stringify({ id: "boundary" }),
+				...Array.from({ length: 200 }, (_, index) => JSON.stringify({ id: `row-${index + 1}` })),
+			].join("\n")}\n`,
+		);
+		const entries = await scanRetainedTranscriptTail(
+			{
+				size: retained.byteLength,
+				readRange: async (start, end) => retained.slice(start, end),
+			},
+			{ boundaryId: "boundary" },
+		);
+		expect(entries.map(entry => (entry as { id?: string }).id)).toEqual(
+			Array.from({ length: 200 }, (_, index) => `row-${index + 1}`),
+		);
 	});
 
 	it("replays an unchanged Broker-identified offline transcript", async () => {

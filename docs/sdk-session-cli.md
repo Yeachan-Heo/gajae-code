@@ -163,6 +163,8 @@ transcript entries.
   pinned to the exact prior revision, so the claim is safe to pass to a new CLI
   invocation even though direct cross-connection continuation-cursor consumption
   remains rejected.
+  For a live session, `--after-transcript-id` without `--cursor` is a usage
+  error; stopped-session replay may use the boundary by itself.
 - `--timeout-ms` bounds live follow; a session whose lifecycle already ended
   (terminal or `terminalUncertain`) replays retained history and exits instead
   of hanging. A live wait that reaches this bound returns the observations
