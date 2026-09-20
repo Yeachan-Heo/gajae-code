@@ -1570,26 +1570,8 @@ impl PortableRecoveryFsRoot {
 pub fn open_portable_recovery_fs_root(root_path: String) -> napi::Result<PortableRecoveryFsRoot> {
 	#[cfg(unix)]
 	{
-		use std::{
-			ffi::CString,
-			os::{fd::FromRawFd, unix::ffi::OsStrExt},
-			path::Path,
-		};
-		let root_c = CString::new(Path::new(&root_path).as_os_str().as_bytes())
-			.map_err(|_| napi::Error::from_reason("invalid_path"))?;
-		// SAFETY: root_c is live and NUL-terminated; successful ownership transfers to
-		// File.
-		let fd = unsafe {
-			libc::open(
-				root_c.as_ptr(),
-				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-			)
-		};
-		if fd < 0 {
-			return Err(napi::Error::from_reason("untrusted_root"));
-		}
-		// SAFETY: fd is newly owned after successful open.
-		let root = unsafe { std::fs::File::from_raw_fd(fd) };
+		let root = open_portable_unix_root(std::path::Path::new(&root_path))
+			.map_err(napi::Error::from_reason)?;
 		Ok(PortableRecoveryFsRoot { root: std::sync::Mutex::new(Some(root)) })
 	}
 	#[cfg(windows)]
@@ -3010,6 +2992,67 @@ fn open_root(path: &Path) -> Result<File, String> {
 	// SAFETY: `fd` is an owned open descriptor whose ownership is transferred
 	// exactly once to `File`.
 	Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_portable_unix_root(path: &std::path::Path) -> Result<std::fs::File, String> {
+	use std::{
+		ffi::CString,
+		os::{fd::FromRawFd, unix::ffi::OsStrExt},
+		path::Component,
+	};
+	if !path.is_absolute() {
+		return Err("invalid_path".to_owned());
+	}
+	// Walk from the real filesystem root so every ancestor is checked and opened without
+	// following symlinks. O_NOFOLLOW on the final pathname alone would still permit a
+	// symlinked state or session directory to redirect this authority.
+	let mut fd = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+	if fd < 0 {
+		return Err("io_error".to_owned());
+	}
+	for component in path.components() {
+		let Component::Normal(name) = component else {
+			if matches!(component, Component::RootDir) {
+				continue;
+			}
+			unsafe { libc::close(fd) };
+			return Err("invalid_path".to_owned());
+		};
+		let name = CString::new(name.as_bytes()).map_err(|_| {
+			unsafe { libc::close(fd) };
+			"invalid_path".to_owned()
+		})?;
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstatat(fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) } != 0
+			|| named.st_mode & libc::S_IFMT != libc::S_IFDIR
+		{
+			unsafe { libc::close(fd) };
+			return Err("untrusted_root".to_owned());
+		}
+		let next = unsafe {
+			libc::openat(
+				fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		unsafe { libc::close(fd) };
+		if next < 0 {
+			return Err("untrusted_root".to_owned());
+		}
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(next, &mut opened) } != 0
+			|| opened.st_mode & libc::S_IFMT != libc::S_IFDIR
+			|| opened.st_dev != named.st_dev
+			|| opened.st_ino != named.st_ino
+		{
+			unsafe { libc::close(next) };
+			return Err("untrusted_root".to_owned());
+		}
+		fd = next;
+	}
+	Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "linux")]

@@ -21,6 +21,17 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("portable retained recovery filesystem root", () => {
+	it("rejects a root whose ancestor is a symlink", async () => {
+		const container = await temporaryDirectory();
+		const target = path.join(container, "target");
+		const alias = path.join(container, "alias");
+		const lifecycle = path.join(target, "owner-lifecycle");
+		await fs.mkdir(lifecycle, { recursive: true });
+		await fs.symlink("target", alias);
+
+		expect(() => openPortableRecoveryFsRoot(path.join(alias, "owner-lifecycle"))).toThrow();
+	});
+
 	it("keeps reads bound to the opened directory across a pathname ABA swap", async () => {
 		const root = await temporaryDirectory();
 		const retained = `${root}-retained`;
