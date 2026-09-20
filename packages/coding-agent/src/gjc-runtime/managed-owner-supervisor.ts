@@ -288,7 +288,10 @@ export async function assertManagedOwnerGenerationPublished(
 	generation: string,
 	options: { timeoutMs?: number; pollMs?: number } = {},
 ): Promise<void> {
-	const timeoutMs = options.timeoutMs ?? 5_000;
+	// Generation publication waits on the same SQLite lock as the synchronous publisher, whose
+	// bounded wait is seven seconds. Keep the supervisor alive past that window so a lock released
+	// at the deadline cannot publish a generation after its exact supervisor has already exited.
+	const timeoutMs = options.timeoutMs ?? 8_000;
 	const pollMs = options.pollMs ?? 20;
 	const deadline = performance.now() + timeoutMs;
 	while (true) {

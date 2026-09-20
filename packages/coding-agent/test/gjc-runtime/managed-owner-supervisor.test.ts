@@ -180,6 +180,29 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("waits through the complete generation publication lock window", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-lock-window-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const lifecycle = path.join(stateDir, sessionId, "owner-lifecycle");
+		try {
+			const handoff = assertManagedOwnerGenerationPublished(stateDir, sessionId, generation);
+			await Bun.sleep(5_500);
+			await fs.mkdir(lifecycle, { recursive: true });
+			await Bun.write(
+				path.join(lifecycle, "generation.json"),
+				JSON.stringify({
+					schema_version: 1,
+					generation,
+					session_id: sessionId,
+					published_at: "2026-01-01T00:00:00.000Z",
+				}),
+			);
+			await expect(handoff).resolves.toBeUndefined();
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	}, 10_000);
 	it("rejects a nested supervised entry that does not match parent-published authority", async () => {
 		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-authority-"));
