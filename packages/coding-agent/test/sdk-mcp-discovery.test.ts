@@ -65,14 +65,22 @@ function createMcpLoadResult(
  * the real contract: the snapshot becomes readable before the call resolves.
  */
 
-function mockDeferredExactMcpLoad(discovery: { promise: Promise<MCPLoadResult> }) {
-	let published: CustomTool[] = [];
-	vi.spyOn(MCPManager.prototype, "getTools").mockImplementation(() => published);
-	return vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => {
+function mockDeferredExactMcpLoad(discovery: { promise: Promise<MCPLoadResult> }, options?: { once?: boolean }) {
+	let published: CustomTool[] | null = null;
+	// Only the deferred flight's own publication is simulated. Every other
+	// manager — and this one before the flight resolves — keeps the real
+	// snapshot, so unrelated tests in this file are unaffected.
+	const realGetTools = MCPManager.prototype.getTools;
+	vi.spyOn(MCPManager.prototype, "getTools").mockImplementation(function (this: MCPManager) {
+		return published ?? realGetTools.call(this);
+	});
+	const publish = async () => {
 		const result = await discovery.promise;
 		published = result.tools as CustomTool[];
 		return result;
-	});
+	};
+	const spy = vi.spyOn(MCPManager.prototype, "discoverAndConnect");
+	return options?.once === false ? spy.mockImplementation(publish) : spy.mockImplementationOnce(publish);
 }
 function createReasoningModel(): Model<"openai-responses"> {
 	return {
@@ -218,7 +226,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		authStorage.setRuntimeApiKey("openai", "test-key");
 		const configPath = path.join(tempDir, "deferred-explicit-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		const discoverAndConnect = mockDeferredExactMcpLoad(discovery);
+		const discoverAndConnect = mockDeferredExactMcpLoad(discovery, { once: false });
 
 		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
@@ -258,7 +266,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			authStorage.setRuntimeApiKey("openai", "test-key");
 			const configPath = path.join(tempDir, "deferred-transition-mcp.json");
 			const discovery = Promise.withResolvers<MCPLoadResult>();
-			mockDeferredExactMcpLoad(discovery);
+			mockDeferredExactMcpLoad(discovery, { once: false });
 			const execute = vi.fn(async () => ({
 				content: [{ type: "text" as const, text: "transition tool executed" }],
 			}));
@@ -301,7 +309,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("reports deferred MCP startup failures generically", async () => {
 		const configPath = path.join(tempDir, "private-deferred-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		mockDeferredExactMcpLoad(discovery);
+		mockDeferredExactMcpLoad(discovery, { once: false });
 		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
 
 		const { session, startDeferredMcpConfig } = await createAgentSession({
@@ -321,7 +329,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	});
 	it("blocks idle yield delivery until deferred MCP startup completes", async () => {
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		mockDeferredExactMcpLoad(discovery);
+		mockDeferredExactMcpLoad(discovery, { once: false });
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
 			mcpConfigPath: path.join(tempDir, "deferred-idle.json"),
