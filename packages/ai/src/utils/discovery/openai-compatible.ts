@@ -317,8 +317,6 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	return Array.from(deduped.values()).sort((left, right) => left.id.localeCompare(right.id));
 }
 
-export const MAX_MODELS_RESPONSE_BYTES_PUBLIC = MAX_MODELS_RESPONSE_BYTES;
-
 /** Bounded JSON body reader for `/models` responses (shared by runtime and setup probe). */
 export async function readBoundedModelsJson(response: Response): Promise<unknown> {
 	return JSON.parse(await readModelsResponse(response));

@@ -3542,8 +3542,9 @@ export class ModelRegistry {
 					// in failure text. Scrub resolved credential material
 					// before the error reaches discovery state, cache
 					// provenance, or the logger below.
-					discoveryFailureEvidence = error;
-					throw scrubDiscoveryError(error, [apiKey, preflightApiKey]);
+					const scrubbedError = scrubDiscoveryError(error, [apiKey, preflightApiKey]);
+					discoveryFailureEvidence = scrubbedError;
+					throw scrubbedError;
 				}
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),

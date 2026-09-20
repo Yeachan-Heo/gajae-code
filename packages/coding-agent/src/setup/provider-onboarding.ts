@@ -752,7 +752,7 @@ export async function reloadAndRefreshDiscoveryCatalog(
 		// state, not rejections.
 	}
 	const state = registry.getProviderDiscoveryState(providerId);
-	if (state && (state.status === "ok" || state.status === "cached")) return null;
+	if (state?.status === "ok") return null;
 	const detail = state?.error ? ` (${state.error})` : "";
 	return (
 		`Live catalog unavailable${detail}; the provider is saved and will populate on the next online refresh. ` +

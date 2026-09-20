@@ -84,6 +84,19 @@ describe("provider onboarding recovery guidance", () => {
 			["gateway", "online", "credential-session"],
 		]);
 	});
+
+	it("warns when targeted refresh falls back to cached models", async () => {
+		const registry: DiscoveryCatalogRefresher = {
+			refresh: async () => undefined,
+			refreshProvider: async () => undefined,
+			getProviderDiscoveryState: (): { status: string; error?: string } => ({
+				status: "cached",
+				error: "HTTP 503",
+			}),
+		};
+
+		expect(await reloadAndRefreshDiscoveryCatalog(registry, "gateway")).toContain("Live catalog unavailable");
+	});
 });
 
 describe("provider onboarding setup core", () => {
