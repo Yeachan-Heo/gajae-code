@@ -83,6 +83,8 @@ describe("issue #986 compaction auth fallback", () => {
 
 	it("falls back to an authenticated role model when the current provider returns auth_unavailable", async () => {
 		const { currentModel, fallbackModel } = await createSession({ fallbackModelRole: "default" });
+		const events: Array<{ type: string; source?: string; message?: string }> = [];
+		session.subscribe(event => events.push(event as (typeof events)[number]));
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new Error(
@@ -114,10 +116,21 @@ describe("issue #986 compaction auth fallback", () => {
 			`${currentModel.provider}/${currentModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
+		const substitution = events.find(
+			event => event.type === "notice" && event.source === "compaction-recovery" && event.message,
+		);
+		expect(substitution?.message).toContain(
+			`Compaction recovery switched model from ${currentModel.provider}/${currentModel.id} to ${fallbackModel.provider}/${fallbackModel.id}`,
+		);
+		expect(substitution?.message).toContain("modelRoles.default");
+		expect(substitution?.message).toContain("candidate credentials unavailable");
 	});
 
 	it("fails fast with a clear provider-specific error when no authenticated fallback exists", async () => {
-		const { currentModel } = await createSession({ configureFallbackAuth: false });
+		const { currentModel, fallbackModel } = await createSession({
+			fallbackModelRole: "default",
+			configureFallbackAuth: true,
+		});
 		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, model) => {
 			if (model.provider === currentModel.provider && model.id === currentModel.id) {
 				throw new Error(
@@ -134,8 +147,43 @@ describe("issue #986 compaction auth fallback", () => {
 		const error = await session.compact().catch(err => err);
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toContain(
-			`Compaction requires usable credentials for ${currentModel.provider}/${currentModel.id}`,
+			`Compaction requires usable credentials for ${fallbackModel.provider}/${fallbackModel.id}`,
 		);
 		expect((error as Error).message).not.toMatch(/auth_unavailable/i);
+		expect((error as Error).message).not.toContain("Credential diagnostic unavailable.");
+	});
+
+	it("surfaces an SSE stall without dispatching an implicit model fallback", async () => {
+		const { currentModel } = await createSession();
+		const stall = "Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error(stall));
+
+		const error = await session.compact().catch(err => err);
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		const [, dispatchedModel] = compactSpy.mock.calls[0]!;
+		expect(`${dispatchedModel.provider}/${dispatchedModel.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("OpenAI Codex SSE stream stalled while waiting for the next event");
+		expect((error as Error).message).not.toContain("Credential diagnostic unavailable.");
+	});
+
+	it("reports an auto-compaction SSE stall without retrying an implicit model", async () => {
+		const { currentModel } = await createSession();
+		session.settings.set("retry.maxRetries", 0);
+		const endEvents: Array<{ errorMessage?: string }> = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") endEvents.push(event);
+		});
+		const stall = "Turn prefix summarization failed: OpenAI Codex SSE stream stalled while waiting for the next event";
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockRejectedValue(new Error(stall));
+
+		await session.runIdleCompaction();
+
+		expect(compactSpy).toHaveBeenCalledTimes(1);
+		const [, dispatchedModel] = compactSpy.mock.calls[0]!;
+		expect(`${dispatchedModel.provider}/${dispatchedModel.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
+		expect(endEvents).toHaveLength(1);
+		expect(endEvents[0]?.errorMessage).toContain("OpenAI Codex SSE stream stalled while waiting for the next event");
 	});
 });

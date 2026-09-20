@@ -1,8 +1,8 @@
 /**
- * Auto-compaction walks a candidate chain: the session model, each preset role,
- * then the same-provider largest-context fallback. When every candidate fails,
- * the error the user sees must lead with the *first* failure and list the rest,
- * not name whichever fallback the chain happened to end on.
+ * Auto-compaction walks a candidate chain: the session model, then each
+ * explicitly configured role. When every candidate fails, the error the user
+ * sees must lead with the *first* failure and list the rest, not name whichever
+ * candidate the chain happened to end on.
  */
 import { describe, expect, it } from "bun:test";
 import { describeCompactionCandidateFailures } from "@gajae-code/coding-agent/session/fallback-chain-controller";
@@ -10,8 +10,8 @@ import { describeCompactionCandidateFailures } from "@gajae-code/coding-agent/se
 describe("describeCompactionCandidateFailures", () => {
 	const failures = [
 		{ model: "openai-codex/gpt-6-astra", message: "Model openai-codex/gpt-6-astra does not support thinking" },
-		{ model: "openai-codex/gpt-5.6-luna", message: "Model openai-codex/gpt-5.6-luna does not support thinking" },
-		{ model: "openai-codex/gpt-5.4", message: "Model openai-codex/gpt-5.4 does not support thinking" },
+		{ model: "anthropic/claude-sonnet-4-5", message: "Model anthropic/claude-sonnet-4-5 does not support thinking" },
+		{ model: "openai/gpt-5", message: "Model openai/gpt-5 does not support thinking" },
 	];
 
 	it("leads with the first candidate's failure, not the last fallback's", () => {

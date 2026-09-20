@@ -105,9 +105,10 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		await session.runIdleCompaction();
 		await session.runIdleCompaction();
 
-		// One maintenance attempt may try multiple model candidates. The retry must
-		// not start a second attempt with the same unchanged request.
-		expect(compactSpy).toHaveBeenCalledTimes(2);
+		// Recovery only tries the active model unless an explicit role fallback is
+		// configured. The retry must not start a second attempt with the same
+		// unchanged request.
+		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(events).toHaveLength(2);
 		expect(events[0]).toMatchObject({
 			errorMessage: expect.stringContaining("prompt is too long"),
@@ -134,7 +135,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 
 		await session.runIdleCompaction();
 
-		expect(compactSpy).toHaveBeenCalledTimes(4);
+		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 	it("does not retry a Kimi Code compaction first-event timeout on the same candidate", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
@@ -204,7 +205,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 
 			const matchingCalls = compactSpy.mock.calls.filter(([, candidate]) => candidate.id === testCase.model.id);
 			expect(matchingCalls).toHaveLength(1);
-			expect(compactSpy.mock.calls.length).toBeGreaterThan(matchingCalls.length);
+			expect(compactSpy.mock.calls.length).toBe(matchingCalls.length);
 			expect(waitSpy).not.toHaveBeenCalled();
 			expect(events).toHaveLength(1);
 			expect(events[0]).toMatchObject({ willRetry: false });
