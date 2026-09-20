@@ -4713,7 +4713,8 @@ export class TUI extends Container {
 		// re-normalized and the diff starts at the window. Output is byte-identical to the
 		// full path (reused entries are deterministic normalizations of identical raw lines).
 		const VIEWPORT_NORMALIZE_OVERSCAN = 8;
-		const rawLines = newLines.slice();
+		// Reassigned below, never mutated in place -- a reference is the snapshot.
+		const rawLines = newLines;
 		const total = rawLines.length;
 		let diffStart = 0;
 		let usedWindowNormalize = false;
