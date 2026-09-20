@@ -410,9 +410,14 @@ describe("AgentSession handoff", () => {
 		expect(handoffSpy).not.toHaveBeenCalled();
 		const startEvents = events.filter(event => event.type === "auto_compaction_start");
 		expect(startEvents).toHaveLength(1);
-		expect(startEvents[0]).toMatchObject({ type: "auto_compaction_start", reason: "overflow" });
+		expect(startEvents[0]).toMatchObject({
+			type: "auto_compaction_start",
+			reason: "overflow",
+			action: "context-full",
+		});
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
+		expect(endEvents[0]).toMatchObject({ action: "context-full" });
 		expect(endEvents[0]).not.toMatchObject({
 			errorMessage: "Auto-handoff failed: no handoff document was generated",
 		});

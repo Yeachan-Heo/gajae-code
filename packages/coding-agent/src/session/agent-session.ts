@@ -20571,8 +20571,6 @@ export class AgentSession {
 		try {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
-			if (autoCompactionSignal.aborted) return await emitAborted();
-			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
 			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
 				return await emitAborted();
 			}
@@ -20729,6 +20727,16 @@ export class AgentSession {
 					this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 				}
 				return { kind: "skipped" };
+			}
+
+			// Build the workflow/state context only after confirming that there is
+			// something to compact. Overflow recovery commonly has no eligible
+			// history (the failed assistant was just removed), and paying for the
+			// asynchronous state projection in that terminal no-op path delays the
+			// required auto_compaction_end event without changing the outcome.
+			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
+			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+				return await emitAborted();
 			}
 
 			let hookCompaction: CompactionResult | undefined;
