@@ -285,7 +285,7 @@ for (const replacement of [false, true]) {
 			await releaseResult.promise;
 			return event;
 		});
-		let starting: Promise<void> | void = undefined;
+		let starting: Promise<void> | void;
 		let transportStops = 0;
 		let broker: Broker | undefined;
 		try {
