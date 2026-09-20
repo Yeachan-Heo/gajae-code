@@ -232,6 +232,49 @@ describe("gjc-session create public owner lifecycle", () => {
 		expect(await Bun.file(path.join(state, "creation-state.json")).json()).toMatchObject({ kind: "creation_started", session_id: name });
 	});
 
+	test("reaps the authorization helper when proof acquisition fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-proof-cleanup-")); roots.push(root);
+		const dir = await worktree(root); const state = path.join(root, "state"); const base = await fixture(root);
+		const helperPid = path.join(root, "helper.pid");
+		const bin = path.join(root, "bin", "gjc-proof-helper");
+		await executable(
+			bin,
+			`#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" != --internal-tmux-owner-isolation ]]; then exec ${JSON.stringify(base)} "$@"; fi
+printf '%s\n' "$$" > ${JSON.stringify(helperPid)}
+request="$(cat)"
+op="$(python3 - "$request" <<'PY'
+import json, sys
+try: print(json.loads(sys.argv[1]).get("op", ""))
+except Exception: print("")
+PY
+)"
+if [[ "$op" == publish_generation || -z "$op" ]]; then
+  sleep 30
+  exit 0
+fi
+printf '%s\n' "$request" | exec ${JSON.stringify(base)} "$@"
+`,
+		);
+		const name = `proof-cleanup-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const result = Bun.spawnSync(["bash", createScript, name, dir], {
+			env: env({
+				GJC_BIN: bin,
+				GJC_SESSION_STATE_DIR: state,
+				GJC_SESSION_TEST_FAIL_AUTHORITY_PROOF: "1",
+			}),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).not.toBe(0);
+		await waitFor(helperPid);
+		const pid = (await Bun.file(helperPid).text()).trim();
+		const deadline = Date.now() + 2_000;
+		while (Date.now() < deadline && await Bun.file(`/proc/${pid}/stat`).exists()) await Bun.sleep(25);
+		expect(await Bun.file(`/proc/${pid}/stat`).exists()).toBe(false);
+	});
+
 	test("normalizes a relative state-directory override before owner isolation", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-state-")); roots.push(root);
 		const dir = await worktree(root); const bin = await fixture(root);

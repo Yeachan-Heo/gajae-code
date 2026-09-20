@@ -591,6 +591,21 @@ def publish_current_alias(canonical_path, alias_path, kind, inject=None):
 
 
 def run_authorized(request, timeout=3):
+    def terminate_and_reap(process):
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+
     read_fd, write_fd = os.pipe()
     proof_fd = os.dup(read_fd)
     environment = os.environ.copy()
@@ -605,18 +620,19 @@ def run_authorized(request, timeout=3):
             stderr=subprocess.DEVNULL,
             text=True,
         )
-        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
-            child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
-        os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
-        os.close(write_fd)
-        write_fd = -1
-        os.close(read_fd)
-        read_fd = -1
         try:
+            if os.environ.get("GJC_SESSION_TEST_FAIL_AUTHORITY_PROOF") == "1":
+                raise OSError("injected authority proof failure")
+            with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
+                child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
+            os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
+            os.close(write_fd)
+            write_fd = -1
+            os.close(read_fd)
+            read_fd = -1
             stdout, _ = process.communicate(input=f"{json.dumps(request, separators=(',', ':'))}\n", timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        except BaseException:
+            terminate_and_reap(process)
             raise
         return process.returncode, stdout
     finally:
@@ -1109,21 +1125,41 @@ authorized_owner_call() {
   python3 - "$GJC_SESSION_GJC_BIN" "$request" "$1" <<'PY'
 import os, subprocess, sys
 binary, request, timeout = sys.argv[1:]
+
+def terminate_and_reap(process):
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+
 read_fd, write_fd = os.pipe()
 proof_fd = os.dup(read_fd)
 environment = os.environ.copy()
 environment["GJC_TMUX_OWNER_AUTHORITY_FD"] = str(read_fd)
 try:
     process = subprocess.Popen([binary, "--internal-tmux-owner-isolation"], env=environment, pass_fds=(read_fd,), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
-        child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
-    os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
-    os.close(write_fd); write_fd = -1
-    os.close(read_fd); read_fd = -1
     try:
+        with open(f"/proc/{process.pid}/stat", encoding="utf-8") as handle:
+            child_start_time = handle.read().rsplit(")", 1)[1].strip().split()[19]
+        os.write(write_fd, f"{process.pid} {child_start_time}\n".encode())
+        os.close(write_fd); write_fd = -1
+        os.close(read_fd); read_fd = -1
         stdout, _ = process.communicate(input=f"{request}\n", timeout=float(timeout))
     except subprocess.TimeoutExpired:
-        process.kill(); process.wait(); raise SystemExit(124)
+        terminate_and_reap(process)
+        raise SystemExit(124)
+    except BaseException:
+        terminate_and_reap(process)
+        raise
     sys.stdout.write(stdout)
     raise SystemExit(process.returncode)
 finally:
