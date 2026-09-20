@@ -3784,7 +3784,12 @@ export class Broker {
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
-		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const identity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			operation === "session.create" ? undefined : target,
+		);
 		const operationKey = `${operation}\0${idempotencyKey}`;
 		const requestedRequestHash = createHash("sha256")
 			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
