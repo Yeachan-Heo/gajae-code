@@ -5094,8 +5094,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							const result = await exact.manager.discoverAndConnect({ configPath: exact.configPath });
 							// A slash control may commit while the deferred startup flight is
 							// loading. Re-read the manager's fenced publication rather than
-							// replaying the stale startup snapshot into the session registry.
-							const resultTools = exact.manager.getTools() as CustomTool[];
+							// replaying the stale startup snapshot into the session registry. A
+							// deferred manager can still be waiting to publish its first catalog,
+							// though; in that case the discovery result is the loaded catalog and
+							// must not be replaced with an empty pending snapshot.
+							const publishedTools = exact.manager.getTools() as CustomTool[];
+							const resultTools =
+								publishedTools.length > 0 || result.tools.length === 0
+									? publishedTools
+									: (result.tools as CustomTool[]);
 							const toolNames = resultTools.map(tool => tool.name);
 							const collidingToolNames = findDeferredExactMcpToolNameCollisions(
 								toolNames,
