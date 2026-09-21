@@ -6611,6 +6611,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					try {
 						await ensureQuestionTransaction(sessionId);
 					} catch (error) {
+						// A session whose persisted location the current policy no longer authorizes
+						// must not be reaped (that would mutate an unauthorized location), but it must
+						// not abort enumeration either: rethrowing refuses the whole sweep, so one such
+						// session would stop reaping for every other session in the namespace. An empty
+						// root list is a namespace-wide misconfiguration, not a per-session defect, so it
+						// still refuses the sweep once instead of warning for every session.
+						if (
+							error instanceof Error &&
+							isSessionAuthorityError(error) &&
+							error.message !== "coordinator_workdir_roots_required"
+						) {
+							logger.warn("Coordinator session reaper skipped an unauthorized session", {
+								sessionId,
+								reason: error.message,
+								detail: error.cause instanceof Error ? error.cause.message : undefined,
+							});
+							continue;
+						}
 						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 					}
 					try {

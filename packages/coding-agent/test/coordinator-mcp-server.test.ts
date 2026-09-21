@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
+import { logger } from "@gajae-code/utils";
 import packageJson from "../package.json" with { type: "json" };
 import {
 	type CodexHandoffOriginV1,
@@ -7334,6 +7335,99 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(second).toMatchObject({ ok: true, closed: true });
 		expect(await Bun.file(sessionFile).exists()).toBe(false);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+
+	async function stageIdleEphemeralSessions(
+		root: string,
+		sessionIds: string[],
+		relocate: (sessionId: string) => { cwd?: string; workspace?: string } = () => ({}),
+	) {
+		const controls: SdkControl[] = [];
+		const brokerSessions = sessionIds.map((sessionId, index) => ({
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			live: true,
+			endpointGeneration: 1,
+			pid: 300 + index,
+			endpointMtimeMs: 2,
+		}));
+		const server = await createSdkControlServer(root, controls, undefined, undefined, brokerSessions);
+		const sessionsDir = path.join(coordinatorNamespace(root), "sessions");
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		for (const sessionId of sessionIds) {
+			await expect(
+				server.callTool("gjc_coordinator_register_session", {
+					session_id: sessionId,
+					cwd: root,
+					idempotency_key: `register-${sessionId}`,
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: true });
+			const file = path.join(sessionsDir, `${sessionId}.json`);
+			const record = JSON.parse(await fs.readFile(file, "utf8"));
+			await Bun.write(file, JSON.stringify({ ...record, ephemeral: true, created_at: staleAt }));
+			const moved = relocate(sessionId);
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				const nextRevision = transaction.revision + 1;
+				transaction.canonical.session.ephemeral = true;
+				transaction.canonical.session.created_at = staleAt;
+				transaction.canonical.session.updated_at = staleAt;
+				if (moved.cwd !== undefined) transaction.canonical.session.cwd = moved.cwd;
+				if (moved.workspace !== undefined) transaction.canonical.session.broker.workspace = moved.workspace;
+				transaction.projection.applied_turns_revision = nextRevision;
+				transaction.projection.applied_reports_revision = nextRevision;
+				transaction.projection.applied_session_revision = nextRevision;
+				transaction.projection.applied_active_revision = nextRevision;
+				transaction.projection.applied_events_revision = nextRevision;
+			});
+			await fs.rm(path.join(coordinatorNamespace(root), "session-states", `${sessionId}.json`), { force: true });
+		}
+		const closedSessionIds = () =>
+			controls
+				.filter(control => control.operation === "session.close")
+				.map(control => (control.input as { sessionId?: string }).sessionId);
+		return { server, sessionsDir, paths, closedSessionIds };
+	}
+
+	it("idle reaping skips a session persisted outside the allowed roots instead of refusing the whole sweep", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const { server, sessionsDir, paths, closedSessionIds } = await stageIdleEphemeralSessions(
+			root,
+			["idle-session", "escaped-session"],
+			sessionId => (sessionId === "escaped-session" ? { cwd: outside, workspace: outside } : {}),
+		);
+		const escapedBefore = await readSessionTransaction(paths, "escaped-session");
+		const warn = vi.spyOn(logger, "warn");
+		try {
+			// Before the fix the escaped session's authority error escaped listSessions and the
+			// whole sweep was refused, so the in-root idle session was never reaped either.
+			expect(await server.sessionReaper.sweepOnce()).toBe(1);
+			expect(closedSessionIds()).toEqual(["idle-session"]);
+			expect(await Bun.file(path.join(sessionsDir, "idle-session.json")).exists()).toBe(false);
+			// The unauthorized session is neither closed nor mutated.
+			expect(await Bun.file(path.join(sessionsDir, "escaped-session.json")).exists()).toBe(true);
+			expect(await readSessionTransaction(paths, "escaped-session")).toEqual(escapedBefore);
+			expect(warn).toHaveBeenCalledWith("Coordinator session reaper skipped an unauthorized session", {
+				sessionId: "escaped-session",
+				reason: "coordinator_workdir_outside_allowed_roots",
+				detail: expect.stringContaining(`cwd ${await fs.realpath(outside)}`),
+			});
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("idle reaping still refuses the sweep when no workdir roots are configured", async () => {
+		const root = await tempRoot();
+		const { server, sessionsDir, closedSessionIds } = await stageIdleEphemeralSessions(root, ["idle-session"]);
+		// An empty root list is a namespace-wide misconfiguration: it must surface once as a
+		// refused sweep rather than as a per-session skip.
+		server.config.allowedRoots = [];
+		await expect(server.sessionReaper.sweepOnce()).rejects.toThrow("coordinator_workdir_roots_required");
+		expect(closedSessionIds()).toEqual([]);
+		expect(await Bun.file(path.join(sessionsDir, "idle-session.json")).exists()).toBe(true);
 	});
 
 	it("idle reaping selects only stale ephemeral coordinator records and uses incarnation-bound session.close", async () => {
