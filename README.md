@@ -1,3 +1,19 @@
+> ### This is a fork of [gajae-code](https://github.com/Yeachan-Heo/gajae-code)
+>
+> **Jev-Code** (`jevc`) adds one thing to that harness: a typed-judgement lane.
+> Gajae-Code routes every agent question to your phone and critiques every plan with a
+> generative model. Jev-Code puts a cheap, fast, typed classifier in front of both, so that
+> what reaches you at 2am is the question only you can answer.
+>
+> Everything else below is gajae-code's work and gajae-code's documentation, kept as-is
+> while this fork is young. Where the two differ, [`docs/jev/`](docs/jev/README.md) says so.
+> Attribution and lineage: [NOTICE.md](NOTICE.md). Upstream is MIT and so is this.
+>
+> Status: **early**. Nothing in the judgement lane has shipped yet — see
+> [`docs/jev/design.md`](docs/jev/design.md) for what is planned and what has been measured.
+
+---
+
 <p align="right">
   <strong>English</strong> | <a href="README.ko.md">한국어</a> | <a href="README.zh-CN.md">中文</a> | <a href="README.ja.md">日本語</a>
 </p>

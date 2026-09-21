@@ -1,3 +1,19 @@
+> ### 이것은 [gajae-code](https://github.com/Yeachan-Heo/gajae-code)의 포크입니다
+>
+> **Jev-Code**(`jevc`)는 그 하네스에 한 가지를 더합니다 — 타입 있는 판정 레인.
+> 가재코드는 에이전트의 모든 질문을 휴대폰으로 보내고 모든 계획을 생성 모델로 비평합니다.
+> Jev-Code는 그 둘 앞에 싸고 빠른 타입 분류기를 세웁니다. 새벽 2시에 당신에게 닿는 것이
+> **당신만 답할 수 있는 질문**이 되도록.
+>
+> 아래 나머지는 전부 가재코드의 작업이고 가재코드의 문서이며, 이 포크가 어릴 동안 그대로 둡니다.
+> 둘이 달라지는 지점은 [`docs/jev/`](docs/jev/README.md)에 적습니다.
+> 귀속과 계보는 [NOTICE.md](NOTICE.md)에 있습니다. 상류가 MIT이고 이것도 MIT입니다.
+>
+> 상태: **초기**. 판정 레인은 아직 아무것도 출시되지 않았습니다 —
+> 무엇을 계획했고 무엇이 실측됐는지는 [`docs/jev/design.md`](docs/jev/design.md)에 있습니다.
+
+---
+
 <p align="right">
   <a href="README.md">English</a> | <strong>한국어</strong> | <a href="README.zh-CN.md">中文</a> | <a href="README.ja.md">日本語</a>
 </p>

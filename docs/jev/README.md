@@ -1,0 +1,10 @@
+# The judgement lane
+
+This directory holds everything that makes Jev-Code different from
+[gajae-code](https://github.com/Yeachan-Heo/gajae-code). If a behaviour is not
+described here, it is upstream's and upstream's documentation is authoritative.
+
+- [`design.md`](design.md) — what the judgement lane is for, where it attaches,
+  and what has actually been measured about the classifier it depends on.
+
+Nothing here has shipped yet.
