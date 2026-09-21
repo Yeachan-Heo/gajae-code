@@ -8,6 +8,7 @@
  */
 export { type ZodType, z } from "zod/v4";
 export * from "./api-registry";
+export * from "./jev/client";
 export * from "./auth-broker";
 export * from "./auth-gateway/types";
 export * from "./auth-storage";
