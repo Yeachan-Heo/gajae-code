@@ -37,9 +37,14 @@ a workflow tool teaches people to stop calling it.
 Choice(executable-as-stated | scope-or-criteria-still-guessed | ambiguous-needs-user)
 ```
 
-One candidate per request, so limit 1 does not apply. The input is the user's own
-short request — no transcript boilerplate — so limit 2 is at its mildest in the
-whole codebase. The three outcomes are disjoint, satisfying limit 3.
+One subject per request, so the candidate-indexing failure does not apply. The
+input is the user's own short request — no transcript boilerplate — so the
+garbage-in problem is at its mildest in the whole codebase. The three outcomes
+are disjoint.
+
+**Blocked on a language split.** The official docs state accuracy in CJK is not
+equal to English, and this gate reads the user's own words. See
+[`api.md`](api.md) — measured per language, not in aggregate, before it ships.
 
 Keep the pattern signals as a **fast pass**: if a signal fires *and* the
 classifier says `executable-as-stated`, skip. Disagreement routes to planning.
@@ -111,8 +116,12 @@ Noul(do these two findings prescribe work that cannot both stand?)
 
 This is the pairwise shape the classifier was measured on: correct pairs 0.88
 and 0.89, unrelated 0.07. Both findings are short typed records with
-`evidence` — clean input, not transcript text. A pass with 12 architect findings
-and 10 critic findings is 120 requests, roughly 6 seconds at 12 concurrent.
+`evidence` — clean input, not transcript text.
+
+Each pair is its own subject, so each is its own request: 12 architect findings
+against 10 critic findings is 120 requests. Do **not** try to fold the ten into
+one `state` array and ask ten questions against it — that is precisely the
+indexing failure. See [`api.md`](api.md) for where batching does help.
 
 Above threshold the pair opens a conflict requiring a disposition, exactly like a
 same-target conflict does today. The writer already fails closed on open

@@ -45,9 +45,15 @@ way.
 **1. It cannot index into its own state.** Putting 45 candidates in one `state`
 array and asking 45 questions that each point at `sessions[k]` produced confident
 answers about the *wrong* candidate — 0.93 on a pair that scores 0.07 when asked
-alone. So every design below is **one candidate per request**. This is a
+alone. So every design below is **one subject per request**. This is a
 constraint, not a tuning parameter, and it is why the run above needed 11,000
 requests instead of 252.
+
+This is narrower than it first reads, and an earlier draft of this document got
+it wrong. Several *questions* about one subject are fine and are the documented
+way to use the API — evaluated in one parallel pass, and the official cookbook
+measures 13 batched questions as 12.2x cheaper and 10.0x faster than 13 calls.
+What breaks is several *subjects* inside one state. See [`api.md`](api.md).
 
 **2. Garbage in gets labelled confidently.** The operator rewrote the input
 digest three times. Boilerplate — session banners, skill-injection lines,
