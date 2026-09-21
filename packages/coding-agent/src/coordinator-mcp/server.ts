@@ -741,7 +741,8 @@ function toolSchema(
 	if (name === "gjc_coordinator_await_turn") {
 		return {
 			name,
-			description: "Poll a durable turn for a bounded time and return the same shape as read_turn.",
+			description:
+				"Poll a durable turn for a bounded time. Observation expiry returns wait_expired:true (legacy ok:false, reason:timeout) without an MCP error. Inspect turn.status for completion; await again without resending the prompt.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -6823,6 +6824,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return {
 				ok: false,
 				reason: "timeout",
+				wait_expired: true,
 				turn: payload.turn,
 				advisory_status: payload.advisory_status,
 				session_state: payload.session_state,
@@ -11084,7 +11086,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (request.method === "tools/call") {
 			const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 			const payload = await callTool(params.name ?? "", params.arguments ?? {});
-			return { jsonrpc: "2.0", id, result: textResult(payload, payload.ok === false) };
+			return { jsonrpc: "2.0", id, result: coordinatorToolResult(payload) };
 		}
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
@@ -11106,8 +11108,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	};
 }
 
-function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
-	const failed = typeof payload === "object" && payload !== null && (payload as { ok?: unknown }).ok === false;
+function coordinatorToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
+	const record = asRecord(payload);
+	// The legacy ok:false means the observation window ended, not that the RPC
+	// failed. Keep its payload contract while preventing host error/retry breakers.
+	const observationExpired = record?.wait_expired === true && record.reason === "timeout" && !record.error;
+	const failed = record?.ok === false && !observationExpired;
 	return textResult(payload, failed);
 }
 
@@ -11152,7 +11158,7 @@ export async function handleCoordinatorMcpRequest(
 		return {
 			jsonrpc: "2.0",
 			id: request.id ?? null,
-			result: legacyToolResult(await server.callTool(params.name ?? "", args)),
+			result: coordinatorToolResult(await server.callTool(params.name ?? "", args)),
 		};
 	} finally {
 		await server.close();
