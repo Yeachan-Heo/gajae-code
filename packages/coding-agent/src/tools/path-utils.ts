@@ -177,6 +177,9 @@ export function splitInternalUrlSel(
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
 	const scheme = schemeMatch[1].toLowerCase();
+	// `embedded://gjc/<path>` identifies a bundled file, so the selector always
+	// trails the path rather than the identifier-shaped authority.
+	if (scheme === "embedded") return splitPathAndSel(rawPath);
 	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
