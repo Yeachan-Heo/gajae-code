@@ -3,8 +3,8 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { PET_SKIN_IDS, PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
-import { setProjectDir } from "@gajae-code/utils";
+import { PET_SKIN_IDS, PET_SKINS, type PetMode, replaceTabs, Spacer, Text } from "@gajae-code/tui";
+import { sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
 import { formatModelProfileDisplayLabel } from "../config/model-profiles";
@@ -34,6 +34,7 @@ import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, u
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
+import type { AgentSession, ExactMcpStatusSnapshot } from "../session/agent-session";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
@@ -45,6 +46,12 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
+import {
+	beginSessionTitleGeneration,
+	invalidateSessionTitleGeneration,
+	isSessionTitleGenerationCurrent,
+} from "../utils/session-title-generation";
+import { buildConversationTitleInput, generateSessionTitle } from "../utils/title-generator";
 import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
@@ -138,6 +145,44 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 		},
 		notifyConfigChanged: () => ctx.notifyConfigChanged?.(),
 	};
+}
+
+async function regenerateSessionTitle(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	try {
+		const generation = beginSessionTitleGeneration(runtime.sessionManager);
+		const input = buildConversationTitleInput(runtime.session.messages);
+		if (!input) {
+			return usage("Nothing to summarize yet — pass a title: /rename <title>", runtime);
+		}
+
+		const generated = await generateSessionTitle(
+			input,
+			runtime.session.modelRegistry,
+			runtime.settings,
+			runtime.session.credentialSessionId,
+			runtime.session.model,
+			provider => runtime.session.agent.metadataForProvider(provider),
+		);
+		if (
+			!isSessionTitleGenerationCurrent(runtime.sessionManager, generation) ||
+			buildConversationTitleInput(runtime.session.messages) !== input
+		)
+			return commandConsumed();
+		if (!generated) {
+			return usage("Could not generate a session title — pass one: /rename <title>", runtime);
+		}
+
+		const stored = await runtime.sessionManager.setSessionName(generated, "user");
+		if (!stored) {
+			await runtime.output("Session name not changed (a user-set name takes precedence).");
+			return commandConsumed();
+		}
+		await runtime.notifyTitleChanged?.();
+		await runtime.output(`Session renamed to ${generated}.`);
+		return commandConsumed();
+	} catch (err) {
+		return usage(`Rename failed: ${errorMessage(err)}`, runtime);
+	}
 }
 
 async function updateSessionStar(
@@ -236,6 +281,36 @@ function providerSetupUsage(): string {
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",
 		"Headless OAuth callbacks can be pasted with /login <redirect URL or code>.",
 	].join("\n");
+}
+
+function exactMcpDisplayName(name: string): string {
+	const sanitized = replaceTabs(sanitizeDisplayLine(name));
+	return sanitized || "<unnamed>";
+}
+
+function renderExactMcpStatus(snapshot: ExactMcpStatusSnapshot): string {
+	if (snapshot.servers.length === 0) {
+		return snapshot.startup === "no-servers-declared"
+			? "MCP servers: the config declares none."
+			: "MCP servers: not started yet.";
+	}
+	const servers = snapshot.servers.map(server => ({ ...server, name: exactMcpDisplayName(server.name) }));
+	// Server names and counts vary in width, so pad to the widest of each column;
+	// an unaligned table is unreadable once more than a couple of servers connect.
+	const nameWidth = Math.max(...servers.map(server => server.name.length));
+	const transportWidth = Math.max(...servers.map(server => server.transport.length));
+	const stateWidth = Math.max(...servers.map(server => server.state.length));
+	const countWidth = Math.max(...servers.map(server => String(server.toolCount).length));
+	const lines = [`MCP servers (${snapshot.startup}):`];
+	for (const server of servers) {
+		const count = String(server.toolCount).padStart(countWidth);
+		const unit = server.toolCount === 1 ? "tool" : "tools";
+		lines.push(
+			`  ${server.name.padEnd(nameWidth)}  ${server.transport.padEnd(transportWidth)}  ` +
+				`${server.state.padEnd(stateWidth)}  ${count} ${unit}`,
+		);
+	}
+	return lines.join("\n");
 }
 
 function formatModelAssignmentSummary(runtime: SlashCommandRuntime): string {
@@ -1620,6 +1695,121 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "mcp",
+		description: "Show MCP server status for this session",
+		allowArgs: true,
+		subcommands: [
+			{ name: "status", description: "Show MCP server status for this session" },
+			{ name: "list", description: "Alias for status" },
+			{ name: "suspend", description: "Suspend one server for this session" },
+			{ name: "resume", description: "Resume one suspended server" },
+			{ name: "reconnect", description: "Reconnect one server" },
+		],
+		// Exact MCP command surface yields its namespace without the exact capability: no `handle`, so the ACP dispatcher
+		// neither advertises nor routes it. Controls stay on the terminal surface.
+		handleTui: async (command, runtime) => {
+			// This builtin is installed statically, but the exact MCP capability is
+			// granted only to root interactive --mcp-config sessions. Preserve the
+			// pristine command namespace for every other session.
+			if (!runtime.ctx.session.hasExactMcpControls) return { prompt: command.text };
+			runtime.ctx.editor.setText("");
+			const args = command.args.trim() ? command.args.trim().split(/\s+/) : [];
+			const subcommand = args[0] ?? "";
+			// `list` is what every other MCP-capable tool calls this, so accept it
+			// rather than punishing the habit with an error.
+			if (
+				subcommand !== "" &&
+				subcommand !== "status" &&
+				subcommand !== "list" &&
+				subcommand !== "suspend" &&
+				subcommand !== "resume" &&
+				subcommand !== "reconnect"
+			) {
+				runtime.ctx.showError(
+					`Unknown subcommand: ${exactMcpDisplayName(subcommand)}. Usage: /mcp [status|list|suspend <name>|resume <name>|reconnect <name>]`,
+				);
+				return commandConsumed();
+			}
+			if (subcommand === "suspend" || subcommand === "resume" || subcommand === "reconnect") {
+				const name = args[1];
+				if (!name || args.length !== 2) {
+					runtime.ctx.showError(`Server name required. Usage: /mcp ${subcommand} <name>`);
+					return commandConsumed();
+				}
+				let result: Awaited<ReturnType<AgentSession["controlExactMcpServer"]>>;
+				try {
+					result = await runtime.ctx.session.controlExactMcpServer(subcommand, name);
+				} catch (error) {
+					if ((error as { code?: string } | undefined)?.code === "busy") {
+						runtime.ctx.showWarning(`MCP ${subcommand} is unavailable while this session is busy.`);
+						return commandConsumed();
+					}
+					runtime.ctx.showError(`MCP ${subcommand} failed.`);
+					return commandConsumed();
+				}
+				if (!result) {
+					runtime.ctx.showWarning(
+						"MCP controls are not available in this session. Start gjc with --mcp-config <absolute-path> to enable them.",
+					);
+					return commandConsumed();
+				}
+				const displayName = exactMcpDisplayName(result.name);
+				switch (result.status) {
+					case "suspended":
+						runtime.ctx.showStatus(`MCP server "${displayName}" suspended for this session.`);
+						break;
+					case "resumed":
+						runtime.ctx.showStatus(`MCP server "${displayName}" resumed (${result.toolCount} tools).`);
+						break;
+					case "reconnected":
+						runtime.ctx.showStatus(`MCP server "${displayName}" reconnected (${result.toolCount} tools).`);
+						break;
+					case "already-suspended":
+						runtime.ctx.showWarning(`MCP server "${displayName}" is already suspended.`);
+						break;
+					case "not-suspended":
+						runtime.ctx.showWarning(`MCP server "${displayName}" is not suspended.`);
+						break;
+					case "unknown-server":
+						runtime.ctx.showError(`Unknown MCP server: ${displayName}`);
+						break;
+					case "unavailable":
+						runtime.ctx.showError(
+							result.action === "resume"
+								? `MCP server "${displayName}" could not be resumed and remains suspended.`
+								: `MCP server "${displayName}" could not be reconnected.`,
+						);
+						break;
+				}
+				return commandConsumed();
+			}
+			if (args.length > 1) {
+				runtime.ctx.showError(`Usage: /mcp ${subcommand || "status"}`);
+				return commandConsumed();
+			}
+			let snapshot: Awaited<ReturnType<AgentSession["getExactMcpStatusSnapshot"]>>;
+			try {
+				snapshot = await runtime.ctx.session.getExactMcpStatusSnapshot();
+			} catch (error) {
+				if ((error as { code?: string } | undefined)?.code === "busy") {
+					runtime.ctx.showWarning(
+						"MCP status is unavailable while this session is busy. Try again once it settles.",
+					);
+					return commandConsumed();
+				}
+				throw error;
+			}
+			if (!snapshot) {
+				runtime.ctx.showWarning(
+					"MCP status is not available in this session. Start gjc with --mcp-config <absolute-path> to enable it.",
+				);
+				return commandConsumed();
+			}
+			runtime.ctx.showStatus(renderExactMcpStatus(snapshot));
+			return commandConsumed();
+		},
+	},
+	{
 		name: "agents",
 		description: "Open Agent Control Center dashboard",
 		handleTui: (_command, runtime) => {
@@ -1650,6 +1840,19 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showTreeSelector();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "fork",
+		description: "Choose an earlier prompt to continue in a new session",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			if (command.args.trim()) {
+				runtime.ctx.showError("Usage: /fork");
+				return;
+			}
+			await runtime.ctx.handleForkCommand();
 		},
 	},
 
@@ -2134,11 +2337,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "rename",
-		description: "Rename the current session",
-		inlineHint: "<title>",
+		description: "Rename the current session, or regenerate the title from the conversation",
+		inlineHint: "[title]",
 		allowArgs: true,
 		handle: async (command, runtime) => {
-			if (!command.args) return usage("Usage: /rename <title>", runtime);
+			if (!command.args) return regenerateSessionTitle(runtime);
+			invalidateSessionTitleGeneration(runtime.sessionManager);
 			const ok = await runtime.sessionManager.setSessionName(command.args, "user");
 			if (!ok) {
 				await runtime.output("Session name not changed (a user-set name takes precedence).");
@@ -2151,8 +2355,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			const title = command.args.trim();
 			if (!title) {
-				runtime.ctx.showError("Usage: /rename <title>");
 				runtime.ctx.editor.setText("");
+				await runtime.ctx.handleRenameCommand();
 				return;
 			}
 			runtime.ctx.editor.setText("");

@@ -25,5 +25,16 @@ export interface HostEndpointAdapters {
 
 export interface BrokerIndexWriter {
 	register(input: { sessionId: string; stateRoot: string; endpointGeneration: number }): void | Promise<void>;
-	unregister?(input: { sessionId: string; stateRoot: string; endpointGeneration: number }): void | Promise<void>;
+	heartbeat?(input: {
+		sessionId: string;
+		stateRoot: string;
+		endpointGeneration: number;
+		activity: { state: "active" | "idle"; at: number };
+	}): void | Promise<void>;
+	unregister?(input: {
+		sessionId: string;
+		stateRoot: string;
+		endpointGeneration: number;
+		reason?: "detached_idle";
+	}): void | Promise<void>;
 }

@@ -146,6 +146,36 @@ describe("model thinking metadata", () => {
 		expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
 	});
 
+	it("exposes Alibaba DeepSeek V4.1 Flash, V4 Pro 0813, and GLM-5.3 efforts", () => {
+		for (const id of ["deepseek-v4.1-flash", "deepseek-v4-pro-0813"] as const) {
+			const model = createModel({
+				id,
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+			});
+			expect(model.thinking).toEqual({
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+				levels: [Effort.Low, Effort.High, Effort.Max],
+			});
+			expect(requireSupportedEffort(model, Effort.Max)).toBe(Effort.Max);
+		}
+
+		const glm = createModel({
+			id: "glm-5.3",
+			api: "openai-completions",
+			provider: "alibaba-token-plan",
+		});
+		expect(glm.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		});
+		expect(requireSupportedEffort(glm, Effort.Max)).toBe(Effort.Max);
+	});
+
 	it("stores supported efforts for Codex mini in model metadata", () => {
 		const model = createModel({
 			id: "gpt-5.1-codex-mini",
@@ -423,6 +453,62 @@ describe("generated model policies", () => {
 				mode: "effort",
 				minLevel: Effort.Low,
 				maxLevel: Effort.Max,
+				levels: [Effort.Low, Effort.High, Effort.Max],
+			},
+		});
+	});
+	it("corrects Alibaba DeepSeek V4.1 Flash, V4 Pro 0813, and GLM-5.3 discovery", () => {
+		const models: Model<Api>[] = [
+			createModel({
+				id: "deepseek-v4.1-flash",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: false,
+			}),
+			createModel({
+				id: "deepseek-v4-pro-0813",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: false,
+			}),
+			createModel({
+				id: "glm-5.3",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: false,
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]).toMatchObject({
+			name: "DeepSeek V4.1 Flash",
+			reasoning: true,
+			contextWindow: 1_000_000,
+			maxTokens: 384_000,
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+				levels: [Effort.Low, Effort.High, Effort.Max],
+			},
+		});
+		expect(models[1]).toMatchObject({
+			name: "DeepSeek V4 Pro 0813",
+			reasoning: true,
+			contextWindow: 1_000_000,
+			maxTokens: 384_000,
+		});
+		expect(models[2]).toMatchObject({
+			name: "GLM-5.3",
+			reasoning: true,
+			contextWindow: 1_000_000,
+			maxTokens: 131_072,
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+				defaultLevel: Effort.Max,
 				levels: [Effort.Low, Effort.High, Effort.Max],
 			},
 		});

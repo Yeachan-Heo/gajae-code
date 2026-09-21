@@ -1043,6 +1043,13 @@ describe("built-in model profile catalog", () => {
 		).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["glm-5.2"]).toBeDefined();
 		expect(
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4.1-flash"],
+		).toBeDefined();
+		expect(
+			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["deepseek-v4-pro-0813"],
+		).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["glm-5.3"]).toBeDefined();
+		expect(
 			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["qwen3.8-max-preview"],
 		).toBeDefined();
 		expect((modelsJson as Record<string, Record<string, unknown>>).xai?.["grok-4.6"]).toBeDefined();

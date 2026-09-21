@@ -298,7 +298,17 @@ describe("model profile activation", () => {
 			await registry.refreshProvider("anthropic", "online");
 
 			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
-			expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+			// Fresh, authoritative live evidence makes the live catalog the selectable
+			// list, so a bundled Opus 5 the provider did not enroll is not selectable
+			// either. The bundled catalog is only the fallback when that evidence is
+			// unavailable (#5720, #5746).
+			expect(
+				registry
+					.getAvailable()
+					.filter(candidate => candidate.provider === "anthropic")
+					.map(candidate => candidate.id)
+					.sort(),
+			).toEqual(["claude-opus-4-6", "claude-sonnet-5"]);
 			expect(
 				registry
 					.getAvailableForProfileActivation()

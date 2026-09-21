@@ -209,10 +209,10 @@ export async function watchSessionHostBrokerLiveness(deps: {
  * no client attached before treating itself as abandoned.
  *
  * This cannot fire during healthy work. "Attached" is the host's own live
- * socket-subscription count, so a client that is merely idle — an editor
- * sitting on an open ACP session, a long agent turn with nobody typing — still
- * holds a socket and resets the window on every poll. Only a client that is
- * actually gone opens it, and 30 minutes is far longer than any client
+ * demand count: observer-only sockets (such as an idle chat daemon) do not
+ * reset the window, while an in-flight turn is reported separately. Only a
+ * client that is actually demanding the host opens it, and 30 minutes is far
+ * longer than any client
  * reconnect budget (ACP's is seconds), so a crashed-and-restarted client
  * reattaches long before the window closes.
  */
@@ -238,8 +238,8 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
  * from every client for a full idle grace, or nobody has come for it at all
  * for a full first-attach grace.
  *
- * `readAttachedClients` reports the host's own live client/socket subscription
- * count; `undefined` means the SDK endpoint publishes no such evidence — before
+ * `readAttachedClients` reports the host's own live demanding-client count;
+ * `undefined` means the SDK endpoint publishes no such evidence — before
  * startup, after teardown, or when every reader itself fails. That ambiguity is
  * never instant detachment: it cannot reap on the poll that first sees it, it
  * can only open a window. Which window depends on what was already observed. A
@@ -268,7 +268,7 @@ export async function watchSessionHostClientAttachment(deps: {
 	idleGraceMs?: number;
 	firstAttachGraceMs?: number;
 	pollMs?: number;
-}): Promise<void> {
+}): Promise<"detached_idle"> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
 	const readWorkInFlight = deps.readWorkInFlight ?? (() => false);
@@ -294,9 +294,9 @@ export async function watchSessionHostClientAttachment(deps: {
 			// registration stops publishing a count instead of reporting zero.
 			// Both accrue against the idle bound rather than running forever.
 			detachedSince ??= now();
-			if (now() - detachedSince >= idleGraceMs) return;
+			if (now() - detachedSince >= idleGraceMs) return "detached_idle";
 		} else if (now() - unattendedSince >= firstAttachGraceMs) {
-			return;
+			return "detached_idle";
 		}
 		await sleep(pollMs);
 	}
@@ -686,10 +686,10 @@ export async function runSessionHost(
 		lifecycleTranscriptPath = session.sessionManager.getSessionFile();
 	});
 	let sessionDisposal: Promise<void> | undefined;
-	const disposeSession = (): Promise<void> => {
+	const disposeSession = (reason?: "detached_idle"): Promise<void> => {
 		sessionDisposal ??= (async () => {
 			try {
-				await session.dispose();
+				await session.dispose(reason === undefined ? {} : { sessionShutdownReason: reason });
 			} catch (error) {
 				if (!isSessionDisposalIncompleteError(error)) throw error;
 				await session.awaitDisposeCompletion();
@@ -735,8 +735,8 @@ export async function runSessionHost(
 		return failureRollback;
 	};
 	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (): Promise<void> => {
-		await disposeSession();
+	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
+		await disposeSession(reason);
 		let failure: SdkStartupFailure | undefined;
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
@@ -766,11 +766,11 @@ export async function runSessionHost(
 		process.exit(process.exitCode ?? 0);
 	};
 	let stopping = false;
-	const stop = () => {
+	const stop = (reason?: "detached_idle") => {
 		if (capability.result?.status === "started") {
 			if (stopping) return;
 			stopping = true;
-			void exitAfterSessionDisposal();
+			void exitAfterSessionDisposal(reason);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
@@ -858,21 +858,21 @@ export async function runSessionHost(
 		await Bun.sleep(5_000);
 	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
-	process.once("SIGTERM", stop);
-	process.once("SIGINT", stop);
+	process.once("SIGTERM", () => stop());
+	process.once("SIGINT", () => stop());
 	// Two independent bounds, either of which reaps this detached host through
 	// the same graceful teardown a SIGTERM would take. The first covers a broker
 	// that is gone for good; the second covers the opposite case, a perfectly
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
-	await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir }),
+	const reapReason = await Promise.race([
+		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
 			readWorkInFlight: sessionHostWorkInFlight,
 		}),
 	]);
-	stop();
+	stop(reapReason);
 	await new Promise<void>(() => {});
 }
 

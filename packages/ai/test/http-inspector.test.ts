@@ -255,6 +255,27 @@ describe("transport failure context", () => {
 		expect(message).not.toContain("synthetic-secret");
 	});
 
+	it("names the host for an h2 stream reset instead of Bun's verbose hint alone", () => {
+		const error = bunTransportError(
+			'HTTP2StreamReset fetching "https://chatgpt.com/backend-api/codex/responses". For more information, pass `verbose: true` in the second argument to fetch()',
+			"HTTP2StreamReset",
+		);
+
+		const message = appendTransportFailureContext(error.message, error, codexDump());
+
+		expect(message).toContain("transport=HTTP2StreamReset");
+		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
+	});
+
+	it("names the host for a refused stream before surfacing the replay decision", async () => {
+		const error = bunTransportError("h2 stream refused", "HTTP2RefusedStream");
+
+		const message = await finalizeErrorMessage(error, codexDump());
+
+		expect(message).toContain("transport=HTTP2RefusedStream");
+		expect(message).toContain("url=https://chatgpt.com/backend-api/codex/responses");
+	});
+
 	it("reads the transport failure through a wrapped cause", () => {
 		const error = Object.assign(new Error("fetch failed"), {
 			cause: bunTransportError(

@@ -1288,6 +1288,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalDrainStarted = false;
 		let execQueuePrefix: Promise<void> | undefined;
 		let terminalPendingError: unknown;
+		let requestCloseError: (Error & { http2RstCode?: number; nativeErrorCode?: string }) | undefined;
+		// Native errors may be frozen; keep observations separate from their identity.
+		const requestErrorResetCodes = new WeakMap<Error, number | undefined>();
 		let terminalBoundarySeen = false;
 		// Lookahead can validate turnEnded while an exec handler holds the normal
 		// parser. Close new exec admission immediately, but leave the validated
@@ -1595,6 +1598,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			h2RequestErrorHandler = error => {
 				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
+				// Enrich only the synthetic reset diagnostic with the first observed
+				// native code. Never replace its message, priority, or retry class.
+				if (requestCloseError && !requestCloseError.nativeErrorCode) {
+					requestCloseError.nativeErrorCode = transportFailureFacts(error)?.nativeErrorCode;
+				}
+				if (!requestErrorResetCodes.has(error)) requestErrorResetCodes.set(error, h2Request?.rstCode);
 				terminalize(error, "drainable");
 			};
 			h2Request.on("error", h2RequestErrorHandler);
@@ -1637,7 +1646,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				responseEnded = true;
-				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), "drainable");
+				requestCloseError = Object.assign(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), {
+					http2RstCode: h2Request?.rstCode,
+				});
+				terminalize(requestCloseError, "drainable");
 			};
 			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
 			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
@@ -2333,6 +2345,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			output.stopReason = callerAbortError || options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.transportFailure = transportFailureFacts(mappedError);
+			if (mappedError instanceof Error && requestErrorResetCodes.has(mappedError)) {
+				output.transportFailure = transportFailureFacts({
+					...output.transportFailure,
+					// The native error can precede the request's reset observation.
+					// Fill a missing observation at settlement, after terminal draining;
+					// local teardown may supply it, so this is not remote-cause evidence.
+					http2RstCode: requestErrorResetCodes.get(mappedError) ?? h2Request?.rstCode,
+				});
+			}
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			finalizeCursorUsage(output, usageState);
 			calculateCost(model, output.usage);
@@ -4150,6 +4171,42 @@ function cursorNativeToolName(kindKey: string): string {
 /** Hard node budget for one native-payload conversion; bounds hostile or cyclic graphs. */
 const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
 const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
+/** Generic boundaries remain lossless within explicit resource limits. */
+const CURSOR_GENERIC_JSON_SAFE_MAX_NODES = 100_000;
+const CURSOR_GENERIC_JSON_SAFE_MAX_DEPTH = 1_000;
+
+interface CursorJsonSafeOptions {
+	stripTypeName: boolean;
+	maxNodes?: number;
+	maxDepth?: number;
+	throwOnLimit?: boolean;
+}
+
+const CURSOR_NATIVE_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
+	stripTypeName: true,
+	maxNodes: CURSOR_JSON_SAFE_MAX_NODES,
+	maxDepth: CURSOR_JSON_SAFE_MAX_DEPTH,
+};
+
+/** Generic JSON boundaries must preserve every schema/context entry losslessly. */
+const CURSOR_GENERIC_JSON_SAFE_OPTIONS: CursorJsonSafeOptions = {
+	stripTypeName: false,
+	maxNodes: CURSOR_GENERIC_JSON_SAFE_MAX_NODES,
+	maxDepth: CURSOR_GENERIC_JSON_SAFE_MAX_DEPTH,
+	throwOnLimit: true,
+};
+
+class CursorJsonSafeLimitError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "CursorJsonSafeLimitError";
+	}
+}
+
+function cursorJsonSafeLimit(options: CursorJsonSafeOptions, message: string): null {
+	if (options.throwOnLimit) throw new CursorJsonSafeLimitError(message);
+	return null;
+}
 
 /**
  * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
@@ -4162,17 +4219,39 @@ const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
  * all of which require `JSON.stringify`-safe values. Attaching the raw payload
  * is exactly the local-snapshot producer defect class behind issue #4578.
  *
- * Rules: `$typeName` is stripped, safe-range bigints become numbers (decimal
- * strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64
- * strings, dates become ISO strings, functions/symbols are dropped, cycles
- * and over-depth values collapse to null, and containers stop accepting
- * entries once the shared node budget is exhausted.
+ * Native payload rules: `$typeName` is stripped, safe-range bigints become
+ * numbers (decimal strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays
+ * become base64 strings, dates become ISO strings, functions/symbols are
+ * dropped, cycles and over-depth values collapse to null, and containers stop
+ * accepting entries once the shared node budget is exhausted. Generic payload
+ * boundaries use the same conversion with their own explicit limits and reject
+ * limit exhaustion instead of returning a truncated value.
  */
-function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }, depth = 0): unknown {
+function cursorJsonSafeValue(value: unknown): unknown {
+	return cursorJsonSafeValueWithOptions(value, CURSOR_NATIVE_JSON_SAFE_OPTIONS);
+}
+
+function cursorJsonSafeValueWithOptions(
+	value: unknown,
+	options: CursorJsonSafeOptions,
+	path?: Set<object>,
+	budget?: { remaining: number },
+	depth = 0,
+): unknown {
 	const seen = path ?? new Set<object>();
-	const nodes = budget ?? { remaining: CURSOR_JSON_SAFE_MAX_NODES };
-	if (nodes.remaining-- <= 0) return null;
-	if (depth >= CURSOR_JSON_SAFE_MAX_DEPTH) return null;
+	const nodes = options.maxNodes === undefined ? undefined : (budget ?? { remaining: options.maxNodes });
+	if (nodes && nodes.remaining-- <= 0) {
+		return cursorJsonSafeLimit(
+			options,
+			`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+		);
+	}
+	if (options.maxDepth !== undefined && depth >= options.maxDepth) {
+		return cursorJsonSafeLimit(
+			options,
+			`Cursor JSON-safe conversion exceeded the maximum depth of ${options.maxDepth.toLocaleString("en-US")}.`,
+		);
+	}
 	if (typeof value === "bigint") {
 		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
 			? Number(value)
@@ -4190,19 +4269,37 @@ function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { rema
 		if (Array.isArray(value)) {
 			const array: unknown[] = [];
 			for (const entry of value) {
-				if (nodes.remaining <= 0) break;
-				array.push(cursorJsonSafeValue(entry, seen, nodes, depth + 1));
+				if (nodes && nodes.remaining <= 0) {
+					cursorJsonSafeLimit(
+						options,
+						`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+					);
+					break;
+				}
+				array.push(cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1));
 			}
 			return array;
 		}
 		const record: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
-			if (key === "$typeName") continue;
-			if (nodes.remaining <= 0) break;
-			record[key] = cursorJsonSafeValue(entry, seen, nodes, depth + 1);
+			if (options.stripTypeName && key === "$typeName") continue;
+			if (nodes && nodes.remaining <= 0) {
+				cursorJsonSafeLimit(
+					options,
+					`Cursor JSON-safe conversion exceeded the maximum node count of ${options.maxNodes?.toLocaleString("en-US")}.`,
+				);
+				break;
+			}
+			Object.defineProperty(record, key, {
+				value: cursorJsonSafeValueWithOptions(entry, options, seen, nodes, depth + 1),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 		}
 		return record;
-	} catch {
+	} catch (error) {
+		if (error instanceof CursorJsonSafeLimitError) throw error;
 		return null;
 	} finally {
 		seen.delete(value);
@@ -4212,6 +4309,16 @@ function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { rema
 /** Exported for direct regression coverage of the JSON-safety boundary. */
 export function cursorJsonSafeValueForTest(value: unknown): unknown {
 	return cursorJsonSafeValue(value);
+}
+
+/** Serialize a generic Cursor JSON boundary without dropping keys or truncating containers. */
+function cursorJsonSafeStringify(value: unknown): string {
+	return JSON.stringify(cursorJsonSafeValueWithOptions(value, CURSOR_GENERIC_JSON_SAFE_OPTIONS)) ?? "";
+}
+
+/** Exported for direct regression coverage of the Cursor serialization boundary. */
+export function cursorJsonSafeStringifyForTest(value: unknown): string {
+	return cursorJsonSafeStringify(value);
 }
 
 function selectMcpToolCall(toolCall: any): any {
@@ -4589,7 +4696,10 @@ function buildCursorWireToolIdentities(tools: Tool[] | undefined): CursorWireToo
 	return tools
 		.filter(tool => !CURSOR_NATIVE_TOOL_NAMES.has(tool.name))
 		.map(tool => {
-			const jsonSchema = flattenToolRootCombinators(toolWireSchema(tool));
+			const jsonSchema = cursorJsonSafeValueWithOptions(
+				flattenToolRootCombinators(toolWireSchema(tool)),
+				CURSOR_GENERIC_JSON_SAFE_OPTIONS,
+			);
 			return {
 				name: tool.name,
 				description: tool.description || "",
@@ -4742,12 +4852,12 @@ export function buildCursorSystemPromptJsons(systemPrompt: readonly string[] | u
 	const systemPrompts = normalizeSystemPrompts(systemPrompt);
 	const jsons =
 		systemPrompts.length === 0
-			? [JSON.stringify({ role: "system", content: "You are a helpful assistant." })]
-			: systemPrompts.map(content => JSON.stringify({ role: "system", content }));
+			? [cursorJsonSafeStringify({ role: "system", content: "You are a helpful assistant." })]
+			: systemPrompts.map(content => cursorJsonSafeStringify({ role: "system", content }));
 	// Composer-harness models need anchor/edit discipline pinned ahead of any
 	// host/default prompt (see composer-discipline.ts for the observed failure modes).
 	if (modelId !== undefined && isComposerHarnessModel(modelId)) {
-		jsons.unshift(JSON.stringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
+		jsons.unshift(cursorJsonSafeStringify({ role: "system", content: CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT }));
 	}
 	return jsons;
 }
@@ -4761,7 +4871,7 @@ function buildRootPromptMessagesJson(
 	const lastUserIdx = findLastUserMessageIndex(messages);
 
 	const pushJson = (obj: unknown) => {
-		const bytes = new TextEncoder().encode(JSON.stringify(obj));
+		const bytes = new TextEncoder().encode(cursorJsonSafeStringify(obj));
 		entries.push(storeCursorBlob(blobStore, bytes));
 	};
 
@@ -4896,6 +5006,18 @@ export function buildCursorUsageToolsKeyForTest(tools: Tool[]): string {
 	return buildCursorUsageToolsKey(tools);
 }
 
+/** Exported for regression coverage of the generic tool-schema wire boundary. */
+export function buildCursorWireToolIdentitiesForTest(
+	tools: Tool[],
+): Array<{ name: string; description: string; inputSchema: JsonValue }> {
+	return buildCursorWireToolIdentities(tools);
+}
+
+/** Exported for regression coverage of lossless conversation identity hashing. */
+export function hashCursorConversationValueForTest(value: unknown): string {
+	return hashCursorConversationValue(value);
+}
+
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
@@ -4977,9 +5099,7 @@ function hashCursorConversationMessage(message: { role: string; content: unknown
 }
 
 function hashCursorConversationValue(value: unknown): string {
-	return createHash("sha256")
-		.update(JSON.stringify(value) ?? "")
-		.digest("hex");
+	return createHash("sha256").update(cursorJsonSafeStringify(value)).digest("hex");
 }
 
 function canReuseCursorConversationContext(

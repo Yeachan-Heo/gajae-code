@@ -54,6 +54,13 @@ function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
 }
 
+function preservePromptFailureMetadata(target: Error, source: JsonObject | undefined): void {
+	if (!source) return;
+	const providerCode = source.providerCode ?? object(source.transportFailure)?.providerCode;
+	if (providerCode !== undefined) Object.assign(target, { providerCode });
+	if (source.phase !== undefined) Object.assign(target, { phase: source.phase });
+}
+
 function providerErrorCode(error: unknown): string | undefined {
 	if (error instanceof AcpSdkAdapterError || error instanceof SdkClientError || error instanceof ReverseLeaseError)
 		return error.code;
@@ -475,10 +482,16 @@ export class AcpSdkAdapter {
 		const envelope = object(response);
 		if (envelope?.ok === false) {
 			const error = object(envelope.error);
-			throw new AcpSdkAdapterError(
+			const adapterError = new AcpSdkAdapterError(
 				typeof error?.code === "string" ? error.code : "request_failed",
 				typeof error?.message === "string" ? error.message : "SDK session request failed.",
 			);
+			// Prompt failures may carry the bounded classifier computed by the host. Keep
+			// those fields on the adapter error so the ACP boundary can project them instead
+			// of reconstructing a bare `{ code, details }` pair. `acpRequestFailure` performs
+			// the final safe-token validation before anything reaches the wire.
+			preservePromptFailureMetadata(adapterError, error);
+			throw adapterError;
 		}
 		return envelope?.result ?? response;
 	}
@@ -494,13 +507,19 @@ export class AcpSdkAdapter {
 		const sessionId = this.#sessionId;
 		if (!attachment || !sessionId || !attachment.isCurrent())
 			throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-		const response = await router.request(
-			sessionId,
-			{ ...frame, id: randomUUID() },
-			attachment.generation,
-			attachment,
-			options,
-		);
+		let response: Record<string, unknown>;
+		try {
+			response = await router.request(
+				sessionId,
+				{ ...frame, id: randomUUID() },
+				attachment.generation,
+				attachment,
+				options,
+			);
+		} catch (error) {
+			if (error instanceof SdkClientError) preservePromptFailureMetadata(error, object(error.details));
+			throw error;
+		}
 		if (!attachment.isCurrent())
 			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");
 		return raw ? response : this.#unwrapSessionResponse(response);

@@ -103,8 +103,15 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  must see the same capability-gated event kinds on both legs, or live and
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Capability used by notification adapters that observe a host without owning its work. */
+export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
+/** Keep live delivery and replay on one capability gate. */
+export function canDeliverSdkEvent(kind: string, capabilities: ReadonlySet<string> | undefined): boolean {
+	return !CAP_GATED_FRAME_KINDS.has(kind) || capabilities?.has(TOOL_ACTIVITY_CAPABILITY) === true;
+}
 
 /** Safe, identifier-free explanations for every refused activation status. */
 const ACTIVATION_MESSAGES: Record<
@@ -210,6 +217,9 @@ export class SessionSdkHost {
 	#stopPromise?: Promise<"stopped">;
 	#unsubscribe?: () => void;
 	#registration?: { writer: BrokerIndexWriter; generation: number };
+	#reportedActivityState?: "active" | "idle";
+	/** Serializes durable activity transitions so a later state cannot be lost. */
+	#activityReportTail: Promise<void> = Promise.resolve();
 	/** The generation whose readiness signal has already been published. */
 	#readyGeneration?: number;
 	/** Serializes activation attempts so a concurrent pair cannot both publish. */
@@ -276,6 +286,7 @@ export class SessionSdkHost {
 
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
+		this.#reportedActivityState = undefined;
 		this.events.restart();
 		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
@@ -298,6 +309,9 @@ export class SessionSdkHost {
 					stateRoot: this.#options.stateRoot,
 					endpointGeneration: this.events.generation,
 				});
+			void this.reportActivity("idle").catch(error =>
+				logger.warn(`sdk: initial idle activity checkpoint failed: ${String(error)}`),
+			);
 			return "started";
 		} catch (error) {
 			this.#unsubscribe?.();
@@ -364,7 +378,9 @@ export class SessionSdkHost {
 		return "activated";
 	}
 
-	async stop(options: { allowLockContention?: boolean } = {}): Promise<"stopped" | "already"> {
+	async stop(
+		options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {},
+	): Promise<"stopped" | "already"> {
 		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
 		const stopPromise = this.#stopStartedHost(options);
@@ -376,7 +392,10 @@ export class SessionSdkHost {
 		}
 	}
 
-	async #stopStartedHost(options: { allowLockContention?: boolean }): Promise<"stopped"> {
+	async #stopStartedHost(options: {
+		allowLockContention?: boolean;
+		unregisterReason?: "detached_idle";
+	}): Promise<"stopped"> {
 		// Fence before the first await: everything after this point is teardown,
 		// and no in-flight activation may publish readiness across it.
 		this.#stopping = true;
@@ -388,6 +407,7 @@ export class SessionSdkHost {
 					sessionId: this.#options.sessionId,
 					stateRoot: this.#options.stateRoot,
 					endpointGeneration: this.events.generation,
+					...(options.unregisterReason === undefined ? {} : { reason: options.unregisterReason }),
 				});
 			} catch (error) {
 				// A live broker may hold the shared session-index lock beyond the
@@ -415,6 +435,30 @@ export class SessionSdkHost {
 				stateRoot: this.#options.stateRoot,
 				endpointGeneration: this.events.generation,
 			});
+		if (this.#started)
+			void this.reportActivity("idle").catch(error =>
+				logger.warn(`sdk: initial idle activity checkpoint failed: ${String(error)}`),
+			);
+	}
+
+	/** Persist the host's observable activity for broker/session-list consumers. */
+	async reportActivity(state: "active" | "idle", at = Date.now()): Promise<void> {
+		const registration = this.#registration;
+		if (!this.#started || this.#stopping || !registration?.writer.heartbeat) return;
+		if (!Number.isFinite(at)) at = Date.now();
+		const write = async (): Promise<void> => {
+			if (this.#reportedActivityState === state) return;
+			await registration.writer.heartbeat!({
+				sessionId: this.#options.sessionId,
+				stateRoot: this.#options.stateRoot,
+				endpointGeneration: this.events.generation,
+				activity: { state, at },
+			});
+			this.#reportedActivityState = state;
+		};
+		const report = this.#activityReportTail.then(write, write);
+		this.#activityReportTail = report.catch(() => undefined);
+		await report;
 	}
 
 	async #send(connectionId: string, frame: SdkFrame): Promise<"written" | "dropped"> {
@@ -563,9 +607,7 @@ export class SessionSdkHost {
 					const sinceSeq = rawSeq;
 					const replay = this.events.replay(sinceSeq, sinceGeneration);
 					const capabilities = this.#options.connectionCapabilities?.(connectionId) ?? EMPTY_CAPABILITIES;
-					const events = replay.events.filter(
-						event => !CAP_GATED_FRAME_KINDS.has(String(event.kind)) || capabilities.has(TOOL_ACTIVITY_CAPABILITY),
-					);
+					const events = replay.events.filter(event => canDeliverSdkEvent(String(event.kind), capabilities));
 					await this.#send(connectionId, {
 						type: "event_replay_result",
 						id,

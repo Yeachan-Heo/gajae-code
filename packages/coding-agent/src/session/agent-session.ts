@@ -131,6 +131,7 @@ import {
 	SERVER_OVERLOADED_PROVIDER_CODE,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 } from "@gajae-code/ai/utils/fallback-transport";
+import { REPETITION_GUARD_ERROR_CODE } from "@gajae-code/ai/utils/stream-repetition-guard";
 import { AttemptRecordStore } from "./attempt-record-store";
 import {
 	BTW_MAX_ANSWER_UTF8_BYTES,
@@ -385,7 +386,8 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { LazyService } from "../runtime/lazy-service";
 import type { NetworkPrewarmRuntime } from "../runtime/network-prewarm-service";
 import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
-import { MCPManager } from "../runtime-mcp/manager";
+import { type ExactMcpServerControlResult, MCPManager } from "../runtime-mcp/manager";
+import { attachExactMcpControls, getExactMcpControls, revokeExactMcpControls } from "../runtime-mcp/redaction";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
@@ -432,6 +434,7 @@ import { parseCommandArgs } from "../utils/command-args";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { extractFileMentions, generateFileMentionMessages } from "../utils/file-mentions";
+import { invalidateSessionTitleGeneration } from "../utils/session-title-generation";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkflowIntentDiff, WORKFLOW_INTENT_DIFF_CUSTOM_TYPE } from "../workflow/workflow-intent-diff";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
@@ -508,6 +511,7 @@ import {
 	getLatestCompactionEntry,
 	getSessionMessageEntryId,
 	getSessionMessageObservationId,
+	SESSION_LIMIT_RECOVERY_ACTIONS,
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
@@ -2294,7 +2298,93 @@ export class StreamingEditFileCache {
 		return this.#totalBytes;
 	}
 }
-type SessionAdmissionKind = "prompt" | "selection";
+type SessionAdmissionKind = "prompt" | "selection" | "mcp-control";
+
+/**
+ * Startup phase of the session-owned exact-config MCP manager.
+ *
+ * `not-started` and `no-servers-declared` are distinguishable only because the
+ * snapshot reads the declared server list from the exact config; the manager
+ * alone reports an empty name list in both cases.
+ */
+export type ExactMcpStartupState = "not-started" | "no-servers-declared" | "in-flight" | "settled";
+
+/**
+ * Per-server state.
+ *
+ * `unavailable` covers a server the config declares that the manager has no
+ * live record of. A tools-only manager erases a server from its own bookkeeping
+ * when the connection fails, so a failed server and one whose startup has not
+ * reached it are indistinguishable from here; both surface as `unavailable`
+ * rather than being dropped from the table.
+ */
+export type ExactMcpServerState = "connecting" | "connected" | "disconnected" | "unavailable";
+export type ExactMcpServerDisplayState = ExactMcpServerState | "suspended";
+
+/**
+ * Transport a server is declared with. Taken from the config's own
+ * discriminator, never from a live connection: `getConnection` throws on a
+ * tools-only manager, so the declaration is the only source available here.
+ */
+export type ExactMcpTransport = "stdio" | "http" | "sse" | "unknown";
+
+export interface ExactMcpServerStatus {
+	readonly name: string;
+	readonly transport: ExactMcpTransport;
+	readonly state: ExactMcpServerDisplayState;
+	readonly toolCount: number;
+}
+
+/**
+ * Whitelisted status shape for the TUI `/mcp` command. Every field here is
+ * either a server name the operator already supplied or a derived enum/count;
+ * pool keys, endpoints, commands, env, headers, tokens, and raw exception text
+ * have no field to travel in.
+ */
+export interface ExactMcpStatusSnapshot {
+	readonly startup: ExactMcpStartupState;
+	readonly servers: readonly ExactMcpServerStatus[];
+}
+
+export type ExactMcpControlAction = "suspend" | "resume" | "reconnect";
+
+export interface ExactMcpControlResult extends ExactMcpServerControlResult {
+	readonly action: ExactMcpControlAction;
+}
+
+type ExactMcpSessionStateSnapshot = {
+	toolRegistry: Map<string, AgentTool>;
+	discoverableMCPTools: Map<string, DiscoverableTool>;
+	selectedMCPToolNames: Set<string>;
+	selectedDiscoveredToolNames: Set<string>;
+	tools: AgentTool[];
+	baseSystemPrompt: string[];
+	systemPrompt: string[];
+	lastAppliedToolSignature: string | undefined;
+	pendingAppliedToolSignature: string | undefined;
+	defaultModelSelectionMutationRevision: number;
+	baseSystemPromptGeneration: number;
+	suspendedTools: Map<string, { selected: string[]; active: string[] }>;
+};
+type PreparedExactMcpRetirement = {
+	canCommit(): boolean;
+	commit(): Promise<void>;
+	abort(): Promise<void>;
+};
+
+/**
+ * An entry states its transport with `type`, or implies it: a `command` entry is
+ * stdio and a `url` entry is http. Only the discriminator is read — the command
+ * string and URL themselves stay inside the config.
+ */
+function exactMcpTransportOf(entry: unknown): ExactMcpTransport {
+	if (!entry || typeof entry !== "object") return "unknown";
+	const record = entry as { type?: unknown; command?: unknown; url?: unknown };
+	if (record.type === "stdio" || record.type === "http" || record.type === "sse") return record.type;
+	if (typeof record.command === "string") return "stdio";
+	if (typeof record.url === "string") return "http";
+	return "unknown";
+}
 class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge {
 	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
 	#released = new Set<string>();
@@ -3119,6 +3209,7 @@ export class AgentSession {
 	#disposeCallerPromise: Promise<void> | undefined;
 	#disposeCompleted = false;
 	#disposeTerminalError: unknown;
+	#sessionShutdownReason: "detached_idle" | undefined;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
@@ -3231,6 +3322,7 @@ export class AgentSession {
 	#discoveryMode: "off" | "mcp-only" | "all" = "off";
 	#discoverableMCPTools = new Map<string, DiscoverableTool>();
 	#selectedMCPToolNames = new Set<string>();
+	#exactMcpSuspendedTools = new Map<string, { selected: string[]; active: string[] }>();
 	// Generic tool discovery (covers built-in + MCP + extension when tools.discoveryMode === "all")
 	#discoverableToolSearchIndex: DiscoverableToolSearchIndex | null = null;
 	#selectedDiscoveredToolNames = new Set<string>();
@@ -6701,7 +6793,7 @@ export class AgentSession {
 									text: [
 										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
 										committed,
-										"Continue by compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`); re-verify the edited file before relying on it.",
+										`To continue, ${SESSION_LIMIT_RECOVERY_ACTIONS}; re-verify the edited file before relying on it.`,
 									].join("\n"),
 								},
 							];
@@ -9204,12 +9296,13 @@ export class AgentSession {
 	 * Remove all listeners, flush pending writes, and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): Promise<void> {
+	dispose(options: { sessionShutdownReason?: "detached_idle" } = {}): Promise<void> {
 		this.#evalExecutionDisposing = true;
 		if (this.#disposeCompleted) return Promise.resolve();
 		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
 		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
 		if (!this.#disposeRunPromise) {
+			this.#sessionShutdownReason = options.sessionShutdownReason;
 			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
 			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
 			this.#disposeDeadlineTimer = setTimeout(() => this.#disposeDeadlineExpired?.resolve(), this.#disposeTimeoutMs);
@@ -9383,7 +9476,10 @@ export class AgentSession {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
 				await awaitDisposeStep(
 					"session shutdown handlers",
-					this.#extensionRunner.emit({ type: "session_shutdown" }),
+					this.#extensionRunner.emit({
+						type: "session_shutdown",
+						...(this.#sessionShutdownReason === undefined ? {} : { reason: this.#sessionShutdownReason }),
+					}),
 				);
 			}
 		} catch (error) {
@@ -10106,6 +10202,240 @@ export class AgentSession {
 		return Array.from(this.#toolRegistry.keys());
 	}
 
+	/**
+	 * Exact MCP controls: stock-workflow transactional successor revocation.
+	 *
+	 * Serialize an exact-config MCP control against both session mutexes.
+	 *
+	 * Admission serializes it with prompts and selection changes and fails closed
+	 * once dispose has closed admission; the transition lease excludes it from
+	 * new/switch/branch/fork/handoff in both directions. Neither side waits for
+	 * the other: whichever arrives second is rejected with a busy error, so a
+	 * control never observes or mutates state inside a transition window.
+	 */
+	async #withExactMcpControlAdmission<T>(body: () => Promise<T>): Promise<T> {
+		return this.#withSessionAdmission("mcp-control", async () => {
+			this.#beginSessionTransition("mcp-control");
+			try {
+				return await body();
+			} finally {
+				this.#endSessionTransition();
+			}
+		});
+	}
+
+	get hasExactMcpControls(): boolean {
+		return getExactMcpControls(this) !== undefined;
+	}
+
+	/**
+	 * Exact-config MCP status for the TUI `/mcp` command.
+	 *
+	 * Returns `undefined` unless this session holds the exact-config capability,
+	 * so a session built outside the root interactive entry point cannot read MCP
+	 * state through it. Data comes only from the session-owned tools-only manager
+	 * and the call never starts a deferred MCP startup or mutates connections.
+	 */
+	async getExactMcpStatusSnapshot(): Promise<ExactMcpStatusSnapshot | undefined> {
+		const controls = getExactMcpControls(this);
+		if (!controls) return undefined;
+		return this.#withExactMcpControlAdmission(async () => {
+			const manager = this.#ownedMcpManager;
+			const live = new Map<string, ExactMcpServerState>();
+			if (manager) {
+				for (const name of manager.getAllServerNames()) live.set(name, manager.getConnectionStatus(name));
+			}
+			const declared = await this.#readExactMcpDeclaredServers(controls.configPath);
+			const names = declared ? [...declared.keys()] : [...live.keys()];
+			if (names.length === 0) {
+				return {
+					startup: declared ? "no-servers-declared" : "not-started",
+					servers: [],
+				} satisfies ExactMcpStatusSnapshot;
+			}
+			const tools = manager?.getTools() ?? [];
+			const servers = names.map(name => ({
+				name,
+				transport: declared?.get(name) ?? ("unknown" as const),
+				state: manager?.isExactServerSuppressed(name)
+					? ("suspended" as const)
+					: (live.get(name) ?? ("unavailable" as const)),
+				toolCount: tools.reduce((count, tool) => (tool.mcpServerName === name ? count + 1 : count), 0),
+			}));
+			const startup =
+				live.size === 0
+					? "not-started"
+					: servers.some(server => server.state === "connecting")
+						? "in-flight"
+						: "settled";
+			return { startup, servers } satisfies ExactMcpStatusSnapshot;
+		});
+	}
+
+	/**
+	 * Apply one session-local exact-config control. Selection persistence is
+	 * deliberately bypassed: suppression is runtime state, not user authority.
+	 */
+	async controlExactMcpServer(
+		action: ExactMcpControlAction,
+		name: string,
+	): Promise<ExactMcpControlResult | undefined> {
+		const controls = getExactMcpControls(this);
+		if (!controls) return undefined;
+		return this.#withExactMcpControlAdmission(async () => {
+			const manager = this.#ownedMcpManager;
+			const declared = await this.#readExactMcpDeclaredServers(controls.configPath);
+			const known = declared?.has(name) ?? manager?.getAllServerNames().includes(name) ?? false;
+			if (!known) return { action, name, status: "unknown-server", toolCount: 0 };
+			if (!manager) return { action, name, status: "unavailable", toolCount: 0 };
+
+			const selected = this.getSelectedMCPToolNames();
+			const active = this.getActiveToolNames().filter(toolName => isMCPToolName(toolName));
+			const serverToolNames = new Set(
+				Array.from(this.#toolRegistry.values())
+					.filter(
+						tool =>
+							isMCPBridgeTool(tool) && (tool as AgentTool & { mcpServerName?: string }).mcpServerName === name,
+					)
+					.map(tool => tool.name),
+			);
+
+			const prepared = await manager.prepareExactServerControl(action, name);
+			const result = prepared.result;
+			if (result.status !== "suspended" && result.status !== "resumed" && result.status !== "reconnected") {
+				await prepared.abort();
+				return { action, ...result };
+			}
+			const snapshot = this.#captureExactMcpSessionState();
+			const suspended = this.#exactMcpSuspendedTools.get(name);
+			try {
+				await this.refreshMCPTools(prepared.tools, {
+					selectedMCPToolNames:
+						action === "suspend"
+							? selected.filter(toolName => !serverToolNames.has(toolName))
+							: action === "resume"
+								? [...selected, ...(suspended?.selected ?? [])]
+								: selected,
+					activeMCPToolNames:
+						action === "suspend"
+							? active.filter(toolName => !serverToolNames.has(toolName))
+							: action === "resume"
+								? [...active, ...(suspended?.active ?? [])]
+								: active,
+					persistMCPSelection: false,
+				});
+				await prepared.commit();
+				if (action === "suspend") {
+					this.#exactMcpSuspendedTools.set(name, {
+						selected: selected.filter(toolName => serverToolNames.has(toolName)),
+						active: active.filter(toolName => serverToolNames.has(toolName)),
+					});
+				} else if (action === "resume") {
+					this.#exactMcpSuspendedTools.delete(name);
+				}
+				return { action, ...result };
+			} catch (error) {
+				this.#restoreExactMcpSessionState(snapshot);
+				await prepared.abort();
+				throw error;
+			}
+		});
+	}
+
+	#captureExactMcpSessionState(): ExactMcpSessionStateSnapshot {
+		return {
+			toolRegistry: new Map(this.#toolRegistry),
+			discoverableMCPTools: new Map(this.#discoverableMCPTools),
+			selectedMCPToolNames: new Set(this.#selectedMCPToolNames),
+			selectedDiscoveredToolNames: new Set(this.#selectedDiscoveredToolNames),
+			tools: [...this.agent.state.tools],
+			baseSystemPrompt: this.#baseSystemPrompt,
+			systemPrompt: this.agent.state.systemPrompt,
+			lastAppliedToolSignature: this.#lastAppliedToolSignature,
+			pendingAppliedToolSignature: this.#pendingAppliedToolSignature,
+			defaultModelSelectionMutationRevision: this.#defaultModelSelectionMutationRevision,
+			baseSystemPromptGeneration: this.#baseSystemPromptGeneration,
+			suspendedTools: new Map(this.#exactMcpSuspendedTools),
+		};
+	}
+
+	#restoreExactMcpSessionState(snapshot: ExactMcpSessionStateSnapshot): void {
+		this.#toolRegistry.clear();
+		for (const [name, tool] of snapshot.toolRegistry) this.#toolRegistry.set(name, tool);
+		this.#discoverableMCPTools = snapshot.discoverableMCPTools;
+		this.#selectedMCPToolNames = snapshot.selectedMCPToolNames;
+		this.#selectedDiscoveredToolNames = snapshot.selectedDiscoveredToolNames;
+		// These are the already-prepared predecessor objects from agent.state;
+		// re-preparing them would stack execution guards and break identity.
+		this.agent.setTools(snapshot.tools);
+		this.#baseSystemPrompt = snapshot.baseSystemPrompt;
+		this.agent.setSystemPrompt(snapshot.systemPrompt);
+		this.#lastAppliedToolSignature = snapshot.lastAppliedToolSignature;
+		this.#pendingAppliedToolSignature = snapshot.pendingAppliedToolSignature;
+		this.#defaultModelSelectionMutationRevision = snapshot.defaultModelSelectionMutationRevision;
+		this.#baseSystemPromptGeneration = snapshot.baseSystemPromptGeneration;
+		this.#exactMcpSuspendedTools = snapshot.suspendedTools;
+		this.#invalidateDiscoveryCaches();
+	}
+
+	async #prepareExactMcpControlRetirement(): Promise<PreparedExactMcpRetirement | undefined> {
+		const controls = getExactMcpControls(this);
+		if (!controls) return undefined;
+		const snapshot = this.#captureExactMcpSessionState();
+		const prepared = await this.#ownedMcpManager?.prepareExactServerControlReset();
+		const restoreControls = (): void => attachExactMcpControls(this, controls);
+		try {
+			if (prepared) await this.refreshMCPTools(prepared.tools, { persistMCPSelection: false });
+			return {
+				canCommit: () => prepared?.canCommit() ?? true,
+				commit: async () => {
+					try {
+						await prepared?.commit();
+						this.#exactMcpSuspendedTools.clear();
+						revokeExactMcpControls(this);
+					} catch (error) {
+						this.#restoreExactMcpSessionState(snapshot);
+						restoreControls();
+						await prepared?.abort();
+						throw error;
+					}
+				},
+				abort: async () => {
+					this.#restoreExactMcpSessionState(snapshot);
+					restoreControls();
+					await prepared?.abort();
+				},
+			};
+		} catch (error) {
+			this.#restoreExactMcpSessionState(snapshot);
+			restoreControls();
+			await prepared?.abort();
+			throw error;
+		}
+	}
+
+	/**
+	 * Server names and transports the exact config declares, or `undefined` when
+	 * the file cannot be read or parsed. Only the name and the transport
+	 * discriminator are taken; command, args, url, headers, and env never leave
+	 * this method, and a read failure degrades to the manager's own view instead
+	 * of surfacing a parse error to the operator.
+	 */
+	async #readExactMcpDeclaredServers(configPath: string): Promise<Map<string, ExactMcpTransport> | undefined> {
+		try {
+			const parsed: unknown = await Bun.file(configPath).json();
+			const servers = (parsed as { mcpServers?: unknown } | null)?.mcpServers;
+			if (!servers || typeof servers !== "object" || Array.isArray(servers)) return undefined;
+			const declared = new Map<string, ExactMcpTransport>();
+			for (const [name, entry] of Object.entries(servers as Record<string, unknown>)) {
+				declared.set(name, exactMcpTransportOf(entry));
+			}
+			return declared;
+		} catch {
+			return undefined;
+		}
+	}
+
 	#getEditModeSession() {
 		return {
 			settings: this.settings,
@@ -10764,7 +11094,14 @@ export class AgentSession {
 	 * Replace MCP tools in the registry and recompute the visible MCP tool set immediately.
 	 * This allows /mcp add/remove/reauth to take effect without restarting the session.
 	 */
-	async refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
+	async refreshMCPTools(
+		mcpTools: CustomTool[],
+		options: {
+			selectedMCPToolNames?: string[];
+			activeMCPToolNames?: string[];
+			persistMCPSelection?: boolean;
+		} = {},
+	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const existingNames = Array.from(this.#toolRegistry.keys());
 		for (const name of existingNames) {
@@ -10798,15 +11135,20 @@ export class AgentSession {
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
-		if (!hasPersistedMCPToolSelection) {
+		if (options.selectedMCPToolNames) {
+			this.#selectedMCPToolNames = new Set(this.#filterSelectableMCPToolNames(options.selectedMCPToolNames));
+		} else if (!hasPersistedMCPToolSelection) {
 			this.#selectedMCPToolNames = new Set(
 				this.#resolveConstructorMCPToolSelection() ?? this.#getConfiguredDefaultSelectedMCPToolNames(),
 			);
 		}
-		const nextActive = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
+		const nextActive = [
+			...this.#getActiveNonMCPToolNames(),
+			...(options.activeMCPToolNames ?? this.getSelectedMCPToolNames()),
+		];
 		await this.#applyActiveToolsByName(nextActive, {
 			previousSelectedMCPToolNames,
-			persistMCPSelection: hasPersistedMCPToolSelection,
+			persistMCPSelection: options.persistMCPSelection ?? hasPersistedMCPToolSelection,
 		});
 	}
 
@@ -12061,6 +12403,8 @@ export class AgentSession {
 			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		if (options?.synthetic !== true && options?.attribution !== "agent")
+			invalidateSessionTitleGeneration(this.sessionManager);
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalPromptOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
@@ -13169,6 +13513,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
@@ -13193,6 +13538,7 @@ export class AgentSession {
 			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		invalidateSessionTitleGeneration(this.sessionManager);
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
@@ -15105,6 +15451,31 @@ export class AgentSession {
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		return AsyncJobManager.endpointIdOf(manager) ?? this.sessionManager.getSessionId() ?? "local";
 	}
+	/**
+	 * Tool call ids the run resource ledger currently holds for `handle` (#5637).
+	 *
+	 * The authoritative answer to "is a tool running?": AgentLoop reserves the
+	 * `kind: "tool"` lease SYNCHRONOUSLY inside its dispatch loop, before the
+	 * tool's `execute` is invoked, and the lease settles when the call really
+	 * ends — whereas `tool_execution_start` only reaches an extension after an
+	 * asynchronous fanout. Strictly read-only: it takes a snapshot and never
+	 * claims, reserves, seals or quarantines. An unknown run reads as empty,
+	 * matching `RunResourceLedger.pending`.
+	 */
+	pendingToolExecutions(handle: string): readonly string[] {
+		const ids = new Set<string>();
+		for (const entry of this.agent.resourceLedger.pending(handle)) {
+			if (entry.kind !== "tool") continue;
+			// AgentLoop labels a tool reservation `<toolName>:<toolCallId>`, and
+			// registers the reservation and its tracked task under the SAME label, so
+			// the set also collapses that pair to one id. A label without a separator
+			// is passed through rather than dropped: over-reporting a running tool
+			// only costs a bounded wait, under-reporting kills it mid-write.
+			const separator = entry.label.indexOf(":");
+			ids.add(separator < 0 ? entry.label : entry.label.slice(separator + 1));
+		}
+		return [...ids];
+	}
 	async abortPromptAndWait(
 		handle: string,
 		options: {
@@ -15659,17 +16030,23 @@ export class AgentSession {
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let exactRetirement: PreparedExactMcpRetirement | undefined;
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				exactRetirement = await this.#prepareExactMcpControlRetirement();
+				if (exactRetirement && !exactRetirement.canCommit())
+					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.setTodoPhases([]);
@@ -15735,17 +16112,23 @@ export class AgentSession {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let exactRetirement: PreparedExactMcpRetirement | undefined;
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				exactRetirement = await this.#prepareExactMcpControlRetirement();
+				if (exactRetirement && !exactRetirement.canCommit())
+					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await exactRetirement?.commit();
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
@@ -15951,6 +16334,8 @@ export class AgentSession {
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
 				);
+				let exactRetirement: PreparedExactMcpRetirement | undefined;
+				let adopted = false;
 				try {
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
@@ -15960,7 +16345,15 @@ export class AgentSession {
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 					this.#assertJobManagerEndpointAdmission(forkedManager.getSessionId(), forkedManager.getSessionFile());
+					exactRetirement = await this.#prepareExactMcpControlRetirement();
+					if (exactRetirement && !exactRetirement.canCommit())
+						throw new Error("Exact MCP control retirement changed before session adoption");
+					this.sessionManager = forkedManager;
+					adopted = true;
+					await exactRetirement?.commit();
 				} catch (error) {
+					await exactRetirement?.abort();
+					if (adopted) this.sessionManager = previousManager;
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
 					try {
@@ -15989,7 +16382,6 @@ export class AgentSession {
 					}
 					throw error;
 				}
-				this.sessionManager = forkedManager;
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				try {
 					await previousManager.close();
@@ -16004,16 +16396,22 @@ export class AgentSession {
 				// public manager getters remain bound to the predecessor.
 				const prepared = await this.sessionManager.prepareFork();
 				if (!prepared) return false;
+				let exactRetirement: PreparedExactMcpRetirement | undefined;
 				try {
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 					this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+					exactRetirement = await this.#prepareExactMcpControlRetirement();
+					if (exactRetirement && !exactRetirement.canCommit())
+						throw new Error("Exact MCP control retirement changed before session adoption");
 					this.sessionManager.commitPreparedNewSession(prepared);
+					await exactRetirement?.commit();
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
 					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 					await this.#runToolSessionTransitionCleanups();
 				} catch (error) {
+					await exactRetirement?.abort();
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 				}
 			}
@@ -18350,6 +18748,7 @@ export class AgentSession {
 			let savedPath: string | undefined;
 			let committed = false;
 			let prepared: PreparedNewSession | undefined;
+			let exactRetirement: PreparedExactMcpRetirement | undefined;
 			try {
 				// Prepare successor entries, persistence, display state, and gate
 				// construction without publishing manager identity. Managed local-root
@@ -18375,9 +18774,13 @@ export class AgentSession {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				exactRetirement = await this.#prepareExactMcpControlRetirement();
+				if (exactRetirement && !exactRetirement.canCommit())
+					throw new Error("Exact MCP control retirement changed before session adoption");
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
+				await exactRetirement?.commit();
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
@@ -18458,6 +18861,7 @@ export class AgentSession {
 				// failure is non-destructive. Predecessor gate emitter, provider
 				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
 				// were never mutated before commit, so they survive intact.
+				await exactRetirement?.abort();
 				await this.sessionManager.restoreRollbackState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -20168,12 +20572,21 @@ export class AgentSession {
 			if (autoCompactionSignal.aborted) return { kind: "aborted", source: "signal" };
 			await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
 			if (autoCompactionSignal.aborted) return await emitAborted();
-			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
-			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
-				return await emitAborted();
-			}
+			// Start the workflow projection in parallel with the synchronous compaction
+			// preparation. Overflow recovery often has no eligible history after the
+			// failed assistant is removed; waiting for this filesystem projection before
+			// discovering that no-op would delay the terminal auto_compaction_end event.
+			// The promise is still awaited below so zero-progress tracking remains a
+			// completed side effect for every compaction observation.
+			const compactionStateSnapshotPromise = this.#compactionStateSnapshot({
+				trackWorkflowRecoveryProgress: true,
+			});
 
 			if (compactionSettings.strategy === "handoff" && reason !== "overflow") {
+				await compactionStateSnapshotPromise;
+				if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+					return await emitAborted();
+				}
 				const handoffFocus = AUTO_HANDOFF_THRESHOLD_FOCUS;
 				const handoffResult = await this.handoff(handoffFocus, {
 					autoTriggered: true,
@@ -20226,6 +20639,7 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
+				await compactionStateSnapshotPromise;
 				return { kind: "skipped" };
 			}
 
@@ -20239,6 +20653,7 @@ export class AgentSession {
 					willRetry: false,
 					skipped: true,
 				});
+				await compactionStateSnapshotPromise;
 				return { kind: "skipped" };
 			}
 
@@ -20287,6 +20702,7 @@ export class AgentSession {
 					skipped: true,
 					continuationSkipReason,
 				});
+				await compactionStateSnapshotPromise;
 				if (overflowNoopWouldReplay) {
 					if (continueAfterMaintenance && this.agent.hasQueuedMessages()) {
 						this.#scheduleAgentContinue({
@@ -20325,6 +20741,11 @@ export class AgentSession {
 					this.#scheduleAutoContinuePrompt(generation, true, options?.resourceRunId);
 				}
 				return { kind: "skipped" };
+			}
+
+			const compactionStateSnapshot = await compactionStateSnapshotPromise;
+			if (autoCompactionSignal.aborted || this.#isDisposed || this.#promptGeneration !== generation) {
+				return await emitAborted();
 			}
 
 			let hookCompaction: CompactionResult | undefined;
@@ -20911,6 +21332,11 @@ export class AgentSession {
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return "terminal";
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		// A decode loop is deterministic for the submitted context: replaying the
+		// identical conversation re-trips the guard and re-bills the full context.
+		// Without this the message carries no transport facts and would fall
+		// through to "unknown", which is admitted for bounded retry (#5627).
+		if (message.errorCode === REPETITION_GUARD_ERROR_CODE) return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
@@ -21459,6 +21885,10 @@ export class AgentSession {
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
+		// HTTP/2 observations explain a terminal failure; they do not authorize replay.
+		if (transportFailure?.http2RstCode !== undefined || transportFailure?.nativeErrorCode !== undefined) {
+			return undefined;
+		}
 		// Managed fallback receives authoritative transport facts from the request
 		// boundary. Once those facts classify as other, error prose must not upgrade
 		// the failure into an unbounded transient or quota retry.
@@ -23767,6 +24197,7 @@ export class AgentSession {
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
 			let transitionCleanupCommitted = false;
+			let exactRetirement: PreparedExactMcpRetirement | undefined;
 
 			try {
 				await this.sessionManager.setSessionFile(sessionPath, {
@@ -23931,6 +24362,11 @@ export class AgentSession {
 						previousSessionState.sessionId,
 						previousSessionState.sessionFile,
 					);
+					exactRetirement = await this.#prepareExactMcpControlRetirement();
+					if (exactRetirement && !exactRetirement.canCommit())
+						throw new Error("Exact MCP control retirement changed before session switch commit");
+					await exactRetirement?.commit();
+					transitionCleanupCommitted = true;
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -23959,7 +24395,6 @@ export class AgentSession {
 							);
 						}
 					}
-					transitionCleanupCommitted = true;
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
 					if (ownerShutdownSettled) {
@@ -23998,6 +24433,12 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
+				let exactRetirementAbortError: unknown;
+				try {
+					await exactRetirement?.abort();
+				} catch (abortError) {
+					exactRetirementAbortError = abortError;
+				}
 				// The switch never committed: rotate the manager's endpoint
 				// registration back to the predecessor before restoring it
 				// (review thread P1 — the map key must track the session id).
@@ -24027,7 +24468,12 @@ export class AgentSession {
 						`Session switch rollback aborted: predecessor endpoint "${previousSessionState.sessionId}" is no longer owned by this session.`,
 					);
 				}
-				await this.sessionManager.restoreRollbackState(previousSessionState);
+				let sessionRestoreError: unknown;
+				try {
+					await this.sessionManager.restoreRollbackState(previousSessionState);
+				} catch (restoreError) {
+					sessionRestoreError = restoreError;
+				}
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;
@@ -24081,8 +24527,17 @@ export class AgentSession {
 				this.agent.serviceTier = previousServiceTier;
 				this.#syncTodoPhasesFromBranch();
 				this.#reconnectToAgent();
-				if (restoreMcpError) {
-					throw restoreMcpError;
+				const rollbackErrors = [exactRetirementAbortError, sessionRestoreError, restoreMcpError].filter(
+					value => value !== undefined,
+				);
+				if (rollbackErrors.length > 0) {
+					if (rollbackErrors.length > 1) {
+						throw new AggregateError(
+							[error, ...rollbackErrors],
+							"Session switch and exact MCP rollback both failed",
+						);
+					}
+					throw new AggregateError([error, rollbackErrors[0]], "Session switch rollback failed");
 				}
 				if (unavailableDefaultChainMessage) {
 					this.emitNotice(
@@ -24154,16 +24609,18 @@ export class AgentSession {
 			const prepared = selectedEntry.parentId
 				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
+			let exactRetirement: PreparedExactMcpRetirement | undefined;
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				exactRetirement = await this.#prepareExactMcpControlRetirement();
+				if (exactRetirement && !exactRetirement.canCommit())
+					throw new Error("Exact MCP control retirement changed before session adoption");
 				this.sessionManager.commitPreparedNewSession(prepared);
-				// Branch commits a successor endpoint identity; re-register the
-				// manager under it (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
-				await this.#runToolSessionTransitionCleanups();
+				await exactRetirement?.commit();
 			} catch (error) {
+				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#pendingNextTurnMessages = [];
@@ -24190,8 +24647,6 @@ export class AgentSession {
 			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
 
-			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
-
 			if (!skipConversationRestore) {
 				this.agent.replaceMessages(sessionContext.messages, {
 					historyRewrite: { reason: "session-branch", preserveSeededPrefix: true },
@@ -24201,6 +24656,12 @@ export class AgentSession {
 			}
 
 			this.#resetIrcRosterDeliveryState();
+			// Once committed, establish the successor's identity and prompt boundary
+			// before fallible post-commit integrations. A cleanup or MCP failure must
+			// not leave the next turn running with the parent's messages/session id.
+			this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+			await this.#runToolSessionTransitionCleanups();
+			await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {

@@ -116,6 +116,76 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"deepseek-v4-pro-0813": {
+			"id": "deepseek-v4-pro-0813",
+			"name": "DeepSeek V4 Pro 0813",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
+		"deepseek-v4.1-flash": {
+			"id": "deepseek-v4.1-flash",
+			"name": "DeepSeek V4.1 Flash",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 384000,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
+		},
 		"glm-5": {
 			"id": "glm-5",
 			"name": "GLM-5",
@@ -195,6 +265,42 @@
 				"mode": "effort",
 				"minLevel": "minimal",
 				"maxLevel": "xhigh"
+			}
+		},
+		"glm-5.3": {
+			"id": "glm-5.3",
+			"name": "GLM-5.3",
+			"api": "openai-completions",
+			"provider": "alibaba-token-plan",
+			"baseUrl": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+			"reasoning": true,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 131072,
+			"compat": {
+				"supportsDeveloperRole": false,
+				"supportsReasoningEffort": true,
+				"reasoningContentField": "reasoning_content",
+				"requiresReasoningContentForToolCalls": true
+			},
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
 			}
 		},
 		"kimi-k2.5": {
@@ -46019,9 +46125,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		},
 		"MiniMax-M3[1m]": {
@@ -46044,9 +46150,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		}
 	},
@@ -46239,9 +46345,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		},
 		"MiniMax-M3[1m]": {
@@ -46264,9 +46370,9 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "high",
+				"maxLevel": "high"
 			}
 		}
 	},
@@ -46538,7 +46644,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "high",
 				"maxLevel": "high"
 			}
 		}
@@ -46811,7 +46917,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "high",
 				"maxLevel": "high"
 			}
 		}

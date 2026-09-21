@@ -54,6 +54,34 @@ function createMcpLoadResult(
 		exaApiKeys: [],
 	};
 }
+
+/**
+ * `MCPManager.discoverAndConnect` publishes its catalog into the manager's own
+ * tool snapshot, and deferred session startup reads that snapshot rather than
+ * the call's return value — so a slash control committing mid-flight cannot be
+ * overwritten by a stale startup result (#5690). Mocking the call alone
+ * therefore leaves `getTools()` empty and the deferred startup reports zero
+ * tools with an error. Stub both together and keep the publication faithful to
+ * the real contract: the snapshot becomes readable before the call resolves.
+ */
+
+function mockDeferredExactMcpLoad(discovery: { promise: Promise<MCPLoadResult> }, options?: { once?: boolean }) {
+	let published: CustomTool[] | null = null;
+	// Only the deferred flight's own publication is simulated. Every other
+	// manager — and this one before the flight resolves — keeps the real
+	// snapshot, so unrelated tests in this file are unaffected.
+	const realGetTools = MCPManager.prototype.getTools;
+	vi.spyOn(MCPManager.prototype, "getTools").mockImplementation(function (this: MCPManager) {
+		return published ?? realGetTools.call(this);
+	});
+	const publish = async () => {
+		const result = await discovery.promise;
+		published = result.tools as CustomTool[];
+		return result;
+	};
+	const spy = vi.spyOn(MCPManager.prototype, "discoverAndConnect");
+	return options?.once === false ? spy.mockImplementation(publish) : spy.mockImplementationOnce(publish);
+}
 function createReasoningModel(): Model<"openai-responses"> {
 	return {
 		id: "mock-reasoning",
@@ -198,9 +226,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		authStorage.setRuntimeApiKey("openai", "test-key");
 		const configPath = path.join(tempDir, "deferred-explicit-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		const discoverAndConnect = vi
-			.spyOn(MCPManager.prototype, "discoverAndConnect")
-			.mockImplementation(async () => await discovery.promise);
+		const discoverAndConnect = mockDeferredExactMcpLoad(discovery, { once: false });
 
 		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
@@ -240,7 +266,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			authStorage.setRuntimeApiKey("openai", "test-key");
 			const configPath = path.join(tempDir, "deferred-transition-mcp.json");
 			const discovery = Promise.withResolvers<MCPLoadResult>();
-			vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+			mockDeferredExactMcpLoad(discovery, { once: false });
 			const execute = vi.fn(async () => ({
 				content: [{ type: "text" as const, text: "transition tool executed" }],
 			}));
@@ -283,7 +309,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("reports deferred MCP startup failures generically", async () => {
 		const configPath = path.join(tempDir, "private-deferred-mcp.json");
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+		mockDeferredExactMcpLoad(discovery, { once: false });
 		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
 
 		const { session, startDeferredMcpConfig } = await createAgentSession({
@@ -303,7 +329,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	});
 	it("blocks idle yield delivery until deferred MCP startup completes", async () => {
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementation(async () => await discovery.promise);
+		mockDeferredExactMcpLoad(discovery, { once: false });
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
 			mcpConfigPath: path.join(tempDir, "deferred-idle.json"),
@@ -564,9 +590,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await firstSession.dispose();
 
 			const discovery = Promise.withResolvers<MCPLoadResult>();
-			vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockImplementationOnce(
-				async () => await discovery.promise,
-			);
+			mockDeferredExactMcpLoad(discovery);
 			const resumedManager = await SessionManager.open(sessionFile!, sessionDir);
 			const { session, startDeferredMcpConfig } = await createAgentSession({
 				...createIsolatedSessionOptions(["read", "search_tool_bm25"]),
@@ -597,9 +621,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	});
 	it("does not start or publish deferred MCP tools after disposal begins", async () => {
 		const discovery = Promise.withResolvers<MCPLoadResult>();
-		const discoverAndConnect = vi
-			.spyOn(MCPManager.prototype, "discoverAndConnect")
-			.mockImplementationOnce(async () => await discovery.promise);
+		const discoverAndConnect = mockDeferredExactMcpLoad(discovery);
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
 			mcpConfigPath: path.join(tempDir, "deferred-dispose.json"),

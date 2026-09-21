@@ -214,9 +214,11 @@ export function resetMarkdownHighlightCallCount(): void {
 export const __markdownPerfCounters = {
 	lexerInvocations: 0,
 	lexedBytes: 0,
+	highlightAdmissionScans: 0,
 	reset(): void {
 		this.lexerInvocations = 0;
 		this.lexedBytes = 0;
+		this.highlightAdmissionScans = 0;
 	},
 };
 
@@ -452,6 +454,7 @@ export class Markdown implements Component {
 	}
 
 	#exceedsHighlightCap(code: string): boolean {
+		__markdownPerfCounters.highlightAdmissionScans += 1;
 		// UTF-8 requires at least one byte per UTF-16 code unit, including lone
 		// surrogates. Reject obviously oversized input without scanning or hashing it.
 		if (code.length > MAX_HIGHLIGHT_BYTES) return true;
@@ -467,10 +470,13 @@ export class Markdown implements Component {
 
 	#highlightCodeBlock(code: string, lang: string): string[] | null {
 		if (!this.#theme.highlightCode) return null;
-		if (this.#exceedsHighlightCap(code)) return null;
+		// Avoid building/hashing keys for obviously oversized input. A cache hit
+		// already passed the immutable byte/line caps; only misses need a scan.
+		if (code.length > MAX_HIGHLIGHT_BYTES) return null;
 		const key = `${objectId(this.#theme)}\x00${lang}\x00${code}`;
 		const cached = highlightCache.get(key);
 		if (cached?.lang === lang && cached.code === code) return cached.lines;
+		if (this.#exceedsHighlightCap(code)) return null;
 		highlightCallCount += 1;
 		const result = this.#theme.highlightCode(code, lang || undefined);
 		highlightCache.set(key, { lang, code, lines: result });

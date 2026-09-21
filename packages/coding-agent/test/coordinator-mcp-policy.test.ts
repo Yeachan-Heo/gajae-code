@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	assertCoordinatorArtifactPath,
+	assertCoordinatorSessionLocations,
 	assertCoordinatorWorkdir,
 	buildCoordinatorMcpConfig,
 	requireCoordinatorMutation,
@@ -74,6 +75,30 @@ describe("Hermes MCP safety policy", () => {
 		await expect(assertCoordinatorWorkdir(config, path.join(root, "..", path.basename(outside)))).rejects.toThrow(
 			"coordinator_workdir_outside_allowed_roots",
 		);
+	});
+
+	it("names the escaping persisted location without changing the authority error message", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		const inside = path.join(root, "session");
+		await fs.mkdir(inside, { recursive: true });
+		const config = buildCoordinatorMcpConfig({
+			GJC_SESSION_ID: "coordinator-policy-test-session",
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+		const canonicalOutside = await fs.realpath(outside);
+
+		await expect(assertCoordinatorSessionLocations(config, inside, inside)).resolves.toBeUndefined();
+
+		// isSessionAuthorityError() in server.ts compares the message verbatim, so it must stay exact.
+		const expectEscape = (cwd: string, workspace: string, detail: string) =>
+			expect(assertCoordinatorSessionLocations(config, cwd, workspace)).rejects.toMatchObject({
+				message: "coordinator_workdir_outside_allowed_roots",
+				cause: expect.objectContaining({ message: `outside allowed roots: ${detail}` }),
+			});
+		await expectEscape(outside, inside, `cwd ${canonicalOutside}`);
+		await expectEscape(inside, outside, `workspace ${canonicalOutside}`);
+		await expectEscape(outside, outside, `cwd ${canonicalOutside}, workspace ${canonicalOutside}`);
 	});
 
 	it("authorizes GJC-managed repository-local worktrees under the repository bucket", async () => {

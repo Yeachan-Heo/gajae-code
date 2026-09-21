@@ -1531,6 +1531,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("native-linux-x64");
 	});
 
+	test("AI model catalog sources select their bundled thinking contract tests", () => {
+		const expected = [
+			"test:packages/ai/test/model-thinking.test.ts",
+			"test:packages/ai/test/minimax-thinking.test.ts",
+			"test:packages/ai/test/preset-catalog-models.test.ts",
+		];
+		for (const source of ["packages/ai/src/model-thinking.ts", "packages/ai/src/models.json"]) {
+			const keys = targeted([source]).map(task => task.key);
+			for (const testKey of expected) expect(keys).toContain(testKey);
+		}
+	});
+
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run + workflow-permissions", () => {
 		const tasks = targeted([".github/workflows/dev-ci.yml"]);
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions", "yaml-parse"]);

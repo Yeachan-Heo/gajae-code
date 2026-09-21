@@ -2984,4 +2984,125 @@ describe("session state lock failure diagnostics", () => {
 		expect(shouldWarnPersistFailure("old", diskFullAgain, 30_000)).toBe(true);
 		expect(shouldWarnPersistFailure("current", diskFullAgain, 30_000)).toBe(false);
 	});
+	describe("transition reclaim refusal classifier (#5606)", () => {
+		const claimWith = async (name: string, owner: Record<string, unknown>) => {
+			const { stateFile } = await seededRunningSession(name);
+			const transitionDir = `${stateFile}.lock.transition`;
+			await fs.mkdir(transitionDir, { recursive: true, mode: 0o700 });
+			await Bun.write(`${transitionDir}.owner`, JSON.stringify(owner));
+			return transitionDir;
+		};
+
+		it("names a released tombstone from another installation", async () => {
+			const dir = await claimWith("reclaim-foreign", {
+				pid: 1,
+				start_time: "unknown",
+				token: "foreign-token",
+				owner_host_id: "0".repeat(64),
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_foreign_host",
+			});
+		});
+
+		it("names a released tombstone with no installation identity at all", async () => {
+			const dir = await claimWith("reclaim-unprovenanced", {
+				pid: 1,
+				start_time: "unknown",
+				token: "no-host-token",
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_unprovenanced",
+			});
+		});
+
+		it("names a live owner rather than reporting a bare timeout", async () => {
+			// This process is unambiguously alive, so liveness cannot be disproven.
+			const dir = await claimWith("reclaim-live", {
+				pid: process.pid,
+				start_time: "unknown",
+				token: "live-owner-token",
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "owner_live_or_unverifiable",
+			});
+		});
+
+		it("names an unreadable owner sidecar", async () => {
+			const { stateFile } = await seededRunningSession("reclaim-unreadable");
+			const dir = `${stateFile}.lock.transition`;
+			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+			await Bun.write(`${dir}.owner`, "{ not json");
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "claim_or_owner_unreadable",
+			});
+		});
+
+		it("names a released tombstone still inside its grace window", async () => {
+			// The goal's acceptance names this branch explicitly and it had no test: the
+			// sidecar is written now, so `Date.now() - mtime` is far below
+			// RELEASED_TRANSITION_GRACE_MS and the reclaim must defer rather than refuse
+			// for a different reason (#5606).
+			const dir = await claimWith("reclaim-grace", {
+				pid: 1,
+				start_time: "unknown",
+				token: "grace-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_within_grace",
+			});
+		});
+
+		it("names a claim whose generation changed between inspection and capture", async () => {
+			// Drives the REAL branch rather than handing the enum to the formatter: the
+			// owner is provably dead and past its grace, so the walk reaches the
+			// generation tuple, and the hook mutates the directory in between so the
+			// captured identity can no longer match what was inspected (#5606).
+			const dir = await claimWith("reclaim-generation", {
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "dead-token",
+				owner_host_id: "local-host",
+			});
+			SessionStateLockTestHooks.afterTransitionStaleInspection = async () => {
+				// Touching the claim moves its mtime/ctime, which is exactly the
+				// external-writer race the tuple exists to catch.
+				await fs.utimes(dir, new Date(Date.now() + 5_000), new Date(Date.now() + 5_000));
+			};
+			try {
+				expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+					reclaimed: false,
+					refusal: "claim_generation_changed",
+				});
+			} finally {
+				SessionStateLockTestHooks.afterTransitionStaleInspection = undefined;
+			}
+		});
+
+		it("carries the refusal onto the timeout message as a bounded enum only", () => {
+			const error = sessionStateLock.transitionClaimTimeoutForTests(
+				"/tmp/runtime-state.json.lock.transition",
+				"claim_generation_changed",
+			);
+			expect(error.reason).toBe("transition_claim_timeout");
+			expect(error.message).toContain("(reclaim refused: claim_generation_changed)");
+			// The suffix must never widen into a path, token, host id, pid or errno.
+			expect(error.message.split("(reclaim refused: ")[1]).toBe("claim_generation_changed).");
+		});
+
+		it("leaves the message unchanged when no refusal was ever recorded", () => {
+			const error = sessionStateLock.transitionClaimTimeoutForTests("/tmp/a.lock.transition", undefined);
+			expect(error.message).not.toContain("reclaim refused");
+			expect(error.reason).toBe("transition_claim_timeout");
+		});
+	});
 });

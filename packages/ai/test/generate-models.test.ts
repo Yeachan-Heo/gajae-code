@@ -172,7 +172,7 @@ describe("injectImageGenerationModels", () => {
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
-	it("adds the DeepSeek and Qwen 3.8 Max fallbacks exactly once", () => {
+	it("adds the DeepSeek, GLM-5.3, and Qwen 3.8 Max fallbacks exactly once", () => {
 		const models: Model[] = [];
 
 		injectAlibabaTokenPlanModels(models);
@@ -191,6 +191,33 @@ describe("injectAlibabaTokenPlanModels", () => {
 				reasoning: true,
 				contextWindow: 1_000_000,
 				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "deepseek-v4-pro-0813",
+				name: "DeepSeek V4 Pro 0813",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "deepseek-v4.1-flash",
+				name: "DeepSeek V4.1 Flash",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 384_000,
+			}),
+			expect.objectContaining({
+				id: "glm-5.3",
+				name: "GLM-5.3",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				contextWindow: 1_000_000,
+				maxTokens: 131_072,
 			}),
 			expect.objectContaining({
 				id: "qwen3.8-max",

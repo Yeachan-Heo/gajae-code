@@ -5,6 +5,7 @@ import { logger } from "@gajae-code/utils";
 import {
 	BROKER_LOCK_ARTIFACT_GRACE_MS,
 	Broker,
+	type BrokerLockArtifactRetention,
 	reapStaleBrokerLockArtifacts,
 	setLockArtifactGraceForTest,
 } from "../src/sdk/broker/broker";
@@ -105,7 +106,7 @@ describe("broker lock artifact reaper", () => {
 		expect(result.retained).toEqual([{ path: live, reason: "owner-alive" }]);
 		expect(await exists(path.join(live, "owner.json"))).toBe(true);
 		expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
-			"sdk broker: retained stale lock artifact .broker.lock.stale-live (owner-alive)",
+			"sdk broker: retained 1 stale lock artifact(s) (owner-alive: 1)",
 		]);
 	});
 
@@ -120,21 +121,90 @@ describe("broker lock artifact reaper", () => {
 		expect(result.removed).toEqual([]);
 		expect(result.retained).toEqual([{ path: broken, reason: "owner-record-unreadable" }]);
 		expect(await exists(broken)).toBe(true);
-		expect(warn).toHaveBeenCalledWith(
-			"sdk broker: retained stale lock artifact .broker.lock.stale-broken (owner-record-unreadable)",
-		);
+		expect(warn).toHaveBeenCalledWith("sdk broker: retained 1 stale lock artifact(s) (owner-record-unreadable: 1)");
 	});
 
-	it("keeps a tombstone whose owner record is missing", async () => {
+	it("removes an empty tombstone whose owner record is missing", async () => {
 		const now = Date.now();
 		const agentDir = await makeAgentDir();
 		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-orphan", "no-record", 30 * HOUR_MS, now);
 
 		const result = await reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: () => false });
 
+		expect(result.removed).toEqual([orphan]);
+		expect(result.retained).toEqual([]);
+		expect(await exists(orphan)).toBe(false);
+	});
+
+	it("skips a tombstone that vanishes while checking its emptiness", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-race", "no-record", 30 * HOUR_MS, now);
+		const readdir = vi.spyOn(fs, "readdir");
+		readdir
+			.mockImplementationOnce(async () => [path.basename(orphan)] as never)
+			.mockImplementationOnce(async () => {
+				await fs.rm(orphan, { recursive: true });
+				throw Object.assign(new Error("candidate vanished"), { code: "ENOENT" });
+			});
+
+		await expect(
+			reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: () => false }),
+		).resolves.toEqual({ removed: [], retained: [] });
+		expect(await exists(orphan)).toBe(false);
+	});
+
+	it("keeps a non-empty tombstone whose owner record is missing", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-orphan", "no-record", 30 * HOUR_MS, now);
+		await Bun.write(path.join(orphan, "payload"), "retained evidence");
+		await ageTo(orphan, 30 * HOUR_MS, now);
+
+		const result = await reapStaleBrokerLockArtifacts({ agentDir, now, graceMs: HOUR_MS, pidAlive: () => false });
+
 		expect(result.removed).toEqual([]);
 		expect(result.retained).toEqual([{ path: orphan, reason: "owner-record-missing" }]);
 		expect(await exists(orphan)).toBe(true);
+	});
+
+	it("aggregates retained artifact warnings and keeps path detail at debug", async () => {
+		const now = Date.now();
+		const agentDir = await makeAgentDir();
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const debug = vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const live = await writeArtifact(agentDir, ".broker.lock.stale-live", { pid: process.pid }, 30 * HOUR_MS, now);
+		const broken = await writeArtifact(agentDir, ".broker.lock.stale-broken", "unparseable", 30 * HOUR_MS, now);
+		const orphan = await writeArtifact(agentDir, ".broker.lock.stale-orphan", "no-record", 30 * HOUR_MS, now);
+		await Bun.write(path.join(orphan, "payload"), "retained evidence");
+		await ageTo(orphan, 30 * HOUR_MS, now);
+
+		const result = await reapStaleBrokerLockArtifacts({
+			agentDir,
+			now,
+			graceMs: HOUR_MS,
+			pidAlive: pid => pid === process.pid,
+		});
+
+		expect(result.removed).toEqual([]);
+		const expectedRetained: BrokerLockArtifactRetention[] = [
+			{ path: broken, reason: "owner-record-unreadable" },
+			{ path: live, reason: "owner-alive" },
+			{ path: orphan, reason: "owner-record-missing" },
+		];
+		expect(result.retained.toSorted((left, right) => left.path.localeCompare(right.path))).toEqual(
+			expectedRetained.toSorted((left, right) => left.path.localeCompare(right.path)),
+		);
+		expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
+			"sdk broker: retained 3 stale lock artifact(s) (owner-alive: 1, owner-record-missing: 1, owner-record-unreadable: 1)",
+		]);
+		expect(debug.mock.calls.map(call => String(call[0])).toSorted()).toEqual(
+			[
+				"sdk broker: retained stale lock artifact .broker.lock.stale-broken (owner-record-unreadable)",
+				"sdk broker: retained stale lock artifact .broker.lock.stale-live (owner-alive)",
+				"sdk broker: retained stale lock artifact .broker.lock.stale-orphan (owner-record-missing)",
+			].toSorted(),
+		);
 	});
 
 	it.skipIf(isRoot)("keeps a permission-denied entry, logs it, and still reaps the rest of the pass", async () => {
@@ -152,9 +222,7 @@ describe("broker lock artifact reaper", () => {
 		expect(result.removed).toEqual([reapable]);
 		expect(result.retained).toEqual([{ path: denied, reason: "owner-record-unreadable" }]);
 		expect(await exists(denied)).toBe(true);
-		expect(warn).toHaveBeenCalledWith(
-			"sdk broker: retained stale lock artifact .broker.lock.stale-denied (owner-record-unreadable)",
-		);
+		expect(warn).toHaveBeenCalledWith("sdk broker: retained 1 stale lock artifact(s) (owner-record-unreadable: 1)");
 	});
 
 	it("removes legacy restart and stale backups that carry no owner record", async () => {

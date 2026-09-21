@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { exactUnlink, type NativeExactFileIdentity } from "@gajae-code/natives";
+import { canDeliverSdkEvent } from "./host";
 import type { SessionSdkTransport } from "./session-runtime";
 import type { SdkFrame } from "./types";
 
@@ -67,6 +68,8 @@ export async function createSdkWebSocketTransport(
 	let capabilitiesHandler: ((connectionId: string, capabilities: readonly string[]) => void) | undefined;
 	let server: SdkServer | undefined;
 	const sockets = new Map<string, Socket>();
+	const negotiatedCapabilities = new Map<string, ReadonlySet<string>>();
+	const helloReceived = new Set<string>();
 	const endpointFile = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
 	let endpointIdentity: NativeExactFileIdentity | undefined;
 	let started = false;
@@ -95,6 +98,8 @@ export async function createSdkWebSocketTransport(
 			}
 		}
 		sockets.clear();
+		negotiatedCapabilities.clear();
+		helloReceived.clear();
 		if (current) await stopServer(current);
 	};
 
@@ -190,6 +195,7 @@ export async function createSdkWebSocketTransport(
 								socket.send(JSON.stringify({ type: "hello", connectionId: socket.data.connectionId }));
 							},
 							message(socket, message) {
+								if (sockets.get(socket.data.connectionId) !== socket) return;
 								const raw = String(message);
 								try {
 									const frame = JSON.parse(raw) as SdkFrame;
@@ -204,11 +210,18 @@ export async function createSdkWebSocketTransport(
 										);
 										return;
 									}
-									if (frame.type === "event_replay" && Array.isArray(frame.capabilities)) {
-										capabilitiesHandler?.(
-											socket.data.connectionId,
-											frame.capabilities.filter((value): value is string => typeof value === "string"),
-										);
+									if (
+										frame.type === "hello" &&
+										frame.protocolVersion === 3 &&
+										(frame.capabilities === undefined || Array.isArray(frame.capabilities)) &&
+										!helloReceived.has(socket.data.connectionId)
+									) {
+										const capabilities = Array.isArray(frame.capabilities)
+											? frame.capabilities.filter((value): value is string => typeof value === "string")
+											: [];
+										helloReceived.add(socket.data.connectionId);
+										negotiatedCapabilities.set(socket.data.connectionId, new Set(capabilities));
+										capabilitiesHandler?.(socket.data.connectionId, capabilities);
 									}
 									frameHandler?.(socket.data.connectionId, frame);
 								} catch {
@@ -217,7 +230,10 @@ export async function createSdkWebSocketTransport(
 							},
 							close(socket) {
 								const { connectionId } = socket.data;
+								if (sockets.get(connectionId) !== socket) return;
 								sockets.delete(connectionId);
+								negotiatedCapabilities.delete(connectionId);
+								helloReceived.delete(connectionId);
 								connectionCloseHandler?.(connectionId);
 							},
 						},
@@ -336,6 +352,8 @@ export async function createSdkWebSocketTransport(
 		broadcastFrame(frame) {
 			const json = JSON.stringify(frame);
 			for (const socket of sockets.values()) {
+				const capabilities = negotiatedCapabilities.get(socket.data.connectionId);
+				if (!canDeliverSdkEvent(String(frame.kind), capabilities)) continue;
 				try {
 					socket.send(json);
 				} catch {

@@ -3,6 +3,7 @@ import { isRetiredModelKey } from "../src/model-retirements";
 import { Effort, getSupportedEfforts } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
+import modelsJson from "../src/models.json" with { type: "json" };
 
 function gemini37SiblingId(modelId: string): string {
 	return modelId.replaceAll("gemini-3.6-flash", "gemini-3.7-flash").replaceAll("gemini-3-6-flash", "gemini-3-7-flash");
@@ -217,6 +218,26 @@ describe("preset catalog model entries", () => {
 		}
 	});
 
+	test("pins first-party MiniMax-M3 thinking in the bundled catalog source", () => {
+		const sourceCatalog = modelsJson as Record<string, Record<string, { thinking?: unknown }>>;
+		const selectors = [
+			["minimax", "MiniMax-M3"],
+			["minimax", "MiniMax-M3[1m]"],
+			["minimax-cn", "MiniMax-M3"],
+			["minimax-cn", "MiniMax-M3[1m]"],
+			["minimax-code", "MiniMax-M3"],
+			["minimax-code-cn", "MiniMax-M3"],
+		] as const;
+
+		for (const [provider, id] of selectors) {
+			expect(sourceCatalog[provider]?.[id]?.thinking, `${provider}/${id}`).toEqual({
+				mode: "effort",
+				minLevel: Effort.High,
+				maxLevel: Effort.High,
+			});
+		}
+	});
+
 	test("bundles minimax-code/MiniMax-M3 canonical id (issue #3896)", () => {
 		const model = getBundledModel("minimax-code", "MiniMax-M3");
 
@@ -226,6 +247,6 @@ describe("preset catalog model entries", () => {
 		expect(model.reasoning).toBe(true);
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(128_000);
-		expect(model.thinking).toBeUndefined();
+		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.High, maxLevel: Effort.High });
 	});
 });
