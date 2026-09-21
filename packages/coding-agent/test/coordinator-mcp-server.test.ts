@@ -7400,6 +7400,149 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
 	});
 
+	async function stageDeadHostSession(root: string, sessionId: string) {
+		const controls: SdkControl[] = [];
+		const brokerSessions: Array<Record<string, unknown>> = [
+			{
+				sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				lastHeartbeatAt: Date.now(),
+				endpointGeneration: 1,
+				pid: 404,
+				endpointMtimeMs: 2,
+			},
+		];
+		// Every close attempt reaches the broker, which answers endpoint_stale instead of
+		// closing — what the broker does for an identity-matching row with no live host.
+		const server = await createSdkControlServer(root, controls, [], undefined, brokerSessions, undefined, undefined, {
+			globalResult: (operation, input) =>
+				operation === "session.close" && input.sessionId === sessionId
+					? { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
+					: undefined,
+		});
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: sessionId,
+				cwd: root,
+				idempotency_key: `register-${sessionId}`,
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", `${sessionId}.json`);
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		const record = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...record, ephemeral: true, created_at: staleAt }));
+		await withSessionTransaction(paths, sessionId, async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+		const closeAttempts = () =>
+			controls.filter(
+				control =>
+					control.operation === "session.close" &&
+					(control.input as { sessionId?: string }).sessionId === sessionId,
+			).length;
+		const deletions = async () =>
+			Object.values(
+				(
+					(await withNamespaceRegistry(paths, async registry => JSON.parse(JSON.stringify(registry)))) as {
+						deletions?: Record<string, { deletion_id: string; session_id: string; phase: string }>;
+					}
+				).deletions ?? {},
+			).filter(entry => entry.session_id === sessionId);
+		return { server, brokerSessions, paths, sessionFile, closeAttempts, deletions };
+	}
+
+	it("force-evicts an idle session whose host is gone while the broker still indexes its unchanged endpoint identity", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"dead-host-session",
+		);
+		const walIncarnation = (await readSessionTransaction(paths, "dead-host-session"))?.endpoint?.incarnation;
+		expect(walIncarnation).toMatch(/^[a-f0-9]{64}$/);
+		// The broker keeps the row with the same generation and incarnation but reports no
+		// host behind it and has not heard from one for far longer than its freshness window.
+		// Before the fix each reap surfaced as close_failed, the reaper treated it as
+		// transient, and the session was retried forever without reaching force eviction.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// One close per sweep: a fresh close first, then recovery of the admitted intent.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES);
+		expect(await readSessionTransaction(paths, "dead-host-session")).toBeNull();
+		await expect(Bun.file(transactionPath(paths, "dead-host-session")).exists()).resolves.toBe(false);
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		const recorded = await deletions();
+		expect(recorded).toContainEqual(
+			expect.objectContaining({
+				deletion_id: `force-evict:dead-host-session:${walIncarnation}`,
+				phase: "completed",
+			}),
+		);
+		// The first reap admitted its own delete intent before the broker answered
+		// endpoint_stale. It stays on record, but the completed force-evict record
+		// supersedes it, so a later stop reports the session closed instead of retrying
+		// the dead endpoint forever.
+		expect(recorded.filter(entry => entry.phase !== "completed")).toEqual([
+			expect.objectContaining({ deletion_id: expect.stringMatching(/^delete:dead-host-session:/), phase: "intent" }),
+		]);
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "dead-host-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+	});
+
+	it("never force-evicts a session whose broker row is still live even when every close answers endpoint_stale", async () => {
+		const root = await tempRoot();
+		const { server, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"live-host-session",
+		);
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// Every sweep reached the broker, so the eviction threshold was crossed and refused.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "live-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).map(entry => entry.phase)).toEqual(["intent"]);
+	});
+
+	it("does not force-evict a not-live broker row whose host went silent only recently", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts } = await stageDeadHostSession(
+			root,
+			"quiet-host-session",
+		);
+		// Past the broker's two-interval freshness window, so the row already reads not
+		// live, but nowhere near long enough to rule out a host that is about to resume.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 3 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "quiet-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+	});
+
 	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

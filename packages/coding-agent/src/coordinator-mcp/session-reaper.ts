@@ -57,10 +57,12 @@ export function selectReapableSessions(
 /**
  * Only a stale/absent endpoint makes a session permanently unreapable, so it is
  * the sole failure that advances the force-eviction counter. Every other reap
- * failure (close_failed, broker unavailability, filesystem errors) is transient
- * and must keep retrying without ever escalating to force eviction. The server
- * wires `reapSession` to throw `new Error(reason)`, so the reason code is the
- * error message here.
+ * failure (a close_failed without a stale endpoint, broker unavailability,
+ * filesystem errors) is transient and must keep retrying without ever escalating
+ * to force eviction. The server wires `reapSession` to throw `new Error(reason)`,
+ * except that a close the broker answered with endpoint_stale (close_failed with
+ * that detail) is thrown as endpoint_stale, so the reason code is the error
+ * message here.
  */
 function isEndpointStaleReapError(err: unknown): boolean {
 	return (err instanceof Error ? err.message : String(err)) === "endpoint_stale";
