@@ -6,5 +6,7 @@ described here, it is upstream's and upstream's documentation is authoritative.
 
 - [`design.md`](design.md) — what the judgement lane is for, where it attaches,
   and what has actually been measured about the classifier it depends on.
+- [`replace-sites.md`](replace-sites.md) — the concrete file and line targets, and
+  the sites that must not be touched.
 
 Nothing here has shipped yet.
