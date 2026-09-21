@@ -1491,33 +1491,72 @@ export async function advanceSchedulerCursor(
 export async function readSessionTransaction(
 	paths: CoordinatorStatePaths,
 	sessionId: string,
+	options: { signal?: AbortSignal } = {},
 ): Promise<CoordinatorSessionTransactionV1 | null> {
+	options.signal?.throwIfAborted();
+	const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(transactionPath(paths, sessionId));
+	options.signal?.throwIfAborted();
+	if (!transaction) return null;
+	// Atomic WAL replacement permits lock-free snapshots. Normalize only in
+	// memory; durable report migration belongs to explicit projection recovery.
+	assertTransaction(transaction, path.basename(paths.root), sessionId);
+	return transaction;
+}
+
+export async function repairLegacyReportIds(
+	paths: CoordinatorStatePaths,
+	sessionId: string,
+	options: { signal?: AbortSignal } = {},
+): Promise<CoordinatorSessionTransactionV1 | null> {
+	options.signal?.throwIfAborted();
 	const file = transactionPath(paths, sessionId);
-	return await withFileLock(transactionLockPath(paths, sessionId), async () => {
-		const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
-		if (!transaction) return null;
-		const beforeMigration = digest(JSON.stringify(transaction));
-		assertTransaction(transaction, path.basename(paths.root), sessionId);
-		normalizeOutbox(transaction);
-		if (digest(JSON.stringify(transaction)) !== beforeMigration) {
-			// Legacy report ids and their references are repaired as one durable WAL
-			// transaction. Bump the revision so scheduler/projection consumers cannot
-			// mistake the repaired image for the pre-migration one.
-			transaction.revision += 1;
-			transaction.projection.scheduler_pending_revision = transaction.revision;
-			transaction.projection.scheduler_digest = digest(
-				JSON.stringify({
-					session_id: transaction.session_id,
-					revision: transaction.revision,
-					active: transaction.canonical.queue.active_turn_id !== null,
-					state: transaction.canonical.desired_session_state,
-				}),
+	const snapshot = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+	options.signal?.throwIfAborted();
+	if (!snapshot) return null;
+	const hasLegacyReports = Object.keys(snapshot.canonical?.reports ?? {}).some(
+		reportId => !COORDINATOR_REPORT_ID_PATTERN.test(reportId),
+	);
+	if (!hasLegacyReports) {
+		// Atomic WAL replacement permits lock-free snapshots. In-memory schema
+		// normalization alone must never turn an observation into a durable write.
+		assertTransaction(snapshot, path.basename(paths.root), sessionId);
+		return snapshot;
+	}
+	// Only legacy report rekeying needs a durable repair. Re-read under the lock
+	// so a concurrent writer cannot be overwritten; never wait behind that writer
+	// during namespace observation. The caller can skip a contended peer and retry.
+	return await withFileLock(
+		transactionLockPath(paths, sessionId),
+		async () => {
+			const transaction = await readTransactionJson<CoordinatorSessionTransactionV1>(file);
+			if (!transaction) return null;
+			const legacyReportIds = Object.keys(transaction.canonical?.reports ?? {}).filter(
+				reportId => !COORDINATOR_REPORT_ID_PATTERN.test(reportId),
 			);
 			assertTransaction(transaction, path.basename(paths.root), sessionId);
-			await writeAtomic(file, transaction);
-		}
-		return transaction;
-	});
+			normalizeOutbox(transaction);
+			if (legacyReportIds.some(reportId => !Object.hasOwn(transaction.canonical.reports, reportId))) {
+				// Legacy report ids and their references are repaired as one durable WAL
+				// transaction. Bump the revision so scheduler/projection consumers cannot
+				// mistake the repaired image for the pre-migration one.
+				transaction.revision += 1;
+				transaction.projection.scheduler_pending_revision = transaction.revision;
+				transaction.projection.scheduler_digest = digest(
+					JSON.stringify({
+						session_id: transaction.session_id,
+						revision: transaction.revision,
+						active: transaction.canonical.queue.active_turn_id !== null,
+						state: transaction.canonical.desired_session_state,
+					}),
+				);
+				assertTransaction(transaction, path.basename(paths.root), sessionId);
+				options.signal?.throwIfAborted();
+				await writeAtomic(file, transaction);
+			}
+			return transaction;
+		},
+		{ ...lockOptions(options.signal), retries: 1, retryDelayMs: 0 },
+	);
 }
 
 export async function withSessionTransaction<T>(

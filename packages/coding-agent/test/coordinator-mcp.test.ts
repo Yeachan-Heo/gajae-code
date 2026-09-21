@@ -10,6 +10,7 @@ import McpServe, {
 	formatCoordinatorCheckPayload,
 	probeCoordinatorBrokerCheck,
 } from "../src/commands/mcp-serve";
+import { acquireFileLock, FileLockAcquireError } from "../src/config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -31,8 +32,10 @@ import {
 	initializeCoordinatorNamespace,
 	readSessionTransaction,
 	reconcileCreationRemoteVerifier,
+	repairLegacyReportIds,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
+	transactionLockPath,
 	transactionPath,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -746,7 +749,19 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 				delete event.public_delivery;
 			}
 			await fs.writeFile(file, JSON.stringify(legacy));
-			const migrated = await readSessionTransaction(paths, sessionId);
+			const originalBytes = await Bun.file(file).text();
+			const release = await acquireFileLock(transactionLockPath(paths, sessionId));
+			let migrated: CoordinatorSessionTransactionV1 | null;
+			try {
+				migrated = await readSessionTransaction(paths, sessionId);
+				expect(await Bun.file(file).text()).toBe(originalBytes);
+				await repairLegacyReportIds(paths, sessionId);
+				expect(await Bun.file(file).text()).toBe(originalBytes);
+				const signal = AbortSignal.abort(new Error("read cancelled"));
+				await expect(readSessionTransaction(paths, sessionId, { signal })).rejects.toThrow("read cancelled");
+			} finally {
+				await release();
+			}
 			expect(migrated).toMatchObject({
 				creation_intent_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
 				canonical: {
@@ -1061,6 +1076,17 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 			};
 			await fs.writeFile(file, JSON.stringify(raw));
 			// Before the fix this read threw state_corrupt instead of returning.
+			const release = await acquireFileLock(transactionLockPath(paths, sessionId));
+			try {
+				expect((await readSessionTransaction(paths, sessionId))?.canonical.reports[legacyReportId]).toBeUndefined();
+				await expect(repairLegacyReportIds(paths, sessionId)).rejects.toBeInstanceOf(FileLockAcquireError);
+				await expect(
+					repairLegacyReportIds(paths, sessionId, { signal: AbortSignal.abort(new Error("repair cancelled")) }),
+				).rejects.toThrow("repair cancelled");
+				expect(await Bun.file(file).json()).toEqual(raw);
+			} finally {
+				await release();
+			}
 			const reloaded = await readSessionTransaction(paths, sessionId);
 			if (!reloaded) throw new Error("legacy transaction did not reload");
 			expect(reloaded?.canonical.reports[legacyReportId]).toBeUndefined();
@@ -1075,6 +1101,7 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 			const reportEvent = reloaded.outbox["legacy-report-event"];
 			expect(reportEvent.entity_id).toBe(migratedReportId);
 			expect(reportEvent.payload.report_id).toBe(migratedReportId);
+			await repairLegacyReportIds(paths, sessionId);
 			const persisted = JSON.parse(await fs.readFile(file, "utf8")) as CoordinatorSessionTransactionV1;
 			expect(persisted.canonical.reports[legacyReportId]).toBeUndefined();
 			expect(persisted.requests.operations["report-operation"]?.local_id).toBe(migratedReportId);
@@ -1149,7 +1176,7 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 					after_seq: 0,
 					limit: 50,
 				});
-				expect(watch.ok).toBe(true);
+				expect(watch).toMatchObject({ ok: true });
 				expect(JSON.stringify(watch)).toContain(healthySessionId);
 				expect(JSON.stringify(watch)).toContain(legacySessionId);
 				expect(await fs.stat(path.join(projections, `${legacyReportId}.json`)).catch(() => null)).toBeNull();

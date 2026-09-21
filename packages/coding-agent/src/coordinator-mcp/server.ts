@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
-import { withFileLock } from "../config/file-lock";
+import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -144,6 +144,7 @@ import {
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
+	repairLegacyReportIds,
 	repairProjections,
 	replaceCreationRetirementIntent,
 	rotateClaimedCreationVerifier,
@@ -7618,8 +7619,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await exportRetainedDeliveries(32, options.signal);
 	}
 
-	async function recoverCanonicalSessionProjection(sessionId: string): Promise<void> {
-		const transaction = await readSessionTransaction(questionPaths, sessionId);
+	async function recoverCanonicalSessionProjection(
+		sessionId: string,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
+		const transaction = await repairLegacyReportIds(questionPaths, sessionId, options);
 		if (!transaction) return;
 		const applied = Math.min(
 			transaction.projection.applied_turns_revision,
@@ -7628,10 +7632,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			transaction.projection.applied_active_revision,
 			transaction.projection.applied_events_revision,
 		);
-		if (applied < transaction.revision) await repairCanonicalProjections(sessionId);
+		if (applied < transaction.revision) await repairCanonicalProjections(sessionId, options);
 	}
 
-	async function recoverCanonicalNamespaceProjections(scopedSessionId: string | null = null): Promise<void> {
+	async function recoverCanonicalNamespaceProjections(
+		scopedSessionId: string | null = null,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
 		await ensureQuestionStateReady();
 		const roster = await readSchedulerRoster(questionPaths);
 		const persisted = await fs.readdir(questionPaths.sessions).catch(() => []);
@@ -7646,7 +7653,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const transaction = await readSessionTransaction(questionPaths, sessionId);
 				if (!transaction) continue;
 				await assertPersistedSessionAuthority(transaction.canonical.session);
-				await recoverCanonicalSessionProjection(sessionId);
+				await recoverCanonicalSessionProjection(sessionId, options);
 			} catch (error) {
 				// Degrade per session instead of aborting the namespace sweep: one
 				// unreadable record must not make every coordination read fail.
@@ -7659,7 +7666,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				});
 				const isCorruptWal = error instanceof Error && error.message === "state_corrupt";
 				const isAuthorityFailure = isSessionAuthorityError(error);
-				if (!isCorruptWal && !isAuthorityFailure) throw error;
+				if (!isCorruptWal && !isAuthorityFailure && !isFileLockAcquireTimeout(error)) throw error;
 				if (scopedSessionId === sessionId && !isCorruptWal) throw error;
 			}
 		}
@@ -8721,14 +8728,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						// repair. The fresh journal snapshot below is the first public read after
 						// that repair/export sequence, so events are visible after the caller's
 						// cursor without allowing recovery to erase a terminal observation.
-						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32);
 					} catch (error) {
 						if (!(error instanceof Error && error.message === "resource_gone")) throw error;
 					}
 				} else if (!watchController.signal.aborted && Date.now() < absoluteDeadline) {
-					await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
 					try {
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32, watchController.signal);
 						await reconcileWatchAdmissions(prioritySessionId, reconcileOptions);
 						await reconcileActiveTurnAcknowledgements(
