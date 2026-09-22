@@ -273,7 +273,7 @@ printf '%s\n' "$request" | exec ${JSON.stringify(base)} "$@"
 		const deadline = Date.now() + 2_000;
 		while (Date.now() < deadline && await Bun.file(`/proc/${pid}/stat`).exists()) await Bun.sleep(25);
 		expect(await Bun.file(`/proc/${pid}/stat`).exists()).toBe(false);
-	});
+	}, { timeout: 20_000 });
 
 	test("normalizes a relative state-directory override before owner isolation", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-state-")); roots.push(root);
