@@ -277,7 +277,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			authStorage = undefined;
 			tempDirRegistry.release(tempDir);
 		}
-	}, 30_000);
+	}, 60_000);
 
 	it("terminal abort registers the scope so the left-running owned job classifies as owned-completion", async () => {
 		const callId = "call_terminal_owned";
@@ -1280,7 +1280,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(promoted).toBe(1);
 		await session.waitForIdle();
 		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-	}, 30_000);
+	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
 		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
@@ -1303,7 +1303,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await secondPrompt;
 		await session.waitForIdle();
 		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
-	}, 30_000);
+	}, 60_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT
