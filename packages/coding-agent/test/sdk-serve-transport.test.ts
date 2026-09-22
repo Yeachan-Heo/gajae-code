@@ -5,7 +5,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
-import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
+import { CliParseError } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import { dispatchPublicCommand } from "../src/cli/public-command-entry";
 import {

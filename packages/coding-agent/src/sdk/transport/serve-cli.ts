@@ -1,12 +1,12 @@
 import * as crypto from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
-import { normalizeBrokerInput } from "../broker/broker";
 import {
 	normalizePublicCommandFailure,
 	type PublicCommandDiagnosticCode,
 	PublicCommandFailure,
 } from "../../cli/public-command-errors";
+import { normalizeBrokerInput } from "../broker/broker";
 import type { BrokerDiscovery } from "../broker/discovery";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError, SdkDiscoveryError } from "../client";
