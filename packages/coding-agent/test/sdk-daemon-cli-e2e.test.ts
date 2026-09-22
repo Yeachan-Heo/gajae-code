@@ -153,6 +153,7 @@ describe("SDK session CLI", () => {
 	let checkpointWatermarks = new Map<string, { revision: number; generation: number; seq: number; idle: boolean }>();
 	let failNextFreshCheckpoint: "error" | "transport" | undefined;
 	let failFinalCheckpoint: "error" | "transport" | undefined;
+	let closeEndpointOnFinalCheckpointFailure = false;
 	let finalCheckpointLiveEvents: Record<string, unknown>[] = [];
 	let cursorlessCheckpointRequests = 0;
 	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
@@ -185,6 +186,7 @@ describe("SDK session CLI", () => {
 		checkpointWatermarks = new Map();
 		failNextFreshCheckpoint = undefined;
 		failFinalCheckpoint = undefined;
+		closeEndpointOnFinalCheckpointFailure = false;
 		finalCheckpointLiveEvents = [];
 		cursorlessCheckpointRequests = 0;
 		lastReplayPayload = "";
@@ -420,7 +422,10 @@ describe("SDK session CLI", () => {
 							if (isFinalCheckpoint && failFinalCheckpoint !== undefined) {
 								const failure = failFinalCheckpoint;
 								failFinalCheckpoint = undefined;
-								if (failure === "transport") return;
+								if (failure === "transport") {
+									if (closeEndpointOnFinalCheckpointFailure) socket.close();
+									return;
+								}
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -1040,7 +1045,45 @@ describe("SDK session CLI", () => {
 			expect(output.ok).toBe(false);
 			expect(output.result).toBeUndefined();
 			expect(output.error?.code).toBeString();
-		});
+		}, 60_000);
+	}
+
+	for (const failure of ["error", "transport"] as const) {
+		it(`preserves a terminal tail when final checkpoint mint fails after session close by ${failure}`, async () => {
+			checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+			transcriptRows = [{ id: "boundary", role: "assistant", content: "observed before close" }];
+			explicitReplayEvents = [];
+			earlyLiveEvents = [
+				{
+					type: "event",
+					generation: 1,
+					seq: 1,
+					kind: "session_closed",
+					payload: { type: "session_closed", sessionId: "live" },
+				},
+			];
+			failFinalCheckpoint = failure;
+			closeEndpointOnFinalCheckpointFailure = failure === "transport";
+
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+			const output = JSON.parse(tail.stdout) as {
+				ok?: boolean;
+				result?: { cursor?: string; terminal?: boolean; items?: Array<Record<string, unknown>> };
+				error?: unknown;
+			};
+			expect(output.ok).toBe(true);
+			expect(output.error).toBeUndefined();
+			expect(output.result?.terminal).toBe(true);
+			expect(output.result?.cursor).toBeUndefined();
+			expect(output.result?.items).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ id: "boundary", kind: "transcript" }),
+					expect.objectContaining({ kind: "session_closed", seq: 1 }),
+				]),
+			);
+		}, 60_000);
 	}
 
 	it("freezes live frame collection before minting the returned cursor", async () => {

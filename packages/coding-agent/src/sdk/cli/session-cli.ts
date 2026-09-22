@@ -1850,15 +1850,22 @@ async function runLiveTail(
 				throwResponseFailure(fresh);
 				resumeCursor = extractCheckpoint(fresh).cursor;
 			} catch (error) {
-				if (error instanceof SdkSessionCliError) throw error;
-				throw new SdkSessionCliError(
-					"unavailable",
-					"The host did not return a continuation checkpoint for this tail.",
-					1,
-					{ sessionId },
-				);
+				// A closed session has no next poll that could resume, so preserve the
+				// complete terminal observation even when the host tears down the
+				// connection before it can mint a final cursor. Active and timed-out
+				// tails still fail closed: returning them without a continuation would
+				// let the caller advance past observations it cannot resume.
+				if (liveReason !== "close") {
+					if (error instanceof SdkSessionCliError) throw error;
+					throw new SdkSessionCliError(
+						"unavailable",
+						"The host did not return a continuation checkpoint for this tail.",
+						1,
+						{ sessionId },
+					);
+				}
 			}
-			if (resumeCursor === undefined)
+			if (resumeCursor === undefined && liveReason !== "close")
 				throw new SdkSessionCliError(
 					"unavailable",
 					"The host did not return a continuation cursor for this tail.",

@@ -132,7 +132,10 @@ transcript entries.
   or the event ring dropped entries before the checkpoint.
 - `--until-idle` exits once the current turn reaches a terminal state; a session
   close exits any tail as `terminal: true`, while a bare live tail otherwise
-  remains attached until `--timeout-ms`. Each item carries `revision` (the durable checkpoint revision); the triple `(revision,generation,seq)` is unique for the session, while `generation:seq` alone is revision-local and restarts each accepted prompt — key idempotency on the triple. Lifecycle
+  remains attached until `--timeout-ms`. If the host closes before it can mint
+  the final continuation cursor, the terminal tail still returns all observed
+  items without a cursor because no follow-up poll is possible. Each item carries
+  `revision` (the durable checkpoint revision); the triple `(revision,generation,seq)` is unique for the session, while `generation:seq` alone is revision-local and restarts each accepted prompt — key idempotency on the triple. Lifecycle
   events that carry a `(generation, seq)` position are reconciled and emitted in
   that canonical order rather than arrival order, so a retained terminal event
   from an earlier turn does not complete a newer turn that is still running, and
