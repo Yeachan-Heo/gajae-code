@@ -35,6 +35,7 @@ import {
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
+import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
@@ -878,7 +879,10 @@ export async function runSessionHost(
 	await new Promise<void>(() => {});
 }
 
-export type SdkInternalArgv = { action: "broker-internal"; agentDir: string } | { action: "session-host-internal" };
+export type SdkInternalArgv =
+	| { action: "broker-internal"; agentDir: string }
+	| { action: "session-host-internal" }
+	| { action: "stderr-drain-internal"; logPath: string; maxBytes: number };
 
 /** Parses the exact private argv contracts used by SDK child-process spawns. */
 export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
@@ -891,6 +895,19 @@ export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 		isSafeSdkInternalAgentDir(argv[2])
 	)
 		return { action: "broker-internal", agentDir: argv[2] };
+	if (
+		argv[0] === "stderr-drain-internal" &&
+		argv.length === 5 &&
+		argv[1] === "--path" &&
+		argv[2] &&
+		path.isAbsolute(argv[2]) &&
+		argv[3] === "--max-bytes"
+	) {
+		const maxBytes = parsePositiveTimeout(argv[4], "--max-bytes");
+		if (maxBytes !== undefined && maxBytes <= 64 * 1024) {
+			return { action: "stderr-drain-internal", logPath: argv[2], maxBytes };
+		}
+	}
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
 
@@ -1119,7 +1136,11 @@ export default class Sdk extends Command {
 	static hidden = false;
 	static delegateHelp = true;
 	async run(): Promise<void> {
-		if (this.argv[0] !== "broker-internal" && this.argv[0] !== "session-host-internal") {
+		if (
+			this.argv[0] !== "broker-internal" &&
+			this.argv[0] !== "session-host-internal" &&
+			this.argv[0] !== "stderr-drain-internal"
+		) {
 			const scan = scanPublicCommand("sdk", this.argv);
 			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 			const { args, flags } = scan;
@@ -1217,9 +1238,14 @@ export default class Sdk extends Command {
 			}
 			throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 		}
+
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
+			return;
+		}
+		if (internal.action === "stderr-drain-internal") {
+			await runSdkStderrDrainer(internal.logPath, internal.maxBytes);
 			return;
 		}
 		const agentDir = path.resolve(internal.agentDir);

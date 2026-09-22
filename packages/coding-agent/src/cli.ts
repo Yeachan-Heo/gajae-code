@@ -10,6 +10,7 @@ import {
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
+import { runSdkStderrDrainerFromArgv } from "./sdk/broker/stderr-drainer";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -135,6 +136,17 @@ export async function runCli(argv: string[]): Promise<void> {
 			await completeManagedOwnerRecovery(admission.context);
 			return;
 		}
+	}
+	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
+		// Private lifecycle stderr drainer: must stay ahead of the public sdk family
+		// dispatcher, which would otherwise reject the private argv as a usage error.
+		try {
+			await runSdkStderrDrainerFromArgv(argv.slice(2));
+		} catch {
+			process.stderr.write("gjc sdk: invalid internal stderr drainer invocation\n");
+			process.exitCode = 2;
+		}
+		return;
 	}
 	if (argv[0] === "sdk" || argv[0] === "daemon") {
 		await dispatchPublicFamily(argv);

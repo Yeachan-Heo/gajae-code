@@ -5721,9 +5721,11 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
 		if (!response.ok && response.error.code === "terminal_uncertain") {
-			expect(response.error.message).toBe(
+			expect(response.error.message).toContain(
 				"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
 			);
+			expect(response.error.message).toContain("stage=readiness");
+			expect(response.error.message).toContain("waiting_for=session_ready");
 			const replay = await broker.handleRequest("session.create", input, "profile-cutoff");
 			expect(replay).toEqual(response);
 			return;
@@ -6089,6 +6091,11 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		});
 		const sdkEntries = await fs.readdir(path.join(root, ".gjc", "state", "sdk"));
 		expect(sdkEntries.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
+		// A successful launch retires its startup stderr artifact as soon as the
+		// broker is done reading it; the host's later output must not accumulate
+		// under the agent directory (#5739 review).
+		const agentSdkEntries = await fs.readdir(path.join(agentDir, "sdk"));
+		expect(agentSdkEntries.filter(entry => entry.startsWith("lifecycle-spawn."))).toEqual([]);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
