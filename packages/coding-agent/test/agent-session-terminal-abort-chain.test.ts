@@ -1266,6 +1266,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		let promoted = 0;
 		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		// Queue the client steer while idle: the auto-continue promotes it into
 		// its OWN run, which fires the ownership hook exactly once.
 		await session.sendUserMessage("client steer", {
@@ -1284,6 +1285,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
 		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		const staleToken = session.captureTerminalAbortSteeringSnapshot();
 		expect(staleToken).toBeDefined();
 		const secondPrompt = session.prompt("second turn").catch(() => {});
