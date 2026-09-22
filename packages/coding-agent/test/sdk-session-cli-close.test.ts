@@ -1,5 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import path from "node:path";
+import { PublicCommandFailure, renderPublicCommandFailure } from "../src/cli/public-command-errors";
 import { runSdkSessionCli, type SdkSessionCliDependencies } from "../src/sdk/cli/session-cli";
 
 const captured: { requests: unknown[]; listCalls: number } = { requests: [], listCalls: 0 };
@@ -39,14 +40,26 @@ const AGENT_DIR = path.join("/tmp", "gjc-sdk-session-close-test-agent");
 async function run(args: Record<string, unknown>): Promise<{ outputs: unknown[]; exitCode: number | undefined }> {
 	const outputs: unknown[] = [];
 	let exitCode: number | undefined;
-	await runSdkSessionCli(
-		{ agentDir: AGENT_DIR, ...args } as never,
-		value => outputs.push(value),
-		code => {
-			exitCode = code;
-		},
-		{ lifecycleService: lifecycle },
-	);
+	try {
+		await runSdkSessionCli(
+			{ agentDir: AGENT_DIR, ...args } as never,
+			value => outputs.push(value),
+			code => {
+				exitCode = code;
+			},
+			{ lifecycleService: lifecycle },
+		);
+	} catch (error) {
+		expect(error).toBeInstanceOf(PublicCommandFailure);
+		expect(outputs).toEqual([]);
+		const command = args.action === "close" ? ["sdk", "session", "close"] : ["sdk", "session"];
+		const rendered = await renderPublicCommandFailure(error, { command, json: true });
+		expect(rendered.stderr).toBe("");
+		const envelope = JSON.parse(rendered.stdout);
+		expect(envelope).toMatchObject({ schema: "gjc.command-error", version: 1, ok: false, command });
+		outputs.push(envelope);
+		exitCode = rendered.exitCode;
+	}
 	return { outputs, exitCode };
 }
 
@@ -59,7 +72,10 @@ beforeEach(() => {
 test("close requires a session id before any lifecycle contact", async () => {
 	const { outputs, exitCode } = await run({ action: "close" });
 	expect(exitCode).toBe(2);
-	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "usage" } });
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: { code: "usage", category: "usage", outcomeCertainty: "not-applied", retryability: "no" },
+	});
 	expect(captured.requests).toEqual([]);
 	expect(captured.listCalls).toBe(0);
 });
@@ -71,7 +87,10 @@ test("close refuses a json input whose sessionId contradicts the selected sessio
 		jsonInput: JSON.stringify({ sessionId: "sess-2" }),
 	});
 	expect(exitCode).toBe(2);
-	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: { code: "usage", category: "usage", outcomeCertainty: "not-applied", retryability: "no" },
+	});
 	expect(captured.requests).toEqual([]);
 	expect(captured.listCalls).toBe(0);
 });
@@ -79,7 +98,10 @@ test("close refuses a json input whose sessionId contradicts the selected sessio
 test("close reports a missing session without issuing a lifecycle mutation", async () => {
 	const { outputs, exitCode } = await run({ action: "close", sessionId: "missing-session" });
 	expect(exitCode).toBe(1);
-	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "session_unavailable" } });
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: { code: "endpoint_stale", category: "unavailable", outcomeCertainty: "unknown" },
+	});
 	expect(captured.requests).toEqual([]);
 	expect(captured.listCalls).toBe(1);
 });
@@ -91,7 +113,10 @@ test("close rejects malformed explicit endpoint authority before mutation", asyn
 		jsonInput: JSON.stringify({ endpointGeneration: 3, endpointIncarnation: "not-an-incarnation" }),
 	});
 	expect(exitCode).toBe(2);
-	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: { code: "usage", category: "usage", outcomeCertainty: "not-applied", retryability: "no" },
+	});
 	expect(captured.requests).toEqual([]);
 	expect(captured.listCalls).toBe(0);
 });
@@ -125,7 +150,7 @@ test("an explicit idempotency key wins over the derived one", async () => {
 	expect(captured.requests[0]).toMatchObject({ requestKey: "attempt-7" });
 });
 
-test("a refused close surfaces the broker error and exits nonzero", async () => {
+test("a refused close surfaces an unknown operation outcome and exits nonzero", async () => {
 	executeResult = {
 		ok: false,
 		operation: "session.close",
@@ -134,7 +159,12 @@ test("a refused close surfaces the broker error and exits nonzero", async () => 
 	};
 	const { outputs, exitCode } = await run({ action: "close", sessionId: "sess-1" });
 	expect(exitCode).toBe(1);
-	expect(outputs[0]).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: { code: "operation_failed", category: "operation", outcomeCertainty: "unknown", retryability: "unknown" },
+	});
+	expect(captured.listCalls).toBe(1);
+	expect(captured.requests).toHaveLength(1);
 });
 
 test("endpoint authority passes through when the caller supplies it", async () => {
@@ -150,9 +180,19 @@ test("endpoint authority passes through when the caller supplies it", async () =
 	});
 });
 
-test("an unknown verb still names close in its usage error", async () => {
+test("an unknown verb reports usage and directs callers to session help without lifecycle contact", async () => {
 	const { outputs, exitCode } = await run({ action: "shutdown", sessionId: "sess-1" });
 	expect(exitCode).toBe(2);
-	const error = (outputs[0] as { error: { message: string } }).error;
-	expect(error.message).toContain("close");
+	expect(outputs[0]).toMatchObject({
+		ok: false,
+		error: {
+			code: "usage",
+			category: "usage",
+			outcomeCertainty: "not-applied",
+			retryability: "no",
+			nextSteps: [{ executable: "gjc", argv: ["sdk", "session", "--help"] }],
+		},
+	});
+	expect(captured.requests).toEqual([]);
+	expect(captured.listCalls).toBe(0);
 });
