@@ -3421,7 +3421,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			{ action: "clarify", question: "Does option 1 include execution?" },
 		];
 		for (const payload of payloads) {
-			const rejected = Object.keys(payload).filter((field) => !outer.has(field));
+			const rejected = Object.keys(payload).filter(field => !outer.has(field));
 			expect(rejected).toEqual([]);
 		}
 	});
