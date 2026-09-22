@@ -1343,10 +1343,11 @@ interface CoordinatorToolIdempotencyRecord {
 	request_digest: string;
 	state: "in_progress" | "completed";
 	response?: Record<string, unknown>;
-	/** Set under the key lock before the delegate claims its canonical prompt. Its
-	 * absence on an in-progress receipt proves the prior attempt failed before any
-	 * prompt effect, so a same-key retry may claim afresh instead of sealing uncertain. */
-	delegate_prompt_claim_started?: true;
+	/** Reused-session delegate prompt-claim provenance, written under the key lock:
+	 * `false` when the attempt starts, `true` immediately before the canonical prompt
+	 * claim. A same-key retry may claim afresh only on an explicit `false`; `true` or
+	 * an absent marker (unknown provenance) keeps missing live state fail-closed. */
+	delegate_prompt_claim_started?: boolean;
 	admission?: DelegateAdmissionCheckpoint;
 	delegate_response_pin?: DelegateResponsePinV1;
 	created_at: string;
@@ -9226,6 +9227,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let initialDelegateRequest: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"];
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
+								// Record that this attempt has not claimed a prompt before any step
+								// that can fail transiently. Only this explicit marker lets a same-key
+								// retry claim afresh; a receipt without it has unknown provenance.
+								if (!recovering && outer.value.delegate_prompt_claim_started === undefined)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: false,
+									});
 								const prior = await readSessionTransaction(questionPaths, sessionId);
 								const prompt = prior?.requests.prompts[requestKey];
 								delegateEffectStarted ||= Boolean(prompt && prompt.phase !== "claimed");
@@ -9308,7 +9317,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								if (
 									// The caller cwd guard above prevents cross-workspace reuse; this
 									// comparison fences the persisted endpoint identity itself.
-									!sameCanonicalPath(binding.workspace, persistedBrokerWorkspace, platform) ||
+									!sameCanonicalPath(binding.workspace, bindingWorkspace, platform) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
 								)
@@ -9441,11 +9450,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								// A reused session has no creation authority to recover through, so a
 								// same-key retry after a pre-admission failure (for example a transient
 								// workspace canonicalization error) would otherwise seal as uncertain. The
-								// outer receipt records when a prompt claim began; without that marker no
-								// prompt was ever claimed and this retry may claim afresh. With it, missing
-								// live state is still not proof that nothing was dispatched.
+								// outer receipt records whether a prompt claim began: an explicit `false`
+								// proves none was claimed and this retry may claim afresh. `true` or an
+								// absent marker means missing live state is still not proof that nothing
+								// was dispatched.
 								const requireClaimedPrompt =
-									recovering && (!reusedSessionId || outer.value.delegate_prompt_claim_started === true);
+									recovering && (!reusedSessionId || outer.value.delegate_prompt_claim_started !== false);
 								if (
 									requireClaimedPrompt &&
 									!priorPrompt &&

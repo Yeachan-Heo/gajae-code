@@ -3966,7 +3966,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		) as Record<string, unknown>;
 		expect(receipt.state).toBe("in_progress");
 		expect(receipt.response).toBeUndefined();
-		expect(receipt.delegate_prompt_claim_started).toBeUndefined();
+		expect(receipt.delegate_prompt_claim_started).toBe(false);
 		failCanonicalization = false;
 		// Real clients retry the original key. The failure happened before any prompt
 		// claim, so the same key must recover into a fresh claim, not terminal_uncertain.
@@ -3975,7 +3975,73 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(await server.callTool("gjc_delegate_plan", retryArgs)).toEqual(retried);
 		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
 	}, 20_000);
-	it("seals a same-key delegate retry as uncertain once a prompt claim has started", async () => {
+	it("keeps a marker-less in-progress reused-delegate receipt uncertain on same-key retry", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-legacy",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry over a legacy receipt",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-legacy",
+			allow_mutation: true,
+		};
+		// A receipt written by a coordinator that predates the claim marker: unknown
+		// provenance, so missing live prompt state must not be read as "never claimed".
+		const receiptFile = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+		);
+		// The request digest excludes the idempotency key, so a probe with the same
+		// canonical arguments yields the digest a legacy receipt for retryArgs carries.
+		const probe = await server.callTool("gjc_delegate_plan", {
+			...retryArgs,
+			idempotency_key: "managed-worktree-delegate-legacy-probe",
+		});
+		expect(probe).toMatchObject({ ok: true });
+		const probeReceipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update("managed-worktree-delegate-legacy-probe").digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		await fs.mkdir(path.dirname(receiptFile), { recursive: true });
+		await Bun.write(
+			receiptFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				tool: probeReceipt.tool,
+				key_digest: createHash("sha256").update(retryArgs.idempotency_key).digest("hex"),
+				request_digest: probeReceipt.request_digest,
+				state: "in_progress",
+				created_at: new Date().toISOString(),
+			})}\n`,
+		);
+		const dispatchesBefore = controls.filter(control => control.operation === "turn.follow_up").length;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(dispatchesBefore);
+	}, 20_000);
+	it("refuses a same-key delegate retry as uncertain once a prompt claim has started", async () => {
 		const root = await tempRoot();
 		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
 		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
