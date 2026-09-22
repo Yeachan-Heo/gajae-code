@@ -66,9 +66,12 @@ import {
 } from "./output-meta";
 import { resolveToCwd } from "./path-utils";
 import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
+import { steerFoldReasonLine, watchSteerForFold } from "./steer-fold";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+export { STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "./steer-fold";
 
 function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string {
 	if (offsetBytes <= 0) return text;
@@ -86,19 +89,6 @@ function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
-/**
- * A user steer folds a running foreground bash call only after it has been
- * running at least this long. Shorter commands finish normally and the steer is
- * consumed at the ordinary tool boundary, so a quick `git status` never turns
- * into a background job plus a wake-up turn.
- */
-export const STEER_FOLD_GRACE_MS = 2_000;
-
-/** Model-facing line appended to a steer-folded background-start result. */
-export function steerFoldReasonLine(jobId: string): string {
-	return `Folded into background job ${jobId} because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`;
-}
-
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -1211,62 +1201,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	/**
-	 * Whether a queued user steer may fold the running foreground wait. Mirrors
-	 * the loop's steer admission: `busyPromptMode=queue` never admits a steer
-	 * into the busy run, so it never folds. `toolInterruptPolicy` is
-	 * deliberately NOT a gate: `finish_tools` means "do not kill the batch to
-	 * deliver a steer", and a fold kills nothing. It is the one way to deliver
-	 * the steer now AND let the command finish, so it applies under both
-	 * policies; the policy only decides what the loop does with sibling tools
-	 * after the fold returns. The auto-background setting is likewise not
-	 * consulted: like the chord, a steer fold is a user action.
-	 *
-	 * Fails closed: a session that cannot report newly admitted steering or
-	 * accept a fold request is not steer-foldable.
-	 */
-	#steerFoldEnabled(): boolean {
-		const { waitForUserSteering, requestForegroundBashBackground } = this.session;
-		if (!waitForUserSteering || !requestForegroundBashBackground) return false;
-		return this.session.settings.get("busyPromptMode") === "steer";
-	}
-
-	/**
-	 * Fold `adapter` on the first user steer that ARRIVES after the wait has run
-	 * for {@link STEER_FOLD_GRACE_MS} since `startedAt`. A steer already queued
-	 * when the wait starts, or one that arrives inside the grace window, never
-	 * folds: the command finishes normally and that steer is consumed at the
-	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
-	 * steer still folds, and re-checks the gate at that moment so a
-	 * `busyPromptMode` change during the command is honored.
-	 * Returns a stop function; call it when the wait settles. No-op when steer
-	 * folding is gated off at start.
-	 */
-	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
-		if (!this.#steerFoldEnabled()) return () => {};
-		const waitForSteer = this.session.waitForUserSteering;
-		const requestFold = this.session.requestForegroundBashBackground;
-		if (!waitForSteer || !requestFold) return () => {};
-		const watch = new AbortController();
-		const observe = async (): Promise<void> => {
-			while (!watch.signal.aborted) {
-				await waitForSteer(watch.signal);
-				if (watch.signal.aborted) return;
-				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
-				if (!this.#steerFoldEnabled()) continue;
-				await requestFold("steer", adapter);
-				return;
-			}
-		};
-		observe().catch((error: unknown) => {
-			logger.warn("Steer-triggered fold failed", {
-				jobId: adapter.jobId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		});
-		return () => watch.abort();
-	}
-
-	/**
 	 * Race a managed job against the auto-background threshold, an explicit fold
 	 * (chord / SDK control / steer), and abort. A steer that arrives once the
 	 * command has run for {@link STEER_FOLD_GRACE_MS} requests a `steer` fold,
@@ -1324,7 +1258,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		const stopSteerWatch =
-			backgroundRequest && foldAdapter ? this.#watchSteerForFold(foldAdapter, startedAt) : () => {};
+			backgroundRequest && foldAdapter
+				? watchSteerForFold(this.session, startedAt, fold => fold("steer", foldAdapter), foldAdapter.jobId)
+				: () => {};
 		try {
 			return await Promise.race(waiters);
 		} finally {
@@ -2800,7 +2736,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							resolveForegroundObserver: () => "already-settled",
 						};
 						const unregisterPtyFold = this.session.registerForegroundFoldParticipant?.(ptyFoldAdapter);
-						const stopPtySteerWatch = this.#watchSteerForFold(ptyFoldAdapter, ptyStartedAt);
+						const stopPtySteerWatch = watchSteerForFold(
+							this.session,
+							ptyStartedAt,
+							fold => fold("steer", ptyFoldAdapter),
+							ptyFoldAdapter.jobId,
+						);
 						ptyFoldUnregister = () => {
 							stopPtySteerWatch();
 							unregisterPtyFold?.();
