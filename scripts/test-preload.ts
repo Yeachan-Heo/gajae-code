@@ -76,6 +76,12 @@ const profileMarker = process.env[profileMarkerKey];
 // Only an absent marker lets the resolver classify the current profile.
 const preIsolationXdgEligible = profileMarker !== undefined ? true : getAgentProfileAuthority() === "default";
 process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
+const logDirProvenanceKey = "GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE";
+const logDirProvenance = process.env[logDirProvenanceKey];
+// `undefined` means this is the first preload in the process tree. Once a
+// parent has marked its selected value, equality means the child inherited the
+// pin while inequality means the child explicitly replaced it.
+const inheritedLogDir = logDirProvenance === undefined ? undefined : logDirProvenance === process.env.GJC_LOG_DIR;
 const preIsolationLogEnv = {
 	GJC_LOG_DIR: process.env.GJC_LOG_DIR,
 	GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
@@ -139,12 +145,13 @@ resetAgentDirFromEnvironment();
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so that is honored untouched — but only when that pin is
-// trusted and does not resolve to the canonical shared user sink. A nonblank
-// value is not evidence of intent on its own: Bun overlays `cwd/.env` into
-// `process.env` before any module runs, so a checkout that declares GJC_LOG_DIR
-// would otherwise be honored here and isolation would never happen. The
-// decision (including that distrust rule and the shared-sink guard) lives in
+// on log content), so that is honored untouched when the child replaced its
+// parent's marked value. An unknown or inherited value that resolves to the
+// canonical shared user sink is isolated instead. A nonblank value is not
+// evidence of intent on its own: Bun overlays `cwd/.env` into `process.env`
+// before any module runs, so a checkout that declares GJC_LOG_DIR would
+// otherwise be honored here and isolation would never happen. The decision
+// (including that distrust rule and the shared-sink guard) lives in
 // ./test-log-dir-isolation.ts so it is unit-testable without importing this
 // preload's side effects.
 //
@@ -156,6 +163,7 @@ resetAgentDirFromEnvironment();
 const logIsolation = decideLogDirIsolation({
 	env: preIsolationLogEnv,
 	projectEnv,
+	inheritedLogDir,
 	sharedLogDir: defaultLogDirFor({
 		home: preIsolationHome,
 		env: preIsolationLogEnv,
@@ -180,6 +188,9 @@ if (logIsolation.action === "isolate") {
 		);
 	}
 }
+// Propagate the selected value so a nested preload can distinguish a pin it
+// inherited from its parent from a value the child explicitly supplied.
+process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was
 // destroyed by test cleanup activity; this preload now installs a

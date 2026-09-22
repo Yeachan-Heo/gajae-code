@@ -132,6 +132,28 @@ describe("test log-dir isolation decision", () => {
 		});
 	});
 
+	test("isolates a pin inherited from a parent test preload", () => {
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: "/tmp/parent-test-logs" },
+				projectEnv: snapshot(),
+				inheritedLogDir: true,
+			}),
+		).toEqual({ action: "isolate", reason: "inherited" });
+	});
+
+	test("honors a child-owned pin even when it uses the canonical path", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: shared },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+				inheritedLogDir: false,
+			}),
+		).toEqual({ action: "honor", logDir: shared });
+	});
+
 	test("honors a trusted pin with surrounding whitespace, trimmed", () => {
 		expect(decideLogDirIsolation({ env: { GJC_LOG_DIR: " /tmp/pinned-logs " }, projectEnv: snapshot() })).toEqual({
 			action: "honor",
@@ -430,7 +452,11 @@ describe("preload log-sink behavior (real preload path)", () => {
 		try {
 			const probe = Bun.spawnSync({
 				cmd: [process.execPath, "--preload", preload, "-e", printLogDir],
-				env: childEnv({ HOME: home, GJC_LOG_DIR: shared }),
+				env: childEnv({
+					HOME: home,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
+				}),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -452,7 +478,13 @@ describe("preload log-sink behavior (real preload path)", () => {
 		try {
 			const probe = Bun.spawnSync({
 				cmd: [process.execPath, "--preload", preload, PROBE],
-				env: childEnv({ HOME: home, XDG_STATE_HOME: xdgStateHome, GJC_LOG_DIR: shared, GJC_PROBE_WRITE: "1" }),
+				env: childEnv({
+					HOME: home,
+					XDG_STATE_HOME: xdgStateHome,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
+					GJC_PROBE_WRITE: "1",
+				}),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -485,6 +517,7 @@ describe("preload log-sink behavior (real preload path)", () => {
 					HOME: home,
 					XDG_STATE_HOME: xdgStateHome,
 					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
 					GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "custom",
 					GJC_PROBE_WRITE: "1",
 				}),

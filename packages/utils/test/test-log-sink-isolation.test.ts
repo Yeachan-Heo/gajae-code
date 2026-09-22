@@ -50,14 +50,23 @@ async function countMarkersInDir(logsDir: string): Promise<number> {
 	return count;
 }
 
-test("test logger resolves and writes errors to an isolated sink", async () => {
+test("test logger rejects an inherited operator sink", async () => {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-path-"));
+	const operatorHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-operator-home-"));
+	const operatorXdgStateHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-operator-xdg-"));
 	try {
-		const canonical = path.join(home, ".gjc", "logs");
+		await fs.mkdir(path.join(operatorXdgStateHome, "gjc"), { recursive: true });
+		const inheritedOperatorSink = path.join(operatorHome, ".gjc", "logs");
 		const env: Record<string, string | undefined> = {
 			...process.env,
 			HOME: home,
-			GJC_LOG_DIR: canonical,
+			// Simulate a parent preload that selected this path before the child
+			// switched to its own temporary HOME. The inherited XDG root makes the
+			// two canonical spellings differ, which is the gap the preload must close
+			// rather than letting the pin reach the operator sink.
+			XDG_STATE_HOME: operatorXdgStateHome,
+			GJC_LOG_DIR: inheritedOperatorSink,
+			GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: inheritedOperatorSink,
 			GJC_PROBE_WRITE: "1",
 		};
 
@@ -73,16 +82,54 @@ test("test logger resolves and writes errors to an isolated sink", async () => {
 			proc.exited,
 		]);
 		expect(exitCode, `log probe failed:\n${stdout}\n${stderr}`).toBe(0);
-
 		const result = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
 			effectiveLogsDir: string | null;
 			markerDir: string | null;
 		};
-		expect(result.effectiveLogsDir).not.toBe(canonical);
+		expect(result.effectiveLogsDir).not.toBe(inheritedOperatorSink);
 		expect(path.basename(result.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
 		expect(result.markerDir).toBe(result.effectiveLogsDir);
 		expect(await countMarkersInDir(result.effectiveLogsDir ?? "")).toBeGreaterThan(0);
-		expect(await countMarkerRecords(home)).toBe(0);
+		expect(await countMarkerRecords(operatorHome)).toBe(0);
+	} finally {
+		await Promise.all([
+			fs.rm(home, { recursive: true, force: true }),
+			fs.rm(operatorHome, { recursive: true, force: true }),
+			fs.rm(operatorXdgStateHome, { recursive: true, force: true }),
+		]);
+	}
+}, 30_000);
+
+test("test logger honors an explicitly owned sink under its HOME", async () => {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-owned-home-"));
+	try {
+		const owned = path.join(home, ".gjc", "logs");
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			GJC_LOG_DIR: owned,
+			GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: path.join(home, ".gjc", "parent-logs"),
+			GJC_PROBE_WRITE: "1",
+		};
+		const proc = Bun.spawn([process.execPath, "--preload", PRELOAD, PROBE], {
+			cwd: REPO_ROOT,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, `log probe failed:\n${stdout}\n${stderr}`).toBe(0);
+		const result = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+			effectiveLogsDir: string | null;
+			markerDir: string | null;
+		};
+		expect(result.effectiveLogsDir).toBe(owned);
+		expect(result.markerDir).toBe(owned);
+		expect(await countMarkersInDir(owned)).toBeGreaterThan(0);
 	} finally {
 		await fs.rm(home, { recursive: true, force: true });
 	}

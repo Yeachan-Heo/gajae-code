@@ -20,7 +20,7 @@ export type LogDirIsolationEnv = Record<string, string | undefined>;
 
 export type LogDirIsolationDecision =
 	/** Replace the ambient value with a fresh isolated log sink. */
-	| { action: "isolate"; reason: "absent" | "untrusted" | "shared" }
+	| { action: "isolate"; reason: "absent" | "untrusted" | "shared" | "inherited" }
 	/** Isolation cannot be made to stick; the suite must refuse to run. */
 	| { action: "fail"; reason: "dynamic" }
 	/** An explicit, trusted pin: honor it. */
@@ -81,12 +81,12 @@ function pathsWithinOrEqual(left: string, right: string, realpath: (target: stri
  *
  * Isolation is the default. An ambient `GJC_LOG_DIR` is deferred to only when it
  * is trusted — an operator export or a fixture pin, not something the checkout's
- * dotenv files put there. The canonical shared user sink is never honored,
- * however: a child test process can inherit an operator export that points back
- * to that sink, and test isolation must win over that pin. Bun overlays those
- * files into `process.env` before any module runs, so without this rule a
- * repository could hand the suite a log directory it ships and isolation would
- * silently not happen.
+ * dotenv files put there. An unknown or inherited pin that resolves to the
+ * canonical shared user sink is never honored; a child that explicitly replaces
+ * its parent's marked value may intentionally pin its own sink. Bun overlays
+ * dotenv files into `process.env` before any module runs, so without these
+ * provenance rules a repository could hand the suite a log directory it ships
+ * and isolation would silently not happen.
  *
  * The declaration set is the canonical snapshot production resolves from —
  * `.env`, `.env.$NODE_ENV`, `.env.local` (skipped under `NODE_ENV=test`),
@@ -107,6 +107,7 @@ export function decideLogDirIsolation(input: {
 	env: LogDirIsolationEnv;
 	projectEnv: ProjectEnvSnapshot;
 	sharedLogDir?: string;
+	inheritedLogDir?: boolean;
 	realpath?: (target: string) => string;
 }): LogDirIsolationDecision {
 	const key = canonicalEnvKey("GJC_LOG_DIR");
@@ -127,7 +128,14 @@ export function decideLogDirIsolation(input: {
 	if (input.projectEnv.dynamic.has(key)) return { action: "fail", reason: "dynamic" };
 	const configured = input.env.GJC_LOG_DIR?.trim();
 	if (!configured) return { action: "isolate", reason: "absent" };
+	// A nested test process inherits the parent preload's log-dir pin through its
+	// environment. Environment variables do not carry their origin, so the
+	// preload propagates a value marker and passes the equality result here. A
+	// matching marker means this process did not choose the pin itself; honoring
+	// it would let a child keep writing to a parent's (or the operator's) sink.
+	if (input.inheritedLogDir === true) return { action: "isolate", reason: "inherited" };
 	if (
+		input.inheritedLogDir !== false &&
 		input.sharedLogDir !== undefined &&
 		pathsWithinOrEqual(configured, input.sharedLogDir, input.realpath ?? ((target: string) => fs.realpathSync(target)))
 	)
