@@ -1572,6 +1572,11 @@ export type SendUserMessageHandler = (
 		 * grants root abort ownership.
 		 */
 		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		/**
+		 * Fired synchronously when a plain prompt's dispatch resolves at queue
+		 * time instead of run end (diverted into an in-flight run's steering).
+		 */
+		onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 	},
