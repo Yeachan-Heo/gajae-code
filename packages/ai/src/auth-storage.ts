@@ -4452,6 +4452,7 @@ export class AuthStorage {
 				if (options?.logDetails !== false) {
 					this.#usageLogger?.debug("Usage fetch requested", {
 						providers: [...new Set(requests.map(request => request.provider))].sort(),
+						credentialTypes: [...new Set(requests.map(request => request.credential.type))].sort(),
 						credentials: requests.length,
 					});
 					if (options?.logIdentity === true) {
@@ -4495,7 +4496,10 @@ export class AuthStorage {
 											this.#getUsageReportScopeAccountId(report),
 									),
 								}))
-							: { count: resolved.length },
+							: {
+								count: resolved.length,
+								providers: [...new Set(resolved.map(report => report.provider))].sort(),
+							},
 					});
 				}
 				return resolved;
