@@ -161,6 +161,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		MCPManager.resetForTests();
+		await modelRegistry.dispose();
 		authStorage.close();
 		setAgentDir(originalAgentDir);
 		if (tempDir && fs.existsSync(tempDir)) {
