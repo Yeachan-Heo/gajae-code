@@ -125,6 +125,10 @@ const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
 /// replay report the authoritative sequence gap instead of buffering forever.
 const MAX_QUEUED_DIRECTED_FRAMES: usize = 256;
 
+/// Diagnostic frame kind used when the response ceiling rejects input before
+/// parsing can safely inspect its envelope.
+const OVERSIZED_DIRECTED_FRAME_KIND: &str = "oversized";
+
 /// Commands serialized through the owning connection task.
 #[derive(Debug)]
 enum DirectCommand {
@@ -562,7 +566,8 @@ pub struct DirectedDeliveryError {
 	pub session_id:    String,
 	/// The requested destination connection id.
 	pub connection_id: String,
-	/// Safe protocol kind extracted from the envelope, never the payload.
+	/// Safe protocol kind extracted from the envelope, or a bounded sentinel
+	/// when the response ceiling rejects input before envelope parsing.
 	pub frame_kind:    String,
 	/// Serialized frame size in bytes.
 	pub frame_bytes:   usize,
@@ -1139,16 +1144,16 @@ impl ServerHandle {
 		json: String,
 	) -> Result<String, DirectedDeliveryError> {
 		let frame_bytes = json.len();
-		let frame_kind = directed_frame_kind(&json);
 		if frame_bytes > RESPONSE_CEILING_BYTES {
 			return Err(self.directed_delivery_error(
 				DirectedDeliveryErrorKind::OversizedFrame,
 				connection_id,
-				frame_kind,
+				OVERSIZED_DIRECTED_FRAME_KIND.to_owned(),
 				frame_bytes,
 				None,
 			));
 		}
+		let frame_kind = directed_frame_kind(&json);
 		let prerequisite_digest = directed_prerequisite_digest(&json).ok_or_else(|| {
 			self.directed_delivery_error(
 				DirectedDeliveryErrorKind::InvalidFrame,
@@ -1191,16 +1196,16 @@ impl ServerHandle {
 		json: String,
 	) -> Result<String, DirectedDeliveryError> {
 		let frame_bytes = json.len();
-		let frame_kind = directed_frame_kind(&json);
 		if frame_bytes > RESPONSE_CEILING_BYTES {
 			return Err(self.directed_delivery_error(
 				DirectedDeliveryErrorKind::OversizedFrame,
 				connection_id,
-				frame_kind,
+				OVERSIZED_DIRECTED_FRAME_KIND.to_owned(),
 				frame_bytes,
 				None,
 			));
 		}
+		let frame_kind = directed_frame_kind(&json);
 		let (json, requires_tool_activity) = validate_directed_frame(json).ok_or_else(|| {
 			self.directed_delivery_error(
 				DirectedDeliveryErrorKind::InvalidFrame,
@@ -2948,6 +2953,7 @@ mod tests {
 			"x".repeat(RESPONSE_CEILING_BYTES),
 		);
 		let oversized_bytes = oversized_json.len();
+		let oversized_with_receipt_json = oversized_json.clone();
 		let oversized = handle
 			.send_to("missing", oversized_json)
 			.expect_err("oversized JSON must be rejected");
@@ -2955,7 +2961,17 @@ mod tests {
 			&oversized,
 			DirectedDeliveryErrorKind::OversizedFrame,
 			"missing",
-			"query_response",
+			OVERSIZED_DIRECTED_FRAME_KIND,
+			oversized_bytes,
+		);
+		let oversized_with_receipt = handle
+			.send_to_with_receipt("missing", oversized_with_receipt_json)
+			.expect_err("oversized JSON must be rejected before receipt parsing");
+		assert_context(
+			&oversized_with_receipt,
+			DirectedDeliveryErrorKind::OversizedFrame,
+			"missing",
+			OVERSIZED_DIRECTED_FRAME_KIND,
 			oversized_bytes,
 		);
 
