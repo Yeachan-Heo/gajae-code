@@ -1787,8 +1787,14 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The branch-protection rollout contract is documented in the workflow.
 	expect(workflow).toContain("Branch-protection rollout contract");
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
-	// instead of failing the job on the 404.
-	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// instead of failing the job on the 404. Every other lookup failure must fail
+	// validation, rather than preserving an old approval as if this were an issue.
+	expect(workflow).toContain('if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then');
+	expect(workflow).toContain('grep -qF "HTTP 404" "$lookup_error"');
+	expect(workflow).toContain('exit "$lookup_status"');
+	// The automatic approval job never runs for comment events: its job check binds to
+	// the default-branch SHA, so any verdict it published landed on `main` (#5694).
+	expect(workflow).toContain("if: ${{ always() && github.event_name != 'issue_comment' }}");
 	// A trusted base missing ANY required validator capability can never authorize.
 	// One marker was not enough: `main` carried the self-review validator but not the
 	// approval freshness rule, so a comment-triggered re-validation ran the old
@@ -1882,6 +1888,92 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
 	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
+});
+
+test("issue-comment PR lookup skips only confirmed 404 and fails closed for other errors", async () => {
+	const document = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+	};
+	const resolver = document.jobs?.validate?.steps?.find(step => step.name === "Resolve PR head/base from the event or the comment's PR");
+	if (!resolver?.run) throw new Error("Missing PR resolver run block");
+	// Exercise the checked-in resolver itself with only the event expressions bound to
+	// fixture values. The fake gh command returns a real 404-shaped failure or a
+	// transient non-404 failure; no duplicate classifier is used in the test.
+	const script = resolver.run
+		.replaceAll("${{ github.event.pull_request.number }}", "")
+		.replaceAll("${{ github.event.pull_request.head.repo.full_name }}", "owner/repo")
+		.replaceAll("${{ github.event.pull_request.head.sha }}", "b".repeat(40))
+		.replaceAll("${{ github.event.pull_request.base.sha }}", "a".repeat(40))
+		.replaceAll("${{ github.event.issue.number }}", "123")
+		.replaceAll("${{ github.repository }}", "owner/repo");
+
+	async function runResolver(errorText: string, status: number): Promise<{ exitCode: number; output: string; stderr: string }> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pr-validation-lookup-"));
+		try {
+			const bin = path.join(root, "bin");
+			await fs.mkdir(bin);
+			const gh = path.join(bin, "gh");
+			await fs.writeFile(gh, `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(errorText)} >&2\nexit ${status}\n`, { mode: 0o755 });
+			const output = path.join(root, "github-output");
+			await fs.writeFile(output, "");
+			const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+			const child = Bun.spawn(["bash", "-e", "-u", "-o", "pipefail", "-c", script], {
+				cwd: root,
+				env: {
+					...inheritedEnv,
+					PATH: `${bin}:${inheritedEnv.PATH ?? ""}`,
+					RUNNER_TEMP: root,
+					GITHUB_OUTPUT: output,
+					COMMENT_BODY: "",
+					COMMENT_PREVIOUS_BODY: "",
+					COMMENT_AUTHOR: "",
+					PR_AUTHOR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			return { exitCode: await child.exited, output: await Bun.file(output).text(), stderr: `${stdout}${stderr}` };
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	const notFound = await runResolver("gh: Not Found (HTTP 404)", 1);
+	expect(notFound.exitCode).toBe(0);
+	expect(notFound.output).toContain("skip=true");
+
+	const transientFailure = await runResolver("gh: Service Unavailable (HTTP 503)", 1);
+	expect(transientFailure.exitCode).not.toBe(0);
+	expect(transientFailure.output).not.toContain("skip=true");
+	expect(transientFailure.stderr).toContain("HTTP 503");
+});
+
+test("issue_comment events never run the default-SHA merge-approval job", async () => {
+	const workflow = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { outputs?: Record<string, string>; if?: string; steps?: Array<{ name?: string; if?: string }> }>;
+	};
+	const validate = workflow.jobs?.validate;
+	const mergeApproval = workflow.jobs?.["merge-approval"];
+
+	// issue_comment runs from the default branch, so the automatic job check is bound
+	// to `main`, never to the PR head. Gating on the resolver's skip output was not
+	// enough: a dev-PR comment awaiting approval, a failed validation, or a non-404
+	// lookup error (where no skip is written) all still published a red "Merge
+	// approval" on `main` (#5694, Codex P1/P2). The exclusion must therefore be by
+	// event name, with nothing left for the resolver to opt into.
+	expect(mergeApproval?.if).toBe("${{ always() && github.event_name != 'issue_comment' }}");
+	expect(validate?.outputs).toEqual({ merge_authorized: "${{ steps.validate.outputs.merge_authorized }}" });
+	// The exact-head verdict for comment events comes from the head-bound check-run
+	// publication in the validate job, which is the only path that names the PR head.
+	const publish = validate?.steps?.find(step => step.name === "Publish head-bound check results for comment-triggered validation");
+	expect(publish?.if).toBe("${{ always() && github.event_name == 'issue_comment' && steps.pr.outputs.skip != 'true' }}");
+	// PR-bound events keep the fail-closed automatic gate: nothing but the event name
+	// may switch it off, so a failed or cancelled contract still yields a red approval.
+	expect(mergeApproval?.if).not.toContain("needs.validate.outputs");
 });
 
 test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
@@ -2551,12 +2643,15 @@ test("the merge-approval gate is a separate, fail-closed check in both workflows
 	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
 	expect(devCi).toContain("throw new Error(`Stale verdict digest");
 	expect(devCi).toContain("merge-approved cannot be self-approved");
-	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
-	// job as Success for required checks, so `needs:` alone would publish a green
-	// approval check for a red contract; always() plus an explicit result test cannot.
+	// Fail closed on a failed/cancelled upstream job. GitHub reports a SKIPPED job as
+	// Success for required checks, so `needs:` alone would publish a green approval
+	// check for a red contract; always() plus an explicit result test cannot. Both
+	// gates are switched off only by event name: the Dev CI gate for anything but a
+	// pull_request, the PR-contract gate for issue_comment runs whose job check would
+	// bind to the default-branch SHA rather than the PR head (#5694).
 	expect(prContract).toContain("needs: [validate]");
 	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
-	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() && github.event_name != 'issue_comment' }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
 		expect(workflow).toContain(guard);
 		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
 		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');

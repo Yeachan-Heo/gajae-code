@@ -416,6 +416,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 			GJC_AGENT_DIR: agentDir,
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_SESSION_ID: sessionId,
+			GJC_STATE_ROOT: stateRoot,
 			GJC_LIFECYCLE_REQUEST_ID: "subprocess-proof",
 			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
 		},
@@ -5601,6 +5602,7 @@ test("session-host-internal exits with a sanitized startup failure before writin
 				GJC_AGENT_DIR: agentDir,
 				GJC_CODING_AGENT_DIR: agentDir,
 				GJC_SESSION_ID: sessionId,
+				GJC_STATE_ROOT: stateRoot,
 				GJC_LIFECYCLE_REQUEST_ID: "startup-failure-proof",
 				GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify({
 					operation: "session.create",
