@@ -89,12 +89,6 @@ function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
-/**
- * A user steer folds a running foreground bash call only after it has been
- * running at least this long. Shorter commands finish normally and the steer is
- * consumed at the ordinary tool boundary, so a quick `git status` never turns
- * into a background job plus a wake-up turn.
- */
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -1265,12 +1259,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		const stopSteerWatch =
 			backgroundRequest && foldAdapter
-				? watchSteerForFold(
-						this.session,
-						startedAt,
-						() => this.session.requestForegroundBashBackground!("steer", foldAdapter),
-						foldAdapter.jobId,
-					)
+				? watchSteerForFold(this.session, startedAt, fold => fold("steer", foldAdapter), foldAdapter.jobId)
 				: () => {};
 		try {
 			return await Promise.race(waiters);
@@ -2750,7 +2739,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						const stopPtySteerWatch = watchSteerForFold(
 							this.session,
 							ptyStartedAt,
-							() => this.session.requestForegroundBashBackground!("steer", ptyFoldAdapter),
+							fold => fold("steer", ptyFoldAdapter),
 							ptyFoldAdapter.jobId,
 						);
 						ptyFoldUnregister = () => {

@@ -22,7 +22,7 @@ import {
 	type ToolUIColor,
 	type ToolUIStatus,
 } from "./render-utils";
-import { steerFoldAwaitReasonLine, watchSteerForFold } from "./steer-fold";
+import { foldAwaitReasonLine, watchSteerForFold } from "./steer-fold";
 import { ToolError } from "./tool-errors";
 
 const jobSchema = z.object({
@@ -243,8 +243,12 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		const waitMs = parseWaitDurationMs(this.session.settings.get("async.pollWaitDuration"));
 		const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
 		const timeoutHandle = setTimeout(() => timeoutResolve(), waitMs);
-		const foldedAwait = Promise.withResolvers<{ ids: string[] }>();
-		const foldedJobIds = new Set<string>();
+		// Settled by `detachObserver` the moment ANY fold moves one of the watched
+		// waits, so the await never outlives its own fold. `job-await` adapters are
+		// never implicit chord / SDK-control targets (the jobs are already in the
+		// background); only the steer watcher below folds them, explicitly.
+		const foldedAwait = Promise.withResolvers<void>();
+		const foldedJobs = new Map<string, FoldReason>();
 		const foldAdapters: FoldAdapter[] = [];
 		const unregisterFoldAdapters: Array<() => void> = [];
 		const startedAt = Date.now();
@@ -272,7 +276,8 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 					if (detached) return "already-settled";
 					detached = true;
 					manager.markBackgrounded(job.id, generation, receipt.reason);
-					foldedJobIds.add(job.id);
+					foldedJobs.set(job.id, receipt.reason);
+					foldedAwait.resolve();
 					return "resolved";
 				},
 				resolveForegroundObserver: () => (detached ? "already-settled" : "resolved"),
@@ -280,22 +285,13 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			foldAdapters.push(adapter);
 			unregisterFoldAdapters.push(this.session.registerForegroundFoldParticipant?.(adapter) ?? (() => {}));
 		}
+		// Fold every watched wait on one steer; each fold that lands settles the
+		// await through `detachObserver`, which is the single place that records a
+		// folded job and its real reason.
 		const stopSteerWatch =
 			foldAdapters.length > 0
-				? watchSteerForFold(this.session, startedAt, async () => {
-						const outcomes = await Promise.all(
-							foldAdapters.map(adapter => this.session.requestForegroundBashBackground!("steer", adapter)),
-						);
-						for (const [index, folded] of outcomes.entries()) {
-							if (!folded) continue;
-							const job = runningJobs[index];
-							if (!job) continue;
-							manager.markBackgrounded(job.id, job.generation, "steer");
-							foldedJobIds.add(job.id);
-						}
-						if (outcomes.some(Boolean) && foldedJobIds.size > 0) {
-							foldedAwait.resolve({ ids: [...foldedJobIds] });
-						}
+				? watchSteerForFold(this.session, startedAt, async fold => {
+						await Promise.all(foldAdapters.map(adapter => fold("steer", adapter)));
 					})
 				: () => {};
 		racePromises.push(timeoutPromise);
@@ -362,13 +358,11 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			cancelOutcomes,
 			this.#readOutputTails(manager, params.tail, ownerFilter),
 		);
-		if (foldedJobIds.size > 0) {
+		if (foldedJobs.size > 0) {
 			const existingText = result.content.find(block => block.type === "text")?.text ?? "";
 			return {
 				...result,
-				content: [
-					{ type: "text", text: `${existingText}\n\n${steerFoldAwaitReasonLine([...foldedJobIds])}`.trim() },
-				],
+				content: [{ type: "text", text: `${existingText}\n\n${foldAwaitReasonLine(foldedJobs)}`.trim() }],
 			};
 		}
 		return result;

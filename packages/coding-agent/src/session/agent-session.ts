@@ -10923,7 +10923,10 @@ export class AgentSession {
 		reason: FoldReason = "chord",
 		adapter?: FoldAdapter,
 	): Promise<ForegroundFoldOutcome> {
-		if (!this.#foldCoordinator.hasFoldableParticipant()) {
+		// An explicit adapter (the steer watcher naming its own wait) is validated by
+		// the coordinator's registration-bound identity check; only the implicit
+		// chord / SDK-control path needs a targetable participant to exist.
+		if (!adapter && !this.#foldCoordinator.hasFoldableParticipant()) {
 			return this.#hasRunningFoldedJob() ? { status: "already_backgrounded" } : { status: "no_active_bash" };
 		}
 		try {
