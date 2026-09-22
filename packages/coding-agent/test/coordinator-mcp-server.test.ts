@@ -43,6 +43,11 @@ import {
 import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
+import {
+	BrokerWorkflowGateEmitter,
+	FileGateStore,
+	MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -4165,6 +4170,75 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			questions: [],
 			diagnostics: [],
 			reconciliation: { attempted: true, complete: true, revision: "accepted-diagnostic", reason: null },
+		});
+	});
+
+	it("bounds accepted Q12 diagnostics so reconciliation stays complete", async () => {
+		const root = await tempRoot();
+		const emitter = new BrokerWorkflowGateEmitter(
+			"visible-session",
+			new FileGateStore(path.join(root, ".gjc", "state", "workflow-gates.json")),
+		);
+		const acceptedGateIds: string[] = [];
+		for (let index = 0; index < MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS + 1; index++) {
+			const continuation = emitter.emitGate({
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			});
+			const pending = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+			if (!pending) throw new Error("Q12 did not expose the pending gate");
+			emitter.prepareTerminalization!(pending.gate_id, "not_published");
+			await emitter.resolveGate!({
+				gate_id: pending.gate_id,
+				answer: "approve",
+				idempotency_key: `accepted-q12-bound-${index}`,
+			});
+			await expect(continuation).resolves.toBe("approve");
+			acceptedGateIds.push(pending.gate_id);
+		}
+
+		const accepted = emitter.listWorkflowGateQueryRecords!().filter(record => record.tag === "accepted");
+		expect(accepted).toHaveLength(MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS);
+		expect(accepted.map(record => record.gate_id)).toEqual(
+			acceptedGateIds.slice(-MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS).reverse(),
+		);
+
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: emitter.listWorkflowGateQueryRecords!(),
+							complete: true,
+							revision: "accepted-q12-bound",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "reconcile bounded accepted diagnostics",
+			idempotency_key: "accepted-q12-bound-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-q12-bound", reason: null },
 		});
 	});
 

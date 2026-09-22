@@ -36,6 +36,9 @@ export type PersistedResolutionOrigin =
 	| { kind: "generic"; channel: "sdk" | "other" }
 	| { kind: "telegram_notification"; interactionActionId: string };
 
+/** Keep accepted diagnostics below the coordinator's cumulative Q12 snapshot cap. */
+export const MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS = 32;
+
 export type PersistedAckPolicy =
 	| { kind: "none"; reason: "non_telegram" | "semantic_noncommit" | "legacy_unproven" }
 	| {
@@ -1488,9 +1491,10 @@ export class WorkflowGateBroker {
 			.filter((record): record is PersistedGate & { status: "accepted" } => record.status === "accepted")
 			.sort(
 				(left, right) =>
-					(left.resolution?.resolved_at ?? "").localeCompare(right.resolution?.resolved_at ?? "") ||
-					left.gate.gate_id.localeCompare(right.gate.gate_id),
+					(right.resolution?.resolved_at ?? "").localeCompare(left.resolution?.resolved_at ?? "") ||
+					right.gate.gate_id.localeCompare(left.gate.gate_id),
 			)
+			.slice(0, MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS)
 			.map(record => ({
 				...record.gate,
 				id: `diagnostic:${record.gate.gate_id}`,
