@@ -52,7 +52,7 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 } from "./types";
-import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
+import { MCPExpectedFailure, MCPHttpRequestError, MCPJsonRpcError, MCPNotificationMethods } from "./types";
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
@@ -149,6 +149,22 @@ export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedM
 	const timeout = config.timeout;
 	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return false;
 	return elapsedMs < timeout;
+}
+
+/** Keep startup logs bounded and free of remote response text. */
+function classifyMCPStartupFailure(error: unknown): string {
+	if (error instanceof MCPHttpRequestError) {
+		return Number.isInteger(error.status) && error.status >= 100 && error.status <= 599
+			? `http-status:${error.status}`
+			: "http-request-error";
+	}
+	if (error instanceof MCPJsonRpcError) {
+		return Number.isInteger(error.code) && Math.abs(error.code) <= 1_000_000
+			? `json-rpc-code:${error.code}`
+			: "json-rpc-error";
+	}
+	if (error instanceof MCPExpectedFailure) return "expected-mcp-failure";
+	return "transport-error";
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
@@ -1341,52 +1357,52 @@ export class MCPManager {
 					);
 				}
 
-				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
-				if (pendingWithoutCache.length > 0) {
-					// The startup wait elapsing means "stop blocking session start", not
-					// "this server failed". A server whose operator declared a `timeout`
-					// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
-					// is still inside that window it keeps connecting in the background
-					// under `connectToServer`'s own timeout, and the background tool load
-					// adopts it. Only a server that declared no window, or already spent it,
-					// is torn down and reported. Exact-config (`toolsOnly`) startup still
-					// fails fast: it builds a catalog once, so a missing server is an error.
-					const startupElapsedMs = Date.now() - startupStartedAt;
-					for (const task of pendingWithoutCache) {
-						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
-							logger.warn("MCP server still connecting after the startup wait", {
-								path: `mcp:${task.name}`,
-								serverName: task.name,
-								startupWaitMs: startupTimeoutMs,
-								declaredTimeoutMs: task.config.timeout,
-							});
-							continue;
-						}
-						const message = `MCP server connection timed out during startup: ${task.name}`;
-						if (!this.#toolsOnly) {
-							logger.warn("MCP server connection timed out during startup", {
-								path: `mcp:${task.name}`,
-								serverName: task.name,
-								startupWaitMs: startupTimeoutMs,
-								declaredTimeoutMs: task.config.timeout,
-								remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
-							});
-						}
-						errors.set(task.name, this.#serverError(message));
-						reportedErrors.add(task.name);
-						task.connectionAbort.abort(new Error(message));
-						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
-						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
-							this.#pendingToolLoads.delete(task.name);
-						this.#pendingConnectionControllers.delete(task.name);
-						void this.#disconnectServer(task.name).catch(error => {
-							this.#logLeaseReleaseFailure(task.name, undefined, error);
+				// Cached tools are only a fallback snapshot; they do not exempt the live
+				// connection from the startup cleanup contract. The startup wait elapsing
+				// means "stop blocking session start", not "this server failed". A server
+				// whose operator declared a `timeout` (`gjc mcp add --timeout`) asked to
+				// wait that long for it, so while it is still inside that window it keeps
+				// connecting in the background under `connectToServer`'s own timeout, and
+				// the background tool load adopts it. Only a server that declared no
+				// window, or already spent it, is torn down and reported. Exact-config
+				// (`toolsOnly`) startup still fails fast: it builds a catalog once, so a
+				// missing server is an error.
+				const startupElapsedMs = Date.now() - startupStartedAt;
+				for (const task of pendingTasks) {
+					if (task.tracked.status !== "pending") continue;
+					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
+						logger.warn("MCP server still connecting after the startup wait", {
+							path: `mcp:${task.name}`,
+							serverName: task.name,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+						});
+						continue;
+					}
+					const message = `MCP server connection timed out during startup: ${task.name}`;
+					if (!this.#toolsOnly) {
+						logger.warn("MCP server connection timed out during startup", {
+							path: `mcp:${task.name}`,
+							serverName: task.name,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+							remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
 						});
 					}
-					// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
-					// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
-					// registered if it eventually connects.
+					errors.set(task.name, this.#serverError(message));
+					reportedErrors.add(task.name);
+					task.connectionAbort.abort(new Error(message));
+					if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
+					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
+						this.#pendingToolLoads.delete(task.name);
+					this.#pendingConnectionControllers.delete(task.name);
+					void this.#disconnectServer(task.name).catch(error => {
+						this.#logLeaseReleaseFailure(task.name, undefined, error);
+					});
 				}
+				// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
+				// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
+				// registered if it eventually connects.
 			}
 
 			for (const task of connectionTasks) {
@@ -1423,7 +1439,7 @@ export class MCPManager {
 						logger.warn("MCP server connection failed during startup", {
 							path: `mcp:${name}`,
 							serverName: name,
-							error: message,
+							error: classifyMCPStartupFailure(reason),
 							remediation:
 								"Check the server command and set --timeout <ms> when startup is expected to be slow.",
 						});
