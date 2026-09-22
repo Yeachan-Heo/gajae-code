@@ -517,13 +517,22 @@ describe("managed session write protocol", () => {
 			code: "EPERM",
 			path: scope.directoryPath,
 		});
-		const staging = new RegExp(`${MANAGED_SESSION_BINDING_FILE}\\..*\\.staging$`);
-		const openSync = vi.spyOn(syncFs, "openSync");
-		const real = openSync.getMockImplementation() ?? syncFs.openSync;
-		openSync.mockImplementation(((target: Parameters<typeof syncFs.openSync>[0], ...rest: unknown[]) => {
-			if (typeof target === "string" && staging.test(target)) throw denied;
-			return (real as (...args: unknown[]) => number)(target, ...rest);
-		}) as typeof syncFs.openSync);
+		// Both retained-native and pathname-backed stores enter this publication
+		// boundary. A staging-file open is not part of every platform's path.
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
 
 		let failure: unknown;
 		try {
@@ -531,15 +540,18 @@ describe("managed session write protocol", () => {
 		} catch (error) {
 			failure = error;
 		} finally {
-			openSync.mockRestore();
+			publish.mockRestore();
 		}
 
+		expect(injected).toBe(1);
 		expect(failure).toBeInstanceOf(Error);
 		const startupError = failure as Error;
 		expect(startupError.cause).toEqual({ classification: "EPERM", diagnostic: "prepare:binding_publish" });
 		expect(startupError.message).toBe("Could not prepare managed session scope (EPERM: prepare:binding_publish).");
 		expect(startupError.message).not.toContain(scope.directoryPath);
 		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
+		// The injected failure must not damage the existing binding or leak the spy.
+		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
 	});
 
 	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
