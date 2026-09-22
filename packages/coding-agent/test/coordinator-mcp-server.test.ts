@@ -3392,6 +3392,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 	});
 
+	it("closes the advertised answer schema against a sibling property map, not against its branches", () => {
+		// `additionalProperties: false` is evaluated against the node that declares it.
+		// With no sibling `properties`, EVERY answer field is "additional" and a compliant
+		// client validator rejects selection, custom-answer, and clarification payloads
+		// before the server is ever called (#5801).
+		const schema = buildCoordinatorAskAnswerSchema(["opt_0", "opt_1"], true, true) as {
+			additionalProperties?: boolean;
+			properties?: Record<string, unknown>;
+			oneOf: Array<{ properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }>;
+		};
+		expect(schema.additionalProperties).toBe(false);
+		const outer = new Set(Object.keys(schema.properties ?? {}));
+		expect(outer.size).toBeGreaterThan(0);
+		const branchFields = new Set<string>();
+		for (const branch of schema.oneOf) {
+			// Each branch stays closed, so the union is still narrower than the outer map.
+			expect(branch.additionalProperties).toBe(false);
+			for (const field of Object.keys(branch.properties ?? {})) branchFields.add(field);
+			for (const field of branch.required ?? []) branchFields.add(field);
+		}
+		// Any field a branch can require or accept must survive the outer closure.
+		for (const field of branchFields) expect([field, outer.has(field)]).toEqual([field, true]);
+		// The three documented answer shapes must clear the outer closure.
+		const payloads: Array<Record<string, unknown>> = [
+			{ selected: ["opt_0"] },
+			{ selected: [], other: true, custom: "Refine the plan only; do not execute." },
+			{ action: "clarify", question: "Does option 1 include execution?" },
+		];
+		for (const payload of payloads) {
+			const rejected = Object.keys(payload).filter((field) => !outer.has(field));
+			expect(rejected).toEqual([]);
+		}
+	});
+
 	it("accepts the advertised explicit other:false answer form", () => {
 		const codec: PrivateAskGateCodecV1 = {
 			schema_version: 1,
