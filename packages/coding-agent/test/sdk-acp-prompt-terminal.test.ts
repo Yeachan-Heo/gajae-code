@@ -3534,6 +3534,42 @@ test("ACP exact reserved terminal wins while recovery and publication are pendin
 	}
 });
 
+test("ACP reattaches after transport loss when terminal recovery is already reserved", async () => {
+	const fixture = await createRecoveryFixture("accepted", "blocking stream");
+	try {
+		const pending = prompt(fixture, "reserved terminal transport loss");
+		await bounded(fixture.promptDelivered, "accepted mutation");
+		fixture.sendAssistantMessage("blocking stream");
+		await bounded(fixture.agentMessageUpdateEntered, "queued stream frame");
+		fixture.sendStopped("end_turn");
+		// Let the terminal ingress mark the waiter reserved while the earlier stream frame
+		// remains blocked in the publication tail.
+		await Bun.sleep(50);
+
+		const settlement = Promise.race([
+			pending.then(
+				value => ({ kind: "resolved" as const, value }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_000).then(() => ({ kind: "timed_out" as const })),
+		]);
+		fixture.notify("reconnect_exhausted");
+		const outcome = await settlement;
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind === "rejected") expect(outcome.error).toMatchObject({ code: "connection_closed" });
+
+		fixture.releaseAgentMessageUpdate();
+		await waitFor(() => idlePhaseUpdates(fixture.updates) >= 2, "session reattachment");
+		const replacement = prompt(fixture, "prompt after transport reattachment");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "reattached prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(replacement, "reattached prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.releaseAgentMessageUpdate();
+		fixture.dispose();
+	}
+});
+
 test("ACP recovery settlement is independent of advisory final-text backpressure", async () => {
 	const fixture = await createRecoveryFixture("rejected", "retained report");
 	try {

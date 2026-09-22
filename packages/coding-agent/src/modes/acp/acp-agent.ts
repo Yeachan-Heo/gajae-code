@@ -3194,15 +3194,17 @@ export class AcpAgent implements Agent {
 		}
 		const waiter = record.activePrompt;
 		if (waiter?.dispatched) {
-			this.#startUncertainPromptRecovery(id, record, waiter);
-			return;
+			// A prior uncertainty notification already owns recovery for this waiter. Keep
+			// the in-flight lookup alive; only declined, non-recovering waiters fall through
+			// to the ordinary transport-loss teardown and reattachment path.
+			if (record.statusRecovery === waiter || this.#startUncertainPromptRecovery(id, record, waiter)) return;
 		}
 		const detail = error.message || "SDK transport reconnect failed.";
 		const terminal = new AcpSdkAdapterError("connection_closed", `ACP session transport was lost: ${detail}`);
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
 	}
 
-	#startUncertainPromptRecovery(id: string, record: SessionRecord, waiter: PromptWaiter): void {
+	#startUncertainPromptRecovery(id: string, record: SessionRecord, waiter: PromptWaiter): boolean {
 		if (
 			this.#sessions.get(id) !== record ||
 			promptWaiterRetired(record, waiter) ||
@@ -3210,10 +3212,11 @@ export class AcpAgent implements Agent {
 			waiter.terminalReserved ||
 			record.statusRecovery === waiter
 		)
-			return;
+			return false;
 		record.statusRecovery = waiter;
 		clearPromptWatchdog(waiter);
 		void this.#recoverUncertainPrompt(id, record, record.adapter, waiter);
+		return true;
 	}
 
 	async #recoverUncertainPrompt(
