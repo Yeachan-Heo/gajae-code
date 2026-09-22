@@ -4076,19 +4076,23 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(
 			server.callTool("gjc_delegate_plan", reuse("managed-worktree-delegate-redirected")),
 		).resolves.toMatchObject({ ok: false, error: { code: "workspace_mismatch" } });
-		// Narrowed roots: the persisted worktree is no longer inside the current policy
-		// even though the projection itself is untouched.
-		await Bun.write(persistedSessionPath, JSON.stringify(persistedSession));
+		// Narrowed roots: the caller cwd and persisted cwd stay identical and inside the
+		// new policy, so the earlier cwd identity guard passes; only the untouched
+		// persisted worktree has fallen outside the current roots.
 		const narrowed = path.join(root, "narrowed");
 		await fs.mkdir(narrowed);
+		await Bun.write(persistedSessionPath, JSON.stringify({ ...persistedSession, cwd: narrowed }));
 		server.config.allowedRoots = [narrowed];
 		server.config.managedWorktreeRoots = [path.join(narrowed, ".worktrees")];
+		const controlsBeforeNarrowedReuse = controls.length;
 		await expect(
 			server.callTool("gjc_delegate_plan", { ...reuse("managed-worktree-delegate-narrowed"), cwd: narrowed }),
 		).resolves.toMatchObject({
 			ok: false,
 			error: { code: "workspace_mismatch" },
 		});
+		// Refusal happens before any broker lookup in the revoked workspace.
+		expect(controls.slice(controlsBeforeNarrowedReuse).map(control => control.operation)).toEqual([]);
 		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(0);
 	}, 20_000);
 	it("keeps endpoint authority separated across two actual managed worktrees", async () => {
