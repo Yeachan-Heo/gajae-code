@@ -523,14 +523,41 @@ async function snapshotFiles(directory: string): Promise<Record<string, string>>
 	return files;
 }
 
+// Copies retain checkout modes; normalize only owned staging files before adding
+// dependency links. Preserve executability without inheriting a permissive umask.
+async function normalizePackageModes(directory: string): Promise<void> {
+	await fs.chmod(directory, 0o755);
+	for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+		const filename = path.join(directory, entry.name);
+		if (entry.isDirectory()) await normalizePackageModes(filename);
+		else if (entry.isFile()) {
+			const metadata = await fs.stat(filename);
+			await fs.chmod(filename, metadata.mode & 0o111 ? 0o755 : 0o644);
+		}
+	}
+}
+
 async function runPackageCommand(command: string[], cwd: string): Promise<void> {
-	const child = Bun.spawn(command, {
-		cwd,
-		env: { ...process.env, PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}` },
-		stdout: "pipe",
-		stderr: "pipe",
-		timeout: 120_000,
-	});
+	// Set the mask in a child, not the test process: prepack regenerates files,
+	// and changing the parent's process-global mask would race other tests.
+	const child = Bun.spawn(
+		[
+			process.execPath,
+			"-e",
+			`
+process.umask(0o022);
+const child = Bun.spawn(${JSON.stringify(command)}, { stdin: "ignore", stdout: "inherit", stderr: "inherit" });
+process.exit(await child.exited);
+`,
+		],
+		{
+			cwd,
+			env: { ...process.env, PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}` },
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 120_000,
+		},
+	);
 	const [exitCode, stdout, stderr] = await Promise.all([
 		child.exited,
 		new Response(child.stdout).text(),
@@ -554,6 +581,7 @@ describe("published vendored Markit", () => {
 					recursive: true,
 					filter: source => path.basename(source) !== "node_modules" && !source.endsWith(".tgz"),
 				});
+				await normalizePackageModes(publisher);
 				const manifest = await Bun.file(path.join(publisher, "package.json")).json();
 				for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
 					for (const [name, version] of Object.entries(manifest[field] ?? {})) {
@@ -614,15 +642,71 @@ describe("published vendored Markit", () => {
 				expect(Object.values(packedFiles).some(value => value.startsWith("symlink:"))).toBe(false);
 				expect(await fs.readdir(packed)).not.toContain("node_modules");
 				await fs.rm(publisher, { recursive: true });
-				await Bun.write(path.join(consumer, "package.json"), JSON.stringify({ private: true, type: "module" }));
+				// Install the current utils cohort, not the already-published version that
+				// predates imports in this coding-agent source (such as error-classification).
+				const utilsRoot = path.join(repoRoot, "packages/utils");
+				const utilsPublisher = path.join(directory, "workspace/packages/utils");
+				const utilsTarballs = path.join(directory, "utils-tarballs");
+				await fs.mkdir(utilsTarballs);
+				await fs.cp(utilsRoot, utilsPublisher, {
+					recursive: true,
+					filter: source => path.basename(source) !== "node_modules" && !source.endsWith(".tgz"),
+				});
+				await normalizePackageModes(utilsPublisher);
+				const utilsManifest = await Bun.file(path.join(utilsPublisher, "package.json")).json();
+				for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+					for (const [name, version] of Object.entries(utilsManifest[field] ?? {})) {
+						utilsManifest[field][name] = await resolvePublishDependency(name, version as string);
+					}
+				}
+				expect(utilsManifest.version).toBe(manifest.dependencies[utilsManifest.name]);
+				await Bun.write(path.join(utilsPublisher, "package.json"), JSON.stringify(utilsManifest));
 				await runPackageCommand(
 					packer === "npm"
-						? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", archive]
-						: [process.execPath, "add", "--ignore-scripts", archive],
+						? ["npm", "pack", "--pack-destination", utilsTarballs]
+						: [process.execPath, "pm", "pack", "--destination", utilsTarballs],
+					utilsPublisher,
+				);
+				const utilsArchives = (await fs.readdir(utilsTarballs)).filter(name => name.endsWith(".tgz"));
+				expect(utilsArchives).toHaveLength(1);
+				const utilsArchive = path.join(utilsTarballs, utilsArchives[0]!);
+				await fs.rm(utilsPublisher, { recursive: true });
+				// A top-level tarball alone does not replace Bun's transitive registry
+				// package with the same version. Bind every utils edge to these bytes.
+				const utilsSpec = `file:${utilsArchive}`;
+				await Bun.write(
+					path.join(consumer, "package.json"),
+					JSON.stringify({
+						private: true,
+						type: "module",
+						dependencies: {
+							[manifest.name]: `file:${archive}`,
+							[utilsManifest.name]: utilsSpec,
+						},
+						overrides: { [utilsManifest.name]: utilsSpec },
+					}),
+				);
+				await runPackageCommand(
+					packer === "npm"
+						? ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"]
+						: [process.execPath, "install", "--ignore-scripts"],
 					consumer,
 				);
 				const installed = await fs.realpath(path.join(consumer, "node_modules/@gajae-code/coding-agent"));
 				expect(installed.startsWith(`${await fs.realpath(consumer)}${path.sep}`)).toBe(true);
+				const installedUtils = await fs.realpath(path.join(consumer, "node_modules/@gajae-code/utils"));
+				expect(installedUtils.startsWith(`${await fs.realpath(consumer)}${path.sep}`)).toBe(true);
+				expect(await snapshotFiles(path.join(installedUtils, "src"))).toEqual(
+					await snapshotFiles(path.join(utilsRoot, "src")),
+				);
+				expect(Object.values(await snapshotFiles(installedUtils)).some(value => value.startsWith("symlink:"))).toBe(
+					false,
+				);
+				expect(
+					await fs.realpath(
+						Bun.resolveSync("@gajae-code/utils/error-classification", path.join(installed, "src/tools")),
+					),
+				).toBe(path.join(installedUtils, "src/error-classification.ts"));
 				const vendored = path.join(installed, "vendor/markit-ai");
 				expect(await snapshotFiles(vendored)).toEqual(await snapshotFiles(markitRoot));
 				expect(await Bun.file(path.join(vendored, "LICENSE")).text()).toContain("MIT");
