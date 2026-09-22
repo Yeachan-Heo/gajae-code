@@ -1887,8 +1887,7 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	expect(publishContract).toBeLessThan(raiseApproval);
 	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
 	// so it would replace a stale green with something that still permits the merge.
-	expect(workflow).toContain('-f conclusion="failure"');
-	expect(workflow).toContain('output[title]="Merge approval (re-validating)"');
+	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
 });
 
 test("issue-comment PR lookup skips only confirmed 404 and fails closed for other errors", async () => {
