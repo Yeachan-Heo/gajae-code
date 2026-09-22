@@ -13,6 +13,7 @@ import type {
 	ModelPerformancePoint,
 	ModelStats,
 	ModelTimeSeriesPoint,
+	ParsedMessageStats,
 	TimeSeriesPoint,
 	UserMessageLink,
 	UserMessageStats,
@@ -228,12 +229,32 @@ function calculateCatalogCost(provider: string, modelId: string, tokens: CostTok
 	};
 }
 
-function resolveStoredCost(stats: MessageStats): UsageCost {
-	if (stats.usage.cost.total !== 0) {
-		return stats.usage.cost;
-	}
-
-	return calculateCatalogCost(stats.provider, stats.model, stats.usage) ?? stats.usage.cost;
+function resolveStoredCost(stats: ParsedMessageStats): UsageCost {
+	const raw = stats.usage.cost;
+	const recorded = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+	const keys = ["input", "output", "cacheRead", "cacheWrite", "total"] as const;
+	// Complete zero-cost payloads historically request catalog pricing. A partial
+	// payload is different: preserve every valid recorded value, including zero.
+	const allZero = keys.every(key => recorded[key] === 0);
+	const catalog = calculateCatalogCost(stats.provider, stats.model, stats.usage);
+	const component = (key: keyof ModelCost): number => {
+		if (!allZero && finite(recorded[key])) return recorded[key];
+		const fallback = catalog?.[key];
+		return finite(fallback) ? fallback : 0;
+	};
+	const input = component("input");
+	const output = component("output");
+	const cacheRead = component("cacheRead");
+	const cacheWrite = component("cacheWrite");
+	const sum = input + output + cacheRead + cacheWrite;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		total: !allZero && finite(recorded.total) ? recorded.total : finite(sum) ? sum : 0,
+	};
 }
 
 function backfillMissingCatalogCosts(database: Database): void {
@@ -242,6 +263,7 @@ function backfillMissingCatalogCosts(database: Database): void {
 			SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
 			FROM messages
 			WHERE cost_total = 0 AND total_tokens > 0
+				AND cost_input = 0 AND cost_output = 0 AND cost_cache_read = 0 AND cost_cache_write = 0
 		`)
 		.all() as CostBackfillRow[];
 
@@ -299,7 +321,7 @@ export function setFileOffset(sessionFile: string, offset: number, lastModified:
 /**
  * Insert message stats into the database.
  */
-export function insertMessageStats(stats: MessageStats[]): number {
+export function insertMessageStats(stats: ParsedMessageStats[]): number {
 	if (!db || stats.length === 0) return 0;
 
 	// Use UPSERT so a re-sync can fix up `premium_requests` for rows persisted

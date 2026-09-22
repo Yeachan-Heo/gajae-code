@@ -4,6 +4,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import type {
 	NativeDirectoryTreeSnapshot,
+	NativeExactFileIdentity,
 	NativeExactUnlinkResult,
 	NativeOwnerOnlySecurityResult,
 	RecoveryFsIdentity,
@@ -25,6 +26,7 @@ type NativeManagedSessionStorage = Pick<
 	| "exactRemoveDirectoryTree"
 	| "exactReplacePath"
 	| "exactUnlink"
+	| "exactUnlinkDirect"
 	| "linkNoReplacePath"
 	| "linkNoReplacePathAsync"
 	| "openRecoveryFsRoot"
@@ -569,6 +571,28 @@ const SCRUBBED_REMNANT_PREFIXES = [
 	".gjc-receipt-placeholder-remove-",
 	".gjc-replace-retry-",
 ] as const;
+const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/**
+ * Replacement staging is named `.<destination-basename>.<uuid>.replacement` and
+ * is published by exchanging it with the destination, so the staging NAME
+ * survives publication while pointing at the retired predecessor. On a POSIX
+ * exchange that leaves the successor inode reachable under two names until the
+ * staging name is unlinked, and a crash between exchange and unlink strands it.
+ *
+ * A stranded staging name that still resolves to the LIVE transcript inode is
+ * not evidence of anything: every managed capture opens no-follow and rejects
+ * `nlink > 1` (`captureManagedFileNoFollowLimit`, `inspectManagedFileNoFollow`),
+ * so the extra name makes the transcript permanently unlistable and unopenable
+ * — `--resume <id>` reports "Session not found." and `--continue` reports
+ * "Could not inspect managed session: read-failed", while the bytes are intact
+ * and resume by explicit path still works. Reaping the surplus NAME (never the
+ * inode) restores both paths without touching transcript content.
+ */
+const REPLACEMENT_STAGING_NAME =
+	/^\.(?<destination>.+)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.replacement$/;
+const REAPER_QUARANTINE_NAME =
+	/^\.gjc-remnant-reap-(?<destination>[0-9a-f]+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
@@ -590,6 +614,237 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 	return { reaped, failures };
 }
 
+type ReplacementAliasObservation = {
+	destination: string;
+	staging: fs.BigIntStats;
+};
+
+function replacementStagingDestination(name: string): string | undefined {
+	return REPLACEMENT_STAGING_NAME.exec(name)?.groups?.destination;
+}
+
+function remnantReapDestination(name: string): string | undefined {
+	const encoded = REAPER_QUARANTINE_NAME.exec(name)?.groups?.destination;
+	if (!encoded || encoded.length % 2 !== 0) return undefined;
+	const destination = Buffer.from(encoded, "hex").toString("utf8");
+	return destination &&
+		Buffer.from(destination).toString("hex") === encoded &&
+		path.basename(destination) === destination
+		? destination
+		: undefined;
+}
+
+function remnantReapQuarantineName(pathname: string): string {
+	const basename = path.basename(pathname);
+	const destination = replacementStagingDestination(basename) ?? remnantReapDestination(basename) ?? basename;
+	return `.gjc-remnant-reap-${Buffer.from(destination).toString("hex")}-${randomUUID()}`;
+}
+
+function isRegularReaperFile(stat: fs.BigIntStats): boolean {
+	return stat.isFile() && !stat.isSymbolicLink();
+}
+
+function sameReaperFileIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+/**
+ * True when `name` is replacement staging whose inode is ALSO reachable under
+ * its own published destination in the same directory. Publication exchanged
+ * the two names, so the surplus staging name aliases the live successor and
+ * pins its `nlink` above one; reaping the staging name restores the
+ * single-link invariant every managed capture requires.
+ *
+ * Two distinct names resolving to one inode already prove `nlink > 1`, so
+ * identity equality is the whole test — the staging name always carries a
+ * leading dot the destination does not, and can never be its own destination.
+ *
+ * A staging name that does NOT alias its destination is left untouched: it is
+ * either an unpublished attempt or a retired predecessor, and both are
+ * recovery evidence owned by receipt reconciliation.
+ */
+function aliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+	destination: string,
+): ReplacementAliasObservation | undefined {
+	try {
+		const staging = fs.lstatSync(path.join(directory, name), { bigint: true });
+		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
+		const published = fs.lstatSync(path.join(directory, destination), { bigint: true });
+		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
+			return undefined;
+		return { destination, staging };
+	} catch {
+		return undefined;
+	}
+}
+
+function stagingAliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+): ReplacementAliasObservation | undefined {
+	const destination = replacementStagingDestination(name);
+	return destination ? aliasesPublishedDestinationSync(directory, name, destination) : undefined;
+}
+
+function remnantReapAliasesPublishedDestinationSync(
+	directory: string,
+	name: string,
+): ReplacementAliasObservation | undefined {
+	const destination = remnantReapDestination(name);
+	return destination ? aliasesPublishedDestinationSync(directory, name, destination) : undefined;
+}
+
+async function aliasesPublishedDestination(
+	directory: string,
+	name: string,
+	destination: string,
+): Promise<ReplacementAliasObservation | undefined> {
+	try {
+		const staging = await fsp.lstat(path.join(directory, name), { bigint: true });
+		if (!isRegularReaperFile(staging) || staging.nlink < 2n) return undefined;
+		const published = await fsp.lstat(path.join(directory, destination), { bigint: true });
+		if (!isRegularReaperFile(published) || published.dev !== staging.dev || published.ino !== staging.ino)
+			return undefined;
+		return { destination, staging };
+	} catch {
+		return undefined;
+	}
+}
+
+async function stagingAliasesPublishedDestination(
+	directory: string,
+	name: string,
+): Promise<ReplacementAliasObservation | undefined> {
+	const destination = replacementStagingDestination(name);
+	return destination ? aliasesPublishedDestination(directory, name, destination) : undefined;
+}
+
+async function remnantReapAliasesPublishedDestination(
+	directory: string,
+	name: string,
+): Promise<ReplacementAliasObservation | undefined> {
+	const destination = remnantReapDestination(name);
+	return destination ? aliasesPublishedDestination(directory, name, destination) : undefined;
+}
+
+function hashReaperFileSync(pathname: string, expected: fs.BigIntStats): string | undefined {
+	let descriptor: number | undefined;
+	try {
+		descriptor = fs.openSync(
+			pathname,
+			fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
+		);
+		const opened = fs.fstatSync(descriptor, { bigint: true });
+		if (!isRegularReaperFile(opened) || !sameReaperFileIdentity(opened, expected)) return undefined;
+		const digest = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		for (;;) {
+			const count = fs.readSync(descriptor, chunk, 0, chunk.byteLength, null);
+			if (count === 0) break;
+			digest.update(chunk.subarray(0, count));
+		}
+		const after = fs.fstatSync(descriptor, { bigint: true });
+		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected) ? digest.digest("hex") : undefined;
+	} catch (error) {
+		if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+		throw error;
+	} finally {
+		if (descriptor !== undefined) fs.closeSync(descriptor);
+	}
+}
+
+async function hashReaperFile(pathname: string, expected: fs.BigIntStats): Promise<string | undefined> {
+	let handle: fsp.FileHandle | undefined;
+	try {
+		handle = await fsp.open(
+			pathname,
+			fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0),
+		);
+		const opened = await handle.stat({ bigint: true });
+		if (!isRegularReaperFile(opened) || !sameReaperFileIdentity(opened, expected)) return undefined;
+		const digest = createHash("sha256");
+		const chunk = Buffer.alloc(64 * 1024);
+		let offset = 0;
+		for (;;) {
+			const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, offset);
+			if (bytesRead === 0) break;
+			digest.update(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const after = await handle.stat({ bigint: true });
+		return isRegularReaperFile(after) && sameReaperFileIdentity(after, expected) ? digest.digest("hex") : undefined;
+	} catch (error) {
+		if (isEnoent(error) || (error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+		throw error;
+	} finally {
+		await handle?.close();
+	}
+}
+
+function exactReaperUnlinkSync(
+	pathname: string,
+	stat: fs.BigIntStats,
+	sha256: string,
+	allowHardLink: boolean,
+): NativeExactUnlinkResult {
+	const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
+	const identity: NativeExactFileIdentity = {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256,
+		quarantineName: remnantReapQuarantineName(pathname),
+		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
+	};
+	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
+}
+
+async function exactReaperUnlink(
+	pathname: string,
+	stat: fs.BigIntStats,
+	sha256: string,
+	allowHardLink: boolean,
+): Promise<NativeExactUnlinkResult> {
+	const parent = await fsp.lstat(path.dirname(pathname), { bigint: true });
+	if (!parent.isDirectory() || parent.isSymbolicLink()) return { ok: false, code: "parent_mismatch" };
+	const identity: NativeExactFileIdentity = {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256,
+		quarantineName: remnantReapQuarantineName(pathname),
+		...(allowHardLink ? { allowHardLink: true, requireHardLink: true } : {}),
+	};
+	return nativeSessionStorage().exactUnlinkDirect(pathname, identity);
+}
+
+function isBenignReaperRace(result: NativeExactUnlinkResult): boolean {
+	return (
+		result.code === "not_found" ||
+		result.code === "identity_mismatch" ||
+		result.code === "reparse_point" ||
+		result.code === "not_regular_file"
+	);
+}
+
 /**
  * Best-effort removal of scrubbed write-protocol remnants from one managed
  * directory. Only zero-length, single-link, non-symlink regular files whose
@@ -599,6 +854,11 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
  * or detached receipts retained as evidence) are never touched. A proven
  * concurrent disappearance (ENOENT) is benign; all other I/O failures are
  * returned and logged once without aborting scope preparation.
+ *
+ * Stranded replacement staging that aliases its own published destination is
+ * reaped by the same pass. That entry is neither zero-length nor single-link,
+ * so the terminal-remnant filters above can never reach it, yet leaving it in
+ * place bricks resume for the session it aliases.
  */
 export function reapScrubbedProtocolRemnantsSync(
 	directory: string,
@@ -614,14 +874,31 @@ export function reapScrubbedProtocolRemnantsSync(
 	let reaped = 0;
 	let failures = 0;
 	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
+		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
+		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
+		const alias = terminalRemnant
+			? undefined
+			: replacementCandidate
+				? stagingAliasesPublishedDestinationSync(directory, name)
+				: remnantReapAliasesPublishedDestinationSync(directory, name);
+		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {
-			const named = fs.lstatSync(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			// The alias probe already stat'ed the staging entry; reuse that exact
+			// observation rather than re-stating the pathname, which would only add
+			// another window. Identity is enforced at removal by the native
+			// primitive, not by how many times the name is looked up.
+			const named = terminalRemnant ? fs.lstatSync(pathname, { bigint: true }) : alias?.staging;
+			if (!named || !isRegularReaperFile(named)) continue;
+			if (terminalRemnant && (named.nlink !== 1n || named.size !== 0n)) continue;
 			if (named.mtimeMs > cutoff) continue;
-			fs.unlinkSync(pathname);
-			reaped += 1;
+			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : hashReaperFileSync(pathname, named);
+			if (!sha256) continue;
+			const removed = exactReaperUnlinkSync(pathname, named, sha256, !terminalRemnant);
+			if (removed.ok) reaped += 1;
+			else if (!isBenignReaperRace(removed)) failures += 1;
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
@@ -635,7 +912,8 @@ const SCRUBBED_REMNANT_REAP_BATCH_SIZE = 256;
 /**
  * Async twin of {@link reapScrubbedProtocolRemnantsSync} with the same safety
  * filters (terminal remnant prefix, zero-length, single-link, non-symlink,
- * older than the age gate), yielding between bounded batches. Long-lived
+ * older than the age gate, plus stranded staging that aliases its own
+ * published destination), yielding between bounded batches. Long-lived
  * processes reap per-session descendant directories through this path so a
  * legacy oversized directory cannot starve timers or sibling subagents while
  * it is being drained (issue #4394).
@@ -655,15 +933,30 @@ export async function reapScrubbedProtocolRemnants(
 	let failures = 0;
 	let scanned = 0;
 	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const terminalRemnant = SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix));
+		const replacementCandidate = REPLACEMENT_STAGING_NAME.test(name);
+		const quarantineCandidate = REAPER_QUARANTINE_NAME.test(name);
+		if (!terminalRemnant && !replacementCandidate && !quarantineCandidate) continue;
 		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+		const alias = terminalRemnant
+			? undefined
+			: replacementCandidate
+				? await stagingAliasesPublishedDestination(directory, name)
+				: await remnantReapAliasesPublishedDestination(directory, name);
+		if (!terminalRemnant && !alias) continue;
 		const pathname = path.join(directory, name);
 		try {
-			const named = await fsp.lstat(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			// Same reuse as the sync twin: one probe observation, one identity-bound
+			// removal.
+			const named = terminalRemnant ? await fsp.lstat(pathname, { bigint: true }) : alias?.staging;
+			if (!named || !isRegularReaperFile(named)) continue;
+			if (terminalRemnant && (named.nlink !== 1n || named.size !== 0n)) continue;
 			if (named.mtimeMs > cutoff) continue;
-			await fsp.unlink(pathname);
-			reaped += 1;
+			const sha256 = terminalRemnant ? EMPTY_FILE_SHA256 : await hashReaperFile(pathname, named);
+			if (!sha256) continue;
+			const removed = await exactReaperUnlink(pathname, named, sha256, !terminalRemnant);
+			if (removed.ok) reaped += 1;
+			else if (!isBenignReaperRace(removed)) failures += 1;
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
