@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { getEmbeddedDefaultGjcSkills } from "@gajae-code/coding-agent/defaults/gjc-defaults";
 import { getActiveSkills, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
 import { InternalUrlRouter } from "@gajae-code/coding-agent/internal-urls";
 import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
@@ -261,36 +262,15 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
-	it("routes selectors from skill relative paths", async () => {
-		const skillDir = path.join(tmpDir, "foo");
-		const referencePath = path.join(skillDir, "docs", "reference.md");
-		await fs.mkdir(path.dirname(referencePath), { recursive: true });
-		await fs.writeFile(
-			referencePath,
-			Array.from({ length: 24 }, (_, index) => `reference line ${index + 1}`).join("\n"),
-		);
-
-		const previousSkills = getActiveSkills();
-		setActiveSkills([
-			{
-				name: "foo",
-				description: "",
-				filePath: path.join(skillDir, "SKILL.md"),
-				baseDir: skillDir,
-				source: "test",
-			},
-		]);
-
-		try {
-			const result = await new ReadTool(createSession(tmpDir)).execute("skill-relative-range", {
-				path: "skill://foo/docs/reference.md:10-20",
-			});
-			const text = textOutput(result);
-			expect(text).toContain("reference line 10");
-			expect(text).not.toContain("reference line 2\n");
-		} finally {
-			setActiveSkills(previousSkills);
-		}
+	it("routes selectors from embedded bundled skill paths", async () => {
+		const body = await getEmbeddedDefaultGjcSkills().find(skill => skill.name === "ultragoal")!.loadContent!();
+		const lines = body.split("\n");
+		const result = await new ReadTool(createSession(tmpDir)).execute("embedded-range", {
+			path: "embedded:gjc/skills/ultragoal/SKILL.md:10-20",
+		});
+		const text = textOutput(result);
+		expect(text).toContain(lines[9]!);
+		expect(text).not.toContain(lines[1]!);
 	});
 
 	it("reads internal URLs without a selector and preserves valid selectors", async () => {
