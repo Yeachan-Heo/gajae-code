@@ -2044,6 +2044,7 @@ export type BeforeAgentStartContributor = (event: {
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
+const COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS = 1_000;
 const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
 
 /**
@@ -9829,7 +9830,20 @@ export class AgentSession {
 		// the aborted run settles. Join that continuation before observing the
 		// sidecar queue; otherwise teardown can race a rearmed run and wait on its
 		// persistence while the test's manager is already being disposed.
-		await this.waitForIdle();
+		const idleStatus = await Promise.race([
+			this.waitForIdle().then(
+				() => ({ status: "settled" as const }),
+				error => ({ status: "error" as const, error }),
+			),
+			Bun.sleep(COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS).then(() => ({ status: "timed_out" as const })),
+		]);
+		if (idleStatus.status === "error") throw idleStatus.error;
+		if (idleStatus.status === "timed_out") {
+			logger.warn("Coordinator persistence test seam timed out waiting for session idle", {
+				sessionId: this.sessionId,
+				timeoutMs: COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS,
+			});
+		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
 	}

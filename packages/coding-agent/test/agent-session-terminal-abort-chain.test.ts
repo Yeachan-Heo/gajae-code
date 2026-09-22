@@ -310,6 +310,22 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 	}, 20_000);
 
+	it("bounds coordinator persistence teardown after its async-job manager is disposed", async () => {
+		const originalWaitForIdle = session.waitForIdle;
+		session.waitForIdle = (() => new Promise<void>(() => {})) as AgentSession["waitForIdle"];
+		try {
+			await manager.dispose({ timeoutMs: 100 });
+			const outcome = await Promise.race([
+				session.awaitCoordinatorRuntimeStatePersistenceForTests().then(() => "settled" as const),
+				Bun.sleep(2_000).then(() => "timed_out" as const),
+			]);
+			expect(outcome).toBe("settled");
+		} finally {
+			session.waitForIdle = originalWaitForIdle;
+			manualTeardown = true;
+		}
+	}, 10_000);
+
 	it("starts managed jobs in the session's endpoint-owned manager, not the process-global instance", async () => {
 		// Reproduction of the review-thread P1 scenario: a SECOND session's
 		// manager is the process-global instance, while this session's manager
