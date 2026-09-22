@@ -27,7 +27,7 @@ async function fixture(): Promise<string> {
 	for (const pkg of packages) {
 		await Bun.write(path.join(dir, pkg.dir, "package.json"), JSON.stringify({ name: pkg.name, ...pkg.manifest }));
 	}
-	for (const script of ["ci-gjc-state-gates.ts", "ci-dev-affected.ts", "ci-risk-canary-manifest.ts"]) {
+	for (const script of ["ci-gjc-state-gates.ts", "ci-dev-affected.ts", "ci-risk-canary-manifest.ts", "telegram-daemon-generation-manifest.json"]) {
 		await Bun.write(path.join(dir, "scripts", script), Bun.file(path.join(import.meta.dir, script)));
 	}
 	return dir;

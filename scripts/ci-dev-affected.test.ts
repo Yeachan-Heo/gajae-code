@@ -50,6 +50,8 @@ test("derives Telegram daemon guard coverage from the manifest inventory", async
 	expect(claimed.every(isTelegramDaemonGenerationGuardFile)).toBe(true);
 	expect(needsTelegramDaemonGenerationGuard(claimed)).toBe(true);
 	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/unrelated.ts"])).toBe(false);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/new-telegram-daemon.ts"])).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/daemon-paths-v2.ts"])).toBe(true);
 
 	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 	const guardStart = workflow.indexOf("  telegram-daemon-generation:\n");

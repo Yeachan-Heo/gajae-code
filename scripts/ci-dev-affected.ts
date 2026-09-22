@@ -17,9 +17,18 @@ const telegramDaemonGenerationGuardFiles = new Set([
 	...Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory)),
 	...Object.keys(telegramDaemonGenerationManifest.nativeAuthoritySha256),
 ]);
+const daemonLikePathSegment = /(?:^|[-_.])daemon(?:[-_.]|$)/i;
+
+function isDaemonLikePath(changedPath: string): boolean {
+	// Keep the planner conservative for a newly-added or renamed daemon source
+	// that has not been added to the manifest yet. The exact manifest-derived set
+	// remains authoritative for known files; this fallback preserves the old
+	// daemon-name trigger so an omitted entry cannot make the guard disappear.
+	return changedPath.split("/").some(segment => daemonLikePathSegment.test(segment));
+}
 
 export function isTelegramDaemonGenerationGuardFile(changedPath: string): boolean {
-	return telegramDaemonGenerationGuardFiles.has(changedPath);
+	return telegramDaemonGenerationGuardFiles.has(changedPath) || isDaemonLikePath(changedPath);
 }
 
 export function needsTelegramDaemonGenerationGuard(paths: readonly string[]): boolean {
