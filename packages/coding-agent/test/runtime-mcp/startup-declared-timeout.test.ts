@@ -24,6 +24,8 @@ rl.on('line', line => {
     }, ${initializeDelayMs});
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: '${toolName}', inputSchema: { type: 'object' } }] } }) + '\\n');
+  } else if (msg.method === 'tools/call') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: 'pong' }] } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -93,12 +95,18 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	}, 15_000);
 
-	test("cleans up an expired pending connection even when cached tools exist", async () => {
+	test("cleans up an expired pending connection and reconnects cached tools", async () => {
 		const cache = {
 			get: vi.fn(async () => [{ name: "ping", inputSchema: { type: "object" } }]),
 			set: vi.fn(async () => {}),
 		} as unknown as MCPToolCache;
 		const manager = new MCPManager(process.cwd(), cache);
+		const source = {
+			provider: "test",
+			providerName: "Test provider",
+			path: "/test/mcp.json",
+			level: "user" as const,
+		};
 		try {
 			const result = await manager.connectServers(
 				{
@@ -107,13 +115,18 @@ describe("MCP startup and the declared connection window", () => {
 						args: ["-e", delayedStdioServer("ping", 5_000)],
 					},
 				},
-				{},
+				{ cached: source },
 			);
 
 			expect(cache.get).toHaveBeenCalledWith("cached", expect.anything());
 			expect(result.errors.get("cached")).toContain("timed out");
 			expect(result.tools).toHaveLength(1);
 			expect(manager.getConnectionStatus("cached")).toBe("disconnected");
+			expect(manager.getSource("cached")).toEqual(source);
+
+			const toolResult = await result.tools[0]!.execute("cached-call", {}, undefined, {} as never);
+			expect(toolResult.details?.isError).not.toBe(true);
+			expect(manager.getConnectedServers()).toContain("cached");
 		} finally {
 			await manager.disconnectAll();
 		}

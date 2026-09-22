@@ -1390,7 +1390,11 @@ export class MCPManager {
 					const message = error instanceof Error ? error.message : String(error);
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, serverName: name, error: message });
+					logger.error("MCP tool load failed", {
+						path: `mcp:${name}`,
+						serverName: name,
+						error: classifyMCPStartupFailure(error),
+					});
 				});
 		}
 
@@ -1493,7 +1497,10 @@ export class MCPManager {
 					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 						this.#pendingToolLoads.delete(task.name);
 					this.#pendingConnectionControllers.delete(task.name);
-					void this.#disconnectServer(task.name).catch(error => {
+					void this.#disconnectServer(task.name, {
+						preserveConfig: this.#toolsOnly || cachedTools.has(task.name),
+						preserveSource: cachedTools.has(task.name),
+					}).catch(error => {
 						this.#logLeaseReleaseFailure(task.name, undefined, error);
 					});
 				}
@@ -2402,7 +2409,10 @@ export class MCPManager {
 		await this.#disconnectServer(name);
 	}
 
-	async #disconnectServer(name: string, options: { preserveConfig?: boolean } = {}): Promise<void> {
+	async #disconnectServer(
+		name: string,
+		options: { preserveConfig?: boolean; preserveSource?: boolean } = {},
+	): Promise<void> {
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
@@ -2412,7 +2422,7 @@ export class MCPManager {
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
-		this.#sources.delete(name);
+		if (!options.preserveSource) this.#sources.delete(name);
 		if (!options.preserveConfig) this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		const connection = this.#connections.get(name);

@@ -10,7 +10,7 @@ import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
-import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
+import { MCPExpectedFailure, MCPHttpRequestError } from "../../src/runtime-mcp/types";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 async function mkdtempExact(prefix: string): Promise<string> {
@@ -126,13 +126,78 @@ describe("MCP manager lifecycle cleanup", () => {
 			expect(error).toHaveBeenCalledWith("MCP tool load failed", {
 				path: "mcp:late",
 				serverName: "late",
-				error: "background tools failure",
+				error: "transport-error",
 			});
 		} finally {
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 		}
 	});
+	test("retains exact-config registration after pending startup expiry for reconnect", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-exact-timeout-reconnect-");
+		const configPath = join(cwd, "mcp.json");
+		const manager = new MCPManager(cwd, null, { toolsOnly: true });
+		const firstTools = Promise.withResolvers<never>();
+		const firstConnection = makeConnection("exact", async () => {});
+		const replacementConnection = makeConnection("exact", async () => {});
+		let connectCount = 0;
+		let listToolsCount = 0;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(async () => {
+			connectCount++;
+			return connectCount === 1 ? firstConnection : replacementConnection;
+		});
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => {
+			listToolsCount++;
+			if (listToolsCount === 1) return await firstTools.promise;
+			return [];
+		});
+		try {
+			await Bun.write(
+				configPath,
+				JSON.stringify({ mcpServers: { exact: { type: "http", url: "http://127.0.0.1:1", timeout: 100 } } }),
+			);
+			const result = await manager.discoverAndConnect({ configPath });
+
+			expect(result.errors.get("exact")).toBe("MCP server unavailable");
+			expect(connect).toHaveBeenCalledTimes(1);
+			expect(await manager.reconnectServer("exact")).toBe(replacementConnection);
+			expect(connect).toHaveBeenCalledTimes(2);
+		} finally {
+			firstTools.reject(new Error("abandoned initial tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("classifies remote errors that reject background tool loading before logging", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const backgroundFailure = Promise.withResolvers<never>();
+		const secret = "DELAYED_MCP_RESPONSE_SECRET";
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => await backgroundFailure.promise);
+		const error = vi.spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{ late: { type: "http", url: "http://127.0.0.1:1", timeout: 10_000 } },
+				{},
+			);
+			expect(result.errors.has("late")).toBe(false);
+
+			backgroundFailure.reject(new MCPHttpRequestError(502, `remote response included ${secret}`));
+			await waitFor(() => result.errors.get("late")?.includes(secret) === true);
+			expect(result.errors.get("late")).toContain(secret);
+			const loggedFailure = error.mock.calls.find(([message]) => message === "MCP tool load failed");
+			expect(loggedFailure).toBeDefined();
+			expect(loggedFailure?.[1]).toMatchObject({ error: "http-status:502" });
+			expect(JSON.stringify(loggedFailure)).not.toContain(secret);
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
 	// The long startup ceiling is ACP-scoped (PR #3164 Option B): a slow gateway
 	// gets its configured window only when the caller supplies an explicit
 	// budget, as ACP lifecycle launches do. Without one, the short default
