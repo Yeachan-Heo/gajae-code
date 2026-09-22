@@ -17,6 +17,7 @@ import {
 	type CrashFingerprint,
 	type CrashProvenance,
 	computeCrashFingerprint,
+	computeHandledErrorFingerprint,
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
 
@@ -60,8 +61,11 @@ function findBoundFingerprint(
 			// suffix omission against the marker rather than trusting its syntax.
 			if (remaining.length > 0) stackCandidates.push(remaining.slice(0, -1).join("\n").trimEnd());
 			for (const stack of stackCandidates) {
-				const fingerprint = computeCrashFingerprint({ name, message, stack });
-				if (fingerprint.fingerprint === markerFingerprint) return fingerprint;
+				const input = { name, message, stack };
+				const fatalFingerprint = computeCrashFingerprint(input);
+				if (fatalFingerprint.fingerprint === markerFingerprint) return fatalFingerprint;
+				const handledFingerprint = computeHandledErrorFingerprint(input);
+				if (handledFingerprint.fingerprint === markerFingerprint) return handledFingerprint;
 			}
 		}
 	}

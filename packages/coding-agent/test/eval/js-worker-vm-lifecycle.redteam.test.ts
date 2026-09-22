@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import {
 	disposeAllVmContexts,
 	executeInVmContext,
@@ -212,6 +213,49 @@ describe("JS worker VM lifecycle redteam", () => {
 			process.off("unhandledRejection", onUnhandled);
 			(globalThis as unknown as { Worker: typeof Worker }).Worker = OriginalWorker;
 		}
+	});
+
+	it("does not trust a VM error name as designed provenance", async () => {
+		const result = await expectSettles(
+			executeInVmContext({
+				sessionKey: `u5-redteam-spoofed-tool-error-${crypto.randomUUID()}`,
+				sessionId: "spoofed-tool-error",
+				cwd: process.cwd(),
+				session: makeSession(),
+				code: "const error = new Error('unexpected plugin failure'); error.name = 'ToolError'; throw error;",
+				filename: "spoofed-tool-error.js",
+				runState: {},
+			}).catch(error => error),
+			"spoofed tool error run",
+		);
+
+		expect(result).toBeInstanceOf(Error);
+		expect((result as Error).name).toBe("ToolError");
+		expect(isDesignedError(result)).toBe(false);
+	});
+
+	it("preserves marked designed provenance across the VM worker boundary", async () => {
+		const result = await expectSettles(
+			executeInVmContext({
+				sessionKey: `u5-redteam-designed-tool-error-${crypto.randomUUID()}`,
+				sessionId: "designed-tool-error",
+				cwd: process.cwd(),
+				session: makeSession({
+					reject: {
+						async execute() {
+							throw new ToolError("tool refusal");
+						},
+					},
+				}),
+				code: "await tool.reject({});",
+				filename: "designed-tool-error.js",
+				runState: {},
+			}).catch(error => error),
+			"designed tool error run",
+		);
+
+		expect(result).toBeInstanceOf(ToolError);
+		expect(isDesignedError(result)).toBe(true);
 	});
 
 	it("rejects pending and queued runs on abort/worker kill without hanging and releases the queue", async () => {

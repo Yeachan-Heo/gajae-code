@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { computeHandledErrorFingerprint, parseCrashRecordMarker } from "../src/crash-fingerprint";
 import { parseCrashEventLine } from "../src/crash-journal";
-import { markDesignedError } from "../src/error-classification";
+import { isDesignedError, markDesignedError } from "../src/error-classification";
 import { recordHandledError, resetHandledErrorDedupeForTest } from "../src/postmortem";
 
 function handledStore(): { readonly log: string; readonly journal: string } {
@@ -68,14 +68,18 @@ describe("recordHandledError", () => {
 		expect(await Bun.file(store.journal).exists()).toBe(false);
 	});
 
-	it("does not record designed tool refusals", async () => {
+	it("records only explicitly designed refusals as excluded", async () => {
 		resetHandledErrorDedupeForTest();
 		const store = handledStore();
 		const refusal = markDesignedError(new Error("Tool call rejected by user (bash)"));
+		const spoofed = new Error("unexpected plugin failure");
+		spoofed.name = "ToolError";
 
 		expect(recordHandledError("Tool bash", refusal, { path: store.log })).toBeUndefined();
-		expect(await Bun.file(store.log).exists()).toBe(false);
-		expect(await Bun.file(store.journal).exists()).toBe(false);
+		expect(isDesignedError(spoofed)).toBe(false);
+		expect(recordHandledError("Tool bash", spoofed, { path: store.log })).toBe(store.log);
+		expect(await Bun.file(store.log).exists()).toBe(true);
+		expect(await Bun.file(store.journal).exists()).toBe(true);
 	});
 
 	it("deduplicates genuine errors by their failing frame rather than the full wrapper stack", async () => {

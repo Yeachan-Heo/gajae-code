@@ -20,13 +20,11 @@ export function markDesignedError<T extends Error>(error: T): T {
 	return error;
 }
 
-/** Return true when a throwable is explicitly marked or carries a known tool-error name. */
+/** Return true when a throwable carries the trusted designed-outcome marker. */
 export function isDesignedError(error: unknown): boolean {
 	if ((typeof error !== "object" && typeof error !== "function") || error === null) return false;
 	try {
-		if ((error as MarkedError)[DESIGNED_ERROR] === true) return true;
-		const name = (error as { readonly name?: unknown }).name;
-		return name === "ToolError" || name === "ToolAbortError";
+		return (error as MarkedError)[DESIGNED_ERROR] === true;
 	} catch {
 		return false;
 	}
