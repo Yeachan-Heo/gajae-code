@@ -50,6 +50,12 @@ jobs:
         id: pr
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Untrusted author-controlled text: passed through the environment so it is
+          # never expanded into the script body.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_PREVIOUS_BODY: ${{ github.event.changes.body.from }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_AUTHOR: ${{ github.event.issue.user.login }}
         shell: bash
         run: |
           set -euo pipefail
@@ -79,9 +85,66 @@ jobs:
           echo "head_repo=$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name')" >> "$GITHUB_OUTPUT"
           echo "head_sha=$(printf '%s' "$pr_json" | jq -r '.head.sha')" >> "$GITHUB_OUTPUT"
           echo "base_sha=$(printf '%s' "$pr_json" | jq -r '.base.sha')" >> "$GITHUB_OUTPUT"
+          # Does the TRIGGERING comment even look like a self-review record?
+          #
+          # `issue_comment` fires for every created, edited or deleted comment by anyone.
+          # Revoking on all of them let any commenter red the exact-head `Merge approval`
+          # and then, because `cancel-in-progress` kills the in-flight revalidation, keep
+          # an authorized PR blocked indefinitely by commenting repeatedly — a denial of
+          # service that changes no authorization evidence (#5740 review, Codex P2).
+          #
+          # Only a comment that is, or just stopped being, a candidate record can change
+          # the answer, so only those justify revoking. `changes.body.from` covers an edit
+          # that removed the marker; the marker alone is checked here, and the validator
+          # still does the real authentication and signature work.
+          # Read through the environment, NEVER by interpolating the comment into the
+          # script. An inline expression referencing the comment body is shell injection
+          # from an untrusted author, and it is unsafe even inside a shell comment:
+          # GitHub expands the expression before bash ever sees the script, so a
+          # multiline body injects a new executable line. The literal form is therefore
+          # not written anywhere in this run block, including in prose.
+          # The marker alone is not enough: anyone may write it, so gating on the string
+          # only would let a third party force revocation and, with cancel-in-progress,
+          # reinstate the denial of service behind one extra step. A self-review record is
+          # author-owned by definition, so the comment must also come from the PR author.
+          # The validator still authenticates author_association and the signature.
+          record_marker="gajae.pr-self-review.v1"
+          if [[ "${COMMENT_AUTHOR:-}" == "${PR_AUTHOR:-}" && -n "${COMMENT_AUTHOR:-}" ]] \
+            && [[ "${COMMENT_BODY:-}" == *"$record_marker"* || "${COMMENT_PREVIOUS_BODY:-}" == *"$record_marker"* ]]; then
+            echo "self_review_event=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "self_review_event=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Skip non-dev comments
         if: ${{ steps.pr.outputs.skip == 'true' }}
         run: echo "::notice::no dev-based PR to validate; contract check skipped"
+      - name: Revoke any prior approval for this head before re-validating
+        # MUST run before checkout, Bun setup, and the validator, and after PR
+        # resolution only because the exact head SHA is required to address the check.
+        #
+        # Revoking inside the publication step still left the whole validation phase
+        # uncovered: a failure during checkout, setup, or validation never reached the
+        # revocation, so a previously-green "Merge approval" survived as the
+        # authoritative required check. Writing the red here means any failure from
+        # this point on leaves the merge blocked (#5692 review).
+        # Only a comment that is, or just stopped being, a candidate self-review record
+        # can change the authorization answer. Revoking on every comment let any
+        # commenter block an authorized PR indefinitely (#5740 review, Codex P2).
+        if: ${{ steps.pr.outputs.skip != 'true' && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Merge approval" \
+            -f head_sha="${{ steps.pr.outputs.head_sha }}" \
+            -f status="completed" \
+            -f conclusion="failure" \
+            -f 'output[title]="Merge approval (re-validating)"' \
+            -f "output[summary]=re-validation in progress; any prior approval for this head is revoked until it completes" \
+            -f "details_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         if: ${{ steps.pr.outputs.skip != 'true' }}
         with:
@@ -137,6 +200,33 @@ jobs:
           fi
           echo "merge_authorized=$authorized" >> "$GITHUB_OUTPUT"
           exit "$status"
+      - name: Keep the approval revoked when revalidation does not complete
+        # Covers the window the dedicated revoke step cannot: a failure AFTER the head
+        # SHA is known but BEFORE the publication step raises the approval. Without this
+        # a failed checkout, Bun setup, or validator leaves whatever the dedicated step
+        # wrote — which is correct — but a failure in the RESOLVE step itself skips the
+        # dedicated step entirely, and any partial SHA we do have should still be used.
+        #
+        # RESIDUAL, deliberately not claimed as closed: if resolution fails before
+        # emitting `head_sha`, or the runner is hard-cancelled, no step runs and a
+        # previously-green check survives. A workflow cannot close that; it needs branch
+        # protection to require a check bound to the current run rather than any green
+        # one (#5692 review).
+        if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' && steps.pr.outputs.head_sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Merge approval" \
+            -f head_sha="${{ steps.pr.outputs.head_sha }}" \
+            -f status="completed" \
+            -f conclusion="failure" \
+            -f 'output[title]="Merge approval (re-validation failed)"' \
+            -f "output[summary]=re-validation did not complete; any prior approval for this head remains revoked" \
+            -f "details_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
       - name: Publish head-bound check results for comment-triggered validation
         # issue_comment runs are associated with the default-branch SHA, not the PR
         # head. Create/update a CHECK RUN on the resolved exact head with the exact
@@ -174,17 +264,37 @@ jobs:
             else
               approval_summary="merge not authorized at exact head; the PR contract itself is valid"
             fi
-            # A trusted base that predates the self-review-aware validator cannot
+            # A trusted base that predates a required validator capability cannot
             # authorize anything; never publish success for that case, under EITHER name.
-            if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]] \
-              && ! grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts"; then
+            #
+            # Each capability needs its OWN marker. The self-review check alone was not
+            # enough: `main` carries the self-review validator but not the approval
+            # freshness rule, so a comment-triggered re-validation ran the old
+            # `commit_id`-only logic and published a GREEN "Merge approval" on the exact
+            # head — the #5692 hole, live on a required context, behind a guard that
+            # reported the base as current (#5692 review).
+            stale_base=""
+            if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
+              # Both markers must be CODE-ONLY tokens. `gajae.pr-self-review.v1` and
+              # `head_ref_force_pushed` each also appear in prose, so a base that kept
+              # the comments while losing the implementation would pass the guard — the
+              # same shape as the bug the guard exists to catch (#5692 review).
+              grep -q "selfReviewSatisfiesPolicy(" "$trusted_root/scripts/verify-pr-verdict.ts" \
+                || stale_base="self-review validation"
+              grep -q "reviewPrecedesHead(" "$trusted_root/scripts/verify-pr-verdict.ts" \
+                || stale_base="${stale_base:+$stale_base and }approval freshness binding"
+            fi
+            if [[ -n "$stale_base" ]]; then
               conclusion="failure"
-              summary="trusted base ${base_sha:0:10} predates self-review validation; bootstrap remains authoritative"
+              summary="trusted base ${base_sha:0:10} predates $stale_base; bootstrap remains authoritative"
               approval_conclusion="failure"
               approval_summary="$summary"
             fi
           fi
           details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # The approval authority was already revoked in its own step, before checkout
+          # and validation, so any failure since then has left the merge blocked. Publish
+          # the contract result, then raise the approval only if that write succeeded.
           gh api --method POST "repos/${{ github.repository }}/check-runs" \
             -H "Accept: application/vnd.github+json" \
             -f name="Validate exact-head PR contract" \
@@ -194,9 +304,8 @@ jobs:
             -f 'output[title]="PR contract (comment-triggered exact-head re-validation)"' \
             -f "output[summary]=$summary" \
             -f "details_url=$details_url"
-          # The approval authority must be republished too: revoking a self-review
-          # comment while only refreshing the contract name would leave a stale green
-          # "Merge approval" check behind it.
+          # Only now may the approval authority be raised to its computed value. Reaching
+          # this line means the contract publication above succeeded.
           gh api --method POST "repos/${{ github.repository }}/check-runs" \
             -H "Accept: application/vnd.github+json" \
             -f name="Merge approval" \

@@ -34,6 +34,8 @@ export interface SessionActivity {
 /** Events persisted without an OS process incarnation (v1/v2 era) are legacy provenance. */
 export type SessionIdentityProvenance = "composite" | "legacy";
 export type SessionTombstoneRule = "retain" | "expire";
+/** Durable provenance for a retired host registration. */
+export type HostUnregisteredReason = "process_exited" | "detached_idle";
 /**
  * Injected retention policy (C3). The broker schedules compaction independently of
  * rotation; settings apply at the next scheduled compaction. `clock` drives both
@@ -141,6 +143,7 @@ export interface SessionIndexEvent {
 	/** Immutable endpoint file identity captured by the broker at registration. */
 	endpointFileId?: string;
 	lifecycleRequestId?: string;
+	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/**
 	 * Distinguishes the terminal-uncertain claim written by a forced stop of a
@@ -170,6 +173,7 @@ export interface IndexedSession {
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
+	hostUnregisteredReason?: HostUnregisteredReason;
 	terminalUncertain?: boolean;
 	/** True only for a terminal-uncertain claim written by a forced stale-worktree release. */
 	forcedStaleRelease?: boolean;
@@ -571,6 +575,10 @@ function projectIdentity(
 	const { latest, heartbeat } = state;
 	const terminal = isTerminalEvent(latest);
 	const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
+	const hostUnregisteredReason =
+		latest.hostUnregisteredReason === "process_exited" || latest.hostUnregisteredReason === "detached_idle"
+			? latest.hostUnregisteredReason
+			: undefined;
 	const pidAlive = alive(latest.pid);
 	// Liveness evidence is host-written: a checkpointed heartbeat, or the
 	// `host_registered` event the host appended itself. Counting registration
@@ -606,6 +614,7 @@ function projectIdentity(
 		endpointMtimeMs: latest.endpointMtimeMs,
 		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
+		...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
 		terminalUncertain,
 		...(latest.forcedStaleRelease === true ? { forcedStaleRelease: true } : {}),
 		indexSeq: latest.indexSeq,
@@ -1701,6 +1710,7 @@ export class SessionIndex {
 			| "processIncarnation"
 			| "hostIncarnation"
 		>,
+		reason?: HostUnregisteredReason,
 	): Promise<boolean> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
@@ -1781,6 +1791,7 @@ export class SessionIndex {
 					...(expected.lifecycleRequestId === undefined
 						? {}
 						: { lifecycleRequestId: expected.lifecycleRequestId }),
+					...(reason === undefined ? {} : { hostUnregisteredReason: reason }),
 				};
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));

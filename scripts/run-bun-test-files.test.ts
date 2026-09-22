@@ -99,6 +99,14 @@ describe("fresh-process test harness contracts", () => {
 				MISTRAL_API_KEY: "host-secret",
 				AWS_SECRET_ACCESS_KEY: "host-secret",
 				OPENAI_API_KEY: "host-secret",
+				GJC_SESSION_FILE: "/operator/session.json",
+				GJC_COORDINATOR_SESSION_STATE_FILE: "/operator/coordinator.json",
+				GJC_COORDINATOR_SESSION_NEW_PATH: "/operator/new-state",
+				GJC_COORDINATOR_MCP_STATE_ROOT: "/operator/coordinator-mcp",
+				GJC_HARNESS_STATE_ROOT: "/operator/harness",
+				GJC_TMUX_OWNER_STATE_DIR: "/operator/tmux",
+				GJC_SDK_DISABLE: "1",
+				GJC_AUTH_BROKER_URL: "http://operator.invalid",
 			},
 		);
 		expect(spec.argv).toEqual([
@@ -117,7 +125,15 @@ describe("fresh-process test harness contracts", () => {
 		expect(spec.env.XDG_RUNTIME_DIR).toBe("/tmp/sandbox with spaces/xdg/runtime");
 		expect(spec.env.GJC_CODING_AGENT_DIR).toBeUndefined();
 		expect(spec.env.GJC_SESSION_ID).toBeUndefined();
+		expect(spec.env.GJC_SESSION_FILE).toBeUndefined();
 		expect(spec.env.GJC_STATE_ROOT).toBeUndefined();
+		expect(spec.env.GJC_COORDINATOR_SESSION_STATE_FILE).toBeUndefined();
+		expect(spec.env.GJC_COORDINATOR_SESSION_NEW_PATH).toBeUndefined();
+		expect(spec.env.GJC_COORDINATOR_MCP_STATE_ROOT).toBeUndefined();
+		expect(spec.env.GJC_HARNESS_STATE_ROOT).toBeUndefined();
+		expect(spec.env.GJC_TMUX_OWNER_STATE_DIR).toBeUndefined();
+		expect(spec.env.GJC_SDK_DISABLE).toBeUndefined();
+		expect(spec.env.GJC_AUTH_BROKER_URL).toBeUndefined();
 		expect(spec.env.E2E).toBeUndefined();
 		expect(spec.env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(spec.env.ANTHROPIC_BASE_URL).toBeUndefined();

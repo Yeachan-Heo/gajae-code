@@ -1,0 +1,3 @@
+### Fixed
+
+- The coordinator session reaper no longer stops reaping for the whole namespace when one ephemeral session's persisted `cwd` or broker workspace falls outside the current `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` (or has no broker workspace). That session is left untouched and skipped with a `Coordinator session reaper skipped an unauthorized session` warning naming it, instead of every sweep being refused with `session-reaper: sweep refused: coordinator_workdir_outside_allowed_roots`. An empty root list still refuses the sweep. The persisted-location authority error keeps its exact message and now carries the escaping `cwd`/`workspace` path in `cause`.

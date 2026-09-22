@@ -258,6 +258,26 @@ describe("SessionSdkHost", () => {
 		expect(unregisterAttempts).toBe(2);
 	});
 
+	test("passes detached-idle provenance through broker unregister", async () => {
+		let reason: string | undefined;
+		const host = new SessionSdkHost({
+			sessionId: "detached-idle-stop",
+			stateRoot: "/tmp/detached-idle-stop",
+			token: "t",
+			sendFrame: () => "written",
+			onFrame: () => () => {},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: input => {
+				reason = input.reason;
+			},
+		});
+		await host.start();
+		await host.stop({ unregisterReason: "detached_idle" });
+		expect(reason).toBe("detached_idle");
+	});
+
 	test("does not fail shutdown when the session-index lock is held by a live broker", async () => {
 		const host = new SessionSdkHost({
 			sessionId: "contended-stop",

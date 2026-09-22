@@ -15758,8 +15758,10 @@ export class SessionManager {
 					// a typed near-limit outcome, not an unclassified abort: surface a
 					// rewrite-scoped error instead of leaking a raw `content_too_large`
 					// rejection to callers with no entry context. Resident entries stay
-					// in memory, so the transcript persists again after `/compact` or
-					// export.
+					// in memory, so the transcript persists again once the user runs one
+					// of the actions in SESSION_LIMIT_RECOVERY_ACTIONS. Do not name the
+					// commands here — a second copy of the advice is how `gjc export`
+					// came back (#5732).
 					if (err instanceof Error && err.message === "content_too_large") {
 						throw new SessionNearLimitRewriteError({
 							transcriptBytes: bytes.byteLength,

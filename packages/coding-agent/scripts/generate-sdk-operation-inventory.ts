@@ -23,6 +23,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal read-only run-resource-ledger view, threaded via terminalAbortSeams so the prompt deadline can find a tool-call boundary; not a user-facing SDK control seam",
 	"slash_command:routing":
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
+	"slash_command:mcp":
+		"interactive exact-config MCP status and session control command; terminal-only handleTui surface is not dispatched through ACP or the public SDK",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:language":
@@ -164,6 +166,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:refreshSshTool": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:refreshBaseSystemPrompt": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:refreshMCPTools": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getExactMcpStatusSnapshot":
+		"internal exact-config MCP status accessor used only by the terminal-only /mcp command; its capability is granted only to root interactive --mcp-config sessions, not a public SDK query",
+	"agent_session:controlExactMcpServer":
+		"internal session-local exact-config MCP suspend/resume/reconnect mutation used only by the terminal-only /mcp command; runtime suppression is not persistent user authority or a public SDK control",
 	"agent_session:refreshGjcSubskillTools": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:buildPreparedDisplaySessionContext": "internal accessor/plumbing, not a user-facing control seam",

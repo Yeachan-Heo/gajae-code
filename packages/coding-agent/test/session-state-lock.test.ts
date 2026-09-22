@@ -3044,6 +3044,50 @@ describe("session state lock failure diagnostics", () => {
 			});
 		});
 
+		it("names a released tombstone still inside its grace window", async () => {
+			// The goal's acceptance names this branch explicitly and it had no test: the
+			// sidecar is written now, so `Date.now() - mtime` is far below
+			// RELEASED_TRANSITION_GRACE_MS and the reclaim must defer rather than refuse
+			// for a different reason (#5606).
+			const dir = await claimWith("reclaim-grace", {
+				pid: 1,
+				start_time: "unknown",
+				token: "grace-token",
+				owner_host_id: "local-host",
+				released: true,
+			});
+			expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+				reclaimed: false,
+				refusal: "released_owner_within_grace",
+			});
+		});
+
+		it("names a claim whose generation changed between inspection and capture", async () => {
+			// Drives the REAL branch rather than handing the enum to the formatter: the
+			// owner is provably dead and past its grace, so the walk reaches the
+			// generation tuple, and the hook mutates the directory in between so the
+			// captured identity can no longer match what was inspected (#5606).
+			const dir = await claimWith("reclaim-generation", {
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "dead-token",
+				owner_host_id: "local-host",
+			});
+			SessionStateLockTestHooks.afterTransitionStaleInspection = async () => {
+				// Touching the claim moves its mtime/ctime, which is exactly the
+				// external-writer race the tuple exists to catch.
+				await fs.utimes(dir, new Date(Date.now() + 5_000), new Date(Date.now() + 5_000));
+			};
+			try {
+				expect(await sessionStateLock.classifyTransitionReclaimForTests(dir, "q")).toEqual({
+					reclaimed: false,
+					refusal: "claim_generation_changed",
+				});
+			} finally {
+				SessionStateLockTestHooks.afterTransitionStaleInspection = undefined;
+			}
+		});
+
 		it("carries the refusal onto the timeout message as a bounded enum only", () => {
 			const error = sessionStateLock.transitionClaimTimeoutForTests(
 				"/tmp/runtime-state.json.lock.transition",

@@ -758,6 +758,37 @@ describe("MCPConnectionPool", () => {
 		await pool.shutdown();
 	});
 
+	test("fences a pending acquisition when a prepared replacement publishes first", async () => {
+		const openStarted = Promise.withResolvers<void>();
+		const allowOpen = Promise.withResolvers<MCPServerConnection>();
+		let opens = 0;
+		const replacementTransport = new FakeTransport();
+		const pool = new MCPConnectionPool({
+			connect: async (name, config) => {
+				opens += 1;
+				if (opens === 1) {
+					openStarted.resolve();
+					return allowOpen.promise;
+				}
+				return connection(name, config, replacementTransport);
+			},
+		});
+		const configValue = config();
+		const pending = pool.acquire("server", configValue, { sessionId: "replacement-fence" });
+		await openStarted.promise;
+
+		const replacement = await pool.prepareReplacement("server", configValue, {
+			sessionId: "replacement-fence",
+		});
+		replacement.commit();
+		allowOpen.resolve(connection("server", configValue, new FakeTransport()));
+
+		await expect(pending).rejects.toBeInstanceOf(MCPPoolAcquireAbortError);
+		expect(pool.isCurrentLease(replacement.lease)).toBe(true);
+		await replacement.lease.release();
+		await pool.shutdown();
+	});
+
 	test("onEvent rejects after pool shutdown invalidates the lease", async () => {
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({ connect: async (name, cfg) => connection(name, cfg, transport) });

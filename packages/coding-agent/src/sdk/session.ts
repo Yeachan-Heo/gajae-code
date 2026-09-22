@@ -5092,7 +5092,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						let hasErrors = false;
 						if (exact) {
 							const result = await exact.manager.discoverAndConnect({ configPath: exact.configPath });
-							const resultTools = result.tools as CustomTool[];
+							// A slash control may commit while the deferred startup flight is
+							// loading. Re-read the manager's fenced publication rather than
+							// replaying the stale startup snapshot into the session registry.
+							const resultTools = exact.manager.getTools() as CustomTool[];
 							const toolNames = resultTools.map(tool => tool.name);
 							const collidingToolNames = findDeferredExactMcpToolNameCollisions(
 								toolNames,

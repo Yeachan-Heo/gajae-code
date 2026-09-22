@@ -11,15 +11,14 @@
  * Some HTTPS endpoints (e.g. corporate API gateways behind reverse proxies)
  * advertise h2 via ALPN but then refuse or reset the connection at the HTTP/2
  * framing layer. Bun surfaces these as `ConnectionRefused`, `ConnectionReset`,
- * `ConnectionClosed`, or `HTTP2StreamReset` rather than `HTTP2Unsupported`, so
- * we treat those codes as h2-fallback triggers as well. `ConnectionRefused` is
- * raised before the request is written, but a reset, a close, or a pre-response
- * RST_STREAM does not prove the peer never consumed the body — it may have
- * processed the request and died before answering. Replaying those three on h1
- * would duplicate the side effect, so `ConnectionReset`, `ConnectionClosed`,
- * and `HTTP2StreamReset` fall back only for requests that are provably
- * replay-safe (replay-safe method AND no body); anything else rethrows the
- * original error.
+ * `ConnectionClosed`, or `HTTP2StreamReset` rather than `HTTP2Unsupported`.
+ * `ConnectionRefused` is raised before the request is written, while
+ * `HTTP2RefusedStream` is the explicit HTTP/2 promise that a stream was never
+ * processed (including a stream above a graceful GOAWAY last-stream-id).
+ * `ConnectionReset`, `ConnectionClosed`, and a generic `HTTP2StreamReset` do
+ * not carry that promise: the peer may have consumed the body before the
+ * connection failed. Retrying those codes would duplicate non-idempotent side
+ * effects, so they preserve the original error instead of falling back.
  *
  * ALPN-refusing hosts (notably zcode.z.ai, the GLM ZCode OAuth broker) abort
  * the TLS handshake entirely when the client offers ALPN h2. Bun reports that
@@ -48,24 +47,21 @@ export function installH2Fetch(): void {
 	const h2FallbackCodes: ReadonlySet<string> = new Set([
 		"HTTP2Unsupported", // Server selected h1 in ALPN
 		"ConnectionRefused", // Server refused the h2 connection
-		"ConnectionReset", // Server reset during h2 handshake
-		"ConnectionClosed", // Server closed before h2 response
-		"HTTP2StreamReset", // Server sent RST_STREAM before any h2 response
+		"HTTP2RefusedStream", // REFUSED_STREAM / never-processed h2 stream
 		// Bun's h2 client reports an ALPN-refusing host's TLS abort with this
 		// code; the h1 fallback below re-verifies the certificate itself.
 		"UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
 	]);
-	/** Fallback codes that may fire *after* the peer consumed the body — replay only when safe. */
-	const replayGatedCodes: ReadonlySet<string> = new Set(["ConnectionReset", "ConnectionClosed", "HTTP2StreamReset"]);
 	const wrapper = async function h2fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		if (!isHttps(input)) return original(input, init);
+		const snapshot = snapshotRequest(input, init);
 		try {
-			return await original(input, { ...init, protocol: "http2" });
+			return await original(snapshot.input, { ...snapshot.init, protocol: "http2" });
 		} catch (err) {
 			const code = (err as { code?: string }).code ?? "";
 			if (!h2FallbackCodes.has(code)) throw err;
-			if (replayGatedCodes.has(code) && !isReplaySafeRequest(input, init)) throw err;
-			return original(input, init);
+			if (code === "HTTP2RefusedStream" && !isReplayableRequest(snapshot.input, snapshot.init)) throw err;
+			return original(snapshot.input, snapshot.init);
 		}
 	} as typeof fetch & PatchedFetch;
 
@@ -75,6 +71,33 @@ export function installH2Fetch(): void {
 	globalThis.fetch = wrapper;
 }
 
+function snapshotRequest(
+	input: string | URL | Request,
+	init?: RequestInit,
+): { input: string | URL | Request; init?: RequestInit } {
+	const snapshotInput = input instanceof URL ? new URL(input.href) : input;
+	const requestLike = typeof input !== "string" && !(input instanceof URL);
+	if (init === undefined && !requestLike) {
+		return { input: snapshotInput };
+	}
+
+	const snapshotInit: RequestInit = { ...(init ?? {}) };
+	if (init?.headers !== undefined) {
+		snapshotInit.headers = snapshotHeaders(init.headers);
+	} else if (requestLike) {
+		snapshotInit.headers = new Headers(input.headers);
+	}
+	return { input: snapshotInput, init: snapshotInit };
+}
+
+function snapshotHeaders(headers: NonNullable<RequestInit["headers"]>): NonNullable<RequestInit["headers"]> {
+	if (headers instanceof Headers) return new Headers(headers);
+	if (Array.isArray(headers)) {
+		return headers.map(([name, value]) => [name, value] as [string, string]);
+	}
+	return { ...headers };
+}
+
 function isHttps(input: string | URL | Request): boolean {
 	if (typeof input === "string") return input.startsWith("https:");
 	if (input instanceof URL) return input.protocol === "https:";
@@ -82,35 +105,29 @@ function isHttps(input: string | URL | Request): boolean {
 }
 
 /**
- * Whether replaying this request on a fresh connection is side-effect free:
- * a replay-safe method AND no body. A body is disqualifying even on such a
- * method, because the wrapper cannot prove the stream is still reusable after
- * the failed h2 attempt.
+ * Whether the request body can be handed to fetch a second time. This is only
+ * used after `HTTP2RefusedStream`, which proves that the peer did not consume
+ * request bytes; a one-shot ReadableStream is still not reusable locally.
  */
-function isReplaySafeRequest(input: string | URL | Request, init?: RequestInit): boolean {
+function isReplayableRequest(input: string | URL | Request, init?: RequestInit): boolean {
 	try {
-		const inputIsUrl = typeof input === "object" && input instanceof URL;
-		let inputMethod: string | undefined = "GET";
-		if (typeof input === "object" && !inputIsUrl) {
-			if (!("method" in input) || typeof input.method !== "string") return false;
-			inputMethod = input.method;
-		}
-		const method = init?.method ?? inputMethod;
-		if (typeof method !== "string") return false;
-		const normalized = method.toUpperCase();
-		if (normalized !== "GET" && normalized !== "HEAD" && normalized !== "OPTIONS") return false;
-
-		// A body on a Request input remains part of the effective request when
-		// init.body is omitted. Treat every non-null body as non-replayable: the
-		// wrapper cannot prove that it remains reusable after the failed h2 attempt.
-		if (init?.body !== undefined && init.body !== null) return false;
-		if (typeof input === "object" && !inputIsUrl) {
-			if (!("body" in input) || input.body !== null) return false;
-		}
-		return true;
+		if (init?.body !== undefined) return isReplayableBody(init.body);
+		if (typeof input === "string" || input instanceof URL) return true;
+		// Request bodies are exposed as ReadableStreams. The same Request object
+		// cannot be used for the second fetch once the first attempt touched it.
+		return input.body === null;
 	} catch {
 		// Cross-realm or proxy Request objects may throw while exposing their
 		// method/body. Do not retry when replayability cannot be established.
 		return false;
 	}
+}
+
+function isReplayableBody(body: RequestInit["body"]): boolean {
+	if (body === null || typeof body === "string") return true;
+	if (typeof Blob !== "undefined" && body instanceof Blob) return true;
+	// ArrayBuffer/views, FormData, and URLSearchParams are mutable caller-owned
+	// values. Fail closed instead of replaying a potentially changed payload if
+	// the asynchronous refusal arrives after the caller mutates one.
+	return false;
 }

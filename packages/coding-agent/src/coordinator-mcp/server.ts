@@ -741,7 +741,8 @@ function toolSchema(
 	if (name === "gjc_coordinator_await_turn") {
 		return {
 			name,
-			description: "Poll a durable turn for a bounded time and return the same shape as read_turn.",
+			description:
+				"Poll a durable turn for a bounded time. Observation expiry returns wait_expired:true (legacy ok:false, reason:timeout) without an MCP error. Inspect turn.status for completion; await again without resending the prompt.",
 			inputSchema: {
 				type: "object",
 				properties: {
@@ -5728,6 +5729,41 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		);
 	}
 
+	async function findPersistedBrokerAuthority(
+		sessions: Array<Record<string, unknown>>,
+		expected: {
+			sessionId: string;
+			workspace: string;
+			endpointGeneration: number | null;
+			endpointIncarnation: string | null;
+		},
+	): Promise<Record<string, unknown> | undefined> {
+		if (expected.endpointGeneration === null || expected.endpointIncarnation === null) return undefined;
+		let canonicalExpectedWorkspace: string;
+		try {
+			canonicalExpectedWorkspace = await canonicalBrokerWorkspace(expected.workspace);
+		} catch {
+			return undefined;
+		}
+		for (const session of sessions) {
+			if (brokerSessionId(session) !== expected.sessionId) continue;
+			if (
+				brokerEndpointGeneration(session) !== expected.endpointGeneration ||
+				brokerEndpointIncarnation(session, expected.sessionId) !== expected.endpointIncarnation
+			)
+				continue;
+			const declaredWorkspace = brokerSessionScope(session);
+			if (declaredWorkspace === null) continue;
+			try {
+				const canonicalDeclaredWorkspace = await canonicalBrokerWorkspace(declaredWorkspace);
+				if (sameCanonicalPath(canonicalDeclaredWorkspace, canonicalExpectedWorkspace, platform)) return session;
+			} catch {
+				// A missing or unreadable locator is not authority for this session.
+			}
+		}
+		return undefined;
+	}
+
 	type BrokerSessionAuthority = {
 		workspace: string;
 		endpointGeneration: number;
@@ -6576,6 +6612,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					try {
 						await ensureQuestionTransaction(sessionId);
 					} catch (error) {
+						// A session whose persisted location the current policy no longer authorizes
+						// must not be reaped (that would mutate an unauthorized location), but it must
+						// not abort enumeration either: rethrowing refuses the whole sweep, so one such
+						// session would stop reaping for every other session in the namespace. An empty
+						// root list is a namespace-wide misconfiguration, not a per-session defect, so it
+						// still refuses the sweep once instead of warning for every session.
+						if (
+							error instanceof Error &&
+							isSessionAuthorityError(error) &&
+							error.message !== "coordinator_workdir_roots_required"
+						) {
+							logger.warn("Coordinator session reaper skipped an unauthorized session", {
+								sessionId,
+								reason: error.message,
+								detail: error.cause instanceof Error ? error.cause.message : undefined,
+							});
+							continue;
+						}
 						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 					}
 					try {
@@ -6788,6 +6842,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return {
 				ok: false,
 				reason: "timeout",
+				wait_expired: true,
 				turn: payload.turn,
 				advisory_status: payload.advisory_status,
 				session_state: payload.session_state,
@@ -8294,18 +8349,49 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						};
 					await reconcileSessionRuntime(canonicalSessionId, { observeQuestions: false });
 					try {
-						const brokerWorkspace = optionalString(session.broker_workspace) ?? cwd;
-						let indexedSession = (await listSessions(brokerWorkspace)).find(
-							candidate => brokerSessionId(candidate) === canonicalSessionId,
+						// A projection can be partially written after its canonical WAL commit.
+						// Recover the durable broker identity before proving the live endpoint so
+						// a missing projection field does not turn an indexed session into a
+						// false `not_indexed` result.
+						const canonicalBroker = (await readSessionTransaction(questionPaths, canonicalSessionId))?.canonical
+							.session.broker;
+						const brokerWorkspace =
+							optionalString(session.broker_workspace) ?? optionalString(canonicalBroker?.workspace) ?? cwd;
+						const persistedEndpointGeneration =
+							typeof session.endpoint_generation === "number" &&
+							Number.isSafeInteger(session.endpoint_generation) &&
+							session.endpoint_generation > 0
+								? session.endpoint_generation
+								: typeof canonicalBroker?.endpoint_generation === "number" &&
+										Number.isSafeInteger(canonicalBroker.endpoint_generation) &&
+										canonicalBroker.endpoint_generation > 0
+									? canonicalBroker.endpoint_generation
+									: null;
+						const persistedEndpointIncarnation =
+							optionalString(session.endpoint_incarnation) ??
+							optionalString(canonicalBroker?.endpoint_incarnation);
+						const expectedAuthority = {
+							sessionId: canonicalSessionId,
+							workspace: brokerWorkspace,
+							endpointGeneration: persistedEndpointGeneration,
+							endpointIncarnation: persistedEndpointIncarnation,
+						};
+						// A matching session id is not enough: the broker row must still
+						// prove the projection's exact worktree endpoint authority.
+						let indexedSession = await findPersistedBrokerAuthority(
+							await listSessions(brokerWorkspace),
+							expectedAuthority,
 						);
-						// Windows broker locators may differ in drive-letter casing or separator
-						// spelling even after the injected canonical workspace seam has resolved
-						// the coordinator path. The scoped listing request is still authoritative;
-						// only its local path filter is relaxed for the exact requested session.
-						if (!indexedSession && platform === "win32") {
+						// A broker locator can retain a valid worktree under a spelling that
+						// the platform-local scope filter cannot normalize (for example a
+						// symlinked worktree or a Windows alias). Retry the unfiltered page,
+						// but keep canonical workspace and endpoint authority checks so this
+						// cannot turn a foreign or rotated row into an indexed session.
+						if (!indexedSession) {
 							const listing = await paginatedBrokerSessionList(brokerWorkspace, { cwd: brokerWorkspace });
-							indexedSession = jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []).find(
-								candidate => brokerSessionId(candidate) === canonicalSessionId,
+							indexedSession = await findPersistedBrokerAuthority(
+								jsonRecords(Array.isArray(listing.sessions) ? listing.sessions : []),
+								expectedAuthority,
 							);
 						}
 						const sessionState = publicCoordinatorSessionState(
@@ -8314,7 +8400,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return {
 							ok: true,
 							session: publicCoordinatorStatusSession(session),
-							status: { ...brokerLiveness(indexedSession ?? null), ...(sessionState ?? {}) },
+							// Broker indexing is the authority for endpoint liveness. A runtime
+							// sidecar can retain a stale `live:true` projection after its
+							// endpoint incarnation rotates, so it must not mask `not_indexed`.
+							status: { ...(sessionState ?? {}), ...brokerLiveness(indexedSession ?? null) },
 							session_state: sessionState,
 						};
 					} catch (error) {
@@ -11015,7 +11104,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (request.method === "tools/call") {
 			const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 			const payload = await callTool(params.name ?? "", params.arguments ?? {});
-			return { jsonrpc: "2.0", id, result: textResult(payload, payload.ok === false) };
+			return { jsonrpc: "2.0", id, result: coordinatorToolResult(payload) };
 		}
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
@@ -11037,8 +11126,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	};
 }
 
-function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
-	const failed = typeof payload === "object" && payload !== null && (payload as { ok?: unknown }).ok === false;
+function coordinatorToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
+	const record = asRecord(payload);
+	// The legacy ok:false means the observation window ended, not that the RPC
+	// failed. Keep its payload contract while preventing host error/retry breakers.
+	const observationExpired = record?.wait_expired === true && record.reason === "timeout" && !record.error;
+	const failed = record?.ok === false && !observationExpired;
 	return textResult(payload, failed);
 }
 
@@ -11083,7 +11176,7 @@ export async function handleCoordinatorMcpRequest(
 		return {
 			jsonrpc: "2.0",
 			id: request.id ?? null,
-			result: legacyToolResult(await server.callTool(params.name ?? "", args)),
+			result: coordinatorToolResult(await server.callTool(params.name ?? "", args)),
 		};
 	} finally {
 		await server.close();

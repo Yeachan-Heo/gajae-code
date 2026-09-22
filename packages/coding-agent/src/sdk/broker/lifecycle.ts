@@ -7014,7 +7014,7 @@ export async function reapDeadSessionRegistrations(
 		.slice(0, Math.max(0, limit));
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
-		if (!(await broker.index.unregisterIfCurrent(session))) continue;
+		if (!(await broker.index.unregisterIfCurrent(session, "process_exited"))) continue;
 		const record = {
 			sessionId: session.sessionId,
 			pid: session.pid,

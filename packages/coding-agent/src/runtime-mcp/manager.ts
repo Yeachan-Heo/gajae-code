@@ -35,6 +35,7 @@ import {
 	MCPPoolLeaseReleaseError,
 } from "./pool";
 import type { MCPProtocolObservation } from "./protocol";
+import { DEFAULT_MCP_STARTUP_WAIT_MS, MAX_MCP_STARTUP_WAIT_MS, MCP_STARTUP_WAIT_GRACE_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -101,15 +102,15 @@ type RetiredLeaseRelease = {
 	promise: Promise<void>;
 };
 
-const STARTUP_TIMEOUT_MS = 250;
-const STARTUP_TIMEOUT_GRACE_MS = 500;
+const STARTUP_TIMEOUT_MS = DEFAULT_MCP_STARTUP_WAIT_MS;
+const STARTUP_TIMEOUT_GRACE_MS = MCP_STARTUP_WAIT_GRACE_MS;
 /**
  * Default ceiling on how long `discoverAndConnect` waits for a server batch to
  * come up. Deliberately short: a config with a large `timeout` must not be able
  * to hang ordinary startup. ACP lifecycle launches carry their own, larger
  * budget derived from the readiness deadline (see `maxStartupTimeoutMs`).
  */
-const MAX_STARTUP_TIMEOUT_MS = 1_750;
+const MAX_STARTUP_TIMEOUT_MS = MAX_MCP_STARTUP_WAIT_MS;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
@@ -306,6 +307,41 @@ export interface MCPManagerOptions {
 	afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 }
 
+export type ExactMcpServerControlStatus =
+	| "suspended"
+	| "already-suspended"
+	| "resumed"
+	| "not-suspended"
+	| "reconnected"
+	| "unavailable"
+	| "unknown-server";
+
+export interface ExactMcpServerControlResult {
+	readonly name: string;
+	readonly status: ExactMcpServerControlStatus;
+	readonly toolCount: number;
+}
+
+/**
+ * A staged catalog the caller can validate against before it is published.
+ * `commit` is the single publication point; `abort` releases anything the
+ * preparation opened and leaves the manager on its predecessor.
+ */
+export interface PreparedExactMcpCatalog {
+	readonly tools: CustomTool<TSchema, MCPToolDetails>[];
+	canCommit(): boolean;
+	commit(): Promise<void>;
+	abort(): Promise<void>;
+}
+
+export interface PreparedExactMcpServerControl extends PreparedExactMcpCatalog {
+	readonly result: ExactMcpServerControlResult;
+	/** Validate a resumed replacement before an atomic multi-server publication. */
+	precommit?(): void;
+	/** Publish after every replacement in the catalog has passed precommit. */
+	publish?(): void;
+}
+
 /**
  * MCP Server Manager.
  *
@@ -365,6 +401,13 @@ export class MCPManager {
 	#reconnectBackoffs = new Map<string, AbortController>();
 	/** Preserved configs for reconnection after connection loss. */
 	#serverConfigs = new Map<string, MCPServerConfig>();
+	// Exact MCP replacements retain cleanup ownership and cancel in-flight candidates.
+	/** Session-local operator suppression; never persisted to MCP config. */
+	#suppressedServers = new Set<string>();
+	/** Prepare-phase fence that prevents a concurrent close/rebind publication. */
+	#pendingExactSuspensions = new Set<string>();
+	/** Single per-server candidate axis shared against automatic reconnect. */
+	#pendingExactControlServers = new Set<string>();
 	/** Monotonic epoch incremented on disconnectAll to invalidate stale reconnections. */
 	#epoch = 0;
 	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
@@ -539,7 +582,11 @@ export class MCPManager {
 	}
 
 	#scheduleSharedRebind(name: string, lease: MCPPoolLease): void {
-		if (this.#scopedLifecycle === "disconnecting") return;
+		if (this.#pendingExactSuspensions.has(name) || this.#pendingExactControlServers.has(name)) {
+			this.#queueDeferredSharedRebind(name, lease, this.#epoch);
+			return;
+		}
+		if (this.#scopedLifecycle === "disconnecting" || this.#suppressedServers.has(name)) return;
 		const active = this.#activeSharedRebinds.get(name);
 		if (active) {
 			if (active.lease !== lease) this.#queueDeferredSharedRebind(name, lease, this.#epoch);
@@ -562,6 +609,15 @@ export class MCPManager {
 	#drainDeferredSharedRebinds(): void {
 		if (this.#scopedLifecycle !== "open" || this.#deferredSharedRebinds.size === 0) return;
 		for (const [name, pending] of this.#deferredSharedRebinds.entries()) {
+			// A suspended or in-flight control still owns this server. Keep the newest
+			// replacement queued so the manager rebinds after suppression clears instead
+			// of staying bound to a retired pool generation.
+			if (
+				this.#suppressedServers.has(name) ||
+				this.#pendingExactSuspensions.has(name) ||
+				this.#pendingExactControlServers.has(name)
+			)
+				continue;
 			if (pending.managerEpoch !== this.#epoch) {
 				this.#deferredSharedRebinds.delete(name);
 				continue;
@@ -614,7 +670,14 @@ export class MCPManager {
 					this.#handleServerNotification(name, event.method, event.params);
 					return;
 				}
-				if (event.type !== "close" || this.#connectionSetSealed) return;
+				if (
+					event.type !== "close" ||
+					this.#connectionSetSealed ||
+					this.#suppressedServers.has(name) ||
+					this.#pendingExactSuspensions.has(name) ||
+					this.#pendingExactControlServers.has(name)
+				)
+					return;
 				void this.reconnectServer(name);
 			}),
 		);
@@ -622,7 +685,12 @@ export class MCPManager {
 
 	async #rebindAfterSharedRestart(name: string, lease: MCPPoolLease): Promise<void> {
 		const managerEpoch = this.#epoch;
-		if (this.#scopedLifecycle === "disconnecting") return;
+		if (
+			this.#scopedLifecycle === "disconnecting" ||
+			this.#pendingExactSuspensions.has(name) ||
+			this.#pendingExactControlServers.has(name)
+		)
+			return;
 		if (this.#scopedLifecycle === "reconnecting") {
 			this.#queueDeferredSharedRebind(name, lease, managerEpoch);
 			return;
@@ -1067,6 +1135,13 @@ export class MCPManager {
 					"MCP connection cleanup pending";
 				errors.set(name, this.#serverError(message));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: message,
+					});
+				}
 				continue;
 			}
 			if (sources[name]) {
@@ -1080,11 +1155,14 @@ export class MCPManager {
 			// Skip if already connected.
 			if (this.#connections.has(name)) {
 				connectedServers.add(name);
-				allTools.push(
-					...this.#tools.filter(
-						tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-					),
-				);
+				if (this.#isExactToolPublicationAllowed(name)) {
+					allTools.push(
+						...this.#tools.filter(
+							tool =>
+								(tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+						),
+					);
+				}
 				continue;
 			}
 
@@ -1093,14 +1171,29 @@ export class MCPManager {
 				this.#pendingToolLoads.has(name) ||
 				this.#pendingReconnections.has(name)
 			) {
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: "connection already pending",
+					});
+				}
 				continue;
 			}
 
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, this.#serverError(validationErrors.join("; ")));
+				const reason = validationErrors.join("; ");
+				errors.set(name, this.#serverError(reason));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason,
+					});
+				}
 				continue;
 			}
 
@@ -1237,10 +1330,12 @@ export class MCPManager {
 						return;
 					this.#pendingToolLoads.delete(name);
 					const reconnect = () => this.reconnectServer(name);
-					const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
-						noReplay: config.sharing === "shared",
-						inputHandler: () => this.#inputRequestHandler ?? undefined,
-					});
+					const customTools = MCPTool.fromTools(
+						this.#connectionForLease(connection),
+						serverTools,
+						reconnect,
+						this.#exactToolOptions(name, config.sharing === "shared"),
+					);
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
 					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
@@ -1250,9 +1345,11 @@ export class MCPManager {
 					this.#retainConnectionCleanupFailure(name, error);
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
+					if (!allowBackgroundLogging || this.#toolsOnly || reportedErrors.has(name)) return;
 					const message = error instanceof Error ? error.message : String(error);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
+					errors.set(name, this.#serverError(message));
+					reportedErrors.add(name);
+					logger.error("MCP tool load failed", { path: `mcp:${name}`, serverName: name, error: message });
 				});
 		}
 
@@ -1331,12 +1428,22 @@ export class MCPManager {
 						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
 							logger.warn("MCP server still connecting after the startup wait", {
 								path: `mcp:${task.name}`,
+								serverName: task.name,
 								startupWaitMs: startupTimeoutMs,
 								declaredTimeoutMs: task.config.timeout,
 							});
 							continue;
 						}
 						const message = `MCP server connection timed out during startup: ${task.name}`;
+						if (!this.#toolsOnly) {
+							logger.warn("MCP server connection timed out during startup", {
+								path: `mcp:${task.name}`,
+								serverName: task.name,
+								startupWaitMs: startupTimeoutMs,
+								declaredTimeoutMs: task.config.timeout,
+								remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
+							});
+						}
 						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
 						task.connectionAbort.abort(new Error(message));
@@ -1344,7 +1451,7 @@ export class MCPManager {
 						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
 							this.#pendingToolLoads.delete(task.name);
 						this.#pendingConnectionControllers.delete(task.name);
-						void this.#disconnectServer(task.name).catch(error => {
+						void this.#disconnectServer(task.name, { preserveConfig: this.#toolsOnly }).catch(error => {
 							this.#logLeaseReleaseFailure(task.name, undefined, error);
 						});
 					}
@@ -1368,26 +1475,39 @@ export class MCPManager {
 						continue;
 					}
 					connectedServers.add(name);
-					const reconnect = () => this.reconnectServer(name);
-					try {
-						allTools.push(
-							...MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
-								noReplay: task.config.sharing === "shared",
-								inputHandler: () => this.#inputRequestHandler ?? undefined,
-							}),
-						);
-					} catch (error) {
-						await this.#cleanupConnectionTasks(connectionTasks);
-						throw error;
+					if (this.#isExactToolPublicationAllowed(name)) {
+						const reconnect = () => this.reconnectServer(name);
+						try {
+							allTools.push(
+								...MCPTool.fromTools(
+									this.#connectionForLease(connection),
+									serverTools,
+									reconnect,
+									this.#exactToolOptions(name, task.config.sharing === "shared"),
+								),
+							);
+						} catch (error) {
+							await this.#cleanupConnectionTasks(connectionTasks);
+							throw error;
+						}
 					}
 				} else if (task.tracked.status === "rejected") {
 					const reason = task.tracked.reason;
 					this.#retainConnectionCleanupFailure(name, reason);
 					const message = reason instanceof Error ? reason.message : String(reason);
+					if (!(this.#toolsOnly && reason instanceof MCPExpectedFailure)) {
+						logger.warn("MCP server connection failed during startup", {
+							path: `mcp:${name}`,
+							serverName: name,
+							error: message,
+							remediation:
+								"Check the server command and set --timeout <ms> when startup is expected to be slow.",
+						});
+					}
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
 					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {
-						await this.#disconnectServer(name).catch(error => {
+						await this.#disconnectServer(name, { preserveConfig: true }).catch(error => {
 							this.#logLeaseReleaseFailure(name, this.#connections.get(name), error);
 						});
 					}
@@ -1396,7 +1516,7 @@ export class MCPManager {
 					}
 				} else {
 					const cached = cachedTools.get(name);
-					if (cached) {
+					if (cached && this.#isExactToolPublicationAllowed(name)) {
 						const source = this.#sources.get(name);
 						const reconnect = () => this.reconnectServer(name);
 						try {
@@ -1407,10 +1527,7 @@ export class MCPManager {
 									() => this.#waitForConnection(name).then(connection => this.#connectionForLease(connection)),
 									source,
 									reconnect,
-									{
-										noReplay: task.config.sharing === "shared",
-										inputHandler: () => this.#inputRequestHandler ?? undefined,
-									},
+									this.#exactToolOptions(name, task.config.sharing === "shared"),
 								),
 							);
 						} catch (error) {
@@ -1443,13 +1560,24 @@ export class MCPManager {
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+		if (!this.#isExactToolPublicationAllowed(name)) return;
 		this.#tools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		this.#tools.push(...tools);
+		if (!this.#suppressedServers.has(name)) this.#tools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(this.#tools);
+	}
+
+	#exactToolOptions(
+		name: string,
+		noReplay: boolean,
+	): { noReplay: boolean; isAvailable?: () => boolean; inputHandler: () => MCPInputRequestHandler | undefined } {
+		const inputHandler = () => this.#inputRequestHandler ?? undefined;
+		return this.#toolsOnly
+			? { noReplay, isAvailable: () => !this.#suppressedServers.has(name), inputHandler }
+			: { noReplay, inputHandler };
 	}
 
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): void {
@@ -1525,7 +1653,437 @@ export class MCPManager {
 	 * Get all loaded tools.
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
-		return [...this.#tools];
+		return this.#tools.filter(tool => !tool.mcpServerName || this.#isExactToolPublicationAllowed(tool.mcpServerName));
+	}
+
+	#isExactToolPublicationAllowed(name: string): boolean {
+		return (
+			!this.#toolsOnly ||
+			(!this.#suppressedServers.has(name) &&
+				!this.#pendingExactSuspensions.has(name) &&
+				!this.#pendingExactControlServers.has(name))
+		);
+	}
+
+	isExactServerSuppressed(name: string): boolean {
+		this.#assertExactServerControl();
+		return this.#suppressedServers.has(name);
+	}
+
+	#exactServerToolCount(name: string): number {
+		return this.#tools.reduce((count, tool) => (tool.mcpServerName === name ? count + 1 : count), 0);
+	}
+
+	#assertExactServerControl(): void {
+		if (!this.#toolsOnly) throw new Error("Exact MCP server controls require a tools-only manager");
+	}
+
+	/**
+	 * Prepare one exact-config control without publishing manager state. Session
+	 * registry and prompt validation run against `tools`; commit is the single
+	 * publication point and abort releases only an unpublished candidate.
+	 */
+	async prepareExactServerControl(
+		action: "suspend" | "resume" | "reconnect",
+		name: string,
+	): Promise<PreparedExactMcpServerControl> {
+		this.#assertExactServerControl();
+		if (!this.#serverConfigs.has(name) && !this.#connections.has(name)) {
+			return this.#settledExactControl({ name, status: "unknown-server", toolCount: 0 });
+		}
+		if (action === "suspend") {
+			if (this.#suppressedServers.has(name)) {
+				return this.#settledExactControl({ name, status: "already-suspended", toolCount: 0 });
+			}
+			this.#pendingExactSuspensions.add(name);
+			await this.#activeSharedRebinds.get(name)?.promise;
+			const tools = this.#tools.filter(
+				tool =>
+					tool.mcpServerName !== name && (!tool.mcpServerName || !this.#suppressedServers.has(tool.mcpServerName)),
+			);
+			return {
+				result: { name, status: "suspended", toolCount: 0 },
+				tools,
+				canCommit: () => true,
+				commit: async () => {
+					this.#suppressedServers.add(name);
+					this.#pendingExactSuspensions.delete(name);
+					this.#reconnectBackoffs.get(name)?.abort(new Error(`MCP server suspended: ${name}`));
+					for (const tool of this.#tools) {
+						if (tool.mcpServerName === name) (tool as MCPTool | DeferredMCPTool).invalidateForSessionControl();
+					}
+					await this.#activeSharedRebinds.get(name)?.promise;
+				},
+				abort: async () => {
+					this.#pendingExactSuspensions.delete(name);
+				},
+			};
+		}
+		if (action === "resume" && !this.#suppressedServers.has(name)) {
+			return this.#settledExactControl({
+				name,
+				status: "not-suspended",
+				toolCount: this.#exactServerToolCount(name),
+			});
+		}
+		if (action === "reconnect" && this.#suppressedServers.has(name)) {
+			return this.#settledExactControl({ name, status: "unavailable", toolCount: 0 });
+		}
+		const automaticReconnect = this.#pendingReconnections.get(name);
+		if (automaticReconnect) {
+			this.#pendingExactControlServers.add(name);
+			let connection: MCPServerConnection | null;
+			try {
+				connection = await automaticReconnect;
+			} catch (error) {
+				this.#pendingExactControlServers.delete(name);
+				this.#drainDeferredSharedRebinds();
+				throw error;
+			}
+			if (!connection) {
+				this.#pendingExactControlServers.delete(name);
+				this.#drainDeferredSharedRebinds();
+				return this.#settledExactControl({ name, status: "unavailable", toolCount: 0 });
+			}
+			let candidateTools: CustomTool<TSchema, MCPToolDetails>[];
+			try {
+				candidateTools = await this.#buildExactServerTools(name, connection);
+			} catch (error) {
+				this.#pendingExactControlServers.delete(name);
+				this.#drainDeferredSharedRebinds();
+				throw error;
+			}
+			return this.#preparedCatalogCommit(
+				name,
+				action === "resume" ? "resumed" : "reconnected",
+				candidateTools,
+				undefined,
+				connection,
+			);
+		}
+		this.#pendingExactControlServers.add(name);
+		const existing = this.#connections.get(name);
+		if (action === "resume" && existing?.transport.connected) {
+			try {
+				const candidateTools = await this.#buildExactServerTools(name, existing);
+				return this.#preparedCatalogCommit(name, "resumed", candidateTools, undefined, existing);
+			} catch {
+				// A mapped transport can close while suppressed; recover with an
+				// unpublished physical candidate instead of exposing stale state.
+			}
+		}
+		try {
+			const candidate = await this.#prepareExactReplacement(name);
+			return this.#preparedCatalogCommit(
+				name,
+				action === "resume" ? "resumed" : "reconnected",
+				candidate.tools,
+				candidate,
+				undefined,
+			);
+		} catch (error) {
+			const cleanupFailure = this.#retainConnectionCleanupFailure(name, error);
+			if (cleanupFailure) {
+				logger.error("MCP exact replacement cleanup failed", {
+					path: `mcp:${name}`,
+					error: cleanupFailure,
+				});
+			}
+			this.#pendingExactControlServers.delete(name);
+			this.#drainDeferredSharedRebinds();
+			return this.#settledExactControl({ name, status: "unavailable", toolCount: 0 });
+		}
+	}
+
+	/** Clear all session-local suppression before this owner adopts a new identity. */
+	async prepareExactServerControlReset(): Promise<PreparedExactMcpCatalog> {
+		this.#assertExactServerControl();
+		const prepared: PreparedExactMcpServerControl[] = [];
+		for (const name of [...this.#suppressedServers]) {
+			try {
+				const candidate = await this.prepareExactServerControl("resume", name);
+				if (candidate.result.status !== "resumed") {
+					logger.warn("MCP server did not resume during identity reset", {
+						path: `mcp:${name}`,
+						status: candidate.result.status,
+					});
+					await candidate.abort();
+					continue;
+				}
+				prepared.push(candidate);
+			} catch (error) {
+				// A suspended server's reachability must not block identity adoption.
+				logger.warn("MCP server resume failed during identity reset", { path: `mcp:${name}`, error });
+			}
+		}
+		const resumedNames = new Set(prepared.map(candidate => candidate.result.name));
+		const carriedOver = this.#tools.filter(
+			tool =>
+				!tool.mcpServerName ||
+				(!this.#suppressedServers.has(tool.mcpServerName) && !resumedNames.has(tool.mcpServerName)),
+		);
+		const resumedTools = prepared.flatMap(candidate =>
+			candidate.tools.filter(tool => tool.mcpServerName === candidate.result.name),
+		);
+		const tools = [...carriedOver, ...resumedTools];
+		sortMCPToolsByName(tools);
+		return {
+			tools,
+			canCommit: () => prepared.every(candidate => candidate.canCommit()),
+			commit: async () => {
+				try {
+					for (const candidate of prepared) {
+						if (!candidate.precommit)
+							throw new Error("Exact MCP reset candidate does not support atomic publication");
+						candidate.precommit();
+					}
+				} catch (error) {
+					await Promise.allSettled(prepared.map(candidate => candidate.abort()));
+					throw error;
+				}
+				for (const candidate of prepared) {
+					if (!candidate.publish) throw new Error("Exact MCP reset candidate does not support atomic publication");
+					candidate.publish();
+				}
+				this.#tools = tools;
+				this.#suppressedServers.clear();
+				this.#pendingExactSuspensions.clear();
+				this.#drainDeferredSharedRebinds();
+			},
+			abort: async () => {
+				await Promise.allSettled(prepared.map(candidate => candidate.abort()));
+			},
+		};
+	}
+
+	#settledExactControl(result: ExactMcpServerControlResult): PreparedExactMcpServerControl {
+		return { result, tools: this.getTools(), canCommit: () => true, commit: async () => {}, abort: async () => {} };
+	}
+
+	async #buildExactServerTools(
+		name: string,
+		connection: MCPServerConnection,
+	): Promise<CustomTool<TSchema, MCPToolDetails>[]> {
+		const config = this.#serverConfigs.get(name) ?? connection.config;
+		const serverTools = await listTools(this.#connectionForLease(connection));
+		const reconnect = () => this.reconnectServer(name);
+		return MCPTool.fromTools(
+			this.#connectionForLease(connection),
+			serverTools,
+			reconnect,
+			this.#exactToolOptions(name, config.sharing === "shared"),
+		);
+	}
+
+	async #preparedCatalogCommit(
+		name: string,
+		status: "resumed" | "reconnected",
+		serverTools: CustomTool<TSchema, MCPToolDetails>[],
+		candidate:
+			| {
+					connection: MCPServerConnection;
+					lease: MCPPoolLease;
+					canCommit(): boolean;
+					publish(): void;
+					abort(): Promise<void>;
+			  }
+			| undefined,
+		expectedConnection: MCPServerConnection | undefined,
+	): Promise<PreparedExactMcpServerControl> {
+		const tools = [
+			...this.#tools.filter(
+				tool =>
+					tool.mcpServerName !== name && (!tool.mcpServerName || !this.#suppressedServers.has(tool.mcpServerName)),
+			),
+			...serverTools,
+		];
+		sortMCPToolsByName(tools);
+		if (this.#toolsOnly && new Set(tools.map(tool => tool.name)).size !== tools.length) {
+			let abortError: unknown;
+			try {
+				await candidate?.abort();
+			} catch (error) {
+				abortError = error;
+			}
+			this.#pendingExactControlServers.delete(name);
+			this.#drainDeferredSharedRebinds();
+			if (abortError !== undefined) throw abortError;
+			return this.#settledExactControl({ name, status: "unavailable", toolCount: 0 });
+		}
+		let settled = false;
+		const precommit = (): void => {
+			if (settled) return;
+			if (
+				candidate
+					? !candidate.canCommit()
+					: expectedConnection &&
+						(this.#connections.get(name) !== expectedConnection || !expectedConnection.transport.connected)
+			) {
+				throw new Error(`MCP exact control predecessor changed before commit: ${name}`);
+			}
+		};
+		const publish = (): void => {
+			if (settled) return;
+			candidate?.publish();
+			settled = true;
+			if (candidate) {
+				this.#leaseByConnection.set(candidate.connection, candidate.lease);
+				this.#connections.set(name, candidate.connection);
+				this.#registerLease(name, candidate.connection);
+			}
+			for (const tool of this.#tools) {
+				if (tool.mcpServerName === name) (tool as MCPTool | DeferredMCPTool).invalidateForSessionControl();
+			}
+			const publishedTools = [
+				...this.#tools.filter(
+					tool =>
+						tool.mcpServerName !== name &&
+						(!tool.mcpServerName || !this.#suppressedServers.has(tool.mcpServerName)),
+				),
+				...serverTools,
+			];
+			sortMCPToolsByName(publishedTools);
+			this.#tools = publishedTools;
+			this.#suppressedServers.delete(name);
+			this.#pendingExactControlServers.delete(name);
+			this.#drainDeferredSharedRebinds();
+		};
+		return {
+			result: { name, status, toolCount: serverTools.length },
+			tools,
+			canCommit: () =>
+				candidate
+					? candidate.canCommit()
+					: !expectedConnection ||
+						(this.#connections.get(name) === expectedConnection && expectedConnection.transport.connected),
+			precommit,
+			publish,
+			commit: async () => {
+				if (settled) return;
+				try {
+					precommit();
+					publish();
+				} catch (error) {
+					let abortError: unknown;
+					try {
+						await candidate?.abort();
+					} catch (cleanupError) {
+						abortError = cleanupError;
+					}
+					this.#pendingExactControlServers.delete(name);
+					this.#drainDeferredSharedRebinds();
+					if (abortError !== undefined) {
+						throw new AggregateError([error, abortError], `MCP exact control commit and cleanup failed: ${name}`);
+					}
+					throw error;
+				}
+			},
+			abort: async () => {
+				if (settled) return;
+				let abortError: unknown;
+				try {
+					await candidate?.abort();
+				} catch (cleanupError) {
+					abortError = cleanupError;
+				}
+				settled = true;
+				this.#pendingExactControlServers.delete(name);
+				this.#drainDeferredSharedRebinds();
+				if (abortError !== undefined) throw abortError;
+			},
+		};
+	}
+
+	async #prepareExactReplacement(name: string): Promise<{
+		connection: MCPServerConnection;
+		lease: MCPPoolLease;
+		tools: CustomTool<TSchema, MCPToolDetails>[];
+		canCommit(): boolean;
+		publish(): void;
+		abort(): Promise<void>;
+	}> {
+		const config = this.#serverConfigs.get(name);
+		if (!config) throw new Error(`MCP server unavailable: ${name}`);
+		await this.#closePendingConnectionCleanup(name);
+		const resolved = await this.#resolveAuthConfig(config);
+		const abort = new AbortController();
+		this.#pendingConnectionControllers.set(name, abort);
+		let prepared:
+			| {
+					lease: MCPPoolLease;
+					canCommit(): boolean;
+					publish(): void;
+					abort(): Promise<void>;
+			  }
+			| undefined;
+		const abortPrepared = async (): Promise<void> => {
+			if (!prepared) return;
+			try {
+				await prepared.abort();
+			} catch (error) {
+				const cleanupFailure = this.#retainConnectionCleanupFailure(name, error);
+				if (cleanupFailure) {
+					logger.error("MCP exact replacement abort cleanup failed", {
+						path: `mcp:${name}`,
+						error: cleanupFailure,
+					});
+				}
+				throw error;
+			}
+		};
+		try {
+			prepared = await this.#pool.prepareReplacement(name, resolved, {
+				keyConfig: config,
+				sharingMode:
+					config.sharing === "shared" &&
+					(resolved.type === "http" || resolved.type === "sse" || resolved.type === "stdio")
+						? "shared"
+						: "per-session",
+				sessionId: config.sharing === "shared" ? undefined : this.#sessionId,
+				signal: abort.signal,
+				advertiseRoots: false,
+				effectiveCwd: resolved.type === "stdio" ? (resolved.cwd ?? this.cwd) : this.cwd,
+				capabilityProfile: "tools-only",
+				effectiveHeaders: resolved.type === "http" || resolved.type === "sse" ? resolved.headers : undefined,
+				onRequest: (method, params) => this.#handleServerRequest(method, params),
+				onCleanupPending: error => this.#retainPendingAcquireCleanup(name, error),
+			});
+			const connection = prepared.lease.connection;
+			connection.config = config;
+			const source = this.#sources.get(name) ?? this.#connections.get(name)?._source;
+			if (source) connection._source = source;
+			const definitions = await listTools(prepared.lease.connectionForLease());
+			const reconnect = () => this.reconnectServer(name);
+			const tools = MCPTool.fromTools(
+				prepared.lease.connectionForLease(),
+				definitions,
+				reconnect,
+				this.#exactToolOptions(name, config.sharing === "shared"),
+			);
+			return {
+				connection,
+				lease: prepared.lease,
+				tools,
+				canCommit: prepared.canCommit,
+				publish: prepared.publish,
+				abort: abortPrepared,
+			};
+		} catch (error) {
+			this.#retainConnectionCleanupFailure(name, error);
+			try {
+				await abortPrepared();
+			} catch (abortError) {
+				throw new AggregateError(
+					[error, abortError],
+					`MCP exact replacement preparation and cleanup failed: ${name}`,
+				);
+			}
+			throw error;
+		} finally {
+			if (this.#pendingConnectionControllers.get(name) === abort) {
+				this.#pendingConnectionControllers.delete(name);
+			}
+		}
 	}
 
 	/**
@@ -1776,7 +2334,7 @@ export class MCPManager {
 		await this.#disconnectServer(name);
 	}
 
-	async #disconnectServer(name: string): Promise<void> {
+	async #disconnectServer(name: string, options: { preserveConfig?: boolean } = {}): Promise<void> {
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
@@ -1787,7 +2345,7 @@ export class MCPManager {
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
 		this.#sources.delete(name);
-		this.#serverConfigs.delete(name);
+		if (!options.preserveConfig) this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		const connection = this.#connections.get(name);
 
@@ -1926,6 +2484,9 @@ export class MCPManager {
 			this.#pendingResourceRefresh.clear();
 			this.#sources.clear();
 			this.#serverConfigs.clear();
+			this.#suppressedServers.clear();
+			this.#pendingExactSuspensions.clear();
+			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
 			this.#tools = [];
 			this.#subscribedResources.clear();
@@ -1966,6 +2527,8 @@ export class MCPManager {
 	async reconnectServer(name: string): Promise<MCPServerConnection | null> {
 		if (this.#connectionSetSealed) return null;
 		if (this.#scopedLifecycle === "disconnecting") return null;
+		if (this.#pendingExactControlServers.has(name)) return this.#connections.get(name) ?? null;
+		if (this.#suppressedServers.has(name)) return null;
 		const pending = this.#pendingReconnections.get(name);
 		if (pending) return pending;
 
@@ -2163,6 +2726,9 @@ export class MCPManager {
 		// while we were connecting (e.g. /mcp reload called disconnectAll).
 		if (
 			!this.#serverConfigs.has(name) ||
+			this.#suppressedServers.has(name) ||
+			this.#pendingExactSuspensions.has(name) ||
+			this.#pendingExactControlServers.has(name) ||
 			this.#epoch !== globalEpoch ||
 			(this.#disconnectEpochs.get(name) ?? 0) !== disconnectEpoch ||
 			(lifecycleEpoch !== undefined &&
@@ -2193,16 +2759,25 @@ export class MCPManager {
 		}
 		try {
 			const serverTools = await listTools(this.#connectionForLease(connection));
-			if (!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection)) {
+			// An exact control can claim this server while tools load; publishing here
+			// would install a catalog the control never validated.
+			if (
+				!this.#isCurrentConnection(name, config, globalEpoch, disconnectEpoch, connection) ||
+				this.#suppressedServers.has(name) ||
+				this.#pendingExactSuspensions.has(name) ||
+				this.#pendingExactControlServers.has(name)
+			) {
 				const disconnectError = new Error(`Server "${name}" was disconnected during tool loading`);
 				await this.#releaseLeasePreservingPrimary(name, connection);
 				throw disconnectError;
 			}
 			const reconnect = () => this.reconnectServer(name);
-			const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
-				noReplay: config.sharing === "shared",
-				inputHandler: () => this.#inputRequestHandler ?? undefined,
-			});
+			const customTools = MCPTool.fromTools(
+				this.#connectionForLease(connection),
+				serverTools,
+				reconnect,
+				this.#exactToolOptions(name, config.sharing === "shared"),
+			);
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
@@ -2267,10 +2842,12 @@ export class MCPManager {
 		const serverTools = await listTools(facade);
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const reconnect = () => this.reconnectServer(name);
-		const customTools = MCPTool.fromTools(facade, serverTools, reconnect, {
-			noReplay: connection.config.sharing === "shared",
-			inputHandler: () => this.#inputRequestHandler ?? undefined,
-		});
+		const customTools = MCPTool.fromTools(
+			facade,
+			serverTools,
+			reconnect,
+			this.#exactToolOptions(name, connection.config.sharing === "shared"),
+		);
 		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server

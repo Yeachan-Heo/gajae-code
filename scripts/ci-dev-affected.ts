@@ -88,6 +88,16 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
+// The MiniMax thinking contract is enriched while bundled catalog entries are
+// loaded, so the catalog assertions must run when either the normalization
+// rules or their generated source data changes. Neither source file has a
+// basename-matched `*.test.ts` sibling for the canonical catalog contract.
+const AI_MODEL_CATALOG_OWNER_TESTS = [
+	"packages/ai/test/model-thinking.test.ts",
+	"packages/ai/test/minimax-thinking.test.ts",
+	"packages/ai/test/preset-catalog-models.test.ts",
+] as const;
+
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
@@ -98,7 +108,12 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
-	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": [
+		"packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		// This module owns the general-vs-profile-activation availability split, so a
+		// change here must also exercise the suite that asserts that split.
+		"packages/coding-agent/test/model-profile-activation.test.ts",
+	],
 	// Making this module asynchronous (e.g. a top-level `await import(...)`)
 	// propagates async-ness through every importer, and bun 1.4.0 drops it on the
 	// `model-registry` <-> `model-resolver` import cycle: the bundle then carries a
@@ -123,6 +138,8 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",
 	],
+	"packages/ai/src/model-thinking.ts": AI_MODEL_CATALOG_OWNER_TESTS,
+	"packages/ai/src/models.json": AI_MODEL_CATALOG_OWNER_TESTS,
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],

@@ -1401,6 +1401,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+
+	test("model-registry changes schedule the availability-split regression suite", () => {
+		const keys = targeted(["packages/coding-agent/src/config/model-registry.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/model-registry-runtime-provider.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/model-profile-activation.test.ts");
+	});
 	test("managed-session-scope changes schedule the owner-only self-heal budget regression", () => {
 		const keys = targeted(["packages/coding-agent/src/session/internal/managed-session-scope.ts"]).map(
 			task => task.key,
@@ -1529,6 +1535,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:packages/ai/test/anthropic-stream-envelope.test.ts");
 		expect(keys).toContain("root-check");
 		expect(keys).toContain("native-linux-x64");
+	});
+
+	test("AI model catalog sources select their bundled thinking contract tests", () => {
+		const expected = [
+			"test:packages/ai/test/model-thinking.test.ts",
+			"test:packages/ai/test/minimax-thinking.test.ts",
+			"test:packages/ai/test/preset-catalog-models.test.ts",
+		];
+		for (const source of ["packages/ai/src/model-thinking.ts", "packages/ai/src/models.json"]) {
+			const keys = targeted([source]).map(task => task.key);
+			for (const testKey of expected) expect(keys).toContain(testKey);
+		}
 	});
 
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run + workflow-permissions", () => {

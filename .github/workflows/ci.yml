@@ -255,12 +255,28 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Download native addon(s)
+         - name: Restore native addon(s) from this run
+           id: native_restore
            if: ${{ matrix.native }}
+           continue-on-error: true
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               name: main-native-${{ github.run_id }}
               path: packages/natives/native
+         - name: Rebuild native addon(s) when this run's artifact has expired
+           if: ${{ matrix.native && steps.native_restore.outcome == 'failure' }}
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: |
+              # `main-native-<run_id>` is retained for one day because a normal run
+              # consumes it inside that same run. Re-running a run older than that
+              # finds no artifact to download, which is not a code failure: rebuild
+              # the same variants from the same source rather than failing every
+              # native shard on an expired artifact (#5715).
+              echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
+              bun run ci:build:native
          - name: Run task shard
            env:
               GITHUB_ACTIONS: ""
@@ -285,11 +301,24 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Download native addon(s)
+         - name: Restore native addon(s) from this run
+           id: native_restore
+           continue-on-error: true
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               name: main-native-${{ github.run_id }}
               path: packages/natives/native
+         - name: Rebuild native addon(s) when this run's artifact has expired
+           if: ${{ steps.native_restore.outcome == 'failure' }}
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: |
+              # Same recovery as the shard lane: an expired run-scoped artifact on a
+              # re-run is not a code failure (#5715).
+              echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
+              bun run ci:build:native
          - name: Run ACP conformance
            run: |
               # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
