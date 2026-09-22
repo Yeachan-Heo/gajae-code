@@ -933,6 +933,21 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 ]);
 
 const USAGE_CACHE_PREFIX = "usage_cache:";
+function hashUsageDiagnosticValue(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length === 0) return undefined;
+	return Bun.hash(value).toString(16);
+}
+
+function redactUsageDiagnosticUrl(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	try {
+		const parsed = new URL(value);
+		return `${parsed.protocol}//${parsed.host}`;
+	} catch {
+		return "[invalid-url]";
+	}
+}
+
 // 5 min stale tolerance. Anthropic / OpenAI rate-limit /usage hard at the IP
 // level so we can't fetch all N credentials every cycle; with a long cache
 // each credential's last-known value sticks visible while peers retry. UI
@@ -949,8 +964,8 @@ const USAGE_FAILURE_BACKOFF_MS = 10_000;
 // Bumped from 3s — Anthropic model usage retries up to 3 times with exponential backoff
 // (~3.5s total worst case); a tight per-request budget aborts retries mid-cycle.
 const DEFAULT_USAGE_REQUEST_TIMEOUT_MS = 10_000;
-/** Maximum time a process may own an aggregate usage poll before peers retry. */
-const USAGE_FETCH_LEASE_MS = DEFAULT_USAGE_REQUEST_TIMEOUT_MS + 5_000;
+/** Grace period after the configured provider timeout before peers retry a poll. */
+const USAGE_FETCH_LEASE_GRACE_MS = 5_000;
 const USAGE_FETCH_WAIT_POLL_MS = 25;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 10_000;
 /** Maximum provider ownership window; expiry recovers a crashed process without indefinite blocking. */
@@ -1414,6 +1429,7 @@ export class AuthStorage {
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#usageFetch: typeof fetch;
 	#usageRequestTimeoutMs: number;
+	#usageFetchLeaseMs: number;
 	#credentialRankingMode: CredentialRankingMode = "balanced";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
@@ -1466,6 +1482,13 @@ export class AuthStorage {
 		this.#usageCache = new AuthStorageUsageCache(this.#store);
 		this.#usageFetch = options.usageFetch ?? fetch;
 		this.#usageRequestTimeoutMs = options.usageRequestTimeoutMs ?? DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
+		const usageTimeoutForLease =
+			typeof this.#usageRequestTimeoutMs === "number" &&
+			Number.isFinite(this.#usageRequestTimeoutMs) &&
+			this.#usageRequestTimeoutMs > 0
+				? this.#usageRequestTimeoutMs
+				: DEFAULT_USAGE_REQUEST_TIMEOUT_MS;
+		this.#usageFetchLeaseMs = usageTimeoutForLease + USAGE_FETCH_LEASE_GRACE_MS;
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
@@ -2430,6 +2453,7 @@ export class AuthStorage {
 			this.#data.set(provider, credentials);
 		}
 		if (identityOrderChanged) this.#resetProviderAssignments(storageProvider);
+		if (!tokenRotationOnly) this.#invalidateUsageCacheForProvider(storageProvider);
 		if (tokenRotationOnly) this.#bumpGeneration("oauth-token-rotation");
 		else this.#bumpGeneration("credentials", provider);
 	}
@@ -4046,6 +4070,8 @@ export class AuthStorage {
 		logDetails: boolean = true,
 	): Promise<UsageReport | null> {
 		const cacheKey = this.#buildUsageReportCacheKey(request);
+		const provider = resolveOAuthStorageProvider(request.provider);
+		const credentialGeneration = this.#getProviderGeneration(provider);
 		const now = Date.now();
 		const cached = this.#usageCache.get<UsageReport | null>(cacheKey);
 		// Fresh cache hit: return whatever's there (success or null fallback).
@@ -4058,6 +4084,7 @@ export class AuthStorage {
 
 		const promise = (async () => {
 			const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
+			if (this.#getProviderGeneration(provider) !== credentialGeneration) return null;
 			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
 			if (report !== null) {
 				// Success: stagger per-credential cache expiry so all accounts don't
@@ -4089,6 +4116,22 @@ export class AuthStorage {
 		return promise;
 	}
 
+	#captureUsageProviderGenerations(requests: ReadonlyArray<UsageRequestDescriptor>): Map<string, number> {
+		const generations = new Map<string, number>();
+		for (const request of requests) {
+			const provider = resolveOAuthStorageProvider(request.provider);
+			if (!generations.has(provider)) generations.set(provider, this.#getProviderGeneration(provider));
+		}
+		return generations;
+	}
+
+	#usageProviderGenerationsMatch(generations: ReadonlyMap<string, number>): boolean {
+		for (const [provider, generation] of generations) {
+			if (this.#getProviderGeneration(provider) !== generation) return false;
+		}
+		return true;
+	}
+
 	#readAggregateUsageCache(cacheKey: string): UsageReport[] | undefined {
 		const cached = this.#usageCache.get<UsageReport[]>(cacheKey);
 		if (!cached || cached.expiresAt <= Date.now() || !Array.isArray(cached.value)) return undefined;
@@ -4098,18 +4141,20 @@ export class AuthStorage {
 	#tryAcquireUsageFetchLease(cacheKey: string): boolean | undefined {
 		const claim = this.#store.tryAcquireUsageFetchLease;
 		if (!claim) return undefined;
-		return claim.call(this.#store, cacheKey, this.#oauthRefreshLeaseOwner, Date.now(), USAGE_FETCH_LEASE_MS);
+		return claim.call(this.#store, cacheKey, this.#oauthRefreshLeaseOwner, Date.now(), this.#usageFetchLeaseMs);
 	}
 
-	async #waitForAggregateUsagePoll(cacheKey: string): Promise<UsageReport[] | undefined> {
-		const deadline = Date.now() + USAGE_FETCH_LEASE_MS;
+	async #waitForAggregateUsagePoll(
+		cacheKey: string,
+	): Promise<{ cached: UsageReport[] | undefined; leaseAcquired: boolean }> {
+		const deadline = Date.now() + this.#usageFetchLeaseMs;
 		while (Date.now() < deadline) {
 			const cached = this.#readAggregateUsageCache(cacheKey);
-			if (cached) return cached;
-			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return undefined;
+			if (cached !== undefined) return { cached, leaseAcquired: false };
+			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return { cached: undefined, leaseAcquired: true };
 			await Bun.sleep(USAGE_FETCH_WAIT_POLL_MS);
 		}
-		return this.#readAggregateUsageCache(cacheKey);
+		return { cached: this.#readAggregateUsageCache(cacheKey), leaseAcquired: false };
 	}
 
 	#releaseUsageFetchLease(cacheKey: string): void {
@@ -4333,10 +4378,15 @@ export class AuthStorage {
 	async fetchUsageReports(options?: {
 		provider?: Provider;
 		baseUrlResolver?: (provider: Provider) => string | undefined;
-		/** Caller's cancel signal; only rejects this caller, never the shared upstream fetch. */
+		/** Caller’s cancel signal; only rejects this caller, never the shared upstream fetch. */
 		signal?: AbortSignal;
 		/** Disable provider/account/error logging for secret-safe control surfaces. */
 		logDetails?: boolean;
+		/**
+		 * Enable identity correlation diagnostics. Values are one-way hashed and
+		 * URLs are reduced to their origin; the default logs provider/type/count only.
+		 */
+		logIdentity?: boolean;
 	}): Promise<UsageReport[] | null> {
 		// Caller override > store-level hook > local per-credential fan-out.
 		// `RemoteAuthCredentialStore` implements the store hook so a gateway
@@ -4381,9 +4431,7 @@ export class AuthStorage {
 		// cache is what lets another process reuse this poll instead of starting a
 		// second provider fan-out while the first process is still collecting rows.
 		const cacheKey = this.#buildUsageReportsCacheKey(requests);
-		const aggregate = this.#readAggregateUsageCache(cacheKey);
-		if (aggregate !== undefined) return raceUsageWithSignal(Promise.resolve(aggregate), options?.signal);
-
+		const providerGenerations = this.#captureUsageProviderGenerations(requests);
 		const inFlight = this.#usageReportsInFlight.get(cacheKey);
 		if (inFlight) return raceUsageWithSignal(inFlight, options?.signal);
 
@@ -4396,23 +4444,26 @@ export class AuthStorage {
 					leaseOwned = initialLeaseClaim === true;
 					if (!leaseOwned) {
 						const shared = await this.#waitForAggregateUsagePoll(cacheKey);
-						if (shared !== undefined) return shared;
-						leaseOwned = this.#tryAcquireUsageFetchLease(cacheKey) === true;
+						if (shared.cached !== undefined) return shared.cached;
+						leaseOwned = shared.leaseAcquired || this.#tryAcquireUsageFetchLease(cacheKey) === true;
 					}
 				}
 
 				if (options?.logDetails !== false) {
 					this.#usageLogger?.debug("Usage fetch requested", {
 						providers: [...new Set(requests.map(request => request.provider))].sort(),
+						credentials: requests.length,
 					});
-					for (const request of requests) {
-						this.#usageLogger?.debug("Usage fetch queued", {
-							provider: request.provider,
-							credentialType: request.credential.type,
-							baseUrl: request.baseUrl,
-							accountId: request.credential.accountId,
-							email: request.credential.email,
-						});
+					if (options?.logIdentity === true) {
+						for (const request of requests) {
+							this.#usageLogger?.debug("Usage fetch queued", {
+								provider: request.provider,
+								credentialType: request.credential.type,
+								baseUrl: redactUsageDiagnosticUrl(request.baseUrl),
+								accountId: hashUsageDiagnosticValue(request.credential.accountId),
+								email: hashUsageDiagnosticValue(request.credential.email),
+							});
+						}
 					}
 				}
 
@@ -4423,25 +4474,28 @@ export class AuthStorage {
 				);
 				const reports = results.filter((report): report is UsageReport => report !== null);
 				const resolved = this.#dedupeUsageReports(reports);
-				if (resolved.length > 0) {
-					this.#usageCache.set(cacheKey, { value: resolved, expiresAt: Date.now() + USAGE_REPORT_TTL_MS });
+				if (this.#usageProviderGenerationsMatch(providerGenerations)) {
+					// This is a lease-scoped handoff for concurrent processes, not a
+					// long-lived aggregate cache: per-credential jitter remains active
+					// on the next poll.
+					this.#usageCache.set(cacheKey, { value: resolved, expiresAt: Date.now() + this.#usageFetchLeaseMs });
 				}
 				if (options?.logDetails !== false) {
 					this.#usageLogger?.debug("Usage fetch resolved", {
-						reports: resolved.map(report => {
-							const accountLabel =
-								this.#getUsageReportMetadataValue(report, "email") ??
-								this.#getUsageReportMetadataValue(report, "accountId") ??
-								this.#getUsageReportMetadataValue(report, "account") ??
-								this.#getUsageReportMetadataValue(report, "user") ??
-								this.#getUsageReportMetadataValue(report, "username") ??
-								this.#getUsageReportScopeAccountId(report);
-							return {
-								provider: report.provider,
-								limits: report.limits.length,
-								account: accountLabel,
-							};
-						}),
+						reports: options?.logIdentity === true
+							? resolved.map(report => ({
+									provider: report.provider,
+									limits: report.limits.length,
+									account: hashUsageDiagnosticValue(
+										this.#getUsageReportMetadataValue(report, "email") ??
+											this.#getUsageReportMetadataValue(report, "accountId") ??
+											this.#getUsageReportMetadataValue(report, "account") ??
+											this.#getUsageReportMetadataValue(report, "user") ??
+											this.#getUsageReportMetadataValue(report, "username") ??
+											this.#getUsageReportScopeAccountId(report),
+									),
+								}))
+							: { count: resolved.length },
 					});
 				}
 				return resolved;

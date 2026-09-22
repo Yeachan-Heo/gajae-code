@@ -192,6 +192,7 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 type Handler = Extension["handlers"] extends Map<string, Array<infer T>> ? T : never;
 type IndexedHandler = { ext: Extension; handler: Handler; registrationOrder: number };
 type IndexedFunctionHook = IndexedHandler & { registration: FunctionHookRegistration };
+type CommandAliasTarget = { extensionPath: string; commandName: string };
 
 export type FunctionHookDispatchResult<TEvent extends ExtensionEvent> =
 	| { action: "continue"; event: TEvent; transformed?: boolean }
@@ -329,6 +330,8 @@ export class ExtensionRunner {
 	#shutdownHandler: ShutdownHandler = () => {};
 	#commandDiagnostics: Array<{ type: string; message: string; path: string }> = [];
 	#commandAliases = new Map<string, RegisteredCommand>();
+	#commandAliasAssignments = new Map<string, string>();
+	#commandAliasTargets = new Map<string, CommandAliasTarget>();
 	#initialized = false;
 	/**
 	 * Buffer for `credential_disabled` events received via {@link emitCredentialDisabled}
@@ -708,9 +711,29 @@ export class ExtensionRunner {
 		for (const ext of this.extensions) {
 			for (const command of ext.commands.values()) {
 				if (reserved?.has(command.name)) {
-					let alias = `extension:${command.name}`;
-					while (reserved.has(alias) || commands.has(alias) || this.#commandAliases.has(alias))
-						alias = `extension:${alias}`;
+					const assignmentKey = `${ext.path}\u0000${command.name}`;
+					let alias = this.#commandAliasAssignments.get(assignmentKey);
+					const aliasTarget = alias ? this.#commandAliasTargets.get(alias) : undefined;
+					const aliasOwnedByCommand =
+						aliasTarget?.extensionPath === ext.path && aliasTarget.commandName === command.name;
+					if (!alias || reserved.has(alias) || commands.has(alias) || (aliasTarget !== undefined && !aliasOwnedByCommand)) {
+						let candidate = alias ?? `extension:${command.name}`;
+						while (
+							reserved.has(candidate) ||
+							commands.has(candidate) ||
+							this.#commandAliases.has(candidate) ||
+							(this.#commandAliasTargets.has(candidate) &&
+								(this.#commandAliasTargets.get(candidate)?.extensionPath !== ext.path ||
+									this.#commandAliasTargets.get(candidate)?.commandName !== command.name))
+						)
+							candidate = `extension:${candidate}`;
+						if (alias && this.#commandAliasTargets.get(alias)?.extensionPath === ext.path && this.#commandAliasTargets.get(alias)?.commandName === command.name) {
+							this.#commandAliasTargets.delete(alias);
+						}
+						alias = candidate;
+						this.#commandAliasAssignments.set(assignmentKey, alias);
+					}
+					this.#commandAliasTargets.set(alias, { extensionPath: ext.path, commandName: command.name });
 					const namespaced = { ...command, name: alias };
 					this.#commandAliases.set(alias, namespaced);
 					commands.set(alias, namespaced);
@@ -732,6 +755,12 @@ export class ExtensionRunner {
 	getCommand(name: string): RegisteredCommand | undefined {
 		const aliased = this.#commandAliases.get(name);
 		if (aliased) return aliased;
+		const aliasTarget = this.#commandAliasTargets.get(name);
+		if (aliasTarget) {
+			const extension = this.extensions.find(ext => ext.path === aliasTarget.extensionPath);
+			const command = extension?.commands.get(aliasTarget.commandName);
+			if (command) return { ...command, name };
+		}
 		for (let index = this.extensions.length - 1; index >= 0; index -= 1) {
 			const command = this.extensions[index]?.commands.get(name);
 			if (command) {

@@ -452,6 +452,34 @@ describe("ExtensionRunner", () => {
 				warnSpy.mockRestore();
 			}
 		});
+
+		it("keeps a collision alias resolvable after an unreserved command refresh", async () => {
+			const commandCode = `
+				export default function(pi) {
+					pi.registerCommand("notify", {
+						description: "Extension notification",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "notify-refresh.ts"), commandCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			runner.getRegisteredCommands(new Set(["notify"]));
+			runner.getRegisteredCommands();
+
+			const refreshedAlias = runner.getCommand("extension:notify");
+			expect(refreshedAlias?.name).toBe("extension:notify");
+			expect(refreshedAlias?.description).toBe("Extension notification");
+		});
 	});
 
 	describe("error handling", () => {

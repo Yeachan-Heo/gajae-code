@@ -64,6 +64,7 @@ interface CacheEntry {
 
 interface ObservableStore extends AuthCredentialStore {
 	cache: Map<string, CacheEntry>;
+	leaseCalls: number[];
 }
 
 /**
@@ -72,8 +73,11 @@ interface ObservableStore extends AuthCredentialStore {
  */
 function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 	const cache = new Map<string, CacheEntry>();
+	const leaseCalls: number[] = [];
+	let leaseOwner: string | undefined;
 	return {
 		cache,
+		leaseCalls,
 		close() {},
 		listAuthCredentials() {
 			return rows;
@@ -101,6 +105,15 @@ function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 		},
 		setCache(key, value, expiresAtSec) {
 			cache.set(key, { value, expiresAtSec });
+		},
+		tryAcquireUsageFetchLease(_key, owner, _nowMs, leaseMs) {
+			leaseCalls.push(leaseMs);
+			if (leaseOwner !== undefined) return false;
+			leaseOwner = owner;
+			return true;
+		},
+		releaseUsageFetchLease() {
+			leaseOwner = undefined;
 		},
 		allocateMonotonicSequence() {
 			return 1;
@@ -281,6 +294,25 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		expect(warn).not.toHaveBeenCalled();
 	});
 
+	it("redacts identity and endpoint details from default usage diagnostics", async () => {
+		storage.close();
+		const debug = vi.fn();
+		const warn = vi.fn();
+		storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+			usageLogger: { debug, warn },
+		});
+		await storage.reload();
+		const secret = "credential-sentinel@example.invalid";
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(makeReport(secret));
+
+		await storage.fetchUsageReports({ baseUrlResolver: () => `https://${secret}/v1` });
+
+		const diagnostics = JSON.stringify(debug.mock.calls);
+		expect(diagnostics).not.toContain(secret);
+		expect(diagnostics).toContain('"credentials":1');
+	});
+
 	it("does NOT cache a failure when no previous good value exists — retries next poll", async () => {
 		let calls = 0;
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
@@ -375,7 +407,8 @@ describe("AuthStorage usage cache: jitter", () => {
 			// `getStale` can recover last-good values; the freshness TTL we actually
 			// jitter lives in the JSON payload. Read that, not the store TTL.
 			const freshExpiries: number[] = [];
-			for (const entry of store.cache.values()) {
+			for (const [key, entry] of store.cache) {
+				if (!key.includes("usage_cache:report:")) continue;
 				if (entry.value.length === 0) continue;
 				const parsed = JSON.parse(entry.value);
 				if (typeof parsed?.expiresAt === "number") freshExpiries.push(parsed.expiresAt);
@@ -395,6 +428,50 @@ describe("AuthStorage usage cache: jitter", () => {
 });
 
 describe("AuthStorage usage cache: cross-process coordination", () => {
+	it("sizes the aggregate lease from the configured request timeout", async () => {
+		const store = makeStore([oauthRow(1, "a@example.com")]);
+		const storage = new AuthStorage(store, {
+			usageRequestTimeoutMs: 60_000,
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		await storage.reload();
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(makeReport("a@example.com"));
+		try {
+			await storage.fetchUsageReports();
+			expect(store.leaseCalls[0]).toBeGreaterThanOrEqual(65_000);
+		} finally {
+			fetchSpy.mockRestore();
+			storage.close();
+		}
+	});
+
+	it("does not publish an aggregate result after credential mutation", async () => {
+		const rows = [oauthRow(1, "a@example.com")];
+		const store = makeStore(rows);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		await storage.reload();
+		const gate = Promise.withResolvers<UsageReport | null>();
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(() => gate.promise);
+		try {
+			const poll = storage.fetchUsageReports();
+			await waitFor(() => fetchSpy.mock.calls.length === 1);
+
+			rows[0] = oauthRow(2, "b@example.com");
+			await storage.reload();
+			gate.resolve(makeReport("a@example.com"));
+			await poll;
+
+			const aggregateKeys = [...store.cache.keys()].filter(key => key.includes("reports:"));
+			expect(aggregateKeys).toHaveLength(0);
+		} finally {
+			gate.resolve(null);
+			fetchSpy.mockRestore();
+			storage.close();
+		}
+	});
+
 	it("coalesces concurrent aggregate polls across SQLite-backed processes", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-usage-coordination-"));
 		const dbPath = path.join(root, "agent.db");
@@ -436,6 +513,56 @@ describe("AuthStorage usage cache: cross-process coordination", () => {
 			expect((await secondPoll)?.map(item => item.provider)).toEqual(["anthropic"]);
 		} finally {
 			gate.resolve(report);
+			await Promise.allSettled([firstPoll ?? Promise.resolve(), secondPoll ?? Promise.resolve()]);
+			fetchSpy.mockRestore();
+			first.close();
+			second.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("caches an empty aggregate completion for concurrent processes", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "pi-ai-usage-empty-coordination-"));
+		const dbPath = path.join(root, "agent.db");
+		const firstStore = await SqliteAuthCredentialStore.open(dbPath);
+		firstStore.saveOAuth("anthropic", {
+			access: "access-token",
+			refresh: "refresh-token",
+			expires: Date.now() + 3_600_000,
+			accountId: "account-a",
+			email: "a@example.com",
+		});
+		const secondStore = await SqliteAuthCredentialStore.open(dbPath);
+		const first = new AuthStorage(firstStore, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		const second = new AuthStorage(secondStore, {
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		await Promise.all([first.reload(), second.reload()]);
+
+		const gate = Promise.withResolvers<UsageReport | null>();
+		let calls = 0;
+		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
+			calls += 1;
+			return gate.promise;
+		});
+		let firstPoll: Promise<UsageReport[] | null> | undefined;
+		let secondPoll: Promise<UsageReport[] | null> | undefined;
+		try {
+			firstPoll = first.fetchUsageReports();
+			await waitFor(() => calls === 1);
+			secondPoll = second.fetchUsageReports();
+			await Bun.sleep(50);
+			expect(calls).toBe(1);
+
+			gate.resolve(null);
+			expect(await firstPoll).toEqual([]);
+			expect(await secondPoll).toEqual([]);
+			expect(await second.fetchUsageReports()).toEqual([]);
+			expect(calls).toBe(2);
+		} finally {
+			gate.resolve(null);
 			await Promise.allSettled([firstPoll ?? Promise.resolve(), secondPoll ?? Promise.resolve()]);
 			fetchSpy.mockRestore();
 			first.close();
