@@ -57,6 +57,7 @@ async function relay(sink: Writable = new PassThrough()) {
 	});
 	ws.readyState = 1;
 	ws.emit("open");
+	ws.emit("message", { data: JSON.stringify({ type: "hello" }) });
 	return { pair: await started, ws, input, sink, errors };
 }
 
