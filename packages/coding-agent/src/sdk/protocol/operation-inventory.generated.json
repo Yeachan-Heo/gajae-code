@@ -4544,7 +4544,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "internal resume-recovery runtime fallback installation without changing persisted model intent, not a user-facing SDK control seam",
+		"rationale": "internal recovered fallback-chain installation during session startup, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -4555,7 +4555,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "internal startup recovery marker preserving recovered model bindings during late restore, not a user-facing SDK control seam",
+		"rationale": "internal startup recovery binding marker, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -4566,7 +4566,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "internal startup recovery predicate protecting recovered runtime model bindings, not a user-facing SDK control seam",
+		"rationale": "internal recovered fallback-chain state query, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"

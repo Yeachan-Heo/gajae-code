@@ -288,11 +288,11 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setDefaultFallbackRuntimeModel":
 		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
 	"agent_session:installRecoveredDefaultFallbackChain":
-		"internal resume-recovery runtime fallback installation without changing persisted model intent, not a user-facing SDK control seam",
+		"internal recovered fallback-chain installation during session startup, not a user-facing SDK control seam",
 	"agent_session:markStartupRecoveryBindingsRequired":
-		"internal startup recovery marker preserving recovered model bindings during late restore, not a user-facing SDK control seam",
+		"internal startup recovery binding marker, not a user-facing SDK control seam",
 	"agent_session:hasRecoveredDefaultFallbackChain":
-		"internal startup recovery predicate protecting recovered runtime model bindings, not a user-facing SDK control seam",
+		"internal recovered fallback-chain state query, not a user-facing SDK control seam",
 	"agent_session:setCredentialPin":
 		"interactive session-scoped OAuth account selector mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
 	"agent_session:setCredentialAuto":
