@@ -783,6 +783,10 @@ function hasResumePickerTerminal(): boolean {
 	return process.stdin.isTTY === true && process.stdout.isTTY === true;
 }
 
+export function shouldNotifyModelFallback(authBootstrap: boolean | undefined, isInteractive: boolean): boolean {
+	return !(authBootstrap === true && isInteractive);
+}
+
 export async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
@@ -2163,7 +2167,7 @@ export async function runRootCommand(
 			}
 		}
 
-		if (modelFallbackMessage) {
+		if (modelFallbackMessage && shouldNotifyModelFallback(parsedArgs.authBootstrap, isInteractive)) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
 		}
 
