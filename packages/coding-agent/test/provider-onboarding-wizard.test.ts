@@ -208,7 +208,7 @@ describe("provider onboarding wizard", () => {
 				"Provider 'live-provider' configured as openai-compatible.",
 				"Models: live-model",
 				"Base URL: https://api.example.com/v1",
-				"API key: *** (environment variable)",
+				"API key: CUST…_KEY (environment variable)",
 				`Config: ${path.join(tempAgentDir!, "models.yml")}`,
 			].join("\n");
 			const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<void>();
@@ -230,6 +230,10 @@ describe("provider onboarding wizard", () => {
 			expect(configChanged).toBe(true);
 			expect(registry.find("live-provider", "live-model")).toBeDefined();
 			expect(ctx.statuses).toEqual([successStatus]);
+			// The env credential is shown as a masked variable-name label; neither the
+			// literal variable name nor any secret value may reach the status text.
+			expect(successStatus).toContain("API key: CUST…_KEY (environment variable)");
+			expect(ctx.statuses.join("\n")).not.toContain("CUSTOM_PROVIDER_KEY");
 		} finally {
 			store.close();
 		}

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { redactEnvironmentVariableName } from "../src/setup/provider-onboarding";
 import { BUILTIN_SLASH_COMMANDS_INTERNAL, executeBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "../src/slash-commands/types";
 
@@ -109,7 +110,11 @@ describe("provider slash command", () => {
 		expect(parsed.providers["local-claude"]?.apiKey).toBeUndefined();
 		expect(parsed.providers["local-claude"]?.apiKeyEnv).toBe(TEST_PROVIDER_KEY_ENV);
 		expect(parsed.providers["local-claude"]?.models.map(model => model.id)).toEqual(["claude-proxy"]);
-		expect(outputs.join("\n")).toContain("API key: *** (environment variable)");
+		expect(outputs.join("\n")).toContain(
+			`API key: ${redactEnvironmentVariableName(TEST_PROVIDER_KEY_ENV)} (environment variable)`,
+		);
+		// The masked label must not expose the literal env var name.
+		expect(outputs.join("\n")).not.toContain(TEST_PROVIDER_KEY_ENV);
 		expect(refreshedMode).toBe("offline");
 		expect(configChanged).toBe(true);
 	});

@@ -231,7 +231,7 @@ describe("provider onboarding wizard red-team", () => {
 				"Provider 'visible-provider' configured as openai-compatible.",
 				"Models: visible-model",
 				"Base URL: https://api.example.com/v1",
-				"API key: *** (environment variable)",
+				"API key: CUST…_KEY (environment variable)",
 				`Config: ${path.join(tempAgentDir!, "models.yml")}`,
 			].join("\n");
 			const { promise: completion, resolve: resolveCompletion } = Promise.withResolvers<void>();
@@ -254,6 +254,9 @@ describe("provider onboarding wizard red-team", () => {
 			expect(refreshModes).toEqual(["offline"]);
 			expect(configChanged).toBe(1);
 			expect(ctx.statuses).toEqual([successStatus]);
+			// Masked variable-name label only: the literal env var name must not leak.
+			expect(successStatus).toContain("API key: CUST…_KEY (environment variable)");
+			expect(ctx.statuses.join("\n")).not.toContain("CUSTOM_PROVIDER_KEY");
 			expect(registry.find("visible-provider", "visible-model")).toBeDefined();
 
 			const selectorLoaded = Promise.withResolvers<void>();
