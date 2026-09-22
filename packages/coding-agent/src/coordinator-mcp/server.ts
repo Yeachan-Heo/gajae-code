@@ -1343,6 +1343,10 @@ interface CoordinatorToolIdempotencyRecord {
 	request_digest: string;
 	state: "in_progress" | "completed";
 	response?: Record<string, unknown>;
+	/** Set under the key lock before the delegate claims its canonical prompt. Its
+	 * absence on an in-progress receipt proves the prior attempt failed before any
+	 * prompt effect, so a same-key retry may claim afresh instead of sealing uncertain. */
+	delegate_prompt_claim_started?: true;
 	admission?: DelegateAdmissionCheckpoint;
 	delegate_response_pin?: DelegateResponsePinV1;
 	created_at: string;
@@ -9280,6 +9284,26 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										},
 									};
 								}
+								// The caller cwd guard only proves args.cwd is inside the current roots.
+								// The persisted pair is what the delegate actually dispatches through, so
+								// reauthorize it against the current policy before it becomes binding scope:
+								// a narrowed managed-worktree root or a redirected projection must not let
+								// a reused delegate reach a workspace the coordinator no longer owns.
+								try {
+									await assertCoordinatorSessionLocations(config, existingCwd, bindingWorkspace, {
+										canonicalizePath: services.canonicalizePath,
+										platform,
+									});
+								} catch (error) {
+									if (!isSessionAuthorityError(error)) throw error;
+									return {
+										ok: false,
+										error: {
+											code: "workspace_mismatch",
+											message: "Coordinator session workspace is outside the allowed roots.",
+										},
+									};
+								}
 								const binding = await exactBrokerSessionBinding(sessionId, bindingWorkspace);
 								if (
 									// The caller cwd guard above prevents cross-workspace reuse; this
@@ -9414,8 +9438,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									(await readCanonicalActiveTurn(sessionId));
 								const priorTransaction = await readSessionTransaction(questionPaths, sessionId);
 								const priorPrompt = priorTransaction?.requests.prompts[requestKey];
+								// A reused session has no creation authority to recover through, so a
+								// same-key retry after a pre-admission failure (for example a transient
+								// workspace canonicalization error) would otherwise seal as uncertain. The
+								// outer receipt records when a prompt claim began; without that marker no
+								// prompt was ever claimed and this retry may claim afresh. With it, missing
+								// live state is still not proof that nothing was dispatched.
+								const requireClaimedPrompt =
+									recovering && (!reusedSessionId || outer.value.delegate_prompt_claim_started === true);
 								if (
-									recovering &&
+									requireClaimedPrompt &&
 									!priorPrompt &&
 									!hasInitialDelegatePromptAuthority(priorTransaction, initialDelegateRequest)
 								)
@@ -9445,13 +9477,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										turn_id: previousActiveTurn.turn_id,
 									};
 								}
+								if (outer.value.delegate_prompt_claim_started !== true)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: true,
+									});
 								const promptKey = await claimCanonicalPrompt(
 									sessionId,
 									taggedPrompt,
 									operation,
 									idempotencyKey,
 									true,
-									recovering,
+									requireClaimedPrompt,
 									initialDelegateRequest,
 								);
 								if (reserved?.terminal_fence && !(await promptReceipt(sessionId, promptKey))) {
