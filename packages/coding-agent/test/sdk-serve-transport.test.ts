@@ -556,6 +556,34 @@ describe("SDK serve raw relay", () => {
 		}
 	});
 
+	test("rejects startup when the upstream closes before opening", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const errors: TransportError[] = [];
+		const started = startRelayPair({
+			url: "ws://fake",
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			downstream: input,
+			downstreamSink: output,
+			onTransportError: error => errors.push(error),
+			webSocketFactory: () => new StalledWebSocket(""),
+		});
+		const ws = await waitFor(() => StalledWebSocket.latest, "fake websocket");
+		ws.close();
+		const result = await Promise.race([
+			started.then(
+				() => "resolved",
+				error => (error instanceof Error ? error.message : String(error)),
+			),
+			Bun.sleep(100).then(() => "timeout"),
+		]);
+		expect(result).toBe("upstream_closed");
+		expect(errors).toEqual([]);
+		input.destroy();
+		output.destroy();
+	});
+
 	test("relays only an explicitly opted-in capability", async () => {
 		const connections: { ws: ServerWebSocket<unknown>; messages: string[] }[] = [];
 		const server = Bun.serve<unknown>({

@@ -401,6 +401,8 @@ export class SessionSdkSessionRuntime {
 	readonly host: SessionSdkHost;
 	readonly transport: SessionSdkTransport;
 	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
+	readonly #connectionIds = new Set<string>();
+	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
 	readonly #capabilitiesDisposer?: () => void;
@@ -409,10 +411,11 @@ export class SessionSdkSessionRuntime {
 
 	constructor(options: SessionSdkRuntimeOptions) {
 		this.transport = options.transport;
+		this.#connectionCapabilitiesProvider =
+			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
 			...options,
-			connectionCapabilities:
-				options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId)),
+			connectionCapabilities: this.#connectionCapabilitiesProvider,
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
@@ -421,13 +424,19 @@ export class SessionSdkSessionRuntime {
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
 				return result ?? "written";
 			},
-			onFrame: options.transport.onFrame,
+			onFrame: handler =>
+				options.transport.onFrame((connectionId, frame) => {
+					this.#connectionIds.add(connectionId);
+					handler(connectionId, frame);
+				}),
 		});
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
+			this.#connectionIds.delete(connectionId);
 			this.#connectionCapabilities.delete(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
+			this.#connectionIds.add(connectionId);
 			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
@@ -483,9 +492,12 @@ export class SessionSdkSessionRuntime {
 
 	/** Snapshot connections that negotiated every capability in the requirement set. */
 	connectionIdsWithCapabilities(required: readonly string[]): string[] {
-		return [...this.#connectionCapabilities].flatMap(([connectionId, capabilities]) =>
-			required.every(capability => capabilities.has(capability)) ? [connectionId] : [],
-		);
+		return [...this.#connectionIds].flatMap(connectionId => {
+			const capabilities = this.#connectionCapabilitiesProvider(connectionId);
+			return capabilities !== undefined && required.every(capability => capabilities.has(capability))
+				? [connectionId]
+				: [];
+		});
 	}
 
 	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */

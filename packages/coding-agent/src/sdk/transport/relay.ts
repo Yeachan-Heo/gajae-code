@@ -133,6 +133,7 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 	let preHelloToWs: Buffer[] = [];
 	let preHelloToWsBytes = 0;
 	let upstreamHelloTimer: ReturnType<typeof setTimeout> | undefined;
+	let openingSettled = false;
 
 	const settle = (error?: Error): void => {
 		if (completed) return;
@@ -274,9 +275,23 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		}
 		enqueue(toDownstream, "ws->downstream", Buffer.concat([Buffer.from(event.data, "utf8"), Buffer.from("\n")]));
 	};
-	const onClose = (): void => void close();
-	const onWebSocketError = (): void => void close(new Error("upstream_error"));
+	const onClose = (): void => {
+		if (!openingSettled) {
+			openingSettled = true;
+			opened.reject(new Error("upstream_closed"));
+		}
+		void close();
+	};
+	const onWebSocketError = (): void => {
+		if (!openingSettled) {
+			openingSettled = true;
+			opened.reject(new Error("upstream_error"));
+		}
+		void close(new Error("upstream_error"));
+	};
 	const onOpen = (): void => {
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
 		if (!upstreamHelloReceived) {
 			upstreamHelloTimer = setTimeout(() => {
@@ -288,11 +303,15 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 		opened.resolve();
 	};
 	const onOpenError = (): void => {
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
 		opened.reject(new Error("upstream_error"));
 	};
 	const onAbort = (): void => {
 		const error = new RelayOpenAbortedError();
+		if (openingSettled) return;
+		openingSettled = true;
 		cleanupOpening();
 		opened.reject(error);
 		void close(error);
