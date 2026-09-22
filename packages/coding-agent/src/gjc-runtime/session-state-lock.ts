@@ -122,6 +122,10 @@ function lockRetryExhausted(budget: LockRetryBudget): boolean {
 	return lockRetryRemainingMs(budget) <= 0;
 }
 
+function lockRetryTotalWaitExhausted(budget: LockRetryBudget): boolean {
+	return Math.max(0, performance.now() - budget.firstAttemptAt) >= LOCK_ACQUIRE_MAX_WAIT_MS;
+}
+
 async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 	budget.attempts++;
 	const remainingMs = lockRetryRemainingMs(budget);
@@ -2442,7 +2446,11 @@ async function runLockPathTransition<T>(
 						() => true,
 						error => (error as NodeJS.ErrnoException).code !== "ENOENT",
 					);
-					if (outcome.reclaimReason !== "released_handoff" || ownerStillPresent)
+					if (
+						outcome.reclaimReason !== "released_handoff" ||
+						ownerStillPresent ||
+						lockRetryTotalWaitExhausted(budget)
+					)
 						throw transitionClaimTimeout(transitionDir, budget, error, lastReclaimRefusal);
 				}
 				continue;

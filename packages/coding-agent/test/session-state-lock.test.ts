@@ -3184,6 +3184,40 @@ describe("session state lock failure diagnostics", () => {
 		}
 	});
 
+	it("keeps the absolute transition deadline for a released handoff", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "released-waiter-deadline.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		await fs.mkdir(transitionDir, { mode: 0o700 });
+		await Bun.write(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: 1,
+				start_time: "unknown",
+				token: "released-waiter-deadline",
+				owner_host_id: "local-host",
+				released: true,
+			}),
+		);
+		setSystemTime();
+		const old = new Date(Date.now() - 2_000);
+		await fs.utimes(`${transitionDir}.owner`, old, old);
+		let monotonicNow = 0;
+		const now = vi.spyOn(performance, "now").mockImplementation(() => monotonicNow);
+		SessionStateLockTestHooks.afterTransitionClaimContention = target => {
+			if (target === transitionDir) monotonicNow = 60_001;
+		};
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "unreachable")).rejects.toMatchObject({
+				reason: "transition_claim_timeout",
+			});
+		} finally {
+			now.mockRestore();
+			await fs.rm(`${transitionDir}.owner`, { force: true });
+			await fs.rmdir(transitionDir).catch(() => undefined);
+		}
+	});
+
 	it("keeps a dead-owner reclaim bounded by the transition deadline", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "dead-owner-waiter.json");
