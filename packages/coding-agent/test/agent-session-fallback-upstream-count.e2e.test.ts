@@ -86,9 +86,10 @@ function typedRateLimitStream(
 	return stream;
 }
 
-function typedOpaqueOverflowStream(model: Model): AssistantMessageEventStream {
+function typedOpaqueOverflowStream(model: Model, release?: Promise<void>): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
-	queueMicrotask(() => {
+	queueMicrotask(async () => {
+		if (release) await release;
 		const message: AssistantMessage & {
 			transportFailure: { kind: "transport"; status: number; openaiErrorCode: string };
 		} = {
@@ -610,20 +611,24 @@ describe("AgentSession fallback upstream request counts", () => {
 		).toHaveLength(1);
 	});
 
-	it("resumes a successor queued while managed no-op maintenance is starting", async () => {
+	it("resumes a successor queued before managed no-op maintenance acquires its ingress fence", async () => {
 		const calls: string[] = [];
 		const events: AgentSessionEvent[] = [];
 		let requestCount = 0;
-		let queuedPrompt: Promise<void> | undefined;
+		let rejectedPrompt: Promise<unknown> | undefined;
+		const overflowStarted = Promise.withResolvers<void>();
+		const releaseOverflow = Promise.withResolvers<void>();
 		const successorTerminal = Promise.withResolvers<void>();
 		const { primary } = createSession(
 			1,
 			model => {
 				calls.push(selector(model));
 				requestCount += 1;
-				return requestCount === 1
-					? typedOpaqueOverflowStream(model)
-					: successfulStream(model, "Queued successor completed");
+				if (requestCount === 1) {
+					overflowStarted.resolve();
+					return typedOpaqueOverflowStream(model, releaseOverflow.promise);
+				}
+				return successfulStream(model, "Queued successor completed");
 			},
 			{
 				"compaction.enabled": true,
@@ -646,21 +651,38 @@ describe("AgentSession fallback upstream request counts", () => {
 				successorTerminal.resolve();
 			}
 			if (
-				!queuedPrompt &&
+				!rejectedPrompt &&
 				event.type === "auto_compaction_start" &&
 				event.reason === "overflow" &&
 				event.action === "context-full"
 			) {
-				queuedPrompt = session!.prompt("Run after terminal overflow", {
-					skipCompactionCheck: true,
-					streamingBehavior: "steer",
-				});
+				// New external work is fenced once automatic maintenance owns the transition.
+				rejectedPrompt = session!
+					.prompt("Rejected during maintenance", {
+						skipCompactionCheck: true,
+						streamingBehavior: "steer",
+					})
+					.then(
+						() => undefined,
+						error => error,
+					);
 			}
 		});
 
-		await session!.prompt("Terminal overflow before queued successor");
-		expect(queuedPrompt).toBeDefined();
-		await queuedPrompt;
+		const predecessor = session!.prompt("Terminal overflow before queued successor");
+		await overflowStarted.promise;
+		try {
+			await session!.prompt("Run after terminal overflow", {
+				skipCompactionCheck: true,
+				streamingBehavior: "steer",
+			});
+			expect(session!.agent.hasQueuedMessages()).toBe(true);
+		} finally {
+			releaseOverflow.resolve();
+		}
+		await predecessor;
+		expect(rejectedPrompt).toBeDefined();
+		expect(await rejectedPrompt).toMatchObject({ code: "busy" });
 		await Promise.race([
 			successorTerminal.promise,
 			Bun.sleep(1_000).then(() => {
