@@ -259,18 +259,49 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
-	it("does not replay a stale discovery snapshot after an exact control fences an empty catalog", async () => {
+	it("uses the discovery result while the deferred manager catalog is still unpublished", async () => {
 		authStorage.setRuntimeApiKey("openai", "test-key");
-		const configPath = path.join(tempDir, "deferred-fenced-mcp.json");
-		const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
-		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
-		// This is the atomic manager view observed when an exact suspend/disconnect
-		// wins the race after discovery has copied its result but before the SDK
-		// continuation consumes it. The empty fenced catalog is authoritative.
+		const configPath = path.join(tempDir, "deferred-unpublished-mcp.json");
+		const discoveredTool = createMcpCustomTool("mcp__discovered_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([discoveredTool]));
+		// The first deferred publication window: discovery already returned loaded
+		// tools but the manager has not published its first catalog yet (#5753).
+		// Only this explicit state may fall back to the discovery result.
 		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
 			tools: [],
-			publication: "fenced",
-			generation: 1,
+			publication: "unpublished",
+			generation: 0,
+		});
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getAllToolNames()).toContain(discoveredTool.name);
+			expect(session.getActiveToolNames()).toContain(discoveredTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
+	it.each([
+		["published", 1],
+		["fenced", 1],
+	] as const)("does not replay a stale discovery snapshot over an empty %s catalog", async (publication, generation) => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, `deferred-${publication}-mcp.json`);
+		const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
+		// `published`: a connected server legitimately exposes zero tools after
+		// discovery copied a now-stale result. `fenced`: an exact suspend/disconnect
+		// wins the race before the SDK continuation consumes the discovery result.
+		// Either empty catalog is authoritative and must not be replaced.
+		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
+			tools: [],
+			publication,
+			generation,
 		});
 
 		const { session, startDeferredMcpConfig } = await createAgentSession({

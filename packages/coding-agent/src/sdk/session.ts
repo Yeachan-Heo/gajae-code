@@ -5251,7 +5251,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// A slash control may commit while the deferred startup flight is
 							// loading. Re-read the manager's fenced publication rather than
 							// replaying the stale startup snapshot into the session registry. A
-							// A deferred manager can still be waiting to publish its first catalog,
+							// deferred manager can still be waiting to publish its first catalog,
 							// though; only that explicit unpublished state may use the discovery
 							// result. Empty published/fenced catalogs are authoritative and must
 							// not replay stale tools across an exact control.
