@@ -1500,6 +1500,7 @@ export class MCPManager {
 					void this.#disconnectServer(task.name, {
 						preserveConfig: this.#toolsOnly || cachedTools.has(task.name),
 						preserveSource: cachedTools.has(task.name),
+						preserveTools: cachedTools.has(task.name),
 					}).catch(error => {
 						this.#logLeaseReleaseFailure(task.name, undefined, error);
 					});
@@ -2411,7 +2412,7 @@ export class MCPManager {
 
 	async #disconnectServer(
 		name: string,
-		options: { preserveConfig?: boolean; preserveSource?: boolean } = {},
+		options: { preserveConfig?: boolean; preserveSource?: boolean; preserveTools?: boolean } = {},
 	): Promise<void> {
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
@@ -2452,18 +2453,20 @@ export class MCPManager {
 			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 		}
 
-		// Remove tools from this server and notify consumers
-		const hadTools = this.#tools.some(
-			tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-		);
-		const remainingTools = this.#tools.filter(
-			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
-		);
-		if (hadTools) {
-			this.#publishToolCatalog(remainingTools);
-			this.#onToolsChanged?.(this.#tools);
-		} else {
-			this.#tools = remainingTools;
+		// Keep a published cache fallback available while its expired live connection closes.
+		if (!options.preserveTools) {
+			const hadTools = this.#tools.some(
+				tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+			);
+			const remainingTools = this.#tools.filter(
+				tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
+			);
+			if (hadTools) {
+				this.#publishToolCatalog(remainingTools);
+				this.#onToolsChanged?.(this.#tools);
+			} else {
+				this.#tools = remainingTools;
+			}
 		}
 
 		// Notify prompt consumers so stale commands are cleared

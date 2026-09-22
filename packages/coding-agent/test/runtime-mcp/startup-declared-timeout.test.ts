@@ -121,6 +121,7 @@ describe("MCP startup and the declared connection window", () => {
 			expect(cache.get).toHaveBeenCalledWith("cached", expect.anything());
 			expect(result.errors.get("cached")).toContain("timed out");
 			expect(result.tools).toHaveLength(1);
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
 			expect(manager.getConnectionStatus("cached")).toBe("disconnected");
 			expect(manager.getSource("cached")).toEqual(source);
 

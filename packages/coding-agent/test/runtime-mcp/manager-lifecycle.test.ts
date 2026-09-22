@@ -9,6 +9,7 @@ import * as mcpClient from "../../src/runtime-mcp/client";
 import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
+import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure, MCPHttpRequestError } from "../../src/runtime-mcp/types";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
@@ -167,6 +168,38 @@ describe("MCP manager lifecycle cleanup", () => {
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps cached fallback tools published after background disconnect finishes", async () => {
+		const cache = {
+			get: vi.fn(async () => [{ name: "ping", inputSchema: { type: "object" } }]),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		const pendingTools = Promise.withResolvers<never>();
+		const closeStarted = Promise.withResolvers<void>();
+		const closeRelease = Promise.withResolvers<void>();
+		const connection = makeConnection("cached", async () => {
+			closeStarted.resolve();
+			await closeRelease.promise;
+		});
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => await pendingTools.promise);
+		try {
+			const result = await manager.connectServers({ cached: { type: "http", url: "http://127.0.0.1:1" } }, {});
+			expect(result.tools.map(tool => tool.name)).toContain("mcp__cached_ping");
+			await closeStarted.promise;
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
+
+			closeRelease.resolve();
+			await Bun.sleep(10);
+			expect(manager.getTools().map(tool => tool.name)).toContain("mcp__cached_ping");
+		} finally {
+			closeRelease.resolve();
+			pendingTools.reject(new Error("abandoned tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
 		}
 	});
 
