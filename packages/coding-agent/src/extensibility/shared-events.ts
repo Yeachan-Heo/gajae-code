@@ -93,9 +93,11 @@ export interface SessionCompactEvent {
 	fromExtension: boolean;
 }
 
-/** Fired on process exit (SIGINT/SIGTERM) */
+/** Fired during session teardown, including process exit and SDK host self-reap. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
+	/** Set only when the SDK host reaped itself after detached-idle grace. */
+	reason?: "detached_idle";
 }
 
 /** Preparation data for tree navigation (used by session_before_tree event) */

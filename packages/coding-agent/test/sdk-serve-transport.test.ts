@@ -4,11 +4,13 @@ import * as net from "node:net";
 import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
-import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import Sdk, { parseSdkInternalArgv, watchSessionHostClientAttachment } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
+import { reapDeadSessionRegistrations } from "../src/sdk/broker/lifecycle.js";
+import { SessionIndex } from "../src/sdk/broker/session-index.js";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version.js";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
@@ -17,6 +19,7 @@ import { type RelayWebSocket, startRelayPair, type TransportError } from "../src
 import {
 	listBrokerSessions,
 	resolveServePendingCeiling,
+	resolveServeSession,
 	runSdkServe,
 	SdkServeError,
 	selectBrokerSession,
@@ -107,6 +110,19 @@ function serveFailure(run: () => unknown): { typed: boolean; code: unknown; exit
 		return { typed: error instanceof SdkServeError, code: typed.code, exitCode: typed.exitCode };
 	}
 	throw new Error("Expected the serve path to fail.");
+}
+
+/** The awaited counterpart of `serveFailure`, for serve paths that reject. */
+async function serveRejectionFailure(
+	run: () => Promise<unknown>,
+): Promise<{ typed: boolean; code: unknown; exitCode: unknown }> {
+	try {
+		await run();
+	} catch (error) {
+		const typed = error as { code?: unknown; exitCode?: unknown };
+		return { typed: error instanceof SdkServeError, code: typed.code, exitCode: typed.exitCode };
+	}
+	throw new Error("Expected the serve path to reject.");
 }
 
 /** A fake SDK broker: a hello on open, then one canned reply per broker request. */
@@ -773,6 +789,711 @@ describe("SDK serve CLI and discovery", () => {
 			code: "endpoint_stale",
 			exitCode: 1,
 		});
+	});
+
+	test("reattaches one indexed-but-dead explicit session before serving", async () => {
+		const sessionId = "dead-session";
+		const cwd = "/workspace";
+		const stateRoot = `${cwd}/.gjc/state`;
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		const calls: {
+			operation: string;
+			input: Record<string, unknown>;
+			options?: { idempotencyKey?: string; timeoutMs?: number };
+		}[] = [];
+		let resumed = false;
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>, options?: { idempotencyKey?: string }) => {
+				calls.push({ operation, input, options });
+				if (operation === "session.list") {
+					if (input.cwd === cwd)
+						return {
+							ok: true,
+							result: {
+								sessions: [
+									{
+										sessionId,
+										live: false,
+										ambiguous: false,
+										terminal: true,
+										hostUnregisteredReason: "detached_idle",
+										locator,
+									},
+								],
+								savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity },
+							},
+						};
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: resumed,
+									ambiguous: false,
+									...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+									locator,
+								},
+							],
+							warnings: [],
+						},
+					};
+				}
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls.map(call => call.operation)).toEqual([
+			"session.list",
+			"session.list",
+			"session.resume",
+			"session.list",
+		]);
+		expect(calls[1]?.input).toEqual({ resolveSessionId: sessionId, cwd });
+		expect(calls[2]?.input).toEqual({
+			sessionId,
+			cwd,
+			stateRoot,
+			sessionPath: `${cwd}/session.jsonl`,
+			sessionIdentity: identity,
+		});
+		expect(calls[2]?.options?.idempotencyKey).toEqual(expect.any(String));
+		expect(calls[2]?.options?.idempotencyKey?.length).toBeLessThanOrEqual(128);
+		expect(calls[2]?.options?.timeoutMs).toBe(21_000);
+		expect(calls.filter(call => call.operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("recovers a session registration retired by the broker dead-process reaper", async () => {
+		const agentDir = await tempDir();
+		const index = await new SessionIndex(agentDir).open();
+		const sessionId = "reaped-session";
+		const deadPid = 4_194_304;
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "e".repeat(64),
+		};
+		await index.append({ sessionId, locator, endpointGeneration: 1, pid: deadPid, type: "host_registered" });
+		expect(await reapDeadSessionRegistrations({ index })).toEqual([
+			{ sessionId, pid: deadPid, endpointGeneration: 1 },
+		]);
+		const reaped = index.listSessions().sessions.find(row => row.sessionId === sessionId);
+		if (!reaped) throw new Error("reaped session row was not retained");
+
+		let resumed = false;
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ ...reaped, live: resumed }],
+							savedSession: { id: sessionId, path: path.join(agentDir, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls).toEqual(["session.list", "session.resume", "session.list"]);
+	});
+
+	test("drives detached-idle self-reap into broker recovery", async () => {
+		const agentDir = await tempDir();
+		const index = await new SessionIndex(agentDir).open();
+		const sessionId = "detached-idle-session";
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: path.join(agentDir, ".gjc", "state") };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const registered = await index.append({
+			sessionId,
+			locator,
+			endpointGeneration: 1,
+			pid: process.pid,
+			type: "host_registered",
+		});
+		let nowMs = 0;
+		let reads = 0;
+		const reapReason = await watchSessionHostClientAttachment({
+			readAttachedClients: () => {
+				reads += 1;
+				return reads === 1 ? 1 : 0;
+			},
+			now: () => nowMs,
+			sleep: async ms => {
+				nowMs += ms;
+			},
+			idleGraceMs: 20,
+			firstAttachGraceMs: 40,
+			pollMs: 10,
+		});
+		expect(reapReason).toBe("detached_idle");
+		expect(await index.unregisterIfCurrent(registered, reapReason)).toBe(true);
+		const reaped = index.listSessions().sessions.find(row => row.sessionId === sessionId);
+		if (!reaped) throw new Error("detached-idle row was not retained");
+		expect(reaped.terminal).toBe(true);
+		expect(reaped.hostUnregisteredReason).toBe("detached_idle");
+
+		let resumed = false;
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.resume") {
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ ...reaped, live: resumed, ...(resumed ? { terminal: false } : {}) }],
+							savedSession: { id: sessionId, path: path.join(agentDir, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(calls).toEqual(["session.list", "session.resume", "session.list"]);
+	});
+
+	test("normalizes a symlinked state root through broker lifecycle input rules", async () => {
+		const agentDir = await tempDir();
+		const cwd = path.join(agentDir, "workspace");
+		const symlinkedCwd = path.join(agentDir, "workspace-link");
+		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.symlink(cwd, symlinkedCwd, "dir");
+		const sessionId = "symlinked-state-root";
+		const locator = {
+			cwd,
+			worktreeRoot: null,
+			stateRoot: path.join(symlinkedCwd, ".gjc", "state"),
+		};
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "f".repeat(64),
+		};
+		let resumed = false;
+		let resumeInput: Record<string, unknown> | undefined;
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				if (operation === "session.resume") {
+					resumeInput = input;
+					resumed = true;
+					return { ok: true, result: { sessionId } };
+				}
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: resumed,
+									ambiguous: false,
+									...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+									locator,
+								},
+							],
+							savedSession: { id: sessionId, path: path.join(cwd, "session.jsonl"), identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, sessionId)).toBe(sessionId);
+		expect(resumeInput).toMatchObject({
+			sessionId,
+			cwd,
+			stateRoot: path.join(cwd, ".gjc", "state"),
+		});
+	});
+
+	test("wires recovery through session.get_endpoint and relay startup", async () => {
+		const agentDir = await tempDir();
+		const socketPath = path.join(agentDir, "serve.sock");
+		const sessionId = "dead-session";
+		const cwd = "/workspace";
+		const stateRoot = `${cwd}/.gjc/state`;
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "a".repeat(64),
+		};
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		const endpoint = upstream();
+		const brokerToken = "broker-token";
+		const brokerRequests: Record<string, unknown>[] = [];
+		let resumed = false;
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("test broker process incarnation unavailable");
+		const brokerServer = Bun.serve<unknown>({
+			port: 0,
+			fetch(req, server) {
+				if (new URL(req.url).searchParams.get("token") !== brokerToken)
+					return new Response("unauthorized", { status: 401 });
+				if (server.upgrade(req, { data: {} })) return;
+				return new Response("upgrade required", { status: 426 });
+			},
+			websocket: {
+				open(ws) {
+					ws.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				},
+				message(ws, message) {
+					const frame = JSON.parse(String(message)) as Record<string, unknown>;
+					brokerRequests.push(frame);
+					const id = typeof frame.id === "string" ? frame.id : "";
+					const respond = (body: Record<string, unknown>) =>
+						ws.send(JSON.stringify({ type: "broker_response", id, ...body }));
+					if (frame.operation === "session.list") {
+						respond({
+							ok: true,
+							result: {
+								indexSeq: 1,
+								sessions: [
+									{
+										sessionId,
+										live: resumed,
+										ambiguous: false,
+										...(resumed ? {} : { terminal: true, hostUnregisteredReason: "detached_idle" }),
+										locator,
+									},
+								],
+								...(resumed ? {} : { savedSession: { id: sessionId, path: `${cwd}/session.jsonl`, identity } }),
+								warnings: [],
+							},
+						});
+						return;
+					}
+					if (frame.operation === "session.resume") {
+						if (typeof frame.idempotencyKey !== "string" || frame.idempotencyKey.length === 0) {
+							respond({
+								ok: false,
+								error: {
+									code: "invalid_input",
+									message: "idempotencyKey is required for lifecycle operations",
+								},
+							});
+							return;
+						}
+						resumed = true;
+						respond({ ok: true, result: { sessionId } });
+						return;
+					}
+					if (frame.operation === "session.get_endpoint") {
+						respond({ ok: true, result: { url: endpoint.url, token } });
+						return;
+					}
+					respond({ ok: false, error: { code: "unexpected_operation", message: String(frame.operation) } });
+				},
+			},
+		});
+		const now = Date.now();
+		await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "sdk", "broker.json"),
+			JSON.stringify({
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "serve-test",
+				pid: process.pid,
+				incarnation,
+				host: "127.0.0.1",
+				port: brokerServer.port,
+				url: `ws://127.0.0.1:${brokerServer.port}`,
+				token: brokerToken,
+				startedAt: now,
+				heartbeatAt: now,
+			}),
+		);
+
+		const previousAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+		setAgentDir(agentDir);
+		const originalProcessOnce = process.once;
+		const invokeOriginalProcessOnce = originalProcessOnce.bind(process) as (
+			event: Parameters<NodeJS.EventEmitter["once"]>[0],
+			listener: Parameters<NodeJS.EventEmitter["once"]>[1],
+		) => typeof process;
+		let stop: (() => void) | undefined;
+		const interceptedProcessOnce: typeof process.once = (
+			event: Parameters<NodeJS.EventEmitter["once"]>[0],
+			listener: Parameters<NodeJS.EventEmitter["once"]>[1],
+		) => {
+			if (event === "SIGTERM") {
+				stop = listener as () => void;
+				return process;
+			}
+			return invokeOriginalProcessOnce(event, listener);
+		};
+		process.once = interceptedProcessOnce;
+		let serving: Promise<void> | undefined;
+		let client: net.Socket | undefined;
+		try {
+			serving = runSdkServe(["--socket", socketPath, "--session", sessionId]);
+			for (let attempt = 0; attempt < 600 && client === undefined; attempt++) {
+				try {
+					client = await socketConnect(socketPath);
+				} catch {
+					await Bun.sleep(5);
+				}
+			}
+			if (!client) throw new Error("Timed out waiting for sdk serve socket");
+			const frame = '{"type":"probe","value":1}';
+			client.write(`gjc-sdk-transport/1 token=${token}\n${frame}\n`);
+			expect(await waitFor(() => endpoint.connections[0]?.messages[0], "relay startup")).toBe(frame);
+			await closeSocket(client);
+			stop = await waitFor(() => stop, "serve shutdown callback");
+			stop();
+			await serving;
+
+			expect(brokerRequests.map(request => request.operation)).toEqual([
+				"session.list",
+				"session.resume",
+				"session.list",
+				"session.get_endpoint",
+			]);
+			const recoveryRequest = brokerRequests.find(request => request.operation === "session.resume");
+			expect(recoveryRequest?.idempotencyKey).toEqual(expect.any(String));
+			expect((recoveryRequest?.idempotencyKey as string).length).toBeLessThanOrEqual(128);
+		} finally {
+			stop?.();
+			if (client) client.destroy();
+			await serving?.catch(() => undefined);
+			process.once = originalProcessOnce;
+			brokerServer.stop(true);
+			endpoint.stop();
+			if (previousAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = previousAgentDir;
+			if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+			resetAgentDirFromEnvironment();
+		}
+	});
+
+	test("does not retry a recovery when the resumed session remains dead", async () => {
+		const sessionId = "still-dead";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				calls.push(operation);
+				if (operation === "session.list" && input.cwd !== undefined)
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: {
+									dev: "1",
+									ino: "2",
+									size: 3,
+									mtimeMs: 4,
+									mtimeNs: "5",
+									sha256: "b".repeat(64),
+								},
+							},
+						},
+					};
+				if (operation === "session.resume") return { ok: true, result: { sessionId } };
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls).toEqual(["session.list", "session.list", "session.resume", "session.list"]);
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(1);
+	});
+
+	test("does not recover an indexed terminal-uncertain explicit session", async () => {
+		const sessionId = "uncertain-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const identity = {
+			dev: "1",
+			ino: "2",
+			size: 3,
+			mtimeMs: 4,
+			mtimeNs: "5",
+			sha256: "d".repeat(64),
+		};
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal_uncertain: true, locator }],
+							savedSession: { id: sessionId, path: "/workspace/session.jsonl", identity },
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "terminal_uncertain",
+			exitCode: 1,
+		});
+		expect(calls).toEqual(["session.list"]);
+	});
+
+	test("does not recover a nonterminal stale row without retirement proof", async () => {
+		const sessionId = "heartbeat-stale-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal: false, locator }],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "e".repeat(64) },
+							},
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls).toEqual(["session.list"]);
+	});
+
+	test("does not resume an indexed terminal session", async () => {
+		const sessionId = "terminal-session";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				if (operation === "session.list")
+					return {
+						ok: true,
+						result: {
+							sessions: [{ sessionId, live: false, ambiguous: false, terminal: true, locator }],
+							// Recovery authority is present, so the only thing keeping this row from
+							// being resumed is that it has already reached a terminal state.
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: { dev: "1", ino: "2", size: 3, mtimeMs: 4, mtimeNs: "5", sha256: "d".repeat(64) },
+							},
+						},
+					};
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
+		expect(calls).toEqual(["session.list"]);
+	});
+
+	test("reports a post-recovery stale endpoint as endpoint_stale rather than serve_failed", async () => {
+		const sessionId = "stale-after-recovery";
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				// A row with no locator cannot carry recovery authority, so the recovery path
+				// raises the stale-endpoint error itself. That error has to stay typed: an
+				// untyped throw here is rewritten to `serve_failed` and the caller loses the
+				// one code that says recovery ran and the endpoint is still not live.
+				if (operation === "session.list")
+					return { ok: true, result: { sessions: [{ sessionId, live: false, ambiguous: false }] } };
+				return { ok: false, error: { code: "unexpected_operation", message: operation } };
+			},
+		} as never;
+
+		expect(await serveRejectionFailure(() => resolveServeSession(broker, sessionId))).toEqual({
+			typed: true,
+			code: "endpoint_stale",
+			exitCode: 1,
+		});
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
+	});
+
+	test("surfaces a recovery failure without retrying or selecting an endpoint", async () => {
+		const sessionId = "resume-fails";
+		const locator = { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" };
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				calls.push(operation);
+				if (operation === "session.list" && input.cwd !== undefined)
+					return {
+						ok: true,
+						result: {
+							sessions: [
+								{
+									sessionId,
+									live: false,
+									ambiguous: false,
+									terminal: true,
+									hostUnregisteredReason: "detached_idle",
+									locator,
+								},
+							],
+							savedSession: {
+								id: sessionId,
+								path: "/workspace/session.jsonl",
+								identity: {
+									dev: "1",
+									ino: "2",
+									size: 3,
+									mtimeMs: 4,
+									mtimeNs: "5",
+									sha256: "c".repeat(64),
+								},
+							},
+						},
+					};
+				if (operation === "session.resume")
+					return { ok: false, error: { code: "resume_failed", message: "resume failed" } };
+				return {
+					ok: true,
+					result: {
+						sessions: [
+							{
+								sessionId,
+								live: false,
+								ambiguous: false,
+								terminal: true,
+								hostUnregisteredReason: "detached_idle",
+								locator,
+							},
+						],
+					},
+				};
+			},
+		} as never;
+
+		await expect(resolveServeSession(broker, sessionId)).rejects.toMatchObject({
+			name: "SdkClientError",
+			code: "resume_failed",
+			message: "resume failed",
+		});
+		expect(calls).toEqual(["session.list", "session.list", "session.resume"]);
+	});
+
+	test("does not recover a live endpoint or change closed selection failures", async () => {
+		const calls: string[] = [];
+		const broker = {
+			global: async (operation: string) => {
+				calls.push(operation);
+				return {
+					ok: true,
+					result: {
+						sessions: [
+							{ sessionId: "live", live: true, ambiguous: false },
+							{ sessionId: "live-2", live: true, ambiguous: false },
+							{ sessionId: "ambiguous", live: false, ambiguous: true },
+						],
+						warnings: [],
+					},
+				};
+			},
+		} as never;
+
+		expect(await resolveServeSession(broker, "live")).toBe("live");
+		expect([
+			await serveRejectionFailure(() => resolveServeSession(broker, "ambiguous")),
+			await serveRejectionFailure(() => resolveServeSession(broker, "missing")),
+			await serveRejectionFailure(() => resolveServeSession(broker)),
+		]).toEqual([
+			{ typed: true, code: "ambiguous_session", exitCode: 1 },
+			{ typed: true, code: "not_found", exitCode: 1 },
+			{ typed: true, code: "multiple_live_endpoints", exitCode: 1 },
+		]);
+		expect(calls.filter(operation => operation === "session.resume")).toHaveLength(0);
 	});
 
 	test("rejects malformed broker session.list pages instead of treating them as empty", async () => {

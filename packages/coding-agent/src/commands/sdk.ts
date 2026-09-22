@@ -268,7 +268,7 @@ export async function watchSessionHostClientAttachment(deps: {
 	idleGraceMs?: number;
 	firstAttachGraceMs?: number;
 	pollMs?: number;
-}): Promise<void> {
+}): Promise<"detached_idle"> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
 	const readWorkInFlight = deps.readWorkInFlight ?? (() => false);
@@ -294,9 +294,9 @@ export async function watchSessionHostClientAttachment(deps: {
 			// registration stops publishing a count instead of reporting zero.
 			// Both accrue against the idle bound rather than running forever.
 			detachedSince ??= now();
-			if (now() - detachedSince >= idleGraceMs) return;
+			if (now() - detachedSince >= idleGraceMs) return "detached_idle";
 		} else if (now() - unattendedSince >= firstAttachGraceMs) {
-			return;
+			return "detached_idle";
 		}
 		await sleep(pollMs);
 	}
@@ -686,10 +686,10 @@ export async function runSessionHost(
 		lifecycleTranscriptPath = session.sessionManager.getSessionFile();
 	});
 	let sessionDisposal: Promise<void> | undefined;
-	const disposeSession = (): Promise<void> => {
+	const disposeSession = (reason?: "detached_idle"): Promise<void> => {
 		sessionDisposal ??= (async () => {
 			try {
-				await session.dispose();
+				await session.dispose(reason === undefined ? {} : { sessionShutdownReason: reason });
 			} catch (error) {
 				if (!isSessionDisposalIncompleteError(error)) throw error;
 				await session.awaitDisposeCompletion();
@@ -735,8 +735,8 @@ export async function runSessionHost(
 		return failureRollback;
 	};
 	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (): Promise<void> => {
-		await disposeSession();
+	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
+		await disposeSession(reason);
 		let failure: SdkStartupFailure | undefined;
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
@@ -766,11 +766,11 @@ export async function runSessionHost(
 		process.exit(process.exitCode ?? 0);
 	};
 	let stopping = false;
-	const stop = () => {
+	const stop = (reason?: "detached_idle") => {
 		if (capability.result?.status === "started") {
 			if (stopping) return;
 			stopping = true;
-			void exitAfterSessionDisposal();
+			void exitAfterSessionDisposal(reason);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
@@ -858,21 +858,21 @@ export async function runSessionHost(
 		await Bun.sleep(5_000);
 	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
-	process.once("SIGTERM", stop);
-	process.once("SIGINT", stop);
+	process.once("SIGTERM", () => stop());
+	process.once("SIGINT", () => stop());
 	// Two independent bounds, either of which reaps this detached host through
 	// the same graceful teardown a SIGTERM would take. The first covers a broker
 	// that is gone for good; the second covers the opposite case, a perfectly
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
-	await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir }),
+	const reapReason = await Promise.race([
+		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
 			readWorkInFlight: sessionHostWorkInFlight,
 		}),
 	]);
-	stop();
+	stop(reapReason);
 	await new Promise<void>(() => {});
 }
 

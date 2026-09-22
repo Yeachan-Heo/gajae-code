@@ -378,7 +378,9 @@ export class SessionSdkHost {
 		return "activated";
 	}
 
-	async stop(options: { allowLockContention?: boolean } = {}): Promise<"stopped" | "already"> {
+	async stop(
+		options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {},
+	): Promise<"stopped" | "already"> {
 		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
 		const stopPromise = this.#stopStartedHost(options);
@@ -390,7 +392,10 @@ export class SessionSdkHost {
 		}
 	}
 
-	async #stopStartedHost(options: { allowLockContention?: boolean }): Promise<"stopped"> {
+	async #stopStartedHost(options: {
+		allowLockContention?: boolean;
+		unregisterReason?: "detached_idle";
+	}): Promise<"stopped"> {
 		// Fence before the first await: everything after this point is teardown,
 		// and no in-flight activation may publish readiness across it.
 		this.#stopping = true;
@@ -402,6 +407,7 @@ export class SessionSdkHost {
 					sessionId: this.#options.sessionId,
 					stateRoot: this.#options.stateRoot,
 					endpointGeneration: this.events.generation,
+					...(options.unregisterReason === undefined ? {} : { reason: options.unregisterReason }),
 				});
 			} catch (error) {
 				// A live broker may hold the shared session-index lock beyond the

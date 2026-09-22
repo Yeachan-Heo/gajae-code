@@ -3287,30 +3287,28 @@ export class ModelRegistry {
 	}
 
 	#profileAvailabilityEvidenceFingerprint(): string {
-		return JSON.stringify(
-			{
-				descriptor: [...this.#descriptorDiscoveryEvidence.entries()]
-					.sort(([left], [right]) => left.localeCompare(right))
-					.map(([provider, evidence]) => [
-						provider,
-						evidence.fresh,
-						evidence.profileFresh,
-						evidence.authGeneration,
-						evidence.endpoint,
-						evidence.profileEndpoint,
-						[...evidence.modelIds].sort(),
-						evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
-					]),
-				configured: [...this.#configuredDiscoveryEvidence.entries()]
-					.sort(([left], [right]) => left.localeCompare(right))
-					.map(([provider, evidence]) => [
-						provider,
-						evidence.authGeneration,
-						evidence.endpoint,
-						[...evidence.modelIds].sort(),
-					]),
-			},
-		);
+		return JSON.stringify({
+			descriptor: [...this.#descriptorDiscoveryEvidence.entries()]
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([provider, evidence]) => [
+					provider,
+					evidence.fresh,
+					evidence.profileFresh,
+					evidence.authGeneration,
+					evidence.endpoint,
+					evidence.profileEndpoint,
+					[...evidence.modelIds].sort(),
+					evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
+				]),
+			configured: [...this.#configuredDiscoveryEvidence.entries()]
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([provider, evidence]) => [
+					provider,
+					evidence.authGeneration,
+					evidence.endpoint,
+					[...evidence.modelIds].sort(),
+				]),
+		});
 	}
 
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {

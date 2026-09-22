@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import { logger } from "@gajae-code/utils";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
@@ -93,6 +94,7 @@ describe("MCP startup and the declared connection window", () => {
 
 	test("gives up on a server once its declared window has actually elapsed", async () => {
 		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const result = await manager.connectServers(
 				{
@@ -110,8 +112,49 @@ describe("MCP startup and the declared connection window", () => {
 			expect(result.connectedServers).toEqual([]);
 			expect(result.errors.get("brief")).toContain("timed out");
 			expect(manager.getConnectionStatus("brief")).toBe("disconnected");
+			expect(warning).toHaveBeenCalledWith(
+				"MCP server connection failed during startup",
+				expect.objectContaining({
+					path: "mcp:brief",
+					remediation: expect.stringContaining("--timeout"),
+				}),
+			);
 		} finally {
+			warning.mockRestore();
 			await manager.disconnectAll();
 		}
 	});
+
+	test("keeps every server in a large untimed batch diagnosable", async () => {
+		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const configs = Object.fromEntries(
+			Array.from({ length: 22 }, (_, index) => [
+				`untimed-${String(index + 1).padStart(2, "0")}`,
+				{
+					command: process.execPath,
+					args: ["-e", delayedStdioServer("ping", 5_000)],
+				},
+			]),
+		);
+		try {
+			const result = await manager.connectServers(configs, {});
+
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors.size).toBe(22);
+			for (const name of Object.keys(configs)) {
+				expect(result.errors.get(name)).toContain("timed out");
+				expect(warning).toHaveBeenCalledWith(
+					"MCP server connection timed out during startup",
+					expect.objectContaining({
+						path: `mcp:${name}`,
+						remediation: expect.stringContaining("--timeout"),
+					}),
+				);
+			}
+		} finally {
+			warning.mockRestore();
+			await manager.disconnectAll();
+		}
+	}, 30_000);
 });

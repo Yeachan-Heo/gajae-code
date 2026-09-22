@@ -1054,7 +1054,17 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await staleRegistry.refreshProvider("anthropic", "online");
 
 			const curatedDefault = DEFAULT_MODEL_PER_PROVIDER.anthropic;
-			expect(staleRegistry.getAvailable().some(model => model.id === curatedDefault)).toBe(true);
+			// Fresh, authoritative live evidence makes the live catalog the selectable
+			// list, so a curated default the provider did not enroll is not selectable
+			// either. The curated default is only the fallback while that evidence is
+			// absent (#5720, #5746).
+			expect(
+				staleRegistry
+					.getAvailable()
+					.filter(model => model.provider === "anthropic")
+					.map(model => model.id)
+					.sort(),
+			).toEqual([currentModelId]);
 			expect(staleRegistry.getAvailableForProfileActivation().some(model => model.id === curatedDefault)).toBe(
 				false,
 			);

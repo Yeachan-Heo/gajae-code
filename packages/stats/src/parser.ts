@@ -131,7 +131,9 @@ function extractStats(
 		timestamp: msg.timestamp,
 		duration: msg.duration ?? null,
 		ttft: msg.ttft ?? null,
-		stopReason: msg.stopReason,
+		// Historical session entries may omit stopReason. Keep the stats schema
+		// non-nullable while preserving those requests instead of aborting sync.
+		stopReason: msg.stopReason ?? "unknown",
 		errorMessage: msg.errorMessage ?? null,
 		usage,
 	};
