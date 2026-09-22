@@ -26,7 +26,7 @@ import {
 } from "../session/streaming-output";
 
 import { formatBytes, wrapBrackets } from "./render-utils";
-import { renderError } from "./tool-errors";
+import { renderError, ToolError } from "./tool-errors";
 
 /**
  * Truncation metadata for the output notice.
@@ -1130,7 +1130,20 @@ async function wrappedExecute(
 		}
 		return result;
 	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
+		// Preserve the original Error class and stack so designed tool outcomes can
+		// be classified by the agent telemetry path and genuine failures retain the
+		// frame where they actually occurred. Non-Error throws still need a stable
+		// Error envelope for the agent loop.
+		if (e instanceof ToolError) {
+			const rendered = renderError(e);
+			if (rendered !== e.message) {
+				const renderedError = new ToolError(rendered, e.context);
+				if (e.stack) renderedError.stack = e.stack;
+				throw renderedError;
+			}
+			throw e;
+		}
+		if (e instanceof Error) throw e;
 		throw new Error(renderError(e));
 	}
 }

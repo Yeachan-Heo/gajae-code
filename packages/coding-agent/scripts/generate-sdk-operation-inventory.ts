@@ -287,6 +287,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile and fallback-chain state, not a user-facing SDK control seam",
 	"agent_session:setDefaultFallbackRuntimeModel":
 		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
+	"agent_session:installRecoveredDefaultFallbackChain":
+		"internal recovered fallback-chain installation during session startup, not a user-facing SDK control seam",
+	"agent_session:markStartupRecoveryBindingsRequired":
+		"internal startup recovery binding marker, not a user-facing SDK control seam",
+	"agent_session:hasRecoveredDefaultFallbackChain":
+		"internal recovered fallback-chain state query, not a user-facing SDK control seam",
 	"agent_session:setCredentialPin":
 		"interactive session-scoped OAuth account selector mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
 	"agent_session:setCredentialAuto":
@@ -295,6 +301,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
 	"agent_session:syncEagerDelegation":
 		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
+	"agent_session:submitUserMessage":
+		"public in-process embedder lifecycle API; direct handle surface, not an SDK transport operation",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
@@ -823,10 +831,17 @@ export function scanAgentSessionMethods(sourceText: string): string[] {
 			throw new Error("SDK operation inventory scanner: AgentSession class body is unbalanced.");
 
 		const methods: string[] = [];
+		const seenMethods = new Set<string>();
 		for (let memberStart = bodyStart + 1; memberStart < bodyEnd; ) {
 			const declaration = scanMethodDeclaration(tokens, memberStart, bodyEnd);
 			if (declaration) {
-				if (declaration.name) methods.push(`agent_session:${declaration.name}`);
+				if (declaration.name) {
+					const sourceId = `agent_session:${declaration.name}`;
+					if (!seenMethods.has(sourceId)) {
+						seenMethods.add(sourceId);
+						methods.push(sourceId);
+					}
+				}
 				memberStart = Math.max(memberStart + 1, declaration.end);
 				continue;
 			}
@@ -952,6 +967,7 @@ function validateRegistry(records: InventoryRecord[]): string[] {
 	const errors: string[] = [];
 	const ids = new Set<string>();
 	const sdkIds = new Set<string>();
+	const sourceIds = new Set<string>();
 	for (const operation of OPERATIONS) {
 		if (ids.has(operation.id)) errors.push(`Duplicate operation ID: ${operation.id}`);
 		ids.add(operation.id);
@@ -963,6 +979,8 @@ function validateRegistry(records: InventoryRecord[]): string[] {
 		if (operation.testIds.length === 0) errors.push(`${operation.id} is missing test IDs.`);
 	}
 	for (const record of records) {
+		if (sourceIds.has(record.sourceId)) errors.push(`Duplicate source seam: ${record.sourceId}`);
+		sourceIds.add(record.sourceId);
 		if (record.decision === "exclude") {
 			if (!record.rationale) errors.push(`${record.sourceId} exclusion lacks a locked rationale.`);
 			if (

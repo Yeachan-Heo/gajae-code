@@ -103,6 +103,8 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  must see the same capability-gated event kinds on both legs, or live and
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Capability for non-replayable streamed turn content. */
+export const TURN_STREAM_CAPABILITY = "turn_stream";
 /** Capability used by notification adapters that observe a host without owning its work. */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);

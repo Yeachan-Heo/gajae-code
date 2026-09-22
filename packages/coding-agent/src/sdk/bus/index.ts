@@ -119,6 +119,7 @@ import {
 	syntheticModelInputError,
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
+import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	createPromptDeadlineLease,
 	isAttributableProgressEventType,
@@ -126,6 +127,7 @@ import {
 	promptDeadlineAt,
 	recordAttributableProgress,
 } from "../prompt-deadline-lease";
+import { runBoundedDeadlineFlush } from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
@@ -5742,10 +5744,56 @@ export function createNotificationsExtension(
 				}
 				if (capture) capture.proof = proof;
 			}
-			// Second deadline-attempt fence across the awaited fencing transition:
-			// progress recorded while fencing was in flight supersedes exactly
-			// like progress during the claim. Non-deadline attempts skip this —
-			// their attempt identity was never registered.
+			if (deadlineAttempt) {
+				// Durability BEFORE the durable terminal (#5583, #5623 review round 4).
+				// The bus owns an independent deadline timer and terminalization path,
+				// so the host wiring in `session-runtime` never sees this expiry —
+				// without this call an active notification-bus session loses its dirty
+				// edits on a deadline, which is the exact work-loss this change exists
+				// to stop. It runs between the durable pending claim above and the
+				// finalize below on purpose: a process death anywhere in this window
+				// leaves the durable record PENDING, so restart recovery retries the
+				// prompt instead of treating work that was never autosaved as finished.
+				// Ordering it after the finalize made the autosave the one step a crash
+				// could silently skip. The cost is that the durable terminal is delayed
+				// by at most the flush's 10s bound.
+				//
+				// Deadline path only: reaching here inside `if (deadlineAttempt)` proves
+				// the attempt was registered, and `winner` is the authoritative claimed
+				// outcome, so a cancel, an `agent_failed`, or a normal `agent_end` never
+				// autosaves. Bounded by the shared race and fully swallowed: the
+				// terminal recorded and published below is identical whether the flush
+				// succeeds, fails, or is abandoned.
+				if (
+					winner.kind === "failed" &&
+					winner.code === "prompt_deadline_exceeded" &&
+					settings?.get("sdk.flushWorktreeOnDeadline") !== false
+				) {
+					// `has` is true only for a value the user actually wrote, so this
+					// separates an explicit opt-in from the schema default. The flush only
+					// honours the default inside a linked worktree the session owns.
+					const configured = settings?.get("sdk.flushWorktreeOnDeadline");
+					const hasExplicitSetting =
+						typeof settings?.has === "function"
+							? settings.has("sdk.flushWorktreeOnDeadline")
+							: configured === true;
+					const explicitOptIn = hasExplicitSetting === true && configured === true;
+					await runBoundedDeadlineFlush(signal =>
+						flushWorktreeOnPromptDeadline(ctx.cwd, {
+							explicitOptIn,
+							isCurrent: () =>
+								deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) ===
+								"current",
+							signal,
+						}),
+					);
+				}
+			}
+			// Second deadline-attempt fence, across both the awaited fencing
+			// transition and the autosave above: progress recorded while either was in
+			// flight supersedes exactly like progress during the claim, and the
+			// autosave alone can hold this path for ten seconds. Non-deadline attempts
+			// skip this — their attempt identity was never registered.
 			if (deadlineAttempt) {
 				const key = promptSubmissionKey(correlation);
 				const status = deadlineAttemptStatus(key, submission, deadlineAttempt);

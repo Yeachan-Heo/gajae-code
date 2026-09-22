@@ -13,6 +13,8 @@ export interface RunErrorPayload {
 	stack?: string;
 	isAbort?: boolean;
 	isToolError?: boolean;
+	/** Set only when the originating error carried the trusted designed marker. */
+	isDesigned?: boolean;
 }
 
 export type ToolReply = { ok: true; value: unknown } | { ok: false; error: RunErrorPayload };

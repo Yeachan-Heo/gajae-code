@@ -290,8 +290,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * first refusal, so an owner still running the generation-178 router keeps
  * killing a session's mirroring after one transient rejection and must be
  * replaced across this upgrade.
+ * Generation 190 acknowledges the protected prompt-deadline boundary change,
+ * so generation-189 owners are replaced instead of retaining the old path.
  */
-export const DAEMON_GENERATION = 189;
+export const DAEMON_GENERATION = 190;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

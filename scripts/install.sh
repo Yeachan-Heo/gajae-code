@@ -824,13 +824,27 @@ install_via_bun() {
     echo "Run 'gjc' to get started!"
 }
 
+# A symlinked destination is never replaced with a regular binary. Called once
+# before the download so a refusal costs an lstat instead of the whole release
+# asset, and again immediately before the replace as the TOCTOU guard. Both call
+# sites share this message.
+refuse_symlinked_destination() {
+    [ -h "$DEST_PATH" ] || return 0
+    die "Refusing to replace symlink ${DEST_PATH} with a regular binary. It is most likely a development link created by 'bun run dev:link'; update that checkout through its own workflow, remove the symlink, or set GJC_INSTALL_DIR to a different directory."
+}
+
 install_binary() {
     detect_platform
     require_official_github_origins
     acquire_lock
-    resolve_release_tag
 
     DEST_PATH="${INSTALL_DIR}/gjc"
+
+    # Nothing about this decision depends on the downloaded bytes, so make it
+    # before spending the download on a destination that can never be published.
+    refuse_symlinked_destination
+    resolve_release_tag
+
     exclusive_tmp "gjc.download"
     DOWNLOAD_TMP="$LAST_EXCLUSIVE_TMP"
     BACKUP_PATH=""
@@ -857,9 +871,7 @@ install_binary() {
     VERIFIED_RELEASE_SHA256="$expected"
     chmod +x "$DOWNLOAD_TMP"
 
-    if [ -h "$DEST_PATH" ]; then
-        die "Refusing to replace symlink ${DEST_PATH} with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
-    fi
+    refuse_symlinked_destination
 
     if [ -e "$DEST_PATH" ]; then
         exclusive_tmp "gjc.bak"

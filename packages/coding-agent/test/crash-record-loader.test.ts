@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import { computeCrashFingerprint, computeHandledErrorFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
 import { findLatestRecord, parseCrashRecords, parseRecoverableCrashRecords } from "../src/crash/record-loader";
 
 const FP_A = "a".repeat(32);
@@ -105,6 +105,18 @@ describe("parseCrashRecords", () => {
 			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef")}`,
 		);
 		expect(parseRecoverableCrashRecords(withPayload).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("accepts a handled record bound to the handled fingerprint identity", () => {
+		const name = "ToolError";
+		const message = "tool failed";
+		const stack = `${name}: ${message}\n    at frame (packages/coding-agent/src/x.ts:1:1)`;
+		const fingerprint = computeHandledErrorFingerprint({ name, message, stack }, { installRoot: process.cwd() });
+		const text =
+			`2026-08-11T12:00:00.000Z pid=4242 [Tool functions.read] ${name}: ${message}\n` +
+			`${stack}\n${formatCrashRecordMarker(fingerprint.fingerprint, 1, "0123456789abcdef")}\n\n`;
+
+		expect(parseRecoverableCrashRecords(text).map(record => record.fingerprint)).toEqual([fingerprint.fingerprint]);
 	});
 
 	it("recovers production v1 records with a colon in the error name", () => {

@@ -1786,13 +1786,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const parentProfileDefinition = parentActiveModelProfile
 			? this.session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
 			: undefined;
+		const parentProfileBindings = parentProfileDefinition
+			? resolveProfileBindings(parentProfileDefinition)
+			: undefined;
+		const parentProfileBinding =
+			parentProfileBindings?.agentModelOverrides[
+				agentName as keyof typeof parentProfileBindings.agentModelOverrides
+			];
 		const parentOwnedModelProfile =
 			parentProfileDefinition &&
-			Object.hasOwn(resolveProfileBindings(parentProfileDefinition).agentModelOverrides, agentName)
+			parentProfileBindings &&
+			Object.hasOwn(parentProfileBindings.agentModelOverrides, agentName)
 				? parentActiveModelProfile
 				: undefined;
 		const modelOverride = resolveAgentModelPatterns({
-			settingsOverride: settingsModelOverride,
+			// Profile bindings are runtime-owned and may not be present in the
+			// persisted settings view exposed to detached task construction.
+			// Keep explicit task settings authoritative, then inherit the active
+			// profile's role binding before falling back to the parent model.
+			settingsOverride: settingsModelOverride ?? parentProfileBinding,
 			agentModel: effectiveAgent.model,
 			settings: this.session.settings,
 			activeModelPattern: parentActiveModelPattern,

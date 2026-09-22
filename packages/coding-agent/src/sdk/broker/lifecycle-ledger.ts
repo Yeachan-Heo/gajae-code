@@ -143,6 +143,11 @@ function canonicalCleanupSessionId(value: unknown): value is string {
 }
 
 const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	// Terminal evidence intentionally has no time-based expiry: forgetting a
+	// completed close would allow a delayed duplicate to reach a later host
+	// generation. The row/byte bounds below are storage limits; compaction keeps
+	// each identity's accepted anchor and latest terminal state instead of
+	// expiring replay authority.
 	maxBytes: 64 * 1024 * 1024,
 	maxLineBytes: 8 * 1024 * 1024,
 	maxRows: 10_000,
@@ -654,7 +659,7 @@ export class LifecycleLedger {
 		for (const [identity, latest] of compacted) {
 			const anchor = anchors.get(identity);
 			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
-			snapshot.push(anchor);
+			snapshot.push(replacement?.identity === identity && latest.state === "accepted" ? latest : anchor);
 			if (latest.state !== "accepted") snapshot.push(latest);
 		}
 		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
@@ -696,16 +701,24 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
-	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
-		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	findByOperationKey(operationKey: string, fingerprint?: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(
+			entry =>
+				entry.operationKey === operationKey && (fingerprint === undefined || entry.fingerprint === fingerprint),
+		);
+	}
+	findAnyByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
 	}
 	/**
 	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
 	 * must reject rather than create a second admission.
 	 */
-	hasLegacyIdentity(): boolean {
-		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>): boolean {
+		return [...this.#byIdentity.values()].some(
+			entry => entry.operationKey === undefined && !excludedIdentities?.has(entry.identity),
+		);
 	}
 	async migrateIdentity(
 		from: string,
@@ -713,15 +726,32 @@ export class LifecycleLedger {
 		metadata: { operationKey: string; fingerprint: string },
 	): Promise<LifecycleLedgerEntry | undefined> {
 		return this.#mutate(async () => {
-			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const existing = this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
-			if (!entry) return undefined;
-			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
-			// Retire the legacy row so hasLegacyIdentity() returns false and future
-			// unrelated lifecycle requests are not globally blocked. The legacy
-			// identity gets a metadata-bearing replacement row in the append-only
-			// log, superseding the original metadata-free entry in #byIdentity.
-			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			if (!entry) return existing;
+			if (existing) {
+				if (entry.operationKey === undefined) {
+					await this.#compact({ ...entry, ...metadata, ts: Date.now() });
+				}
+				return existing;
+			}
+			// A migrated identity needs the same accepted anchor as a fresh request;
+			// appending only a terminal row would be quarantined on the next restart.
+			await this.#append({
+				version: SDK_STATE_VERSION,
+				identity: to,
+				requestHash: entry.requestHash,
+				...metadata,
+				state: "accepted",
+				ts: Date.now(),
+			});
+			const migrated =
+				entry.state === "accepted"
+					? this.#byIdentity.get(to)
+					: await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire metadata-free legacy rows by rewriting their latest row in place;
+			// appending a duplicate terminal row would violate the ledger history rules.
+			if (entry.operationKey === undefined) await this.#compact({ ...entry, ...metadata, ts: Date.now() });
 			return migrated;
 		});
 	}
@@ -756,7 +786,7 @@ export class LifecycleLedger {
 	async begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string } = {},
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string } = {},
 	): Promise<BeginResult> {
 		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
@@ -764,7 +794,7 @@ export class LifecycleLedger {
 	async #begin(
 		identity: string,
 		requestHash: string,
-		metadata: { operationKey?: string; fingerprint?: string },
+		metadata: { operationKey?: string; fingerprint?: string; intendedSessionId?: string },
 	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
@@ -776,6 +806,7 @@ export class LifecycleLedger {
 					requestHash,
 					operationKey: metadata.operationKey,
 					fingerprint: metadata.fingerprint,
+					intendedSessionId: metadata.intendedSessionId,
 					state: "accepted",
 					ts: Date.now(),
 				}),

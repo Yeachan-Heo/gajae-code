@@ -375,12 +375,26 @@ export interface WorkflowGateDiagnostic extends WorkflowGate {
 	id: string;
 	tag: "quarantined";
 	lifecycle: WorkflowGateLifecycle;
+	/** Whether the durable broker retained an answer for this gate. */
+	answer_recorded: boolean;
+}
+
+/** Durable acceptance evidence for a gate that is no longer pending. */
+export interface WorkflowGateResolutionDiagnostic extends WorkflowGate {
+	id: string;
+	tag: "accepted";
+	/** True when the accepted record contains the answer body. */
+	answer_recorded: true;
+	resolved_at: string;
+	/** Single post-accept disposition; raw answers and derived answer values stay private. */
+	post_accept_disposition: "accepted" | "terminalized" | "advanced" | "continuation_lost" | "unknown";
 }
 
 /** Stable Q12 row preserving the root WorkflowGate shape. */
 export type WorkflowGateQueryRecord =
-	| (WorkflowGate & { id: string; tag: "pending"; lifecycle?: undefined })
-	| WorkflowGateDiagnostic;
+	| (WorkflowGate & { id: string; tag: "pending"; lifecycle?: undefined; answer_recorded: false })
+	| WorkflowGateDiagnostic
+	| WorkflowGateResolutionDiagnostic;
 
 /** Inbound: the agent's answer to a workflow gate. */
 export interface WorkflowGateResponse {

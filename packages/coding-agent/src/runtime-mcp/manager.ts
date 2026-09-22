@@ -112,6 +112,13 @@ const STARTUP_TIMEOUT_GRACE_MS = MCP_STARTUP_WAIT_GRACE_MS;
  */
 const MAX_STARTUP_TIMEOUT_MS = MAX_MCP_STARTUP_WAIT_MS;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
+const MCP_STARTUP_TIMEOUT_PREFIX = "MCP server connection timed out during startup:";
+
+export function isMCPStartupTimeoutError(error: unknown): boolean {
+	return typeof error === "string"
+		? error.startsWith(MCP_STARTUP_TIMEOUT_PREFIX)
+		: error instanceof Error && error.message.startsWith(MCP_STARTUP_TIMEOUT_PREFIX);
+}
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =

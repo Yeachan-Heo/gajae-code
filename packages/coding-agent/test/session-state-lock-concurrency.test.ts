@@ -215,8 +215,9 @@ describe("coordinator session state lock under cross-process contention", () => 
 				const stateFile = path.join(root, `live-proc-${probe.label}.json`);
 				const lockFile = `${stateFile}.lock`;
 				await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+				const readyFile = `${stateFile}.ready`;
 
-				const holder = Bun.spawn([process.execPath, PROBE, stateFile, probe.label, "1", "60000"], {
+				const holder = Bun.spawn([process.execPath, PROBE, stateFile, probe.label, "1", "60000", readyFile], {
 					cwd: REPO_ROOT,
 					env: { ...process.env, NO_COLOR: "1" },
 					stdout: "pipe",
@@ -224,7 +225,8 @@ describe("coordinator session state lock under cross-process contention", () => 
 				});
 				try {
 					const lockDeadline = Date.now() + 20_000;
-					while (!fsSync.existsSync(lockFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+					while (!fsSync.existsSync(readyFile) && Date.now() < lockDeadline) await Bun.sleep(25);
+					expect(fsSync.existsSync(readyFile)).toBe(true);
 					expect((JSON.parse(await Bun.file(lockFile).text()) as { pid: number }).pid).toBe(holder.pid);
 
 					SessionStateLockTestHooks.probeLinuxProcPid = pid =>

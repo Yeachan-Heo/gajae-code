@@ -1365,8 +1365,7 @@ const TURN_PREFIX_SUMMARIZATION_PROMPT = prompt.render(compactionTurnPrefixPromp
  * Reasoning effort for a maintenance one-shot call (summary, turn-prefix
  * summary, handoff), sized against the model that will actually run it.
  *
- * These calls want `high`, but they must never *demand* it: the fallback
- * chain hands them whatever same-provider model has the most context, and a
+ * These calls want `high`, but they must never *demand* it: a
  * reasoning-capable model on a transport without reasoning control (the
  * registry strips `thinking` for a proxied `openai-codex` baseUrl) rejects any
  * explicit effort inside the provider mapper. The agent turn already clamps

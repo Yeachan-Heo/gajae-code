@@ -43,8 +43,16 @@ export async function deriveIdempotencyIdentity(
 	agentDir: string,
 	operation: string,
 	callerKey: string,
-	_protocolVersionOrLegacyTargetHash?: string,
+	targetHash?: string,
 ): Promise<string> {
+	const key = await getBrokerIdentityKey(agentDir);
+	return createHmac("sha256", Buffer.from(key, "hex"))
+		.update(`4|${operation}|${callerKey}|${targetHash ?? ""}`)
+		.digest("hex");
+}
+
+/** Identity format used by lifecycle rows written before target binding. */
+export async function deriveLegacyIdentity(agentDir: string, operation: string, callerKey: string): Promise<string> {
 	const key = await getBrokerIdentityKey(agentDir);
 	return createHmac("sha256", Buffer.from(key, "hex")).update(`3|${operation}|${callerKey}`).digest("hex");
 }

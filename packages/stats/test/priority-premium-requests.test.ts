@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { getAgentDir, getSessionsDir, getStatsDbPath, setAgentDir, TempDir } from "@gajae-code/utils";
 import { syncAllSessions } from "../src/aggregator";
 import { closeDb, getOverallStats, getRecentRequests } from "../src/db";
-import { parseSessionFile } from "../src/parser";
+import { getSessionEntry, parseSessionFile } from "../src/parser";
 
 const originalConfigDir = process.env.PI_CONFIG_DIR;
 const originalAgentDir = getAgentDir();
@@ -78,6 +78,107 @@ function assistantEntry(opts: {
 }
 
 describe("priority service-tier premium-request backfill", () => {
+	it("skips malformed metadata between valid rows and advances incremental offsets", async () => {
+		const valid = assistantEntry({ id: "before", provider: "openai" });
+		const message = valid.message as Record<string, unknown>;
+		const usage = message.usage as Record<string, unknown>;
+		const malformed: unknown[] = [null, 1, "entry", [], { type: "message", id: "null-message", message: null }];
+		for (const key of ["model", "provider", "api"]) {
+			for (const value of [undefined, null, "", " ", 3, {}]) {
+				malformed.push({ ...valid, id: `bad-${key}-${malformed.length}`, message: { ...message, [key]: value } });
+			}
+		}
+		for (const value of [undefined, null, "usage", []]) {
+			malformed.push({ ...valid, id: `bad-usage-${malformed.length}`, message: { ...message, usage: value } });
+		}
+		for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) {
+			for (const value of [undefined, null, "1", -1, Infinity]) {
+				malformed.push({
+					...valid,
+					id: `bad-${key}-${malformed.length}`,
+					message: { ...message, usage: { ...usage, [key]: value } },
+				});
+			}
+		}
+		for (const value of [undefined, null, "1", -1, Infinity]) {
+			malformed.push({ ...valid, id: `bad-time-${malformed.length}`, message: { ...message, timestamp: value } });
+		}
+		const file = await writeSession("--tmp--proj", "metadata.jsonl", { lines: [valid] });
+		const first = await parseSessionFile(file);
+		const after = assistantEntry({ id: "after", provider: "openai" });
+		await fs.appendFile(file, `${[...malformed, after].map(value => JSON.stringify(value)).join("\n")}\n`);
+		const incremental = await parseSessionFile(file, first.newOffset);
+		expect(first.stats.map(row => row.entryId)).toEqual(["before"]);
+		expect(incremental.stats.map(row => row.entryId)).toEqual(["after"]);
+		expect((await Bun.file(file).text()).slice(incremental.newOffset)).toBe("\n");
+		expect((await parseSessionFile(file, incremental.newOffset)).stats).toEqual([]);
+		await fs.appendFile(file, `${JSON.stringify({ ...after, id: "last" })}\n`);
+		const last = await parseSessionFile(file, incremental.newOffset);
+		expect(last.stats.map(row => row.entryId)).toEqual(["last"]);
+		expect(await getSessionEntry(file, "after")).toEqual(after);
+		expect(await getSessionEntry(file, "last")).toEqual({ ...after, id: "last" });
+		expect(await getSessionEntry(file, "absent")).toBeNull();
+		await syncAllSessions();
+		expect(
+			getRecentRequests()
+				.map(row => row.entryId)
+				.sort(),
+		).toEqual(["after", "before", "last"]);
+	});
+
+	it("preserves fractional metadata and unknown identities while normalizing optional fields", async () => {
+		const entry = assistantEntry({ id: "fractional", provider: "unknown-provider", premiumRequests: 0.5 });
+		const message = entry.message as Record<string, unknown>;
+		const usage = message.usage as Record<string, unknown>;
+		message.model = "unknown-model";
+		message.duration = "invalid";
+		message.ttft = -1;
+		message.errorMessage = {};
+		message.stopReason = null;
+		usage.input = 0.5;
+		usage.output = 0;
+		usage.totalTokens = 0.5;
+		const entries = [entry];
+		for (const premiumRequests of [null, "1", -1, Infinity]) {
+			entries.push({
+				...entry,
+				id: `optional-${entries.length}`,
+				message: { ...message, usage: { ...usage, premiumRequests } },
+			});
+		}
+		await writeSession("--tmp--proj", "optional.jsonl", { lines: entries });
+		await syncAllSessions();
+		const requests = getRecentRequests();
+		expect(requests).toHaveLength(5);
+		for (const row of requests) {
+			expect(row.model).toBe("unknown-model");
+			expect(row.provider).toBe("unknown-provider");
+			expect(row.duration).toBeNull();
+			expect(row.ttft).toBeNull();
+			expect(row.errorMessage).toBeNull();
+			expect(row.stopReason).toBe("unknown");
+			expect(row.usage.input).toBe(0.5);
+			expect(row.usage.output).toBe(0);
+			expect(row.usage.totalTokens).toBe(0.5);
+			expect(row.usage.premiumRequests).toBe(row.entryId === "fractional" ? 0.5 : 0);
+		}
+	});
+
+	it("retains fractional optional metrics and derives priority premium requests from invalid metadata", async () => {
+		const entry = assistantEntry({ id: "priority-invalid", provider: "openai" });
+		const message = entry.message as Record<string, unknown>;
+		message.duration = 0.5;
+		message.ttft = 0.25;
+		(message.usage as Record<string, unknown>).premiumRequests = "invalid";
+		await writeSession("--tmp--proj", "priority-invalid.jsonl", {
+			lines: [{ type: "service_tier_change", serviceTier: "priority" }, entry],
+		});
+		await syncAllSessions();
+		const request = getRecentRequests(1)[0];
+		expect(request.duration).toBe(0.5);
+		expect(request.ttft).toBe(0.25);
+		expect(request.usage.premiumRequests).toBeGreaterThan(0);
+	});
 	it("preserves assistant messages that omit stopReason", async () => {
 		await writeSession("--tmp--proj", "missing-stop-reason.jsonl", {
 			lines: [

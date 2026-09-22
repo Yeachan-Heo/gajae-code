@@ -43,6 +43,11 @@ import {
 import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
+import {
+	BrokerWorkflowGateEmitter,
+	FileGateStore,
+	MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -484,7 +489,10 @@ async function createSdkControlServer(
 							const sessionId = input.sessionId;
 							const index = brokerSessions.findIndex(session => session.sessionId === sessionId);
 							if (index >= 0) brokerSessions.splice(index, 1);
-							return { ok: true, result: { sessionId } };
+							return {
+								ok: true,
+								result: { sessionId, ...(input.forceRetireStale === true ? { retired: true } : {}) },
+							};
 						}
 						if (operation === "session.create") {
 							const target = input.target as Record<string, unknown> | undefined;
@@ -2531,6 +2539,37 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(queries).toEqual([]);
 	});
 
+	it("surfaces distinct spawn causes instead of collapsing them to a bare spawn_failed", async () => {
+		const root = await tempRoot();
+		const causes = [
+			"Unable to spawn session: spawn ENOENT (binary not found)",
+			"Session created-session-1 exited before registering readiness. (exit=23)",
+		];
+		for (const [index, cause] of causes.entries()) {
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+				globalResult: operation =>
+					operation === "session.create"
+						? { ok: false, error: { code: "spawn_failed", message: cause } }
+						: undefined,
+			});
+			await expect(
+				server.callTool("gjc_coordinator_start_session", {
+					cwd: root,
+					idempotency_key: `spawn-cause-${index}`,
+					allow_mutation: true,
+				}),
+			).resolves.toEqual({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: `Session host could not be spawned. Cause: ${cause}`,
+					diagnostic: cause,
+				},
+			});
+		}
+	});
+
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3392,6 +3431,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 	});
 
+	it("closes the advertised answer schema against a sibling property map, not against its branches", () => {
+		// `additionalProperties: false` is evaluated against the node that declares it.
+		// With no sibling `properties`, EVERY answer field is "additional" and a compliant
+		// client validator rejects selection, custom-answer, and clarification payloads
+		// before the server is ever called (#5801).
+		const schema = buildCoordinatorAskAnswerSchema(["opt_0", "opt_1"], true, true) as {
+			additionalProperties?: boolean;
+			properties?: Record<string, unknown>;
+			oneOf: Array<{ properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }>;
+		};
+		expect(schema.additionalProperties).toBe(false);
+		const outer = new Set(Object.keys(schema.properties ?? {}));
+		expect(outer.size).toBeGreaterThan(0);
+		const branchFields = new Set<string>();
+		for (const branch of schema.oneOf) {
+			// Each branch stays closed, so the union is still narrower than the outer map.
+			expect(branch.additionalProperties).toBe(false);
+			for (const field of Object.keys(branch.properties ?? {})) branchFields.add(field);
+			for (const field of branch.required ?? []) branchFields.add(field);
+		}
+		// Any field a branch can require or accept must survive the outer closure.
+		for (const field of branchFields) expect([field, outer.has(field)]).toEqual([field, true]);
+		// The three documented answer shapes must clear the outer closure.
+		const payloads: Array<Record<string, unknown>> = [
+			{ selected: ["opt_0"] },
+			{ selected: [], other: true, custom: "Refine the plan only; do not execute." },
+			{ action: "clarify", question: "Does option 1 include execution?" },
+		];
+		for (const payload of payloads) {
+			const rejected = Object.keys(payload).filter(field => !outer.has(field));
+			expect(rejected).toEqual([]);
+		}
+	});
+
 	it("accepts the advertised explicit other:false answer form", () => {
 		const codec: PrivateAskGateCodecV1 = {
 			schema_version: 1,
@@ -4112,6 +4185,128 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
 		).resolves.toMatchObject({
 			turn: { status: "active" },
+		});
+	});
+
+	it("ignores accepted Q12 diagnostics during coordinator reconciliation", async () => {
+		const root = await tempRoot();
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [
+								{
+									...sharedAskGate("accepted-q12", runtimeTurnId, "ralplan", "approval"),
+									id: "diagnostic:accepted-q12",
+									tag: "accepted" as const,
+									answer_recorded: true as const,
+									resolved_at: GATE_RESOLVED_AT,
+									post_accept_disposition: "advanced" as const,
+								},
+							],
+							complete: true,
+							revision: "accepted-diagnostic",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "ignore accepted diagnostic",
+			idempotency_key: "accepted-diagnostic-prompt",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-diagnostic", reason: null },
+		});
+	});
+
+	it("bounds accepted Q12 diagnostics so reconciliation stays complete", async () => {
+		const root = await tempRoot();
+		const emitter = new BrokerWorkflowGateEmitter(
+			"visible-session",
+			new FileGateStore(path.join(root, ".gjc", "state", "workflow-gates.json")),
+		);
+		const acceptedGateIds: string[] = [];
+		for (let index = 0; index < MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS + 1; index++) {
+			const continuation = emitter.emitGate({
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			});
+			const pending = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+			if (!pending) throw new Error("Q12 did not expose the pending gate");
+			emitter.prepareTerminalization!(pending.gate_id, "not_published");
+			await emitter.resolveGate!({
+				gate_id: pending.gate_id,
+				answer: "approve",
+				idempotency_key: `accepted-q12-bound-${index}`,
+			});
+			await expect(continuation).resolves.toBe("approve");
+			acceptedGateIds.push(pending.gate_id);
+		}
+
+		const accepted = emitter.listWorkflowGateQueryRecords!().filter(record => record.tag === "accepted");
+		expect(accepted).toHaveLength(MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS);
+		expect(accepted.map(record => record.gate_id)).toEqual(
+			acceptedGateIds.slice(-MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS).reverse(),
+		);
+
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: emitter.listWorkflowGateQueryRecords!(),
+							complete: true,
+							revision: "accepted-q12-bound",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "reconcile bounded accepted diagnostics",
+			idempotency_key: "accepted-q12-bound-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-q12-bound", reason: null },
 		});
 	});
 
@@ -7564,6 +7759,248 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 		expect(await Bun.file(idleFile).exists()).toBe(false);
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
+	});
+
+	async function stageDeadHostSession(
+		root: string,
+		sessionId: string,
+		options: {
+			globalResult?: (
+				operation: string,
+				input: Record<string, unknown>,
+				brokerSessions: Array<Record<string, unknown>>,
+			) => unknown;
+		} = {},
+	) {
+		const controls: SdkControl[] = [];
+		const brokerSessions: Array<Record<string, unknown>> = [
+			{
+				sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				lastHeartbeatAt: Date.now(),
+				endpointGeneration: 1,
+				pid: 404,
+				endpointMtimeMs: 2,
+			},
+		];
+		// Every close attempt reaches the broker, which answers endpoint_stale instead of
+		// closing — what the broker does for an identity-matching row with no live host.
+		const server = await createSdkControlServer(root, controls, [], undefined, brokerSessions, undefined, undefined, {
+			globalResult: (operation, input, sessions) => {
+				const override = options.globalResult?.(operation, input, sessions);
+				if (override !== undefined) return override;
+				return operation === "session.close" && input.sessionId === sessionId
+					? input.forceRetireStale === true
+						? { ok: true, result: { sessionId, retired: true } }
+						: { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
+					: undefined;
+			},
+		});
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: sessionId,
+				cwd: root,
+				idempotency_key: `register-${sessionId}`,
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const sessionFile = path.join(coordinatorNamespace(root), "sessions", `${sessionId}.json`);
+		const staleAt = new Date(Date.now() - 31 * 60_000).toISOString();
+		const record = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...record, ephemeral: true, created_at: staleAt }));
+		await withSessionTransaction(paths, sessionId, async transaction => {
+			const nextRevision = transaction.revision + 1;
+			transaction.canonical.session.ephemeral = true;
+			transaction.canonical.session.created_at = staleAt;
+			transaction.canonical.session.updated_at = staleAt;
+			transaction.projection.applied_turns_revision = nextRevision;
+			transaction.projection.applied_reports_revision = nextRevision;
+			transaction.projection.applied_session_revision = nextRevision;
+			transaction.projection.applied_active_revision = nextRevision;
+			transaction.projection.applied_events_revision = nextRevision;
+		});
+		const closeAttempts = () =>
+			controls.filter(
+				control =>
+					control.operation === "session.close" &&
+					(control.input as { sessionId?: string }).sessionId === sessionId,
+			).length;
+		const deletions = async () =>
+			Object.values(
+				(
+					(await withNamespaceRegistry(paths, async registry => JSON.parse(JSON.stringify(registry)))) as {
+						deletions?: Record<string, { deletion_id: string; session_id: string; phase: string }>;
+					}
+				).deletions ?? {},
+			).filter(entry => entry.session_id === sessionId);
+		return { server, brokerSessions, paths, sessionFile, closeAttempts, deletions };
+	}
+
+	it("force-evicts an idle session whose host is gone while the broker still indexes its unchanged endpoint identity", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"dead-host-session",
+		);
+		const walIncarnation = (await readSessionTransaction(paths, "dead-host-session"))?.endpoint?.incarnation;
+		expect(walIncarnation).toMatch(/^[a-f0-9]{64}$/);
+		// The broker keeps the row with the same generation and incarnation but reports no
+		// host behind it and has not heard from one for far longer than its freshness window.
+		// Before the fix each reap surfaced as close_failed, the reaper treated it as
+		// transient, and the session was retried forever without reaching force eviction.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// One normal close per sweep plus the final atomic stale-authority fence.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "dead-host-session")).toBeNull();
+		await expect(Bun.file(transactionPath(paths, "dead-host-session")).exists()).resolves.toBe(false);
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		const recorded = await deletions();
+		expect(recorded).toContainEqual(
+			expect.objectContaining({
+				deletion_id: `force-evict:dead-host-session:${walIncarnation}`,
+				phase: "completed",
+			}),
+		);
+		// The first reap admitted its own delete intent before the broker answered
+		// endpoint_stale. It stays on record, but the completed force-evict record
+		// supersedes it, so a later stop reports the session closed instead of retrying
+		// the dead endpoint forever.
+		expect(recorded.filter(entry => entry.phase !== "completed")).toEqual([
+			expect.objectContaining({ deletion_id: expect.stringMatching(/^delete:dead-host-session:/), phase: "intent" }),
+		]);
+		await expect(
+			server.callTool("gjc_coordinator_stop_session", { session_id: "dead-host-session", allow_mutation: true }),
+		).resolves.toMatchObject({ ok: true, closed: true });
+	});
+
+	it("never force-evicts a session whose broker row is still live even when every close answers endpoint_stale", async () => {
+		const root = await tempRoot();
+		const { server, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+			root,
+			"live-host-session",
+		);
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		// Every sweep reached the broker, so the eviction threshold was crossed and refused.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "live-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).map(entry => entry.phase)).toEqual(["intent"]);
+	});
+
+	it("does not force-evict a not-live broker row whose host went silent only recently", async () => {
+		const root = await tempRoot();
+		const { server, brokerSessions, paths, sessionFile, closeAttempts } = await stageDeadHostSession(
+			root,
+			"quiet-host-session",
+		);
+		// Past the broker's two-interval freshness window, so the row already reads not
+		// live, but nowhere near long enough to rule out a host that is about to resume.
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 3 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+		expect(await readSessionTransaction(paths, "quiet-host-session")).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+	});
+
+	it("does not force-evict unresolved broker authority rows", async () => {
+		for (const flag of ["ambiguous", "terminalUncertain"] as const) {
+			const root = await tempRoot();
+			const sessionId = `unresolved-${flag}`;
+			const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+				root,
+				sessionId,
+			);
+			brokerSessions[0]!.live = false;
+			brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+			brokerSessions[0]![flag] = true;
+
+			for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+				expect(await server.sessionReaper.sweepOnce()).toBe(0);
+			}
+
+			expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+			expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+			await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+			expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+				[],
+			);
+		}
+	});
+
+	it("refuses cleanup when the broker authority recovers before the atomic fence", async () => {
+		const root = await tempRoot();
+		const sessionId = "recovered-before-fence";
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId || input.forceRetireStale !== true)
+					return undefined;
+				sessions[0]!.live = true;
+				sessions[0]!.lastHeartbeatAt = Date.now();
+				return { ok: false, error: { code: "endpoint_stale", message: "authority recovered before fence" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+			[],
+		);
+	});
+
+	it("escalates a close-time not_found race to bounded stale eviction", async () => {
+		const root = await tempRoot();
+		const sessionId = "close-not-found-race";
+		let closeRace = true;
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId) return undefined;
+				if (input.forceRetireStale === true)
+					return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+				if (closeRace) {
+					closeRace = false;
+					sessions.splice(0, 1);
+				}
+				return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		expect(await deletions()).toContainEqual(
+			expect.objectContaining({
+				deletion_id: expect.stringMatching(/^force-evict:close-not-found-race:/),
+				phase: "completed",
+			}),
+		);
 	});
 
 	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {

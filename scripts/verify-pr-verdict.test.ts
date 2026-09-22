@@ -1982,6 +1982,7 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		[".github/actions/build-native/action.yml\tinputs.hash", "hex digest computed in-workflow; ci.yml is the only caller"],
 		[".github/actions/build-native/action.yml\tinputs.nightly_version", "same generated version; ci.yml is the only caller"],
 		[".github/workflows/ci.yml\tgithub.ref", "ref name; writing one requires push access to this protected path"],
+		[".github/workflows/ci.yml\tgithub.run_id", "integer assigned by GitHub"],
 		[".github/workflows/ci.yml\tgithub.sha", "40-hex, server-computed"],
 		[".github/workflows/ci.yml\tmatrix.binary_path", "workflow-fixed matrix literal"],
 		[".github/workflows/ci.yml\tneeds.acp_conformance.result", "closed result enum"],
@@ -2187,6 +2188,41 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	expect(inspected).toBeGreaterThan(0);
 });
 
+// GitHub expands `${{ ... }}` into the run scalar BEFORE any interpreter sees it, so a
+// parser handed the raw body is not reading the program that runs. PowerShell in
+// particular reads `${{` as a braced variable name and reports "Use `{ instead of { in
+// variable names" for every expression-bearing step -- a diagnostic about a body that
+// never exists at runtime. Substitute expressions with a benign literal first, which is
+// what the runner effectively does. Nesting rule matches the justification guard: `{`
+// appears inside an expression only within a single-quoted literal.
+const substituteWorkflowExpressions = (scalar: string, replacement = "EXPR"): string => {
+	let out = "";
+	let at = 0;
+	while (at < scalar.length) {
+		const open = scalar.indexOf("${{", at);
+		if (open === -1) return out + scalar.slice(at);
+		out += scalar.slice(at, open);
+		let cursor = open + 3;
+		let quoted = false;
+		let end = -1;
+		while (cursor < scalar.length) {
+			const character = scalar[cursor];
+			if (character === "'") quoted = !quoted;
+			else if (!quoted && character === "}" && scalar[cursor + 1] === "}") {
+				end = cursor;
+				break;
+			}
+			cursor++;
+		}
+		// An unterminated expression is left verbatim: the parser should see the broken
+		// text rather than have this helper quietly repair it.
+		if (end === -1) return out + scalar.slice(open);
+		out += replacement;
+		at = end + 2;
+	}
+	return out;
+};
+
 // Parse a PowerShell body with PowerShell's own AST parser, without executing it.
 // Returns "" when clean, or the parser's diagnostics. Mirrors the established pattern
 // in scripts/install-tests/install-ps1-compat.test.ts.
@@ -2326,13 +2362,32 @@ test("every run scalar is checked by the interpreter that will actually run it (
 		return;
 	}
 	for (const candidate of powershell) {
-		const diagnostics = await parsePowerShell(pwshPath, candidate.body);
+		const diagnostics = await parsePowerShell(pwshPath, substituteWorkflowExpressions(candidate.body));
 		expect({ file: candidate.file, step: candidate.step, diagnostics }).toEqual({
 			file: candidate.file,
 			step: candidate.step,
 			diagnostics: "",
 		});
 	}
+	// Each body costs one pwsh start, and the runner needs roughly a second apiece, so
+	// the default 5s budget expires mid-sweep. bun then SIGTERMs the child and the test
+	// reports the kill as a PARSER VERDICT -- `PowerShell parser exited 143` against a
+	// workflow step that is perfectly valid. Every PR whose affected shard covers this
+	// file went red on that, so the budget is explicit and sized for the sweep.
+}, 180_000);
+
+test("workflow expressions are substituted before an interpreter parses the body", () => {
+	// Raw `${{ }}` made PowerShell report "Use `{ instead of { in variable names" for a
+	// perfectly valid step, because the runner had already replaced the expression by the
+	// time pwsh ran. That diagnostic was invisible while the sweep was still timing out.
+	expect(substituteWorkflowExpressions('--version "${{ needs.meta.outputs.v }}"')).toBe('--version "EXPR"');
+	expect(substituteWorkflowExpressions("a ${{ x }} b ${{ y }} c")).toBe("a EXPR b EXPR c");
+	// A brace inside a single-quoted literal belongs to the expression, not to its end.
+	expect(substituteWorkflowExpressions("${{ hashFiles('**/{a,b}.lock') }}")).toBe("EXPR");
+	// Nothing to substitute must change nothing at all.
+	expect(substituteWorkflowExpressions("echo ${VAR} $env:PATH")).toBe("echo ${VAR} $env:PATH");
+	// An unterminated expression is handed over verbatim rather than silently repaired.
+	expect(substituteWorkflowExpressions("echo ${{ broken")).toBe("echo ${{ broken");
 });
 
 test("the PowerShell parse helper surfaces diagnostics rather than swallowing them (#5740 review)", async () => {
@@ -2360,8 +2415,15 @@ test("the PowerShell parse helper surfaces diagnostics rather than swallowing th
 	const silent = await write("silent", "#!/bin/sh\nexit 7\n");
 	expect(await parsePowerShell(silent, "whatever")).toBe("PowerShell parser exited 7");
 
-	// And the body must actually reach the parser as a file it can read.
-	const echoes = await write("echoes", "#!/bin/sh\nsed -n '2p' \"$(ls -t \"${TMPDIR:-/tmp}\"/gjc-pwsh-parse-*/step.ps1 | head -1)\"\nexit 1\n");
+	// And the body must actually reach the parser as a file it can read. The stub takes
+	// the path out of the command it was handed, the way the real parser does. Picking
+	// the newest `gjc-pwsh-parse-*` directory instead made this assertion depend on every
+	// other run sharing the machine's temp dir, and it failed against a sibling run's
+	// leftovers rather than against anything this test did.
+	const echoes = await write(
+		"echoes",
+		"#!/bin/sh\nsed -n '2p' \"$(printf '%s' \"$3\" | sed -n \"s/.*ParseFile('\\\\([^']*\\\\)'.*/\\\\1/p\")\"\nexit 1\n",
+	);
 	expect(await parsePowerShell(echoes, "line one\nline two")).toBe("line two");
 	await fs.rm(directory, { recursive: true, force: true });
 });

@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -1962,6 +1961,12 @@ export interface NativeExactFileIdentity {
    * hard links. Remaining links are retained after exact quarantine cleanup.
    */
   allowHardLink?: boolean
+  /**
+   * Require the authorized regular file to retain at least two hard links at
+   * every identity check. This is used by cleanup paths that remove only a
+   * surplus alias while preserving the live transcript link.
+   */
+  requireHardLink?: boolean
 }
 
 /** Typed result of an identity-bound regular-file deletion or directory detach. */

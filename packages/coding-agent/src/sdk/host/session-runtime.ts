@@ -64,6 +64,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
@@ -97,7 +98,12 @@ import {
 	BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD,
 	hasBrokerRuntimeAbortCapability,
 } from "./control/runtime-gate";
-import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
+import {
+	SESSION_HOST_OBSERVER_CAPABILITY,
+	SessionSdkHost,
+	type SessionSdkHostOptions,
+	TURN_STREAM_CAPABILITY,
+} from "./host";
 import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import { createSdkRunCapability } from "./sdk-run-capability";
@@ -395,6 +401,9 @@ export interface SdkOnlyTerminalAbortSeams {
 export class SessionSdkSessionRuntime {
 	readonly host: SessionSdkHost;
 	readonly transport: SessionSdkTransport;
+	readonly #connectionCapabilities = new Map<string, ReadonlySet<string>>();
+	readonly #connectionIds = new Set<string>();
+	readonly #connectionCapabilitiesProvider: (connectionId: string) => ReadonlySet<string> | undefined;
 	readonly #connectionDisposer?: () => void;
 	readonly #malformedDisposer?: () => void;
 	readonly #capabilitiesDisposer?: () => void;
@@ -403,10 +412,11 @@ export class SessionSdkSessionRuntime {
 
 	constructor(options: SessionSdkRuntimeOptions) {
 		this.transport = options.transport;
-		const capabilities = new Map<string, ReadonlySet<string>>();
+		this.#connectionCapabilitiesProvider =
+			options.connectionCapabilities ?? (connectionId => this.#connectionCapabilities.get(connectionId));
 		this.host = new SessionSdkHost({
 			...options,
-			connectionCapabilities: options.connectionCapabilities ?? (connectionId => capabilities.get(connectionId)),
+			connectionCapabilities: this.#connectionCapabilitiesProvider,
 			sessionId: options.transport.sessionId,
 			stateRoot: options.transport.stateRoot,
 			token: options.transport.token,
@@ -415,14 +425,20 @@ export class SessionSdkSessionRuntime {
 				if (result instanceof Promise) return result.then(outcome => outcome ?? "written");
 				return result ?? "written";
 			},
-			onFrame: options.transport.onFrame,
+			onFrame: handler =>
+				options.transport.onFrame((connectionId, frame) => {
+					this.#connectionIds.add(connectionId);
+					handler(connectionId, frame);
+				}),
 		});
 		this.#connectionDisposer = options.transport.onConnectionClose?.(connectionId => {
-			capabilities.delete(connectionId);
+			this.#connectionIds.delete(connectionId);
+			this.#connectionCapabilities.delete(connectionId);
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
-			capabilities.set(connectionId, new Set(negotiated));
+			this.#connectionIds.add(connectionId);
+			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
 		});
 		this.#malformedDisposer = options.transport.onMalformedFrame?.((connectionId, message) => {
 			this.host.handleMalformedFrame(connectionId, message);
@@ -472,6 +488,28 @@ export class SessionSdkSessionRuntime {
 			if (result instanceof Promise) result.catch(() => undefined);
 		} catch {
 			// A dead connection is reaped by the transport's own close handling.
+		}
+	}
+
+	/** Snapshot connections that negotiated every capability in the requirement set. */
+	connectionIdsWithCapabilities(required: readonly string[]): string[] {
+		return [...this.#connectionIds].flatMap(connectionId => {
+			const capabilities = this.#connectionCapabilitiesProvider(connectionId);
+			return capabilities !== undefined && required.every(capability => capabilities.has(capability))
+				? [connectionId]
+				: [];
+		});
+	}
+
+	/** Deliver a non-replayable frame to connections with an explicit capability intersection. */
+	sendFrameToCapabilities(
+		required: readonly string[],
+		frame: SdkFrame,
+		excluding: ReadonlySet<string> = new Set(),
+	): void {
+		for (const connectionId of this.connectionIdsWithCapabilities(required)) {
+			if (excluding.has(connectionId)) continue;
+			this.sendFrameTo(connectionId, frame);
 		}
 	}
 
@@ -1980,6 +2018,7 @@ function createQuerySurface(
 					...gate,
 					id: `pending:${gate.gate_id}`,
 					tag: "pending" as const,
+					answer_recorded: false as const,
 				})) ??
 				[]
 			);
@@ -4508,8 +4547,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	): void => {
 		try {
 			const payload = toAgentWireEventPayload(event);
+			const delivered = new Set<string>();
 			for (const invocation of invocations) {
 				if (invocation.connectionId === undefined) continue;
+				delivered.add(invocation.connectionId);
 				current.runtime.sendFrameTo(invocation.connectionId, {
 					type: "event",
 					kind: event.type,
@@ -4517,6 +4558,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					...invocation.correlation,
 				});
 			}
+			// A relay or dashboard can observe a turn submitted by another client. It
+			// explicitly negotiates both the stream and observer capabilities, so give it
+			// the same live content frames without inventing a submitter correlation.
+			current.runtime.sendFrameToCapabilities(
+				[TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY],
+				{ type: "event", kind: event.type, payload },
+				delivered,
+			);
 		} catch {
 			// Streamed content is best-effort; the turn producing it is authoritative.
 		}
@@ -5268,10 +5317,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * the session and see the turn settle but never receive a single word of the
 	 * answer.
 	 *
-	 * Scoped to the owning invocations of the batch that is actually running: a
-	 * turn nobody submitted over the SDK (an ordinary terminal prompt, an
-	 * autonomous continuation, cron, monitor) has no owner connection and streams
-	 * nothing at all, so a session with no attached client pays one map lookup.
+	 * Correlated content is scoped to the owning invocations of the batch that is
+	 * actually running. Explicit observer connections additionally receive the
+	 * uncorrelated copy, including for agent-owned runs with no SDK submitter.
+	 * A session with no owner or eligible observer pays one capability-map lookup.
 	 */
 	const STREAMED_TURN_EVENT_TYPES: ReadonlySet<string> = new Set([
 		"message_update",
@@ -5284,6 +5333,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const current = lifecycleStateForContext(ctx, "agent_start");
 		const activeInvocation = current?.activeInvocation;
 		if (!current) return;
+		const observerConnections = current.runtime.connectionIdsWithCapabilities([
+			TURN_STREAM_CAPABILITY,
+			SESSION_HOST_OBSERVER_CAPABILITY,
+		]);
 		const batch = activeInvocation
 			? current.openLifecycleBatches.find(candidate =>
 					candidate.invocations.some(
@@ -5298,7 +5351,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			: current.lifecycleActive
 				? (current.attachedInvocations ?? [])
 				: [];
-		if (invocations.length === 0) return;
+		if (invocations.length === 0 && observerConnections.length === 0) return;
 		// Content bypasses the lifecycle replay ring and must never interrupt its producer.
 		if (!event || typeof event.type !== "string" || !STREAMED_TURN_EVENT_TYPES.has(event.type)) return;
 		// emitLifecycle("agent_start") awaits durable persistence before it
@@ -5371,6 +5424,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
 			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
+			// Persist the agent's uncommitted work before the retirement below tears
+			// the session down (#5583). Best effort by contract: failures are logged
+			// inside the flush and the deadline outcome is unaffected.
+			onDeadlineExceeded: async (_correlation, signal, isCurrent) => {
+				if (options.settings?.get("sdk.flushWorktreeOnDeadline" as never) === false) return;
+				// `has` is true only for a value the user actually wrote, so this
+				// separates an explicit opt-in from the schema default. The flush only
+				// honours the default inside a linked worktree the session owns.
+				const configured = options.settings?.get("sdk.flushWorktreeOnDeadline" as never);
+				const hasExplicitSetting =
+					typeof options.settings?.has === "function"
+						? options.settings.has("sdk.flushWorktreeOnDeadline" as never)
+						: configured === true;
+				const explicitOptIn = hasExplicitSetting === true && configured === true;
+				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, isCurrent, signal });
+			},
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (deadlineOutcome === undefined) {
@@ -6263,6 +6332,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			failureDiagnosticCodes: new Map(),
 			lifecycleTasks: new Set(),
 		};
+		// Capture the SDK turn that owns a headless workflow gate before it is
+		// persisted. Q12 can then explain both sides of a stalled turn: the gate
+		// identity and whether an answer was recorded for that originating turn.
+		ctx.workflowGate?.setRuntimeTurnProvider?.(() => active?.activeInvocation?.correlation.turnId);
 		lifecycleOwnerHolder.state = runtimeOwner;
 		active = runtimeOwner;
 		try {

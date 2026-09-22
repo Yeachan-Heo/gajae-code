@@ -9,7 +9,7 @@ credentials, and raw session transports remain inside SDK core; see
 
 | Surface | Entrypoint | Use it when |
 | --- | --- | --- |
-| SDK session CLI | `gjc sdk session list|inspect|send|status|tail` or `raw control|query|global` | A local script needs bounded, credential-free session operations. |
+| SDK session CLI | `gjc sdk session list|inspect|send|status|tail|close|retire` or `raw control|query|global` | A local script needs bounded, credential-free session operations. |
 | Coordinator MCP | `gjc mcp-serve coordinator` | A controller needs multi-session orchestration, durable reports, or worktree-scoped lifecycle operations. |
 | Managed adapter | Configured Telegram, Discord, or Slack integration | A provider renders session presentation through opaque Router attachments. |
 | ACP | `gjc --mode acp` or `gjc acp` | An editor or ACP-compatible client supplies the session frontend. |
