@@ -56,7 +56,16 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"timeout-ms",
 	],
 	"sdk session status": ["agent-dir", "timeout-ms"],
-	"sdk session tail": ["agent-dir", "repo", "cursor", "strict", "until-idle", "all-events", "timeout-ms"],
+	"sdk session tail": [
+		"agent-dir",
+		"repo",
+		"cursor",
+		"after-transcript-id",
+		"strict",
+		"until-idle",
+		"all-events",
+		"timeout-ms",
+	],
 	"sdk session retire": ["agent-dir", "json-input", "json-input-file", "json-input-stdin", "idempotency-key"],
 	"sdk session raw": [],
 	"sdk session raw control": [

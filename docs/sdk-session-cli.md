@@ -194,6 +194,11 @@ transcript entries.
   verifies the unexpired claim and exchanges it for a fresh connection-owned
   cursor pinned to the exact prior revision; direct cross-connection cursor
   consumption remains rejected, so reconnect never echoes or rewinds a cursor.
+- `--after-transcript-id` selects the caller's last observed transcript row;
+  live resumes require it alongside `--cursor`, while offline tails may use the
+  boundary directly. The boundary is recoverable: an unknown row leaves the
+  retained snapshot intact, while a boundary older than the retained window
+  fails closed with a retention gap.
 - `--timeout-ms` bounds live follow; a session whose lifecycle already ended
   (terminal or `terminalUncertain`) replays retained history and exits instead
   of hanging.

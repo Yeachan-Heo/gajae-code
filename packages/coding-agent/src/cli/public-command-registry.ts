@@ -334,6 +334,9 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 			...sessionFlags,
 			repo,
 			cursor: stringFlag("Saved checkpoint token for continuation."),
+			"after-transcript-id": stringFlag(
+				"Transcript row boundary for resumed tails; omit rows through this id when --cursor is supplied.",
+			),
 			strict: booleanFlag("Fail closed on retention gaps."),
 			"until-idle": booleanFlag("Exit after an observed terminal turn state."),
 			"all-events": booleanFlag("Include every event-ring kind."),

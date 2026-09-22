@@ -1166,6 +1166,7 @@ export default class Sdk extends Command {
 					confirm: Boolean(flags.confirm),
 					idempotencyKey: stringFlag("idempotency-key"),
 					cursor: stringFlag("cursor"),
+					afterTranscriptId: stringFlag("after-transcript-id"),
 					wait: Boolean(flags.wait),
 					timeoutMs,
 					strict: Boolean(flags.strict),

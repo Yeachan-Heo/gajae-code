@@ -1993,7 +1993,7 @@ describe("SDK session CLI", () => {
 		expect(result.exitCode, result.stderr).toBe(1);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: false,
-			error: { code: "retention_gap", details: { reason: "boundary_out_of_window" } },
+			error: { code: "operation_failed", category: "operation" },
 		});
 	}, 60_000);
 	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {

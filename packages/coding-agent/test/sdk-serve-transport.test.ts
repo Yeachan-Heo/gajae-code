@@ -2398,6 +2398,14 @@ describe("SDK serve CLI and discovery", () => {
 				),
 			);
 			await waitFor(() => upstreamServer.connections[0], "stdio relay upstream");
+			// The upstream fixture announces the relay connection immediately after
+			// accepting it. Consume that protocol hello before asserting the later
+			// application frame and teardown diagnostic channels.
+			await waitFor(
+				() => (stdoutChunks.join("").includes('{"type":"hello","connectionId":"fixture"}') ? true : undefined),
+				"stdio relay hello",
+			);
+			stdoutChunks.length = 0;
 			const frame = '{"type":"relay","ok":true}';
 			upstreamServer.connections[0]!.ws.send(frame);
 			await waitFor(() => (stdoutChunks.length ? stdoutChunks.join("") : undefined), "stdio relay frame");
