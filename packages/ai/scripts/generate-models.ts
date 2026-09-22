@@ -74,14 +74,20 @@ function isRetiredBundledModel(model: Pick<Model, "provider" | "id">): boolean {
 }
 
 /**
- * Keep the reviewed GPT-6 Astra Codex row available without authenticated
- * discovery. The values mirror OpenAI Codex 0.153.4's bundled model catalog;
- * generated policies apply the public API pricing and freeform tool metadata.
+ * Keep the reviewed GPT-6 Codex rows available without authenticated discovery.
+ * Astra mirrors OpenAI Codex 0.153.4's bundled model catalog; Sol and Luna ship
+ * with the same Codex transport and envelope, whose 272K prompt budget is the
+ * short-context boundary OpenAI publishes for the whole GPT-6 family
+ * (https://developers.openai.com/api/docs/pricing). Generated policies apply the
+ * public API pricing and freeform tool metadata.
+ *
+ * Only Astra carries `priority: 1`; Sol and Luna stay in default catalog order
+ * so the flagship remains the first Codex suggestion.
  */
-export function injectCodexAstraModel(models: Model[]): void {
-	const astra: Model<"openai-codex-responses"> = {
-		id: "gpt-6-astra",
-		name: "GPT-6-Astra",
+export function injectCodexGpt6Models(models: Model[]): void {
+	const gpt6 = (id: string, name: string, priority?: number): Model<"openai-codex-responses"> => ({
+		id,
+		name,
 		api: "openai-codex-responses",
 		provider: "openai-codex",
 		baseUrl: "https://chatgpt.com/backend-api",
@@ -91,10 +97,17 @@ export function injectCodexAstraModel(models: Model[]): void {
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		preferWebsockets: true,
-		priority: 1,
-	};
-	const hasAstra = models.some(model => model.provider === astra.provider && model.id === astra.id);
-	if (!hasAstra) models.push(astra);
+		...(priority === undefined ? {} : { priority }),
+	});
+	const bundled: Model<"openai-codex-responses">[] = [
+		gpt6("gpt-6-astra", "GPT-6-Astra", 1),
+		gpt6("gpt-6-sol", "GPT-6-Sol"),
+		gpt6("gpt-6-luna", "GPT-6-Luna"),
+	];
+	for (const model of bundled) {
+		const exists = models.some(existing => existing.provider === model.provider && existing.id === model.id);
+		if (!exists) models.push(model);
+	}
 }
 
 /**
@@ -796,7 +809,7 @@ async function generateModels() {
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	allModels = applyClaudeOpusVisionCorrections(allModels);
-	injectCodexAstraModel(allModels);
+	injectCodexGpt6Models(allModels);
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	injectKiroModels(allModels);

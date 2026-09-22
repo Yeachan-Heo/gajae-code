@@ -176,6 +176,44 @@ describe("calculateCost", () => {
 		});
 	});
 
+	it("bundles GPT-6 Sol and Luna standard and long-context pricing", () => {
+		const sol = getBundledModel("openai-codex", "gpt-6-sol");
+		expect(sol.cost).toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
+		expect(sol.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 },
+		});
+
+		const luna = getBundledModel("openai-codex", "gpt-6-luna");
+		expect(luna.cost).toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
+		expect(luna.longContextPricing).toEqual({
+			threshold: 272_000,
+			cost: { input: 0.2, output: 0.75, cacheRead: 0.02, cacheWrite: 0.25 },
+		});
+	});
+
+	it("switches GPT-6 Sol pricing only above 272K input tokens", () => {
+		const model = getBundledModel("openai-codex", "gpt-6-sol");
+		const usage = (cacheWrite: number): Usage => ({
+			input: 200_000,
+			output: 1_000,
+			cacheRead: 72_000,
+			cacheWrite,
+			totalTokens: 273_000 + cacheWrite,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const threshold = usage(0);
+		const aboveThreshold = usage(1);
+
+		calculateCost(model, threshold);
+		calculateCost(model, aboveThreshold);
+
+		// 200K input @ $2 + 1K output @ $10 + 72K cacheRead @ $0.20
+		expect(threshold.cost.total).toBeCloseTo(0.4244, 8);
+		// same request one cache-write token past the threshold, at 2x/1.5x rates
+		expect(aboveThreshold.cost.total).toBeCloseTo(0.843805, 8);
+	});
+
 	it("switches GPT-6 Astra pricing only above 272K input tokens", () => {
 		const model = getBundledModel("openai-codex", "gpt-6-astra");
 		const usage = (cacheWrite: number): Usage => ({

@@ -1,18 +1,18 @@
 import { describe, expect, it } from "bun:test";
 import {
 	injectAlibabaTokenPlanModels,
-	injectCodexAstraModel,
+	injectCodexGpt6Models,
 	injectImageGenerationModels,
 	injectMuseSparkModels,
 } from "../scripts/generate-models";
 import type { Model } from "../src/types";
 
-describe("injectCodexAstraModel", () => {
-	it("adds the reviewed Codex fallback exactly once", () => {
+describe("injectCodexGpt6Models", () => {
+	it("adds the reviewed Codex fallbacks exactly once", () => {
 		const models: Model[] = [];
 
-		injectCodexAstraModel(models);
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
+		injectCodexGpt6Models(models);
 
 		expect(models).toEqual([
 			expect.objectContaining({
@@ -27,7 +27,31 @@ describe("injectCodexAstraModel", () => {
 				preferWebsockets: true,
 				priority: 1,
 			}),
+			expect.objectContaining({
+				id: "gpt-6-sol",
+				name: "GPT-6-Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 272_000,
+				maxTokens: 128_000,
+				preferWebsockets: true,
+			}),
+			expect.objectContaining({
+				id: "gpt-6-luna",
+				name: "GPT-6-Luna",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 272_000,
+				maxTokens: 128_000,
+				preferWebsockets: true,
+			}),
 		]);
+		expect(models.filter(model => model.id === "gpt-6-sol")).toHaveLength(1);
+		expect(models.find(model => model.id === "gpt-6-sol")).not.toHaveProperty("priority");
 	});
 
 	it("preserves authenticated discovery metadata", () => {
@@ -45,9 +69,9 @@ describe("injectCodexAstraModel", () => {
 		};
 		const models: Model[] = [discovered];
 
-		injectCodexAstraModel(models);
+		injectCodexGpt6Models(models);
 
-		expect(models).toEqual([discovered]);
+		expect(models.find(model => model.id === "gpt-6-astra")).toEqual(discovered);
 	});
 });
 
