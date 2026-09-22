@@ -1401,6 +1401,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+
+	test("model-registry changes schedule the availability-split regression suite", () => {
+		const keys = targeted(["packages/coding-agent/src/config/model-registry.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/model-registry-runtime-provider.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/model-profile-activation.test.ts");
+	});
 	test("managed-session-scope changes schedule the owner-only self-heal budget regression", () => {
 		const keys = targeted(["packages/coding-agent/src/session/internal/managed-session-scope.ts"]).map(
 			task => task.key,

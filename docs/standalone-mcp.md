@@ -26,7 +26,29 @@ A server is loaded at startup when all of the following hold:
 - the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server stored but unloaded at startup — flip the flag and start a new session to load it);
 - project-scope servers load by default; setting `mcp.enableProjectConfig` explicitly to `false` in settings disables every project-scope source for that environment.
 
+Conventional discovery logs a structured `Skipping MCP autoload registration`
+diagnostic with the server name and reason when an eligible-looking entry is
+disabled, denylisted, or opted out with `autoload: false`.
+
 Malformed or unparseable definitions are skipped fail-closed: they are never partially loaded, a warning is emitted, and the session continues with the remaining valid servers. A server that fails to connect reports an error entry and the session continues.
+
+Ordinary startup uses a bounded wait for the initial MCP batch. With no positive
+per-server timeouts, the default wait is 250ms. When any registration declares a
+positive `timeout`, the batch wait is the largest declared timeout plus 500ms of
+grace, capped at 1,750ms. An untimed registration is disconnected when that
+effective batch wait expires, so slow stdio or remote servers can be absent from
+the first session even though the registration is valid. `gjc mcp list` reports
+a `startupDiagnostic` for these entries (and the runtime log records the server
+name and timeout reason). Add a per-server window when registering a slow server,
+for example:
+
+```bash
+gjc mcp add <name> --command <cmd> --timeout 10000
+```
+
+With a positive `timeout`, the server continues connecting in the background
+after the bounded batch wait until its declared window ends. The connection
+result and log retain a per-server error if that window is also exhausted.
 
 ### Opt out
 

@@ -69,7 +69,8 @@ type ModelProfileActivationSession = Pick<
 		| "resolveModelByLookupAlias"
 		| "authStorage"
 		| "isCredentiallessProvider"
-	>;
+	> &
+		Partial<Pick<ModelRegistry, "getAvailableForProfileActivation">>;
 	getConfiguredModelChainState?: (role: string) => ConfiguredModelChainState | undefined;
 };
 
@@ -249,7 +250,12 @@ function concretizeMaterializedAssignmentValues(
 	const sessionId = (options.session as { sessionId?: string }).sessionId;
 	const credentialSessionId = options.session.credentialSessionId ?? sessionId;
 	if (!modelRegistry || !sessionId) return assignments;
-	const availableModels = modelRegistry.getAvailable();
+	// Materialized assignments are persisted into `modelRoles` and
+	// `task.agentModelOverrides` and later consumed by profile execution, so they
+	// must resolve against the descriptor-backed profile-activation catalog, not
+	// the broadened general one: otherwise a bare assignment can persist a
+	// bundled model that fresh live profile evidence excludes.
+	const availableModels = modelRegistry.getAvailableForProfileActivation?.() ?? modelRegistry.getAvailable();
 	const authenticatedModels = availableModels.filter(model => {
 		const isCredentiallessProvider = modelRegistry.isCredentiallessProvider?.bind(modelRegistry);
 		const hasUsableAuth = modelRegistry.authStorage?.hasUsableAuth?.bind(modelRegistry.authStorage);
