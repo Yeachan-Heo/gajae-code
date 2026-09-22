@@ -7,6 +7,7 @@ import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import * as bashExecutor from "@gajae-code/coding-agent/exec/bash-executor";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -1524,12 +1525,34 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// use the manager inherited from the parent rather than process-global
 		// session B, or jobs and their async-result delivery cross session trees.
 		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		// Keep manager selection, raw-line dispatch, and cancellation real, but
+		// gate stdout explicitly instead of racing native shell startup on CI.
+		const started = Promise.withResolvers<bashExecutor.BashExecutorOptions>();
+		const stopped = Promise.withResolvers<void>();
+		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			if (!options?.signal) throw new Error("expected monitor cancellation signal");
+			options.signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+			started.resolve(options);
+			await stopped.promise;
+			return {
+				output: "monitor-line\n",
+				exitCode: undefined,
+				cancelled: options.signal.aborted,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 13,
+				outputLines: 1,
+				outputBytes: 13,
+			};
+		});
 		try {
 			AsyncJobManager.setInstance(foreign);
+			const sendCustomMessage = vi.fn(async () => {});
 			const childToolSession: ToolSession = {
 				...toolSession,
 				getSessionId: () => "unregistered-child-endpoint",
 				getAsyncJobManager: () => manager,
+				sendCustomMessage,
 			};
 			const monitorTool = new MonitorTool(childToolSession);
 			await monitorTool.execute("monitor-call", {
@@ -1537,17 +1560,28 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				kind: "other",
 				description: "probe",
 			});
+			const execution = await started.promise;
 			expect(foreign.getAllJobs().length).toBe(0);
 			const endpointJobs = manager.getAllJobs();
 			expect(endpointJobs.length).toBe(1);
+			expect(endpointJobs[0]!.status).toBe("running");
+			expect(execution.onRawChunk).toBeDefined();
+			execution.onRawChunk!("monitor-line\n");
 			// Non-persistent monitors cancel after the first delivered line —
-			// on the endpoint manager that owns the job.
+			// on the endpoint manager that owns the job, not by natural exit.
+			expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+			expect(execution.signal!.aborted).toBe(true);
 			await waitFor(
-				() => manager.getJob(endpointJobs[0]!.id)?.status !== "running",
+				() => manager.getJob(endpointJobs[0]!.id)?.status === "cancelled",
 				"endpoint monitor cancelled",
 				5_000,
 			);
+			execution.onRawChunk!("late-monitor-line\n");
+			expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+			expect(foreign.getAllJobs().length).toBe(0);
 		} finally {
+			stopped.resolve();
+			executeBashSpy.mockRestore();
 			AsyncJobManager.setInstance(manager);
 		}
 	}, 20_000);

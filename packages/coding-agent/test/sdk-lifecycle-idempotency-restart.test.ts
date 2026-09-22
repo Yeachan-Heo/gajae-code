@@ -326,10 +326,15 @@ describe("SDK lifecycle ledger", () => {
 		const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
 		await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
 		await fs.writeFile(ledgerPath, "1");
-		const probe = await fs.open(ledgerPath, fs.constants.O_RDONLY);
-		const readSpy = spyOn(Object.getPrototypeOf(probe), "read").mockResolvedValue({
-			buffer: Buffer.alloc(2),
-			bytesRead: 2,
+		const originalOpen = fs.open;
+		const restoreReads: Array<() => void> = [];
+		const openSpy = spyOn(fs, "open").mockImplementation(async (filePath, flags, mode) => {
+			const handle = await originalOpen(filePath, flags, mode);
+			if (filePath === ledgerPath) {
+				const readSpy = spyOn(handle, "read").mockResolvedValue({ buffer: Buffer.alloc(2), bytesRead: 2 });
+				restoreReads.push(() => readSpy.mockRestore());
+			}
+			return handle;
 		});
 		try {
 			await expect(new LifecycleLedger(dir, { maxBytes: 1 }).readTerminal("target", "request")).resolves.toEqual({
@@ -337,8 +342,8 @@ describe("SDK lifecycle ledger", () => {
 				reason: "oversized-by-read",
 			});
 		} finally {
-			readSpy.mockRestore();
-			await probe.close();
+			openSpy.mockRestore();
+			for (const restore of restoreReads) restore();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
