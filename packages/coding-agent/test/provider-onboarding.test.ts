@@ -1015,4 +1015,41 @@ describe("provider onboarding precommit cancellation", () => {
 			authStorage.close();
 		}
 	});
+	it("restores the previous config when credential publication is rejected", async () => {
+		const modelsPath = await tempModelsPath();
+		const authStorage = await AuthStorage.create(getAgentDbPath());
+		await authStorage.set("publish-rejected", { type: "api_key", key: "sk-old-secret" });
+		const original = YAML.stringify({
+			providers: {
+				"publish-rejected": {
+					baseUrl: "https://old.example.com/v1",
+					api: "openai-responses",
+					models: [{ id: "old-model" }],
+				},
+			},
+		});
+		await Bun.write(modelsPath, original);
+		const publishError = new Error("credential authority unavailable");
+		const setSpy = vi.spyOn(authStorage, "set").mockRejectedValue(publishError);
+		try {
+			await expect(
+				addApiCompatibleProvider({
+					compatibility: "openai",
+					providerId: "publish-rejected",
+					baseUrl: "https://new.example.com/v1",
+					apiKey: "sk-new-secret",
+					models: ["new-model"],
+					modelsPath,
+					force: true,
+					authStorage,
+				}),
+			).rejects.toThrow("could not publish credentials");
+			expect(YAML.parse(await Bun.file(modelsPath).text())).toEqual(YAML.parse(original));
+			expect(await authStorage.peekApiKey("publish-rejected")).toBe("sk-old-secret");
+			expect(setSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			setSpy.mockRestore();
+			authStorage.close();
+		}
+	});
 });
