@@ -46,6 +46,8 @@ describe("read of bundled skill identifiers", () => {
 		const result = await tool.execute("read-embedded", { path: "embedded:gjc/skills/ultragoal/SKILL.md" });
 		const text = textOutput(result);
 		expect(text).toContain(body.split("\n")[0]);
+		expect(text).toContain(body.trimEnd().split("\n").at(-1)!);
+		expect(result.details?.truncation).toBeUndefined();
 	});
 
 	it("applies a line selector to an embedded: path", async () => {
