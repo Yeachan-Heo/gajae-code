@@ -2334,7 +2334,12 @@ test("every run scalar is checked by the interpreter that will actually run it (
 			diagnostics: "",
 		});
 	}
-});
+	// Each body costs one pwsh start, and the runner needs roughly a second apiece, so
+	// the default 5s budget expires mid-sweep. bun then SIGTERMs the child and the test
+	// reports the kill as a PARSER VERDICT -- `PowerShell parser exited 143` against a
+	// workflow step that is perfectly valid. Every PR whose affected shard covers this
+	// file went red on that, so the budget is explicit and sized for the sweep.
+}, 180_000);
 
 test("the PowerShell parse helper surfaces diagnostics rather than swallowing them (#5740 review)", async () => {
 	// pwsh is absent on this mac dev box, so the guard above skips its 23 bodies and
