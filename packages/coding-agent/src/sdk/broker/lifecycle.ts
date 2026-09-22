@@ -52,6 +52,7 @@ import {
 	type VerifiedSessionDeleteResult,
 	type VerifiedSessionDeleteTarget,
 } from "../../session/session-storage";
+import type { SessionWorkLease } from "../../session/session-work-lease";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
@@ -7405,8 +7406,8 @@ export interface SessionHostRuntimeEvidence {
 	attachedClients: SessionHostAttachmentReader;
 	/** Optional subset of attached sockets that only observes the host. */
 	observerClients?: SessionHostAttachmentReader;
-	/** Whether this runtime currently has agent work in flight. */
-	workInFlight: () => boolean;
+	/** One authoritative lease held by every admitted or continuing work state. */
+	workLease: SessionWorkLease;
 }
 
 /** One runtime's live publication, retractable only by its owner. */
@@ -7476,15 +7477,15 @@ export function sessionHostAttachedClients(): number | undefined {
 }
 
 /**
- * Whether any runtime in this process has agent work in flight right now.
+ * Whether any runtime in this process still holds its authoritative work lease.
  *
  * Positive evidence only: a runtime that publishes nothing, or whose reader
  * fails, reports no work, so this can never keep an abandoned host alive.
  */
-export function sessionHostWorkInFlight(): boolean {
-	for (const { workInFlight } of sessionHostRuntimes) {
+export function sessionHostWorkLeaseActive(): boolean {
+	for (const { workLease } of sessionHostRuntimes) {
 		try {
-			if (workInFlight()) return true;
+			if (workLease.isHeld()) return true;
 		} catch {}
 	}
 	return false;

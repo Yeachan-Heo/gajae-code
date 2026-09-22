@@ -28,7 +28,7 @@ import {
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	sessionHostAttachedClients,
-	sessionHostWorkInFlight,
+	sessionHostWorkLeaseActive,
 	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
@@ -253,19 +253,18 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
  * an observed count of zero. Every reachable state therefore carries a finite
  * bound.
  *
- * `readWorkInFlight` reports whether the host is running agent work right now.
- * Work is positive proof a client did come for this host: a prompt can only
- * arrive over an endpoint a client dialed. Live work therefore restarts both
- * windows, which is what keeps a mid-prompt host alive whether its count reads
- * zero or stops being readable at all. That still bounds a host whose SDK
- * runtime never came up: with no transport it can never receive a prompt, so it
- * never reports work and its window keeps running from process start. And any
- * real turn ends, after which the window resumes; live work defers a bound, it
- * never removes it.
+ * `readWorkLease` reports whether the host's authoritative session-work lease
+ * is held. A lease is positive proof a client did come for this host: a prompt
+ * can only arrive over an endpoint a client dialed. Live work therefore
+ * restarts both windows, which is what keeps a mid-prompt host alive whether
+ * its count reads zero or stops being readable at all. That still bounds a
+ * host whose SDK runtime never came up: with no transport it can never receive
+ * a prompt, so it never acquires work and its window keeps running from process
+ * start. Releasing the lease resumes the applicable bound.
  */
 export async function watchSessionHostClientAttachment(deps: {
 	readAttachedClients: () => number | undefined;
-	readWorkInFlight?: () => boolean;
+	readWorkLease?: () => boolean;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	idleGraceMs?: number;
@@ -274,7 +273,7 @@ export async function watchSessionHostClientAttachment(deps: {
 }): Promise<"detached_idle"> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
-	const readWorkInFlight = deps.readWorkInFlight ?? (() => false);
+	const readWorkLease = deps.readWorkLease ?? (() => false);
 	const idleGraceMs = deps.idleGraceMs ?? SESSION_HOST_DETACHED_IDLE_GRACE_MS;
 	const firstAttachGraceMs = deps.firstAttachGraceMs ?? SESSION_HOST_FIRST_ATTACH_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_ATTACHMENT_POLL_MS;
@@ -284,7 +283,7 @@ export async function watchSessionHostClientAttachment(deps: {
 	let unattendedSince = now();
 	for (;;) {
 		const attached = deps.readAttachedClients();
-		if (readWorkInFlight()) {
+		if (readWorkLease()) {
 			unattendedSince = now();
 			detachedSince = null;
 		}
@@ -872,7 +871,7 @@ export async function runSessionHost(
 		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
-			readWorkInFlight: sessionHostWorkInFlight,
+			readWorkLease: sessionHostWorkLeaseActive,
 		}),
 	]);
 	stop(reapReason);

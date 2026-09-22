@@ -68,6 +68,11 @@ import {
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
+	createSessionWorkLease,
+	type SessionWorkLease,
+	type SessionWorkLeaseHandle,
+} from "../../session/session-work-lease";
+import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
@@ -1294,6 +1299,17 @@ interface SessionRuntime {
 	serverStopped: boolean;
 	/** This runtime's own host-liveness publication; only its teardown may retract it. */
 	evidencePublication?: SessionHostRuntimePublication;
+	/** Authoritative lease held by admitted input, execution, and recovery work. */
+	workLease: SessionWorkLease;
+	/** Lease retained while an uncorrelated agent loop is active. */
+	activeWorkLease?: SessionWorkLeaseHandle;
+	/** Lease retained while an agent loop is paused awaiting resumption. */
+	pausedWorkLease?: SessionWorkLeaseHandle;
+	/**
+	 * Handles of queued submissions promoted to their own run, handed over at
+	 * the promotion boundary and retired by that run's agent_start.
+	 */
+	promotedWorkLeases: SessionWorkLeaseHandle[];
 	brokerRegistrationReleased: boolean;
 	verbosity: "lean" | "verbose";
 	/** Whether the agent loop is currently running (drives the typing indicator). */
@@ -2502,6 +2518,82 @@ function deepStructuralEqual(left: unknown, right: unknown): boolean {
 	);
 }
 
+/**
+ * Holds one session work lease handle for a dispatched submission from dispatch
+ * until the submission's own settlement boundary:
+ *
+ * - a queued message (steer, follow-up, or a prompt diverted into steering)
+ *   releases when it leaves the session queue: consumed inside the running turn
+ *   (`startsOwnRun: false`), removed (`removed: true`), or promoted to its own
+ *   run (`startsOwnRun: true`), where the handle is handed to the runtime and
+ *   released by that run's `agent_start`;
+ * - an inline prompt releases when its dispatch resolves, which is the end of
+ *   its run; the runtime's active-run handle and the accepted submission's
+ *   own handle cover the execution in between;
+ * - a failed or never-admitted dispatch releases immediately.
+ *
+ * Every transfer is bound to THIS message's hooks, never to queue position, so
+ * batched or reordered promotions cannot release a different submission's
+ * handle. A message that stays queued keeps its handle: it is admitted work
+ * the host must outlive, and only the session's own removal hook ends it.
+ */
+interface AdmissionWorkLease {
+	hooks: {
+		onQueuedPromoted: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+		onDispatchDisposition: (promotion: { startsOwnRun: boolean }) => void;
+	};
+	/** The session admitted the message (a preflight hook fired). */
+	accepted(): void;
+	/** The dispatch resolves at queue time; the message waits for its promotion hook. */
+	queued(): void;
+	/** The dispatch resolved; releases unless the message is still queued. */
+	dispatched(): void;
+	/** The dispatch failed or was never admitted; nothing is queued. */
+	abandon(): void;
+}
+
+function createAdmissionWorkLease(
+	lease: SessionWorkLease | undefined,
+	queuedAtDispatch: boolean,
+	promote: ((handle: SessionWorkLeaseHandle) => void) | undefined,
+): AdmissionWorkLease {
+	let handle = lease?.acquire();
+	let accepted = false;
+	let queued = queuedAtDispatch;
+	const release = (): void => {
+		handle?.release();
+		handle = undefined;
+	};
+	return {
+		hooks: {
+			onQueuedPromoted: promotion => {
+				const current = handle;
+				if (!current) return;
+				handle = undefined;
+				if (promotion.removed || promotion.startsOwnRun !== true || !promote) current.release();
+				else promote(current);
+			},
+			onDispatchDisposition: promotion => {
+				// The dispatch resolved at queue time, not at run end: the message sits
+				// in the steering queue until its promotion hook fires.
+				if (promotion.startsOwnRun === false) queued = true;
+			},
+		},
+		accepted: () => {
+			accepted = true;
+		},
+		queued: () => {
+			queued = true;
+		},
+		dispatched: () => {
+			// The session send contract invokes a preflight hook before resolving;
+			// an adapter that resolves without admitting anything queued no work.
+			if (!accepted || !queued) release();
+		},
+		abandon: release,
+	};
+}
+
 function sdkControlSurface(
 	ctx: ExtensionContext,
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
@@ -2595,6 +2687,10 @@ function sdkControlSurface(
 	// executions and post-response publications) so session teardown can join
 	// them before reporting durable quiescence.
 	trackReconciliationProducer?: (producer: Promise<unknown>) => void,
+	sessionWorkLease?: SessionWorkLease,
+	// Hands a queued submission's lease handle to the runtime when that
+	// submission is promoted to its own run; the run's agent_start adopts it.
+	promoteWorkLease?: (handle: SessionWorkLeaseHandle) => void,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2602,6 +2698,7 @@ function sdkControlSurface(
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
 	};
+	const hostWorkLease = sessionWorkLease ?? ctx.getSessionWorkLease?.();
 	const bindings = new Set(ctx.sdkBindings?.() ?? []);
 	const surfacePolicy = createSdkSurfaceFactory({
 		ctx,
@@ -2639,23 +2736,58 @@ function sdkControlSurface(
 		return "unknown";
 	};
 	const sendSteer = async (text: string, clientRef?: string) => {
+		// A steer is always queued: its handle is held from dispatch until the
+		// message leaves the session queue (consumed in-run, promoted to its own
+		// run, or removed), which is the only boundary bound to THIS message.
+		const admission = createAdmissionWorkLease(hostWorkLease, true, promoteWorkLease);
+		const sendOptions = {
+			deliverAs: "steer" as const,
+			onPreflightAcceptCommit: admission.accepted,
+			onPreflightAccepted: admission.accepted,
+			...admission.hooks,
+		};
 		if (clientRef === undefined) {
 			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
-			await api.sendUserMessage(text, { deliverAs: "steer" });
+			try {
+				await api.sendUserMessage(text, sendOptions);
+				admission.dispatched();
+			} catch (error) {
+				admission.abandon();
+				throw error;
+			}
 			return { ...correlation, accepted: true };
 		}
 		const normalizedClientRef = clientRef.trim();
-		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
+		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer) {
+			admission.abandon();
 			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
-		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
-		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		}
+		let reservation: Awaited<ReturnType<NonNullable<typeof skillRecon.reserveSteer>>>;
 		try {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
+			reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
+		} catch (error) {
+			admission.abandon();
+			throw error;
+		}
+		if (reservation.replay) {
+			admission.abandon();
+			return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		}
+		let dispatched = false;
+		try {
+			await api.sendUserMessage(text, sendOptions);
+			dispatched = true;
+			admission.dispatched();
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
 				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
 			};
 		} catch (error) {
+			// Only a failed dispatch leaves no queued message behind. When the
+			// dispatch resolved and the durable settlement failed afterwards, the
+			// steer is still queued in the session, so its handle stays held until
+			// the promotion or removal hook fires.
+			if (!dispatched) admission.abandon();
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
 				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
@@ -2763,17 +2895,28 @@ function sdkControlSurface(
 			throw Object.assign(new Error("clientRef must be a non-empty string of at most 128 characters."), {
 				code: "invalid_input",
 			});
+		// An explicit steer/follow-up is queued and settles at its promotion
+		// boundary; a fresh prompt settles when its run resolves. A plain prompt
+		// that finds the loop busy at dispatch is queued as steering (below), and
+		// one the session itself diverts reports that through onDispatchDisposition.
+		const admission = createAdmissionWorkLease(hostWorkLease, deliverAs !== undefined, promoteWorkLease);
 		if (trackReconciliation) {
 			// Restart recovery must be committed before a tracked prompt reserves capacity,
 			// otherwise it can admit against pre-hydration state or a lost clientRef.
 			try {
 				await awaitReconciliationReady();
 			} catch {
+				admission.abandon();
 				throw Object.assign(new Error("Prompt reconciliation state is unavailable; retry after restart."), {
 					code: "unavailable",
 				});
 			}
-			admitPrompt(trimmedClientRef);
+			try {
+				admitPrompt(trimmedClientRef);
+			} catch (error) {
+				admission.abandon();
+				throw error;
+			}
 		}
 		try {
 			if (forceFresh && isSessionBusy()) {
@@ -2792,6 +2935,7 @@ function sdkControlSurface(
 					},
 				);
 		} catch (error) {
+			admission.abandon();
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		}
@@ -2861,12 +3005,14 @@ function sdkControlSurface(
 				);
 			} catch (error) {
 				accepting = false;
+				admission.abandon();
 				// Durable acceptance failed, so the prompt was never accepted: reject the
 				// control preflight and rethrow so the awaiting session does not execute it.
 				onPromptAcceptFailed(correlation);
 				settlePreflight({ status: "rejected", error });
 				throw error;
 			}
+			admission.accepted();
 			accepting = false;
 			accepted = true;
 			// #4743: an accepted run owns a durable terminal publication when it
@@ -2886,18 +3032,22 @@ function sdkControlSurface(
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
+		const effectiveDeliverAs = deliverAs ?? (!forceFresh && isBusy() ? ("steer" as const) : undefined);
+		if (effectiveDeliverAs !== undefined) admission.queued();
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
-					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
+					...(effectiveDeliverAs ? { deliverAs: effectiveDeliverAs } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
+					...admission.hooks,
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
 			);
 		} catch (error) {
 			submissionSettled.resolve();
+			admission.abandon();
 			if (accepted && !preflightController.signal.aborted)
 				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
@@ -2908,6 +3058,7 @@ function sdkControlSurface(
 			// joined — only its reconciliation publications are tracked below.
 			void submission.then(
 				() => {
+					admission.dispatched();
 					if (!accepted)
 						settlePreflight({
 							status: "rejected",
@@ -2918,6 +3069,7 @@ function sdkControlSurface(
 					submissionSettled.resolve();
 				},
 				error => {
+					admission.abandon();
 					if (accepted && !preflightController.signal.aborted)
 						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
@@ -2930,6 +3082,7 @@ function sdkControlSurface(
 			if (result.status === "rejected") throw result.error;
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
+			admission.abandon();
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
@@ -4366,6 +4519,37 @@ export function createNotificationsExtension(
 		"session.branch",
 	]);
 	const sessionId = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
+	const releaseActiveWorkLease = (rt: SessionRuntime): void => {
+		rt.activeWorkLease?.release();
+		rt.activeWorkLease = undefined;
+	};
+	const releasePausedWorkLease = (rt: SessionRuntime): void => {
+		rt.pausedWorkLease?.release();
+		rt.pausedWorkLease = undefined;
+	};
+	const releasePromotedWorkLeases = (rt: SessionRuntime): void => {
+		for (const handle of rt.promotedWorkLeases.splice(0)) handle.release();
+	};
+	const beginAgentWork = (rt: SessionRuntime): void => {
+		releasePausedWorkLease(rt);
+		// Acquire the run's handle before retiring the promoted ones so the lease
+		// never reads as released between a queued submission and its run.
+		if (!rt.activeWorkLease) rt.activeWorkLease = rt.workLease.acquire();
+		// Every submission promoted into this run handed its handle over at the
+		// promotion boundary; the run's own handle covers them from here.
+		releasePromotedWorkLeases(rt);
+	};
+	const finishAgentWork = (rt: SessionRuntime, paused: boolean): void => {
+		if (paused) {
+			if (!rt.pausedWorkLease) rt.pausedWorkLease = rt.activeWorkLease ?? rt.workLease.acquire();
+			rt.activeWorkLease = undefined;
+			return;
+		}
+		// A run that failed before its agent_start still reaches agent_end; the
+		// handles promoted into it have no later agent_start to retire them.
+		if (!rt.activeWorkLease) releasePromotedWorkLeases(rt);
+		releaseActiveWorkLease(rt);
+	};
 
 	async function stopSession(
 		id: string,
@@ -4509,6 +4693,9 @@ export function createNotificationsExtension(
 				// runs while an identity successor is already serving, and clearing
 				// that live runtime's reader would manufacture "no evidence" for a
 				// host whose clients are still attached.
+				releaseActiveWorkLease(rt);
+				releasePausedWorkLease(rt);
+				releasePromotedWorkLeases(rt);
 				rt.evidencePublication?.retract();
 				rt.evidencePublication = undefined;
 			} catch (e) {
@@ -4646,7 +4833,25 @@ export function createNotificationsExtension(
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
+		const workLease = ctx.getSessionWorkLease?.() ?? createSessionWorkLease();
 		let runtime: SessionRuntime | undefined;
+		// A promoted submission's handle must either enter the runtime-owned list
+		// before teardown fences it, or be released immediately: stopSession drains
+		// the list after fencing, and a predecessor runtime that already stopped
+		// (mid session_switch) would otherwise hold the handle forever.
+		const promoteWorkLease = (handle: SessionWorkLeaseHandle): void => {
+			const currentRuntime = runtime;
+			if (
+				!currentRuntime ||
+				currentRuntime.stopping ||
+				currentRuntime.serverStopped ||
+				runtimes.get(id) !== currentRuntime
+			) {
+				handle.release();
+				return;
+			}
+			currentRuntime.promotedWorkLeases.push(handle);
+		};
 
 		// The SDK can always answer now (interactive via the answer source, or the
 		// workflow gate), so the endpoint advertises a resolver. Validate the native
@@ -4916,6 +5121,8 @@ export function createNotificationsExtension(
 			executionHandle?: string;
 			/** Cancels accepted skill preparation before an execution handle exists. */
 			preflightAbort?: () => void | Promise<void>;
+			/** Keeps the host alive from durable admission through terminal publication. */
+			workLease?: SessionWorkLeaseHandle;
 			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 			/**
@@ -5063,6 +5270,7 @@ export function createNotificationsExtension(
 					pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
 			}
 		};
+
 		const addTerminalTombstone = (key: string, connectionId: string, now = Date.now()) => {
 			promptTerminalTombstones.delete(key);
 			promptTerminalTombstones.set(key, { connectionId, expiresAt: now + PROMPT_TERMINAL_TOMBSTONE_TTL_MS });
@@ -5072,6 +5280,10 @@ export function createNotificationsExtension(
 		const finalizePrompt = (key: string, correlation: { commandId: string; turnId: string }) => {
 			const submission = promptSubmissions.get(key);
 			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (submission?.workLease) {
+				submission.workLease.release();
+				submission.workLease = undefined;
+			}
 			promptSubmissions.delete(key);
 			removePendingPromptCorrelation(correlation);
 			if (submission) addTerminalTombstone(key, submission.connectionId);
@@ -5079,6 +5291,10 @@ export function createNotificationsExtension(
 		const expirePromptDelivery = (key: string, submission: PromptSubmission) => {
 			if (!submission.terminal) return;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (submission.workLease) {
+				submission.workLease.release();
+				submission.workLease = undefined;
+			}
 			promptSubmissions.delete(key);
 			// A fatal closure is transport-level, not a committed semantic terminal: the
 			// durable record stays authoritative, so it must never leave a tombstone.
@@ -5475,6 +5691,7 @@ export function createNotificationsExtension(
 				if (trackReconciliation) releasePromptAdmission(clientRef);
 				return;
 			}
+			const workLeaseHandle = runtime?.workLease.acquire();
 			// Register delivery ownership synchronously before any await so post-accept
 			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
@@ -5486,11 +5703,13 @@ export function createNotificationsExtension(
 					([, submission]) =>
 						submission.terminal && (submission.phase === "delivered" || submission.fatal === true),
 				);
-				if (!oldestTerminal)
+				if (!oldestTerminal) {
+					workLeaseHandle?.release();
 					throw Object.assign(
 						new Error("Too many active prompt submissions; reconcile or await terminal state."),
 						{ code: "reconciliation_capacity" },
 					);
+				}
 				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
 			}
 			if (sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(sdkRunToken, correlation);
@@ -5509,6 +5728,7 @@ export function createNotificationsExtension(
 					maxMs: resolveSdkPromptMaxRuntimeMs(settings?.get("sdk.promptMaxRuntimeMs")),
 				}),
 				phase: "active",
+				...(workLeaseHandle ? { workLease: workLeaseHandle } : {}),
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
 				...(preflightAbort ? { preflightAbort } : {}),
@@ -5527,9 +5747,14 @@ export function createNotificationsExtension(
 		};
 		/** Roll back process-local registration when durable acceptance failed. */
 		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
 			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
-			promptSubmissions.delete(promptSubmissionKey(correlation));
+			if (submission?.workLease) {
+				submission.workLease.release();
+				submission.workLease = undefined;
+			}
+			promptSubmissions.delete(key);
 			removePendingPromptCorrelation(correlation);
 		};
 		const recordPromptTerminal = (correlation: { commandId: string; turnId: string } | undefined) => {
@@ -5553,6 +5778,10 @@ export function createNotificationsExtension(
 		) => {
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
+			if (submission.workLease) {
+				submission.workLease.release();
+				submission.workLease = undefined;
+			}
 			if (!submission.terminal) {
 				submission.terminal = true;
 				submission.fatal = true;
@@ -7044,6 +7273,8 @@ export function createNotificationsExtension(
 			terminalAbortSeams,
 			// #4743: join fire-and-forget reconciliation producers at teardown.
 			trackReconciliationProducer,
+			workLease,
+			promoteWorkLease,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -7566,6 +7797,8 @@ export function createNotificationsExtension(
 			policyGeneration: 0,
 			workflowGatePublicationEpoch: 0,
 			busy: false,
+			workLease,
+			promotedWorkLeases: [],
 			pendingPromptCorrelations,
 			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
@@ -8135,6 +8368,8 @@ export function createNotificationsExtension(
 								]
 							: text;
 					let acceptedSent = false;
+					const deliverAsSteer = runtime?.busy === true;
+					const admission = createAdmissionWorkLease(workLease, deliverAsSteer, promoteWorkLease);
 					const acceptAdmission = (): void => {
 						// Fired by AgentSession's preflight acceptance: after admission has
 						// committed but before the turn starts. Registering the update id and
@@ -8142,6 +8377,7 @@ export function createNotificationsExtension(
 						// pendingInbound registration it consumes.
 						if (acceptedSent) return;
 						acceptedSent = true;
+						admission.accepted();
 						if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
 						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "accepted");
 					};
@@ -8151,12 +8387,15 @@ export function createNotificationsExtension(
 						// of after the await; a rejection (preflight, admission, or later)
 						// still reaches the catch and maps to a rejected ack.
 						await api.sendUserMessage(content, {
-							...(runtime?.busy ? { deliverAs: "steer" as const } : {}),
+							...(deliverAsSteer ? { deliverAs: "steer" as const } : {}),
 							onPreflightAcceptCommit: acceptAdmission,
 							onPreflightAccepted: acceptAdmission,
+							...admission.hooks,
 						});
 						acceptAdmission();
+						admission.dispatched();
 					} catch (e) {
+						admission.abandon();
 						sendInboundAck(
 							authenticatedInbound.connectionId,
 							authenticatedInbound,
@@ -8283,22 +8522,19 @@ export function createNotificationsExtension(
 			// The native server owns the only authoritative view of this host's live
 			// SDK client sockets; publish it with observer-only sockets separated so a
 			// detached session host can bound its own lifetime without probing the OS
-			// (#4010). The handle is this runtime's alone, so only this runtime's teardown
-			// can retract it.
-			const readWorkInFlight = (): boolean =>
-				initializedRuntime.busy ||
-				initializedRuntime.pendingPromptCorrelations.length > 0 ||
-				initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0;
+			// (#4010). Work is represented by the session's single lease, not by
+			// reconstructed busy/correlation fields. The handle is this runtime's alone,
+			// so only this runtime's teardown can retract it.
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
 				observerClients: () => {
-					if (readWorkInFlight()) return 0;
+					if (workLease.isHeld()) return 0;
 					const observers = [...hostCapCache.keys()].filter(connectionId =>
 						liveHostCapabilities(connectionId)?.has(SESSION_HOST_OBSERVER_CAPABILITY),
 					).length;
 					return Math.min(server.clientCount(), observers);
 				},
-				workInFlight: readWorkInFlight,
+				workLease,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -9287,6 +9523,7 @@ export function createNotificationsExtension(
 		if (sdkRunToken && correlation) rt.pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
+		beginAgentWork(rt);
 		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		if (continuation) return;
 		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
@@ -9442,6 +9679,7 @@ export function createNotificationsExtension(
 		} else {
 			rt.emitPromptLifecycle(undefined, { type: "agent_end", sessionId: id });
 		}
+		finishAgentWork(rt, event.stopReason === "paused");
 		rt.activePromptCorrelation = undefined;
 		terminalizeInFlightTools(rt, id, event.stopReason === "cancelled" ? "cancelled" : "failed");
 		try {

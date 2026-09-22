@@ -68,7 +68,7 @@ import {
 import type { InteractiveModeContext } from "../src/modes/types";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
-import { sessionHostAttachedClients, sessionHostWorkInFlight } from "../src/sdk/broker/lifecycle";
+import { sessionHostAttachedClients, sessionHostWorkLeaseActive } from "../src/sdk/broker/lifecycle";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
@@ -96,6 +96,7 @@ import type {
 import * as sessionSdkRunCapability from "../src/session/sdk-run-capability";
 import { readSdkRunCapability } from "../src/session/sdk-run-capability";
 import { SessionManager } from "../src/session/session-manager";
+import { createSessionWorkLease, type SessionWorkLease } from "../src/session/session-work-lease";
 
 type CapturedSendUserMessage = (
 	content: Parameters<ExtensionActions["sendUserMessage"]>[0],
@@ -790,7 +791,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		await host.session.extensionRunner?.emit({ type: "agent_start" });
-		expect(sessionHostWorkInFlight()).toBe(true);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
 		expect(sessionHostAttachedClients()).toBe(baseDemand + 1);
 		await host.session.extensionRunner?.emit({
 			type: "agent_end",
@@ -798,7 +799,7 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 			messages: [{ role: "assistant", stopReason: "stop" }],
 		} as never);
 		await Bun.sleep(20);
-		expect(sessionHostWorkInFlight()).toBe(false);
+		expect(sessionHostWorkLeaseActive()).toBe(false);
 		expect(sessionHostAttachedClients()).toBe(baseDemand);
 
 		const disconnectedBeforeReplay = new SdkClient(host.endpoint.url, host.endpoint.token, {
@@ -812,6 +813,400 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	} finally {
 		await observer.close();
 		await host.stop();
+	}
+}, 60_000);
+
+test("accepted prompt keeps the host lease held until active lifecycle settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-admission-lease-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "admission-lease",
+			operation: "turn.prompt",
+			input: { text: "hold the host lease" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "admission-lease"),
+		"accepted prompt response",
+	);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] },
+		sessionContext,
+	);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "active lifecycle lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("accepted steer failure releases its queued host lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-lease-failure-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			throw Object.assign(new Error("steer dispatch failed after acceptance"), { code: "unavailable" });
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "steer-lease-failure",
+			operation: "turn.steer",
+			input: { text: "fail after acceptance" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-lease-failure"),
+		"steer failure response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "steer-lease-failure")).toMatchObject({
+		ok: false,
+		error: { code: "unavailable" },
+	});
+	await waitFor(() => !sessionHostWorkLeaseActive(), "failed steer lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/**
+ * Bring up a session host whose `sendUserMessage` captures every promotion hook
+ * per dispatched submission, connect one SDK socket, and return the pieces the
+ * lease-ownership tests drive by hand.
+ */
+async function startLeaseHarness(
+	prefix: string,
+	dispatch: (options: InternalCapturedOptions | undefined, index: number) => Promise<void> | void = async options => {
+		await firePreflightAccept(options);
+	},
+	contextOverrides: Record<string, unknown> = {},
+): Promise<{
+	handlers: Map<string, (event: unknown, context: unknown) => unknown>;
+	sessionContext: Record<string, unknown>;
+	sends: InternalCapturedOptions[];
+	frames: Record<string, unknown>[];
+	socket: WebSocket;
+	control(id: string, operation: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
+}> {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-${prefix}-`));
+	dirs.push(cwd);
+	const sessionId = `sdk-${prefix}-${Date.now()}`;
+	const sessionContext = { ...context(cwd, sessionId), ...contextOverrides };
+	const sends: InternalCapturedOptions[] = [];
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			const captured = options as InternalCapturedOptions | undefined;
+			if (captured) sends.push(captured);
+			await dispatch(captured, sends.length - 1);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+		socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		await waitFor(() => frames.some(frame => frame.type === "control_response" && frame.id === id), `${id} response`);
+		return frames.find(frame => frame.type === "control_response" && frame.id === id) as Record<string, unknown>;
+	};
+	return { handlers, sessionContext, sends, frames, socket, control };
+}
+
+test("every submission promoted into one batched run releases its own lease at that run's agent_start", async () => {
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("batched-promotion");
+	await control("steer-a", "turn.steer", { text: "first" });
+	await control("steer-b", "turn.steer", { text: "second" });
+	await control("steer-c", "turn.steer", { text: "third" });
+	expect(sends).toHaveLength(3);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	// agent_end disowned all three steers and rearmed them as ONE follow-up
+	// batch: the session fires every hook with startsOwnRun: true, then one
+	// agent_start follows for the batch.
+	for (const options of sends) options.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(assistantEndEvent("batched"), sessionContext);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "batched promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+/** A session work lease that also reports how many handles are outstanding. */
+function countingSessionWorkLease(): SessionWorkLease & { outstanding(): number } {
+	const lease = createSessionWorkLease();
+	let outstanding = 0;
+	return {
+		acquire: () => {
+			const handle = lease.acquire();
+			outstanding += 1;
+			let released = false;
+			return {
+				release: () => {
+					if (released) return;
+					released = true;
+					outstanding -= 1;
+					handle.release();
+				},
+			};
+		},
+		isHeld: () => lease.isHeld(),
+		outstanding: () => outstanding,
+	};
+}
+
+test("a promoted run releases the promoted submission's own lease, not the oldest admitted one", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("promotion-order", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("follow-up", "turn.follow_up", { text: "queued first" });
+	await control("steer", "turn.steer", { text: "queued second" });
+	expect(sends).toHaveLength(2);
+	// Two queued admissions plus the follow-up's accepted submission record.
+	expect(lease.outstanding()).toBe(3);
+	const [followUp, steer] = sends;
+	// Disowned steering is prepended ahead of the earlier follow-up: the steer
+	// starts the run and the follow-up is consumed inside it.
+	steer?.onQueuedPromoted?.({ startsOwnRun: true });
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	// The run's own handle replaced the steer's; the follow-up's is untouched.
+	expect(lease.outstanding()).toBe(3);
+	followUp?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("agent_end")?.(assistantEndEvent("reordered"), sessionContext);
+	// Only the follow-up's submission record remains, bounded by its own
+	// terminal/deadline; no admission handle survives the run.
+	await waitFor(() => lease.outstanding() === 1, "reordered promotion lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("an accepted prompt diverted into steering or removed from the queue releases its admission lease", async () => {
+	// Count outstanding handles directly: the accepted submission's own record
+	// lease stays held until its terminal, so the aggregate cannot distinguish a
+	// released admission handle from a leaked one here.
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness(
+		"prompt-queue-exit",
+		async (options, index) => {
+			await firePreflightAccept(options);
+			// The session began streaming before the first dispatch ran: the prompt
+			// was parked as steering and its submission resolves at queue time.
+			if (index === 0) options?.onDispatchDisposition?.({ startsOwnRun: false });
+		},
+		{ getSessionWorkLease: () => lease },
+	);
+	await control("diverted", "turn.prompt", { text: "raced into steering" });
+	await waitFor(() => sends.length === 1, "diverted prompt dispatch");
+	await Bun.sleep(20);
+	// Submission record + queued admission.
+	expect(lease.outstanding()).toBe(2);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+	expect(lease.outstanding()).toBe(1);
+
+	await control("queued", "turn.follow_up", { text: "cleared from the queue" });
+	await waitFor(() => sends.length === 2, "follow-up dispatch");
+	await Bun.sleep(20);
+	expect(lease.outstanding()).toBe(3);
+	sends[1]?.onQueuedPromoted?.({ startsOwnRun: true, removed: true });
+	expect(lease.outstanding()).toBe(2);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("a steer whose durable settlement fails after dispatch keeps its lease while the message stays queued", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-settle-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-settle-failure-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const sends: InternalCapturedOptions[] = [];
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				if (options) sends.push(options as InternalCapturedOptions);
+				await firePreflightAccept(options);
+				// The reservation write committed; the NEXT commit is the accepted
+				// settlement, which fails at its atomic rename.
+				failedCommit.arm();
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steer-settle-failure",
+				operation: "turn.steer",
+				input: { text: "queued but not durably settled", clientRef: "steer-settle-failure-ref" },
+			}),
+		);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-settle-failure"),
+			"steer settlement response",
+		);
+		expect(sends).toHaveLength(1);
+		// The message is still queued in the session, so the host must stay alive
+		// until the session's own promotion or removal hook retires it.
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		sends[0]?.onQueuedPromoted?.({ startsOwnRun: false });
+		await waitFor(() => !sessionHostWorkLeaseActive(), "queued steer lease release");
+		// Teardown reports the injected persistence failure by contract (#4743).
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
+test("a submission promoted after its runtime stopped releases its lease instead of parking it", async () => {
+	const lease = countingSessionWorkLease();
+	const { handlers, sessionContext, sends, control } = await startLeaseHarness("late-promotion", undefined, {
+		getSessionWorkLease: () => lease,
+	});
+	await control("steer", "turn.steer", { text: "promoted after teardown" });
+	expect(lease.outstanding()).toBe(1);
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	// The runtime is fenced and its lists drained; a promotion that lands now
+	// has no run to hand its handle to.
+	expect(lease.outstanding()).toBe(1);
+	sends[0]?.onQueuedPromoted?.({ startsOwnRun: true });
+	expect(lease.outstanding()).toBe(0);
+}, 60_000);
+
+test("an accepted prompt that fails closed before its terminal releases its submission lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fail-closed-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fail-closed-lease-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "fail-closed",
+				operation: "turn.prompt",
+				input: { text: "terminal claim will not persist", clientRef: "fail-closed-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "fail-closed"),
+			"accepted prompt response",
+		);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(sessionHostWorkLeaseActive()).toBe(true);
+		// The acceptance and agent_start writes committed; the terminal claim is
+		// the next commit and fails, so the prompt fails closed with no later
+		// traffic to expire its record.
+		failedCommit.arm();
+		await handlers.get("agent_end")?.(assistantEndEvent("lost"), sessionContext);
+		await failedCommit.failed;
+		await waitFor(
+			() => frames.some(frame => frame.type === "agent_failed" && frame.error !== undefined),
+			"fail-closed terminal frame",
+		);
+		await waitFor(() => !sessionHostWorkLeaseActive(), "fail-closed lease release");
+		await Promise.resolve(handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext)).catch(
+			() => undefined,
+		);
+	} finally {
+		errorSpy.mockRestore();
+		warnSpy.mockRestore();
+		failedCommit.restore();
 	}
 }, 60_000);
 
@@ -1952,11 +2347,19 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 		[
 			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{ preflightSignal: expect.any(AbortSignal) },
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
 		],
 	]);
 });
@@ -2015,6 +2418,8 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 				deliverAs: "followUp",
 				preflightSignal: expect.any(AbortSignal),
 				sdkRunCapability: expect.any(Object),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
 			},
 		],
 	]);

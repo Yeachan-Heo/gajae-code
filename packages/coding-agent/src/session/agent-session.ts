@@ -143,6 +143,7 @@ import {
 	truncateUtf8,
 	utf8ByteLength,
 } from "./btw-contract";
+import { createSessionWorkLease, type SessionWorkLease, type SessionWorkLeaseHandle } from "./session-work-lease";
 import { DEFAULT_ARTIFACT_MAX_BYTES, truncateHeadBytes } from "./streaming-output";
 
 export interface ForkContextSeedMetadata {
@@ -3884,6 +3885,9 @@ export class AgentSession {
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
+	readonly #sessionWorkLease: SessionWorkLease = createSessionWorkLease();
+	#postPromptWorkLeases = new Map<Promise<void>, SessionWorkLeaseHandle>();
+	#deferredAgentEndWorkLeases = new Map<symbol, SessionWorkLeaseHandle>();
 	#runCancellationDomains = new SessionRunCancellationDomainBridge();
 	#postPromptLeases = new Map<string, RunResourceProducerLease>();
 	#runResourceLeaseContext = new AsyncLocalStorage<RunResourceProducerLease>();
@@ -4614,6 +4618,7 @@ export class AgentSession {
 		if (!pending) return undefined;
 		const hold = Symbol("deferred-agent-end-continuation");
 		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
 		return hold;
 	}
 
@@ -4625,6 +4630,7 @@ export class AgentSession {
 		this.#pendingAgentEndEmit = pending;
 		const hold = Symbol("deferred-agent-end-continuation");
 		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		this.#deferredAgentEndWorkLeases.set(hold, this.#sessionWorkLease.acquire());
 		return hold;
 	}
 
@@ -4632,10 +4638,16 @@ export class AgentSession {
 		if (!hold) return undefined;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
 		this.#pendingAgentEndContinuationHolds.delete(hold);
+		this.#deferredAgentEndWorkLeases.get(hold)?.release();
+		this.#deferredAgentEndWorkLeases.delete(hold);
 		if (pending && this.#pendingAgentEndEmit === pending) {
 			this.#pendingAgentEndEmit = undefined;
 			for (const [candidate, candidatePending] of this.#pendingAgentEndContinuationHolds) {
-				if (candidatePending === pending) this.#pendingAgentEndContinuationHolds.delete(candidate);
+				if (candidatePending === pending) {
+					this.#pendingAgentEndContinuationHolds.delete(candidate);
+					this.#deferredAgentEndWorkLeases.get(candidate)?.release();
+					this.#deferredAgentEndWorkLeases.delete(candidate);
+				}
 			}
 		}
 		this.#resolveSessionSettlement();
@@ -4662,6 +4674,8 @@ export class AgentSession {
 		if (!hold) return;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
 		this.#pendingAgentEndContinuationHolds.delete(hold);
+		this.#deferredAgentEndWorkLeases.get(hold)?.release();
+		this.#deferredAgentEndWorkLeases.delete(hold);
 		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
@@ -4672,6 +4686,8 @@ export class AgentSession {
 			break;
 		}
 		this.#pendingAgentEndContinuationHolds.clear();
+		for (const lease of this.#deferredAgentEndWorkLeases.values()) lease.release();
+		this.#deferredAgentEndWorkLeases.clear();
 		this.#restoreDeferredAgentEndAfterContinuationFailure(pending);
 	}
 
@@ -4705,9 +4721,11 @@ export class AgentSession {
 			fenceGeneration,
 			(this.#selectionFenceDeferredContinuations.get(fenceGeneration) ?? 0) + 1,
 		);
+		const workLease = this.#sessionWorkLease.acquire();
 		void deferred
 			.catch(() => {})
 			.finally(() => {
+				workLease.release();
 				this.#endSelectionFenceDeferralTracking(fenceGeneration);
 			});
 	}
@@ -8127,6 +8145,7 @@ export class AgentSession {
 		excludeFromRecovery = false,
 	): void {
 		this.#postPromptTasks.add(task);
+		this.#postPromptWorkLeases.set(task, this.#sessionWorkLease.acquire());
 		this.#postPromptTaskSelectionFenceGenerations.set(task, selectionFenceGeneration);
 		if (excludeFromRecovery) this.#postPromptTaskRecoveryExcluded.add(task);
 		this.#ensurePostPromptTasksPromise();
@@ -8137,6 +8156,8 @@ export class AgentSession {
 		void task
 			.catch(() => {})
 			.finally(() => {
+				this.#postPromptWorkLeases.get(task)?.release();
+				this.#postPromptWorkLeases.delete(task);
 				this.#postPromptTasks.delete(task);
 				this.#postPromptTaskSelectionFenceGenerations.delete(task);
 				this.#postPromptTaskRecoveryExcluded.delete(task);
@@ -8780,6 +8801,8 @@ export class AgentSession {
 	#abandonPostPromptTasks(): void {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
+		for (const lease of this.#postPromptWorkLeases.values()) lease.release();
+		this.#postPromptWorkLeases.clear();
 		this.#postPromptTasks.clear();
 		this.#postPromptTaskSelectionFenceGenerations.clear();
 		this.#postPromptTaskRecoveryExcluded.clear();
@@ -12048,6 +12071,11 @@ export class AgentSession {
 	 */
 	get hasPostPromptWork(): boolean {
 		return this.#postPromptTasks.size > 0;
+	}
+
+	/** The host-liveness lease shared by admission, execution, and recovery work. */
+	get sessionWorkLease(): SessionWorkLease {
+		return this.#sessionWorkLease;
 	}
 
 	/** Stable resource ownership identifier for the active prompt run. */
