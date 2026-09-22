@@ -740,13 +740,18 @@ function toolSchema(
 		return {
 			name,
 			description:
-				"Create a durable turn and deliver a bounded follow-up prompt for a selected coordinator bridge session.",
+				"Create a durable turn, or set steer:true with the active turn_id to deliver requested input to that running turn. queue:true is only for a separate later task; it is not consumption acknowledgement.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					session_id: sessionId,
 					prompt: { type: "string" },
 					queue: { type: "boolean" },
+					steer: { type: "boolean" },
+					turn_id: {
+						type: "string",
+						description: "Required with steer:true; the existing active coordinator turn.",
+					},
 					force: { type: "boolean" },
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
@@ -1250,8 +1255,10 @@ const COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP = 64 * 1024;
 const COORDINATOR_IDEMPOTENCY_STRING_BYTE_CAP = 8 * 1024;
 const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	invalid_input: "Coordinator request input is invalid.",
+	turn_not_active: "Feedback requires the selected active turn; no new coordinator turn was created.",
 	invalid_request: "Coordinator request is invalid.",
 	invalid_session_id: "Coordinator session id is invalid.",
+	invalid_turn_id: "Coordinator turn id is invalid.",
 	unknown_operation: "Coordinator operation is unsupported.",
 	not_found: "Coordinator resource was not found.",
 	resource_gone: "Coordinator resource is no longer available.",
@@ -5178,7 +5185,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 
 	async function queryLastAssistant(session: Record<string, unknown>): Promise<string | null> {
-		const item = sdkQueryPageItem(await querySession(session, "session.last_assistant"), "session.last_assistant");
+		let item: unknown;
+		try {
+			item = sdkQueryPageItem(await querySession(session, "session.last_assistant"), "session.last_assistant");
+		} catch (error) {
+			// Compatibility with running older hosts: this exact Q17 diagnostic
+			// denotes an absent text payload, not a missing session or closed store.
+			if (
+				error instanceof SdkClientError &&
+				error.code === "resource_gone" &&
+				error.message === "snapshot payload is unavailable"
+			)
+				return null;
+			throw error;
+		}
 		if (typeof item === "string") return item;
 		const message = asRecord(item);
 		return typeof message?.text === "string"
@@ -10354,6 +10374,62 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
 				const prompt = args.prompt;
+				if (args.steer === true) {
+					if (args.queue === true || args.force === true)
+						return {
+							ok: false,
+							error: { code: "invalid_input", message: "steer cannot be combined with queue or force." },
+						};
+					const turnId = safeTurnId(args.turn_id);
+					return await withToolIdempotency(
+						name,
+						idempotencyKey,
+						{ session_id: sessionId, turn_id: turnId, prompt, steer: true, allow_mutation: true },
+						async () =>
+							await withSessionTransition(sessionId, async () => {
+								const transaction = await readSessionTransaction(questionPaths, sessionId);
+								const turn = transaction?.canonical.turns[turnId];
+								if (
+									!transaction ||
+									!turn ||
+									transaction.canonical.queue.active_turn_id !== turnId ||
+									(turn.status !== "active" && turn.status !== "waiting_for_answer")
+								)
+									return {
+										ok: false,
+										error: {
+											code: "turn_not_active",
+											message: "Feedback requires the selected active turn; no new turn was created.",
+										},
+									};
+								const session = asRecord(await readJsonFile(sessionFile(sessionId)));
+								if (!session) throw new Error("resource_gone");
+								await assertPersistedSessionAuthority(transaction.canonical.session);
+								const clientRef = `coordinator-feedback:${createHash("sha256")
+									.update(JSON.stringify([sessionId, turnId, idempotencyKey]))
+									.digest("hex")}`;
+								const response = asRecord(
+									await controlSession(session, "turn.steer", { text: prompt, clientRef }, idempotencyKey),
+								);
+								const result = asRecord(response?.result);
+								return {
+									ok: result?.accepted === true,
+									session_id: sessionId,
+									turn_id: turnId,
+									delivery: "steer",
+									queued: false,
+									consumption_verified: false,
+									steer_client_ref: clientRef,
+									result,
+								};
+							}),
+						true,
+						response =>
+							["ambiguous", "uncertain_after_send", "connection_closed", "timeout"].includes(
+								String(asRecord(response.error)?.code),
+							),
+					);
+				}
 				return await withToolIdempotency(
 					name,
 					idempotencyKey,

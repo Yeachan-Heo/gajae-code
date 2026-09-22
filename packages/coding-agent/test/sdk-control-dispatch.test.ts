@@ -368,6 +368,36 @@ test("serializes ordered operations while retry.now bypasses the session chain",
 	expect(started).toEqual(["retry", "first", "second"]);
 });
 
+test("steering reaches an active worker before an earlier ordered control settles", async () => {
+	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
+	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const calls: string[] = [];
+	const surface = {
+		prompt: async () => {
+			entered.resolve();
+			await release.promise;
+			calls.push("prompt-settled");
+		},
+		steer: () => {
+			calls.push("steer");
+			return { accepted: true };
+		},
+	} as unknown as ControlSurface;
+	const pending = dispatchControl(surface, prompt, { ...request(prompt), input: { text: "work" } });
+	await entered.promise;
+	const feedback = dispatchControl(surface, steer, { ...request(steer), input: { text: "requested evidence" } });
+	try {
+		await Bun.sleep(0);
+		expect(calls).toEqual(["steer"]);
+		expect(await feedback).toMatchObject({ ok: true, result: { accepted: true } });
+	} finally {
+		release.resolve();
+		await Promise.all([pending, feedback]);
+	}
+});
+
 test("abort-and-prompt cancels pending preflight but waits for prior ordered controls", async () => {
 	const prompt = OPERATIONS.find(row => row.sdkId === "turn.prompt")!;
 	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;

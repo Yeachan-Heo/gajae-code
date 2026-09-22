@@ -1683,7 +1683,7 @@ function createQuerySurface(
 					: entry.content?.flatMap(block => (block.type === "text" ? [block.text] : [])).join("\n");
 			if (text !== undefined && text.trim().length > 0) return text;
 		}
-		return undefined;
+		return null;
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
 	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;

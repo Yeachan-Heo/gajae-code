@@ -356,3 +356,15 @@ gjc mcp-serve coordinator --check --json
 ```
 
 Expected result includes `ok: true`, server name `gjc-coordinator-mcp`, and the GJC-named tool list. The JSON check is discovery-only and non-mutating: it retains those legacy fields and adds `catalog: { "ready": true, "reason": null }` and `broker`. `broker.discovery_status` is `ready`, `unavailable`, or `error`, with reason `null`, `absent_or_invalid`, `unsupported_state_version`, `discovery_access_denied`, or `discovery_read_failed`. `broker.operational_ready` is always `null`; the check does not connect, ensure/bootstrap, write, repair, or delete. `bootstrap_supported` is `true` and `bootstrap_attempted` is `false`. It does not expose broker authority, path, endpoint, process metadata, token, or raw error details. `gjc mcp-serve hermes --check --json` returns the identical coordinator check payload; its human output remains the server/tools summary.
+
+## Active operator feedback and empty responses
+
+The generated operator instructions distinguish requested input for current work from a separate queued task. `gjc_coordinator_send_prompt` accepts `steer: true` with the existing active `turn_id`; it uses a correlated SDK `turn.steer` and returns `delivery: "steer"`, `steer_client_ref`, and `consumption_verified: false`. The usual mutation consent and session authority checks apply. Combining steering with queue/force is invalid; stale or non-active turns are refused. Existing `queue: true` behavior is unchanged.
+
+Check structured questions and any named operator-action artifact. Empty `list_questions` does not cover free-text requests. Resolve authorized operator-owned requests, deliver the evidence, then verify worker acknowledgement/application. A reporting-only watcher escalates to its authorized controller rather than performing new actions without authorization. Formal workflow gates still use the bound question-answer tool.
+
+The SDK `session.last_assistant` query returns a successful null item when no readable assistant text exists. Coordinator `read_tail` returns an empty lines array. For older running hosts, only the exact Q17 diagnostic `resource_gone: snapshot payload is unavailable` is normalized to an empty response; missing sessions and a closing snapshot store are not normalized. This permits a coordinator update without restarting working host sessions.
+
+The `turn_id` check runs under the Coordinator process's transition queue. It is not a cross-process or atomic SDK execution fence: the runtime may finish while feedback is in flight. Inspect the worker acknowledgement and resulting artifacts before treating evidence as consumed; a steering admission alone does not prove which model step received it.
+
+SDK steering bypasses the ordinary control dispatch chain so an earlier pending control cannot prevent input from reaching its worker. Already-running hosts retain their loaded dispatcher until a normal restart/resume; updating only Coordinator cannot hot-patch that code. Treat unanswered steering as uncertain, retain the same idempotency key for retries, and do not restart unrelated work as automatic recovery.

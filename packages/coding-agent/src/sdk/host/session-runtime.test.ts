@@ -231,7 +231,7 @@ test("session.last_assistant returns the latest projected readable text past non
 	});
 });
 
-test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {
+test("session.last_assistant returns null when the projected transcript has no readable assistant text", async () => {
 	const sessionId = "last-assistant-empty";
 	const ctx = extensionContext(sessionId, "/tmp", {
 		transcript: [
@@ -252,7 +252,7 @@ test("session.last_assistant returns resource_gone when the projected transcript
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: true, page: { items: [null] } });
 });
 
 test("native prompt reconciliation fails closed for an explicitly empty assistant result", () => {

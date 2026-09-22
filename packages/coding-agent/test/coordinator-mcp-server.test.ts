@@ -753,6 +753,140 @@ async function patchTurnDelivery(
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	it("delivers active feedback as a correlated steer without creating a queued turn", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control =>
+				control.operation === "turn.steer"
+					? { ok: true, result: { accepted: true, status: "accepted", clientRef: control.input.clientRef } }
+					: undefined,
+		});
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work needing operator input",
+			idempotency_key: "feedback-work",
+			allow_mutation: true,
+		});
+		const input = {
+			session_id: "visible-session",
+			turn_id: sent.turn_id,
+			prompt: "requested source is ready",
+			steer: true,
+			idempotency_key: "feedback-source",
+			allow_mutation: true,
+		};
+		const feedback = await server.callTool("gjc_coordinator_send_prompt", input);
+		expect(feedback).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			queued: false,
+			turn_id: sent.turn_id,
+			consumption_verified: false,
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toEqual(feedback);
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", { ...input, prompt: "different evidence" }),
+		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		expect(
+			await server.callTool("gjc_coordinator_send_prompt", {
+				...input,
+				turn_id: undefined,
+				idempotency_key: "feedback-missing-turn",
+			}),
+		).toMatchObject({ ok: false, error: { code: "invalid_turn_id" } });
+		expect(controls.filter(control => control.operation === "turn.steer")).toEqual([
+			{
+				operation: "turn.steer",
+				input: { text: input.prompt, clientRef: feedback.steer_client_ref },
+				idempotencyKey: input.idempotency_key,
+			},
+		]);
+		const tx = await readSessionTransaction(
+			coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity),
+			"visible-session",
+		);
+		expect(Object.keys(tx!.canonical.turns)).toEqual([String(sent.turn_id)]);
+		const refused = await server.callTool("gjc_coordinator_send_prompt", {
+			...input,
+			queue: true,
+			idempotency_key: "feedback-invalid",
+		});
+		expect(refused).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		const stale = await server.callTool("gjc_coordinator_send_prompt", {
+			...input,
+			turn_id: "turn-11111111-2222-4333-8444-555555555555",
+			idempotency_key: "feedback-stale",
+		});
+		expect(stale).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+		expect(controls.filter(control => control.operation === "turn.steer")).toHaveLength(1);
+	});
+
+	it("retries an unobserved steer with the same durable client reference", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let attempts = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			controlResult: control => {
+				if (control.operation !== "turn.steer") return undefined;
+				attempts += 1;
+				return attempts === 1
+					? { ok: false, error: { code: "uncertain_after_send", message: "response lost" } }
+					: { ok: true, result: { accepted: true, clientRef: control.input.clientRef } };
+			},
+		});
+		await registerSdkSession(server, root);
+		const turn = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "steer-retry-work",
+			allow_mutation: true,
+		});
+		const input = {
+			session_id: "visible-session",
+			turn_id: turn.turn_id,
+			prompt: "evidence",
+			steer: true,
+			idempotency_key: "steer-retry-evidence",
+			allow_mutation: true,
+		};
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: false,
+			error: { code: "uncertain_after_send" },
+		});
+		expect(await server.callTool("gjc_coordinator_send_prompt", input)).toMatchObject({
+			ok: true,
+			delivery: "steer",
+			consumption_verified: false,
+		});
+		const steers = controls.filter(control => control.operation === "turn.steer");
+		expect(steers).toHaveLength(2);
+		expect(steers[0]).toEqual(steers[1]);
+	});
+
+	it.each([
+		null,
+		"snapshot payload is unavailable",
+		"snapshot store is closing",
+	])("keeps absent assistant text distinct from missing resources: %s", async payload => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "session.last_assistant"
+				? payload === null
+					? { ok: true, page: { items: [null] } }
+					: { ok: false, error: { code: "resource_gone", message: payload } }
+				: { ok: true, page: { items: [{ isStreaming: true }], complete: true, revision: "test" } },
+		);
+		await registerSdkSession(server, root);
+		const tail = await server.callTool("gjc_coordinator_read_tail", { session_id: "visible-session" });
+		expect(tail).toMatchObject(
+			payload === "snapshot store is closing"
+				? { ok: false, error: { code: "resource_gone" } }
+				: { ok: true, source: "sdk", lines: [] },
+		);
+	});
+
 	it("refuses to register a running session without an established sidecar authority", async () => {
 		const root = await tempRoot();
 		const server = await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {

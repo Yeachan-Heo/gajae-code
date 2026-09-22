@@ -543,5 +543,10 @@ export function dispatchControl(
 	}
 	if (row.idempotency === "idempotent" && dispatchRequest.idempotencyKey)
 		return idempotent(surface, row, dispatchRequest, work);
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
+	// Active feedback must reach the worker even while an earlier ordered control
+	// waits for that worker. Correlated steer admission remains deduplicated by
+	// the runtime reconciliation store, independently of this dispatch chain.
+	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+		? serialize(surface, work)
+		: work();
 }
