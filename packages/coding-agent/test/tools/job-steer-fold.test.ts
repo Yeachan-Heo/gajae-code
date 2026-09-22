@@ -118,6 +118,68 @@ describe("steer-triggered job await fold", () => {
 		await held.job.promise;
 	}, 10_000);
 
+	// A job that a foreground fold already moved owns a receipt slot until it
+	// completes, so the coordinator refuses a second fold for it. The await must
+	// still be released so the steer is delivered, and the original receipt (not
+	// a second one) must carry the completion.
+	it("releases a steered await over a job that an earlier fold already moved", async () => {
+		if (!harness) throw new Error("expected steer harness");
+		const held = registerHeldJob("previously folded");
+		const priorFold: FoldAdapter = {
+			kind: "bash-managed",
+			jobId: held.id,
+			jobGeneration: held.job.generation,
+			label: held.job.label,
+			cwdSensitive: true,
+			originatingTurn: false,
+			outputRef: { jobId: held.id, generation: held.job.generation, instruction: "tail it" },
+			getJob: () => harness?.manager.getJob(held.id),
+			detachObserver: receipt => {
+				harness?.manager.markBackgrounded(held.id, held.job.generation, receipt.reason);
+				return "resolved";
+			},
+			resolveForegroundObserver: () => "already-settled",
+		};
+		expect((await harness.coordinator.requestFold(priorFold, "chord")).status).toBe("folded");
+		expect(harness.coordinator.slotStateFor(held.job)).toBe("present");
+		expect(harness.folds).toHaveLength(1);
+
+		const resultPromise = new JobTool(harness.session).execute("job-await-refold", { poll: [held.id] });
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		harness.steer();
+		const result = await resultPromise;
+
+		expect(textOf(result)).toContain("Folded the job await");
+		expect(textOf(result)).toContain("because a user steer arrived");
+		expect(harness.manager.getJob(held.id)?.status).toBe("running");
+		// The first fold's reason and receipt survive; no second fold event or slot was minted.
+		expect(harness.manager.getJob(held.id)?.metadata?.foldReason).toBe("chord");
+		expect(harness.folds).toHaveLength(1);
+		expect(harness.coordinator.slotStateFor(held.job)).toBe("present");
+		held.gate.resolve("refold result");
+		await held.job.promise;
+	}, 10_000);
+
+	it("watches task-backed jobs without folding them", async () => {
+		if (!harness) throw new Error("expected steer harness");
+		const gate = Promise.withResolvers<string>();
+		const taskId = harness.manager.register("task", "subagent task", () => gate.promise);
+		const taskJob = harness.manager.getJob(taskId);
+		if (!taskJob) throw new Error(`expected task job ${taskId}`);
+		const resultPromise = new JobTool(harness.session).execute("job-await-task", { poll: [taskId] });
+		await Bun.sleep(STEER_FOLD_GRACE_MS + 100);
+		expect(harness.session.hasForegroundBashBackgroundRequestHandler?.()).toBe(false);
+		harness.steer();
+		await Bun.sleep(100);
+		expect(harness.folds).toHaveLength(0);
+		expect(harness.manager.getJob(taskId)?.metadata?.foldReason).toBeUndefined();
+		expect(harness.coordinator.slotStateFor(taskJob)).toBe("none");
+		gate.resolve("task result");
+		const result = await resultPromise;
+		expect(textOf(result)).toContain("task result");
+		expect(textOf(result)).not.toContain("Folded the job await");
+	}, 10_000);
+
 	it("does not fold a steer inside the grace window", async () => {
 		if (!harness) throw new Error("expected steer harness");
 		const held = registerHeldJob("early await");
