@@ -72,6 +72,7 @@ import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import { resolveSdkHostModel, type SdkHostModelRegistryLoader } from "../src/sdk/host/model-pin";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import { writeDurableCoordinatorSession } from "./helpers/coordinator-session-fixture";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
@@ -3854,21 +3855,395 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(listScopes).toContain(worktree);
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
-	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+	it("reuses a delegate session through its persisted managed-worktree authority", async () => {
 		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktree = path.join(root, "hermes-worktree");
+		await Bun.$`git worktree add -q -b hermes ${worktree}`.cwd(root);
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		const first = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			worktree: "hermes",
+			task: "first managed-worktree task",
+			idempotency_key: "managed-worktree-delegate-first",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const persistedSessionPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const persistedSession = JSON.parse(await fs.readFile(persistedSessionPath, "utf8")) as Record<string, unknown>;
+		const symlinkedWorktree = path.join(root, "hermes-link");
+		await fs.symlink(worktree, symlinkedWorktree, "dir");
+		await Bun.write(
+			persistedSessionPath,
+			JSON.stringify({ ...persistedSession, broker_workspace: `${symlinkedWorktree}${path.sep}` }),
+		);
+
+		const second = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "second managed-worktree task",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-second",
+			allow_mutation: true,
+		});
+		expect(second).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		if (process.platform !== "win32") {
+			await Bun.write(
+				persistedSessionPath,
+				JSON.stringify({ ...persistedSession, broker_workspace: worktree.toUpperCase() }),
+			);
+			await expect(
+				server.callTool("gjc_delegate_plan", {
+					cwd: root,
+					session_id: "created-session-1",
+					task: "case-mismatched worktree must not bind",
+					queue: true,
+					idempotency_key: "managed-worktree-delegate-case-mismatch",
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		}
+	}, 20_000);
+	it("does not seal transient managed-worktree canonicalization failures", async () => {
+		const root = await tempRoot();
+		const worktree = path.join(root, "hermes-worktree");
+		await fs.mkdir(worktree, { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let failCanonicalization = false;
+		const canonicalizePath = async (value: string): Promise<string> => {
+			if (failCanonicalization && value === worktree)
+				throw Object.assign(new Error("temporary canonicalization failure"), { code: "EACCES" });
+			return fs.realpath(value);
+		};
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{ canonicalizePath },
+		);
 		await expect(
-			server.callTool("gjc_coordinator_start_session", {
+			server.callTool("gjc_delegate_plan", {
 				cwd: root,
-				idempotency_key: "managed-worktree-status",
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-transient",
 				allow_mutation: true,
 			}),
 		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after transient canonicalization failure",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-transient",
+			allow_mutation: true,
+		};
+		failCanonicalization = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "unavailable" },
+		});
+		const receipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(receipt.state).toBe("in_progress");
+		expect(receipt.response).toBeUndefined();
+		expect(receipt.delegate_prompt_claim_started).toBe(false);
+		failCanonicalization = false;
+		// Real clients retry the original key. The failure happened before any prompt
+		// claim, so the same key must recover into a fresh claim, not terminal_uncertain.
+		const retried = await server.callTool("gjc_delegate_plan", retryArgs);
+		expect(retried).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		expect(await server.callTool("gjc_delegate_plan", retryArgs)).toEqual(retried);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+	}, 20_000);
+	it("keeps a marker-less in-progress reused-delegate receipt uncertain on same-key retry", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
 		await expect(
-			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-legacy",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry over a legacy receipt",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-legacy",
+			allow_mutation: true,
+		};
+		// A receipt written by a coordinator that predates the claim marker: unknown
+		// provenance, so missing live prompt state must not be read as "never claimed".
+		const receiptFile = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+		);
+		// The request digest excludes the idempotency key, so a probe with the same
+		// canonical arguments yields the digest a legacy receipt for retryArgs carries.
+		const probe = await server.callTool("gjc_delegate_plan", {
+			...retryArgs,
+			idempotency_key: "managed-worktree-delegate-legacy-probe",
+		});
+		expect(probe).toMatchObject({ ok: true });
+		const probeReceipt = JSON.parse(
+			await fs.readFile(
+				path.join(
+					coordinatorNamespace(root),
+					"idempotency",
+					`${createHash("sha256").update("managed-worktree-delegate-legacy-probe").digest("hex")}.json`,
+				),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		await fs.mkdir(path.dirname(receiptFile), { recursive: true });
+		await Bun.write(
+			receiptFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				tool: probeReceipt.tool,
+				key_digest: createHash("sha256").update(retryArgs.idempotency_key).digest("hex"),
+				request_digest: probeReceipt.request_digest,
+				state: "in_progress",
+				created_at: new Date().toISOString(),
+			})}\n`,
+		);
+		const dispatchesBefore = controls.filter(control => control.operation === "turn.follow_up").length;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(dispatchesBefore);
+	}, 20_000);
+	it("refuses a same-key delegate retry as uncertain once a prompt claim has started", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		let crash = false;
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			[],
+			"gjc --worktree hermes",
+			undefined,
+			{
+				afterPromptReceiptPersisted: () => {
+					if (crash) throw new Error("injected post-claim crash");
+				},
+			},
+		);
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-claimed",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const retryArgs = {
+			cwd: root,
+			session_id: "created-session-1",
+			task: "retry after post-claim crash",
+			queue: true,
+			idempotency_key: "managed-worktree-delegate-claimed",
+			allow_mutation: true,
+		};
+		crash = true;
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({ ok: false });
+		const receiptFile = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(retryArgs.idempotency_key).digest("hex")}.json`,
+		);
+		const receipt = JSON.parse(await fs.readFile(receiptFile, "utf8")) as Record<string, unknown>;
+		expect(receipt).toMatchObject({ state: "in_progress", delegate_prompt_claim_started: true });
+		crash = false;
+		// Erase the claimed prompt so the retry sees no live receipt. The outer marker
+		// still proves a claim started, so missing state must not be read as a fresh key.
+		const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+		const promptKey = createHash("sha256").update(`${retryArgs.idempotency_key}\0turn.follow_up`).digest("hex");
+		await withSessionTransaction(paths, "created-session-1", async transaction => {
+			const request = transaction.requests.prompts[promptKey];
+			if (!request) throw new Error("fixture expected a claimed prompt");
+			const turnId = request.coordinator_turn_id;
+			if (turnId) {
+				delete transaction.canonical.turns[turnId];
+				transaction.canonical.queue.ordered_turn_ids = transaction.canonical.queue.ordered_turn_ids.filter(
+					candidate => candidate !== turnId,
+				);
+			}
+			delete transaction.requests.prompts[promptKey];
+		});
+		await expect(server.callTool("gjc_delegate_plan", retryArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(1);
+	}, 20_000);
+	it("refuses delegate reuse when the persisted workspace escapes the current roots", async () => {
+		const root = await tempRoot();
+		const outside = await tempRoot();
+		await fs.mkdir(path.join(root, "hermes-worktree"), { recursive: true });
+		await fs.mkdir(path.join(root, ".worktrees"), { recursive: true });
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_delegate_plan", {
+				cwd: root,
+				worktree: "hermes",
+				task: "first managed-worktree task",
+				idempotency_key: "managed-worktree-delegate-first-escape",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const persistedSessionPath = path.join(coordinatorNamespace(root), "sessions", "created-session-1.json");
+		const persistedSession = JSON.parse(await fs.readFile(persistedSessionPath, "utf8")) as Record<string, unknown>;
+		const reuse = (key: string) => ({
+			cwd: root,
+			session_id: "created-session-1",
+			task: "reuse must be reauthorized",
+			queue: true,
+			idempotency_key: key,
+			allow_mutation: true,
+		});
+		// A projection redirected to an existing directory outside every root: the
+		// caller cwd still passes, so only persisted-pair reauthorization can refuse it.
+		await Bun.write(persistedSessionPath, JSON.stringify({ ...persistedSession, broker_workspace: outside }));
+		await expect(
+			server.callTool("gjc_delegate_plan", reuse("managed-worktree-delegate-redirected")),
+		).resolves.toMatchObject({ ok: false, error: { code: "workspace_mismatch" } });
+		// Narrowed roots: the caller cwd and persisted cwd stay identical and inside the
+		// new policy, so the earlier cwd identity guard passes; only the untouched
+		// persisted worktree has fallen outside the current roots.
+		const narrowed = path.join(root, "narrowed");
+		await fs.mkdir(narrowed);
+		await Bun.write(persistedSessionPath, JSON.stringify({ ...persistedSession, cwd: narrowed }));
+		server.config.allowedRoots = [narrowed];
+		server.config.managedWorktreeRoots = [path.join(narrowed, ".worktrees")];
+		const controlsBeforeNarrowedReuse = controls.length;
+		await expect(
+			server.callTool("gjc_delegate_plan", { ...reuse("managed-worktree-delegate-narrowed"), cwd: narrowed }),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "workspace_mismatch" },
+		});
+		// Refusal happens before any broker lookup in the revoked workspace.
+		expect(controls.slice(controlsBeforeNarrowedReuse).map(control => control.operation)).toEqual([]);
+		expect(controls.filter(control => control.operation === "turn.follow_up")).toHaveLength(0);
+	}, 20_000);
+	it("keeps endpoint authority separated across two actual managed worktrees", async () => {
+		const root = await tempRoot();
+		await Bun.$`git init -q -b main`.cwd(root);
+		await Bun.$`git config user.email test@example.com`.cwd(root);
+		await Bun.$`git config user.name Test`.cwd(root);
+		await Bun.write(path.join(root, "tracked.txt"), "fixture\n");
+		await Bun.$`git add tracked.txt`.cwd(root);
+		await Bun.$`git commit -qm fixture`.cwd(root);
+		const worktrees = new Map<string, string>();
+		for (const name of ["task-a", "task-b"]) {
+			const worktree = path.join(root, name);
+			await Bun.$`git worktree add -q -b ${name} ${worktree}`.cwd(root);
+			worktrees.set(name, worktree);
+		}
+		const controls: SdkControl[] = [];
+		const brokerSessions = [
+			...(["task-a", "task-b"] as const).map(name => {
+				const sessionCwd = worktrees.get(name)!;
+				return {
+					sessionId: `created-${name}`,
+					locator: {
+						cwd: sessionCwd,
+						worktreeRoot: sessionCwd,
+						stateRoot: path.join(sessionCwd, ".gjc", "state"),
+					},
+					live: true,
+					endpointGeneration: 1,
+					pid: process.pid,
+					endpointMtimeMs: 0,
+				};
+			}),
+		];
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${session.sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await Bun.write(
+				endpointPath,
+				JSON.stringify({
+					sessionId: session.sessionId,
+					pid: process.pid,
+					url: "ws://sdk.example.test",
+					token: "test-token",
+				}),
+			);
+			// The durable fixture helper uses mtime=1 in its deterministic authority
+			// digest; the endpoint file itself still exists in the real worktree.
+			session.endpointMtimeMs = 1;
+		}
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			undefined,
+			undefined,
+			brokerSessions,
+			undefined,
+			undefined,
+			{ preserveEndpointAuthority: true },
+		);
+		const env = {
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+			GJC_COORDINATOR_MCP_MUTATIONS: "sessions,questions,reports",
+			GJC_COORDINATOR_MCP_PROFILE: "local",
+			GJC_COORDINATOR_MCP_REPO: "repo",
+		};
+		for (const session of brokerSessions) {
+			const sessionCwd = (session.locator as Record<string, unknown>).cwd as string;
+			await writeDurableCoordinatorSession({ sessionId: session.sessionId as string, cwd: sessionCwd, env });
+		}
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-a" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
-	}, 15_000);
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-task-b" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+
+		const sessionListScopes = controls
+			.filter(control => control.operation === "session.list")
+			.map(control => control.input.cwd);
+		expect(sessionListScopes).toContain(worktrees.get("task-a"));
+		expect(sessionListScopes).toContain(worktrees.get("task-b"));
+	}, 30_000);
 	it("does not index a managed-worktree endpoint after its authority changes", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3923,6 +4298,21 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" }),
 		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
 	});
+	it("indexes a live managed-worktree endpoint when its persisted authority matches", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, undefined, undefined, [], "gjc --worktree hermes");
+		await expect(
+			server.callTool("gjc_coordinator_start_session", {
+				cwd: root,
+				idempotency_key: "managed-worktree-status",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		await expect(
+			server.callTool("gjc_coordinator_read_status", { session_id: "created-session-1" }),
+		).resolves.toMatchObject({ ok: true, status: { authority: "sdk_broker", live: true } });
+	}, 15_000);
 	it("never returns credential-contaminated reused session records", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

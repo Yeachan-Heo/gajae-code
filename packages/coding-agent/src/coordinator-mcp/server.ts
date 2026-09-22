@@ -1343,6 +1343,11 @@ interface CoordinatorToolIdempotencyRecord {
 	request_digest: string;
 	state: "in_progress" | "completed";
 	response?: Record<string, unknown>;
+	/** Reused-session delegate prompt-claim provenance, written under the key lock:
+	 * `false` when the attempt starts, `true` immediately before the canonical prompt
+	 * claim. A same-key retry may claim afresh only on an explicit `false`; `true` or
+	 * an absent marker (unknown provenance) keeps missing live state fail-closed. */
+	delegate_prompt_claim_started?: boolean;
 	admission?: DelegateAdmissionCheckpoint;
 	delegate_response_pin?: DelegateResponsePinV1;
 	created_at: string;
@@ -5211,6 +5216,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response.error)?.code === "ambiguous";
 	}
 
+	function isTransientDelegateAuthorityFailure(response: Record<string, unknown>): boolean {
+		if (response.ok !== false) return false;
+		return asRecord(response.error)?.code === "unavailable";
+	}
+
 	function publicErrorCode(code: unknown): string {
 		return typeof code === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, code) ? code : "unavailable";
 	}
@@ -8362,9 +8372,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				const binding = await exactBrokerSessionBinding(sessionId, cwd);
 				const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const priorWorkspace = optionalString(priorSession?.broker_workspace);
 				const priorAuthority =
 					priorSession &&
-					priorSession.broker_workspace === binding.workspace &&
+					priorWorkspace !== null &&
+					sameCanonicalPath(priorWorkspace, binding.workspace, platform) &&
 					priorSession.endpoint_generation === binding.endpointGeneration &&
 					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
 						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
@@ -9215,6 +9227,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let initialDelegateRequest: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"];
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
+								// Record that this attempt has not claimed a prompt before any step
+								// that can fail transiently. Only this explicit marker lets a same-key
+								// retry claim afresh; a receipt without it has unknown provenance.
+								if (!recovering && outer.value.delegate_prompt_claim_started === undefined)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: false,
+									});
 								const prior = await readSessionTransaction(questionPaths, sessionId);
 								const prompt = prior?.requests.prompts[requestKey];
 								delegateEffectStarted ||= Boolean(prompt && prompt.phase !== "claimed");
@@ -9246,13 +9266,58 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Coordinator session is bound to another workspace.",
 										},
 									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
-								if (
-									!sameCanonicalPath(
-										optionalString(existing.broker_workspace) ?? "",
-										canonicalCwd,
+								// Delegate-created managed-worktree sessions retain the caller's
+								// repository cwd separately from the broker's execution worktree.
+								// Resolve endpoint authority in that persisted broker workspace;
+								// using canonicalCwd here searches the parent repository and makes
+								// every follow-up appear unindexed even while its endpoint is live.
+								const persistedBrokerWorkspace = optionalString(existing.broker_workspace);
+								if (!persistedBrokerWorkspace)
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								let bindingWorkspace: string;
+								try {
+									bindingWorkspace = await canonicalBrokerWorkspace(persistedBrokerWorkspace);
+								} catch (error) {
+									if (!(error instanceof SdkClientError) || error.code !== "not_found") throw error;
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								}
+								// The caller cwd guard only proves args.cwd is inside the current roots.
+								// The persisted pair is what the delegate actually dispatches through, so
+								// reauthorize it against the current policy before it becomes binding scope:
+								// a narrowed managed-worktree root or a redirected projection must not let
+								// a reused delegate reach a workspace the coordinator no longer owns.
+								try {
+									await assertCoordinatorSessionLocations(config, existingCwd, bindingWorkspace, {
+										canonicalizePath: services.canonicalizePath,
 										platform,
-									) ||
+									});
+								} catch (error) {
+									if (!isSessionAuthorityError(error)) throw error;
+									return {
+										ok: false,
+										error: {
+											code: "workspace_mismatch",
+											message: "Coordinator session workspace is outside the allowed roots.",
+										},
+									};
+								}
+								const binding = await exactBrokerSessionBinding(sessionId, bindingWorkspace);
+								if (
+									// The caller cwd guard above prevents cross-workspace reuse; this
+									// comparison fences the persisted endpoint identity itself.
+									!sameCanonicalPath(binding.workspace, bindingWorkspace, platform) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
 								)
@@ -9382,8 +9447,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									(await readCanonicalActiveTurn(sessionId));
 								const priorTransaction = await readSessionTransaction(questionPaths, sessionId);
 								const priorPrompt = priorTransaction?.requests.prompts[requestKey];
+								// A reused session has no creation authority to recover through, so a
+								// same-key retry after a pre-admission failure (for example a transient
+								// workspace canonicalization error) would otherwise seal as uncertain. The
+								// outer receipt records whether a prompt claim began: an explicit `false`
+								// proves none was claimed and this retry may claim afresh. `true` or an
+								// absent marker means missing live state is still not proof that nothing
+								// was dispatched.
+								const requireClaimedPrompt =
+									recovering && (!reusedSessionId || outer.value.delegate_prompt_claim_started !== false);
 								if (
-									recovering &&
+									requireClaimedPrompt &&
 									!priorPrompt &&
 									!hasInitialDelegatePromptAuthority(priorTransaction, initialDelegateRequest)
 								)
@@ -9413,13 +9487,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										turn_id: previousActiveTurn.turn_id,
 									};
 								}
+								if (outer.value.delegate_prompt_claim_started !== true)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: true,
+									});
 								const promptKey = await claimCanonicalPrompt(
 									sessionId,
 									taggedPrompt,
 									operation,
 									idempotencyKey,
 									true,
-									recovering,
+									requireClaimedPrompt,
 									initialDelegateRequest,
 								);
 								if (reserved?.terminal_fence && !(await promptReceipt(sessionId, promptKey))) {
@@ -9566,6 +9645,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					true,
 					response =>
 						(!delegateResponseComplete && (creationRemoteStarted || delegateEffectStarted)) ||
+						isTransientDelegateAuthorityFailure(response) ||
 						isRouterRequestAmbiguous(response),
 				);
 			}
