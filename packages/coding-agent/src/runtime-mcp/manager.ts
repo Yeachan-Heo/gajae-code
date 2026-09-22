@@ -261,6 +261,22 @@ export interface MCPLoadResult {
 	exaApiKeys: string[];
 }
 
+export type MCPToolCatalogPublication = "unpublished" | "published" | "fenced";
+
+/**
+ * Atomic view of the manager's fenced tool catalog and its publication state.
+ *
+ * `unpublished` is reserved for the initial deferred window where no manager
+ * catalog has been published and no exact control is fencing it. An empty
+ * `published` or `fenced` catalog is authoritative and must not be replaced
+ * with an in-flight discovery result.
+ */
+export interface MCPToolCatalogSnapshot {
+	tools: CustomTool<TSchema, MCPToolDetails>[];
+	publication: MCPToolCatalogPublication;
+	generation: number;
+}
+
 /** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
@@ -378,6 +394,8 @@ export class MCPManager {
 	readonly #retiredLeaseReleases = new Set<RetiredLeaseRelease>();
 	#nextScopedOperationId = 1;
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
+	#toolCatalogGeneration = 0;
+	#toolCatalogPublished = false;
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
@@ -1548,7 +1566,7 @@ export class MCPManager {
 		}
 
 		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#tools = allTools;
+		if (shouldPublishToolSnapshot) this.#publishToolCatalog(allTools);
 		allowBackgroundLogging = true;
 
 		return {
@@ -1561,13 +1579,14 @@ export class MCPManager {
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
 		if (!this.#isExactToolPublicationAllowed(name)) return;
-		this.#tools = this.#tools.filter(
+		const publishedTools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		if (!this.#suppressedServers.has(name)) this.#tools.push(...tools);
+		if (!this.#suppressedServers.has(name)) publishedTools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
-		sortMCPToolsByName(this.#tools);
+		sortMCPToolsByName(publishedTools);
+		this.#publishToolCatalog(publishedTools);
 	}
 
 	#exactToolOptions(
@@ -1654,6 +1673,32 @@ export class MCPManager {
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
 		return this.#tools.filter(tool => !tool.mcpServerName || this.#isExactToolPublicationAllowed(tool.mcpServerName));
+	}
+
+	/**
+	 * Read the fenced catalog and publication state atomically.
+	 *
+	 * An empty catalog is still authoritative after publication or while an
+	 * exact control is in flight. Deferred startup may fall back to its discovery
+	 * result only for the explicit `unpublished` state.
+	 */
+	getToolCatalogSnapshot(): MCPToolCatalogSnapshot {
+		const exactControlFence =
+			this.#toolsOnly &&
+			(this.#suppressedServers.size > 0 ||
+				this.#pendingExactSuspensions.size > 0 ||
+				this.#pendingExactControlServers.size > 0);
+		return {
+			tools: this.getTools(),
+			publication: exactControlFence ? "fenced" : this.#toolCatalogPublished ? "published" : "unpublished",
+			generation: this.#toolCatalogGeneration,
+		};
+	}
+
+	#publishToolCatalog(tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+		this.#tools = tools;
+		this.#toolCatalogGeneration++;
+		this.#toolCatalogPublished = true;
 	}
 
 	#isExactToolPublicationAllowed(name: string): boolean {
@@ -1845,7 +1890,7 @@ export class MCPManager {
 					if (!candidate.publish) throw new Error("Exact MCP reset candidate does not support atomic publication");
 					candidate.publish();
 				}
-				this.#tools = tools;
+				this.#publishToolCatalog(tools);
 				this.#suppressedServers.clear();
 				this.#pendingExactSuspensions.clear();
 				this.#drainDeferredSharedRebinds();
@@ -1943,7 +1988,7 @@ export class MCPManager {
 				...serverTools,
 			];
 			sortMCPToolsByName(publishedTools);
-			this.#tools = publishedTools;
+			this.#publishToolCatalog(publishedTools);
 			this.#suppressedServers.delete(name);
 			this.#pendingExactControlServers.delete(name);
 			this.#drainDeferredSharedRebinds();
@@ -2378,10 +2423,15 @@ export class MCPManager {
 		const hadTools = this.#tools.some(
 			tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
 		);
-		this.#tools = this.#tools.filter(
+		const remainingTools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		if (hadTools) this.#onToolsChanged?.(this.#tools);
+		if (hadTools) {
+			this.#publishToolCatalog(remainingTools);
+			this.#onToolsChanged?.(this.#tools);
+		} else {
+			this.#tools = remainingTools;
+		}
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
@@ -2488,7 +2538,7 @@ export class MCPManager {
 			this.#pendingExactSuspensions.clear();
 			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
-			this.#tools = [];
+			this.#publishToolCatalog([]);
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures,

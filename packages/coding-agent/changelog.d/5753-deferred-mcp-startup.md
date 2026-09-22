@@ -1,3 +1,3 @@
 ### Fixed
 
-- Preserve the discovered MCP catalog when deferred exact-config startup has not published its first manager snapshot yet, so startup reports the real tool count and error state without dropping persisted MCP selections.
+- Preserve the discovered MCP catalog only while deferred exact-config startup has not published or fenced its first manager snapshot, so startup reports the real tool count without replaying tools suppressed by a concurrent exact control.

@@ -259,6 +259,33 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
+	it("does not replay a stale discovery snapshot after an exact control fences an empty catalog", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-fenced-mcp.json");
+		const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
+		// This is the atomic manager view observed when an exact suspend/disconnect
+		// wins the race after discovery has copied its result but before the SDK
+		// continuation consumes it. The empty fenced catalog is authoritative.
+		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
+			tools: [],
+			publication: "fenced",
+			generation: 1,
+		});
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			expect(session.getAllToolNames()).not.toContain(staleTool.name);
+			expect(session.getActiveToolNames()).not.toContain(staleTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it(
 		"keeps deferred MCP startup and tool use alive across a logical session transition",
