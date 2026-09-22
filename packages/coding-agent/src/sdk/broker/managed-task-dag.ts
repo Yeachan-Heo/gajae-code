@@ -1630,7 +1630,7 @@ async function removeEmptyManagedEnrollment(agentDir: string, controlRoot: strin
 		async () => {
 			const record = await loadEnrollmentIndexUnderLock(target);
 			if (!record.controlRoots.includes(controlRoot)) return true;
-			if (record.nativeIdentities.length > 0 || (record.byRoot[controlRoot] ?? []).length > 0) return false;
+			if ((record.byRoot[controlRoot] ?? []).length > 0) return false;
 			const controlRoots = record.controlRoots.filter(root => root !== controlRoot);
 			const byRoot = { ...record.byRoot };
 			delete byRoot[controlRoot];
@@ -1716,11 +1716,7 @@ export async function restoreManagedAttemptRefs(agentDir: string): Promise<Resto
 		try {
 			const read = await readExistingStateForMutation(managedTaskDomainPath(controlRoot));
 			if (read.kind !== "valid") {
-				if (
-					read.kind === "absent" &&
-					enrollment.nativeIdentities.length === 0 &&
-					(enrollment.byRoot[controlRoot] ?? []).length === 0
-				) {
+				if (read.kind === "absent" && (enrollment.byRoot[controlRoot] ?? []).length === 0) {
 					if (await removeEmptyManagedEnrollment(agentDir, controlRoot)) continue;
 				}
 				failedRoots.push(controlRoot);

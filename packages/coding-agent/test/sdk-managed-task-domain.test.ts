@@ -330,4 +330,29 @@ describe("strict private shared domain transactions", () => {
 		expect(enrolled.state.state_revision).toBe(1);
 		expect((await loadManagedEnrollmentRecord(root)).controlRoots).toEqual([root]);
 	});
+	it("reclaims an absent root without losing another root's native enrollment", async () => {
+		const { root, binding, node } = await fixture();
+		await enroll(binding, [node("a")]);
+		await transactManagedTaskDomain({ binding, expectedRevision: 1 }, state =>
+			admitManagedTask(state, admission("a")),
+		);
+		const native = managedIdentity("a");
+		await recordManagedEnrollment(root, root, native);
+		const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-stale-"));
+		roots.push(staleRoot);
+		await recordManagedEnrollment(root, staleRoot);
+		const before = await restoreManagedAttemptRefs(root);
+		expect(before.failedRoots).toEqual([]);
+		expect(before.refs).toHaveLength(1);
+		expect(before.refs[0]?.nativeIdentity).toBe(native);
+		const record = await loadManagedEnrollmentRecord(root);
+		expect(record.controlRoots).toEqual([root]);
+		expect(record.byRoot).toEqual({ [root]: [native] });
+		expect(record.nativeIdentities).toEqual([native]);
+		expect(await restoreManagedAttemptRefs(root)).toEqual(before);
+		// An established root still fails closed when its own state disappears.
+		await fs.rm(managedTaskDomainPath(root));
+		expect((await restoreManagedAttemptRefs(root)).failedRoots).toEqual([root]);
+		expect((await loadManagedEnrollmentRecord(root)).nativeIdentities).toEqual([native]);
+	});
 });
