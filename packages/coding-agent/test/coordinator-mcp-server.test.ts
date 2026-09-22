@@ -483,7 +483,10 @@ async function createSdkControlServer(
 							const sessionId = input.sessionId;
 							const index = brokerSessions.findIndex(session => session.sessionId === sessionId);
 							if (index >= 0) brokerSessions.splice(index, 1);
-							return { ok: true, result: { sessionId } };
+							return {
+								ok: true,
+								result: { sessionId, ...(input.forceRetireStale === true ? { retired: true } : {}) },
+							};
 						}
 						if (operation === "session.create") {
 							const target = input.target as Record<string, unknown> | undefined;
@@ -7400,7 +7403,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(await Bun.file(path.join(sessionsDir, "registered-session.json")).exists()).toBe(true);
 	});
 
-	async function stageDeadHostSession(root: string, sessionId: string) {
+	async function stageDeadHostSession(
+		root: string,
+		sessionId: string,
+		options: {
+			globalResult?: (
+				operation: string,
+				input: Record<string, unknown>,
+				brokerSessions: Array<Record<string, unknown>>,
+			) => unknown;
+		} = {},
+	) {
 		const controls: SdkControl[] = [];
 		const brokerSessions: Array<Record<string, unknown>> = [
 			{
@@ -7416,10 +7429,15 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		// Every close attempt reaches the broker, which answers endpoint_stale instead of
 		// closing — what the broker does for an identity-matching row with no live host.
 		const server = await createSdkControlServer(root, controls, [], undefined, brokerSessions, undefined, undefined, {
-			globalResult: (operation, input) =>
-				operation === "session.close" && input.sessionId === sessionId
-					? { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
-					: undefined,
+			globalResult: (operation, input, sessions) => {
+				const override = options.globalResult?.(operation, input, sessions);
+				if (override !== undefined) return override;
+				return operation === "session.close" && input.sessionId === sessionId
+					? input.forceRetireStale === true
+						? { ok: true, result: { sessionId, retired: true } }
+						: { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } }
+					: undefined;
+			},
 		});
 		await expect(
 			server.callTool("gjc_coordinator_register_session", {
@@ -7481,8 +7499,8 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			expect(await server.sessionReaper.sweepOnce()).toBe(0);
 		}
 
-		// One close per sweep: a fresh close first, then recovery of the admitted intent.
-		expect(closeAttempts()).toBe(MAX_REAP_FAILURES);
+		// One normal close per sweep plus the final atomic stale-authority fence.
+		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
 		expect(await readSessionTransaction(paths, "dead-host-session")).toBeNull();
 		await expect(Bun.file(transactionPath(paths, "dead-host-session")).exists()).resolves.toBe(false);
 		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
@@ -7541,6 +7559,90 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
 		expect(await readSessionTransaction(paths, "quiet-host-session")).not.toBeNull();
 		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+	});
+
+	it("does not force-evict unresolved broker authority rows", async () => {
+		for (const flag of ["ambiguous", "terminalUncertain"] as const) {
+			const root = await tempRoot();
+			const sessionId = `unresolved-${flag}`;
+			const { server, brokerSessions, paths, sessionFile, closeAttempts, deletions } = await stageDeadHostSession(
+				root,
+				sessionId,
+			);
+			brokerSessions[0]!.live = false;
+			brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+			brokerSessions[0]![flag] = true;
+
+			for (let i = 0; i < MAX_REAP_FAILURES + 1; i++) {
+				expect(await server.sessionReaper.sweepOnce()).toBe(0);
+			}
+
+			expect(closeAttempts()).toBe(MAX_REAP_FAILURES + 1);
+			expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+			await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+			expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+				[],
+			);
+		}
+	});
+
+	it("refuses cleanup when the broker authority recovers before the atomic fence", async () => {
+		const root = await tempRoot();
+		const sessionId = "recovered-before-fence";
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId || input.forceRetireStale !== true)
+					return undefined;
+				sessions[0]!.live = true;
+				sessions[0]!.lastHeartbeatAt = Date.now();
+				return { ok: false, error: { code: "endpoint_stale", message: "authority recovered before fence" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).not.toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(true);
+		expect((await deletions()).filter(entry => entry.deletion_id.startsWith(`force-evict:${sessionId}:`))).toEqual(
+			[],
+		);
+	});
+
+	it("escalates a close-time not_found race to bounded stale eviction", async () => {
+		const root = await tempRoot();
+		const sessionId = "close-not-found-race";
+		let closeRace = true;
+		const { server, brokerSessions, paths, sessionFile, deletions } = await stageDeadHostSession(root, sessionId, {
+			globalResult: (operation, input, sessions) => {
+				if (operation !== "session.close" || input.sessionId !== sessionId) return undefined;
+				if (input.forceRetireStale === true)
+					return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+				if (closeRace) {
+					closeRace = false;
+					sessions.splice(0, 1);
+				}
+				return { ok: false, error: { code: "not_found", message: "session disappeared before close" } };
+			},
+		});
+		brokerSessions[0]!.live = false;
+		brokerSessions[0]!.lastHeartbeatAt = Date.now() - 31 * 60_000;
+
+		for (let i = 0; i < MAX_REAP_FAILURES; i++) {
+			expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		}
+
+		expect(await readSessionTransaction(paths, sessionId)).toBeNull();
+		await expect(Bun.file(sessionFile).exists()).resolves.toBe(false);
+		expect(await deletions()).toContainEqual(
+			expect.objectContaining({
+				deletion_id: expect.stringMatching(/^force-evict:close-not-found-race:/),
+				phase: "completed",
+			}),
+		);
 	});
 
 	it("force-evicts a session whose projection lost its endpoint incarnation once the broker endpoint has rotated away, retiring WAL, registry, retained deliveries, and projections", async () => {

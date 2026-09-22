@@ -87,6 +87,7 @@ import {
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import {
+	DEAD_HOST_HEARTBEAT_SILENCE_MS,
 	type IndexedSession,
 	isSessionAuthorityEligible,
 	resolveSessionLocator,
@@ -2447,6 +2448,43 @@ async function executeUncertainRetirement(
 		}
 	}
 	return retirementProof(retirementIdentity, receipt.indexSeq);
+}
+
+/**
+ * Fence a coordinator's dead-host cleanup against the broker's current index
+ * authority. This is deliberately separate from ordinary `session.close`: the
+ * runtime endpoint is already known to be unavailable, so the broker must make
+ * the exact generation terminal under its index lock before coordinator state is
+ * removed. A fresh heartbeat, successor, ambiguous row, or terminal-uncertain
+ * authority refuses the fence.
+ */
+async function executeStaleSessionRetirement(broker: Broker, input: Input): Promise<BrokerResponse> {
+	const id = sessionId(input);
+	if (!id) return fail("invalid_input", "sessionId is required.");
+	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	const requestedAuthority = requestedCloseAuthority(input);
+	if ("error" in requestedAuthority) return requestedAuthority.error;
+	if (!requestedAuthority.authority)
+		return fail("invalid_input", "stale session retirement requires endpoint authority.");
+	const cwd = lifecycleCwd(input);
+	if (!cwd) return fail("invalid_input", "stale session retirement requires cwd.");
+	const result = await broker.index.retireStaleIfCurrent({
+		sessionId: id,
+		workspace: cwd,
+		endpointGeneration: requestedAuthority.authority.endpointGeneration,
+		endpointIncarnation: requestedAuthority.authority.endpointIncarnation,
+	});
+	if (result === "not_found") return fail("not_found", "session is not indexed");
+	if (result === "stale") return fail("endpoint_stale", "session endpoint authority changed or is unresolved.");
+	return {
+		ok: true,
+		result: {
+			sessionId: id,
+			retired: true,
+			...(result === "already_retired" ? { alreadyRetired: true } : {}),
+			heartbeatSilenceMs: DEAD_HOST_HEARTBEAT_SILENCE_MS,
+		},
+	};
 }
 
 function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
@@ -5646,6 +5684,8 @@ async function executeLifecycleResponse(
 	const id = cleanup && operation === "session.delete" ? cleanup.sessionId : sessionId(input);
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	if (operation === "session.close" && input.forceRetireStale === true)
+		return await executeStaleSessionRetirement(broker, input);
 	await broker.index.refresh();
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {

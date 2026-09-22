@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Broker } from "../src/sdk/broker/broker";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
+	executeLifecycle,
 	releaseForcedStaleWorktreeForTest,
 	setProcessIncarnationForTest,
 	worktreeOccupantForTest,
@@ -20,7 +22,7 @@ const uncertain = () => "uncertain" as const;
 // `setProcessIncarnationForTest` therefore exercises the real code path without
 // standing up a full broker.
 function fakeBroker(index: SessionIndex, incarnationReader: (pid: number) => string | undefined): Broker {
-	const broker = { index } as unknown as Broker;
+	const broker = { index, ledger: { get: () => undefined } } as unknown as Broker;
 	setProcessIncarnationForTest(broker, incarnationReader);
 	return broker;
 }
@@ -228,5 +230,107 @@ describe("forced stale-endpoint worktree release", () => {
 		const owner = index.listSessions().sessions.find(session => session.sessionId === "live");
 		expect(owner?.terminalUncertain).toBeFalsy();
 		expect(worktreeOccupantForTest(index.listSessions().sessions, WORKTREE, uncertain)).toBe("live");
+	});
+
+	it("atomically fences an exact long-silent authority and rejects a refreshed heartbeat", async () => {
+		const { index, stateRoot } = await scenario();
+		const sessionId = "atomic-stale";
+		const staleAt = Date.now() - 31 * 60_000;
+		const registered = {
+			...registration(sessionId, stateRoot, {
+				endpointGeneration: 3,
+				pid: 999_991,
+				incarnation: "stale-incarnation",
+			}),
+			endpointMtimeMs: 2,
+		};
+		await index.append({ ...registered, ts: staleAt });
+		await index.append({
+			...registered,
+			type: "host_heartbeat",
+			ts: staleAt,
+			activity: { state: "idle", at: staleAt },
+		});
+		const row = index.listSessions().sessions.find(session => session.sessionId === sessionId) as IndexedSession;
+		const incarnation = endpointIncarnation(row, sessionId);
+		expect(incarnation).toMatch(/^[a-f0-9]{64}$/);
+		if (!incarnation) throw new Error("endpoint incarnation missing");
+		expect(
+			await index.retireStaleIfCurrent({
+				sessionId,
+				workspace: WORKTREE,
+				endpointGeneration: row.endpointGeneration,
+				endpointIncarnation: incarnation,
+			}),
+		).toBe("retired");
+		expect(index.listSessions().sessions.find(session => session.sessionId === sessionId)?.terminal).toBe(true);
+
+		const refreshedId = "atomic-refreshed";
+		const refreshed = {
+			...registration(refreshedId, stateRoot, {
+				endpointGeneration: 4,
+				pid: 999_992,
+				incarnation: "refreshed-incarnation",
+			}),
+			endpointMtimeMs: 2,
+		};
+		await index.append({ ...refreshed, ts: staleAt });
+		await index.append({
+			...refreshed,
+			type: "host_heartbeat",
+			ts: Date.now(),
+			activity: { state: "idle", at: Date.now() },
+		});
+		const refreshedRow = index
+			.listSessions()
+			.sessions.find(session => session.sessionId === refreshedId) as IndexedSession;
+		const refreshedIncarnation = endpointIncarnation(refreshedRow, refreshedId);
+		if (!refreshedIncarnation) throw new Error("refreshed endpoint incarnation missing");
+		expect(
+			await index.retireStaleIfCurrent({
+				sessionId: refreshedId,
+				workspace: WORKTREE,
+				endpointGeneration: refreshedRow.endpointGeneration,
+				endpointIncarnation: refreshedIncarnation,
+			}),
+		).toBe("stale");
+		expect(index.listSessions().sessions.find(session => session.sessionId === refreshedId)?.terminal).toBe(false);
+	});
+
+	it("exposes the atomic stale fence through the lifecycle broker operation", async () => {
+		const { index, stateRoot } = await scenario();
+		const sessionId = "lifecycle-stale";
+		const staleAt = Date.now() - 31 * 60_000;
+		const registered = {
+			...registration(sessionId, stateRoot, {
+				endpointGeneration: 5,
+				pid: 999_993,
+				incarnation: "lifecycle-stale-incarnation",
+			}),
+			endpointMtimeMs: 2,
+		};
+		await index.append({ ...registered, ts: staleAt });
+		await index.append({
+			...registered,
+			type: "host_heartbeat",
+			ts: staleAt,
+			activity: { state: "idle", at: staleAt },
+		});
+		const row = index.listSessions().sessions.find(session => session.sessionId === sessionId) as IndexedSession;
+		const incarnation = endpointIncarnation(row, sessionId);
+		if (!incarnation) throw new Error("endpoint incarnation missing");
+		const outcome = await executeLifecycle(
+			fakeBroker(index, () => undefined),
+			"session.close",
+			{
+				sessionId,
+				cwd: WORKTREE,
+				endpointGeneration: row.endpointGeneration,
+				endpointIncarnation: incarnation,
+				forceRetireStale: true,
+			},
+			"lifecycle-stale-fence",
+		);
+		expect(outcome.response).toMatchObject({ ok: true, result: { sessionId, retired: true } });
 	});
 });
