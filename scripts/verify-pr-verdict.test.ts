@@ -1982,6 +1982,7 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		[".github/actions/build-native/action.yml\tinputs.hash", "hex digest computed in-workflow; ci.yml is the only caller"],
 		[".github/actions/build-native/action.yml\tinputs.nightly_version", "same generated version; ci.yml is the only caller"],
 		[".github/workflows/ci.yml\tgithub.ref", "ref name; writing one requires push access to this protected path"],
+		[".github/workflows/ci.yml\tgithub.run_id", "integer assigned by GitHub"],
 		[".github/workflows/ci.yml\tgithub.sha", "40-hex, server-computed"],
 		[".github/workflows/ci.yml\tmatrix.binary_path", "workflow-fixed matrix literal"],
 		[".github/workflows/ci.yml\tneeds.acp_conformance.result", "closed result enum"],
