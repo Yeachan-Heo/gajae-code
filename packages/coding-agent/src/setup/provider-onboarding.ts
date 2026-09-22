@@ -70,6 +70,7 @@ export interface ProviderSetupResult {
 	modelIds: string[];
 	modelsPath: string;
 	redactedApiKey: string;
+	apiKeyEnv?: string;
 	credentialSource: "literal" | "env";
 	/** True when the provider persists a `discovery:` block (live catalog). */
 	discoveryEnabled: boolean;
@@ -191,6 +192,12 @@ async function resolveStoredApiKeyForProbe(
 
 export function redactSecret(_secret: string): string {
 	return "***";
+}
+
+/** Preserve a small, non-sensitive part of an environment variable name. */
+export function redactEnvironmentVariableName(name: string): string {
+	if (name.length <= 8) return "…";
+	return `${name.slice(0, 4)}…${name.slice(-4)}`;
 }
 
 function apiForCompatibility(compatibility: ProviderCompatibility): ProviderSetupApi {
@@ -577,6 +584,7 @@ export async function addApiCompatibleProvider(input: ProviderSetupInput): Promi
 		modelIds: validated.models,
 		modelsPath,
 		redactedApiKey: redactSecret(validated.apiKey),
+		apiKeyEnv: validated.credentialSource === "env" ? validated.apiKey : undefined,
 		credentialSource: validated.credentialSource,
 		discoveryEnabled: validated.discovery !== undefined,
 		discoveryType: validated.discovery?.type,
@@ -773,7 +781,7 @@ export function formatProviderSetupResult(result: ProviderSetupResult): string {
 				]
 			: []),
 		`Base URL: ${result.baseUrl}`,
-		`API key: ${result.credentialSource === "env" ? `${result.redactedApiKey} (environment variable)` : result.redactedApiKey}`,
+		`API key: ${result.credentialSource === "env" ? `${redactEnvironmentVariableName(result.apiKeyEnv ?? result.redactedApiKey)} (environment variable)` : result.redactedApiKey}`,
 		`Config: ${result.modelsPath}`,
 	].join("\n");
 }

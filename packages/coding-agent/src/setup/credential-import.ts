@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AuthCredential, OAuthCredential } from "@gajae-code/ai/core";
 import { $credentialEnv, isEnoent } from "@gajae-code/utils";
-import { redactSecret } from "./provider-onboarding";
+import { redactEnvironmentVariableName, redactSecret } from "./provider-onboarding";
 
 /** gjc provider ids that external credentials map onto. */
 export type ExternalProvider = "anthropic" | "openai-codex";
@@ -469,7 +469,7 @@ export function formatDiscoverySummary(result: CredentialDiscoveryResult): strin
 	}
 	for (const hint of result.environment) {
 		lines.push(
-			`env     ${EXTERNAL_PROVIDER_LABELS[hint.provider]} · ${hint.variable}=${hint.redactedValue} (already active via environment)`,
+			`env     ${EXTERNAL_PROVIDER_LABELS[hint.provider]} · ${redactEnvironmentVariableName(hint.variable)}=${hint.redactedValue} (already active via environment)`,
 		);
 	}
 	return lines;
