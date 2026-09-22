@@ -78,6 +78,7 @@ import {
 } from "./acp-event-mapper";
 import { resolveAcpPermissionMode } from "./permission-mode";
 import type { AcpStartupOptions } from "./startup-options";
+import { resolveStartupProvenance } from "./startup-provenance";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -3027,24 +3028,23 @@ export class AcpAgent implements Agent {
 			// a broker-launched SDK host keeps ACP ownership across reconnects.
 			await adapter.start({ activateProviders: false });
 			let capabilities: JsonObject | undefined;
+			// A query that never answered and a host that answered without provenance are
+			// different operator problems, so the failure is retained instead of discarded.
+			let capabilitiesFailure: unknown;
 			try {
 				const response = object(await adapter.query("runtime.capabilities"));
 				const result = object(response?.result) ?? response;
 				// Q18 is a paged query surface: the capability object arrives as the single
 				// page item, so fall back to the envelope only for direct-result hosts.
 				capabilities = object(pageItems(result)[0]) ?? result;
-			} catch {}
-			const primaryControlSurface =
-				capabilities?.primaryControlSurface === "sdk"
-					? "sdk"
-					: capabilities?.primaryControlSurface === "cli"
-						? "cli"
-						: undefined;
-			if (capabilities?.promptTerminalOutcomeVersion !== 1 || primaryControlSurface === undefined)
-				throw new AcpSdkAdapterError(
-					"unavailable",
-					"This ACP client requires a newer GJC SDK session with startup control provenance; restart the session.",
-				);
+			} catch (error) {
+				capabilitiesFailure = error;
+			}
+			const primaryControlSurface = resolveStartupProvenance({
+				sessionId: id,
+				capabilities,
+				queryFailure: capabilitiesFailure,
+			});
 			if (primaryControlSurface === "sdk") {
 				adapter.authorizeProviderActivation();
 				await adapter.ensureProviders();
