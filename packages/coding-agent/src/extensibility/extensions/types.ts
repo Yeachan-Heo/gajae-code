@@ -484,7 +484,7 @@ export interface ExtensionContext {
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle(): string | undefined;
 	/** The session's authoritative host-liveness lease. */
-	getSessionWorkLease?(): SessionWorkLease;
+	getSessionWorkLease?(): SessionWorkLease | undefined;
 	/** Abort the current agent operation */
 	abort(): void | Promise<void>;
 	/** Abort and prove whether resources for a specific prompt settled. */
@@ -1664,7 +1664,7 @@ export interface ExtensionContextActions {
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
 	/** The session's authoritative host-liveness lease. */
-	getSessionWorkLease?: () => SessionWorkLease;
+	getSessionWorkLease?: () => SessionWorkLease | undefined;
 	abort: () => void | Promise<void>;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 

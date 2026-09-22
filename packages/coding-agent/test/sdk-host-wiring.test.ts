@@ -815,6 +815,98 @@ test("observer daemon demand covers hello-before-replay, replay-after, and disco
 	}
 }, 60_000);
 
+test("accepted prompt keeps the host lease held until active lifecycle settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-admission-lease-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-admission-lease-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "admission-lease",
+			operation: "turn.prompt",
+			input: { text: "hold the host lease" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "admission-lease"),
+		"accepted prompt response",
+	);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	expect(sessionHostWorkLeaseActive()).toBe(true);
+	await handlers.get("agent_end")?.(
+		{ type: "agent_end", stopReason: "completed", messages: [{ role: "assistant", stopReason: "stop" }] },
+		sessionContext,
+	);
+	await waitFor(() => !sessionHostWorkLeaseActive(), "active lifecycle lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
+test("accepted steer failure releases its queued host lease", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steer-lease-failure-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steer-lease-failure-${Date.now()}`;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			await firePreflightAccept(options);
+			throw Object.assign(new Error("steer dispatch failed after acceptance"), { code: "unavailable" });
+		},
+		true,
+	);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "steer-lease-failure",
+			operation: "turn.steer",
+			input: { text: "fail after acceptance" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "steer-lease-failure"),
+		"steer failure response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "steer-lease-failure")).toMatchObject({
+		ok: false,
+		error: { code: "unavailable" },
+	});
+	await waitFor(() => !sessionHostWorkLeaseActive(), "failed steer lease release");
+	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+
 test("replay capability claims cannot turn a demanding connection into an observer", async () => {
 	let sdkFrame: Parameters<NotificationServer["onSdkFrame"]>[0] | undefined;
 	const sdkFrameImpl = NotificationServer.prototype.onSdkFrame;

@@ -2610,7 +2610,7 @@ function sdkControlSurface(
 	trackReconciliationProducer?: (producer: Promise<unknown>) => void,
 	sessionWorkLease?: SessionWorkLease,
 	queueWorkLease?: (lease: SessionWorkLeaseHandle) => void,
-	removeQueuedWorkLease?: (lease: SessionWorkLeaseHandle) => void,
+	removeQueuedWorkLease?: (lease: SessionWorkLeaseHandle) => boolean,
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
 	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
@@ -2666,19 +2666,29 @@ function sdkControlSurface(
 			workLease?.release();
 			workLease = undefined;
 		};
+		const releaseQueuedWorkLease = (): void => {
+			const handle = queuedWorkLease;
+			if (!handle) return;
+			const removed = removeQueuedWorkLease?.(handle);
+			// A false result means agent_start already transferred the handle to
+			// active execution; only release a handle that is still queued.
+			if (removed !== false) handle.release();
+			queuedWorkLease = undefined;
+		};
 		const onAccepted = (): void => {
 			accepted = true;
 			if (!workLease) return;
 			queuedWorkLease = workLease;
 			if (queueWorkLease) queueWorkLease(workLease);
-			else releaseWorkLease();
+			else {
+				workLease.release();
+				queuedWorkLease = undefined;
+			}
 			workLease = undefined;
 		};
 		const onPromoted = (promotion: { startsOwnRun?: boolean; removed?: boolean }): void => {
 			if (promotion.removed || promotion.startsOwnRun === false) {
-				if (queuedWorkLease) removeQueuedWorkLease?.(queuedWorkLease);
-				queuedWorkLease?.release();
-				queuedWorkLease = undefined;
+				releaseQueuedWorkLease();
 			}
 		};
 		if (clientRef === undefined) {
@@ -2697,6 +2707,7 @@ function sdkControlSurface(
 				if (!accepted) releaseWorkLease();
 			} catch (error) {
 				releaseWorkLease();
+				releaseQueuedWorkLease();
 				throw error;
 			}
 			return { ...correlation, accepted: true };
@@ -2721,6 +2732,7 @@ function sdkControlSurface(
 			};
 		} catch (error) {
 			releaseWorkLease();
+			releaseQueuedWorkLease();
 			return {
 				sessionId: ctx.sessionManager.getSessionId(),
 				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
@@ -2829,6 +2841,14 @@ function sdkControlSurface(
 				code: "invalid_input",
 			});
 		let admissionWorkLease = hostWorkLease?.acquire();
+		let queuedAdmissionWorkLease: SessionWorkLeaseHandle | undefined;
+		const releaseQueuedAdmissionWorkLease = (): void => {
+			const handle = queuedAdmissionWorkLease;
+			if (!handle) return;
+			const removed = removeQueuedWorkLease?.(handle);
+			if (removed !== false) handle.release();
+			queuedAdmissionWorkLease = undefined;
+		};
 		if (trackReconciliation) {
 			// Restart recovery must be committed before a tracked prompt reserves capacity,
 			// otherwise it can admit against pre-hydration state or a lost clientRef.
@@ -2946,9 +2966,10 @@ function sdkControlSurface(
 				throw error;
 			}
 			if (admissionWorkLease) {
-				if (requesterConnectionId || trackReconciliation) admissionWorkLease.release();
-				else if (queueWorkLease) queueWorkLease(admissionWorkLease);
-				else admissionWorkLease.release();
+				if (queueWorkLease) {
+					queuedAdmissionWorkLease = admissionWorkLease;
+					queueWorkLease(admissionWorkLease);
+				} else admissionWorkLease.release();
 				admissionWorkLease = undefined;
 			}
 			accepting = false;
@@ -2982,6 +3003,7 @@ function sdkControlSurface(
 			);
 		} catch (error) {
 			submissionSettled.resolve();
+			releaseQueuedAdmissionWorkLease();
 			if (accepted && !preflightController.signal.aborted)
 				trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 			else settlePreflight({ status: "rejected", error });
@@ -3002,6 +3024,7 @@ function sdkControlSurface(
 					submissionSettled.resolve();
 				},
 				error => {
+					releaseQueuedAdmissionWorkLease();
 					if (accepted && !preflightController.signal.aborted)
 						trackReconciliationProducer?.(Promise.resolve(onPromptFailed(correlation, error)));
 					else settlePreflight({ status: "rejected", error });
@@ -3014,6 +3037,7 @@ function sdkControlSurface(
 			if (result.status === "rejected") throw result.error;
 			return { commandId, turnId, accepted: true, ...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}) };
 		} catch (error) {
+			releaseQueuedAdmissionWorkLease();
 			admissionWorkLease?.release();
 			admissionWorkLease = undefined;
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
@@ -7197,15 +7221,18 @@ export function createNotificationsExtension(
 					runtimes.get(id) !== currentRuntime
 				) {
 					lease.release();
-					return;
+					return false;
 				}
 				currentRuntime.pendingIngressWorkLeases.push(lease);
+				return true;
 			},
 			lease => {
 				const currentRuntime = runtime;
-				if (!currentRuntime) return;
+				if (!currentRuntime) return false;
 				const index = currentRuntime.pendingIngressWorkLeases.indexOf(lease);
-				if (index >= 0) currentRuntime.pendingIngressWorkLeases.splice(index, 1);
+				if (index < 0) return false;
+				currentRuntime.pendingIngressWorkLeases.splice(index, 1);
+				return true;
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
