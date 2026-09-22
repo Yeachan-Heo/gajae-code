@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "bun:test";
 import { logger } from "@gajae-code/utils";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
+import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
 // honors it. Startup used to discard it anyway: one batch-wide timer decided
@@ -92,6 +93,32 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	}, 15_000);
 
+	test("cleans up an expired pending connection even when cached tools exist", async () => {
+		const cache = {
+			get: vi.fn(async () => [{ name: "ping", inputSchema: { type: "object" } }]),
+			set: vi.fn(async () => {}),
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache);
+		try {
+			const result = await manager.connectServers(
+				{
+					cached: {
+						command: process.execPath,
+						args: ["-e", delayedStdioServer("ping", 5_000)],
+					},
+				},
+				{},
+			);
+
+			expect(cache.get).toHaveBeenCalledWith("cached", expect.anything());
+			expect(result.errors.get("cached")).toContain("timed out");
+			expect(result.tools).toHaveLength(1);
+			expect(manager.getConnectionStatus("cached")).toBe("disconnected");
+		} finally {
+			await manager.disconnectAll();
+		}
+	}, 15_000);
+
 	test("gives up on a server once its declared window has actually elapsed", async () => {
 		const manager = new MCPManager(process.cwd());
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -122,6 +149,38 @@ describe("MCP startup and the declared connection window", () => {
 		} finally {
 			warning.mockRestore();
 			await manager.disconnectAll();
+		}
+	});
+
+	test("does not persist remote startup error text in the default warning", async () => {
+		const secret = "STARTUP_HTTP_SECRET";
+		const server = Bun.serve({
+			port: 0,
+			fetch() {
+				return new Response(`server rejected ${secret}`, { status: 500 });
+			},
+		});
+		const manager = new MCPManager(process.cwd());
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const result = await manager.connectServers(
+				{
+					remote: { type: "http", url: server.url.href, timeout: 1_000 },
+				},
+				{},
+			);
+
+			expect(result.errors.get("remote")).toContain(secret);
+			const startupWarning = warning.mock.calls.find(
+				([message]) => message === "MCP server connection failed during startup",
+			);
+			expect(startupWarning).toBeDefined();
+			expect(startupWarning?.[1]).toMatchObject({ error: "expected-mcp-failure" });
+			expect(JSON.stringify(startupWarning)).not.toContain(secret);
+		} finally {
+			warning.mockRestore();
+			await manager.disconnectAll();
+			await server.stop(true);
 		}
 	});
 
