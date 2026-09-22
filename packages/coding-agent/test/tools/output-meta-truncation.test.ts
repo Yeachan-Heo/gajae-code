@@ -33,7 +33,7 @@ describe("output truncation metadata plumbing", () => {
 			label: "Refuse",
 			description: "refuses",
 			parameters: z.object({}),
-			execute: async () => {
+			execute: async (_toolCallId: string, _params: Record<string, never>) => {
 				throw expected;
 			},
 		});

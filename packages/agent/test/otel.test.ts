@@ -31,10 +31,10 @@ import type { Message } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { EventStream } from "@gajae-code/ai/utils/event-stream";
-import { context, SpanStatusCode, trace } from "@opentelemetry/api";
-import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { getHandledErrorLogPath, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils/dirs";
 import { resetHandledErrorDedupeForTest } from "@gajae-code/utils/postmortem";
+import { context, SpanStatusCode, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import {
 	BasicTracerProvider,
 	InMemorySpanExporter,

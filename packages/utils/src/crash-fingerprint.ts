@@ -235,9 +235,7 @@ function computeFingerprint(
 	const identity = includeMessage
 		? ["gjc-crash-fp.v1", errorName, messageClass, ...frames]
 		: ["gjc-crash-fp.v1", "handled", errorName, frames[0] ?? NO_APP_FRAME];
-	const digest = createHash("sha256")
-		.update(canonicalSerialization(identity))
-		.digest();
+	const digest = createHash("sha256").update(canonicalSerialization(identity)).digest();
 	return {
 		fingerprint: digest.subarray(0, CRASH_FINGERPRINT_HEX_LENGTH / 2).toString("hex"),
 		version: CRASH_FINGERPRINT_VERSION,
