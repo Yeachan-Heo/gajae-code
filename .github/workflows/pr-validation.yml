@@ -45,9 +45,6 @@ jobs:
     outputs:
       # Fail closed: absent means the validator never reported an authorized merge.
       merge_authorized: ${{ steps.validate.outputs.merge_authorized }}
-      # Issue comments that are not on a dev-based PR are deliberately skipped and
-      # must not publish a verdict against the event's default-branch commit.
-      skipped: ${{ steps.pr.outputs.skip }}
     steps:
       - name: Resolve PR head/base from the event or the comment's PR
         id: pr
@@ -76,8 +73,11 @@ jobs:
           fi
           # A confirmed HTTP 404 means this issue is not a pull request and is the
           # only lookup failure that may safely skip. Any other error leaves the PR
-          # identity unknown; fail the validation job so the always-running approval
-          # gate cannot preserve a prior authorization.
+          # identity unknown; fail the validation job instead of skipping, so the run
+          # is visibly red rather than silently treated as a non-PR comment. No head
+          # is resolved, so nothing is published against any SHA: the automatic
+          # approval job is excluded for comment events and the head-bound steps
+          # require a resolved head.
           lookup_error="$RUNNER_TEMP/gjc-pr-lookup.err"
           if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then
             :
@@ -334,13 +334,20 @@ jobs:
   merge-approval:
     name: Merge approval
     needs: [validate]
-    # always() is load-bearing whenever the contract was evaluated. GitHub reports a
-    # SKIPPED job as Success for required checks
+    # always() is load-bearing for PR-bound events. GitHub reports a SKIPPED job as
+    # Success for required checks
     # (https://docs.github.com/en/pull-requests/reference/status-checks), so a
     # plain `needs:` would skip this job when the contract job fails and publish a GREEN
-    # merge-approval check for a red contract. A deliberate issue_comment skip has no
-    # PR head to protect, so it must not publish a verdict against the default branch.
-    if: ${{ always() && needs.validate.outputs.skipped != 'true' }}
+    # merge-approval check for a red contract.
+    #
+    # issue_comment runs are excluded as a whole, not by the resolver's outcome. Their
+    # automatic job check is bound to the default-branch SHA (`github.sha` is `main`,
+    # never the PR head), so every verdict it published — pending approval, failed
+    # validation, a comment on an ordinary issue — landed as a red "Merge approval" on
+    # `main` (#5694). The exact-head verdict for a comment event is published by the
+    # validate job's head-bound check-run step instead; when PR resolution itself fails
+    # there is no head to protect and the validate job's own failure is the signal.
+    if: ${{ always() && github.event_name != 'issue_comment' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     # Reads only the upstream job's result and output: no checkout, no bun, no token.
