@@ -49,6 +49,7 @@ function assistantEntry(opts: {
 	parentId?: string | null;
 	provider: string;
 	premiumRequests?: number;
+	omitStopReason?: boolean;
 }): Record<string, unknown> {
 	return {
 		type: "message",
@@ -61,7 +62,7 @@ function assistantEntry(opts: {
 			api: "openai-responses",
 			provider: opts.provider,
 			model: "gpt-5.4",
-			stopReason: "stop",
+			...(opts.omitStopReason ? {} : { stopReason: "stop" }),
 			timestamp: Date.now(),
 			usage: {
 				input: 10,
@@ -77,6 +78,27 @@ function assistantEntry(opts: {
 }
 
 describe("priority service-tier premium-request backfill", () => {
+	it("preserves assistant messages that omit stopReason", async () => {
+		await writeSession("--tmp--proj", "missing-stop-reason.jsonl", {
+			lines: [
+				{
+					type: "session",
+					version: 1,
+					id: "missing-stop-reason",
+					timestamp: new Date().toISOString(),
+					cwd: "/tmp/proj",
+				},
+				assistantEntry({ id: "missing-stop-reason-entry", provider: "openai", omitStopReason: true }),
+			],
+		});
+
+		await syncAllSessions();
+
+		const request = getRecentRequests(1)[0];
+		expect(request?.entryId).toBe("missing-stop-reason-entry");
+		expect(request?.stopReason).toBe("unknown");
+	});
+
 	it("derives premium_requests from service_tier_change entries for OpenAI traffic", async () => {
 		await writeSession("--tmp--proj", "01.jsonl", {
 			lines: [

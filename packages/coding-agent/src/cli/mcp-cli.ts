@@ -19,7 +19,13 @@ import {
 	resolveScopeMCPConfigPath,
 	upsertScopeMCPServer,
 } from "../runtime-mcp/scope-config";
-import { type AutoloadStatus, computeAutoloadStatus } from "../runtime-mcp/startup-policy";
+import {
+	type AutoloadStatus,
+	computeAutoloadStatus,
+	DEFAULT_MCP_STARTUP_WAIT_MS,
+	MAX_MCP_STARTUP_WAIT_MS,
+	MCP_STARTUP_WAIT_GRACE_MS,
+} from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 
 export type MCPAction = "add" | "list" | "remove";
@@ -64,6 +70,8 @@ interface RuntimeServerEntry extends RedactedServerEntry {
 	runtimeStatus: AutoloadStatus;
 	/** Human-readable explanation of the runtime status. */
 	runtimeNote: string;
+	/** Actionable guidance when startup can disconnect an untimed registration. */
+	startupDiagnostic?: string;
 }
 
 const REDACTED = "<redacted>";
@@ -88,6 +96,18 @@ function autoloadStatusNote(status: AutoloadStatus): string {
 		case "disabled":
 			return "Disabled; not loaded by sessions. Re-enable to autoload.";
 	}
+}
+
+function startupDiagnostic(config: MCPServerConfig, status: AutoloadStatus): string | undefined {
+	if (status !== "autoload") return undefined;
+	const timeout = config.timeout;
+	if (typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0) return undefined;
+	return (
+		`No per-server timeout is declared. Ordinary standalone sessions wait ${DEFAULT_MCP_STARTUP_WAIT_MS}ms when no ` +
+		`registration declares a positive timeout; otherwise the batch wait uses the largest declared timeout plus ` +
+		`${MCP_STARTUP_WAIT_GRACE_MS}ms grace, capped at ${MAX_MCP_STARTUP_WAIT_MS}ms. Unfinished connections are ` +
+		"disconnected; add --timeout <ms> when registering slower servers."
+	);
 }
 
 function resolvePath(args: MCPCommandArgs): ScopedPath {
@@ -243,8 +263,14 @@ export function redactMCPServerConfig(config: MCPServerConfig): MCPServerConfig 
 function withRuntimeDisclosure<T extends object>(
 	value: T,
 	status: AutoloadStatus,
+	diagnostic?: string,
 ): T & { runtimeStatus: AutoloadStatus; runtimeNote: string } {
-	return { ...value, runtimeStatus: status, runtimeNote: autoloadStatusNote(status) };
+	return {
+		...value,
+		runtimeStatus: status,
+		runtimeNote: autoloadStatusNote(status),
+		...(diagnostic === undefined ? {} : { startupDiagnostic: diagnostic }),
+	};
 }
 
 async function collectEntries(scoped: ScopedPath, cwd?: string): Promise<RuntimeServerEntry[]> {
@@ -257,12 +283,14 @@ async function collectEntries(scoped: ScopedPath, cwd?: string): Promise<Runtime
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([name, serverConfig]) => {
 			const runtimeStatus = computeAutoloadStatus(name, serverConfig, disabledSet);
+			const diagnostic = startupDiagnostic(serverConfig, runtimeStatus);
 			return {
 				name,
 				scope: scoped.scope,
 				path: scoped.path,
 				runtimeStatus,
 				runtimeNote: autoloadStatusNote(runtimeStatus),
+				...(diagnostic === undefined ? {} : { startupDiagnostic: diagnostic }),
 				config: redactMCPServerConfig(serverConfig),
 			};
 		});
@@ -297,9 +325,11 @@ async function runAdd(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 		},
 		args.cwd,
 	);
-	const redacted = redactMCPServerConfig(config);
+	const disclosedConfig = result.status === "skipped" ? (storedConfig.mcpServers?.[args.name] ?? config) : config;
+	const redacted = redactMCPServerConfig(disclosedConfig);
 	const disabled = new Set(storedConfig.disabledServers ?? (await readScopeDisabledServers(scoped.scope, args.cwd)));
-	const runtimeStatus = computeAutoloadStatus(args.name, config, disabled);
+	const runtimeStatus = computeAutoloadStatus(args.name, disclosedConfig, disabled);
+	const diagnostic = startupDiagnostic(disclosedConfig, runtimeStatus);
 	if (args.flags.json) {
 		writeJson(
 			withRuntimeDisclosure(
@@ -312,6 +342,7 @@ async function runAdd(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 					config: redacted,
 				},
 				runtimeStatus,
+				diagnostic,
 			),
 		);
 		return;
@@ -321,12 +352,14 @@ async function runAdd(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
 			`MCP server "${args.name}" already exists in ${scoped.scope} config. Pass --force to overwrite. ` +
 				`Runtime: ${autoloadStatusNote(runtimeStatus)}\n`,
 		);
+		if (diagnostic) process.stdout.write(`Startup: ${diagnostic}\n`);
 		return;
 	}
 	process.stdout.write(
 		`MCP server "${args.name}" ${result.status} in ${scoped.scope} config: ${scoped.path}\n` +
 			`Runtime: ${autoloadStatusNote(runtimeStatus)}\n`,
 	);
+	if (diagnostic) process.stdout.write(`Startup: ${diagnostic}\n`);
 }
 
 async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> {
@@ -348,6 +381,7 @@ async function runList(args: MCPCommandArgs, scoped: ScopedPath): Promise<void> 
 	for (const entry of entries) {
 		process.stdout.write(`${renderDetails(entry)}\n`);
 		process.stdout.write(`Runtime: ${entry.runtimeNote}\n`);
+		if (entry.startupDiagnostic) process.stdout.write(`Startup: ${entry.startupDiagnostic}\n`);
 	}
 }
 

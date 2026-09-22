@@ -4652,8 +4652,11 @@ export class TUI extends Container {
 			}
 			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
 			for (let lineIndex = 0; lineIndex < rendered.lines.length; lineIndex++) {
-				for (const placement of kittyPlacements[lineIndex] ?? []) {
-					placementOwners.set(this.#kittyPlacementKey(placement), owner);
+				const placements = kittyPlacements[lineIndex];
+				if (placements !== undefined) {
+					for (const placement of placements) {
+						placementOwners.set(this.#kittyPlacementKey(placement), owner);
+					}
 				}
 				renderedLines.push(safeLines[lineIndex] ?? rendered.lines[lineIndex]!);
 			}
@@ -4713,7 +4716,8 @@ export class TUI extends Container {
 		// re-normalized and the diff starts at the window. Output is byte-identical to the
 		// full path (reused entries are deterministic normalizations of identical raw lines).
 		const VIEWPORT_NORMALIZE_OVERSCAN = 8;
-		const rawLines = newLines.slice();
+		// Reassigned below, never mutated in place -- a reference is the snapshot.
+		const rawLines = newLines;
 		const total = rawLines.length;
 		let diffStart = 0;
 		let usedWindowNormalize = false;

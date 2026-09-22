@@ -2438,6 +2438,78 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		expect(queries).toEqual(["Q12", "context.get"]);
 	});
+	it("returns await observation expiry without an MCP error or another prompt", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, []);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "keep working while the controller observes",
+			idempotency_key: "await-observation",
+			allow_mutation: true,
+		});
+		expect(sent).toMatchObject({ ok: true, status: "active" });
+		for (const timeoutMs of [1, 1, 1]) {
+			const response = await server.handleJsonRpc({
+				jsonrpc: "2.0",
+				id: timeoutMs,
+				method: "tools/call",
+				params: {
+					name: "gjc_coordinator_await_turn",
+					arguments: { turn_id: sent.turn_id, timeout_ms: timeoutMs },
+				},
+			});
+			expect(response.result.isError).toBe(false);
+			expect(JSON.parse(response.result.content[0].text)).toMatchObject({
+				ok: false,
+				reason: "timeout",
+				wait_expired: true,
+				turn: { turn_id: sent.turn_id, status: "active", completed_at: null },
+			});
+		}
+		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+		expect(await server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).toMatchObject({
+			ok: true,
+			turn: { status: "active", completed_at: null },
+		});
+	}, 30_000);
+	it("keeps rejected awaits and SDK request timeouts as MCP errors", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
+			controlResult: () => {
+				throw new SdkClientError("timeout", "SDK request timed out");
+			},
+		});
+		await registerSdkSession(server, root);
+		const unknown = await server.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: {
+				name: "gjc_coordinator_await_turn",
+				arguments: { turn_id: "turn-00000000-0000-4000-8000-000000000000", timeout_ms: 0 },
+			},
+		});
+		expect(unknown.result.isError).toBe(true);
+		expect(JSON.parse(unknown.result.content[0].text)).toEqual({ ok: false, reason: "unknown_turn" });
+		const failed = await server.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 2,
+			method: "tools/call",
+			params: {
+				name: "gjc_coordinator_send_prompt",
+				arguments: {
+					session_id: "visible-session",
+					prompt: "work",
+					idempotency_key: "sdk-timeout",
+					allow_mutation: true,
+				},
+			},
+		});
+		expect(failed.result.isError).toBe(true);
+		expect(JSON.parse(failed.result.content[0].text)).toMatchObject({ ok: false, error: { code: "timeout" } });
+	});
 	it("uses the generation-bound broker endpoint when a stale local endpoint file is absent", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

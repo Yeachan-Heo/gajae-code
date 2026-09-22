@@ -27,7 +27,7 @@ export interface MessageStats {
 	/** Time to first token in milliseconds */
 	ttft: number | null;
 	/** Stop reason */
-	stopReason: StopReason;
+	stopReason: StopReason | "unknown";
 	/** Error message if stopReason is error */
 	errorMessage: string | null;
 	/** Token usage */
