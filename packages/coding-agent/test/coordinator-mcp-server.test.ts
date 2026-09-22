@@ -3595,6 +3595,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(journal.filter(event => event.kind === "turn.completed")).toHaveLength(1);
 	});
 
+	it("rejects outside-root report evidence as input and accepts corrected evidence with a new key", async () => {
+		const root = await tempRoot();
+		const outsideRoot = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		const deniedPath = path.join(outsideRoot, "private-session.jsonl");
+		await fs.writeFile(deniedPath, "private session contents");
+		const request = {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "evidence validation",
+			evidence_paths: [deniedPath],
+			idempotency_key: "denied-evidence",
+			allow_mutation: true,
+		};
+		const rejected = await server.callTool("gjc_coordinator_report_status", request);
+		expect(rejected).toMatchObject({
+			ok: false,
+			reason: "artifact_outside_allowed_roots",
+			error: { code: "invalid_input" },
+		});
+		expect(JSON.stringify(rejected)).not.toContain(outsideRoot);
+		await expect(server.callTool("gjc_coordinator_report_status", request)).resolves.toEqual(rejected);
+		const evidencePath = path.join(root, "evidence.txt");
+		await fs.writeFile(evidencePath, "approved evidence");
+		expect(
+			await server.callTool("gjc_coordinator_report_status", {
+				...request,
+				evidence_paths: [evidencePath],
+				idempotency_key: "corrected-evidence",
+			}),
+		).toMatchObject({ ok: true });
+	});
+
 	it("replays a committed report without revalidating deleted evidence", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

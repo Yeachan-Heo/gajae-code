@@ -834,7 +834,12 @@ function toolSchema(
 					summary: { type: "string" },
 					blocker: { type: "string" },
 					pr_url: { type: "string" },
-					evidence_paths: { type: "array", items: { type: "string" } },
+					evidence_paths: {
+						type: "array",
+						items: { type: "string" },
+						description:
+							"Evidence must be inside configured artifact roots. Agent session logs are not automatically allowed.",
+					},
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
@@ -5247,6 +5252,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function publicError(error: unknown): Record<string, unknown> {
 		if (error instanceof Error && error.message.startsWith("coordinator_mutation_call_not_allowed:"))
 			return { ok: false, reason: error.message };
+		if (error instanceof Error) {
+			const reason = error.message.startsWith("coordinator_artifact_outside_allowed_roots:")
+				? "artifact_outside_allowed_roots"
+				: error.message === "coordinator_artifact_state_root_denied"
+					? "artifact_state_root_denied"
+					: undefined;
+			if (reason)
+				return {
+					ok: false,
+					reason,
+					error: { code: "invalid_input", message: PUBLIC_ERROR_MESSAGES.invalid_input },
+				};
+		}
 		const directCode = error instanceof SdkClientError ? error.code : sinkErrorCode(error);
 		const messageCode =
 			error instanceof Error && Object.hasOwn(PUBLIC_ERROR_MESSAGES, error.message) ? error.message : undefined;
