@@ -19,6 +19,7 @@ import {
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
 import { initTheme } from "../src/modes/theme/theme";
+import { isCurrentWorkflowGateContinuation } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../src/session/messages";
 import { SessionManager } from "../src/session/session-manager";
@@ -31,6 +32,14 @@ function attachTerminalController(emitter: WorkflowGateEmitter): void {
 		cancelGateInteractions: () => {},
 	});
 }
+
+it("does not settle a non-matching workflow-gate emitter after continuation loss", () => {
+	const expectedEmitter = {} as WorkflowGateEmitter;
+	const successorEmitter = {} as WorkflowGateEmitter;
+	expect(isCurrentWorkflowGateContinuation("session-b", "session-a", successorEmitter, expectedEmitter)).toBe(false);
+	expect(isCurrentWorkflowGateContinuation("session-a", "session-a", successorEmitter, expectedEmitter)).toBe(false);
+	expect(isCurrentWorkflowGateContinuation("session-a", "session-a", expectedEmitter, expectedEmitter)).toBe(true);
+});
 
 /**
  * The SDK-built ToolSession must forward getWorkflowGateEmitter from AgentSession

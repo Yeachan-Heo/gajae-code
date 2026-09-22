@@ -1,0 +1,49 @@
+diff --git a/dist/converters/pdf/extract.js b/dist/converters/pdf/extract.js
+index 7e3f02ea889f166c30975cce53f7cbe4de620e54..e1dcd4517128adf1021299cb5aa937bf2f98fab7 100644
+--- a/dist/converters/pdf/extract.js
++++ b/dist/converters/pdf/extract.js
+@@ -14,6 +14,8 @@
+ const SAME_LINE_Y_TOLERANCE = 2;
+ /** Max horizontal gap (pts) to merge adjacent fragments into one text box. */
+ const MAX_MERGE_GAP = 14;
++// Reuse the asynchronously initialized module when rendering extracted images.
++let mupdf;
+ /**
+  * Merge horizontally adjacent raw text items on the same visual line into
+  * word/phrase-level text boxes.
+@@ -429,7 +431,6 @@ function extractImageRegions(stext, pageNumber, pageHeight) {
+  * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
+  */
+ export function renderImageRegion(input, region) {
+-    const mupdf = require("mupdf");
+     const doc = mupdf.Document.openDocument(input, "application/pdf");
+     const page = doc.loadPage(region.pageNumber - 1);
+     const pad = 10;
+@@ -453,12 +454,11 @@ export function renderImageRegion(input, region) {
+  * Extract text boxes and vector segments from all pages of a PDF buffer.
+  */
+ export async function extractPages(input) {
+-    let mupdf;
+     try {
+         mupdf = await import("mupdf");
+     }
+-    catch {
+-        throw new Error("PDF support requires 'mupdf'. Install it: npm install mupdf");
++    catch (cause) {
++        throw new Error("MuPDF module initialization failed", { cause });
+     }
+     const doc = mupdf.Document.openDocument(input, "application/pdf");
+     const pages = [];
+diff --git a/dist/markit.js b/dist/markit.js
+index d9ba0a06e0d42a855f353a4df3aa7d3bfab11100..281ffc15b67b0d15a638f01ebcbcc1d842e5cc61 100644
+--- a/dist/markit.js
++++ b/dist/markit.js
+@@ -225,7 +225,7 @@ export class Markit {
+             const details = errors
+                 .map((e) => `  ${e.converter}: ${e.error.message}`)
+                 .join("\n");
+-            throw new Error(`Conversion failed:\n${details}`);
++            throw new AggregateError(errors.map((entry) => entry.error), `Conversion failed:\n${details}`, { cause: errors[0].error });
+         }
+         throw new Error(`Unsupported format: ${streamInfo.extension || streamInfo.mimetype || "unknown"}`);
+     }

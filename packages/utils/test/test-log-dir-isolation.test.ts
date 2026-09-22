@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { decideLogDirIsolation } from "../../../scripts/test-log-dir-isolation";
+import { decideLogDirIsolation, defaultLogDirFor } from "../../../scripts/test-log-dir-isolation";
 import type { ProjectEnvSnapshot } from "../src/env-file";
 
 /**
@@ -132,11 +132,118 @@ describe("test log-dir isolation decision", () => {
 		});
 	});
 
+	test("isolates a pin inherited from a parent test preload", () => {
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: "/tmp/parent-test-logs" },
+				projectEnv: snapshot(),
+				inheritedLogDir: true,
+			}),
+		).toEqual({ action: "isolate", reason: "inherited" });
+	});
+
+	test("honors a child-owned pin even when it uses the canonical path", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: shared },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+				inheritedLogDir: false,
+			}),
+		).toEqual({ action: "honor", logDir: shared });
+	});
+
 	test("honors a trusted pin with surrounding whitespace, trimmed", () => {
 		expect(decideLogDirIsolation({ env: { GJC_LOG_DIR: " /tmp/pinned-logs " }, projectEnv: snapshot() })).toEqual({
 			action: "honor",
 			logDir: "/tmp/pinned-logs",
 		});
+	});
+
+	test("isolates a trusted pin that resolves to the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: shared }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("isolates a symlink alias of the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: "/tmp/operator-logs" },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+				realpath: target => (target === "/tmp/operator-logs" ? shared : target),
+			}),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("isolates a trusted pin nested under the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: `${shared}/sub` },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+			}),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("isolates a missing descendant through a symlinked shared-log parent", () => {
+		const shared = "/home/operator/.gjc/logs";
+		const configured = "/tmp/log-link/new";
+		expect(
+			decideLogDirIsolation({
+				env: { GJC_LOG_DIR: configured },
+				projectEnv: snapshot(),
+				sharedLogDir: shared,
+				realpath: target => {
+					if (target === "/tmp/log-link") return shared;
+					if (target === shared) return shared;
+					throw new Error("missing");
+				},
+			}),
+		).toEqual({ action: "isolate", reason: "shared" });
+	});
+
+	test("computes the shared sink from the pre-isolation profile state", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-log-dir-home-"));
+		const xdgStateHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-log-dir-xdg-"));
+		try {
+			await fs.promises.mkdir(path.join(xdgStateHome, "gjc"), { recursive: true });
+			const env = { XDG_STATE_HOME: xdgStateHome };
+			const expected =
+				process.platform === "linux" || process.platform === "darwin"
+					? path.join(xdgStateHome, "gjc", "logs")
+					: path.join(home, ".gjc", "logs");
+			expect(defaultLogDirFor({ home, env, projectEnv: snapshot(), xdgEligible: true })).toBe(expected);
+			expect(defaultLogDirFor({ home, env, projectEnv: snapshot(), xdgEligible: false })).toBe(
+				path.join(home, ".gjc", "logs"),
+			);
+		} finally {
+			await Promise.all([
+				fs.promises.rm(home, { recursive: true, force: true }),
+				fs.promises.rm(xdgStateHome, { recursive: true, force: true }),
+			]);
+		}
+	});
+
+	test("honors a trusted pin with a shared-log prefix but outside the shared directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		const sibling = "/home/operator/.gjc/logs-custom";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: sibling }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "honor", logDir: sibling });
+	});
+
+	test("still honors a trusted pin outside the shared user log directory", () => {
+		const shared = "/home/operator/.gjc/logs";
+		const pinned = "/tmp/pinned-logs";
+		expect(
+			decideLogDirIsolation({ env: { GJC_LOG_DIR: pinned }, projectEnv: snapshot(), sharedLogDir: shared }),
+		).toEqual({ action: "honor", logDir: pinned });
 	});
 
 	test("isolates a key declared with an empty value", () => {
@@ -156,7 +263,16 @@ describe("preload log-sink behavior (real preload path)", () => {
 	function childEnv(overrides: Record<string, string>): Record<string, string | undefined> {
 		const env: Record<string, string | undefined> = { ...process.env };
 		delete env.GJC_LOG_DIR;
-		return { ...env, ...overrides };
+		// Keep nested preload probes independent from the parent test process's
+		// temporary profile and ambient XDG state. Tests that exercise XDG pass it
+		// explicitly below; the marker is pinned so that inherited agent-dir state
+		// cannot silently turn that path comparison into the custom-profile lane.
+		delete env.XDG_STATE_HOME;
+		return {
+			...env,
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			...overrides,
+		};
 	}
 
 	/**
@@ -327,6 +443,101 @@ describe("preload log-sink behavior (real preload path)", () => {
 			expect(probe.stdout.toString().trim()).toBe(pinned);
 		} finally {
 			await fs.promises.rm(pinned, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("replaces an inherited canonical log pin with a fresh isolated sink", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-shared-home-"));
+		const shared = path.join(home, ".gjc", "logs");
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, "-e", printLogDir],
+				env: childEnv({
+					HOME: home,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
+				}),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const adopted = probe.stdout.toString().trim();
+			expect(probe.exitCode, probe.stderr.toString()).toBe(0);
+			expect(adopted).not.toBe(shared);
+			expect(path.basename(adopted).startsWith("gjc-test-logs-")).toBe(true);
+			await fs.promises.rm(adopted, { recursive: true, force: true });
+		} finally {
+			await fs.promises.rm(home, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("replaces an inherited XDG canonical log pin before agent isolation", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-xdg-home-"));
+		const xdgStateHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-xdg-state-"));
+		const shared = path.join(xdgStateHome, "gjc", "logs");
+		await fs.promises.mkdir(shared, { recursive: true });
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, PROBE],
+				env: childEnv({
+					HOME: home,
+					XDG_STATE_HOME: xdgStateHome,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
+					GJC_PROBE_WRITE: "1",
+				}),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stdout = probe.stdout.toString();
+			expect(probe.exitCode, probe.stderr.toString()).toBe(0);
+			const resolved = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+				effectiveLogsDir: string | null;
+				markerDir: string | null;
+			};
+			expect(resolved.effectiveLogsDir).not.toBe(shared);
+			expect(path.basename(resolved.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
+			expect(resolved.markerDir).toBe(resolved.effectiveLogsDir);
+		} finally {
+			await Promise.all([
+				fs.promises.rm(home, { recursive: true, force: true }),
+				fs.promises.rm(xdgStateHome, { recursive: true, force: true }),
+			]);
+		}
+	}, 30_000);
+
+	test("does not trust an ambient custom profile marker when guarding an inherited XDG pin", async () => {
+		const home = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-marker-home-"));
+		const xdgStateHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-marker-xdg-"));
+		const shared = path.join(xdgStateHome, "gjc", "logs");
+		await fs.promises.mkdir(shared, { recursive: true });
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, PROBE],
+				env: childEnv({
+					HOME: home,
+					XDG_STATE_HOME: xdgStateHome,
+					GJC_LOG_DIR: shared,
+					GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: shared,
+					GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "custom",
+					GJC_PROBE_WRITE: "1",
+				}),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stdout = probe.stdout.toString();
+			expect(probe.exitCode, probe.stderr.toString()).toBe(0);
+			const resolved = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+				effectiveLogsDir: string | null;
+				markerDir: string | null;
+			};
+			expect(resolved.effectiveLogsDir).not.toBe(shared);
+			expect(path.basename(resolved.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
+			expect(resolved.markerDir).toBe(resolved.effectiveLogsDir);
+		} finally {
+			await Promise.all([
+				fs.promises.rm(home, { recursive: true, force: true }),
+				fs.promises.rm(xdgStateHome, { recursive: true, force: true }),
+			]);
 		}
 	}, 30_000);
 });

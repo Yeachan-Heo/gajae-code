@@ -121,14 +121,44 @@ const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
+function lifecycleKnownSecrets(extraSecrets: Iterable<unknown> = []): string[] {
+	return [
+		...Object.entries(process.env)
+			.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
+			.map(([, value]) => value),
+		...extraSecrets,
+	].filter((secret): secret is string => typeof secret === "string" && secret.length > 0);
+}
+
+function validateLifecycleExecutable(file: string): void {
+	// Bun's Node-compatible spawn can emit an ENOENT error before the returned
+	// ChildProcess has an opportunity to receive an `error` listener. Validate
+	// absolute launch paths first so a missing or non-executable runtime becomes a
+	// normal broker response instead of an uncaught broker exception. Bare names
+	// still resolve through PATH at spawn time.
+	if (!path.isAbsolute(file)) return;
+	const stat = fsSync.statSync(file);
+	if (!stat.isFile()) throw new Error(`Lifecycle runtime executable is not a regular file: ${file}`);
+	fsSync.accessSync(file, fsSync.constants.X_OK);
+}
+
+function lifecycleChildExitDiagnostic(child?: ChildProcess): string | undefined {
+	if (!child) return undefined;
+	const parts: string[] = [];
+	if (child.exitCode !== null && child.exitCode !== 0) parts.push(`exit=${child.exitCode}`);
+	if (child.signalCode) parts.push(`signal=${child.signalCode}`);
+	return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+export function lifecycleFailureMessage(message: string, child?: ChildProcess): string {
+	const details = [lifecycleChildExitDiagnostic(child)].filter((value): value is string => value !== undefined);
+	return details.length > 0 ? `${message} (${details.join("; ")})` : message;
+}
+
 function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
 	const parts = [`Session ${id} ${READY_THEN_EXIT_MESSAGE}.`];
-	if (child && child.exitCode !== null) parts.push(`exit=${child.exitCode}`);
-	if (child?.signalCode) parts.push(`signal=${child.signalCode}`);
-	// Host stderr is deliberately excluded: the detached host receives launch
-	// configuration and inherited credentials, and no pattern-based redaction can
-	// prove arbitrary child output free of that material; its stderr is discarded
-	// by the OS and never captured (#4712 review).
+	const diagnostic = lifecycleFailureMessage("", child).trim();
+	if (diagnostic) parts.push(diagnostic);
 	return fail("ready_then_exited", parts.join(" "));
 }
 
@@ -144,12 +174,19 @@ export function terminalUncertainStartupMessage(response: BrokerResponse): strin
 }
 
 export async function waitForChildSpawn(
-	spawned: Pick<ChildProcess, "off" | "on" | "once">,
+	spawned: Pick<ChildProcess, "off" | "on" | "once" | "pid">,
 	onPostSpawnError: (error: Error) => void = error =>
 		logger.warn("sdk session child emitted an error after successful spawn", {
 			message: sanitizeSdkStartupMessage(error),
 		}),
 ): Promise<void> {
+	// Bun may publish the `spawn` event synchronously for native executables.
+	// A populated PID is already the same ownership fact the event conveys, so
+	// do not wait forever for an event that was emitted before this listener ran.
+	if (spawned.pid !== undefined) {
+		spawned.on("error", onPostSpawnError);
+		return;
+	}
 	const spawnOutcome = Promise.withResolvers<void>();
 	const onSpawn = () => {
 		spawned.off("error", onError);
@@ -3760,6 +3797,52 @@ async function terminateSpawnedChild(
 			failure.artifact.rollback.brokerRegistrationReleased;
 		if (!rollbackComplete) {
 			if (!readyThenExitToleranceEnabled()) {
+				// A child that exited with a non-zero status before publishing any
+				// lifecycle receipt has no durable rollback to wait for. Prove the
+				// owned artifacts are gone and release its registration, but retain
+				// terminal uncertainty for timeouts, clean exits, and child-authored
+				// startup receipts whose rollback is incomplete.
+				if (failure || child.exitCode === null || child.exitCode === 0) return failClosed();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				const publishedReady = (await probePublishedReadyAuthority(root, id, expected)).kind === "matched";
+				if (publishedReady) return failClosed();
+				const artifactsRemoved = await removeOwnedLifecycleArtifacts(
+					root,
+					id,
+					expected,
+					undefined,
+					undefined,
+					proofBudget,
+				);
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				await broker.index.refresh();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+				const registered = broker.index
+					.listSessions()
+					.sessions.find(session => session.sessionId === id && session.pid === pid);
+				let registrationReleased =
+					!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) ||
+					registered?.terminal === true ||
+					registered?.terminalUncertain === true;
+				if (registered && !registrationReleased) {
+					registrationReleased = await broker.index.unregisterIfCurrent(registered);
+					if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+					await broker.index.refresh();
+					registrationReleased =
+						registrationReleased || !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker);
+				}
+				const stillExited =
+					observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
+					"exited";
+				const endpointGone = await endpointRemoved(root, id);
+				if (
+					stillExited &&
+					artifactsRemoved &&
+					endpointGone &&
+					registrationReleased &&
+					lifecycleProofWithinDeadline(proofBudget)
+				)
+					return true;
 				return failClosed();
 			}
 			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
@@ -4254,6 +4337,7 @@ async function waitForReady(
 	deadline: number,
 	expected: EffectMarker,
 	timing: LifecycleTiming,
+	child?: ChildProcess,
 	signal: "session_ready" | typeof SESSION_PREPARED_EVENT = "session_ready",
 ): Promise<ReadinessResult> {
 	const classifyExitedAfterReady = async (): Promise<ReadinessResult> => {
@@ -4276,10 +4360,11 @@ async function waitForReady(
 			}
 			return { kind: "startup_failed", failure: startupFailure };
 		}
-		if (
-			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
-			"exited"
-		) {
+		const childExited = child !== undefined && (child.exitCode !== null || child.signalCode !== null);
+		const processObservation = observeProcess(expected.pid, expected.incarnation, value =>
+			processIncarnationForBroker(broker, value),
+		);
+		if (childExited || processObservation === "exited") {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			if (finalStartupFailure) {
 				const afterReady = await classifyExitedAfterReady();
@@ -5460,17 +5545,17 @@ async function executeLifecycleResponse(
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		let childSpawned = false;
+		const launchSecrets = launch.coordinatorSidecarSigningKey ? [launch.coordinatorSidecarSigningKey] : [];
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
+				validateLifecycleExecutable(cmd.file);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					// stdio stays "ignore": `unref()` does not detach an active
-					// stdio handle, so a parent-owned stderr pipe would keep the
-					// broker process alive for the host's whole lifetime (retention
-					// through restart/shutdown). Host stderr is therefore discarded
-					// by the OS rather than captured (#4712 review).
+					// A detached host can outlive this broker. Keep all stdio ignored so
+					// child output cannot cross the lifecycle response boundary or grow an
+					// unbounded capture artifact after startup.
 					stdio: "ignore",
 					env: {
 						// Master capability is process-local to direct Bash children and must
@@ -5552,10 +5637,19 @@ async function executeLifecycleResponse(
 					: true;
 
 			return terminated
-				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
+				? fail(
+						"spawn_failed",
+						lifecycleFailureMessage(
+							`Unable to spawn session: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets(launchSecrets))}`,
+							child,
+						),
+					)
 				: fail(
 						"terminal_uncertain",
-						`Unable to establish spawned-session ownership and could not prove the child dead: ${error instanceof Error ? error.message : String(error)}`,
+						lifecycleFailureMessage(
+							`Unable to establish spawned-session ownership and could not prove the child dead: ${sanitizeSdkStartupMessage(error, lifecycleKnownSecrets(launchSecrets))}`,
+							child,
+						),
 					);
 		}
 		if (!child || !spawnedAuthority) {
@@ -5569,6 +5663,7 @@ async function executeLifecycleResponse(
 			readinessDeadline,
 			spawnedAuthority,
 			timing,
+			child,
 			launch.readiness === "deferred" ? SESSION_PREPARED_EVENT : "session_ready",
 		);
 
@@ -5592,16 +5687,12 @@ async function executeLifecycleResponse(
 						)
 					: fail(
 							"terminal_uncertain",
-							`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
+							`Session ${launch.id} did not become ready and its spawned process could not be verified dead; cleanup could not be proven.`,
 						);
-			// Host stderr never reaches caller-visible error strings: the detached
-			// host handles launch configuration and inherited credentials, so its
-			// output cannot be proven free of secret material — it is discarded at
-			// the OS level (stdio "ignore"), never captured (#4712 review).
 			return readiness.kind === "startup_failed"
 				? fail(
 						readiness.failure.code ?? "spawn_failed",
-						readiness.failure.message,
+						lifecycleFailureMessage(readiness.failure.message, child),
 						undefined,
 						readiness.failure.details,
 					)
@@ -5613,7 +5704,10 @@ async function executeLifecycleResponse(
 								`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}.`,
 							)
 						: readiness.kind === "child_exited"
-							? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
+							? fail(
+									"spawn_failed",
+									lifecycleFailureMessage(`Session ${launch.id} exited before registering readiness.`, child),
+								)
 							: fail(
 									"readiness_timeout",
 									`Session ${launch.id} did not register an endpoint before the readiness timeout.`,

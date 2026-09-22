@@ -7,12 +7,14 @@
  */
 import { AgentProtocolHandler } from "./agent-protocol";
 import { ArtifactProtocolHandler } from "./artifact-protocol";
+import { EmbeddedProtocolHandler } from "./embedded-protocol";
 import { GjcProtocolHandler } from "./gjc-protocol";
 import { IssueProtocolHandler, PrProtocolHandler } from "./issue-pr-protocol";
 import { LocalProtocolHandler } from "./local-protocol";
 import { MemoryProtocolHandler } from "./memory-protocol";
-import { parseInternalUrl } from "./parse";
+import { normalizeInternalUrlInput, parseInternalUrl } from "./parse";
 import { RuleProtocolHandler } from "./rule-protocol";
+import { SkillProtocolHandler } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class InternalUrlRouter {
@@ -29,6 +31,8 @@ export class InternalUrlRouter {
 		this.register(new RuleProtocolHandler());
 		this.register(new IssueProtocolHandler());
 		this.register(new PrProtocolHandler());
+		this.register(new SkillProtocolHandler());
+		this.register(new EmbeddedProtocolHandler());
 	}
 
 	/** Process-global router instance. */
@@ -55,7 +59,7 @@ export class InternalUrlRouter {
 	}
 
 	canHandle(input: string): boolean {
-		const match = input.match(/^([a-z][a-z0-9+.-]*):\/\//i);
+		const match = normalizeInternalUrlInput(input).match(/^([a-z][a-z0-9+.-]*):\/\//i);
 		if (!match) return false;
 		return this.#handlers.has(match[1].toLowerCase());
 	}

@@ -112,6 +112,38 @@ function fakeReconciliation(): {
 }
 
 describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
+	test("does not flush when another terminal outcome wins the claim", async () => {
+		const { reconciliation } = fakeReconciliation();
+		let flushes = 0;
+		let expired = 0;
+		const claimed = {
+			kind: "stopped" as const,
+			reason: "cancelled" as const,
+			provenance: "client_cancel" as const,
+		};
+		const manager = new PromptDeadlineManager({
+			reconciliation: {
+				...reconciliation,
+				claimPendingOutcome: async () => claimed,
+			} as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			onDeadlineExceeded: () => {
+				flushes += 1;
+			},
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cancel-wins-cmd", turnId: "cancel-wins-turn" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(80);
+
+		expect(flushes).toBe(0);
+		expect(expired).toBe(0);
+		manager.clearAll();
+	});
+
 	test("expires an accepted lease while reconciliation is barriered, without agent_start", async () => {
 		let now = 0;
 		const { reconciliation, state } = fakeReconciliation();

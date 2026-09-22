@@ -416,6 +416,70 @@ describe("ExtensionRunner", () => {
 			const command = runner.getCommand("deploy");
 			expect(command?.description).toBe("Explicit deploy");
 		});
+
+		it("namespaces extension commands that collide with built-ins without warning", async () => {
+			const commandCode = `
+				export default function(pi) {
+					pi.registerCommand("notify", {
+						description: "Extension notification",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "notify.ts"), commandCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				const commands = runner.getRegisteredCommands(new Set(["notify"]));
+				expect(commands.map(command => command.name)).toEqual(["extension:notify"]);
+				expect(runner.getCommand("extension:notify")?.name).toBe("extension:notify");
+				expect(runner.getCommandDiagnostics()).toEqual([
+					expect.objectContaining({
+						type: "info",
+						message: expect.stringContaining("renamed to 'extension:notify'"),
+					}),
+				]);
+				expect(warnSpy).not.toHaveBeenCalled();
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+
+		it("keeps a collision alias resolvable after an unreserved command refresh", async () => {
+			const commandCode = `
+				export default function(pi) {
+					pi.registerCommand("notify", {
+						description: "Extension notification",
+						handler: async () => {},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "notify-refresh.ts"), commandCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			runner.getRegisteredCommands(new Set(["notify"]));
+			runner.getRegisteredCommands();
+
+			const refreshedAlias = runner.getCommand("extension:notify");
+			expect(refreshedAlias?.name).toBe("extension:notify");
+			expect(refreshedAlias?.description).toBe("Extension notification");
+		});
 	});
 
 	describe("error handling", () => {

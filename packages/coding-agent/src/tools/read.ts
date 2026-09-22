@@ -14,7 +14,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { getActiveSkills } from "../extensibility/skills";
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
-import { parseInternalUrl } from "../internal-urls/parse";
+import { normalizeInternalUrlInput, parseInternalUrl } from "../internal-urls/parse";
 import type { InternalUrl } from "../internal-urls/types";
 import { getLanguageFromPath, type Theme } from "../modes/theme/theme";
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
@@ -2745,7 +2745,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// off the URL and surfaced via parseSel rather than confusing handlers.
 		const internalRouter = InternalUrlRouter.instance();
 		if (internalRouter.canHandle(readPath)) {
-			const internalTarget = splitInternalUrlSel(readPath, {
+			const internalTarget = splitInternalUrlSel(normalizeInternalUrlInput(readPath), {
 				activeSkillNames: getActiveSkills().map(skill => skill.name),
 			});
 			const parsed = parseSel(internalTarget.sel);
@@ -3590,7 +3590,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			sourcePath: resource.sourcePath,
 			sourceInternal: url,
 			entityLabel: "resource",
-			ignoreResultLimits: scheme === "skill",
+			ignoreResultLimits: scheme === "skill" || scheme === "embedded",
 			immutable: resource.immutable,
 			raw,
 			truncationDirection: direction,

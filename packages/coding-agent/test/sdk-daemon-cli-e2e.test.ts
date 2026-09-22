@@ -142,10 +142,20 @@ describe("SDK session CLI", () => {
 	// Retained transcript rows served by `transcript.list`. Non-empty rows make
 	// the checkpoint advertise a cursor so the CLI actually drains the page.
 	let transcriptRows: Record<string, unknown>[] = [];
+	let freshMints = 0;
+	const freshTokens = new Set<string>();
+	const transcriptListCursors: string[] = [];
 	let checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
 	let checkpointInputToken: unknown;
 	let transcriptCursor: unknown;
 	let signedExchange: { source: string; replacement: string } | undefined;
+	let trackCheckpointWatermarks = false;
+	let checkpointWatermarks = new Map<string, { revision: number; generation: number; seq: number; idle: boolean }>();
+	let failNextFreshCheckpoint: "error" | "transport" | undefined;
+	let failFinalCheckpoint: "error" | "transport" | undefined;
+	let closeEndpointOnFinalCheckpointFailure = false;
+	let finalCheckpointLiveEvents: Record<string, unknown>[] = [];
+	let cursorlessCheckpointRequests = 0;
 	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
 	// test can prove a raw coordinate claim really was transmitted.
 	let lastReplayPayload = "";
@@ -165,10 +175,20 @@ describe("SDK session CLI", () => {
 		preCheckpointLiveEvents = [];
 		wireLog = [];
 		transcriptRows = [];
+		freshMints = 0;
+		freshTokens.clear();
+		transcriptListCursors.length = 0;
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
 		checkpointInputToken = undefined;
 		transcriptCursor = undefined;
 		signedExchange = undefined;
+		trackCheckpointWatermarks = false;
+		checkpointWatermarks = new Map();
+		failNextFreshCheckpoint = undefined;
+		failFinalCheckpoint = undefined;
+		closeEndpointOnFinalCheckpointFailure = false;
+		finalCheckpointLiveEvents = [];
+		cursorlessCheckpointRequests = 0;
 		lastReplayPayload = "";
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		await initializeTestRepository(root);
@@ -256,17 +276,41 @@ describe("SDK session CLI", () => {
 							});
 							return;
 						}
+						if (trackCheckpointWatermarks && !isExplicitTailReplay(frame)) {
+							socket.send(
+								JSON.stringify({
+									type: "event_replay_result",
+									id: frame.id,
+									ok: true,
+									generation: 1,
+									lastSeq: 0,
+									events: [],
+								}),
+							);
+							return;
+						}
+						const sinceSeq = typeof frame.sinceSeq === "number" ? frame.sinceSeq : -1;
+						const events = trackCheckpointWatermarks
+							? replayEvents.filter(event => typeof event.seq !== "number" || event.seq > sinceSeq)
+							: replayEvents;
+						if (trackCheckpointWatermarks) {
+							const latestSeq = events.reduce(
+								(maximum, event) => (typeof event.seq === "number" ? Math.max(maximum, event.seq) : maximum),
+								-1,
+							);
+							if (latestSeq >= 0) checkpointRecord = { ...checkpointRecord, seq: latestSeq };
+						}
 						socket.send(
 							JSON.stringify({
 								type: "event_replay_result",
 								id: frame.id,
 								ok: true,
 								generation: 1,
-								lastSeq: replayEvents.reduce(
+								lastSeq: events.reduce(
 									(maximum, event) => (typeof event.seq === "number" ? Math.max(maximum, event.seq) : maximum),
 									0,
 								),
-								events: replayEvents,
+								events,
 								...(replayGap === undefined ? {} : { gap: replayGap }),
 							}),
 						);
@@ -274,6 +318,14 @@ describe("SDK session CLI", () => {
 							deferredLiveDispatched = true;
 							const pending = deferredLiveEvents;
 							void Bun.sleep(DEFERRED_LIVE_EVENT_DELAY_MS).then(() => {
+								if (trackCheckpointWatermarks) {
+									const latestSeq = pending.reduce(
+										(maximum, event) =>
+											typeof event.seq === "number" ? Math.max(maximum, event.seq) : maximum,
+										-1,
+									);
+									if (latestSeq >= 0) checkpointRecord = { ...checkpointRecord, seq: latestSeq };
+								}
 								for (const event of pending)
 									for (const target of openSockets) {
 										try {
@@ -331,8 +383,18 @@ describe("SDK session CLI", () => {
 							return;
 						}
 						if (frame.query === "session.checkpoint") {
-							checkpointInputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
-							if (signedExchange !== undefined && checkpointInputToken !== signedExchange.source) {
+							const inputToken = (frame.input as Record<string, unknown> | undefined)?.checkpointToken;
+							if (inputToken === undefined) cursorlessCheckpointRequests++;
+							const isFinalCheckpoint = inputToken === undefined && cursorlessCheckpointRequests >= 2;
+							// Only the FIRST checkpoint of a resumed tail carries the caller's token;
+							// the CLI mints a fresh (cursorless) checkpoint afterwards for the
+							// caller to resume from, exactly like the real host allows.
+							if (inputToken !== undefined) checkpointInputToken = inputToken;
+							if (
+								signedExchange !== undefined &&
+								inputToken !== undefined &&
+								inputToken !== signedExchange.source
+							) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -343,9 +405,68 @@ describe("SDK session CLI", () => {
 								);
 								return;
 							}
+							if (failNextFreshCheckpoint !== undefined && inputToken === undefined) {
+								const failure = failNextFreshCheckpoint;
+								failNextFreshCheckpoint = undefined;
+								if (failure === "transport") return;
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: false,
+										error: { code: "unavailable", message: "checkpoint unavailable" },
+									}),
+								);
+								return;
+							}
+							if (isFinalCheckpoint && failFinalCheckpoint !== undefined) {
+								const failure = failFinalCheckpoint;
+								failFinalCheckpoint = undefined;
+								if (failure === "transport") {
+									if (closeEndpointOnFinalCheckpointFailure) socket.close();
+									return;
+								}
+								socket.send(
+									JSON.stringify({
+										type: "query_response",
+										id: frame.id,
+										ok: false,
+										error: { code: "unavailable", message: "final checkpoint unavailable" },
+									}),
+								);
+								return;
+							}
 							for (const event of preCheckpointLiveEvents) {
 								socket.send(JSON.stringify(event));
 								wireLog.push(`pre_checkpoint_live_sent:${event.kind}:${event.seq}`);
+							}
+							// A resumed tail exchanges its token once, then mints FRESH cursorless
+							// checkpoints (to page the current snapshot, and to hand back). Mint a
+							// distinct token for each so the test can tell them apart.
+							const minted =
+								inputToken !== undefined
+									? (signedExchange?.replacement ?? "transcript-page-1")
+									: `fresh-${++freshMints}`;
+							const checkpointForResponse =
+								trackCheckpointWatermarks && inputToken !== undefined
+									? (checkpointWatermarks.get(String(inputToken)) ?? checkpointRecord)
+									: checkpointRecord;
+							const shouldReturnCursor =
+								transcriptRows.length > 0 || inputToken !== undefined || isFinalCheckpoint;
+							if (trackCheckpointWatermarks && shouldReturnCursor) {
+								checkpointWatermarks.set(minted, checkpointForResponse);
+							}
+							if (shouldReturnCursor && inputToken === undefined) freshTokens.add(minted);
+							// A host can capture the checkpoint watermark and then publish a frame
+							// before the checkpoint response reaches the client. This is the race
+							// the final-cursor test models; the client must leave the frame for the
+							// next poll rather than include it behind the returned cursor.
+							if (isFinalCheckpoint) {
+								for (const event of finalCheckpointLiveEvents) {
+									socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
+									wireLog.push(`final_checkpoint_live_sent:${event.kind}:${event.seq}`);
+								}
+								finalCheckpointLiveEvents = [];
 							}
 							socket.send(
 								JSON.stringify({
@@ -353,10 +474,8 @@ describe("SDK session CLI", () => {
 									id: frame.id,
 									ok: true,
 									result: {
-										checkpoint: checkpointRecord,
-										...(transcriptRows.length > 0
-											? { checkpointToken: signedExchange?.replacement ?? "transcript-page-1" }
-											: {}),
+										checkpoint: checkpointForResponse,
+										...(shouldReturnCursor ? { checkpointToken: minted } : {}),
 										...(signedExchange === undefined ? {} : { cursor: "legacy-must-not-win" }),
 									},
 								}),
@@ -365,11 +484,12 @@ describe("SDK session CLI", () => {
 						}
 						if (frame.query === "transcript.list") {
 							transcriptCursor = frame.cursor;
-							if (
-								signedExchange !== undefined &&
-								(frame.cursor !== signedExchange.replacement ||
-									verifyCursor(String(frame.cursor), "tail-e2e-key") === undefined)
-							) {
+							transcriptListCursors.push(String(frame.cursor));
+							// Under a staged exchange, the exchanged replacement may be paged
+							// exactly once (the CLI drains it to release its pin) and any fresh
+							// mint may be paged; anything else is not a live pin.
+							const isReplacement = signedExchange !== undefined && frame.cursor === signedExchange.replacement;
+							if (signedExchange !== undefined && !isReplacement && !freshTokens.has(String(frame.cursor))) {
 								socket.send(
 									JSON.stringify({
 										type: "query_response",
@@ -429,9 +549,17 @@ describe("SDK session CLI", () => {
 
 	type OfflineSession = { id: string; path: string };
 
-	async function createStoppedSavedSession(): Promise<OfflineSession> {
+	async function createStoppedSavedSession(rows = 0): Promise<OfflineSession> {
 		const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
 		await session.ensureOnDisk();
+		for (let index = 0; index < rows; index++) {
+			session.appendMessage({
+				role: index % 2 === 0 ? "user" : "assistant",
+				content: [{ type: "text", text: `row ${index}` }],
+				timestamp: 1_700_000_000_000 + index,
+			} as never);
+		}
+		if (rows > 0) await session.flush();
 		const id = session.getSessionId();
 		const savedPath = session.getSessionFile();
 		if (!savedPath) throw new Error("Expected a retained managed session path.");
@@ -672,9 +800,13 @@ describe("SDK session CLI", () => {
 		}, 90_000);
 	}
 
-	it("forwards the exchanged checkpoint token to transcript.list", async () => {
+	it("a resumed tail pages a fresh snapshot, drops rows up to --after-transcript-id, and returns a fresh cursor", async () => {
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
-		transcriptRows = [{ id: "assistant-1", role: "assistant", content: "saved" }];
+		transcriptRows = [
+			{ id: "assistant-1", role: "assistant", content: "saved" },
+			{ id: "user-2", role: "user", content: "next" },
+			{ id: "assistant-3", role: "assistant", content: [{ type: "toolCall", name: "read" }] },
+		];
 		const sourceEnvelope: CursorEnvelope = {
 			cursorVersion: 1,
 			protocolMajor: 3,
@@ -696,6 +828,8 @@ describe("SDK session CLI", () => {
 			"live",
 			"--cursor",
 			source,
+			"--after-transcript-id",
+			"assistant-1",
 			"--until-idle",
 			"--timeout-ms",
 			"1000",
@@ -703,11 +837,302 @@ describe("SDK session CLI", () => {
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(verifyCursor(String(checkpointInputToken), "tail-e2e-key")).toBeDefined();
 		expect(checkpointInputToken).toBe(source);
-		expect(transcriptCursor).toBe(replacement);
-		expect(transcriptCursor).not.toBe("legacy-must-not-win");
-		const result = JSON.parse(tail.stdout).result as Record<string, unknown>;
+		// The exchanged replacement is pinned to the OLD snapshot at offset 0. It
+		// is paged exactly once, to RELEASE its pin (transcript.list is the only
+		// release the query surface exposes; an unreleased pin per poll hit the
+		// 128 cap within minutes) - its rows are discarded. The rows the caller
+		// receives come from a FRESH mint.
+		expect(transcriptListCursors).toEqual([replacement, "fresh-1"]);
+		expect(transcriptCursor).toBe("fresh-1");
+		const result = JSON.parse(tail.stdout).result as {
+			items: Array<{ kind: string; id?: string }>;
+			cursor?: unknown;
+			terminal: boolean;
+			gap?: unknown;
+		};
 		expect(result.terminal).toBe(true);
 		expect(result.gap).toBeUndefined();
+		// Only the rows AFTER the caller's boundary come back - the tool-call row included.
+		expect(result.items.filter(item => item.kind === "transcript").map(item => item.id)).toEqual([
+			"user-2",
+			"assistant-3",
+		]);
+		// And a resumable cursor: the second fresh mint (the first was spent paging),
+		// never the consumed one, and never under a name the output redactor strips.
+		expect(result.cursor).toBe("fresh-2");
+		expect("checkpointToken" in result).toBe(false);
+	}, 60_000);
+
+	it("a resumed tail with an unknown --after-transcript-id keeps every row (a duplicate is recoverable, a missing row is not)", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [
+			{ id: "assistant-1", role: "assistant", content: "saved" },
+			{ id: "user-2", role: "user", content: "next" },
+		];
+		const sourceEnvelope: CursorEnvelope = {
+			cursorVersion: 1,
+			protocolMajor: 3,
+			sessionId: "live",
+			resource: "transcript",
+			revision: "revision-1",
+			highWatermark: checkpointRecord,
+			issuedAt: 1,
+			expiresAt: Number.MAX_SAFE_INTEGER,
+			position: { offset: 0, selector: { queryId: "Q01" } },
+			direction: "forward",
+			pageShape: { targetBytes: 256 * 1024 },
+		};
+		const source = signCursor({ ...sourceEnvelope, nonce: "source" }, "tail-e2e-key");
+		const replacement = signCursor({ ...sourceEnvelope, nonce: "replacement" }, "tail-e2e-key");
+		signedExchange = { source, replacement };
+		const tail = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			source,
+			"--after-transcript-id",
+			"rotated-out-of-retention",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(tail.exitCode, tail.stderr).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { items: Array<{ kind: string; id?: string }> };
+		expect(result.items.filter(item => item.kind === "transcript").map(item => item.id)).toEqual([
+			"assistant-1",
+			"user-2",
+		]);
+	}, 60_000);
+
+	for (const failure of ["error", "transport"] as const) {
+		it(`preserves the exchanged transcript snapshot when fresh paging fails by ${failure}`, async () => {
+			checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+			transcriptRows = [
+				{ id: "boundary", role: "assistant", content: "already observed" },
+				{ id: "tool-call", role: "tool", content: "observed after the boundary" },
+			];
+			const sourceEnvelope: CursorEnvelope = {
+				cursorVersion: 1,
+				protocolMajor: 3,
+				sessionId: "live",
+				resource: "transcript",
+				revision: "revision-1",
+				highWatermark: checkpointRecord,
+				issuedAt: 1,
+				expiresAt: Number.MAX_SAFE_INTEGER,
+				position: { offset: 0, selector: { queryId: "Q01" } },
+				direction: "forward",
+				pageShape: { targetBytes: 256 * 1024 },
+			};
+			const source = signCursor({ ...sourceEnvelope, nonce: `source-${failure}` }, "tail-e2e-key");
+			const replacement = signCursor({ ...sourceEnvelope, nonce: `replacement-${failure}` }, "tail-e2e-key");
+			signedExchange = { source, replacement };
+			failNextFreshCheckpoint = failure;
+
+			const tail = await runCli(root, agentDir, [
+				"tail",
+				"live",
+				"--cursor",
+				source,
+				"--after-transcript-id",
+				"boundary",
+				"--until-idle",
+				"--timeout-ms",
+				failure === "transport" ? "100" : "1000",
+			]);
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+			const result = JSON.parse(tail.stdout).result as {
+				items: Array<{ kind: string; id?: string }>;
+			};
+			expect(result.items.filter(item => item.kind === "transcript").map(item => item.id)).toEqual(["tool-call"]);
+		});
+	}
+
+	it("does not lose or replay an event across a returned cursor boundary", async () => {
+		trackCheckpointWatermarks = true;
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+		replayEvents = [{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } }];
+
+		const first = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(first.exitCode, first.stderr).toBe(0);
+		const firstResult = JSON.parse(first.stdout).result as {
+			cursor?: string;
+			items: Array<{ kind: string; seq?: number }>;
+		};
+		expect(firstResult.cursor).toBeString();
+		expect(firstResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([1]);
+
+		// The second poll sees the old event still retained plus a new event. A
+		// cursor minted after the first response must begin strictly after seq 1;
+		// an early mint would replay seq 1 here.
+		replayEvents = [
+			{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } },
+			{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } },
+		];
+		const second = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			firstResult.cursor!,
+			"--after-transcript-id",
+			"boundary",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(second.exitCode, second.stderr).toBe(0);
+		const secondResult = JSON.parse(second.stdout).result as {
+			items: Array<{ kind: string; seq?: number }>;
+		};
+		expect(secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([2]);
+		expect([
+			...firstResult.items.filter(item => item.kind === "turn_end").map(item => item.seq),
+			...secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq),
+		]).toEqual([1, 2]);
+	}, 60_000);
+
+	it("resumes event replay from the fresh paging checkpoint", async () => {
+		trackCheckpointWatermarks = true;
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+		replayEvents = [{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } }];
+
+		const first = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(first.exitCode, first.stderr).toBe(0);
+		const firstResult = JSON.parse(first.stdout).result as { cursor?: string };
+		expect(firstResult.cursor).toBeString();
+
+		// The exchanged cursor is pinned at seq 1, while the fresh paging
+		// checkpoint observes seq 2. Event seq 2 is already covered by the fresh
+		// snapshot and must not be replayed; only seq 3 is new to this poll.
+		checkpointRecord = { revision: 1, generation: 1, seq: 2, idle: true };
+		replayEvents = [
+			{ type: "event", generation: 1, seq: 1, kind: "turn_end", payload: { type: "turn_end" } },
+			{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } },
+			{ type: "event", generation: 1, seq: 3, kind: "turn_end", payload: { type: "turn_end" } },
+		];
+		const second = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			firstResult.cursor!,
+			"--after-transcript-id",
+			"boundary",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(second.exitCode, second.stderr).toBe(0);
+		const secondResult = JSON.parse(second.stdout).result as { items: Array<{ kind: string; seq?: number }> };
+		expect(secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([3]);
+	}, 60_000);
+
+	for (const failure of ["error", "transport"] as const) {
+		it(`does not return resumable success when final checkpoint mint fails by ${failure}`, async () => {
+			checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+			transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+			failFinalCheckpoint = failure;
+			const tail = await runCli(root, agentDir, [
+				"tail",
+				"live",
+				"--until-idle",
+				"--timeout-ms",
+				failure === "transport" ? "100" : "1000",
+			]);
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+			const output = JSON.parse(tail.stdout) as { ok?: boolean; result?: unknown; error?: { code?: string } };
+			expect(output.ok).toBe(false);
+			expect(output.result).toBeUndefined();
+			expect(output.error?.code).toBeString();
+		}, 60_000);
+	}
+
+	for (const failure of ["error", "transport"] as const) {
+		it(`preserves a terminal tail when final checkpoint mint fails after session close by ${failure}`, async () => {
+			checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+			transcriptRows = [{ id: "boundary", role: "assistant", content: "observed before close" }];
+			explicitReplayEvents = [];
+			earlyLiveEvents = [
+				{
+					type: "event",
+					generation: 1,
+					seq: 1,
+					kind: "session_closed",
+					payload: { type: "session_closed", sessionId: "live" },
+				},
+			];
+			failFinalCheckpoint = failure;
+			closeEndpointOnFinalCheckpointFailure = failure === "transport";
+
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+
+			expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+			const output = JSON.parse(tail.stdout) as {
+				ok?: boolean;
+				result?: { cursor?: string; terminal?: boolean; items?: Array<Record<string, unknown>> };
+				error?: unknown;
+			};
+			expect(output.ok).toBe(true);
+			expect(output.error).toBeUndefined();
+			expect(output.result?.terminal).toBe(true);
+			expect(output.result?.cursor).toBeUndefined();
+			expect(output.result?.items).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ id: "boundary", kind: "transcript" }),
+					expect.objectContaining({ kind: "session_closed", seq: 1 }),
+				]),
+			);
+		}, 60_000);
+	}
+
+	it("freezes live frame collection before minting the returned cursor", async () => {
+		trackCheckpointWatermarks = true;
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: true };
+		transcriptRows = [{ id: "boundary", role: "assistant", content: "already observed" }];
+		finalCheckpointLiveEvents = [
+			{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } },
+		];
+
+		const first = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(first.exitCode, first.stderr).toBe(0);
+		const firstResult = JSON.parse(first.stdout).result as {
+			cursor?: string;
+			items: Array<{ kind: string; seq?: number }>;
+		};
+		expect(firstResult.cursor).toBeString();
+		expect(firstResult.items.filter(item => item.kind === "turn_end")).toEqual([]);
+
+		// The frame published after the captured watermark belongs to the next
+		// poll, where it must be observed exactly once.
+		replayEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } }];
+		const second = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--cursor",
+			firstResult.cursor!,
+			"--after-transcript-id",
+			"boundary",
+			"--until-idle",
+			"--timeout-ms",
+			"1000",
+		]);
+		expect(second.exitCode, second.stderr).toBe(0);
+		const secondResult = JSON.parse(second.stdout).result as { items: Array<{ kind: string; seq?: number }> };
+		expect(secondResult.items.filter(item => item.kind === "turn_end").map(item => item.seq)).toEqual([2]);
+	}, 60_000);
+
+	it("rejects --after-transcript-id without --cursor for a live tail", async () => {
+		const tail = await runCli(root, agentDir, [
+			"tail",
+			"live",
+			"--after-transcript-id",
+			"boundary",
+			"--timeout-ms",
+			"100",
+		]);
+		expect(tail.exitCode, tail.stderr).toBe(2);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "usage" } });
 	}, 60_000);
 
 	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {
@@ -935,8 +1360,11 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
 
 		assertLiveFramesPrecededReplay();
-		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
-		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+		// The wait window closed without the turn going idle. That is a bounded,
+		// non-terminal observation, not a failure: what was collected is returned
+		// and `terminal: false` says the turn is still running.
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: true, result: { terminal: false } });
 	}, 60_000);
 
 	it("does not complete --until-idle when a delayed unsequenced terminal follows a newer sequenced start", async () => {
@@ -958,8 +1386,11 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
 
 		assertLiveFramesPrecededReplay();
-		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
-		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+		// The wait window closed without the turn going idle. That is a bounded,
+		// non-terminal observation, not a failure: what was collected is returned
+		// and `terminal: false` says the turn is still running.
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: true, result: { terminal: false } });
 	}, 60_000);
 
 	it("fails closed when conflicting lifecycle kinds claim the same canonical position", async () => {
@@ -1486,6 +1917,26 @@ describe("SDK session CLI", () => {
 		).rejects.toThrow("Retained transcript history contains unparseable entries");
 	});
 
+	it("accepts an offline boundary with exactly 200 newer retained rows", async () => {
+		const encoder = new TextEncoder();
+		const retained = encoder.encode(
+			`${[
+				JSON.stringify({ id: "boundary" }),
+				...Array.from({ length: 200 }, (_, index) => JSON.stringify({ id: `row-${index + 1}` })),
+			].join("\n")}\n`,
+		);
+		const entries = await scanRetainedTranscriptTail(
+			{
+				size: retained.byteLength,
+				readRange: async (start, end) => retained.slice(start, end),
+			},
+			{ boundaryId: "boundary" },
+		);
+		expect(entries.map(entry => (entry as { id?: string }).id)).toEqual(
+			Array.from({ length: 200 }, (_, index) => `row-${index + 1}`),
+		);
+	});
+
 	it("replays an unchanged Broker-identified offline transcript", async () => {
 		const session = await createStoppedSavedSession();
 		const result = await runCli(root, agentDir, ["tail", session.id]);
@@ -1493,6 +1944,40 @@ describe("SDK session CLI", () => {
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: true,
 			result: { version: 2, source: "offline", session: { sessionId: session.id }, terminal: true },
+		});
+	}, 60_000);
+	it("an offline tail honours --after-transcript-id exactly like a live resume", async () => {
+		// A session that stopped between two polls must not replay processed
+		// history on the next one; the boundary contract is the same offline.
+		const session = await createStoppedSavedSession(3);
+		const all = JSON.parse((await runCli(root, agentDir, ["tail", session.id])).stdout).result.items as Array<{
+			id?: string;
+		}>;
+		expect(all.length).toBeGreaterThan(1);
+		const boundary = all[0]!.id!;
+		const after = await runCli(root, agentDir, ["tail", session.id, "--after-transcript-id", boundary]);
+		expect(after.exitCode, after.stderr).toBe(0);
+		const items = JSON.parse(after.stdout).result.items as Array<{ id?: string }>;
+		expect(items.map(item => item.id)).toEqual(all.slice(1).map(item => item.id));
+		// Unknown boundary keeps everything.
+		const unknown = JSON.parse(
+			(await runCli(root, agentDir, ["tail", session.id, "--after-transcript-id", "nope"])).stdout,
+		).result.items;
+		expect(unknown).toHaveLength(all.length);
+	}, 60_000);
+	it("fails closed when an offline resume boundary is older than the retained window", async () => {
+		const session = await createStoppedSavedSession(205);
+		const lines = (await fs.readFile(session.path, "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const boundary = lines.find(entry => typeof entry.id === "string")?.id;
+		expect(boundary).toBeString();
+		const result = await runCli(root, agentDir, ["tail", session.id, "--after-transcript-id", String(boundary)]);
+		expect(result.exitCode, result.stderr).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: false,
+			error: { code: "retention_gap", details: { reason: "boundary_out_of_window" } },
 		});
 	}, 60_000);
 	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {

@@ -198,6 +198,7 @@ import {
 	logger,
 	prompt,
 	Snowflake,
+	safeErrorDescription,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -212,7 +213,12 @@ import {
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
-import { activateModelProfile, materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
+import {
+	activateModelProfile,
+	applyModelProfileRuntimeBindings,
+	materializeActiveModelProfileAssignment,
+	resolveMissingSessionModelRecovery,
+} from "../config/model-profile-activation";
 import {
 	ModelProfileRegistryError,
 	resolveModelProfileName,
@@ -237,6 +243,7 @@ import {
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	type ScopedModelSelection,
+	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -452,6 +459,7 @@ import {
 	effectiveFallbackDelay,
 	FallbackChainController,
 	type FallbackChainRuntimeState,
+	sanitizeCompactionCandidateFailureMessage,
 } from "./fallback-chain-controller";
 
 export { DefaultModelSelectionRecoveryError } from "./default-model-selection";
@@ -2037,6 +2045,7 @@ export type BeforeAgentStartContributor = (event: {
 }) => Promise<BeforeAgentStartInternalMessage | undefined>;
 
 const AGENT_END_WORKER_INTEGRATION_TIMEOUT_MS = 5_000;
+const COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS = 1_000;
 const POST_PUBLICATION_ERROR_MAX_BYTES = 512;
 
 /**
@@ -2511,6 +2520,17 @@ type CoordinatorRuntimeStatePersistContext = {
 	sessionFile: string | undefined;
 	stateFile: string | null;
 };
+
+/** A lost continuation may only settle the emitter/session pair that opened it. */
+export function isCurrentWorkflowGateContinuation(
+	currentSessionId: string,
+	expectedSessionId: string,
+	currentEmitter: WorkflowGateEmitter | undefined,
+	expectedEmitter: WorkflowGateEmitter,
+): boolean {
+	return currentSessionId === expectedSessionId && currentEmitter === expectedEmitter;
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -3028,6 +3048,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#startupRecoveryBindingsRequired = false;
 	#fallbackTransitionGeneration = 0;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
 	#escapedNonAsciiManagedRetries = 0;
@@ -9817,6 +9838,24 @@ export class AgentSession {
 
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
+		// A terminal abort can schedule a preserved follow-up as a fresh turn after
+		// the aborted run settles. Join that continuation before observing the
+		// sidecar queue; otherwise teardown can race a rearmed run and wait on its
+		// persistence while the test's manager is already being disposed.
+		const idleStatus = await Promise.race([
+			this.waitForIdle().then(
+				() => ({ status: "settled" as const }),
+				error => ({ status: "error" as const, error }),
+			),
+			Bun.sleep(COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS).then(() => ({ status: "timed_out" as const })),
+		]);
+		if (idleStatus.status === "error") throw idleStatus.error;
+		if (idleStatus.status === "timed_out") {
+			logger.warn("Coordinator persistence test seam timed out waiting for session idle", {
+				sessionId: this.sessionId,
+				timeoutMs: COORDINATOR_PERSISTENCE_TEST_IDLE_TIMEOUT_MS,
+			});
+		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
 	}
@@ -11842,7 +11881,26 @@ export class AgentSession {
 						path.join(sessionStateDir(this.sessionManager.getCwd(), sessionId), "workflow-gates.json"),
 					)
 				: new MemoryGateStore();
-		return new BrokerWorkflowGateEmitter(sessionId, gateStore);
+		let emitter: BrokerWorkflowGateEmitter;
+		emitter = new BrokerWorkflowGateEmitter(sessionId, gateStore, {
+			continuationLost: () => {
+				if (
+					!isCurrentWorkflowGateContinuation(
+						this.sessionManager.getSessionId(),
+						sessionId,
+						this.#workflowGateEmitter,
+						emitter,
+					)
+				)
+					return;
+				void this.abort({ cause: "internal", silent: true }).catch(error => {
+					logger.warn("Failed to settle a workflow gate turn after continuation loss", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+			},
+		});
+		return emitter;
 	}
 
 	/**
@@ -16540,15 +16598,42 @@ export class AgentSession {
 		await this.refreshBaseSystemPrompt();
 	}
 
-	/** Resolver intent only for assignments owned by the active profile. */
+	/** Resolver intent only for default assignments owned by an active or runtime-recovered durable profile. */
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
-		if (!this.#activeModelProfile) return undefined;
-		const profile = this.#modelRegistry.getModelProfile?.(this.#activeModelProfile);
+		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
+		const profileName =
+			this.#activeModelProfile ??
+			(role === "default" &&
+			runtimeDefaultIdentity?.origin === "runtime" &&
+			runtimeDefaultIdentity.identity === this.settings.get("modelProfile.default")
+				? runtimeDefaultIdentity.identity
+				: undefined);
+		if (!profileName) return undefined;
+		const profile = this.#modelRegistry.getModelProfile?.(profileName);
 		if (!profile) return undefined;
 		const bindings = resolveProfileBindings(profile);
+		const configuredDefault = role === "default" ? this.getConfiguredModelChain("default")?.[0] : undefined;
+		const profileDefault = Array.isArray(bindings.defaultSelector)
+			? bindings.defaultSelector[0]
+			: bindings.defaultSelector;
+		const configuredDefaultIdentity = configuredDefault
+			? splitSelectorThinkingSuffix(configuredDefault).selector.trim().toLowerCase()
+			: undefined;
+		const profileDefaultIdentity = profileDefault
+			? splitSelectorThinkingSuffix(profileDefault).selector.trim().toLowerCase()
+			: undefined;
+		const configuredDefaultModel = configuredDefaultIdentity
+			? parseModelString(configuredDefaultIdentity)
+			: undefined;
+		const profileDefaultModel = profileDefaultIdentity ? parseModelString(profileDefaultIdentity) : undefined;
+		const ownsConfiguredDefault =
+			configuredDefaultModel && profileDefaultModel
+				? configuredDefaultModel.provider === profileDefaultModel.provider &&
+					configuredDefaultModel.id === profileDefaultModel.id
+				: profileDefaultIdentity !== undefined && configuredDefaultIdentity === profileDefaultIdentity;
 		const owned =
 			role === "default"
-				? bindings.defaultSelector !== undefined
+				? runtimeDefaultIdentity?.origin === "runtime" || ownsConfiguredDefault
 				: Object.hasOwn(bindings.modelRoles, role) || Object.hasOwn(bindings.agentModelOverrides, role);
 		return owned ? { aliasIntent: "preset-equivalent" } : undefined;
 	}
@@ -16570,9 +16655,10 @@ export class AgentSession {
 	 * configured `modelBindings` (also installed into these two override slots
 	 * once at startup) are not profile-owned and must survive the transition.
 	 */
-	#resetSessionScopedModelProfileState(): void {
+	#resetSessionScopedModelProfileState(options?: { preserveDefaultConfiguredChain?: boolean; force?: boolean }): void {
 		const persistedProfile = this.settings.get("modelProfile.default");
-		if (persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile()) return;
+		if (!options?.force && persistedProfile !== undefined && persistedProfile === this.getActiveModelProfile())
+			return;
 		const hadInstalledKeys =
 			this.#activeProfileInstalledRoles.size > 0 || this.#activeProfileInstalledAgentOverrides.size > 0;
 		if (hadInstalledKeys) {
@@ -16595,7 +16681,7 @@ export class AgentSession {
 			this.#modelRegistry.reapplyConfiguredModelBindings(this.settings);
 		}
 		const defaultChain = getSessionContextForInternalRead(this.sessionManager).configuredModelChains.default;
-		if (defaultChain && defaultChain.identity !== undefined) {
+		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
 		this.setActiveModelProfile(undefined);
@@ -16837,11 +16923,36 @@ export class AgentSession {
 	 * must not mutate the persisted configured intent.
 	 */
 	setDefaultFallbackRuntimeModel(selector: string): void {
+		this.installRecoveredDefaultFallbackChain([selector], undefined, 0, []);
+	}
+
+	/** Install a runtime-only durable fallback without changing saved session intent. */
+	installRecoveredDefaultFallbackChain(
+		entries: readonly string[],
+		identity: string | undefined,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+		options?: { emitResolutionEvent?: boolean },
+	): void {
 		this.#defaultFallbackController = new FallbackChainController(
-			{ role: "default", entries: [selector], origin: "runtime", explicitHead: true },
+			{ role: "default", entries: [...entries], origin: "runtime", identity, explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
 		this.#defaultFallbackExhaustedLastTurn = false;
+		this.#seedDefaultFallbackResolutionForController(
+			this.#defaultFallbackController,
+			activeIndex,
+			skips,
+			options?.emitResolutionEvent ?? true,
+		);
+	}
+
+	markStartupRecoveryBindingsRequired(): void {
+		this.#startupRecoveryBindingsRequired = true;
+	}
+
+	hasRecoveredDefaultFallbackChain(): boolean {
+		return this.#startupRecoveryBindingsRequired || this.#defaultFallbackController?.chain.origin === "runtime";
 	}
 
 	/**
@@ -16849,9 +16960,18 @@ export class AgentSession {
 	 * The configured chain's role, origin, and identity are retained by the controller.
 	 */
 	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
-		const controller = this.#defaultFallbackChain();
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackChain(), activeIndex, skips);
+	}
+
+	/** Seed an already-selected runtime controller without legacy-chain materialization. */
+	#seedDefaultFallbackResolutionForController(
+		controller: FallbackChainController,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+		emitResolutionEvent = true,
+	): void {
 		controller.seedResolution(activeIndex, skips);
-		this.#emitResolutionFallbackSwitch(controller);
+		if (emitResolutionEvent) this.#emitResolutionFallbackSwitch(controller);
 	}
 
 	getDefaultFallbackRuntimeState(): DefaultFallbackRuntimeState {
@@ -20288,33 +20408,79 @@ export class AgentSession {
 			addCandidate(this.#resolveRoleModelFull(role, availableModels, currentModel).model);
 		}
 
-		// Last-resort fallback: the largest-context model that shares the ACTIVE
-		// model's provider. Scoping this to the current provider keeps auto-
-		// compaction on the user's configured/custom route instead of silently
-		// defaulting to an unrelated provider (e.g. a stray OpenAI credential
-		// with no remaining credit) just because it happens to be in the bundled
-		// catalog. Cross-provider compaction stays possible, but only when the
-		// user opts in explicitly via modelRoles (handled by the loop above).
-		const fallbackProvider = currentModel?.provider;
-		const sortedByContext = [...availableModels]
-			.filter(model => fallbackProvider === undefined || model.provider === fallbackProvider)
-			.sort((a, b) => b.contextWindow - a.contextWindow);
-		for (const model of sortedByContext) {
-			if (!seen.has(this.#getModelKey(model))) {
-				addCandidate(model);
-				break;
-			}
-		}
-
 		return candidates;
+	}
+	#compactionCandidateSource(candidate: Model): string {
+		const currentModel = this.model;
+		if (currentModel && modelsAreEqual(candidate, currentModel)) return "active session model";
+		for (const role of MODEL_ROLE_IDS) {
+			const roleModel = this.#resolveRoleModelFull(role, this.#modelRegistry.getAvailable(), currentModel).model;
+			if (roleModel && modelsAreEqual(candidate, roleModel)) return `modelRoles.${role}`;
+		}
+		return "configured compaction fallback";
+	}
+	#compactionFailureReason(error: unknown): string {
+		const message = sanitizeCompactionCandidateFailureMessage(error instanceof Error ? error.message : String(error));
+		if (/stream stalled while waiting for the next event/i.test(message)) {
+			return "SSE stream stalled while waiting for the next event";
+		}
+		if (/timed? out while waiting for the first event/i.test(message)) {
+			return "SSE stream timed out while waiting for the first event";
+		}
+		if (/auth_unavailable|no auth available|credential/i.test(message)) {
+			return "candidate credentials unavailable";
+		}
+		return message.length > 160 ? `${message.slice(0, 157)}...` : message;
+	}
+	async #emitCompactionModelSubstitution(from: Model, to: Model, reason: string): Promise<void> {
+		const fromKey = this.#getModelKey(from);
+		const toKey = this.#getModelKey(to);
+		const source = this.#compactionCandidateSource(to);
+		try {
+			await this.#emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "compaction-recovery",
+				message: `Compaction recovery switched model from ${fromKey} to ${toKey} (${source}) after ${reason}.`,
+			});
+		} catch (error) {
+			logger.warn("Failed to publish compaction model substitution", {
+				from: fromKey,
+				to: toKey,
+				error: String(error),
+			});
+		}
+	}
+	async #resolveCompactionCandidate(
+		candidate: Model,
+		previousCandidate: Model | undefined,
+		previousFailure: unknown,
+	): Promise<{ apiKey: string; authError?: undefined } | { apiKey: undefined; authError: Error }> {
+		const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
+		if (!apiKey) return { apiKey: undefined, authError: this.#buildCompactionAuthError(candidate) };
+		if (previousCandidate) {
+			await this.#emitCompactionModelSubstitution(
+				previousCandidate,
+				candidate,
+				this.#compactionFailureReason(previousFailure),
+			);
+		}
+		return { apiKey, authError: undefined };
 	}
 	#isCompactionAuthFailure(error: unknown): boolean {
 		if (!(error instanceof Error)) return false;
+		if (
+			/stream stalled while waiting for the next event|timed? out while waiting for the first event/i.test(
+				error.message,
+			)
+		) {
+			return false;
+		}
 		return /auth_unavailable|no auth available/i.test(error.message);
 	}
 
-	#buildCompactionAuthError(): Error {
-		const currentModel = this.model;
+	#buildCompactionAuthError(candidate?: Model): Error {
+		const currentModel = candidate ?? this.model;
 		if (!currentModel) {
 			return new Error(
 				"Compaction requires a model with usable credentials, but no authenticated compaction model is available.",
@@ -20364,10 +20530,20 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		const candidates = this.#getCompactionModelCandidates(this.#modelRegistry.getAvailable());
 		const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
+		let previousCandidate: Model | undefined;
+		let previousFailure: unknown;
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-			if (!apiKey) continue;
+			const { apiKey, authError } = await this.#resolveCompactionCandidate(
+				candidate,
+				previousCandidate,
+				previousFailure,
+			);
+			if (apiKey === undefined) {
+				previousCandidate = candidate;
+				previousFailure = authError;
+				continue;
+			}
 
 			try {
 				return await compact(preparation, candidate, apiKey, customInstructions, signal, {
@@ -20385,10 +20561,12 @@ export class AgentSession {
 				if (!this.#isCompactionAuthFailure(error)) {
 					throw error;
 				}
+				previousCandidate = candidate;
+				previousFailure = this.#buildCompactionAuthError(candidate);
 			}
 		}
 
-		throw this.#buildCompactionAuthError();
+		throw previousFailure instanceof Error ? previousFailure : this.#buildCompactionAuthError();
 	}
 
 	async #prepareCompactionFromHooks(
@@ -20631,30 +20809,14 @@ export class AgentSession {
 			}
 
 			if (!this.model) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw new Error("No model selected");
 			}
 
 			const availableModels = this.#modelRegistry.getAvailable();
 			if (availableModels.length === 0) {
-				await this.#emitSessionEvent({
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					skipped: true,
-				});
 				await compactionStateSnapshotPromise;
-				return { kind: "skipped" };
+				throw this.#buildCompactionAuthError(this.model);
 			}
 
 			if (autoCompactionSignal.aborted) return await emitAborted();
@@ -20842,14 +21004,29 @@ export class AgentSession {
 				const telemetry = resolveTelemetry(this.agent.telemetry, this.sessionId);
 				let compactResult: CompactionResult | undefined;
 				let lastError: unknown;
-				// Every candidate that was tried and failed, in order. Only the last failure
-				// used to reach the user, which named whichever same-provider fallback the
-				// chain ended on and hid that the session model itself had already failed.
+				// Every candidate that was tried and failed, in order. Keep the first
+				// failure visible, and retain candidate-specific diagnostics for explicit
+				// role fallbacks instead of collapsing the chain to its final error.
 				const candidateFailures: Array<{ model: string; message: string }> = [];
+				let previousCandidate: Model | undefined;
+				let previousFailure: unknown;
 
 				for (const candidate of candidates) {
-					const apiKey = await this.#modelRegistry.getApiKey(candidate, this.credentialSessionId);
-					if (!apiKey) continue;
+					const { apiKey, authError } = await this.#resolveCompactionCandidate(
+						candidate,
+						previousCandidate,
+						previousFailure,
+					);
+					if (apiKey === undefined) {
+						lastError = authError;
+						previousCandidate = candidate;
+						previousFailure = authError;
+						candidateFailures.push({
+							model: `${candidate.provider}/${candidate.id}`,
+							message: authError.message,
+						});
+						continue;
+					}
 
 					let attempt = 0;
 					while (true) {
@@ -20878,8 +21055,14 @@ export class AgentSession {
 
 							const message = error instanceof Error ? error.message : String(error);
 							if (this.#isCompactionAuthFailure(error)) {
-								lastError = this.#buildCompactionAuthError();
-								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
+								const authError = this.#buildCompactionAuthError(candidate);
+								lastError = authError;
+								previousCandidate = candidate;
+								previousFailure = authError;
+								candidateFailures.push({
+									model: `${candidate.provider}/${candidate.id}`,
+									message: authError.message,
+								});
 								break;
 							}
 							const retryAfterMs = this.#parseRetryAfterMsFromError(message);
@@ -20892,6 +21075,8 @@ export class AgentSession {
 									isUsageLimitError(message));
 							if (!shouldRetry) {
 								lastError = error;
+								previousCandidate = candidate;
+								previousFailure = error;
 								candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 								break;
 							}
@@ -20917,6 +21102,8 @@ export class AgentSession {
 										model: `${candidate.provider}/${candidate.id}`,
 									});
 									lastError = error;
+									previousCandidate = candidate;
+									previousFailure = error;
 									candidateFailures.push({ model: `${candidate.provider}/${candidate.id}`, message });
 									break; // Exit retry loop, continue to next candidate
 								}
@@ -24174,8 +24361,16 @@ export class AgentSession {
 			const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 			const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
 			const previousModel = this.model;
+			const previousDefaultFallbackRuntimeState = this.getDefaultFallbackRuntimeState();
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
+			const previousModelRolesOverride = structuredClone(this.settings.getOverride("modelRoles"));
+			const previousAgentModelOverridesOverride = structuredClone(
+				this.settings.getOverride("task.agentModelOverrides"),
+			);
+			const previousActiveProfileInstalledRoles = new Map(this.#activeProfileInstalledRoles);
+			const previousActiveProfileInstalledAgentOverrides = new Map(this.#activeProfileInstalledAgentOverrides);
+			const previousPreProfileModel = this.#preProfileModel;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 			const previousTools = [...this.agent.state.tools];
@@ -24196,6 +24391,9 @@ export class AgentSession {
 				? this.#suspendWorkflowGateEmitter(previousSessionState.sessionId)
 				: undefined;
 			let unavailableDefaultChainMessage: string | undefined;
+			let recoveredDefaultChainMessage: string | undefined;
+			let recoveredThinkingLevel: ThinkingLevel | undefined;
+			let durableDefaultRecoveryError: string | undefined;
 			let transitionCleanupCommitted = false;
 			let exactRetirement: PreparedExactMcpRetirement | undefined;
 
@@ -24253,12 +24451,6 @@ export class AgentSession {
 
 				const resumeModelBehavior = this.settings.get("session.resumeModelBehavior");
 				const configuredDefaultChain = sessionContext.configuredModelChains.default;
-				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
-				const defaultEntries =
-					resumeModelBehavior === "useCurrentDefault"
-						? settingsDefaultEntries
-						: (configuredDefaultChain?.entries ??
-							(sessionContext.models.default ? [sessionContext.models.default] : []));
 				const profileDefinitions = this.#modelRegistry.getModelProfiles?.() ?? new Map<string, unknown>();
 				const configuredProfileName = this.settings.get("modelProfile.default");
 				const configuredProfileIdentity = configuredProfileName
@@ -24270,18 +24462,45 @@ export class AgentSession {
 				const liveProfileIdentity = previousActiveModelProfile
 					? resolveModelProfileName(previousActiveModelProfile, profileDefinitions)
 					: undefined;
-				this.#activeModelProfile =
+				let targetActiveModelProfile =
 					resumeModelBehavior === "useCurrentDefault"
-						? liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
-							? liveProfileIdentity
-							: configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+						? switchingToDifferentSession
+							? configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
 								? configuredProfileIdentity
 								: undefined
+							: liveProfileIdentity && profileDefinitions.has(liveProfileIdentity)
+								? liveProfileIdentity
+								: configuredProfileIdentity && profileDefinitions.has(configuredProfileIdentity)
+									? configuredProfileIdentity
+									: undefined
 						: configuredDefaultChain?.origin === "profile-activation" &&
 								persistedProfileIdentity &&
 								profileDefinitions.has(persistedProfileIdentity)
 							? persistedProfileIdentity
 							: undefined;
+				// Keep a durable profile's existing runtime layer when the successor
+				// resolves to that same profile. A cross-file transition has no separate
+				// profile activation to reinstall its role and delegation bindings. Any
+				// session-only or different predecessor profile must still be removed
+				// before resolving the successor's default chain.
+				const retainsDurableProfileLayer =
+					switchingToDifferentSession &&
+					targetActiveModelProfile !== undefined &&
+					targetActiveModelProfile === configuredProfileIdentity &&
+					liveProfileIdentity === targetActiveModelProfile;
+				let targetProfileRuntimeInstalled = !switchingToDifferentSession || retainsDurableProfileLayer;
+				if (switchingToDifferentSession && !retainsDurableProfileLayer)
+					this.#resetSessionScopedModelProfileState({
+						preserveDefaultConfiguredChain: true,
+						force: true,
+					});
+				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
+				const defaultEntries =
+					resumeModelBehavior === "useCurrentDefault"
+						? settingsDefaultEntries
+						: (configuredDefaultChain?.entries ??
+							(sessionContext.models.default ? [sessionContext.models.default] : []));
+				this.#activeModelProfile = targetActiveModelProfile;
 				this.#defaultFallbackController = undefined;
 				if (defaultEntries.length > 0) {
 					const resolution = await resolveModelChainWithAuth(
@@ -24295,14 +24514,77 @@ export class AgentSession {
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 						},
 					);
-					const controller = this.#defaultFallbackChain();
+					let controller = this.#defaultFallbackChain();
 					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
-					if (!resolution.model) {
-						unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
-						throw new Error(unavailableDefaultChainMessage);
+					let resolvedModel = resolution.model;
+					if (!resolvedModel) {
+						if (resumeModelBehavior === "keepSessionModel") {
+							try {
+								const recovery = await resolveMissingSessionModelRecovery({
+									modelRegistry: this.#modelRegistry,
+									settings: this.settings,
+									defaultEntries,
+									skips: resolution.skips,
+									savedDefault: sessionContext.models.default,
+									credentialSessionId: this.credentialSessionId,
+									...(this.#persistedModelProfileAliasIntent("default") ?? {}),
+								});
+								if (recovery?.model) {
+									const installedProfileKeys =
+										this.#activeProfileInstalledRoles.size > 0 ||
+										this.#activeProfileInstalledAgentOverrides.size > 0;
+									const recoveryNeedsBindings =
+										switchingToDifferentSession ||
+										targetActiveModelProfile !== recovery.profileName ||
+										!installedProfileKeys;
+									if (recoveryNeedsBindings) {
+										if (!switchingToDifferentSession)
+											this.#resetSessionScopedModelProfileState({
+												preserveDefaultConfiguredChain: true,
+												force: true,
+											});
+										await applyModelProfileRuntimeBindings({
+											session: this,
+											modelRegistry: this.#modelRegistry,
+											settings: this.settings,
+											profileName: recovery.profileName,
+										});
+										targetActiveModelProfile = recovery.profileName;
+										targetProfileRuntimeInstalled = true;
+									}
+									this.installRecoveredDefaultFallbackChain(
+										recovery.entries,
+										recovery.profileName,
+										recovery.activeIndex,
+										recovery.skips,
+										{ emitResolutionEvent: false },
+									);
+									controller = this.#defaultFallbackChain(false);
+									resolvedModel = recovery.model;
+									recoveredThinkingLevel = recovery.explicitThinkingLevel ? recovery.thinkingLevel : undefined;
+									recoveredDefaultChainMessage =
+										"Saved session model is no longer registered; restored the durable default preset instead.";
+								} else if (recovery) {
+									durableDefaultRecoveryError = "durable default preset resolution failed";
+								}
+							} catch (error) {
+								// The saved chain remains authoritative on recovery failure, but the
+								// durable preset's diagnostic is actionable and must not disappear.
+								logger.warn("Failed to recover saved session model through durable default", {
+									error: safeErrorDescription(error),
+								});
+								durableDefaultRecoveryError = "durable default preset resolution failed";
+							}
+						}
+						if (!resolvedModel) {
+							unavailableDefaultChainMessage = this.#fallbackExhaustionError(controller);
+							if (durableDefaultRecoveryError)
+								unavailableDefaultChainMessage += `; durable default preset recovery failed: ${durableDefaultRecoveryError}`;
+							throw new Error(unavailableDefaultChainMessage);
+						}
 					}
-					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
-						this.#setModelAuthoritatively(resolution.model, "restore");
+					if (!this.model || !modelsAreEqual(this.model, resolvedModel)) {
+						this.#setModelAuthoritatively(resolvedModel, "restore");
 					}
 					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					// No thinking-level write here: the recompute below is the single
@@ -24310,6 +24592,11 @@ export class AgentSession {
 					// would append a stray thinking_level_change entry that flips
 					// hasThinkingEntry and changes what the recompute restores.
 				}
+				// The saved chain may need its profile identity for alias resolution, but
+				// a cross-file transition must not advertise that profile after its
+				// runtime role layer was removed. Otherwise delegation prompt state and
+				// actual role routing diverge.
+				if (!targetProfileRuntimeInstalled) this.#activeModelProfile = undefined;
 
 				const hasThinkingEntry = this.sessionManager
 					.getBranch()
@@ -24318,10 +24605,17 @@ export class AgentSession {
 					.getBranch()
 					.some(entry => entry.type === "service_tier_change");
 				const defaultThinkingLevel = this.settings.get("defaultThinkingLevel");
+				const hasExplicitDefaultThinkingLevel = this.settings.has("defaultThinkingLevel");
 				const configuredServiceTier = this.settings.get("serviceTier");
-				const persistedThinkingLevel = hasThinkingEntry
-					? (sessionContext.thinkingLevel as ThinkingLevel | undefined)
-					: defaultThinkingLevel;
+				const sessionThinkingLevel = sessionContext.thinkingLevel as ThinkingLevel | undefined;
+				const recoveredModelThinkingLevel =
+					recoveredDefaultChainMessage && !hasExplicitDefaultThinkingLevel
+						? this.model?.thinking?.defaultLevel
+						: undefined;
+				const persistedThinkingLevel =
+					hasThinkingEntry && sessionThinkingLevel !== ThinkingLevel.Inherit
+						? sessionThinkingLevel
+						: (recoveredThinkingLevel ?? recoveredModelThinkingLevel ?? defaultThinkingLevel);
 				const nextThinkingLevel = resolveThinkingLevelForModel(
 					this.model,
 					persistedThinkingLevel === ThinkingLevel.Inherit
@@ -24341,16 +24635,15 @@ export class AgentSession {
 					: configuredServiceTier === "none"
 						? undefined
 						: configuredServiceTier;
-				// Switching to another session file must not carry the predecessor's
-				// profile marker or role overrides into the successor; the successor's
-				// own configured model is restored above.
-				if (switchingToDifferentSession) this.#resetSessionScopedModelProfileState();
 				// Establish the successor's durable session identity only after every
 				// restored state facet is live. Identity-bound extension hooks run below.
 				await this.sessionManager.ensureOnDisk();
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
 				if (switchingToDifferentSession) {
+					// Profile cleanup changed the active role layer; refresh eager task
+					// delegation and its base prompt before reconnecting the successor.
+					await this.syncEagerDelegation();
 					// The local:// migration gate for this successor already ran above,
 					// before the identity was published (#2797 / #2925).
 					this.#resetHindsightConversationTrackingIfHindsight();
@@ -24430,6 +24723,8 @@ export class AgentSession {
 					...previousDeferredSdkFollowUps,
 				]);
 				this.#deferredSdkFollowUps = [];
+				if (recoveredDefaultChainMessage) this.#emitResolutionFallbackSwitch(this.#defaultFallbackChain(false));
+				if (recoveredDefaultChainMessage) this.emitNotice("warning", recoveredDefaultChainMessage, "fallback");
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
@@ -24474,8 +24769,16 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
-				this.#defaultFallbackController = undefined;
+				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
+				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
+				else this.settings.override("modelRoles", previousModelRolesOverride);
+				if (previousAgentModelOverridesOverride === undefined)
+					this.settings.clearOverride("task.agentModelOverrides");
+				else this.settings.override("task.agentModelOverrides", previousAgentModelOverridesOverride);
+				this.#activeProfileInstalledRoles = new Map(previousActiveProfileInstalledRoles);
+				this.#activeProfileInstalledAgentOverrides = new Map(previousActiveProfileInstalledAgentOverrides);
+				this.#preProfileModel = previousPreProfileModel;
 				this.#activeModelProfile = previousActiveModelProfile;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -24513,9 +24816,8 @@ export class AgentSession {
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
-				if (previousModel) {
-					this.#setAgentModelWithReasoningContext(previousModel);
-				}
+				this.#setAgentModelWithReasoningContext(previousModel);
+				this.#syncAppendOnlyContext(previousModel);
 				this.#thinkingLevelMutationRevision++;
 				this.#thinkingLevelLiveMutationRevision++;
 				this.#pendingThinkingLevelControlSuccess = undefined;

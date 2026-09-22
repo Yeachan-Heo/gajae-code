@@ -86,6 +86,8 @@ export interface SdkSessionCliArgs {
 	strict?: boolean;
 	untilIdle?: boolean;
 	allEvents?: boolean;
+	/** tail --cursor: transcript row id the caller has already processed; rows up to and including it are omitted. */
+	afterTranscriptId?: string;
 	page?: boolean;
 	repo?: string;
 	scope?: string;
@@ -97,7 +99,8 @@ export interface SdkSessionCliArgs {
 
 type JsonRecord = Record<string, unknown>;
 type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.lookup" | "session.list">;
-type TailExitReason = "idle" | "close";
+/** Why a tail call returned: the turn went idle, the session closed, or the caller's wait window closed (non-terminal). */
+type TailExitReason = "idle" | "close" | "timeout";
 export interface RetainedTranscriptTailReader {
 	readonly size: number;
 	readRange(start: number, end: number): Promise<Uint8Array>;
@@ -146,7 +149,7 @@ class SdkSessionCliError extends Error {
 
 class RetainedTranscriptTailError extends Error {
 	constructor(
-		readonly reason: "unavailable" | "corrupt" | "line_limit" | "scan_limit" | "changed",
+		readonly reason: "unavailable" | "corrupt" | "line_limit" | "scan_limit" | "changed" | "boundary_out_of_window",
 		message: string,
 	) {
 		super(message);
@@ -1266,14 +1269,23 @@ function retainedTranscriptCorrupt(): RetainedTranscriptTailError {
 	);
 }
 
-export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailReader): Promise<unknown[]> {
+export async function scanRetainedTranscriptTail(
+	reader: RetainedTranscriptTailReader,
+	options: { boundaryId?: string } = {},
+): Promise<unknown[]> {
 	if (!Number.isSafeInteger(reader.size) || reader.size < 0) throw retainedTranscriptUnavailable();
 	const entries: unknown[] = [];
+	let rowsAfterBoundary = 0;
+	let boundaryFound = false;
 	let position = reader.size;
 	let scannedBytes = 0;
 	let scannedLines = 0;
 	let trailingFragment = new Uint8Array();
-	while (position > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
+	while (
+		position > 0 &&
+		(entries.length < TAIL_OFFLINE_MAX_ENTRIES || (options.boundaryId !== undefined && !boundaryFound)) &&
+		(options.boundaryId === undefined || !boundaryFound)
+	) {
 		const remainingBytes = TAIL_OFFLINE_MAX_SCAN_BYTES - scannedBytes;
 		if (remainingBytes <= 0)
 			throw new RetainedTranscriptTailError(
@@ -1313,7 +1325,11 @@ export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailR
 		}
 
 		let lineEnd = complete.byteLength;
-		while (lineEnd > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
+		while (
+			lineEnd > 0 &&
+			(entries.length < TAIL_OFFLINE_MAX_ENTRIES || (options.boundaryId !== undefined && !boundaryFound)) &&
+			(options.boundaryId === undefined || !boundaryFound)
+		) {
 			const newline = complete.lastIndexOf(0x0a, lineEnd - 1);
 			const lineStart = newline < 0 ? 0 : newline + 1;
 			const line = complete.subarray(lineStart, lineEnd);
@@ -1331,12 +1347,24 @@ export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailR
 					"Retained transcript history exceeds the bounded tail replay limit.",
 				);
 			try {
-				entries.push(JSON.parse(transcriptDecoder.decode(line)));
-			} catch {
+				const entry: unknown = JSON.parse(transcriptDecoder.decode(line));
+				if (options.boundaryId !== undefined && isRecord(entry) && entry.id === options.boundaryId) {
+					if (rowsAfterBoundary > TAIL_OFFLINE_MAX_ENTRIES)
+						throw new RetainedTranscriptTailError(
+							"boundary_out_of_window",
+							"The requested transcript boundary is older than the bounded offline tail window.",
+						);
+					boundaryFound = true;
+				} else if (options.boundaryId !== undefined && !boundaryFound) {
+					rowsAfterBoundary++;
+				}
+				if (entries.length < TAIL_OFFLINE_MAX_ENTRIES) entries.push(entry);
+			} catch (error) {
+				if (error instanceof RetainedTranscriptTailError) throw error;
 				throw retainedTranscriptCorrupt();
 			}
 		}
-		if (entries.length === TAIL_OFFLINE_MAX_ENTRIES) break;
+		if (entries.length === TAIL_OFFLINE_MAX_ENTRIES && (options.boundaryId === undefined || boundaryFound)) break;
 		if (start > 0) {
 			if (partial.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
 				throw new RetainedTranscriptTailError(
@@ -1350,7 +1378,10 @@ export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailR
 	return entries.reverse();
 }
 
-async function readRetainedTranscriptTail(savedSession: SessionLifecycleSavedSession): Promise<unknown[]> {
+async function readRetainedTranscriptTail(
+	savedSession: SessionLifecycleSavedSession,
+	afterTranscriptId?: string,
+): Promise<unknown[]> {
 	let descriptor: fs.FileHandle | undefined;
 	try {
 		descriptor = await fs.open(savedSession.path, retainedTranscriptOpenFlags());
@@ -1360,10 +1391,13 @@ async function readRetainedTranscriptTail(savedSession: SessionLifecycleSavedSes
 		// Bind every range read to the opened descriptor so a later pathname replacement
 		// cannot change the retained history selected by the lifecycle lookup.
 		const file = Bun.file(descriptor.fd);
-		const entries = await scanRetainedTranscriptTail({
-			size: Number(before.size),
-			readRange: async (start, end) => new Uint8Array(await file.slice(start, end).arrayBuffer()),
-		});
+		const entries = await scanRetainedTranscriptTail(
+			{
+				size: Number(before.size),
+				readRange: async (start, end) => new Uint8Array(await file.slice(start, end).arrayBuffer()),
+			},
+			{ boundaryId: afterTranscriptId },
+		);
 		const after = await descriptor.stat({ bigint: true });
 		if (
 			!matchesRetainedTranscriptIdentity(savedSession.identity, after) ||
@@ -1391,6 +1425,7 @@ async function offlineTailReplay(
 	agentDir: string,
 	sessionId: string,
 	row: SdkSessionRowV1,
+	afterTranscriptId?: string,
 ): Promise<unknown> {
 	const lifecycle = createBrokerSessionLifecycleService(agentDir);
 	const outcome = await lifecycle.list({
@@ -1415,7 +1450,7 @@ async function offlineTailReplay(
 		);
 	let entries: unknown[];
 	try {
-		entries = await readRetainedTranscriptTail(savedSession);
+		entries = await readRetainedTranscriptTail(savedSession, afterTranscriptId);
 	} catch (error) {
 		const retained = error instanceof RetainedTranscriptTailError ? error : retainedTranscriptUnavailable();
 		throw new SdkSessionCliError("retention_gap", retained.message, 1, {
@@ -1423,15 +1458,21 @@ async function offlineTailReplay(
 			reason: retained.reason,
 		});
 	}
+	const items = entries.map((entry, index) =>
+		toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
+	);
+	// The same contract as a live resume: rows up to and including the id the
+	// caller already has are omitted, so a session that stopped between two
+	// polls does not replay processed history on the next one. Unknown
+	// boundary keeps everything (a duplicate is recoverable; a missing row is not).
+	const boundary = afterTranscriptId === undefined ? -1 : items.findIndex(item => item.id === afterTranscriptId);
 	return {
 		ok: true,
 		result: {
 			version: SESSION_ROWS_VERSION,
 			source: "offline",
 			session: row,
-			items: entries.map((entry, index) =>
-				toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
-			),
+			items: boundary >= 0 ? items.slice(boundary + 1) : items,
 			terminal: true,
 		},
 	};
@@ -1460,6 +1501,8 @@ async function runLiveTail(
 	const seenEvents = new Set<string>();
 	const liveRevisionBuffer = new TailRevisionBuffer();
 	let checkpoint: SdkCheckpointRecordV1 | undefined;
+	let transcriptCheckpoint: SdkCheckpointRecordV1 | undefined;
+	let eventReplayCheckpoint: SdkCheckpointRecordV1 | undefined;
 	let gap: SdkRetentionGapV1 | undefined;
 	let liveReason: TailExitReason | undefined;
 	let resolveLive: ((reason: TailExitReason) => void) | undefined;
@@ -1473,6 +1516,7 @@ async function runLiveTail(
 	let turnIdle = false;
 	let turnStateKey: TailSeqKey | undefined;
 	let closed = false;
+	let acceptingLiveFrames = true;
 	// Lifecycle kind already claimed at each canonical position. A same-kind
 	// duplicate never reaches here (dedupe keys include kind), so any entry that
 	// disagrees is a host stating two different lifecycle kinds at one position.
@@ -1537,6 +1581,7 @@ async function runLiveTail(
 	};
 
 	const recordLiveFrame = (attachment: SessionAttachment, frame: SessionRouterFrame): void => {
+		if (!acceptingLiveFrames) return;
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
@@ -1572,6 +1617,8 @@ async function runLiveTail(
 			throwResponseFailure(checkpointResponse);
 			const extraction = extractCheckpoint(checkpointResponse);
 			checkpoint = extraction.record;
+			transcriptCheckpoint = checkpoint;
+			eventReplayCheckpoint = checkpoint;
 			gap = extraction.gap;
 			if (checkpoint !== undefined)
 				applyLifecycle(
@@ -1585,7 +1632,87 @@ async function runLiveTail(
 					gap,
 				);
 
+			// Which snapshot to page. A fresh tail pages the checkpoint it was just
+			// handed. A resumed tail (`--cursor`) must NOT page the exchanged cursor:
+			// that one is pinned to the OLD snapshot at offset 0, so it would replay
+			// every row the caller already processed. It pages a fresh snapshot
+			// instead and drops rows up to the caller's `--after-transcript-id`, so
+			// the result is exactly the transcript delta since the last tail - the
+			// rows that carry tool calls and interim assistant text.
 			let cursor = extraction.cursor;
+			if (args.cursor !== undefined) {
+				if (cursor === undefined)
+					throw new SdkSessionCliError(
+						"unavailable",
+						"The host did not return the exchanged checkpoint needed to resume this tail.",
+						1,
+					);
+				const exchangedCursor = cursor;
+				let freshPagingCursor: string | undefined;
+				let freshPagingCheckpoint: SdkCheckpointRecordV1 | undefined;
+				try {
+					const fresh = await router.request(
+						sessionId,
+						{ type: "query_request", query: "session.checkpoint", input: {} },
+						attachment.generation,
+						attachment,
+						args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+					);
+					throwResponseFailure(fresh);
+					const freshExtraction = extractCheckpoint(fresh);
+					freshPagingCursor = freshExtraction.cursor;
+					freshPagingCheckpoint = freshExtraction.record;
+					if (freshPagingCursor === undefined || freshPagingCheckpoint === undefined)
+						throw new Error("The host returned an incomplete transcript checkpoint.");
+				} catch {
+					// Keep the exchanged cursor as a complete fallback. Returning only live
+					// frames after a failed fresh checkpoint would silently discard the
+					// transcript delta the caller is resuming for.
+					freshPagingCursor = undefined;
+					freshPagingCheckpoint = undefined;
+				}
+				if (freshPagingCursor !== undefined && freshPagingCheckpoint !== undefined) {
+					const pagingCursor = freshPagingCursor;
+					const pagingCheckpoint = freshPagingCheckpoint;
+					// The exchanged cursor is pinned to the old snapshot. Release it only
+					// after the fresh snapshot has been acquired so a failed mint can still
+					// page the exchanged snapshot instead of returning partial success.
+					let drain: string | undefined = exchangedCursor;
+					while (drain !== undefined) {
+						try {
+							const page = extractTranscriptPage(
+								await router.request(
+									sessionId,
+									{ type: "query_request", query: "transcript.list", input: {}, cursor: drain },
+									attachment.generation,
+									attachment,
+									args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+								),
+							);
+							drain = page.complete ? undefined : page.cursor;
+						} catch {
+							// Releasing is best-effort; a pin that cannot be drained expires with its TTL.
+							drain = undefined;
+						}
+					}
+					cursor = pagingCursor;
+					transcriptCheckpoint = pagingCheckpoint;
+					eventReplayCheckpoint = pagingCheckpoint;
+					applyLifecycle(
+						mergeEventTailItems(
+							eventItems,
+							seenEvents,
+							liveRevisionBuffer.resolve(pagingCheckpoint.revision),
+							include,
+						),
+					);
+				} else {
+					cursor = exchangedCursor;
+					transcriptCheckpoint = checkpoint;
+					eventReplayCheckpoint = checkpoint;
+				}
+			}
+			const transcriptStart = transcriptItems.length;
 			while (cursor !== undefined) {
 				const response = await router.request(
 					sessionId,
@@ -1596,7 +1723,7 @@ async function runLiveTail(
 				);
 				throwResponseFailure(response);
 				const page = extractTranscriptPage(response);
-				const rev = checkpoint?.revision;
+				const rev = transcriptCheckpoint?.revision;
 				let nextSeq = transcriptItems.length;
 				mergeTailItems(
 					transcriptItems,
@@ -1604,7 +1731,7 @@ async function runLiveTail(
 					page.items.map(item => {
 						const it = toTailItemV1(item, { kind: "transcript" });
 						if (it.revision === undefined && rev !== undefined) it.revision = rev;
-						if (it.generation === undefined) it.generation = checkpoint?.generation ?? 0;
+						if (it.generation === undefined) it.generation = transcriptCheckpoint?.generation ?? 0;
 						if (it.seq === undefined) it.seq = nextSeq++;
 						return it;
 					}),
@@ -1613,14 +1740,23 @@ async function runLiveTail(
 				if (page.complete || page.cursor === undefined) break;
 				cursor = page.cursor;
 			}
+			if (args.cursor !== undefined && args.afterTranscriptId !== undefined) {
+				// Drop the rows the caller already has. Unknown boundary (row rotated
+				// out, or a different session) → keep everything: a duplicate is
+				// recoverable downstream, a silently missing row is not.
+				const boundary = transcriptItems.findIndex(
+					(item, index) => index >= transcriptStart && item.id === args.afterTranscriptId,
+				);
+				if (boundary >= 0) transcriptItems.splice(transcriptStart, boundary + 1 - transcriptStart);
+			}
 
 			const replayResponse = await router.request(
 				sessionId,
 				{
 					type: "event_replay",
-					...(checkpoint === undefined
+					...(eventReplayCheckpoint === undefined
 						? {}
-						: { sinceGeneration: checkpoint.generation, sinceSeq: checkpoint.seq }),
+						: { sinceGeneration: eventReplayCheckpoint.generation, sinceSeq: eventReplayCheckpoint.seq }),
 				},
 				attachment.generation,
 				attachment,
@@ -1628,7 +1764,7 @@ async function runLiveTail(
 			);
 			throwResponseFailure(replayResponse);
 			const replay = object(replayResponse) ?? {};
-			const replayGap = eventGapToRetentionGap(replay.gap, replay, checkpoint);
+			const replayGap = eventGapToRetentionGap(replay.gap, replay, eventReplayCheckpoint);
 			if (replayGap !== undefined) {
 				gap = replayGap;
 				if (args.strict === true)
@@ -1655,20 +1791,21 @@ async function runLiveTail(
 			}
 			const replayItems = rawEvents.map(event => {
 				const it = toTailItemV1(event, { kind: "event" });
-				if (it.revision === undefined && checkpoint?.revision !== undefined) it.revision = checkpoint.revision;
+				if (it.revision === undefined && eventReplayCheckpoint?.revision !== undefined)
+					it.revision = eventReplayCheckpoint.revision;
 				return it;
 			});
 			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, replayItems, include));
 			if (malformed !== undefined) throw malformed;
-			if (checkpoint !== undefined) {
+			if (eventReplayCheckpoint !== undefined) {
 				const checkpointKey = {
-					revision: checkpoint.revision,
-					generation: checkpoint.generation,
-					seq: checkpoint.seq,
+					revision: eventReplayCheckpoint.revision,
+					generation: eventReplayCheckpoint.generation,
+					seq: eventReplayCheckpoint.seq,
 				};
 				if (turnStateKey === undefined || compareTailSeqKeys(checkpointKey, turnStateKey) >= 0) {
 					turnStateKey = checkpointKey;
-					turnIdle = checkpoint.idle;
+					turnIdle = eventReplayCheckpoint.idle;
 				}
 			}
 			if (liveReason === undefined && args.untilIdle === true && turnIdle) liveReason = "idle";
@@ -1677,18 +1814,14 @@ async function runLiveTail(
 				resolveLive = completion.resolve;
 				rejectLive = completion.reject;
 				const timeoutMs = args.timeoutMs ?? 10_000;
-				const timer = setTimeout(
-					() =>
-						completion.reject(
-							new SdkSessionCliError(
-								"tail_timeout",
-								"Tail did not reach an exit condition within the wait window.",
-								1,
-								{ sessionId, timeoutMs },
-							),
-						),
-					timeoutMs,
-				);
+				// The wait window closing is not a failure: it is the caller's bound on
+				// one tail call, and everything collected inside it (transcript rows,
+				// replayed and live events) is a valid, non-terminal observation.
+				// Throwing here discarded that observation, so a poller watching a
+				// running turn with `--until-idle` saw nothing until the turn ended -
+				// every mid-turn tool call and interim line was lost, and the poll
+				// itself blocked for the whole window. `terminal: false` says the rest.
+				const timer = setTimeout(() => completion.resolve("timeout"), timeoutMs);
 				try {
 					liveReason = await completion.promise;
 				} finally {
@@ -1697,6 +1830,48 @@ async function runLiveTail(
 					rejectLive = undefined;
 				}
 			}
+			// Freeze collection before minting the caller's continuation. A host can
+			// capture the checkpoint watermark and publish a frame before the response
+			// reaches us; that frame belongs to the next poll, not behind this cursor.
+			acceptingLiveFrames = false;
+			// Mint the caller's continuation only after replay and live follow have
+			// reached their exit condition. A checkpoint minted earlier can point
+			// behind events already included in this response, causing the next poll
+			// to replay observations the caller already processed.
+			let resumeCursor: string | undefined;
+			try {
+				const fresh = await router.request(
+					sessionId,
+					{ type: "query_request", query: "session.checkpoint", input: {} },
+					attachment.generation,
+					attachment,
+					args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
+				);
+				throwResponseFailure(fresh);
+				resumeCursor = extractCheckpoint(fresh).cursor;
+			} catch (error) {
+				// A closed session has no next poll that could resume, so preserve the
+				// complete terminal observation even when the host tears down the
+				// connection before it can mint a final cursor. Active and timed-out
+				// tails still fail closed: returning them without a continuation would
+				// let the caller advance past observations it cannot resume.
+				if (liveReason !== "close") {
+					if (error instanceof SdkSessionCliError) throw error;
+					throw new SdkSessionCliError(
+						"unavailable",
+						"The host did not return a continuation checkpoint for this tail.",
+						1,
+						{ sessionId },
+					);
+				}
+			}
+			if (resumeCursor === undefined && liveReason !== "close")
+				throw new SdkSessionCliError(
+					"unavailable",
+					"The host did not return a continuation cursor for this tail.",
+					1,
+					{ sessionId },
+				);
 			return {
 				ok: true,
 				result: {
@@ -1704,6 +1879,13 @@ async function runLiveTail(
 					source: "session",
 					session: row,
 					...(checkpoint === undefined ? {} : { checkpoint }),
+					// A signed, UNCONSUMED checkpoint cursor to resume from. Carried as
+					// `cursor`, not `checkpointToken`: output passes through
+					// stripSecretFields, whose /token/i matches the latter by name, so a
+					// caller never saw it and no tail could ever be resumed (every poll
+					// replayed the whole session). It is an opaque per-grant cursor, not a
+					// credential - the same shape `list`/`transcript` already return.
+					...(resumeCursor === undefined ? {} : { cursor: resumeCursor }),
 					...(gap === undefined ? {} : { gap }),
 					items: tailItems(),
 					terminal: liveReason === "idle" || liveReason === "close",
@@ -1720,6 +1902,12 @@ export async function runTail(
 	sessionId: string,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
+	if (args.cursor !== undefined && args.afterTranscriptId === undefined)
+		throw new SdkSessionCliError(
+			"usage",
+			"--after-transcript-id is required when resuming a session tail with --cursor.",
+			2,
+		);
 	const row = (await sessionRows(agentDir, { resolveSessionId: sessionId })).sessions.find(
 		candidate => candidate.sessionId === sessionId,
 	);
@@ -1727,7 +1915,10 @@ export async function runTail(
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)
 		throw new SdkSessionCliError("session_deleted", `Session ${sessionId} was deleted and has no tail.`, 1);
-	if (!row.live || row.terminalUncertain === true) return await offlineTailReplay(repo, agentDir, sessionId, row);
+	if (row.live && row.terminalUncertain !== true && args.afterTranscriptId !== undefined && args.cursor === undefined)
+		throw new SdkSessionCliError("usage", "--after-transcript-id requires --cursor for a live session tail.", 2);
+	if (!row.live || row.terminalUncertain === true)
+		return await offlineTailReplay(repo, agentDir, sessionId, row, args.afterTranscriptId);
 	return await runLiveTail(agentDir, sessionId, row, args);
 }
 

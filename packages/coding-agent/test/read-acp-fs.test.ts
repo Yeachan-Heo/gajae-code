@@ -261,6 +261,38 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
+	it("routes selectors from skill relative paths", async () => {
+		const skillDir = path.join(tmpDir, "foo");
+		const referencePath = path.join(skillDir, "docs", "reference.md");
+		await fs.mkdir(path.dirname(referencePath), { recursive: true });
+		await fs.writeFile(
+			referencePath,
+			Array.from({ length: 24 }, (_, index) => `reference line ${index + 1}`).join("\n"),
+		);
+
+		const previousSkills = getActiveSkills();
+		setActiveSkills([
+			{
+				name: "foo",
+				description: "",
+				filePath: path.join(skillDir, "SKILL.md"),
+				baseDir: skillDir,
+				source: "test",
+			},
+		]);
+
+		try {
+			const result = await new ReadTool(createSession(tmpDir)).execute("skill-relative-range", {
+				path: "skill://foo/docs/reference.md:10-20",
+			});
+			const text = textOutput(result);
+			expect(text).toContain("reference line 10");
+			expect(text).not.toContain("reference line 2\n");
+		} finally {
+			setActiveSkills(previousSkills);
+		}
+	});
+
 	it("reads internal URLs without a selector and preserves valid selectors", async () => {
 		const router = InternalUrlRouter.instance();
 		const resolveSpy = spyOn(router, "resolve").mockResolvedValue({

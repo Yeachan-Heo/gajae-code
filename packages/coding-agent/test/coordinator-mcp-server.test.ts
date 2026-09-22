@@ -43,6 +43,11 @@ import {
 import { MAX_REAP_FAILURES } from "../src/coordinator-mcp/session-reaper";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
+import {
+	BrokerWorkflowGateEmitter,
+	FileGateStore,
+	MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS,
+} from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
 	buildAskGateAnswerSchema,
@@ -2534,6 +2539,37 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(queries).toEqual([]);
 	});
 
+	it("surfaces distinct spawn causes instead of collapsing them to a bare spawn_failed", async () => {
+		const root = await tempRoot();
+		const causes = [
+			"Unable to spawn session: spawn ENOENT (binary not found)",
+			"Session created-session-1 exited before registering readiness. (exit=23)",
+		];
+		for (const [index, cause] of causes.entries()) {
+			const controls: SdkControl[] = [];
+			const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+				globalResult: operation =>
+					operation === "session.create"
+						? { ok: false, error: { code: "spawn_failed", message: cause } }
+						: undefined,
+			});
+			await expect(
+				server.callTool("gjc_coordinator_start_session", {
+					cwd: root,
+					idempotency_key: `spawn-cause-${index}`,
+					allow_mutation: true,
+				}),
+			).resolves.toEqual({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: `Session host could not be spawned. Cause: ${cause}`,
+					diagnostic: cause,
+				},
+			});
+		}
+	});
+
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3395,6 +3431,40 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		}
 	});
 
+	it("closes the advertised answer schema against a sibling property map, not against its branches", () => {
+		// `additionalProperties: false` is evaluated against the node that declares it.
+		// With no sibling `properties`, EVERY answer field is "additional" and a compliant
+		// client validator rejects selection, custom-answer, and clarification payloads
+		// before the server is ever called (#5801).
+		const schema = buildCoordinatorAskAnswerSchema(["opt_0", "opt_1"], true, true) as {
+			additionalProperties?: boolean;
+			properties?: Record<string, unknown>;
+			oneOf: Array<{ properties?: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }>;
+		};
+		expect(schema.additionalProperties).toBe(false);
+		const outer = new Set(Object.keys(schema.properties ?? {}));
+		expect(outer.size).toBeGreaterThan(0);
+		const branchFields = new Set<string>();
+		for (const branch of schema.oneOf) {
+			// Each branch stays closed, so the union is still narrower than the outer map.
+			expect(branch.additionalProperties).toBe(false);
+			for (const field of Object.keys(branch.properties ?? {})) branchFields.add(field);
+			for (const field of branch.required ?? []) branchFields.add(field);
+		}
+		// Any field a branch can require or accept must survive the outer closure.
+		for (const field of branchFields) expect([field, outer.has(field)]).toEqual([field, true]);
+		// The three documented answer shapes must clear the outer closure.
+		const payloads: Array<Record<string, unknown>> = [
+			{ selected: ["opt_0"] },
+			{ selected: [], other: true, custom: "Refine the plan only; do not execute." },
+			{ action: "clarify", question: "Does option 1 include execution?" },
+		];
+		for (const payload of payloads) {
+			const rejected = Object.keys(payload).filter(field => !outer.has(field));
+			expect(rejected).toEqual([]);
+		}
+	});
+
 	it("accepts the advertised explicit other:false answer form", () => {
 		const codec: PrivateAskGateCodecV1 = {
 			schema_version: 1,
@@ -4115,6 +4185,128 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			server.callTool("gjc_coordinator_read_turn", { session_id: "visible-session", turn_id: sent.turn_id }),
 		).resolves.toMatchObject({
 			turn: { status: "active" },
+		});
+	});
+
+	it("ignores accepted Q12 diagnostics during coordinator reconciliation", async () => {
+		const root = await tempRoot();
+		let runtimeTurnId = "unbound";
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: [
+								{
+									...sharedAskGate("accepted-q12", runtimeTurnId, "ralplan", "approval"),
+									id: "diagnostic:accepted-q12",
+									tag: "accepted" as const,
+									answer_recorded: true as const,
+									resolved_at: GATE_RESOLVED_AT,
+									post_accept_disposition: "advanced" as const,
+								},
+							],
+							complete: true,
+							revision: "accepted-diagnostic",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "ignore accepted diagnostic",
+			idempotency_key: "accepted-diagnostic-prompt",
+			allow_mutation: true,
+		});
+		const runtimeAcknowledgement = sent.result as { turn_id?: unknown };
+		if (typeof runtimeAcknowledgement.turn_id !== "string") throw new Error("missing runtime turn id");
+		runtimeTurnId = runtimeAcknowledgement.turn_id;
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-diagnostic", reason: null },
+		});
+	});
+
+	it("bounds accepted Q12 diagnostics so reconciliation stays complete", async () => {
+		const root = await tempRoot();
+		const emitter = new BrokerWorkflowGateEmitter(
+			"visible-session",
+			new FileGateStore(path.join(root, ".gjc", "state", "workflow-gates.json")),
+		);
+		const acceptedGateIds: string[] = [];
+		for (let index = 0; index < MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS + 1; index++) {
+			const continuation = emitter.emitGate({
+				stage: "ralplan",
+				kind: "approval",
+				schema: { type: "string", enum: ["approve"] },
+			});
+			const pending = emitter.listWorkflowGateQueryRecords!().find(record => record.tag === "pending");
+			if (!pending) throw new Error("Q12 did not expose the pending gate");
+			emitter.prepareTerminalization!(pending.gate_id, "not_published");
+			await emitter.resolveGate!({
+				gate_id: pending.gate_id,
+				answer: "approve",
+				idempotency_key: `accepted-q12-bound-${index}`,
+			});
+			await expect(continuation).resolves.toBe("approve");
+			acceptedGateIds.push(pending.gate_id);
+		}
+
+		const accepted = emitter.listWorkflowGateQueryRecords!().filter(record => record.tag === "accepted");
+		expect(accepted).toHaveLength(MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS);
+		expect(accepted.map(record => record.gate_id)).toEqual(
+			acceptedGateIds.slice(-MAX_ACCEPTED_WORKFLOW_GATE_QUERY_RECORDS).reverse(),
+		);
+
+		const server = await createSdkControlServer(root, [], [], query =>
+			query === "Q12"
+				? {
+						ok: true,
+						page: {
+							items: emitter.listWorkflowGateQueryRecords!(),
+							complete: true,
+							revision: "accepted-q12-bound",
+						},
+					}
+				: { ok: true, page: { items: [], complete: true, revision: "context" } },
+		);
+		await registerSdkSession(server, root);
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "reconcile bounded accepted diagnostics",
+			idempotency_key: "accepted-q12-bound-prompt",
+			allow_mutation: true,
+		});
+		await patchSessionState(server, root, "visible-session", {
+			state: "running",
+			ready_for_input: false,
+			current_turn_id: sent.turn_id,
+			last_turn_id: sent.turn_id,
+			source: "agent_session_event",
+			live: true,
+		});
+
+		await expect(
+			server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" }),
+		).resolves.toMatchObject({
+			ok: true,
+			questions: [],
+			diagnostics: [],
+			reconciliation: { attempted: true, complete: true, revision: "accepted-q12-bound", reason: null },
 		});
 	});
 

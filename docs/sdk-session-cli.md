@@ -132,7 +132,10 @@ transcript entries.
   or the event ring dropped entries before the checkpoint.
 - `--until-idle` exits once the current turn reaches a terminal state; a session
   close exits any tail as `terminal: true`, while a bare live tail otherwise
-  remains attached until `--timeout-ms`. Each item carries `revision` (the durable checkpoint revision); the triple `(revision,generation,seq)` is unique for the session, while `generation:seq` alone is revision-local and restarts each accepted prompt — key idempotency on the triple. Lifecycle
+  remains attached until `--timeout-ms`. If the host closes before it can mint
+  the final continuation cursor, the terminal tail still returns all observed
+  items without a cursor because no follow-up poll is possible. Each item carries
+  `revision` (the durable checkpoint revision); the triple `(revision,generation,seq)` is unique for the session, while `generation:seq` alone is revision-local and restarts each accepted prompt — key idempotency on the triple. Lifecycle
   events that carry a `(generation, seq)` position are reconciled and emitted in
   that canonical order rather than arrival order, so a retained terminal event
   from an earlier turn does not complete a newer turn that is still running, and
@@ -154,17 +157,28 @@ transcript entries.
   specific prompt operation, `status <sessionId> <opRef>` remains the lossless
   authority.
 - `--all-events` widens the emitted set to every event-ring kind.
-- `--cursor` resumes from a saved signed checkpoint claim. `session.checkpoint`
-  verifies the unexpired claim and exchanges it for a fresh connection-owned
-  cursor pinned to the exact prior revision; direct cross-connection cursor
-  consumption remains rejected, so reconnect never echoes or rewinds a cursor.
+- `--cursor <cursor> --after-transcript-id <id>` resumes from a saved signed
+  checkpoint claim. The companion transcript id is required so a caller cannot
+  accidentally replay the entire retained transcript; rows through that id are
+  omitted (an unknown id keeps the bounded history because a duplicate is
+  recoverable while a missing row is not). `session.checkpoint` verifies the
+  unexpired signed claim and exchanges it for a fresh connection-owned cursor
+  pinned to the exact prior revision, so the claim is safe to pass to a new CLI
+  invocation even though direct cross-connection continuation-cursor consumption
+  remains rejected.
+  For a live session, `--after-transcript-id` without `--cursor` is a usage
+  error; stopped-session replay may use the boundary by itself.
 - `--timeout-ms` bounds live follow; a session whose lifecycle already ended
   (terminal or `terminalUncertain`) replays retained history and exits instead
-  of hanging.
+  of hanging. A live wait that reaches this bound returns the observations
+  collected so far with `terminal: false` and exits `0`; it is not the same as
+  `send --wait`, whose `wait_timeout` remains an operational failure.
 
 A deleted session has no tail (`session_deleted`). A stopped session replays
 its retained transcript without an endpoint (offline source), bounded to the
-most recent retained entries.
+most recent retained entries. If `--after-transcript-id` names a row older than
+that bounded window, the command fails closed with `retention_gap` instead of
+silently omitting unprocessed rows.
 
 ### retire
 
@@ -285,9 +299,11 @@ direct discovery-file reads, and output is versioned and credential-free.
 
 Verbs exit `0` on success and write JSON to stdout. Failures write a JSON error
 envelope to stdout with a non-zero exit: usage errors exit `2`, operational
-failures (broker unavailable, session unavailable, retention gap, wait
-timeout) exit `1`. Error details are recursively redacted of secret-shaped
-fields before rendering.
+failures (broker unavailable, session unavailable, retention gap, and
+`send --wait` timeout) exit `1`. A live `session tail` wait window is a bounded
+observation rather than an operational failure: it exits `0` with
+`terminal: false` and all items observed before the deadline. Error details are
+recursively redacted of secret-shaped fields before rendering.
 
 ## Scoped search (`gjc sdk search`)
 

@@ -6,11 +6,9 @@
  * transport is not an audited reasoning-control endpoint (the registry strips
  * `thinking` and `modelSupportsReasoningControl` reports false — a proxied
  * `openai-codex` baseUrl is the everyday case) then fails inside
- * `requireSupportedEffort` with "does not support thinking", and because the
- * compaction fallback chain picks the same-provider largest-context model,
- * every candidate dies on the same throw and auto-compaction reports the last
- * one. The agent turn itself survives because it clamps through the same
- * helper; only the maintenance calls skipped it.
+ * `requireSupportedEffort` with "does not support thinking". The agent turn
+ * itself survives because it clamps through the same helper; only the
+ * maintenance calls skipped it.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {

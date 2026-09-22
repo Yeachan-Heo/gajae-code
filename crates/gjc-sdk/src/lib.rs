@@ -45,6 +45,7 @@ pub use reverse::{
 	ReverseServerFrame,
 };
 pub use server::{
-	CapabilityUpdate, DependentIdleDeliveryOutcome, DependentIdleDeliveryStatus, PushFrameError,
-	ServerConfig, ServerHandle, WorkflowGateRegistrationError, start,
+	CapabilityUpdate, DependentIdleDeliveryOutcome, DependentIdleDeliveryStatus,
+	DirectedDeliveryError, DirectedDeliveryErrorKind, PushFrameError, ServerConfig, ServerHandle,
+	WorkflowGateRegistrationError, start,
 };

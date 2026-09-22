@@ -19,6 +19,7 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
+import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
@@ -1259,6 +1260,26 @@ describe("SessionSdkSessionRuntime", () => {
 				expect.objectContaining({ type: "query_response", id: "query", ok: true }),
 			]),
 		);
+		await runtime.stop();
+	});
+
+	test("uses a custom capability provider for live delivery without transport negotiation hooks", async () => {
+		const transport = memoryTransport();
+		const runtime = new SessionSdkSessionRuntime({
+			transport,
+			connectionCapabilities: connectionId =>
+				connectionId === "observer"
+					? new Set([TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY])
+					: new Set(),
+		});
+		await runtime.start();
+		transport.feed("observer", { type: "event_replay", id: "replay", sinceSeq: 0 });
+		runtime.sendFrameToCapabilities([TURN_STREAM_CAPABILITY, SESSION_HOST_OBSERVER_CAPABILITY], {
+			type: "event",
+			kind: "message_update",
+			payload: {},
+		});
+		expect(transport.sent).toContainEqual({ type: "event", kind: "message_update", payload: {} });
 		await runtime.stop();
 	});
 	test("SDK-only host publishes one replayable bash_folded frame per fold and drops the subscription on shutdown", async () => {

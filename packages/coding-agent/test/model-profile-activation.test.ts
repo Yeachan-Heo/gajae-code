@@ -13,6 +13,7 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
@@ -383,6 +384,233 @@ describe("model profile activation", () => {
 		// persisted for later profile execution, so it must resolve against the
 		// catalog that fresh live profile evidence narrowed.
 		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
+	});
+
+	test("durable default recovery excludes a bundled default absent from the activation catalog", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "anthropic/claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
+		expect(recovery).toMatchObject({
+			profileName: profile.name,
+			entries: ["anthropic/claude-opus-5"],
+			activeIndex: 1,
+			skips: [{ selector: "anthropic/claude-opus-5", reason: "unknown_model" }],
+		});
+		expect(recovery.model).toBeUndefined();
+	});
+
+	test.each([
+		"user",
+		"registry",
+	] as const)("durable %s profile recovery rejects an unresolved qualified executor when its default resolves", async source => {
+		const profile: ModelProfileDefinition = {
+			name: `${source}-unresolved-executor`,
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
+			source,
+		};
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+	});
+
+	test("durable default recovery rejects unknown required providers before credential probing", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unknown-recovery-provider",
+			requiredProviders: ["future-provider"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async () => "key-provider-a");
+		const registry = {
+			...baseRegistry,
+			getConfiguredProviderIds: () => ["provider-a"],
+			isKnownProvider: (provider: string) => provider === "provider-a",
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery accepts a credentialless OpenCodex proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credentialless-opencodex-recovery",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "registry",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const proxyModel = model("opencodex", "provider-a/default");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), proxyModel],
+			getAvailable: () => [proxyModel],
+			getAvailableForProfileActivation: () => [proxyModel],
+			getConfiguredProviderIds: () => [],
+			isKnownProvider: (provider: string) => provider === "provider-a" || provider === "opencodex",
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : "key-provider-a"),
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated({
+				"modelProfile.proxyProvider": "opencodex",
+				"modelProfile.proxyMode": "always",
+			}),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.model).toMatchObject({ provider: "opencodex", id: "provider-a/default" });
+	});
+
+	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "provider-b") throw new Error("optional provider lookup failed");
+				return "key-provider-a";
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toMatchObject({
+			profileName: profile.name,
+			entries: ["provider-a/default"],
+			model: expect.objectContaining({ provider: "provider-a", id: "default" }),
+			activeIndex: 0,
+			skips: [],
+		});
+	});
+
+	test("durable default recovery retains a Cursor head and applies managed fallback safety", async () => {
+		const cursor = { ...model("cursor", "agent"), api: "cursor-agent" } as Model;
+		const fallback = model("provider-a", "default");
+		const profile: ModelProfileDefinition = {
+			name: "cursor-recovery",
+			requiredProviders: [],
+			modelMapping: { default: ["cursor/agent", "provider-a/default"] },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = { ...baseRegistry, getAll: () => [cursor, fallback] } as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["cursor/agent", "provider-a/default"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(1);
+		expect(recovery.skips[0]?.reason).toContain("requires provider-side tool execution");
+	});
+
+	test("durable default recovery does not probe a throwing fallback after a callable head", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "callable-head",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: ["provider-a/default", "provider-b/tail"] },
+			source: "user",
+		};
+		const head = model("provider-a", "default");
+		const tail = model("provider-b", "tail");
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async (provider: string) => {
+			if (provider === "provider-b") throw new Error("tail credential lookup must not run");
+			return "key-provider-a";
+		});
+		const registry = {
+			...baseRegistry,
+			getAll: () => [head, tail],
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["provider-a/default", "provider-b/tail"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(0);
+	});
+
+	test("durable default recovery rejects a required provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "required-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async () => {
+				throw new Error("required provider lookup failed");
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow("required provider lookup failed");
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {

@@ -9,30 +9,84 @@
  * notably NOT from `dirs.ts`, whose load-time resolver construction would freeze
  * state before the preload sets its isolation variables).
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { resolveCanonicalLogsDir } from "../packages/utils/src/canonical-log-dir";
 import type { ProjectEnvSnapshot } from "../packages/utils/src/env-file";
 import { canonicalEnvKey } from "../packages/utils/src/env-file";
 
 /** Environment inputs the decision reads. Injectable for tests. */
-export interface LogDirIsolationEnv {
-	GJC_LOG_DIR?: string | undefined;
-}
+export type LogDirIsolationEnv = Record<string, string | undefined>;
 
 export type LogDirIsolationDecision =
 	/** Replace the ambient value with a fresh isolated log sink. */
-	| { action: "isolate"; reason: "absent" | "untrusted" }
+	| { action: "isolate"; reason: "absent" | "untrusted" | "shared" | "inherited" }
 	/** Isolation cannot be made to stick; the suite must refuse to run. */
 	| { action: "fail"; reason: "dynamic" }
 	/** An explicit, trusted pin: honor it. */
 	| { action: "honor"; logDir: string };
+
+/** Resolve the canonical user log directory without importing the path resolver. */
+export function defaultLogDirFor(input: {
+	home: string;
+	env: LogDirIsolationEnv;
+	projectEnv: ProjectEnvSnapshot;
+	xdgEligible: boolean;
+}): string {
+	return resolveCanonicalLogsDir({ ...input, pathExists: fs.existsSync });
+}
+
+function normalizePath(target: string): string {
+	const resolved = path.normalize(path.resolve(target));
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative !== "" && !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+function resolveThroughExistingAncestor(target: string, realpath: (target: string) => string): string | undefined {
+	let current = path.resolve(target);
+	const missing: string[] = [];
+	for (;;) {
+		try {
+			const resolved = realpath(current);
+			return normalizePath(path.join(resolved, ...missing.reverse()));
+		} catch {
+			const parent = path.dirname(current);
+			if (parent === current) return undefined;
+			missing.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function pathsWithinOrEqual(left: string, right: string, realpath: (target: string) => string): boolean {
+	const normalizedLeft = normalizePath(left);
+	const normalizedRight = normalizePath(right);
+	const resolvedLeft = resolveThroughExistingAncestor(left, realpath);
+	const resolvedRight = resolveThroughExistingAncestor(right, realpath);
+	if (resolvedLeft !== undefined && resolvedRight !== undefined) {
+		return resolvedLeft === resolvedRight || isPathWithin(resolvedRight, resolvedLeft);
+	}
+	// If no existing ancestor can be resolved, fail closed only for lexical
+	// descendants. Existing ancestors are resolved above so a symlinked parent
+	// cannot make a missing child appear outside the shared sink.
+	return normalizedLeft === normalizedRight || isPathWithin(normalizedRight, normalizedLeft);
+}
 
 /**
  * Decide whether this test process must be isolated into a fresh log sink.
  *
  * Isolation is the default. An ambient `GJC_LOG_DIR` is deferred to only when it
  * is trusted — an operator export or a fixture pin, not something the checkout's
- * dotenv files put there. Bun overlays those files into `process.env` before any
- * module runs, so without this rule a repository could hand the suite a log
- * directory it ships and isolation would silently not happen.
+ * dotenv files put there. An unknown or inherited pin that resolves to the
+ * canonical shared user sink is never honored; a child that explicitly replaces
+ * its parent's marked value may intentionally pin its own sink. Bun overlays
+ * dotenv files into `process.env` before any module runs, so without these
+ * provenance rules a repository could hand the suite a log directory it ships
+ * and isolation would silently not happen.
  *
  * The declaration set is the canonical snapshot production resolves from —
  * `.env`, `.env.$NODE_ENV`, `.env.local` (skipped under `NODE_ENV=test`),
@@ -52,6 +106,9 @@ export type LogDirIsolationDecision =
 export function decideLogDirIsolation(input: {
 	env: LogDirIsolationEnv;
 	projectEnv: ProjectEnvSnapshot;
+	sharedLogDir?: string;
+	inheritedLogDir?: boolean;
+	realpath?: (target: string) => string;
 }): LogDirIsolationDecision {
 	const key = canonicalEnvKey("GJC_LOG_DIR");
 	const declared = Object.hasOwn(input.projectEnv.values, key);
@@ -71,6 +128,18 @@ export function decideLogDirIsolation(input: {
 	if (input.projectEnv.dynamic.has(key)) return { action: "fail", reason: "dynamic" };
 	const configured = input.env.GJC_LOG_DIR?.trim();
 	if (!configured) return { action: "isolate", reason: "absent" };
+	// A nested test process inherits the parent preload's log-dir pin through its
+	// environment. Environment variables do not carry their origin, so the
+	// preload propagates a value marker and passes the equality result here. A
+	// matching marker means this process did not choose the pin itself; honoring
+	// it would let a child keep writing to a parent's (or the operator's) sink.
+	if (input.inheritedLogDir === true) return { action: "isolate", reason: "inherited" };
+	if (
+		input.inheritedLogDir !== false &&
+		input.sharedLogDir !== undefined &&
+		pathsWithinOrEqual(configured, input.sharedLogDir, input.realpath ?? ((target: string) => fs.realpathSync(target)))
+	)
+		return { action: "isolate", reason: "shared" };
 	if (declared) return { action: "isolate", reason: "untrusted" };
 	return { action: "honor", logDir: configured };
 }
