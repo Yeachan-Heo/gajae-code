@@ -75,6 +75,8 @@ export const CURATED_TIER_LABELS = {
 
 /** Generated from packages/ai/src/models.json at feature land: 3919 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
+	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"alibaba-token-plan/qwen3.8-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/anthropic.claude-fable-5-1": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"amazon-bedrock/anthropic.claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },

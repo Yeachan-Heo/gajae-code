@@ -31826,6 +31826,56 @@
 			"contextWindow": 1000000,
 			"maxTokens": 128000
 		},
+		"claude-opus-5-5": {
+			"id": "claude-opus-5-5",
+			"name": "Anthropic Opus 5.5",
+			"api": "kiro-codewhisperer-stream",
+			"provider": "kiro",
+			"baseUrl": "https://q.us-east-1.amazonaws.com/",
+			"reasoning": true,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			},
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000
+		},
+		"claude-opus-5.5": {
+			"id": "claude-opus-5.5",
+			"name": "Anthropic Opus 5.5",
+			"api": "kiro-codewhisperer-stream",
+			"provider": "kiro",
+			"baseUrl": "https://q.us-east-1.amazonaws.com/",
+			"reasoning": true,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "high"
+			},
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1000000,
+			"maxTokens": 128000
+		},
 		"claude-sonnet-4": {
 			"id": "claude-sonnet-4",
 			"name": "Anthropic Sonnet 4",
@@ -71747,13 +71797,13 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.55968,
-				"output": 1.67904,
-				"cacheRead": 0.017808,
+				"input": 0.55572,
+				"output": 1.66716,
+				"cacheRead": 0.018524000000000002,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
-			"maxTokens": 393216,
+			"maxTokens": 384000,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -74029,9 +74079,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.922722,
-				"output": 1.845444,
-				"cacheRead": 0.0768935,
+				"input": 0.9159360000000001,
+				"output": 1.8318720000000002,
+				"cacheRead": 0.076328,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
