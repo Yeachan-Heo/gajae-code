@@ -7,6 +7,7 @@ import { type AsyncJob, AsyncJobManager, type FoldReason, isBackgroundJobSupport
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
+import type { FoldAdapter } from "../session/fold-coordinator";
 import { lookupOwnedRegistration, unregisterOwnedRegistration } from "../session/terminal-abort";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
@@ -21,6 +22,7 @@ import {
 	type ToolUIColor,
 	type ToolUIStatus,
 } from "./render-utils";
+import { steerFoldAwaitReasonLine, watchSteerForFold } from "./steer-fold";
 import { ToolError } from "./tool-errors";
 
 const jobSchema = z.object({
@@ -241,6 +243,61 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 		const waitMs = parseWaitDurationMs(this.session.settings.get("async.pollWaitDuration"));
 		const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
 		const timeoutHandle = setTimeout(() => timeoutResolve(), waitMs);
+		const foldedAwait = Promise.withResolvers<{ ids: string[] }>();
+		const foldedJobIds = new Set<string>();
+		const foldAdapters: FoldAdapter[] = [];
+		const unregisterFoldAdapters: Array<() => void> = [];
+		const startedAt = Date.now();
+		for (const job of runningJobs) {
+			const generation = job.generation;
+			let detached = false;
+			const adapter: FoldAdapter = {
+				kind: "job-await",
+				jobId: job.id,
+				jobGeneration: generation,
+				label: job.label,
+				cwdSensitive: false,
+				signal,
+				originatingTurn: false,
+				outputRef: {
+					jobId: job.id,
+					generation,
+					instruction: `Use the job tool's tail operation for ${job.id} to read this job's output.`,
+				},
+				getJob: () => {
+					const current = manager.getJob(job.id);
+					return current?.generation === generation ? current : undefined;
+				},
+				detachObserver: receipt => {
+					if (detached) return "already-settled";
+					detached = true;
+					manager.markBackgrounded(job.id, generation, receipt.reason);
+					foldedJobIds.add(job.id);
+					return "resolved";
+				},
+				resolveForegroundObserver: () => (detached ? "already-settled" : "resolved"),
+			};
+			foldAdapters.push(adapter);
+			unregisterFoldAdapters.push(this.session.registerForegroundFoldParticipant?.(adapter) ?? (() => {}));
+		}
+		const stopSteerWatch =
+			foldAdapters.length > 0
+				? watchSteerForFold(this.session, startedAt, async () => {
+						const outcomes = await Promise.all(
+							foldAdapters.map(adapter => this.session.requestForegroundBashBackground!("steer", adapter)),
+						);
+						for (const [index, folded] of outcomes.entries()) {
+							if (!folded) continue;
+							const job = runningJobs[index];
+							if (!job) continue;
+							manager.markBackgrounded(job.id, job.generation, "steer");
+							foldedJobIds.add(job.id);
+						}
+						if (outcomes.some(Boolean) && foldedJobIds.size > 0) {
+							foldedAwait.resolve({ ids: [...foldedJobIds] });
+						}
+					})
+				: () => {};
 		racePromises.push(timeoutPromise);
 
 		const watchedJobIds = runningJobs.map(job => job.id);
@@ -284,25 +341,37 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 				signal.addEventListener("abort", onAbort, { once: true });
 				racePromises.push(abortPromise);
 				try {
-					await Promise.race(racePromises);
+					await Promise.race([...racePromises, foldedAwait.promise]);
 				} finally {
 					signal.removeEventListener("abort", onAbort);
 				}
 			} else {
-				await Promise.race(racePromises);
+				await Promise.race([...racePromises, foldedAwait.promise]);
 			}
 		} finally {
+			stopSteerWatch();
+			for (const unregister of unregisterFoldAdapters) unregister();
 			manager.unwatchJobs(watchedJobIds);
 			clearTimeout(timeoutHandle);
 			if (progressTimer) clearInterval(progressTimer);
 		}
 
-		return this.#buildResult(
+		const result = this.#buildResult(
 			manager,
 			allTrackedJobs,
 			cancelOutcomes,
 			this.#readOutputTails(manager, params.tail, ownerFilter),
 		);
+		if (foldedJobIds.size > 0) {
+			const existingText = result.content.find(block => block.type === "text")?.text ?? "";
+			return {
+				...result,
+				content: [
+					{ type: "text", text: `${existingText}\n\n${steerFoldAwaitReasonLine([...foldedJobIds])}`.trim() },
+				],
+			};
+		}
+		return result;
 	}
 
 	/**

@@ -38,7 +38,7 @@ import foldReceiptPrompt from "../prompts/tools/fold-receipt.md" with { type: "t
 export const FOLD_WAKE_MERGE_WINDOW_MS = 800;
 
 /** The wait kinds that can be folded. `task`/`subagent` awaits are a non-goal. */
-export type FoldWaitKind = "bash-managed" | "client-terminal" | "bash-pty";
+export type FoldWaitKind = "bash-managed" | "client-terminal" | "bash-pty" | "job-await";
 
 /** Outcome of settling the foreground caller. Exactly one party may settle it. */
 export type ForegroundSettleOutcome = "resolved" | "already-settled";
