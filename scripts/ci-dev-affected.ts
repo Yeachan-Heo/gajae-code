@@ -5,11 +5,36 @@ import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { selectCanaryTests } from "./ci-risk-canary-manifest";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
 
 
 const repoRoot = path.join(import.meta.dir, "..");
 const ZERO_SHA = /^0+$/;
 const PACKAGE_SCOPES = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
+const telegramDaemonGenerationGuardFiles = new Set([
+	"scripts/telegram-daemon-generation-guard.ts",
+	"scripts/telegram-daemon-generation-manifest.json",
+	...Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory)),
+	...Object.keys(telegramDaemonGenerationManifest.nativeAuthoritySha256),
+]);
+const daemonLikePathSegment = /(?:^|[-_.])daemon(?:[-_.]|$)/i;
+
+function isDaemonLikePath(changedPath: string): boolean {
+	// Keep the planner conservative for a newly-added or renamed daemon source
+	// that has not been added to the manifest yet. The exact manifest-derived set
+	// remains authoritative for known files; this fallback preserves the old
+	// daemon-name trigger so an omitted entry cannot make the guard disappear.
+	return changedPath.split("/").some(segment => daemonLikePathSegment.test(segment));
+}
+
+export function isTelegramDaemonGenerationGuardFile(changedPath: string): boolean {
+	return telegramDaemonGenerationGuardFiles.has(changedPath) || isDaemonLikePath(changedPath);
+}
+
+export function needsTelegramDaemonGenerationGuard(paths: readonly string[]): boolean {
+	return paths.some(isTelegramDaemonGenerationGuardFile);
+}
+
 // The coding-agent package has hundreds of test files; keep affected validation
 // below the shard timeout by splitting package-wide/full-workspace TypeScript
 // suites across the matrix. Dev keeps the default; Main CI full mode overrides
@@ -515,8 +540,8 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
 // planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
-// smoke flag. Downstream jobs reuse the planner's exact diff via
-// CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
+// smoke and daemon-guard flags. Downstream jobs reuse the planner's exact diff
+// via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref on each runner.
 // Paths that affect the compiled tab-worker smoke graph. Keep this authoritative
 // predicate in the planner: dev-ci consumes its emitted flag rather than copying
 // path checks into individual jobs.
@@ -639,6 +664,7 @@ async function emitFullMatrix(): Promise<void> {
 		`has_native=${hasNative}`,
 		`has_python=${hasPython}`,
 		`has_risk_canaries=${hasRiskCanaries}`,
+		"has_protected_daemon_decl=true",
 		"",
 	];
 	await fs.appendFile(githubOutput, lines.join("\n"));
@@ -679,6 +705,7 @@ async function emitMatrix(): Promise<void> {
 		`has_risk_canaries=${hasRiskCanaries}`,
 		`has_darwin_arm64_tab_worker_smoke=${hasDarwinArm64TabWorkerSmoke}`,
 		`has_windows_session_path=${hasWindowsSessionPath}`,
+		`has_protected_daemon_decl=${needsTelegramDaemonGenerationGuard(paths)}`,
 		`plan_digest=${digest}`,
 		`plan_source_sha=${sourceSha}`,
 		`plan_mode=${mode}`,

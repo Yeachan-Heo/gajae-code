@@ -6,6 +6,7 @@ import {
 	safeSpawnRender,
 	selectNewestMasterAttestationEpoch,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
+import { PublicCommandFailure } from "../src/cli/public-command-errors";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
 import { SdkClientError } from "../src/sdk/client/client";
 
@@ -170,30 +171,63 @@ describe("gjc sdk spawn CLI", () => {
 		expect(launches).toBe(1);
 	});
 
-	it("renders the replay key when session.spawn is uncertain after send", async () => {
-		const idempotencyKey = "spawn-retry-key";
-		let dispatchedKey: string | undefined;
-		const result = await runSdkSpawn(
-			{ cwd: "/tmp", prompt: task, idempotencyKey },
+	it("propagates the complete replay key before lossy rendering", async () => {
+		const idempotencyKey = "k".repeat(9000);
+		await expect(
+			runSdkSpawn(
+				{ cwd: "/tmp", prompt: task, idempotencyKey },
+				{
+					env: masterEnv,
+					resolveAttestationEpoch: epoch,
+					dispatch: async () => {
+						throw new SdkClientError("uncertain_after_send", `${task} ${capability}`);
+					},
+				},
+			),
+		).rejects.toMatchObject({
+			input: { kind: "uncertain_after_send", references: [{ kind: "idempotencyKey", value: idempotencyKey }] },
+		});
+	});
+
+	it("retains a generated key when the broker rejects the dispatched spawn", async () => {
+		let generated: string | undefined;
+		const error = await runSdkSpawn(
+			{ cwd: "/tmp", prompt: task },
 			{
 				env: masterEnv,
 				resolveAttestationEpoch: epoch,
 				dispatch: async (_agentDir, _input, key) => {
-					dispatchedKey = key;
-					throw new SdkClientError("uncertain_after_send", "spawn response was lost after send");
+					generated = key;
+					return { ok: false, error: { code: "uncertain_after_send", message: task } };
 				},
 			},
-		);
-		expect(dispatchedKey).toBe(idempotencyKey);
-		expect(result).toEqual({
-			rendered: {
-				code: "uncertain_after_send",
-				idempotencyKey,
-				error: { code: "uncertain_after_send", message: "spawn response was lost after send" },
-			},
-			exitCode: 1,
-		});
-		expect(renderSpawnTable(result.rendered)).toContain(`Retry idempotency key: ${idempotencyKey}`);
+		).catch(error => error);
+		expect(generated).toBeDefined();
+		expect(error).toBeInstanceOf(PublicCommandFailure);
+		expect(error.input.references).toContainEqual({ kind: "idempotencyKey", value: generated });
+		expect(JSON.stringify(error.input)).not.toContain(task);
+	});
+
+	it("preserves returned reconciliation references without echoing raw errors", () => {
+		const operationRef = "r".repeat(9000);
+		try {
+			safeSpawnRender({
+				ok: false,
+				error: {
+					code: "uncertain_after_send",
+					message: `${task} ${capability}`,
+					operationRef,
+					sessionId: "child-1",
+				},
+			});
+			throw new Error("Expected typed failure");
+		} catch (error) {
+			expect(error).toBeInstanceOf(PublicCommandFailure);
+			const failure = error as PublicCommandFailure;
+			expect(failure.input.references).toContainEqual({ kind: "operationRef", value: operationRef });
+			expect(JSON.stringify(failure.input)).not.toContain(task);
+			expect(JSON.stringify(failure.input)).not.toContain(capability);
+		}
 	});
 
 	it("renders only safe fields for every outcome and never echoes input", async () => {
@@ -215,19 +249,35 @@ describe("gjc sdk spawn CLI", () => {
 			{ ok: false, error: { code: "idempotency_conflict", message: "idempotency key conflicts" } },
 		];
 		for (const outcome of outcomes) {
+			if (!(outcome as { ok: boolean }).ok) {
+				expect(() => safeSpawnRender(outcome)).toThrow(PublicCommandFailure);
+				continue;
+			}
 			const { rendered, exitCode } = safeSpawnRender(outcome);
 			const text = `${JSON.stringify(rendered)}\n${renderSpawnTable(rendered)}`;
 			expect(text).not.toContain(task);
 			expect(text).not.toContain(capability);
-			if ((outcome as { ok: boolean }).ok) {
-				expect(exitCode).toBe(0);
-				// Unsafe extra fields are dropped by the allowlist projection.
-				expect(Object.keys(rendered).sort()).toEqual(["claimId", "code", "seed", "sessionId", "substrateKind"]);
-			} else {
-				expect(exitCode).toBe(1);
-				expect(rendered.error?.code).toBeDefined();
-			}
+			expect(exitCode).toBe(0);
+			expect(Object.keys(rendered).sort()).toEqual(["claimId", "code", "seed", "sessionId", "substrateKind"]);
 		}
+	});
+
+	it("sanitizes untrusted human-readable spawn fields", () => {
+		const { rendered } = safeSpawnRender({
+			ok: true,
+			result: {
+				code: "ok\u001b[31m",
+				claimId: "claim\u2028id",
+				sessionId: "session\u0007id",
+				substrateKind: "headless",
+				seed: { phase: "accepted\u2029phase", status: "ready" },
+			},
+		});
+		const text = renderSpawnTable(rendered);
+		expect(text).not.toContain("\u001b");
+		expect(text).not.toContain("\u2028");
+		expect(text).not.toContain("\u2029");
+		expect(text).not.toContain("\u0007");
 	});
 
 	it("exposes typed errors for scripting", () => {

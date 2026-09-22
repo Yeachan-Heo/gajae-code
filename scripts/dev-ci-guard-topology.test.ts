@@ -164,14 +164,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		const guard = requiredJob(d, "telegram-daemon-generation");
 		const guardCondition = String(guard.if);
-		expect(guardCondition).toContain("telegram-daemon");
-		expect(guardCondition).toContain("chat-daemon");
-		expect(guardCondition).toContain("telegram-daemon-generation-guard.ts");
+		expect(guardCondition).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+		expect(guardCondition).not.toContain("needs.affected-plan.outputs.changed_paths");
 		const affected = requiredJob(d, "affected");
 		expect(affected.needs).toContain("telegram-daemon-generation");
 		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
-		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toContain("telegram-daemon-generation-guard.ts");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.has_protected_daemon_decl }}");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 		expect(requiredEnvValue(aggregateStep, "CI_DEV_AFFECTED_PLAN")).toBe(
 			"${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json",

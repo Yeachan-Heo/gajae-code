@@ -253,15 +253,42 @@ one accepted submission with one model call or one `agent_end` event.
 
 For generic embedders, prefer an application-owned queue of bounded full turns
 submitted through `session.prompt()`, and use `steer`/`followUp` only for live
-conversational controls. The `sendUserMessage` promise has delivery-mode
-dependent completion semantics:
+conversational controls. When a queued control must remain pending until its
+exact ownership is known, use `submitUserMessage()`:
+
+```ts
+const submission = await session.submitUserMessage("refresh the status", {
+  deliverAs: "followUp",
+  queuePolicy: "sequential",
+  trackSubmission: true,
+});
+
+await submission.admitted;
+const execution = await submission.execution;
+// execution.disposition is "joined-current-run", "promoted-to-run", or "removed".
+// For execution, attemptScope identifies the run that owns the terminal boundary.
+await submission.terminal;
+```
+
+`submissionId` is generated per call, so identical message text remains
+independently correlatable. `admitted` resolves only after the exact queue
+entry exists. `execution` resolves at same-run consumption, successor-run
+promotion, or exact removal. `terminal` resolves at the owning run's
+`agent_end` boundary, or immediately for removal. `submission.cancel()` removes
+the entry when it is still queued; it returns `false` after execution or
+removal. `queuePolicy: "sequential"` preserves FIFO delivery one queued input
+at a time, including when the session's configured follow-up/steering mode is
+`"all"`.
+
+The ordinary `sendUserMessage` promise retains its delivery-mode-dependent
+completion semantics:
 
 - An ordinary idle submission with no `deliverAs` queues nothing and awaits the
   prompt turn, including its terminal completion.
 - An explicit queued `steer`/`followUp`, or a submission diverted into a queue
   because a live turn is active, resolves when the submission is admitted to
-  that delivery path. Use supported session events to correlate its later
-  consumption, completion, and cancellation.
+  that delivery path. Use `submitUserMessage` when later consumption,
+  completion, and cancellation must be correlated to one exact submission.
 
 Neither promise is a generic queue-drained receipt. Do not build a generic
 embedder contract around internal dispatch or promotion-correlation hooks.

@@ -14,7 +14,6 @@ import { LocalProtocolHandler } from "./local-protocol";
 import { MemoryProtocolHandler } from "./memory-protocol";
 import { normalizeInternalUrlInput, parseInternalUrl } from "./parse";
 import { RuleProtocolHandler } from "./rule-protocol";
-import { SkillProtocolHandler } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 export class InternalUrlRouter {
@@ -31,7 +30,6 @@ export class InternalUrlRouter {
 		this.register(new RuleProtocolHandler());
 		this.register(new IssueProtocolHandler());
 		this.register(new PrProtocolHandler());
-		this.register(new SkillProtocolHandler());
 		this.register(new EmbeddedProtocolHandler());
 	}
 

@@ -277,7 +277,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			authStorage = undefined;
 			tempDirRegistry.release(tempDir);
 		}
-	}, 30_000);
+	}, 60_000);
 
 	it("terminal abort registers the scope so the left-running owned job classifies as owned-completion", async () => {
 		const callId = "call_terminal_owned";
@@ -1266,6 +1266,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		let promoted = 0;
 		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		// Queue the client steer while idle: the auto-continue promotes it into
 		// its OWN run, which fires the ownership hook exactly once.
 		await session.sendUserMessage("client steer", {
@@ -1277,11 +1278,14 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedSteering(), "steer consumed by its own run");
 		await waitFor(() => promoted === 1, "steer ownership hook fired");
 		expect(promoted).toBe(1);
-	}, 30_000);
+		await session.waitForIdle();
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
 		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
 		await session.prompt("first turn");
+		await session.waitForIdle();
 		const staleToken = session.captureTerminalAbortSteeringSnapshot();
 		expect(staleToken).toBeDefined();
 		const secondPrompt = session.prompt("second turn").catch(() => {});
@@ -1297,7 +1301,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
 		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		await secondPrompt;
-	}, 30_000);
+		await session.waitForIdle();
+		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+	}, 60_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT

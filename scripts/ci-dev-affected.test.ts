@@ -2,7 +2,8 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -42,6 +43,24 @@ test("the production SDK host suites run sequentially and stop after a failure",
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
+
+test("derives Telegram daemon guard coverage from the manifest inventory", async () => {
+	const claimed = Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory));
+	expect(claimed.length).toBeGreaterThan(0);
+	expect(claimed.every(isTelegramDaemonGenerationGuardFile)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(claimed)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/unrelated.ts"])).toBe(false);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/new-telegram-daemon.ts"])).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/daemon-paths-v2.ts"])).toBe(true);
+
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+	const guardStart = workflow.indexOf("  telegram-daemon-generation:\n");
+	const guardEnd = workflow.indexOf("\n  windows-dev-doctor:", guardStart);
+	const guard = workflow.slice(guardStart, guardEnd);
+	expect(workflow).toContain("has_protected_daemon_decl: ${{ steps.plan.outputs.has_protected_daemon_decl }}");
+	expect(guard).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+	expect(guard).not.toContain("needs.affected-plan.outputs.changed_paths");
+});
 
 describe("planTasks command shape (issue #622)", () => {
 	test("no scheduled command uses the false-green standalone `bun --cwd <dir>` form", () => {
@@ -173,7 +192,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
 		expect(workflow).toContain(
-			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')",
+			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.has_protected_daemon_decl }}",
 		);
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");

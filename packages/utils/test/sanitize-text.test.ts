@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { sanitizeText } from "../src/sanitize-text";
+import { sanitizeDisplayLine, sanitizeText } from "../src/sanitize-text";
 
 describe("sanitizeText", () => {
 	it("strips ANSI CSI and removes C0/C1 control chars while keeping tab + LF", () => {
@@ -49,5 +49,10 @@ describe("sanitizeText", () => {
 
 	it("strips DEL and normalizes lone CR", () => {
 		expect(sanitizeText("a\x7fb\rc")).toBe("abc");
+	});
+
+	it("strips bidi and directional format controls from single display lines", () => {
+		const hostile = "a\u061Cb\u200Ec\u200Fd\u202Ae\u202Bf\u202Cg\u202Dh\u202Ei\u2066j\u2067k\u2068l\u2069m";
+		expect(sanitizeDisplayLine(hostile)).toBe("abcdefghijklm");
 	});
 });

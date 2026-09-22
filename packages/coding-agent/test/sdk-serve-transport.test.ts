@@ -1,12 +1,19 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, spyOn, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
-import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
+import { CliParseError } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
+import { dispatchPublicCommand } from "../src/cli/public-command-entry";
+import {
+	PUBLIC_COMMAND_DIAGNOSTICS,
+	PublicCommandFailure,
+	renderPublicCommandFailure,
+} from "../src/cli/public-command-errors";
+import { renderPublicCommandHelp } from "../src/cli/public-command-help";
 import Sdk, { parseSdkInternalArgv, watchSessionHostClientAttachment } from "../src/commands/sdk.js";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery.js";
 import { reapDeadSessionRegistrations } from "../src/sdk/broker/lifecycle.js";
@@ -23,9 +30,11 @@ import {
 } from "../src/sdk/transport/relay.js";
 import {
 	listBrokerSessions,
+	ownSdkServeTransport,
 	resolveServePendingCeiling,
 	resolveServeSession,
 	runSdkServe,
+	type SdkServeDependencies,
 	SdkServeError,
 	selectBrokerSession,
 } from "../src/sdk/transport/serve-cli.js";
@@ -810,6 +819,38 @@ describe("SDK serve raw relay", () => {
 });
 
 describe("SDK socket serve", () => {
+	test("closes the bound listener and removes exit cleanup when post-listen lstat fails", async () => {
+		const dir = await tempDir();
+		const socketPath = path.join(dir, "startup-failure.sock");
+		const startupError = new Error("post-listen lstat failed");
+		const exitListeners = process.listenerCount("exit");
+		const close = spyOn(net.Server.prototype, "close");
+		const lstat = spyOn(fs, "lstat")
+			.mockRejectedValueOnce(Object.assign(new Error("absent"), { code: "ENOENT" }))
+			.mockRejectedValueOnce(startupError);
+		try {
+			await expect(
+				startSocketServe({ url: "ws://127.0.0.1:1", token, pendingCeilingBytes: 256 * 1024, socketPath }),
+			).rejects.toBe(startupError);
+			expect(lstat).toHaveBeenCalledTimes(2);
+			expect(close).toHaveBeenCalledTimes(1);
+			expect(process.listenerCount("exit")).toBe(exitListeners);
+		} finally {
+			lstat.mockRestore();
+			close.mockRestore();
+		}
+		// Rebinding uses the real filesystem and listener, not a mocked transport.
+		const handle = await startSocketServe({
+			url: "ws://127.0.0.1:1",
+			token,
+			pendingCeilingBytes: 256 * 1024,
+			socketPath,
+		});
+		await handle.close();
+		await handle.done;
+		expect(process.listenerCount("exit")).toBe(exitListeners);
+	});
+
 	test("matches stdio capability negotiation on the Unix-socket relay", async () => {
 		const fake = upstream();
 		const dir = await tempDir();
@@ -983,15 +1024,14 @@ describe("SDK serve CLI and discovery", () => {
 		expect(parseSdkInternalArgv(["session-host-internal"])).toEqual({ action: "session-host-internal" });
 		expect(() => parseSdkInternalArgv(["broker-internal"])).toThrow(CliParseError);
 		const output: string[] = [];
-		const stdout = process.stdout.write;
-		(process.stdout as unknown as { write(value: string): boolean }).write = value => {
-			output.push(value);
-			return true;
-		};
-		try {
-			renderCommandHelp("gjc", "sdk", Sdk);
-		} finally {
-			(process.stdout as unknown as { write: typeof stdout }).write = stdout;
+		for (const command of [["sdk"], ["sdk", "serve"]]) {
+			let rendered = renderPublicCommandHelp(command);
+			output.push(rendered.output);
+			while (rendered.document.next) {
+				const { section, page } = rendered.document.next;
+				rendered = renderPublicCommandHelp(command, { section, page, revision: rendered.document.revision });
+				output.push(rendered.output);
+			}
 		}
 		const help = output.join("\n");
 		expect(help).toContain("serve");
@@ -1003,11 +1043,247 @@ describe("SDK serve CLI and discovery", () => {
 		expect(help).not.toContain("--agent-dir");
 	});
 
+	test("preflight preserves SDK-owned classifications and sanitized cleanup evidence without transport output", async () => {
+		for (const [code, kind, proof] of [
+			["broker_restarting", "broker_restarting", "pre-effect"],
+			["unauthorized", "authorization_denied", "pre-effect"],
+			["forbidden", "authorization_denied", "pre-effect"],
+			["authorization_denied", "authorization_denied", "pre-effect"],
+			["timeout", "timeout", "unknown"],
+			["unavailable", "unavailable", "unknown"],
+			["endpoint_stale", "endpoint_stale", "pre-effect"],
+			["uncertain_after_send", "uncertain_after_send", "sent"],
+			["secret-unknown-code", "operation_failed", undefined],
+		] as const) {
+			for (const cleanupFails of [false, true]) {
+				const calls: string[] = [];
+				const dependencies: SdkServeDependencies = {
+					readDiscovery: async () => ({ url: "ws://unused", token: "secret-token" }),
+					connect: async () => ({
+						global: async () => {
+							calls.push("list");
+							throw new SdkClientError(code, "secret-message", { token: "secret-token" });
+						},
+						close: async () => {
+							calls.push("close");
+							if (cleanupFails) throw new Error("secret-cleanup");
+						},
+					}),
+					startStdio: async () => {
+						calls.push("start");
+						throw new Error("unexpected transport start");
+					},
+					startSocket: async () => {
+						calls.push("start");
+						throw new Error("unexpected transport start");
+					},
+				};
+				let failure: unknown;
+				try {
+					await runSdkServe(["--stdio", "--pending-ceiling", "262144"], dependencies);
+				} catch (error) {
+					failure = error;
+				}
+				expect(failure).toBeInstanceOf(PublicCommandFailure);
+				const input = (failure as PublicCommandFailure).input;
+				expect(input.kind).toBe(kind);
+				expect(input.proof).toBe(proof);
+				expect(input.diagnostics ?? []).toEqual(cleanupFails ? ["broker_cleanup_failed"] : []);
+				expect(JSON.stringify(failure)).not.toContain("secret");
+				expect(calls).toEqual(["list", "close"]);
+			}
+		}
+	});
+
+	test("connection failures retain SDK classification but unknown error codes have no authority", async () => {
+		for (const error of [
+			new SdkClientError("broker_restarting", "secret"),
+			Object.assign(new Error("secret"), { code: "broker_restarting" }),
+		]) {
+			const dependencies: SdkServeDependencies = {
+				readDiscovery: async () => ({ url: "ws://unused", token: "unused" }),
+				connect: async () => {
+					throw error;
+				},
+				startStdio: async () => {
+					throw new Error("unexpected transport start");
+				},
+				startSocket: async () => {
+					throw new Error("unexpected transport start");
+				},
+			};
+			await expect(runSdkServe(["--stdio", "--pending-ceiling", "262144"], dependencies)).rejects.toMatchObject({
+				input: {
+					kind: error instanceof SdkClientError ? "broker_restarting" : "broker_unavailable",
+					proof: "pre-effect",
+				},
+			});
+		}
+	});
+
+	test("startup failure retains its primary typed evidence when broker cleanup fails", async () => {
+		const primary = new PublicCommandFailure({
+			kind: "timeout",
+			proof: "sent",
+			references: [{ kind: "sessionId", value: "session-one" }],
+		});
+		const dependencies: SdkServeDependencies = {
+			readDiscovery: async () => ({ url: "ws://unused", token: "unused" }),
+			connect: async () => ({
+				global: async operation =>
+					operation === "session.list"
+						? { ok: true, result: { sessions: [{ sessionId: "session-one", live: true }], warnings: [] } }
+						: { ok: true, result: { url: "ws://unused", token: "unused" } },
+				close: async () => {
+					throw new Error("secret-cleanup");
+				},
+			}),
+			startStdio: async () => {
+				throw primary;
+			},
+			startSocket: async () => {
+				throw new Error("unexpected socket start");
+			},
+		};
+		await expect(runSdkServe(["--stdio", "--pending-ceiling", "262144"], dependencies)).rejects.toMatchObject({
+			input: { ...primary.input, diagnostics: ["broker_cleanup_failed"] },
+		});
+	});
+
+	test("transport ownership contains failures before any bytes and always cleans up", async () => {
+		// Bun needs a numeric restoration after the intentional nonzero exit;
+		// undefined means the prior effective exit was zero, not a reset value.
+		const exitCode = process.exitCode ?? 0;
+		const stderr = process.stderr.write;
+		const diagnostics: string[] = [];
+		const beforeInt = process.listenerCount("SIGINT");
+		const beforeTerm = process.listenerCount("SIGTERM");
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			diagnostics.push(value);
+			return true;
+		};
+		const calls: string[] = [];
+		try {
+			await expect(
+				ownSdkServeTransport(
+					{
+						done: Promise.reject(new Error("secret-token")),
+						close: async () => {
+							calls.push("transport");
+							throw new Error("secret-path");
+						},
+					},
+					async () => {
+						calls.push("broker");
+						throw new Error("secret-broker");
+					},
+				),
+			).resolves.toBeUndefined();
+			expect(calls).toEqual(["transport", "broker"]);
+			expect(process.exitCode).toBe(1);
+			expect(diagnostics).toEqual(['{"type":"transport_error","code":"serve_failed"}\n']);
+			expect(process.listenerCount("SIGINT")).toBe(beforeInt);
+			expect(process.listenerCount("SIGTERM")).toBe(beforeTerm);
+		} finally {
+			process.stderr.write = stderr;
+			process.exitCode = exitCode;
+		}
+	});
+
+	test("cleanup failure after successful transport completion stays transport-owned", async () => {
+		const exitCode = process.exitCode ?? 0;
+		const stderr = process.stderr.write;
+		const diagnostics: string[] = [];
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			diagnostics.push(value);
+			return true;
+		};
+		try {
+			await expect(
+				ownSdkServeTransport({ done: Promise.resolve(), close: async () => {} }, async () => {
+					throw new Error("credential-in-cleanup");
+				}),
+			).resolves.toBeUndefined();
+			expect(process.exitCode).toBe(1);
+			expect(diagnostics).toEqual(['{"type":"transport_error","code":"serve_failed"}\n']);
+		} finally {
+			process.stderr.write = stderr;
+			process.exitCode = exitCode;
+		}
+	});
+
+	test("successful transport completion closes both owners without ordinary output", async () => {
+		const calls: string[] = [];
+		const exitCode = process.exitCode;
+		await ownSdkServeTransport(
+			{
+				done: Promise.resolve(),
+				close: async () => {
+					calls.push("transport");
+				},
+			},
+			async () => {
+				calls.push("broker");
+			},
+		);
+		expect(calls).toEqual(["transport", "broker"]);
+		expect(process.exitCode).toBe(exitCode);
+	});
 	test("rejects invalid serve mode and ceiling before discovery", async () => {
-		await expect(runSdkServe([])).rejects.toThrow(CliParseError);
-		await expect(runSdkServe(["--stdio", "--socket", "/tmp/x"])).rejects.toThrow(CliParseError);
-		await expect(runSdkServe(["--stdio", "--pending-ceiling", "262143"])).rejects.toThrow(CliParseError);
-		await expect(runSdkServe(["--stdio", "--pending-ceiling", "nope"])).rejects.toThrow(CliParseError);
+		await expect(runSdkServe([])).rejects.toBeInstanceOf(PublicCommandFailure);
+		await expect(runSdkServe(["--stdio", "--socket", "/tmp/x"])).rejects.toMatchObject({ input: { kind: "usage" } });
+		await expect(runSdkServe(["--stdio", "--pending-ceiling", "262143"])).rejects.toMatchObject({
+			input: { kind: "usage" },
+		});
+		await expect(runSdkServe(["--stdio", "--pending-ceiling", "nope"])).rejects.toMatchObject({
+			input: { kind: "usage" },
+		});
+	});
+
+	test.each([
+		[["--stdio", "--socket", "/tmp/x"], "usage_transport_exclusive"],
+		[["--stdio", "--stdio"], "usage_duplicate_option"],
+		[["--bogus"], "usage_unknown_argument"],
+		[["--socket"], "usage_missing_value"],
+		[["--stdio", "--pending-ceiling", "nope"], "usage_invalid_option_value"],
+	] as const)("usage failure %j stays actionable without echoing argv (%s)", async (argv, diagnostic) => {
+		const failure = await runSdkServe([...argv]).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(PublicCommandFailure);
+		expect((failure as PublicCommandFailure).input.diagnostics).toEqual([diagnostic]);
+		const rendered = await renderPublicCommandFailure(failure, { command: ["sdk", "serve"], json: true });
+		expect(rendered.stderr).toBe("");
+		const envelope = JSON.parse(rendered.stdout) as { error: { category: string }; diagnostics: unknown[] };
+		expect(envelope.error.category).toBe("usage");
+		expect(envelope.diagnostics).toEqual([{ code: diagnostic, message: PUBLIC_COMMAND_DIAGNOSTICS[diagnostic] }]);
+		expect(rendered.stdout).not.toContain("--bogus");
+	});
+
+	test("an endpoint without its minted credential fails pre-effect and never starts the transport", async () => {
+		const calls: string[] = [];
+		const dependencies: SdkServeDependencies = {
+			readDiscovery: async () => ({ url: "ws://unused", token: "unused" }),
+			connect: async () => ({
+				global: async operation =>
+					operation === "session.list"
+						? { ok: true, result: { sessions: [{ sessionId: "session-one", live: true }], warnings: [] } }
+						: { ok: true, result: { url: "ws://unused", token: "" } },
+				close: async () => {
+					calls.push("close");
+				},
+			}),
+			startStdio: async () => {
+				calls.push("start");
+				throw new Error("unexpected transport start");
+			},
+			startSocket: async () => {
+				calls.push("start");
+				throw new Error("unexpected transport start");
+			},
+		};
+		await expect(runSdkServe(["--stdio", "--pending-ceiling", "262144"], dependencies)).rejects.toMatchObject({
+			input: { kind: "unavailable", proof: "pre-effect" },
+		});
+		expect(calls).toEqual(["close"]);
 	});
 
 	test("parses stale tombstones and fails endpoint selection closed", async () => {
@@ -1036,8 +1312,8 @@ describe("SDK serve CLI and discovery", () => {
 		expect(resolveServePendingCeiling(undefined, undefined)).toBe(8 * 1024 * 1024);
 		expect(resolveServePendingCeiling(undefined, String(512 * 1024))).toBe(512 * 1024);
 		expect(resolveServePendingCeiling(String(1024 * 1024), String(512 * 1024))).toBe(1024 * 1024);
-		expect(() => resolveServePendingCeiling(undefined, "262143")).toThrow(CliParseError);
-		expect(() => resolveServePendingCeiling("nope", undefined)).toThrow(CliParseError);
+		expect(() => resolveServePendingCeiling(undefined, "262143")).toThrow(PublicCommandFailure);
+		expect(() => resolveServePendingCeiling("nope", undefined)).toThrow(PublicCommandFailure);
 	});
 
 	test("keeps the downstream sink pure: frames only, diagnostics to the error channel", async () => {
@@ -1993,7 +2269,7 @@ describe("SDK serve CLI and discovery", () => {
 		}
 	});
 
-	test("surfaces a cleanup-only broker failure as a typed serve_cleanup_failed", async () => {
+	test("reports a cleanup-only broker failure through the transport diagnostic channel", async () => {
 		const fake = upstream();
 		const broker = fakeBroker(operation =>
 			operation === "session.list"
@@ -2004,27 +2280,28 @@ describe("SDK serve CLI and discovery", () => {
 				: { ok: true, result: { url: fake.url, token } },
 		);
 		const socketPath = path.join(await tempDir(), "serve.sock");
+		const diagnostics: string[] = [];
+		const realStderr = process.stderr.write;
+		const previousExitCode = process.exitCode;
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			diagnostics.push(String(value));
+			return true;
+		};
 		try {
-			const failure = await withServeAgentDir(broker.url, async () =>
+			const result = await withServeAgentDir(broker.url, async () =>
 				withRejectingBrokerClose(async () => {
 					const before = process.listeners("SIGINT");
-					// Resolve rather than reject, so a serve that fails early cannot
-					// surface as an unhandled rejection while we wait for its handler.
-					const served = runSdkServe(["--socket", socketPath]).then(
-						() => undefined,
-						(error: unknown) => error,
-					);
+					const served = runSdkServe(["--socket", socketPath]);
 					await stopServeViaSignalHandler(before);
 					return await served;
 				}),
 			);
-			expect(failure).toBeInstanceOf(SdkServeError);
-			expect(failure).toMatchObject({
-				code: "serve_cleanup_failed",
-				exitCode: 1,
-				details: { code: "timeout", message: closeFailureMessage },
-			});
+			expect(result).toBeUndefined();
+			expect(process.exitCode).toBe(1);
+			expect(diagnostics).toEqual(['{"type":"transport_error","code":"serve_failed"}\n']);
 		} finally {
+			process.stderr.write = realStderr;
+			process.exitCode = previousExitCode ?? 0;
 			broker.stop();
 			fake.stop();
 		}
@@ -2079,6 +2356,71 @@ describe("SDK serve CLI and discovery", () => {
 			expect("cleanupError" in clean.error).toBe(false);
 		} finally {
 			broker.stop();
+		}
+	});
+
+	test("keeps post-start stdio failures out of the relay frame channel", async () => {
+		const upstreamServer = upstream();
+		const broker = fakeBroker(operation =>
+			operation === "session.list"
+				? {
+						ok: true,
+						result: { sessions: [{ sessionId: "sess-live", live: true, ambiguous: false }], warnings: [] },
+					}
+				: { ok: true, result: { url: upstreamServer.url, token } },
+		);
+		const stdoutChunks: string[] = [];
+		const stderrChunks: string[] = [];
+		const input = new PassThrough();
+		const stdinDescriptor = Object.getOwnPropertyDescriptor(process, "stdin");
+		const realStdout = process.stdout.write;
+		const realStderr = process.stderr.write;
+		const previousExitCode = process.exitCode;
+		Object.defineProperty(process, "stdin", { value: input, configurable: true });
+		(process.stdout as unknown as { write(value: string): boolean }).write = value => {
+			stdoutChunks.push(String(value));
+			return true;
+		};
+		(process.stderr as unknown as { write(value: string): boolean }).write = value => {
+			stderrChunks.push(String(value));
+			return true;
+		};
+		try {
+			const before = process.listeners("SIGINT");
+			const served = withRejectingBrokerClose(async () =>
+				withServeAgentDir(broker.url, async () =>
+					dispatchPublicCommand(["serve", "--stdio", "--json"], {
+						bin: "gjc",
+						version: "test",
+						command: "sdk",
+						load: async () => Sdk,
+					}),
+				),
+			);
+			await waitFor(() => upstreamServer.connections[0], "stdio relay upstream");
+			// The upstream fixture announces the relay connection immediately after
+			// accepting it. Consume that protocol hello before asserting the later
+			// application frame and teardown diagnostic channels.
+			await waitFor(
+				() => (stdoutChunks.join("").includes('{"type":"hello","connectionId":"fixture"}') ? true : undefined),
+				"stdio relay hello",
+			);
+			stdoutChunks.length = 0;
+			const frame = '{"type":"relay","ok":true}';
+			upstreamServer.connections[0]!.ws.send(frame);
+			await waitFor(() => (stdoutChunks.length ? stdoutChunks.join("") : undefined), "stdio relay frame");
+			await stopServeViaSignalHandler(before);
+			await served;
+			expect(stdoutChunks.join("")).toBe(`${frame}\n`);
+			expect(stderrChunks.join("")).toBe('{"type":"transport_error","code":"serve_failed"}\n');
+		} finally {
+			(process.stdout as unknown as { write: typeof realStdout }).write = realStdout;
+			(process.stderr as unknown as { write: typeof realStderr }).write = realStderr;
+			if (stdinDescriptor) Object.defineProperty(process, "stdin", stdinDescriptor);
+			input.destroy();
+			process.exitCode = previousExitCode ?? 0;
+			broker.stop();
+			upstreamServer.stop();
 		}
 	});
 

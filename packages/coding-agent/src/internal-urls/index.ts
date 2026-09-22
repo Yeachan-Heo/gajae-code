@@ -19,5 +19,4 @@ export * from "./memory-protocol";
 export * from "./parse";
 export * from "./router";
 export * from "./rule-protocol";
-export * from "./skill-protocol";
 export type * from "./types";

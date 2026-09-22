@@ -83,6 +83,20 @@ async function runCliArgs(repo: string, agentDir: string, commandArgs: string[])
 		// truncated capture of a finished child (exit code alone is not enough).
 		const stdout = await fs.readFile(stdoutPath, "utf8");
 		const stderr = await fs.readFile(stderrPath, "utf8");
+		if (exitCode !== 0) {
+			expect(stderr).toBe("");
+			expect(Buffer.byteLength(stdout)).toBeLessThanOrEqual(8192);
+			const parsed = JSON.parse(stdout) as Record<string, unknown>;
+			// `session.lookup` deliberately returns a structured reconciliation
+			// outcome (including uncertain `not_found`) rather than an exception
+			// envelope; all other public failures must use the boundary envelope.
+			const isStructuredLookup = parsed.operation === "session.lookup" && typeof parsed.status === "string";
+			if (!isStructuredLookup) {
+				expect(parsed).toMatchObject({ schema: "gjc.command-error", version: 1, ok: false });
+				expect(parsed).not.toHaveProperty("result");
+			}
+			expect(stdout).not.toContain("session-token");
+		}
 		return { exitCode, stdout, stderr };
 	} finally {
 		closeCaptureFd(stdoutFd);
@@ -92,11 +106,11 @@ async function runCliArgs(repo: string, agentDir: string, commandArgs: string[])
 }
 
 async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
-	return await runCliArgs(repo, agentDir, publicSessionArgs(args));
+	return await runCliArgs(repo, agentDir, [...publicSessionArgs(args), "--json"]);
 }
 
 async function runSdkCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
-	return await runCliArgs(repo, agentDir, ["sdk", ...args]);
+	return await runCliArgs(repo, agentDir, ["sdk", ...args, ...(args.includes("--json") ? [] : ["--json"])]);
 }
 
 // Broker `session.list` rows always carry a v2 locator: legacy shapes are
@@ -628,7 +642,7 @@ describe("SDK session CLI", () => {
 		expect(control.exitCode).toBe(1);
 		expect(receivedControl).toBeUndefined();
 		expect(endpointConnections).toBe(connectionsAfterList);
-		expect(JSON.parse(control.stdout)).toMatchObject({ error: { code: "unknown_operation" } });
+		expect(JSON.parse(control.stdout)).toMatchObject({ error: { code: "operation_failed" } });
 		expect(control.stderr).not.toContain("session-token");
 
 		const query = await runCli(root, agentDir, [
@@ -650,7 +664,9 @@ describe("SDK session CLI", () => {
 			'{"sessionId":"live"}',
 		]);
 		expect(refused.exitCode).toBe(1);
-		expect(JSON.parse(refused.stdout)).toMatchObject({ error: { code: "endpoint_credential_forbidden" } });
+		expect(JSON.parse(refused.stdout)).toMatchObject({
+			error: { code: "authorization_denied", outcomeCertainty: "not-applied" },
+		});
 
 		const credentialFlag = await runCli(root, agentDir, [
 			"global",
@@ -688,9 +704,9 @@ describe("SDK session CLI", () => {
 			expect(result.exitCode, `search stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
 			expect(JSON.parse(result.stdout)).toMatchObject({
 				version: 1,
-				status: "unavailable",
-				rows: [],
-				error: { code: "malformed_response" },
+				schema: "gjc.command-error",
+				ok: false,
+				error: { code: "operation_failed" },
 			});
 		} finally {
 			broker.handleRequest = originalHandleRequest;
@@ -784,7 +800,7 @@ describe("SDK session CLI", () => {
 			const tail = await runCli(root, agentDir, args);
 			if (strict) {
 				expect(tail.exitCode).toBe(1);
-				expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+				expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "operation_failed" } });
 			} else {
 				expect(tail.exitCode, tail.stderr).toBe(0);
 				const explicitRequest = wireLog.indexOf("explicit_replay_request");
@@ -1428,8 +1444,8 @@ describe("SDK session CLI", () => {
 		const endFirst = await runConflict(conflictingEnd, conflictingStart);
 
 		expect({ startFirst, endFirst }).toEqual({
-			startFirst: { exitCode: 1, ok: false, code: "protocol_error" },
-			endFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+			startFirst: { exitCode: 1, ok: false, code: "operation_failed" },
+			endFirst: { exitCode: 1, ok: false, code: "operation_failed" },
 		});
 	}, 60_000);
 
@@ -1561,8 +1577,8 @@ describe("SDK session CLI", () => {
 		const conflictFirst = await runBatch([...conflictPair, closeEvent]);
 
 		expect({ closeFirst, conflictFirst }).toEqual({
-			closeFirst: { exitCode: 1, ok: false, code: "protocol_error" },
-			conflictFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+			closeFirst: { exitCode: 1, ok: false, code: "operation_failed" },
+			conflictFirst: { exitCode: 1, ok: false, code: "operation_failed" },
 		});
 	}, 60_000);
 
@@ -1629,7 +1645,7 @@ describe("SDK session CLI", () => {
 			conflictCode: conflictParsed.error?.code,
 		}).toEqual({
 			visibleSummary: { exitCode: 0, turnStartCount: 2, totalItems: 3 },
-			conflictCode: "protocol_error",
+			conflictCode: "operation_failed",
 		});
 	}, 60_000);
 
@@ -1664,7 +1680,7 @@ describe("SDK session CLI", () => {
 		}
 
 		expect(observed).toEqual(
-			malformedClaims.map(claim => ({ name: claim.name, exitCode: 1, code: "protocol_error" })),
+			malformedClaims.map(claim => ({ name: claim.name, exitCode: 1, code: "operation_failed" })),
 		);
 	}, 120_000);
 
@@ -1717,7 +1733,7 @@ describe("SDK session CLI", () => {
 			rawClaims.map(claim => ({
 				name: claim.name,
 				exitCode: 1,
-				code: "protocol_error",
+				code: "operation_failed",
 				wireCarriedClaim: true,
 			})),
 		);
@@ -1793,8 +1809,8 @@ describe("SDK session CLI", () => {
 			},
 		}).toEqual({
 			observed: conflictPairs.flatMap(([closeKind, otherKind]) => [
-				{ case: `${closeKind} then ${otherKind}`, exitCode: 1, code: "protocol_error" },
-				{ case: `${otherKind} then ${closeKind}`, exitCode: 1, code: "protocol_error" },
+				{ case: `${closeKind} then ${otherKind}`, exitCode: 1, code: "operation_failed" },
+				{ case: `${otherKind} then ${closeKind}`, exitCode: 1, code: "operation_failed" },
 			]),
 			controlItems: [
 				{ kind: "turn_start", seq: 2 },
@@ -1831,7 +1847,7 @@ describe("SDK session CLI", () => {
 
 		assertLiveFramesPrecededReplay();
 		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
-		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "protocol_error" } });
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "operation_failed" } });
 	}, 60_000);
 
 	it("completes --until-idle in canonical order when frame arrival order delivers the newer terminal first", async () => {
@@ -1977,7 +1993,7 @@ describe("SDK session CLI", () => {
 		expect(result.exitCode, result.stderr).toBe(1);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: false,
-			error: { code: "retention_gap", details: { reason: "boundary_out_of_window" } },
+			error: { code: "operation_failed", category: "operation" },
 		});
 	}, 60_000);
 	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {
@@ -2008,7 +2024,7 @@ describe("SDK session CLI", () => {
 		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: false,
-			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
+			error: { code: "operation_failed", category: "operation" },
 		});
 	}, 60_000);
 
@@ -2022,7 +2038,7 @@ describe("SDK session CLI", () => {
 		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: false,
-			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
+			error: { code: "operation_failed", category: "operation" },
 		});
 		expect(result.stdout).not.toContain("attacker");
 	}, 60_000);
@@ -2037,7 +2053,7 @@ describe("SDK session CLI", () => {
 		});
 		expect(selections).toBe(1);
 		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
-		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "operation_failed" } });
 		expect(result.stdout).not.toContain("attacker");
 	}, 60_000);
 
@@ -2052,7 +2068,7 @@ describe("SDK session CLI", () => {
 		expect(selections).toBe(1);
 		expect(Date.now() - startedAt).toBeLessThan(10_000);
 		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
-		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "operation_failed" } });
 	}, 60_000);
 
 	it("drains SDK session CLI session.list continuation pages before returning sessions", async () => {
@@ -2218,7 +2234,8 @@ describe("SDK session CLI", () => {
 		const result = await runCli(root, agentDir, ["list", "--scope", "all"]);
 		expect(result.exitCode).toBe(1);
 		const output = JSON.parse(result.stdout);
-		expect(output).toMatchObject({ ok: false, error: { code: "continuation_failed", message: "page two failed" } });
+		expect(output).toMatchObject({ ok: false, error: { code: "operation_failed", category: "operation" } });
+		expect(result.stdout).not.toContain("page two failed");
 		expect(output).not.toHaveProperty("result");
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
@@ -2243,7 +2260,7 @@ describe("SDK session CLI", () => {
 		const output = JSON.parse(result.stdout);
 		expect(output).toMatchObject({
 			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
+			error: { code: "operation_failed", category: "operation" },
 		});
 		expect(output).not.toHaveProperty("result");
 		expect(requests).toEqual([{}, { cursor: "repeat" }]);
@@ -2268,7 +2285,7 @@ describe("SDK session CLI", () => {
 		const output = JSON.parse(result.stdout);
 		expect(output).toMatchObject({
 			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a malformed page." },
+			error: { code: "operation_failed", category: "operation" },
 		});
 		expect(output).not.toHaveProperty("result");
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
@@ -2309,14 +2326,14 @@ describe("SDK session CLI", () => {
 			`{"cwd":${JSON.stringify(root)}}`,
 		]);
 		expect(result.exitCode).toBe(2);
-		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "invalid_input" } });
+		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "usage", outcomeCertainty: "not-applied" } });
 	}, 60_000);
 
 	it("fails closed on corrupt endpoint records without exposing discovery details", async () => {
 		await fs.writeFile(path.join(stateRoot, "sdk", "live.json"), "not-json");
 		const result = await runCli(root, agentDir, ["query", "live", "--query", "session.metadata"]);
 		expect(result.exitCode).toBe(1);
-		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "session_unavailable" } });
+		expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "endpoint_stale" } });
 		expect(endpointConnections).toBe(0);
 	}, 60_000);
 
@@ -2327,7 +2344,7 @@ describe("SDK session CLI", () => {
 		try {
 			const result = await runCli(root, agentDir, ["query", "live", "--query", "session.metadata"]);
 			expect(result.exitCode).toBe(1);
-			expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "session_unavailable" } });
+			expect(JSON.parse(result.stdout)).toMatchObject({ error: { code: "endpoint_stale" } });
 			expect(endpointConnections).toBe(0);
 		} finally {
 			await fs.chmod(endpoint, 0o600);
