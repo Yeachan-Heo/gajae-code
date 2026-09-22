@@ -435,7 +435,9 @@ describe("AuthStorage usage cache: cross-process coordination", () => {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
 		await storage.reload();
-		const fetchSpy = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(makeReport("a@example.com"));
+		const fetchSpy = vi
+			.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage")
+			.mockResolvedValue(makeReport("a@example.com"));
 		try {
 			await storage.fetchUsageReports();
 			expect(store.leaseCalls[0]).toBeGreaterThanOrEqual(65_000);

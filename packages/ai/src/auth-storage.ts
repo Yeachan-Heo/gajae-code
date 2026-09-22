@@ -4483,23 +4483,24 @@ export class AuthStorage {
 				}
 				if (options?.logDetails !== false) {
 					this.#usageLogger?.debug("Usage fetch resolved", {
-						reports: options?.logIdentity === true
-							? resolved.map(report => ({
-									provider: report.provider,
-									limits: report.limits.length,
-									account: hashUsageDiagnosticValue(
-										this.#getUsageReportMetadataValue(report, "email") ??
-											this.#getUsageReportMetadataValue(report, "accountId") ??
-											this.#getUsageReportMetadataValue(report, "account") ??
-											this.#getUsageReportMetadataValue(report, "user") ??
-											this.#getUsageReportMetadataValue(report, "username") ??
-											this.#getUsageReportScopeAccountId(report),
-									),
-								}))
-							: {
-								count: resolved.length,
-								providers: [...new Set(resolved.map(report => report.provider))].sort(),
-							},
+						reports:
+							options?.logIdentity === true
+								? resolved.map(report => ({
+										provider: report.provider,
+										limits: report.limits.length,
+										account: hashUsageDiagnosticValue(
+											this.#getUsageReportMetadataValue(report, "email") ??
+												this.#getUsageReportMetadataValue(report, "accountId") ??
+												this.#getUsageReportMetadataValue(report, "account") ??
+												this.#getUsageReportMetadataValue(report, "user") ??
+												this.#getUsageReportMetadataValue(report, "username") ??
+												this.#getUsageReportScopeAccountId(report),
+										),
+									}))
+								: {
+										count: resolved.length,
+										providers: [...new Set(resolved.map(report => report.provider))].sort(),
+									},
 					});
 				}
 				return resolved;

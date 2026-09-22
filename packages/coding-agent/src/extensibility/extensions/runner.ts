@@ -716,7 +716,12 @@ export class ExtensionRunner {
 					const aliasTarget = alias ? this.#commandAliasTargets.get(alias) : undefined;
 					const aliasOwnedByCommand =
 						aliasTarget?.extensionPath === ext.path && aliasTarget.commandName === command.name;
-					if (!alias || reserved.has(alias) || commands.has(alias) || (aliasTarget !== undefined && !aliasOwnedByCommand)) {
+					if (
+						!alias ||
+						reserved.has(alias) ||
+						commands.has(alias) ||
+						(aliasTarget !== undefined && !aliasOwnedByCommand)
+					) {
 						let candidate = alias ?? `extension:${command.name}`;
 						while (
 							reserved.has(candidate) ||
@@ -727,7 +732,11 @@ export class ExtensionRunner {
 									this.#commandAliasTargets.get(candidate)?.commandName !== command.name))
 						)
 							candidate = `extension:${candidate}`;
-						if (alias && this.#commandAliasTargets.get(alias)?.extensionPath === ext.path && this.#commandAliasTargets.get(alias)?.commandName === command.name) {
+						if (
+							alias &&
+							this.#commandAliasTargets.get(alias)?.extensionPath === ext.path &&
+							this.#commandAliasTargets.get(alias)?.commandName === command.name
+						) {
 							this.#commandAliasTargets.delete(alias);
 						}
 						alias = candidate;
