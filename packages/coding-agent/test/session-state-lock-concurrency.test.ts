@@ -132,17 +132,19 @@ describe("coordinator session state lock under cross-process contention", () => 
 		const stateFile = path.join(root, "killed-owner.json");
 		const lockFile = `${stateFile}.lock`;
 		await Bun.write(stateFile, JSON.stringify({ marks: [] }));
+		const readyFile = `${stateFile}.ready`;
 
 		// A real process that takes the lock and is then killed mid-hold, so the owner
 		// record on disk is exactly what a crashed holder leaves.
-		const holder = Bun.spawn([process.execPath, PROBE, stateFile, "killed", "1", "60000"], {
+		const holder = Bun.spawn([process.execPath, PROBE, stateFile, "killed", "1", "60000", readyFile], {
 			cwd: REPO_ROOT,
 			env: { ...process.env, NO_COLOR: "1" },
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 		const deadline = Date.now() + 20_000;
-		while (!fsSync.existsSync(lockFile) && Date.now() < deadline) await Bun.sleep(25);
+		while (!fsSync.existsSync(readyFile) && Date.now() < deadline) await Bun.sleep(25);
+		expect(fsSync.existsSync(readyFile)).toBe(true);
 		expect(fsSync.existsSync(lockFile)).toBe(true);
 		const owner = JSON.parse(await Bun.file(lockFile).text()) as { pid: number; released?: boolean };
 		expect(owner.pid).toBe(holder.pid);
