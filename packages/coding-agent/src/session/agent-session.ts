@@ -23797,13 +23797,25 @@ export class AgentSession {
 			)
 				return "unchanged";
 			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const beforeType = authStorage.getSessionCredentialType(provider, credentialSessionId);
 			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				// Account-model rejection retains default backoff, not response retry-after.
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
-			if (!remaining) return "exhausted";
+			if (!remaining) {
+				if (before === undefined || beforeType === undefined) return "unchanged";
+				const failedRowStillActive = authStorage
+					.listCredentialInventory(provider)
+					.some(
+						credential =>
+							credential.id === before &&
+							!credential.disabled &&
+							credential.credentialKind === beforeType,
+					);
+				return failedRowStillActive ? "exhausted" : "unchanged";
+			}
 			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			if (before !== undefined && after !== undefined && before !== after) return "rotated";
