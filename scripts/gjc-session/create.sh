@@ -228,7 +228,8 @@ try:
     try:
         generation_fd = os.open(os.path.basename(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
     except FileNotFoundError:
-        print('{"state":"absent"}')
+        root_identity = os.fstat(root_fd)
+        print(json.dumps({"state":"absent","root_dev":str(root_identity.st_dev),"root_ino":str(root_identity.st_ino)}, separators=(",", ":")))
         raise SystemExit(0)
     with os.fdopen(generation_fd, encoding="utf-8") as handle:
         record = json.load(handle)

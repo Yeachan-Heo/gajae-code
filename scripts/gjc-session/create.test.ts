@@ -49,10 +49,19 @@ request = json.loads(sys.argv[1])
 mode = sys.argv[2]
 bin_path = sys.argv[3]
 def generation_baseline(generation_path):
-    if not os.path.exists(generation_path): return {"state": "absent"}
-    with open(generation_path, encoding="utf-8") as handle: record = json.load(handle)
-    root_identity = os.stat(os.path.dirname(generation_path))
-    return {"state": "current", **record, "root_dev": str(root_identity.st_dev), "root_ino": str(root_identity.st_ino)}
+    root_path = os.path.dirname(generation_path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try: root_fd = os.open(root_path, flags)
+    except FileNotFoundError: return {"state": "absent"}
+    try:
+        try: generation_fd = os.open(os.path.basename(generation_path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
+        except FileNotFoundError:
+            root_identity = os.fstat(root_fd)
+            return {"state": "absent", "root_dev": str(root_identity.st_dev), "root_ino": str(root_identity.st_ino)}
+        with os.fdopen(generation_fd, encoding="utf-8") as handle: record = json.load(handle)
+        root_identity = os.fstat(root_fd)
+        return {"state": "current", **record, "root_dev": str(root_identity.st_dev), "root_ino": str(root_identity.st_ino)}
+    finally: os.close(root_fd)
 if request["op"] == "publish_generation":
     generation_path = os.path.join(request["state_dir"], request["session_id"], "owner-lifecycle", "generation.json")
     current = generation_baseline(generation_path)

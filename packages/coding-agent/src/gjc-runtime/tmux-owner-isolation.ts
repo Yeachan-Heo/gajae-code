@@ -947,7 +947,7 @@ export async function planTmuxOwnerIsolation(request: PlanRequest, probe: OwnerI
 	} catch {
 		return failure("scope_unavailable", "owner_generation_unavailable");
 	}
-	if (!sameOwnerGenerationBaseline(currentBaseline, request.baseline))
+	if (!ownerGenerationBaselineMatchesExpected(currentBaseline, request.baseline))
 		return failure("scope_unavailable", "owner_generation_stale");
 	try {
 		const server = await probe.probeServer(request.socket_key, tmuxControlArgv(request.tmux_argv));
@@ -1098,7 +1098,7 @@ export async function bootstrapTmuxOwnerIsolation(
 		const attemptFile = path.join(paths.root, `attempt-${request.attempt.token}.json`);
 		const recordedAttempt = await readJson<PersistedAttempt>(attemptFile);
 		const currentBaseline = await captureOwnerGenerationBaseline(request.state_dir, request.session_id);
-		const baselineMatches = sameOwnerGenerationBaseline(currentBaseline, request.attempt.baseline);
+		const baselineMatches = ownerGenerationBaselineMatchesExpected(currentBaseline, request.attempt.baseline);
 		const derivedSession = tmuxAttemptSession(request.tmux_argv);
 		if (
 			!baselineMatches ||
@@ -1165,7 +1165,7 @@ export async function bootstrapTmuxOwnerIsolation(
 		let result: { exitCode: number | null; stdout?: string } | null = null;
 		try {
 			const currentBaseline = await captureOwnerGenerationBaseline(request.state_dir, request.session_id);
-			const baselineMatches = sameOwnerGenerationBaseline(currentBaseline, request.attempt.baseline);
+			const baselineMatches = ownerGenerationBaselineMatchesExpected(currentBaseline, request.attempt.baseline);
 			if (!baselineMatches)
 				return {
 					schema_version: 1,
@@ -1363,7 +1363,7 @@ export async function replaceOwnerGeneration(
 	try {
 		assertNoStagedOwnerTerminal(paths);
 		const previous = await captureOwnerGenerationBaseline(stateDir, sessionId);
-		if (expectedBaseline && !sameOwnerGenerationBaseline(previous, expectedBaseline))
+		if (expectedBaseline && !ownerGenerationBaselineMatchesExpected(previous, expectedBaseline))
 			throw new Error("generation_baseline_changed");
 		const published = {
 			schema_version: 1 as const,
@@ -1434,7 +1434,7 @@ export function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
 }
 
 export type OwnerGenerationBaseline =
-	| { state: "absent" }
+	| { state: "absent"; root_dev?: string; root_ino?: string }
 	| {
 			state: "current";
 			schema_version: 1;
@@ -1448,7 +1448,11 @@ export type OwnerGenerationBaseline =
 function isOwnerGenerationBaseline(value: unknown): value is OwnerGenerationBaseline {
 	return (
 		isRecord(value) &&
-		((Object.keys(value).length === 1 && value.state === "absent") ||
+		((value.state === "absent" &&
+			(Object.keys(value).length === 1 ||
+				(hasOnlyKeys(value, ["state", "root_dev", "root_ino"]) &&
+					nonEmpty(value.root_dev) &&
+					nonEmpty(value.root_ino)))) ||
 			(hasOnlyKeys(value, [
 				"state",
 				"schema_version",
@@ -1484,18 +1488,34 @@ function generationPublicationRecord(baseline: Extract<OwnerGenerationBaseline, 
 	};
 }
 
-function sameOwnerGenerationBaseline(left: OwnerGenerationBaseline, right: OwnerGenerationBaseline): boolean {
+function sameOwnerGenerationBaseline(current: OwnerGenerationBaseline, expected: OwnerGenerationBaseline): boolean {
+	if (current.state !== expected.state) return false;
+	if (current.state === "absent")
+		return current.root_dev === expected.root_dev && current.root_ino === expected.root_ino;
 	return (
-		left.state === right.state &&
-		(left.state === "absent" ||
-			(right.state === "current" &&
-				left.schema_version === right.schema_version &&
-				left.generation === right.generation &&
-				left.session_id === right.session_id &&
-				left.published_at === right.published_at &&
-				left.root_dev === right.root_dev &&
-				left.root_ino === right.root_ino))
+		expected.state === "current" &&
+		current.schema_version === expected.schema_version &&
+		current.generation === expected.generation &&
+		current.session_id === expected.session_id &&
+		current.published_at === expected.published_at &&
+		current.root_dev === expected.root_dev &&
+		current.root_ino === expected.root_ino
 	);
+}
+
+/** Compares current state to the captured plan, permitting only initial root creation. */
+function ownerGenerationBaselineMatchesExpected(
+	current: OwnerGenerationBaseline,
+	expected: OwnerGenerationBaseline,
+): boolean {
+	if (
+		current.state === "absent" &&
+		expected.state === "absent" &&
+		expected.root_dev === undefined &&
+		expected.root_ino === undefined
+	)
+		return true;
+	return sameOwnerGenerationBaseline(current, expected);
 }
 
 export interface ManagedOwnerPredecessorEvidence {
@@ -1697,10 +1717,11 @@ function ownerGenerationBaselineFromAuthority(
 	sessionId: string,
 ): OwnerGenerationBaseline {
 	const identity = authority.identity();
+	if (!identity.ok || !identity.identity) throw new Error("baseline_generation_corrupt");
 	const generation = authority.read("generation.json", TMUX_OWNER_ISOLATION_MAX_LINE_BYTES);
-	if (generation.code === "not_found") return { state: "absent" };
-	if (!identity.ok || !identity.identity || !generation.ok || !generation.data)
-		throw new Error("baseline_generation_corrupt");
+	if (generation.code === "not_found")
+		return { state: "absent", root_dev: identity.identity.dev, root_ino: identity.identity.ino };
+	if (!generation.ok || !generation.data) throw new Error("baseline_generation_corrupt");
 	let record: unknown;
 	try {
 		record = JSON.parse(Buffer.from(generation.data).toString("utf8"));
@@ -1830,7 +1851,7 @@ export function isOwnerGenerationBaselineCurrentSync(
 ): boolean {
 	try {
 		const current = captureOwnerGenerationBaselineSync(stateDir, sessionId);
-		return sameOwnerGenerationBaseline(current, baseline);
+		return ownerGenerationBaselineMatchesExpected(current, baseline);
 	} catch {
 		return false;
 	}
@@ -1892,7 +1913,8 @@ export function replaceOwnerGenerationSync(
 		const previous = authority
 			? ownerGenerationBaselineFromAuthority(authority, sessionId)
 			: captureOwnerGenerationBaselineSync(stateDir, sessionId);
-		if (!sameOwnerGenerationBaseline(previous, expectedBaseline)) throw new Error("baseline_generation_changed");
+		if (!ownerGenerationBaselineMatchesExpected(previous, expectedBaseline))
+			throw new Error("baseline_generation_changed");
 		const published = {
 			schema_version: 1 as const,
 			generation,

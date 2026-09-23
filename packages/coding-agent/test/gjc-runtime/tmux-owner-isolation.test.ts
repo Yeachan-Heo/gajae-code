@@ -252,6 +252,17 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 				tmux_argv: [...validLaunchArgv],
 			}),
 		).toBe(true);
+		const generationFreeRequest = {
+			...request,
+			platform: process.platform,
+			cwd: launchCwd,
+			tmux_argv: [...validLaunchArgv],
+			baseline: { state: "absent" as const, root_dev: "1", root_ino: "2" },
+		};
+		expect(isTrustedOwnerIsolationProtocolRequest(generationFreeRequest)).toBe(true);
+		expect(parseOwnerIsolationRequest(JSON.stringify(generationFreeRequest))).not.toBeNull();
+		const partialRootIdentity = { ...generationFreeRequest, baseline: { state: "absent", root_dev: "1" } };
+		expect(parseOwnerIsolationRequest(JSON.stringify(partialRootIdentity))).toBeNull();
 		for (const argv of [
 			[...validLaunchArgv.slice(0, 5), ...validLaunchArgv.slice(8)],
 			[...validLaunchArgv.slice(0, -1), "run-shell", "echo escaped"],
@@ -2225,6 +2236,31 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 				fsSync.rmSync(lifecyclePaths(state, sessionId, generation).root, { recursive: true, force: true });
 				fsSync.renameSync(displacedRoot, lifecyclePaths(state, sessionId, generation).root);
 			}
+			fsSync.rmSync(state, { recursive: true, force: true });
+		}
+	});
+
+	it("binds a generation-free baseline to its existing lifecycle root", () => {
+		const state = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-generation-empty-root-"));
+		const sessionId = "session";
+		const paths = lifecyclePaths(state, sessionId, "generation");
+		const displacedRoot = `${paths.root}.original`;
+		try {
+			fsSync.mkdirSync(paths.root, { recursive: true });
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			expect(baseline).toMatchObject({
+				state: "absent",
+				root_dev: expect.any(String),
+				root_ino: expect.any(String),
+			});
+			fsSync.renameSync(paths.root, displacedRoot);
+			fsSync.mkdirSync(paths.root);
+			expect(isOwnerGenerationBaselineCurrentSync(state, sessionId, baseline)).toBe(false);
+			expect(() => replaceOwnerGenerationSync(state, sessionId, "replacement", baseline)).toThrow(
+				"baseline_generation_changed",
+			);
+			expect(fsSync.existsSync(paths.generationFile)).toBe(false);
+		} finally {
 			fsSync.rmSync(state, { recursive: true, force: true });
 		}
 	});
