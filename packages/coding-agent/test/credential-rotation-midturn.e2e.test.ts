@@ -289,6 +289,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	trigger?: "quota" | "rate_limit";
 	preblockedAccounts?: readonly string[];
 	runtimeApiKey?: string;
+	addApiKeyDuringMark?: string;
 	predecessorModel?: Model;
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
@@ -393,19 +394,26 @@ async function runManagedFallbackQuotaScenario(options: {
 		session.setConfiguredModelChain("default", entries, "test");
 		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
 		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
-		if (options.removeFailedCredentialDuringMark) {
+		if (options.removeFailedCredentialDuringMark || options.addApiKeyDuringMark !== undefined) {
 			let removedFailedCredential = false;
+			let addedApiKey = false;
 			markUsageLimitReached.mockImplementation(async (markProvider, markSessionId, markOptions) => {
 				const pendingMark = markBeforeRemoval(markProvider, markSessionId, markOptions);
-				if (!removedFailedCredential && markOptions?.rowId !== undefined) {
-					const removalTarget = storage
-						.listCredentialRemovalTargets(markProvider)
-						.find(target => target.id === markOptions.rowId);
-					if (!removalTarget) throw new Error("Missing removal target for failed credential row");
-					const removal = storage.removeAuthCredentialsHard(markProvider, [removalTarget]);
-					if (removal.kind !== "removed") throw new Error("Could not remove failed credential row");
-					storage.removeRuntimePreferredCredentialSelector(markProvider);
-					removedFailedCredential = true;
+				if (markOptions?.rowId !== undefined) {
+					if (options.removeFailedCredentialDuringMark && !removedFailedCredential) {
+						const removalTarget = storage
+							.listCredentialRemovalTargets(markProvider)
+							.find(target => target.id === markOptions.rowId);
+						if (!removalTarget) throw new Error("Missing removal target for failed credential row");
+						const removal = storage.removeAuthCredentialsHard(markProvider, [removalTarget]);
+						if (removal.kind !== "removed") throw new Error("Could not remove failed credential row");
+						storage.removeRuntimePreferredCredentialSelector(markProvider);
+						removedFailedCredential = true;
+					}
+					if (options.addApiKeyDuringMark !== undefined && !addedApiKey) {
+						storage.upsertCredential(markProvider, { type: "api_key", key: options.addApiKeyDuringMark });
+						addedApiKey = true;
+					}
 				}
 				return pendingMark;
 			});
@@ -433,6 +441,21 @@ describe("managed fallback quota credential rotation", () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!model) throw new Error("Missing bundled Codex fixture model");
 		const result = await runManagedFallbackQuotaScenario({ accounts: ["a", "b"], quotaKeys: ["TOKEN-a"] });
+		expect(result).toEqual({
+			models: [selector(model), selector(model)],
+			keys: ["TOKEN-a", "TOKEN-b"],
+			markCount: 1,
+		});
+	});
+
+	test("stays within the failed credential kind when another kind is also stored", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a"],
+			addApiKeyDuringMark: "stored-codex-api-key",
+		});
 		expect(result).toEqual({
 			models: [selector(model), selector(model)],
 			keys: ["TOKEN-a", "TOKEN-b"],
