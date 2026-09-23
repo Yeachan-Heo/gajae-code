@@ -180,6 +180,19 @@ export function buildActivationRecord(input: {
 const READ_LIMIT = 256 * 1024;
 
 /**
+ * Whether `ctime` participates in the torn-read guard.
+ *
+ * On Windows, `ctimeNs` is NTFS ChangeTime, and the platform bumps it a few
+ * hundred milliseconds after a PE is executed (real-time protection revisits
+ * the image) without touching content, size, or mtime. The updater execs a
+ * staged binary for `--version`/`--smoke-test` and then immediately re-reads
+ * it, so that asynchronous bump lands mid-read and every update would be
+ * rejected as `target_changed`. Content drift is still caught by dev/ino,
+ * size, mtime, nlink and the lexical-vs-handle identity comparison.
+ */
+const CTIME_GUARDS_IDENTITY = process.platform !== "win32";
+
+/**
  * Bounded, no-follow, identity-revalidated read of one regular file. Rejects
  * symlinks, non-regular files, a symlinked/changed parent, and any content
  * or identity drift observed between the open and the final lexical check.
@@ -231,13 +244,13 @@ async function readExactRegularFile(
 			after.dev !== opened.dev ||
 			after.ino !== opened.ino ||
 			after.mtimeNs !== opened.mtimeNs ||
-			after.ctimeNs !== opened.ctimeNs ||
+			(CTIME_GUARDS_IDENTITY && after.ctimeNs !== opened.ctimeNs) ||
 			after.size !== opened.size ||
 			after.nlink !== opened.nlink ||
 			lexical.dev !== after.dev ||
 			lexical.ino !== after.ino ||
 			lexical.mtimeNs !== after.mtimeNs ||
-			lexical.ctimeNs !== after.ctimeNs
+			(CTIME_GUARDS_IDENTITY && lexical.ctimeNs !== after.ctimeNs)
 		)
 			throw new Error("target_changed");
 		const identity: FileIdentity = {

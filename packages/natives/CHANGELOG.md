@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `exactReplaceRetained` works on Windows again. Its source and destination handles are now opened with `READ_CONTROL`, so the executable ownership check can read the security descriptor instead of failing every publish with `acl_unavailable`. That check also accepts `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` as owner or write-capable principals: every stock user-profile location inherits Full Control for both, and both bypass the DACL through privilege anyway, so refusing them rejected every real install directory with `acl_present`.
+
 ## [0.17.4] - 2026-09-23
 
 ## [0.17.3] - 2026-09-22

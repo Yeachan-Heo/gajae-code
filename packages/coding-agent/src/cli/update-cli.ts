@@ -151,6 +151,22 @@ async function getBunGlobalBinDir(): Promise<string | undefined> {
 	}
 }
 
+/**
+ * Build a staging sibling of an installed binary (`gjc.exe` -> `gjc.new.<stamp>.exe`).
+ *
+ * The staged candidate is exec'd for its `--version`/`--smoke-test` before it
+ * is published. On Windows, Bun refuses to spawn an absolute path whose
+ * extension is not in PATHEXT, so `gjc.exe.new.<stamp>` fails with
+ * "command not found" and every binary update rolls back. Keeping the target's
+ * extension at the end of the sibling name makes the candidate executable
+ * everywhere while leaving extension-less Unix targets unchanged.
+ */
+export function stagingSiblingPath(targetPath: string, label: string, stamp: string): string {
+	const extension = path.extname(targetPath);
+	const base = extension ? targetPath.slice(0, -extension.length) : targetPath;
+	return `${base}.${label}.${stamp}${extension}`;
+}
+
 function normalizePathForComparison(filePath: string): string {
 	const normalized = path.normalize(filePath);
 	if (process.platform === "win32") return normalized.toLowerCase();
@@ -1145,8 +1161,8 @@ export async function runBinaryUpdateFlow(
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
 	const stamp = randomUUID();
-	const tempPath = `${targetPath}.new.${stamp}`;
-	const backupPath = `${targetPath}.bak.${stamp}`;
+	const tempPath = stagingSiblingPath(targetPath, "new", stamp);
+	const backupPath = stagingSiblingPath(targetPath, "bak", stamp);
 	const releaseLock = await acquireBinaryUpdateLock(targetPath);
 	try {
 		const originalTarget = await snapshotRegularFile(targetPath);

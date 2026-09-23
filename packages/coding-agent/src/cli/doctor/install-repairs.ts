@@ -32,6 +32,7 @@ import {
 	isProtectedSourcePathForInstall,
 	replaceBinaryForUpdate,
 	smokeTestPinnedCandidate,
+	stagingSiblingPath,
 } from "../update-cli";
 
 export type InstallSourceKind = "standalone" | "source" | "npm-wrapper" | "unknown";
@@ -284,13 +285,13 @@ export async function repairStandaloneBinary(
 		const stagingPath =
 			pending && observedRecord.status === "valid"
 				? observedRecord.record.stagingPath
-				: `${path.resolve(targetPath)}.restore.${randomUUID()}`;
+				: stagingSiblingPath(path.resolve(targetPath), "restore", randomUUID());
 		started = true;
 		if (!pending) await deps.fetchCandidate(candidate, stagingPath);
 		const verification = await replaceBinaryForUpdate({
 			targetPath,
 			tempPath: stagingPath,
-			backupPath: `${path.resolve(targetPath)}.restore-backup.${randomUUID()}`,
+			backupPath: stagingSiblingPath(path.resolve(targetPath), "restore-backup", randomUUID()),
 			expectedVersion: candidate.version,
 			originalTarget: descriptor.targetIdentity,
 			originalParent: descriptor.parentIdentity,

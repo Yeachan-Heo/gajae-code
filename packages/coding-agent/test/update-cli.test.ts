@@ -40,6 +40,7 @@ import {
 	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
 	sanitizeVerificationOutputForTest,
+	stagingSiblingPath,
 	verifyInstalledVersionForTest,
 	verifyMigrationTargetAdapterForTest,
 	verifyMigrationTargetForTest,
@@ -2018,7 +2019,63 @@ describe("update-cli download durability", () => {
 	});
 });
 
+describe("update-cli staging sibling paths", () => {
+	it("keeps the target's executable extension at the end so Windows can exec the candidate", () => {
+		const target = path.win32.join("C:\\Users\\me\\AppData\\Local\\gjc", "gjc.exe");
+		const staged = stagingSiblingPath(target, "new", "1234");
+		expect(staged).toBe(path.win32.join("C:\\Users\\me\\AppData\\Local\\gjc", "gjc.new.1234.exe"));
+		expect(path.extname(staged)).toBe(".exe");
+		expect(path.dirname(staged)).toBe(path.dirname(target));
+		expect(stagingSiblingPath(target, "bak", "1234")).toBe(
+			path.win32.join("C:\\Users\\me\\AppData\\Local\\gjc", "gjc.bak.1234.exe"),
+		);
+	});
+
+	it("leaves extension-less targets with the plain suffix form", () => {
+		expect(stagingSiblingPath("/home/me/.gjc/bin/gjc", "new", "abcd")).toBe("/home/me/.gjc/bin/gjc.new.abcd");
+		expect(stagingSiblingPath("/home/me/.gjc/bin/gjc", "restore", "abcd")).toBe("/home/me/.gjc/bin/gjc.restore.abcd");
+	});
+
+	it("stages a Windows candidate under a name Bun can spawn", async () => {
+		if (process.platform !== "win32") return;
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc.exe");
+		const stagedPath = stagingSiblingPath(targetPath, "new", "probe");
+		await fs.copyFile(process.execPath, stagedPath);
+		const result = await Bun.$`${stagedPath} --version`.quiet().nothrow();
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString().trim()).toBe(Bun.version);
+	});
+});
+
 describe("update-cli binary update flow", () => {
+	it("stages Windows-style targets with the extension preserved", async () => {
+		const calls: string[] = [];
+		const targetPath = path.join(await makeTempDir(), "gjc.exe");
+		const flow: BinaryUpdateFlow = {
+			download: async (_url, tempPath) => {
+				calls.push(tempPath);
+			},
+			fsync: async () => {},
+			replace: async options => {
+				calls.push(options.tempPath, options.backupPath);
+				return { ok: true };
+			},
+			verifyInstalledVersion: async () => ({ ok: true }),
+		};
+
+		await runBinaryUpdateFlow(targetPath, "https://example.test/gjc.exe", "1.2.3", flow);
+
+		const stem = targetPath.slice(0, -".exe".length);
+		const [tempPath, replacedTempPath, backupPath] = calls;
+		expect(tempPath.startsWith(`${stem}.new.`)).toBe(true);
+		expect(tempPath.endsWith(".exe")).toBe(true);
+		expect(path.dirname(tempPath)).toBe(path.dirname(targetPath));
+		expect(replacedTempPath).toBe(tempPath);
+		expect(backupPath.startsWith(`${stem}.bak.`)).toBe(true);
+		expect(backupPath.endsWith(".exe")).toBe(true);
+	});
+
 	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
 		const calls: string[] = [];
 		const targetPath = path.join(await makeTempDir(), "gjc");
@@ -2045,10 +2102,11 @@ describe("update-cli binary update flow", () => {
 		const result = await runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow);
 
 		expect(result.ok).toBe(true);
-		expect(calls[0]).toMatch(new RegExp(`^download https://example.test/gjc -> ${targetPath}\\.new\\.`));
-		expect(calls[1]).toMatch(new RegExp(`^fsync ${targetPath}\\.new\\.`));
+		expect(calls[0].startsWith(`download https://example.test/gjc -> ${targetPath}.new.`)).toBe(true);
+		expect(calls[1].startsWith(`fsync ${targetPath}.new.`)).toBe(true);
 		expect(calls[2]).toBe("beforeReplace");
-		expect(calls[3]).toMatch(new RegExp(`^replace ${targetPath}\\.new\\..* -> ${targetPath}$`));
+		expect(calls[3].startsWith(`replace ${targetPath}.new.`)).toBe(true);
+		expect(calls[3].endsWith(` -> ${targetPath}`)).toBe(true);
 		expect(calls[4]).toBe("verify 1.2.3");
 		expect(calls.some(call => call.startsWith("removeTemp "))).toBe(false);
 	});
@@ -2078,7 +2136,7 @@ describe("update-cli binary update flow", () => {
 			"fsync failed",
 		);
 
-		expect(calls[0]).toMatch(new RegExp(`^download ${targetPath}\\.new\\.`));
+		expect(calls[0].startsWith(`download ${targetPath}.new.`)).toBe(true);
 		expect(calls[1]).toBe("fsync");
 		expect(calls).toHaveLength(2);
 		expect(calls).not.toContain("replace");

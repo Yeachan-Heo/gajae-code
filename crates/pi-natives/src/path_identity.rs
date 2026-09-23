@@ -8609,6 +8609,14 @@ mod platform {
 	/// mismatch, or any ACCESS_ALLOWED ACE that grants a write-capable right to
 	/// a principal other than the verified owner. Read/execute-only ACEs for
 	/// other principals are accepted.
+	///
+	/// `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` are treated as the
+	/// owner's peers: every file under a user profile inherits Full Control for
+	/// both (so refusing them would reject every stock install location), and
+	/// both hold take-ownership/restore privileges that bypass the DACL anyway,
+	/// so excluding them buys no integrity. Files created from an elevated
+	/// shell are owned by `BUILTIN\Administrators` rather than the user, which
+	/// is why they are also accepted as owner.
 	fn verify_executable_ownership_no_shared_write(handle: HANDLE) -> Result<(), &'static str> {
 		const FILE_WRITE_DATA: u32 = 0x0000_0002;
 		const FILE_APPEND_DATA: u32 = 0x0000_0004;
@@ -8661,7 +8669,19 @@ mod platform {
 			// SAFETY: GetSecurityInfo returned owner within the live security
 			// descriptor; sid is a validated current-user SID.
 			if unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
-				return Err("owner_mismatch");
+				// SAFETY: GetSecurityInfo returned the owner SID inside the live
+				// descriptor; IsValidSid proves it is complete and GetLengthSid bounds
+				// the byte view to exactly that SID.
+				if unsafe { IsValidSid(owner) } == 0 {
+					return Err("acl_malformed");
+				}
+				let owner_length =
+					usize::try_from(unsafe { GetLengthSid(owner) }).map_err(|_| "acl_malformed")?;
+				let owner_bytes =
+					unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_length) };
+				if !is_platform_trusted_sid(owner_bytes) {
+					return Err("owner_mismatch");
+				}
 			}
 			if dacl.is_null() {
 				return Err("acl_present");
@@ -8724,15 +8744,15 @@ mod platform {
 				let ace_sid = unsafe {
 					std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), ace_size - sid_offset)
 				};
-				if valid_sid(ace_sid).is_none() {
+				let Some(ace_sid_length) = valid_sid(ace_sid) else {
 					return Err("acl_malformed");
-				}
+				};
 				// SAFETY: both pointers identify complete validated SIDs that remain live
 				// through comparison.
 				let grants_owner = unsafe {
 					EqualSid(ace_sid.as_ptr().cast_mut().cast(), sid.as_ptr().cast_mut().cast())
 				} != 0;
-				if !grants_owner {
+				if !grants_owner && !is_platform_trusted_sid(&ace_sid[..ace_sid_length]) {
 					return Err("acl_present");
 				}
 			}
@@ -8801,10 +8821,13 @@ mod platform {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
 			Err(_) => return NativeExactUnlinkResult::failure("io_error"),
 		}
+		// READ_CONTROL is required on both handles: they are handed to
+		// verify_executable_ownership_no_shared_write, whose GetSecurityInfo call
+		// is refused with ERROR_ACCESS_DENIED ("acl_unavailable") without it.
 		let source = match open_exact_with_share(
 			&source_path,
 			"file",
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | READ_CONTROL | 0x0001_0000,
 			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
@@ -8861,7 +8884,11 @@ mod platform {
 			open_relative_with_share_status(
 				parent_handle,
 				destination_name,
-				FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+				FILE_READ_ATTRIBUTES
+					| 0x0001_0000
+					| FILE_WRITE_ATTRIBUTES
+					| FILE_READ_DATA
+					| READ_CONTROL,
 				false,
 				FILE_SHARE_READ | FILE_SHARE_DELETE,
 			)
@@ -9375,6 +9402,19 @@ mod platform {
 			return Err(());
 		}
 		Ok(sid_bytes[..sid_length].to_vec())
+	}
+
+	/// `NT AUTHORITY\SYSTEM` (S-1-5-18) in binary SID form.
+	const LOCAL_SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+	/// `BUILTIN\Administrators` (S-1-5-32-544) in binary SID form.
+	const BUILTIN_ADMINISTRATORS_SID: [u8; 16] =
+		[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0];
+
+	/// Principals that every stock Windows install location already grants Full
+	/// Control and that can bypass any DACL through privilege; see
+	/// [`verify_executable_ownership_no_shared_write`].
+	fn is_platform_trusted_sid(sid: &[u8]) -> bool {
+		sid == LOCAL_SYSTEM_SID || sid == BUILTIN_ADMINISTRATORS_SID
 	}
 
 	const OBJECT_INHERIT_ACE: u8 = 0x01;

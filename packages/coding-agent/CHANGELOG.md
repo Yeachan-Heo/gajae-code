@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `gjc update` now completes on Windows. The downloaded candidate is staged as `gjc.new.<id>.exe` instead of `gjc.exe.new.<id>`, so Bun can execute it for the pre-publish `--version`/`--smoke-test` check instead of failing with `bun: command not found` and rolling back. The post-exec identity re-read no longer treats the NTFS ChangeTime bump that Windows applies a few hundred milliseconds after a binary is executed as `target_changed`. Doctor's standalone-binary restore uses the same extension-preserving staging names.
+
 ## [0.17.4] - 2026-09-23
 
 ### Changed
