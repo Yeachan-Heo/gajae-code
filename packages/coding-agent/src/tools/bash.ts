@@ -94,6 +94,14 @@ const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
+const COORDINATOR_ONLY_BASH_ENV = [
+	"GJC_COORDINATOR_SESSION_STATE_FILE",
+	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+	"GJC_COORDINATOR_SESSION_READINESS_FILE",
+	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+	"GJC_COORDINATOR_SIDECAR_KEY_ID",
+] as const;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -658,6 +666,16 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 		normalized[key] = value;
 	}
 	return normalized;
+}
+
+/**
+ * The shell runner's per-command env map can override ambient entries, but cannot
+ * remove them. Unset coordinator-only names before the command in the shell's
+ * command scope; explicit tool env values remain available to that command.
+ */
+function scrubCoordinatorAmbientEnv(command: string, explicitEnv: Record<string, string> | undefined): string {
+	const envNames = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(explicitEnv ?? {}, name));
+	return envNames.length > 0 ? `unset ${envNames.join(" ")}\n${command}` : command;
 }
 
 /**
@@ -1288,6 +1306,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		ctx?: AgentToolContext,
 	): Promise<{
 		command: string;
+		clientCommand: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
 		directMasterSpawn: boolean;
@@ -1462,6 +1481,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
+		const clientCommand = command;
+		if (!directMasterSpawn) command = scrubCoordinatorAmbientEnv(command, expandedEnv);
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
@@ -1492,6 +1513,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		return {
 			command,
+			clientCommand,
 			commandCwd,
 			resolvedEnv,
 			directMasterSpawn,
@@ -1741,6 +1763,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		);
 		const {
 			command,
+			clientCommand,
 			commandCwd,
 			resolvedEnv,
 			directMasterSpawn,
@@ -1972,7 +1995,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 			const createPromise = Promise.resolve().then(() =>
 				clientBridge.createTerminal!({
-					command,
+					command: clientCommand,
 					cwd: commandCwd,
 					env: resolvedEnv
 						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))

@@ -44,6 +44,15 @@ function textOf(result: unknown): string {
 	return content.find(block => block.type === "text")?.text ?? "";
 }
 
+const coordinatorOnlyEnvNames = [
+	"GJC_COORDINATOR_SESSION_STATE_FILE",
+	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+	"GJC_COORDINATOR_SESSION_READINESS_FILE",
+	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+	"GJC_COORDINATOR_SIDECAR_KEY_ID",
+];
+
 describe("issue #5374: session identity on the bash tool-env path", () => {
 	it("a master-owned child exposes its own id in GJC_SESSION_ID", async () => {
 		const result = await new BashTool(createSession("child-session", "master-owner")).execute("call", {
@@ -64,5 +73,45 @@ describe("issue #5374: session identity on the bash tool-env path", () => {
 			command: echoSessionEnv(),
 		});
 		expect(textOf(result)).toContain("own=master-owner");
+	});
+});
+
+describe("issue #5802: coordinator env isolation at the bash boundary", () => {
+	it("scrubs inherited coordinator env while preserving explicit overrides and derived session identity", async () => {
+		const namesToRestore = [...coordinatorOnlyEnvNames, "GJC_SESSION_ID"];
+		const previousEnv = new Map(namesToRestore.map(name => [name, process.env[name]]));
+		for (const name of coordinatorOnlyEnvNames) process.env[name] = `ambient-${name}`;
+		process.env.GJC_SESSION_ID = "parent-session";
+
+		try {
+			const command = [
+				`for name in ${coordinatorOnlyEnvNames.join(" ")}; do`,
+				`  value=$(printenv "$name" 2>/dev/null || printf '<unset>')`,
+				`  printf '%s=%s\\n' "$name" "$value"`,
+				"done",
+				`printf 'GJC_SESSION_ID=%s\\n' "$GJC_SESSION_ID"`,
+				`printf 'BASH_TOOL_EXPLICIT=%s\\n' "$BASH_TOOL_EXPLICIT"`,
+			].join("\n");
+			const result = await new BashTool(createSession("child-session")).execute("call", {
+				command,
+				env: {
+					GJC_COORDINATOR_SESSION_ID: "explicit-coordinator-id",
+					BASH_TOOL_EXPLICIT: "explicit-tool-value",
+				},
+			});
+			const output = textOf(result);
+			for (const name of coordinatorOnlyEnvNames) {
+				expect(output).toContain(
+					`${name}=${name === "GJC_COORDINATOR_SESSION_ID" ? "explicit-coordinator-id" : "<unset>"}`,
+				);
+			}
+			expect(output).toContain("GJC_SESSION_ID=child-session");
+			expect(output).toContain("BASH_TOOL_EXPLICIT=explicit-tool-value");
+		} finally {
+			for (const [name, value] of previousEnv) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 	});
 });
