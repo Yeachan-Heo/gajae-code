@@ -613,7 +613,15 @@ function isContextFreeAcknowledgement(value: string): boolean {
 		.normalize("NFC")
 		.replace(/[\p{P}\s]+/gu, " ")
 		.trim();
+	const agreementOnly =
+		/^(?:(?:i|we|you|they|he|she)\s+)?(?:do\s+)?(?:(?:fully|completely|totally|strongly|absolutely|certainly|definitely)\s+)?agree(?:d)?(?:\s+(?:fully|completely|totally|strongly|absolutely|certainly|definitely))?$/iu.test(
+			normalized,
+		) ||
+		/^(?:(?:i|we|you|they|he|she)\s+)?(?:fully|completely|totally|strongly|absolutely|certainly|definitely\s+)?agree(?:d)?\s+(?:with|to)\s+(?:it|this|that|the\s+(?:above|same|proposal|plan|approach|decision|idea|option|choice|statement|recommendation|requirement)|you|your\s+(?:proposal|plan|approach|decision|idea|option|choice|statement|recommendation|requirement))$/iu.test(
+			normalized,
+		);
 	return (
+		agreementOnly ||
 		/^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)$/iu.test(
 			normalized,
 		) ||
