@@ -1592,6 +1592,7 @@ describe("queued promotion run identity (#4668)", () => {
 			disposition: "completed",
 		});
 		if (terminal.disposition !== "completed") throw new Error("Expected completed terminal receipt");
+		expect(terminal.attemptScope).toEqual(execution.attemptScope);
 		expect(observedScopes).toContain("turn_start:2");
 		unsubscribe();
 		await promptDone;

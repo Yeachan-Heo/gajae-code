@@ -5,6 +5,8 @@ import {
 	ItermPetTransport,
 	isItermCandidate,
 	type NativePetUi,
+	type PetTmuxResult,
+	type PetTmuxRunner,
 	type PetTransportClock,
 } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
 
@@ -56,6 +58,53 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 		await Promise.resolve();
 	}
 	throw new Error("condition did not become true within 200 microtasks");
+}
+
+function makeRefreshFixture(tmux: PetTmuxRunner, transportClock = clock) {
+	const input = new Input();
+	const transport = new ItermPetTransport({
+		mode: "managed",
+		clock: transportClock,
+		input,
+		output: { write: async () => ({ status: "written" as const }) },
+		tmux,
+		paneId: "%1",
+		expectedClientId: "@1",
+		topology: async () => ({ clients: 1, paneId: "%1", ownedPaneId: "%1", clientId: "@1" }),
+	});
+	return {
+		input,
+		transport,
+		async ready() {
+			const probe = transport.inspectManagedTopology();
+			await waitFor(() => input.listeners.size === 1);
+			input.send("\x1b]1337;Capabilities=F\x07");
+			await probe;
+		},
+	};
+}
+
+function pendingCursorCommand(started: { resolve: () => void }, aborted: { resolve: () => void }) {
+	let commandSignal: AbortSignal | undefined;
+	const tmux: PetTmuxRunner = async (argv, signal) => {
+		if (argv[0] === "show-options" && argv.includes("-q")) return { status: 0, stdout: "" };
+		if (argv[0] === "show-options" && argv.includes("-A")) return { status: 0, stdout: "on" };
+		if (argv[0] === "set-option") return { status: 0, stdout: "" };
+		if (argv[0] === "display-message") {
+			commandSignal = signal;
+			started.resolve();
+			const result = Promise.withResolvers<PetTmuxResult>();
+			const onAbort = () => {
+				aborted.resolve();
+				result.resolve({ status: 1, stdout: "" });
+			};
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			return result.promise;
+		}
+		return { status: 0, stdout: "" };
+	};
+	return { tmux, getCommandSignal: () => commandSignal };
 }
 
 const nativeUi = {
@@ -153,6 +202,58 @@ describe("managed iTerm Pet topology revocation", () => {
 		await x.transport.inspectManagedTopology();
 		expect(x.events.at(-1)).toEqual({ available: false, reason: "topology-ineligible", epoch: 4 });
 		expect(x.events).toHaveLength(5);
+	});
+});
+
+describe("managed iTerm Pet cursor refresh cancellation", () => {
+	it("aborts a pending cursor command when its TUI lifecycle ends", async () => {
+		const commandStarted = Promise.withResolvers<void>();
+		const commandAborted = Promise.withResolvers<void>();
+		const command = pendingCursorCommand(commandStarted, commandAborted);
+		const fixture = makeRefreshFixture(command.tmux);
+		await fixture.ready();
+
+		const lifecycle = new AbortController();
+		const refresh = fixture.transport.refreshManagedClient(1, 2, lifecycle.signal);
+		await commandStarted.promise;
+		lifecycle.abort();
+
+		expect(await refresh).toBe(false);
+		await commandAborted.promise;
+		expect(command.getCommandSignal()?.aborted).toBe(true);
+		await fixture.transport.dispose();
+	});
+
+	it("aborts a pending cursor command when the refresh deadline expires", async () => {
+		const timers = new Map<number, { callback: () => void; ms: number }>();
+		let nextTimerId = 0;
+		const timeoutClock: PetTransportClock = {
+			now: () => 0,
+			setTimeout: (callback, ms) => {
+				const id = ++nextTimerId;
+				timers.set(id, { callback, ms });
+				return id;
+			},
+			clearTimeout: handle => {
+				if (typeof handle === "number") timers.delete(handle);
+			},
+		};
+		const commandStarted = Promise.withResolvers<void>();
+		const commandAborted = Promise.withResolvers<void>();
+		const command = pendingCursorCommand(commandStarted, commandAborted);
+		const fixture = makeRefreshFixture(command.tmux, timeoutClock);
+		await fixture.ready();
+
+		const refresh = fixture.transport.refreshManagedClient(1, 2);
+		await commandStarted.promise;
+		const timeout = [...timers.values()].find(timer => timer.ms === 250);
+		if (!timeout) throw new Error("managed cursor refresh timeout was not scheduled");
+		timeout.callback();
+
+		expect(await refresh).toBe(false);
+		await commandAborted.promise;
+		expect(command.getCommandSignal()?.aborted).toBe(true);
+		await fixture.transport.dispose();
 	});
 });
 
