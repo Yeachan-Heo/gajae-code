@@ -1703,8 +1703,6 @@ export class ModelRegistry {
 		aliases: new Map(),
 	};
 	#availableModelsCache: Model<Api>[] | undefined;
-	#providerBaseUrlIndex: { models: readonly Model<Api>[]; byProvider: ReadonlyMap<string, string> } | undefined;
-	#catalogModelOrderIndex: { models: readonly Model<Api>[]; order: ReadonlyMap<string, number> } | undefined;
 	#availableModelsDisabledProviders: string | undefined;
 	#availableModelsEnvFingerprint: string | undefined;
 	#sessionCanonicalVariants = new Map<string, string>();
@@ -5016,8 +5014,7 @@ export class ModelRegistry {
 	}
 
 	/** Stable model order from the registry catalog (never caller candidate order). */
-	#catalogModelOrder(): ReadonlyMap<string, number> {
-		if (this.#catalogModelOrderIndex?.models === this.#models) return this.#catalogModelOrderIndex.order;
+	#catalogModelOrder(): Map<string, number> {
 		const modelOrder = new Map<string, number>();
 		for (let index = 0; index < this.#models.length; index += 1) {
 			const selector = formatCanonicalVariantSelector(this.#models[index]!);
@@ -5025,7 +5022,6 @@ export class ModelRegistry {
 				modelOrder.set(selector, index);
 			}
 		}
-		this.#catalogModelOrderIndex = { models: this.#models, order: modelOrder };
 		return modelOrder;
 	}
 
@@ -5057,7 +5053,7 @@ export class ModelRegistry {
 			exactnessKey?: string;
 			credentialSessionId?: string;
 			providerRank?: Map<string, number>;
-			modelOrder?: ReadonlyMap<string, number>;
+			modelOrder?: Map<string, number>;
 		} = {},
 	): CanonicalModelVariant | undefined {
 		if (variants.length === 0) return undefined;
@@ -5429,6 +5425,10 @@ export class ModelRegistry {
 	 */
 	getAvailableForProfileActivation(): Model<Api>[] {
 		const bundledIdsByProvider = new Map<string, Set<string>>();
+		// Evidence staleness depends only on the provider, and resolving it scans the
+		// catalog for the provider base URL. Decide it once per provider per call so a
+		// multi-thousand-model catalog is not rescanned for every model.
+		const staleEvidenceByProvider = new Map<string, boolean>();
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
 			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
@@ -5443,12 +5443,15 @@ export class ModelRegistry {
 				bundledIdsByProvider.set(model.provider, bundledModelIds);
 			}
 			if (!bundledModelIds.has(model.id)) return true;
-			if (
-				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
-				evidence.profileEndpoint !==
-					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "")
-			)
-				return true;
+			let staleEvidence = staleEvidenceByProvider.get(model.provider);
+			if (staleEvidence === undefined) {
+				staleEvidence =
+					evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
+					evidence.profileEndpoint !==
+						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "");
+				staleEvidenceByProvider.set(model.provider, staleEvidence);
+			}
+			if (staleEvidence) return true;
 			return evidence.profileModelIds.has(model.id);
 		});
 	}
@@ -5636,23 +5639,10 @@ export class ModelRegistry {
 	 * Get the base URL associated with a provider, if any model defines one.
 	 */
 	getProviderBaseUrl(provider: string): string | undefined {
-		return this.#getProviderBaseUrlIndex().get(provider) ?? resolveProviderBaseUrlFromEnv(provider);
-	}
-
-	/**
-	 * First model-declared base URL per provider, in catalog order. Every catalog
-	 * mutation replaces `#models` wholesale, so the array identity is the cache key.
-	 * Availability checks call `getProviderBaseUrl` once per model; a linear scan of
-	 * a multi-thousand-model catalog there made each `/model` open quadratic.
-	 */
-	#getProviderBaseUrlIndex(): ReadonlyMap<string, string> {
-		if (this.#providerBaseUrlIndex?.models === this.#models) return this.#providerBaseUrlIndex.byProvider;
-		const byProvider = new Map<string, string>();
-		for (const model of this.#models) {
-			if (model.baseUrl && !byProvider.has(model.provider)) byProvider.set(model.provider, model.baseUrl);
-		}
-		this.#providerBaseUrlIndex = { models: this.#models, byProvider };
-		return byProvider;
+		return (
+			this.#models.find(m => m.provider === provider && m.baseUrl)?.baseUrl ??
+			resolveProviderBaseUrlFromEnv(provider)
+		);
 	}
 
 	/** Opaque owner token for registry-scoped AuthStorage reads. */

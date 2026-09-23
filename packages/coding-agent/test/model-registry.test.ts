@@ -424,6 +424,25 @@ describe("ModelRegistry", () => {
 			expect(registry.getProviderBaseUrl("no-such-provider")).toBeUndefined();
 		});
 
+		test("getProviderBaseUrl reflects in-place changes to the catalog returned by getAll()", () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+			// `getAll()` exposes the live catalog to extensions; lookups must not be served
+			// from a snapshot taken before an in-place edit.
+			const model = registry.getAll().find(candidate => candidate.provider === "base-url-proxy");
+			if (!model) throw new Error("proxy model missing");
+			model.baseUrl = "https://edited.example.com/v1";
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://edited.example.com/v1");
+		});
+
 		test("getProviderBaseUrl env fallback still applies to providers without a catalog base URL", () => {
 			const restore = setEnvForTest("MY_LATE_PROXY_BASE_URL", "https://late.example.com/v1");
 			try {
