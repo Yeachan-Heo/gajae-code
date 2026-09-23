@@ -181,6 +181,34 @@ describe("GJC tmux session management", () => {
 		);
 	});
 
+	it("skips unsafe foreign names without losing valid tagged sessions", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(
+				0,
+				[
+					"foreign session:glyph\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\t\t$1",
+					"gajae_code_alpha\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\t\t$2",
+					"gajae_code_beta\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\t\t$3",
+				].join("\n"),
+			),
+		);
+		clearPsmuxDetectionCache();
+
+		expect(listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" }).map(session => session.name)).toEqual([
+			"gajae_code_alpha",
+			"gajae_code_beta",
+		]);
+	});
+
+	it("still rejects malformed tmux session rows that break field alignment", () => {
+		spyOn(Bun, "spawnSync").mockReturnValue(
+			spawnResult(0, "foreign session:glyph\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\t\t$1\textra"),
+		);
+		clearPsmuxDetectionCache();
+
+		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow("gjc_tmux_session_row_malformed");
+	});
+
 	it("returns an empty list when tmux has no server", () => {
 		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(1, "", "no server running on /tmp/tmux"));
 		clearPsmuxDetectionCache();

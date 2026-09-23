@@ -155,6 +155,52 @@ describe("tmux GC safety", () => {
 		);
 	});
 
+	it("classifies unsafe profile-tagged names as untagged without losing valid GC candidates", async () => {
+		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+		const calls: string[][] = [];
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation((cmd: string[]) => {
+			calls.push(cmd);
+			if (!cmd.includes("list-sessions")) return spawnResult(0, "");
+			return spawnResult(
+				0,
+				[
+					sessionLine({ name: "foreign session:glyph", profile: "1" }),
+					sessionLine({ name: "gajae_code_alpha", profile: "1" }),
+					sessionLine({ name: "gajae_code_beta", profile: "1" }),
+				].join("\n"),
+			);
+		});
+
+		const result = await tmuxSessionsGcAdapter.collect(ctx());
+		const unsafe = result.records.find(entry => entry.id === "foreign session:glyph");
+		const alpha = result.records.find(entry => entry.id === "gajae_code_alpha");
+		const beta = result.records.find(entry => entry.id === "gajae_code_beta");
+
+		expect(result.errors).toEqual([]);
+		expect(unsafe).toMatchObject({
+			status: "unclassified",
+			removable: false,
+			reason: "untagged_tmux_session",
+		});
+		expect(alpha).toMatchObject({
+			status: "unclassified",
+			removable: false,
+			reason: "metadata_less_gjc_owned_idle_orphan_missing_terminal_marker",
+		});
+		expect(beta).toMatchObject({
+			status: "unclassified",
+			removable: false,
+			reason: "metadata_less_gjc_owned_idle_orphan_missing_terminal_marker",
+		});
+		expect(await tmuxSessionsGcAdapter.prune(unsafe!, ctx())).toEqual({
+			removed: false,
+			skipped: "not_removable_tmux_session",
+		});
+		expect(calls.some(cmd => cmd.includes("kill-session"))).toBe(false);
+		expect(calls.some(cmd => cmd.includes("show-options") && cmd.includes("foreign session:glyph"))).toBe(false);
+	});
+
 	it("classifies terminal detached sessions but refuses prune without exact server proof", async () => {
 		spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
 		const stateFile = "/tmp/gjc-terminal-marker.json";

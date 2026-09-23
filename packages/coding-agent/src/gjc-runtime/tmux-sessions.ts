@@ -336,6 +336,16 @@ function parseNumber(value: string | undefined): number {
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function isSafeGjcTmuxSessionName(name: string): boolean {
+	try {
+		assertSafeGjcTmuxSessionName(name);
+		return true;
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("gjc_tmux_session_name_unsafe:")) return false;
+		throw error;
+	}
+}
+
 function parseSessionLine(line: string, validateName = true): GjcTmuxSessionStatus | null {
 	const fields = line.split("\t");
 	if (fields.length > 17) throw new Error("gjc_tmux_session_row_malformed");
@@ -590,7 +600,9 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 		const authority = psmuxAuthorityFromEnv(listed.env) ?? undefined;
 		return listed.lines
 			.map(line => parseSessionLine(line, false))
-			.filter((session): session is GjcTmuxSessionStatus => session != null)
+			.filter(
+				(session): session is GjcTmuxSessionStatus => session != null && isSafeGjcTmuxSessionName(session.name),
+			)
 			.map(session => {
 				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
 				effectiveSessionEnvironments.set(hydrated, listed.env);
@@ -599,7 +611,6 @@ export function listGjcTmuxSessions(env: NodeJS.ProcessEnv = process.env): GjcTm
 			})
 			.filter((session): session is GjcTmuxSessionStatus => {
 				if (session?.profile !== GJC_TMUX_PROFILE_VALUE) return false;
-				assertSafeGjcTmuxSessionName(session.name);
 				return true;
 			})
 			.map(session => {
@@ -626,6 +637,7 @@ export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): Gjc
 			.map(line => parseSessionLine(line, false))
 			.filter((session): session is GjcTmuxSessionStatus => session != null)
 			.map(session => {
+				if (!isSafeGjcTmuxSessionName(session.name)) return { ...session, profile: undefined };
 				const hydrated = hydrateSessionFromExactOptions(session, listed.env);
 				effectiveSessionEnvironments.set(hydrated, listed.env);
 				if (listed.env !== authorityEnv) fallbackSessionEnvironments.add(hydrated);
@@ -633,11 +645,7 @@ export function listTmuxSessionsForGc(env: NodeJS.ProcessEnv = process.env): Gjc
 			});
 	});
 	const tagged = sessions
-		.filter(session => {
-			if (session.profile !== GJC_TMUX_PROFILE_VALUE) return false;
-			assertSafeGjcTmuxSessionName(session.name);
-			return true;
-		})
+		.filter(session => session.profile === GJC_TMUX_PROFILE_VALUE)
 		.sort((a, b) => a.name.localeCompare(b.name));
 	const taggedNames = new Set(tagged.map(session => session.name));
 	const untagged = sessions
