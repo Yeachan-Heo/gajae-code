@@ -14,7 +14,7 @@ describe("preset catalog model entries", () => {
 		const astra = getBundledModel("openai-codex", "gpt-6-astra");
 		expect(astra).toMatchObject({
 			id: "gpt-6-astra",
-			name: "GPT-6-Astra",
+			name: "GPT-6 Astra",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: "https://chatgpt.com/backend-api",
@@ -246,7 +246,7 @@ describe("preset catalog model entries", () => {
 		expect(model.name).toBe("MiniMax-M3");
 		expect(model.reasoning).toBe(true);
 		expect(model.contextWindow).toBe(1_000_000);
-		expect(model.maxTokens).toBe(128_000);
+		expect(model.maxTokens).toBe(512_000);
 		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.High, maxLevel: Effort.High });
 	});
 });
