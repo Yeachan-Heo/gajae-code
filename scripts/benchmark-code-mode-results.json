@@ -294,7 +294,8 @@
   "rawArtifactPath": "scripts/benchmark-code-mode-runs.json.gz",
   "limitations": [
     "Results describe only this fixed 8-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
-    "Attempt deadlines cover session creation and agent/tool execution; handler-session setup and cleanup use separately bounded timeouts."
+    "Attempt deadlines cover session creation and agent/tool execution; handler-session setup and cleanup use separately bounded timeouts.",
+    "Arm B invokes the same read/search handler objects directly without AgentToolContext or the ordinary agent-loop dispatcher; interpret outcomes as specific to this consumer prototype."
   ],
   "priorExploratoryArtifact": "scripts/benchmark-code-mode-exploratory-results.json"
 }
