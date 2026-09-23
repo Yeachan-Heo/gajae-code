@@ -304,6 +304,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			publication,
 			generation,
 		});
+		const setOnToolsChanged = vi.spyOn(MCPManager.prototype, "setOnToolsChanged");
 
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
@@ -312,6 +313,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			expect(setOnToolsChanged).not.toHaveBeenCalled();
 			expect(session.getAllToolNames()).not.toContain(staleTool.name);
 			expect(session.getActiveToolNames()).not.toContain(staleTool.name);
 		} finally {

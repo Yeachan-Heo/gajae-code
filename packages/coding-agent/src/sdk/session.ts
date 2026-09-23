@@ -1261,6 +1261,7 @@ const MAX_EXACT_MCP_TOOL_NAME_LENGTH = 100;
 const pluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 const conventionalMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 const failedPluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
+const pluginMcpCleanupFailures = new WeakSet<MCPManager>();
 
 function sameMcpToolSnapshot(first: readonly CustomTool[], second: readonly CustomTool[]): boolean {
 	return first.length === second.length && first.every((tool, index) => tool === second[index]);
@@ -3440,6 +3441,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 			}
 			failedPluginMcpManagerServers.set(owned, new Set(failedPluginNames));
+			if (pluginCleanupFailed) pluginMcpCleanupFailures.add(owned);
 			const successfulTools = result.tools.filter(
 				tool => tool.mcpServerName === undefined || !failedPluginNames.has(tool.mcpServerName),
 			);
@@ -5458,10 +5460,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Wire late catalog publications from every owned manager into the live
 		// session. Plugin-only managers also change after startup through
 		// tools/list_changed; mixed managers additionally publish cached fallbacks.
-		// Shared by eager startup and the deferred conventional starter.
+		// Shared by eager startup and the deferred starter.
 		const wireOwnedMcpToolSync = (initialTools?: readonly CustomTool[]): void => {
 			const manager = mcpManager;
-			if (!manager || !publishOwnedMcpTools) return;
+			if (!manager || !publishOwnedMcpTools || manager.isToolsOnly()) return;
 			// Late MCP connections can publish near-simultaneously.
 			// Serialize the swaps so an older snapshot cannot interleave with a
 			// newer one inside replaceNamedCustomTools and leave a stale list.
@@ -5610,6 +5612,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (!sameMcpToolSnapshot(catalogTools, ownedMcpManagerTools)) {
 						void syncOwnedMcpTools(catalog.tools.map(tool => tool as CustomTool));
 					}
+				} else if (!pluginMcpCleanupFailures.has(manager)) {
+					void syncOwnedMcpTools(ownedMcpManagerTools);
 				}
 			}
 		};

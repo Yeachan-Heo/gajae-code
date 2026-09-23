@@ -229,7 +229,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 	);
 
 	test.skipIf(process.platform !== "linux")(
-		"retains the startup finding and successful tools when cleanup of an unsettled plugin fails",
+		"retains current startup evidence and successful tools when cleanup fails before catalog publication",
 		async () => {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-runtime-cleanup-failure-"));
 			let session: AgentSession | undefined;
@@ -305,7 +305,9 @@ describe("GJC Bundles settings integration through the production selector", () 
 					}),
 				);
 				expect(JSON.stringify(pluginErrorLog.mock.calls)).not.toContain(cleanupSecret);
-				expect(created.mcpManager).toBeDefined();
+				const manager = created.mcpManager;
+				if (!manager) throw new Error("Expected the owned MCP manager to be retained");
+				expect(manager.getToolCatalogSnapshot().publication).toBe("unpublished");
 				const runtimeSnapshot = created.gjcRuntimeSnapshot;
 				if (!runtimeSnapshot) throw new Error("Expected a GJC runtime snapshot provider");
 				const runtime = runtimeSnapshot.current();
