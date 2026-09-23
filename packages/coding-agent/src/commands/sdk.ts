@@ -1560,14 +1560,20 @@ export default class Sdk extends Command {
 			writtenAt: Date.now(),
 		});
 		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
-			startupExitWrite ??= (async () => {
-				const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
-				if (Number.isSafeInteger(testDelayMs) && testDelayMs > 0 && testDelayMs <= 10_000) {
-					await emitBrokerStartupTestSignal("startup-exit-record-fallback-waiting");
-					await Bun.sleep(testDelayMs);
-				}
-				return await writeBrokerStartupExitRecordBounded(agentDir, record, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
-			})();
+			const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
+			const beforeWriteForTest =
+				Number.isSafeInteger(testDelayMs) && testDelayMs > 0 && testDelayMs <= 10_000
+					? async () => {
+							await emitBrokerStartupTestSignal("startup-exit-record-fallback-waiting");
+							await Bun.sleep(testDelayMs);
+						}
+					: undefined;
+			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
+				agentDir,
+				record,
+				BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
+				beforeWriteForTest,
+			);
 			return startupExitWrite;
 		};
 		const brokerReadyForSignal = (): Broker | undefined =>
@@ -1600,9 +1606,8 @@ export default class Sdk extends Command {
 					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
 					: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
-			const forceAsyncExitRecordWrite = process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_FORCE_ASYNC === "1";
 			const recordWrittenSynchronously =
-				!forceAsyncExitRecordWrite && writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
+				reason === "startup-signal" && writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
 			startupExitTask = (async () => {
 				const exitRecordWrite = recordWrittenSynchronously
 					? { kind: "written" as const }

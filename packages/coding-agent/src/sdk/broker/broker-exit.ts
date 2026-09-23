@@ -257,6 +257,7 @@ export async function writeBrokerStartupExitRecordBounded(
 	agentDir: string,
 	record: BrokerStartupExitRecord,
 	timeoutMs = 1_000,
+	beforeWriteForTest?: () => Promise<void>,
 ): Promise<BrokerStartupExitWriteStatus> {
 	const settled = Promise.withResolvers<BrokerStartupExitWriteStatus>();
 	const abortController = new AbortController();
@@ -264,7 +265,10 @@ export async function writeBrokerStartupExitRecordBounded(
 		abortController.abort();
 		settled.resolve({ kind: "timed_out" });
 	}, timeoutMs);
-	void writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record, abortController.signal).then(
+	void (async () => {
+		await beforeWriteForTest?.();
+		await writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record, abortController.signal);
+	})().then(
 		() => settled.resolve({ kind: "written" }),
 		error => {
 			const code =
