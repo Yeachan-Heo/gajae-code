@@ -3734,7 +3734,7 @@ describe("SessionSdkSessionRuntime", () => {
 		try {
 			await handlers.get("session_start")?.({}, context);
 			await rm(agentDir);
-			await mkdir(agentDir, { recursive: true });
+			await mkdir(agentDir, { recursive: true, mode: 0o700 });
 			broker = new Broker({ agentDir });
 			await broker.start();
 			await handlers.get("turn_start")?.({}, context);
