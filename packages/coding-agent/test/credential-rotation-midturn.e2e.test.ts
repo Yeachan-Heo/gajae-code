@@ -399,21 +399,26 @@ async function runManagedFallbackQuotaScenario(options: {
 			let addedApiKey = false;
 			markUsageLimitReached.mockImplementation(async (markProvider, markSessionId, markOptions) => {
 				const pendingMark = markBeforeRemoval(markProvider, markSessionId, markOptions);
-				if (markOptions?.rowId !== undefined) {
-					if (options.removeFailedCredentialDuringMark && !removedFailedCredential) {
+				if (options.removeFailedCredentialDuringMark && !removedFailedCredential) {
+					const rowId =
+						markOptions?.rowId ??
+						(markSessionId === undefined
+							? undefined
+							: storage.getSessionCredentialRowId(markProvider, markSessionId));
+					if (rowId !== undefined) {
 						const removalTarget = storage
 							.listCredentialRemovalTargets(markProvider)
-							.find(target => target.id === markOptions.rowId);
+							.find(target => target.id === rowId);
 						if (!removalTarget) throw new Error("Missing removal target for failed credential row");
 						const removal = storage.removeAuthCredentialsHard(markProvider, [removalTarget]);
 						if (removal.kind !== "removed") throw new Error("Could not remove failed credential row");
 						storage.removeRuntimePreferredCredentialSelector(markProvider);
 						removedFailedCredential = true;
 					}
-					if (options.addApiKeyDuringMark !== undefined && !addedApiKey) {
-						storage.upsertCredential(markProvider, { type: "api_key", key: options.addApiKeyDuringMark });
-						addedApiKey = true;
-					}
+				}
+				if (markOptions?.rowId !== undefined && options.addApiKeyDuringMark !== undefined && !addedApiKey) {
+					storage.upsertCredential(markProvider, { type: "api_key", key: options.addApiKeyDuringMark });
+					addedApiKey = true;
 				}
 				return pendingMark;
 			});
@@ -517,6 +522,22 @@ describe("managed fallback quota credential rotation", () => {
 			accounts: ["a", "b", "c"],
 			quotaKeys: ["TOKEN-a"],
 			removeFailedCredentialDuringMark: true,
+		});
+		expect(result.models).toEqual([selector(model), selector(model)]);
+		expect(result.keys[0]).toBe("TOKEN-a");
+		expect(["TOKEN-b", "TOKEN-c"]).toContain(result.keys[1]);
+		expect(result.markCount).toBe(1);
+	});
+
+	test("finds a same-kind peer when row identity is unknown and the failed row vanishes", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b", "c"],
+			quotaKeys: ["TOKEN-a"],
+			maxAttempts: 1,
+			removeFailedCredentialDuringMark: true,
+			unknownRowIdBeforeMark: true,
 		});
 		expect(result.models).toEqual([selector(model), selector(model)]);
 		expect(result.keys[0]).toBe("TOKEN-a");
