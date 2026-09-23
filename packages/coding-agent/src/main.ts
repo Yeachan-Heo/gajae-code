@@ -476,7 +476,7 @@ type StartupModelProfileArgs = {
 };
 
 function staleDefaultProfileMessage(error: UnknownModelProfileError): string {
-	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI or run gjc config reset modelProfile.default to clear it.`;
+	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml if present, or run gjc config reset modelProfile.default for the global setting.`;
 }
 
 async function applyStartupModelProfilesWithPolicy(
@@ -687,7 +687,9 @@ async function applyDeferredStartupModelProfilesForRoot(
 	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
 		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
 		: undefined;
-	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError);
+	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError, error =>
+		recoverableErrors.push(staleDefaultProfileMessage(error)),
+	);
 	return { recoverableErrors };
 }
 
