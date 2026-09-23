@@ -5435,6 +5435,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						try {
 							await session.replaceNamedCustomTools(previousNames, nextTools, {
 								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+								activateNewTools: false,
 							});
 						} catch (error) {
 							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];

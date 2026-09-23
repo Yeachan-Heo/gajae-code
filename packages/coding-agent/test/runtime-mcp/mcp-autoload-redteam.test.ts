@@ -282,6 +282,11 @@ describe("red-team: conventional MCP autoload", () => {
 				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
 			);
 			if (!reconnectedTool) throw new Error("reconnected MCP tool was not created");
+			const [lateConventionalTool] = MCPTool.fromTools(
+				{ name: "slow-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!lateConventionalTool) throw new Error("late conventional MCP tool was not created");
 			const [pluginTool] = MCPTool.fromTools(
 				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
 				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
@@ -317,7 +322,7 @@ describe("red-team: conventional MCP autoload", () => {
 			) {
 				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
 				if (nextTools.includes(cachedTool)) cachedToolPublishedCheck.resolve();
-				if (nextTools.includes(reconnectedTool)) reconnectedToolPublished = true;
+				if (nextTools.some(tool => tool.name === reconnectedTool.name)) reconnectedToolPublished = true;
 				if (nextTools.includes(pluginTool)) {
 					pluginToolPublished = true;
 					pluginToolPublishedCheck.resolve();
@@ -383,12 +388,19 @@ describe("red-team: conventional MCP autoload", () => {
 
 				// Simulate the conventional manager's reconnect publication while
 				// retaining the plugin tool in the manager's complete snapshot.
-				publishToolsChanged([reconnectedTool, pluginTool]);
+				publishToolsChanged([reconnectedTool, lateConventionalTool, pluginTool]);
 				await reconnectSyncSealCheck.promise;
 				expect(reconnectedToolPublished).toBe(true);
 				expect(sealConnectionSet).not.toHaveBeenCalled();
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
 				expect(mcpManager?.isConnectionSetMutationBlocked()).toBe(true);
+				expect(session.getAllToolNames()).toContain(lateConventionalTool.name);
+				expect(session.getActiveToolNames()).not.toContain(lateConventionalTool.name);
+				expect(session.getSelectedMCPToolNames()).not.toContain(lateConventionalTool.name);
+				await session.setActiveToolsByName(["read", lateConventionalTool.name]);
+				expect(session.getActiveToolNames()).toContain(lateConventionalTool.name);
+				await session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).not.toContain(lateConventionalTool.name);
 
 				// Once the cached server's tools leave the live catalog, the hold must
 				// clear and restore the mixed-session fixed-connection contract.
