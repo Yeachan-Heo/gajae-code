@@ -297,7 +297,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 193 gates streamed content on negotiated observer capabilities,
  * so existing owners are replaced before exposing the new observer path.
  */
-export const DAEMON_GENERATION = 193;
+export const DAEMON_GENERATION = 194;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
