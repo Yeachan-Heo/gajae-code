@@ -11,6 +11,7 @@ import {
 	crystalSnapshotDigest,
 	type DeepInterviewCrystal,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import {
 	assertDeepInterviewCrystalCoversLiveTranscript,
 	authoritativeConversationSnapshot,
@@ -2909,7 +2910,7 @@ describe("gjc state handoff", () => {
 					phase: "handoff",
 					payload: { state: { intent_contract: { items: [] } } },
 				}),
-			).rejects.toThrow("canonical Round 0 intent contract is immutable through runtime reconciliation");
+			).rejects.toThrow("persisted intent contract is invalid; refusing to discard locked policy");
 			await expect(
 				reconcileWorkflowSkillState({
 					cwd,
@@ -2920,6 +2921,191 @@ describe("gjc state handoff", () => {
 					payload: { state: { rounds: [{ round_key: "forged", lifecycle: "answered" }] } },
 				}),
 			).rejects.toThrow("ready Crystal evidence is immutable through runtime reconciliation");
+		});
+	});
+
+	it("keeps ready Crystal topology and auto-answered rounds immutable through generic and reconcile writes", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const published = (await readJson(callerPath)) as Record<string, unknown>;
+			const inner = published.state as Record<string, unknown>;
+			inner.topology = { approved: ["review"] };
+			inner.auto_answered_rounds = ["round-1"];
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(published, callerPath));
+
+			for (const [field, replacement] of [
+				["topology", { approved: ["forged"] }],
+				["auto_answered_rounds", ["round-2"]],
+			] as const) {
+				const generic = await runNativeStateCommand(
+					[
+						"write",
+						"--mode",
+						"deep-interview",
+						"--input",
+						JSON.stringify({ state: { [field]: replacement } }),
+						"--json",
+					],
+					cwd,
+				);
+				expect(generic.status).toBe(2);
+				expect(generic.stderr).toContain("ready Crystal evidence is immutable through generic state write");
+
+				await expect(
+					reconcileWorkflowSkillState({
+						cwd,
+						mode: "deep-interview",
+						sessionId: TEST_SESSION_ID,
+						active: true,
+						phase: "handoff",
+						payload: { state: { [field]: replacement } },
+					}),
+				).rejects.toThrow("ready Crystal evidence is immutable through runtime reconciliation");
+			}
+
+			const after = (await readJson(callerPath))?.state as Record<string, unknown>;
+			expect(after.topology).toEqual({ approved: ["review"] });
+			expect(after.auto_answered_rounds).toEqual(["round-1"]);
+		});
+	});
+
+	it("keeps intent_contract_required runtime-owned and fails closed on persisted orphan markers", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(statePath, {
+				skill: "deep-interview",
+				version: WORKFLOW_STATE_VERSION,
+				active: true,
+				current_phase: "interviewing",
+				state: { rounds: [], established_facts: [] },
+			});
+
+			const generic = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { intent_contract_required: true, generic_note: "survives" } }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(generic.status).toBe(0);
+			let persisted = (await readJson(statePath)) as Record<string, unknown>;
+			expect((persisted.state as Record<string, unknown>).intent_contract_required).toBeUndefined();
+			expect((persisted.state as Record<string, unknown>).generic_note).toBe("survives");
+
+			await reconcileWorkflowSkillState({
+				cwd,
+				mode: "deep-interview",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "interviewing",
+				payload: { state: { intent_contract_required: true, reconciled_note: "survives" } },
+			});
+			persisted = (await readJson(statePath)) as Record<string, unknown>;
+			expect((persisted.state as Record<string, unknown>).intent_contract_required).toBeUndefined();
+			expect((persisted.state as Record<string, unknown>).reconciled_note).toBe("survives");
+
+			const orphaned = {
+				...persisted,
+				state: {
+					...(persisted.state as Record<string, unknown>),
+					intent_contract_required: true,
+					rounds: [{ round: 0, lifecycle: "answered" }],
+				},
+			};
+			await writeJson(statePath, stampWorkflowEnvelopeChecksum(orphaned, statePath));
+			const blockedGeneric = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { intent_contract_required: false, blocked_note: "not written" } }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(blockedGeneric.status).toBe(2);
+			expect(blockedGeneric.stderr).toContain("persisted intent contract is required but missing");
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "interviewing",
+					payload: { state: { intent_contract_required: false, blocked_note: "not written" } },
+				}),
+			).rejects.toThrow("persisted intent contract is required but missing");
+			persisted = (await readJson(statePath)) as Record<string, unknown>;
+			expect((persisted.state as Record<string, unknown>).intent_contract_required).toBe(true);
+			expect((persisted.state as Record<string, unknown>).blocked_note).toBeUndefined();
+		});
+	});
+
+	it("keeps a recorder-owned intent contract usable through generic writes", async () => {
+		await withTempCwd(async cwd => {
+			const seeded = await runNativeDeepInterviewCommand(["--json", "preserve confirmed intent"], cwd);
+			expect(seeded.status, seeded.stderr).toBe(0);
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const pendingGeneric = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { generic_note: "pending Round 0 remains usable" } }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(pendingGeneric.status, pendingGeneric.stderr).toBe(0);
+			let recorded = (await readJson(statePath)) as Record<string, unknown>;
+			expect((recorded.state as Record<string, unknown>).intent_contract_required).toBe(true);
+			expect((recorded.state as Record<string, unknown>).intent_contract).toBeUndefined();
+
+			await appendOrMergeDeepInterviewRound(
+				cwd,
+				statePath,
+				{
+					round: 0,
+					questionId: "intent-confirmation",
+					questionText: "Confirm locked intent",
+					component: "review-topology",
+					dimension: "topology",
+					selectedOptions: ["Confirm"],
+					intent_contract: {
+						items: [{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" }],
+						confirmation_options: ["Confirm"],
+					},
+				},
+				{ sessionId: TEST_SESSION_ID },
+			);
+			recorded = (await readJson(statePath)) as Record<string, unknown>;
+			const recordedState = recorded.state as Record<string, unknown>;
+			const contract = recordedState.intent_contract;
+			expect(recordedState.intent_contract_required).toBe(true);
+			expect(contract).toBeDefined();
+
+			const generic = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { intent_contract_required: false, generic_note: "still usable" } }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(generic.status, generic.stderr).toBe(0);
+			const after = (await readJson(statePath))?.state as Record<string, unknown>;
+			expect(after.intent_contract).toEqual(contract);
+			expect(after.intent_contract_required).toBe(true);
+			expect(after.generic_note).toBe("still usable");
 		});
 	});
 
