@@ -74,7 +74,7 @@ export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "f
 	provenance: "deadline";
 };
 
-export type PromptDeadlineTerminalization = "settled" | "idle" | "uncertain";
+export type PromptDeadlineTerminalization = "settled" | "uncertain";
 
 export interface PromptTerminalTransitionEvidence {
 	content?: TurnResultContent;
@@ -96,6 +96,8 @@ export class PromptDeadlineManager {
 	readonly #uncertaintyRecoveryPending = new Set<string>();
 	readonly #expiring = new Set<string>();
 	readonly #pendingTerminalTransitions = new Set<string>();
+	readonly #deadlineDeferredTerminalTransitions = new Set<string>();
+	readonly #deadlineTerminalizationConfirmed = new Set<string>();
 	readonly #pendingTerminalFailureReasons = new Map<string, { code: string; message: string }>();
 	readonly #pendingTerminalEvidence = new Map<string, PromptTerminalTransitionEvidence>();
 	readonly #getLeaseMs: () => number;
@@ -210,7 +212,10 @@ export class PromptDeadlineManager {
 		// A successor agent_start must not drain this correlation while its
 		// durable upgrade is still pending or being retried.
 		this.#expiring.add(key);
-		if (this.#pendingTerminalTransitions.has(key)) {
+		if (
+			this.#pendingTerminalTransitions.has(key) &&
+			(!this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineTerminalizationConfirmed.has(key))
+		) {
 			const failureReason = this.#pendingTerminalFailureReasons.get(key);
 			try {
 				if (failureReason !== undefined) {
@@ -252,7 +257,7 @@ export class PromptDeadlineManager {
 			this.clear(correlation);
 			return;
 		}
-		if (lookup.error !== undefined) {
+		if (lookup.error !== undefined && !this.#deadlineDeferredTerminalTransitions.has(key)) {
 			// A real agent_failed diagnostic already won before the zero-activity
 			// deadline. Use the synthetic boundary only to close that failed run;
 			// never overwrite its authenticated classifier with
@@ -321,16 +326,40 @@ export class PromptDeadlineManager {
 			this.#recoverUncertainty(key, correlation, lease, generation);
 			return;
 		}
-		if (terminalization === "settled") {
-			// An active run is fenced before its worktree is flushed. Otherwise a
-			// tool can still be writing while the deadline autosave snapshots it.
-			// The claim above remains the durable pending marker throughout both
-			// bounded operations, so restart recovery never reports unsaved work as
-			// finished.
-			await this.#runDeadlineFlush(correlation, lease, generation);
-			// Fence again AFTER the flush (#5623 review round 2): progress can land
-			// while the bounded git operation runs and renew the lease.
+		// An active run is fenced before its worktree is flushed. Otherwise a
+		// tool can still be writing while the deadline autosave snapshots it.
+		// The claim above remains the durable pending marker throughout both
+		// bounded operations, so restart recovery never reports unsaved work as
+		// finished.
+		await this.#runDeadlineFlush(correlation, lease, generation);
+		// Fence again AFTER the flush (#5623 review round 2): progress can land
+		// while the bounded git operation runs and renews the lease.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		if (this.#pendingTerminalTransitions.has(key)) {
+			this.#deadlineTerminalizationConfirmed.add(key);
+			const failureReason = this.#pendingTerminalFailureReasons.get(key);
+			try {
+				if (failureReason !== undefined) {
+					await this.#reconciliation.noteTransition("prompt", correlation, {
+						type: "agent_failed",
+						error: Object.assign(new Error(failureReason.message), { code: failureReason.code }),
+					} as never);
+				}
+				await this.#reconciliation.noteTransition("prompt", correlation, {
+					type: "agent_end",
+					...this.#pendingTerminalEvidence.get(key),
+				});
+			} catch {
+				this.#retry(key);
+				return;
+			}
 			if (this.#backOffIfSuperseded(key, lease, generation)) return;
+			this.#expiryRetries.delete(key);
+			try {
+				this.#onExpired?.(correlation);
+			} catch {}
+			this.clear(correlation);
+			return;
 		}
 		// A real agent_end observed while the deadline was fencing its run is
 		// authoritative. Keep that stopped/failed result instead of publishing a
@@ -343,6 +372,13 @@ export class PromptDeadlineManager {
 			}
 		} catch {
 			this.#retry(key);
+			return;
+		}
+		if (this.#onDeadlineTerminalization !== undefined) {
+			// This runtime only publishes a terminal deadline result after the exact
+			// run's observed agent_end has been replayed above. A settled abort proof
+			// without that lifecycle evidence is still not a publishable terminal.
+			this.#recoverUncertainty(key, correlation, lease, generation);
 			return;
 		}
 		try {
@@ -548,6 +584,7 @@ export class PromptDeadlineManager {
 		correlation: InvocationCorrelation,
 		pendingFailure?: { code: string; message: string },
 		evidence?: PromptTerminalTransitionEvidence,
+		deferUntilDeadlineSettlement = false,
 	): void {
 		const key = leaseKey(correlation);
 		if (!this.#leases.has(key)) {
@@ -558,6 +595,11 @@ export class PromptDeadlineManager {
 			this.onAccepted(correlation);
 		}
 		this.#pendingTerminalTransitions.add(key);
+		if (deferUntilDeadlineSettlement) this.#deadlineDeferredTerminalTransitions.add(key);
+		else {
+			this.#deadlineDeferredTerminalTransitions.delete(key);
+			this.#deadlineTerminalizationConfirmed.delete(key);
+		}
 		if (evidence !== undefined) this.#pendingTerminalEvidence.set(key, evidence);
 		// Compound failure-plus-terminal recovery intent (exact-head review HIGH):
 		// when expiry replays this real terminal transition after a failed write, it
@@ -576,6 +618,8 @@ export class PromptDeadlineManager {
 		this.#uncertaintyRecoveryPending.delete(key);
 		this.#expiring.delete(key);
 		this.#pendingTerminalTransitions.delete(key);
+		this.#deadlineDeferredTerminalTransitions.delete(key);
+		this.#deadlineTerminalizationConfirmed.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
 	}
@@ -589,6 +633,8 @@ export class PromptDeadlineManager {
 		this.#uncertaintyRecoveryPending.clear();
 		this.#expiring.clear();
 		this.#pendingTerminalTransitions.clear();
+		this.#deadlineDeferredTerminalTransitions.clear();
+		this.#deadlineTerminalizationConfirmed.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
 	}
