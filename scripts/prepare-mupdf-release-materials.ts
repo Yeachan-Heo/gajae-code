@@ -57,6 +57,10 @@ async function run(command: string[], cwd: string, env: NodeJS.ProcessEnv): Prom
 	if (exitCode !== 0) throw new Error(`MuPDF source build command failed with exit code ${exitCode}: ${command.join(" ")}`);
 }
 
+async function readFileBuffer(filePath: string): Promise<Buffer> {
+	return Buffer.from(await Bun.file(filePath).arrayBuffer());
+}
+
 function npmPackage(): InstalledMuPdf {
 	const codingAgent = path.join(repoRoot, "packages/coding-agent");
 	let modulePath: string;
@@ -73,18 +77,18 @@ function npmPackage(): InstalledMuPdf {
 }
 
 async function verifyPinnedNpmPackage(installed: InstalledMuPdf): Promise<Buffer> {
-	const lock = await fs.readFile(path.join(repoRoot, "bun.lock"), "utf8");
+	const lock = await Bun.file(path.join(repoRoot, "bun.lock")).text();
 	if (!lock.includes(`"mupdf": ["mupdf@${MUPDF_VERSION}", "", {}, "${MUPDF_NPM_INTEGRITY}"]`)) {
 		throw new Error("bun.lock does not bind the expected MuPDF npm integrity to mupdf 1.28.0");
 	}
-	const metadata = JSON.parse(await fs.readFile(path.join(installed.packageRoot, "package.json"), "utf8")) as {
+	const metadata = JSON.parse(await Bun.file(path.join(installed.packageRoot, "package.json")).text()) as {
 		name?: unknown;
 		version?: unknown;
 	};
 	if (metadata.name !== "mupdf" || metadata.version !== MUPDF_VERSION) {
 		throw new Error(`Installed npm MuPDF must be mupdf ${MUPDF_VERSION}; found ${String(metadata.name)} ${String(metadata.version)}`);
 	}
-	const wasm = await fs.readFile(installed.wasmPath).catch(() => {
+	const wasm = await readFileBuffer(installed.wasmPath).catch(() => {
 		throw new Error(`Integrity-pinned npm MuPDF WASM is missing: ${installed.wasmPath}`);
 	});
 	if (wasm.length === 0) throw new Error("Integrity-pinned npm MuPDF WASM is empty");
@@ -146,8 +150,8 @@ function sourceDirectory(workDirectory: string, entries: string[]): MuPdfSourceL
 }
 
 async function checkUpstreamPackage(sourceDirectory: string, installedDirectory: string): Promise<void> {
-	const sourcePackage = JSON.parse(await fs.readFile(path.join(sourceDirectory, "package.json"), "utf8")) as Record<string, unknown>;
-	const installedPackage = JSON.parse(await fs.readFile(path.join(installedDirectory, "package.json"), "utf8")) as Record<string, unknown>;
+	const sourcePackage = JSON.parse(await Bun.file(path.join(sourceDirectory, "package.json")).text()) as Record<string, unknown>;
+	const installedPackage = JSON.parse(await Bun.file(path.join(installedDirectory, "package.json")).text()) as Record<string, unknown>;
 	// Artifex's 1.28.0 source archive retains the previous WASM package version;
 	// its published npm manifest changes only that version field.
 	if (sourcePackage.name !== "mupdf" || sourcePackage.version !== "1.27.0" || installedPackage.version !== MUPDF_VERSION) {
@@ -257,7 +261,7 @@ async function prepareReleaseMaterials(outputDirectory: string): Promise<{ direc
 	try {
 		const archive = await downloadOfficialSource();
 		const archivePath = path.join(temporaryDirectory, "mupdf-source.tar.gz");
-		await fs.writeFile(archivePath, archive, { mode: 0o600 });
+		await Bun.write(archivePath, archive, { mode: 0o600, createPath: false });
 		const entries = listArchiveEntries(archivePath, temporaryDirectory);
 		await run(["tar", "-xzf", archivePath, "-C", temporaryDirectory], temporaryDirectory, process.env);
 		const sourceLayout = sourceDirectory(temporaryDirectory, entries);
@@ -274,15 +278,15 @@ async function prepareReleaseMaterials(outputDirectory: string): Promise<{ direc
 		);
 		const builtWasmPath = path.join(sourceLayout.packageRoot, "dist", "mupdf-wasm.wasm");
 		const [rebuiltWasm, building, packageJson, buildScript, compressScript, sourceCopying, npmLicense] = await Promise.all([
-			fs.readFile(builtWasmPath).catch(() => {
+			readFileBuffer(builtWasmPath).catch(() => {
 				throw new Error("Official MuPDF source prepack completed without producing dist/mupdf-wasm.wasm");
 			}),
-			fs.readFile(sourceLayout.buildingPath),
-			fs.readFile(path.join(sourceLayout.packageRoot, "package.json")),
-			fs.readFile(path.join(sourceLayout.packageRoot, "tools/build.sh")),
-			fs.readFile(path.join(sourceLayout.packageRoot, "tools/compress.sh")),
-			fs.readFile(sourceLayout.copyingPath),
-			fs.readFile(path.join(installed.packageRoot, "LICENSE")),
+			readFileBuffer(sourceLayout.buildingPath),
+			readFileBuffer(path.join(sourceLayout.packageRoot, "package.json")),
+			readFileBuffer(path.join(sourceLayout.packageRoot, "tools/build.sh")),
+			readFileBuffer(path.join(sourceLayout.packageRoot, "tools/compress.sh")),
+			readFileBuffer(sourceLayout.copyingPath),
+			readFileBuffer(path.join(installed.packageRoot, "LICENSE")),
 		]);
 		if (rebuiltWasm.length === 0) throw new Error("Official MuPDF source prepack produced an empty dist/mupdf-wasm.wasm");
 		const rebuiltWasmSha256 = sha256(rebuiltWasm);
@@ -332,11 +336,11 @@ async function prepareReleaseMaterials(outputDirectory: string): Promise<{ direc
 		const stageDirectory = path.join(temporaryDirectory, "materials");
 		await fs.mkdir(stageDirectory);
 		await Promise.all([
-			fs.writeFile(path.join(stageDirectory, "mupdf-source.tar.gz"), archive),
-			fs.writeFile(path.join(stageDirectory, "mupdf-built.wasm"), rebuiltWasm),
-			fs.writeFile(path.join(stageDirectory, "mupdf-build-recipe.txt"), recipe),
-			fs.writeFile(path.join(stageDirectory, "mupdf-notices.txt"), notices),
-			fs.writeFile(path.join(stageDirectory, "mupdf-provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`),
+			Bun.write(path.join(stageDirectory, "mupdf-source.tar.gz"), archive, { createPath: false }),
+			Bun.write(path.join(stageDirectory, "mupdf-built.wasm"), rebuiltWasm, { createPath: false }),
+			Bun.write(path.join(stageDirectory, "mupdf-build-recipe.txt"), recipe, { createPath: false }),
+			Bun.write(path.join(stageDirectory, "mupdf-notices.txt"), notices, { createPath: false }),
+			Bun.write(path.join(stageDirectory, "mupdf-provenance.json"), `${JSON.stringify(provenance, null, 2)}\n`, { createPath: false }),
 		]);
 		await verifyMuPdfReleaseMaterials(stageDirectory);
 		const resolvedOutputDirectory = path.resolve(outputDirectory);
@@ -344,7 +348,9 @@ async function prepareReleaseMaterials(outputDirectory: string): Promise<{ direc
 		const publishOrder = MUPDF_RELEASE_MATERIALS;
 		const publishDirectory = await fs.mkdtemp(path.join(resolvedOutputDirectory, ".mupdf-release-materials-"));
 		try {
-			for (const name of publishOrder) await fs.copyFile(path.join(stageDirectory, name), path.join(publishDirectory, name));
+			for (const name of publishOrder) {
+				await Bun.write(path.join(publishDirectory, name), Bun.file(path.join(stageDirectory, name)), { createPath: false });
+			}
 			for (const name of publishOrder) await fs.rename(path.join(publishDirectory, name), path.join(resolvedOutputDirectory, name));
 		} finally {
 			await fs.rm(publishDirectory, { recursive: true, force: true });

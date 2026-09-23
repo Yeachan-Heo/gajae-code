@@ -138,7 +138,7 @@ async function requireFile(directory: string, name: string): Promise<Buffer> {
 	if (!metadata) throw new Error(`MuPDF release material is missing or unreadable: ${name}`);
 	if (!metadata.isFile() || metadata.size <= 0) throw new Error(`MuPDF release material is missing or empty: ${name}`);
 	try {
-		return await fs.readFile(filePath);
+		return Buffer.from(await Bun.file(filePath).arrayBuffer());
 	} catch {
 		throw new Error(`MuPDF release material is unreadable: ${name}`);
 	}
@@ -155,20 +155,20 @@ async function installedNpmWasm(): Promise<Buffer> {
 	const packageRoot = path.resolve(path.dirname(modulePath), "..");
 	let metadata: { version?: unknown };
 	try {
-		metadata = JSON.parse(await fs.readFile(path.join(packageRoot, "package.json"), "utf8")) as { version?: unknown };
+		metadata = JSON.parse(await Bun.file(path.join(packageRoot, "package.json")).text()) as { version?: unknown };
 	} catch {
 		throw new Error("Installed mupdf package metadata is missing or malformed");
 	}
 	if (metadata.version !== MUPDF_VERSION) throw new Error(`Installed mupdf package version is ${String(metadata.version)}, expected ${MUPDF_VERSION}`);
 	const lockPath = path.resolve(import.meta.dir, "../bun.lock");
-	const lockText = await fs.readFile(lockPath, "utf8");
+	const lockText = await Bun.file(lockPath).text();
 	if (!lockText.includes(`"mupdf": ["mupdf@${MUPDF_VERSION}", "", {}, "${MUPDF_NPM_INTEGRITY}"]`)) {
 		throw new Error("bun.lock does not bind the pinned MuPDF npm integrity to mupdf 1.28.0");
 	}
 	const wasmPath = path.join(path.dirname(modulePath), "mupdf-wasm.wasm");
 	let wasm: Buffer;
 	try {
-		wasm = await fs.readFile(wasmPath);
+		wasm = Buffer.from(await Bun.file(wasmPath).arrayBuffer());
 	} catch {
 		throw new Error(`Installed mupdf package WASM is missing or unreadable: ${wasmPath}`);
 	}
