@@ -15,6 +15,7 @@ import type {
 	TaskDecisionRecorder,
 } from "../src/task/decision-collection";
 import * as collection from "../src/task/decision-collection";
+import { buildTaskDecisionContext } from "../src/task/decision-routing";
 import { type ExecutorOptions, runSubprocess } from "../src/task/executor";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -62,6 +63,76 @@ function options(): ExecutorOptions {
 		enableLsp: false,
 	};
 }
+
+function decisionContext(mode: "shadow" | "routing") {
+	return buildTaskDecisionContext({
+		role: "executor",
+		assignment: "do work",
+		provider: {
+			provider: { decide: async () => ({ result: { choice: "fast", probabilities: { fast: 1 }, confidence: 1 } }) },
+			providerName: "kev",
+			mode,
+			decisionModel: "kev-latest",
+			timeoutMs: 5000,
+		},
+	});
+}
+
+/** Run one preflight-exhausted child with the store pinned to `root`, returning the resolved mode. */
+async function collectAt(root: string, settings: ReturnType<typeof Settings.isolated>, mode: "shadow" | "routing") {
+	const real = collection.beginTaskDecision;
+	const resolved: Array<collection.TaskCollectionMode | "off" | undefined> = [];
+	const spy = vi.spyOn(collection, "beginTaskDecision").mockImplementation(async (input, storeOptions) => {
+		resolved.push(storeOptions?.mode);
+		return real(input, { ...storeOptions, rootDir: root });
+	});
+	try {
+		const result = await runSubprocess({
+			...options(),
+			settings,
+			decisionContext: decisionContext(mode),
+			autoroutingPreflight: true,
+			autoroutingCandidates: [],
+		});
+		expect(result.exitCode).toBe(1);
+		return resolved;
+	} finally {
+		spy.mockRestore();
+	}
+}
+
+describe("decision collection consent", () => {
+	test("enabling decisions in either mode creates no store and records nothing", async () => {
+		for (const mode of ["shadow", "routing"] as const) {
+			const base = await fs.mkdtemp(path.join(os.tmpdir(), "task-collection-consent-"));
+			roots.push(base);
+			const root = path.join(base, "task-decisions");
+			const settings = Settings.isolated({ "task.decision.enabled": true, "task.decision.mode": mode });
+			// Decisions are on and `task.decision.collection` is unset: no implicit metadata.
+			expect(await collectAt(root, settings, mode)).toEqual([undefined]);
+			await expect(fs.lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await collection.exportTaskDecisionEvents({ rootDir: root, includeContent: true })).toEqual([]);
+		}
+	});
+
+	test("explicit metadata consent creates the store and records the execution without content", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "task-collection-consent-"));
+		roots.push(base);
+		const root = path.join(base, "task-decisions");
+		const settings = Settings.isolated({
+			"task.decision.enabled": true,
+			"task.decision.mode": "routing",
+			"task.decision.collection": "metadata",
+		});
+		expect(await collectAt(root, settings, "routing")).toEqual(["metadata"]);
+		expect((await fs.stat(path.join(root, "task-decisions.db"))).isFile()).toBe(true);
+		const events = await collection.exportTaskDecisionEvents({ rootDir: root, includeContent: true });
+		expect(events.length).toBeGreaterThan(0);
+		expect(events.every(event => event.mode === "metadata")).toBe(true);
+		expect(events.some(event => event.event_type === "outcome")).toBe(true);
+		expect(events.every(event => event.assignment === undefined)).toBe(true);
+	});
+});
 
 describe("task decision collection integration", () => {
 	test("routed preflight exhaustion emits one outcome and no model executions", async () => {
