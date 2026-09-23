@@ -91,6 +91,46 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		expect(mcpManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
+	test("waits through a plugin MCP's declared timeout window before publishing its tools", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-slow-start-"));
+		const bundleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-bundle-slow-start-"));
+		tempDirs.push(cwd, bundleRoot);
+		fs.cpSync(mcpBundle, bundleRoot, { recursive: true });
+		const serverPath = path.join(bundleRoot, "mcp", "server.mjs");
+		const serverSource = fs.readFileSync(serverPath, "utf8");
+		const delayedServerSource = serverSource.replace(
+			"const rl = readline.createInterface",
+			"await new Promise(resolve => setTimeout(resolve, 2_100));\n\nconst rl = readline.createInterface",
+		);
+		expect(delayedServerSource).not.toBe(serverSource);
+		fs.writeFileSync(serverPath, delayedServerSource);
+		const installed = await installGjcBundle({ cwd }, "project", bundleRoot);
+		expect(installed.ok).toBe(true);
+
+		const { session, mcpManager, gjcRuntimeSnapshot } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			sessionManager: SessionManager.inMemory(cwd),
+			settings: Settings.isolated(),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+		try {
+			expect(mcpManager?.getConnectedServers()).toContain("domain_docs");
+			expect(session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+			expect(gjcRuntimeSnapshot?.current().status).toBe("current");
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	test("keeps always-on plugin MCP tools active across newSession and switchSession resume", async () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-resume-"));
 		tempDirs.push(cwd);

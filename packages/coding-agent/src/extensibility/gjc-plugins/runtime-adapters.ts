@@ -20,7 +20,13 @@ import { isV2Tool } from "./migration";
 import { gjcPluginInstallRoot, resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope, registryRootForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
-import type { GjcPluginRegistryEntry, GjcPluginScope, JsonSchema202012, NormalizedToolSurfaceV2 } from "./types";
+import type {
+	GjcBundleIdentity,
+	GjcPluginRegistryEntry,
+	GjcPluginScope,
+	JsonSchema202012,
+	NormalizedToolSurfaceV2,
+} from "./types";
 
 export interface AlwaysOnPluginTools {
 	tools: CustomTool[];
@@ -30,6 +36,11 @@ export interface AlwaysOnPluginTools {
 export interface GjcPluginToolDeclaration extends NormalizedToolSurfaceV2 {
 	plugin: string;
 	scope: GjcPluginScope;
+}
+
+export interface GjcPluginMcpServerProvenance {
+	identity: GjcBundleIdentity;
+	surfaceId: string;
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -557,7 +568,9 @@ async function prepareVerifiedStdioLaunch(input: {
 		throw new Error("Authenticated plugin MCP stdio launch capsules are available only on Linux");
 	}
 	if (input.launcher === "bun") {
-		throw new Error("Authenticated plugin MCP Bun launch capsules are unavailable");
+		throw new Error(
+			"Authenticated plugin MCP Bun launch capsules are unavailable: Bun's clearable runtime plugin hooks cannot enforce the authenticated module-loading boundary required to restrict plugin imports to verified capsule bytes",
+		);
 	}
 	const registerCleanup = input.registerCleanup;
 	if (!registerCleanup) {
@@ -1045,18 +1058,22 @@ export async function renderSkillAdvertisement(input: {
  * Convert active plugin-bundle MCP surfaces into runtime MCPServerConfig entries,
  * applying install + runtime MCP policy (URL scheme/private-range deny, DNS
  * re-resolution for http/sse, stdio root-confinement) before connection. Servers
- * failing policy are quarantined and excluded. Returns {} when none.
+ * failing policy are quarantined and excluded. The provenance map contains
+ * only servers present in `configs`, so connection errors can be attributed to
+ * the authenticated bundle and stable surface that supplied each server.
  */
 export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 	configs: Record<string, any>;
 	quarantine: SessionQuarantine[];
+	serverProvenance: ReadonlyMap<string, GjcPluginMcpServerProvenance>;
 }> {
 	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, true);
-	if (effective.length === 0) return { configs: {}, quarantine: [] };
+	if (effective.length === 0) return { configs: {}, quarantine: [], serverProvenance: new Map() };
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must
 	// remain an ordinary own key rather than interacting with Object.prototype.
 	const configs: Record<string, any> = Object.create(null) as Record<string, any>;
+	const serverProvenance = new Map<string, GjcPluginMcpServerProvenance>();
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		let compiledMcps: Map<string, (typeof entry.surfaces.mcps)[number]> | undefined;
@@ -1209,6 +1226,10 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 					// servers connect without bundle-declared headers.
 					configs[m.name] = bindPluginMcpToPublicNetwork({ type: cfg.transport, url: url.toString() });
 				}
+				serverProvenance.set(m.name, {
+					identity: bundleIdentity(entry.scope, entry.name),
+					surfaceId: `mcp:${m.name}`,
+				});
 			} catch (error) {
 				quarantine.push({
 					identity: bundleIdentity(entry.scope, entry.name),
@@ -1220,5 +1241,5 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 			}
 		}
 	}
-	return { configs, quarantine };
+	return { configs, quarantine, serverProvenance };
 }
