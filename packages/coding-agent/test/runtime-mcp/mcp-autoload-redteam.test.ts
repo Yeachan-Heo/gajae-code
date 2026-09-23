@@ -340,6 +340,10 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
 				expect(sealConnectionSet).not.toHaveBeenCalled();
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+				expect(mcpManager?.isConnectionSetMutationBlocked()).toBe(true);
+				await expect(mcpManager?.discoverAndConnect({ nativeOnly: true })).rejects.toThrow(
+					"connection set is frozen",
+				);
 
 				// Simulate the manager's reconnect publication: its live catalog now
 				// contains MCPTool instead of the cached DeferredMCPTool. Wait until
@@ -350,6 +354,7 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(reconnectedToolPublished).toBe(true);
 				expect(sealConnectionSet).not.toHaveBeenCalled();
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+				expect(mcpManager?.isConnectionSetMutationBlocked()).toBe(true);
 
 				// Once the cached server's tools leave the live catalog, the hold must
 				// clear and restore the mixed-session fixed-connection contract.
@@ -584,6 +589,34 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
 				const result = await mcpManager?.discoverAndConnect({ nativeOnly: true });
 				expect(result?.connectedServers).toContain("solo");
+			} finally {
+				await session.dispose();
+			}
+		}, 30_000);
+
+		it("publishes newly connected conventional servers into the session catalog", async () => {
+			await writeProjectConfig(".gjc/mcp.json", {
+				mcpServers: { solo: demoConfig() },
+			});
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				if (!mcpManager) throw new Error("session-owned MCP manager was not created");
+				const result = await mcpManager.connectServers(
+					{ fresh: demoConfig() },
+					{
+						fresh: {
+							provider: "native",
+							providerName: "GJC",
+							level: "project",
+							path: path.join(projectDir, ".gjc", "mcp.json"),
+						},
+					},
+				);
+				expect(result.connectedServers).toContain("fresh");
+				for (let attempt = 0; attempt < 50 && !session.getAllToolNames().includes("mcp__fresh_hello"); attempt++) {
+					await Bun.sleep(10);
+				}
+				expect(session.getAllToolNames()).toContain("mcp__fresh_hello");
 			} finally {
 				await session.dispose();
 			}

@@ -243,6 +243,43 @@ describe("MCP manager lifecycle cleanup", () => {
 		}
 	});
 
+	test("refreshes conventional cache scope when rediscovering MCP configuration", async () => {
+		const cwd = await mkdtempExact("gjc-mcp-cache-scope-refresh-");
+		const cacheSet = vi.fn(async (_name: string, _config: MCPServerConfig, _tools: MCPToolDefinition[]) => {});
+		const cache = {
+			get: vi.fn(async (_name: string, _config: MCPServerConfig) => null),
+			set: cacheSet,
+		} as unknown as MCPToolCache;
+		const manager = new MCPManager(cwd, cache, { toolCacheServerNames: new Set(["old"]) });
+		const oldConfig: MCPServerConfig = { type: "http", url: "http://127.0.0.1:1" };
+		const source = {
+			provider: "native",
+			providerName: "GJC",
+			level: "project" as const,
+			path: join(cwd, ".gjc", "mcp.json"),
+		};
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async name => makeConnection(name, async () => {}));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async connection => [
+			{ name: `tool_${connection.name}`, inputSchema: { type: "object" } },
+		]);
+		try {
+			await manager.connectServers({ old: oldConfig }, { old: source });
+			await Bun.write(
+				join(cwd, ".gjc", "mcp.json"),
+				JSON.stringify({ mcpServers: { fresh: { type: "http", url: "http://127.0.0.1:2" } } }),
+			);
+			await manager.disconnectAll();
+			const reloaded = await manager.discoverAndConnect({ nativeOnly: true });
+
+			expect(reloaded.connectedServers).toContain("fresh");
+			expect(cacheSet.mock.calls.map(([name]) => name)).toEqual(["old", "fresh"]);
+		} finally {
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("classifies remote errors that reject background tool loading before logging", async () => {
 		const manager = new MCPManager(process.cwd());
 		const connection = makeConnection("late", async () => {});

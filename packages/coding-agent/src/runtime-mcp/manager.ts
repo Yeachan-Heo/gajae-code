@@ -458,8 +458,9 @@ export class MCPManager {
 	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
 	#scopedLifecycleEpoch = 0;
 	readonly #toolsOnly: boolean;
-	readonly #toolCacheServerNames: ReadonlySet<string> | undefined;
+	#toolCacheServerNames: Set<string> | undefined;
 	#toolsOnlyConfigLoaded = false;
+	#connectionSetMutationBlocked = false;
 	#connectionSetSealed = false;
 
 	#serverError(message: string): string {
@@ -575,11 +576,25 @@ export class MCPManager {
 		return this.#scopedLifecycleEpoch;
 	}
 	#assertConnectionSetMutable(): void {
-		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
+		if (this.#connectionSetMutationBlocked) {
+			throw new Error(
+				this.#connectionSetSealed ? "MCP manager connection set is sealed" : "MCP manager connection set is frozen",
+			);
+		}
+	}
+
+	/** Block config mutations and reloads while keeping existing servers reconnectable. */
+	freezeConnectionSet(): void {
+		this.#connectionSetMutationBlocked = true;
 	}
 
 	sealConnectionSet(): void {
+		this.freezeConnectionSet();
 		this.#connectionSetSealed = true;
+	}
+
+	isConnectionSetMutationBlocked(): boolean {
+		return this.#connectionSetMutationBlocked;
 	}
 
 	isConnectionSetSealed(): boolean {
@@ -1135,6 +1150,11 @@ export class MCPManager {
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
 		});
+		if (this.#toolCacheServerNames !== undefined) {
+			this.#toolCacheServerNames = new Set(
+				Object.keys(configs).filter(name => sources[name]?.provider !== "gjc-plugins"),
+			);
+		}
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);
 		if (configurationWarning) result.errors.set("$config", "MCP configuration unavailable");
 		result.exaApiKeys = exaApiKeys;

@@ -2493,6 +2493,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 						}
 						ownedConventionalMcpToolNames = [...new Set(ownedConventionalMcpToolNames)];
+						const unsettledConventionalNames = [...conventionalCacheServerNames].filter(
+							name =>
+								nextManager?.getConnectionStatus(name) === "connecting" ||
+								cachedConventionalMcpServerNames.has(name),
+						);
+						if (pluginNames.size > 0) {
+							if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0) {
+								nextManager.sealConnectionSet();
+							} else {
+								nextManager.freezeConnectionSet();
+							}
+						}
 						nextCustomTools.push(...(result.tools as CustomTool[]));
 						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
 						for (const tool of result.tools) {
@@ -3222,8 +3234,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
 				throw error;
 			}
+			const conventionalServerNames = new Set(
+				Object.keys(conventionalConfigs).filter(name => !pluginNames.has(name)),
+			);
 			for (const tool of result.tools) {
-				if (tool instanceof DeferredMCPTool && Object.hasOwn(conventionalConfigs, tool.mcpServerName)) {
+				if (tool instanceof DeferredMCPTool && conventionalServerNames.has(tool.mcpServerName)) {
 					cachedConventionalMcpServerNames.add(tool.mcpServerName);
 				}
 			}
@@ -3248,7 +3263,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// needs the mixed manager to remain mutable. Successfully connected
 			// ordinary tools do not delay the synchronous seal; cached fallbacks keep
 			// their reconnect path available while they remain published.
-			const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
+			const unsettledConventionalNames = [...conventionalServerNames].filter(
 				name => owned.getConnectionStatus(name) === "connecting" || cachedConventionalMcpServerNames.has(name),
 			);
 			const retainOwnedManager =
@@ -3258,9 +3273,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				ownsMcpManager = true;
 				customTools.push(...(result.tools as CustomTool[]));
 				cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
-				for (const name of Object.keys(conventionalConfigs)) ownedConventionalMcpServerNames.add(name);
+				for (const name of conventionalServerNames) ownedConventionalMcpServerNames.add(name);
 				pluginMcpManagerServers.set(owned, connectedPluginNames);
-				conventionalMcpManagerServers.set(owned, new Set(Object.keys(conventionalConfigs)));
+				conventionalMcpManagerServers.set(owned, conventionalServerNames);
 				for (const tool of result.tools) {
 					const serverName = tool.mcpServerName;
 					if (serverName === undefined) continue;
@@ -3270,12 +3285,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						ownedConventionalMcpToolNames.push(tool.name);
 					}
 				}
-				publishOwnedConventionalMcpTools = ownedConventionalMcpServerNames.size > 0;
+				publishOwnedConventionalMcpTools = conventionalServerNames.size > 0;
 				ownedPluginServersConnected = connectedPluginNames.size > 0;
-				// Plugin-bundle connections are fixed for the session lifetime only
-				// when no conventional server is still connecting in the same manager;
-				// otherwise the seal is re-applied once they settle (below).
-				if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0) owned.sealConnectionSet();
+				// Keep plugin config authority fixed even while a conventional cached
+				// fallback needs reconnects; a full reload would disconnect and lose the
+				// plugin-bundle configs because native discovery does not reload them.
+				if (pluginNames.size > 0) {
+					if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0) {
+						owned.sealConnectionSet();
+					} else {
+						owned.freezeConnectionSet();
+					}
+				}
 			} else {
 				try {
 					await owned.disconnectAll();
@@ -5214,7 +5235,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// starter once its connect lands. No-op when there is no owned manager or
 		// nothing conventional to publish.
 		const wireOwnedConventionalToolSync = (): void => {
-			if (!mcpManager || !publishOwnedConventionalMcpTools) return;
+			const manager = mcpManager;
+			if (!manager || !publishOwnedConventionalMcpTools) return;
 			// Late conventional connections can publish near-simultaneously.
 			// Serialize the swaps so an older snapshot cannot interleave with a
 			// newer one inside replaceNamedCustomTools and leave a stale list.
@@ -5224,7 +5246,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
 				conventionalToolsSync = conventionalToolsSync
 					.then(async () => {
-						if (session.isDisposed) return;
+						if (session.isDisposed || mcpManager !== manager) return;
+						for (const tool of tools) {
+							const serverName = tool.mcpServerName;
+							if (!serverName || manager.getSource(serverName)?.provider === "gjc-plugins") continue;
+							if (manager.getSource(serverName)) {
+								ownedConventionalMcpServerNames.add(serverName);
+								if (tool instanceof DeferredMCPTool) cachedConventionalMcpServerNames.add(serverName);
+							}
+						}
 						const nextTools = tools.filter(tool =>
 							tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
 						);
@@ -5250,14 +5280,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// restores the fixed-connection plugin contract.
 						if (
 							ownedPluginServersConnected &&
-							mcpManager !== undefined &&
-							!mcpManager.isConnectionSetSealed() &&
+							!manager.isConnectionSetSealed() &&
 							![...ownedConventionalMcpServerNames].some(
-								name => mcpManager?.getConnectionStatus(name) === "connecting",
+								name => manager.getConnectionStatus(name) === "connecting",
 							) &&
 							!hasPublishedCachedTool
 						) {
-							mcpManager.sealConnectionSet();
+							manager.sealConnectionSet();
 						}
 					})
 					.catch(error => {
@@ -5265,10 +5294,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 				return conventionalToolsSync;
 			};
-			mcpManager.setOnToolsChanged(tools => {
+			manager.setOnToolsChanged(tools => {
 				void syncConventionalTools(tools as CustomTool[]);
 			});
-			void syncConventionalTools(mcpManager.getTools() as CustomTool[]);
+			void syncConventionalTools(manager.getTools() as CustomTool[]);
 		};
 		const wireOwnedMcpManagerLifecycle = (): void => {
 			if (!mcpManager) return;
