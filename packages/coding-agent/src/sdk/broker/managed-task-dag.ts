@@ -1632,9 +1632,9 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	const agent = await fs.realpath(agentDir);
 	const target = managedEnrollmentIndexPath(agent);
 	try {
+		// This is a read-only load; privateDurable is a Linux-only guarded-write mode.
 		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
 			cwd: agent,
-			privateDurable: { directory: path.dirname(target) },
 		});
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
