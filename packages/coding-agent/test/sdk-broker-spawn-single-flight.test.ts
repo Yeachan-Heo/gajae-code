@@ -5,7 +5,7 @@ import * as os from "node:os";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
-import { readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
+import { readBrokerExitRecord, readBrokerStartupExitRecord } from "../src/sdk/broker/broker-exit";
 import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
@@ -697,6 +697,42 @@ it("records SIGTERM and SIGINT received before broker readiness", async () => {
 		}
 	}
 }, 15_000);
+
+it("persists an active signal exit during the publication handoff", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+		cwd: import.meta.dir,
+		stdin: "ignore",
+		stdout: "ignore",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS: "4000",
+			GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+		},
+	});
+	try {
+		expect(child.pid).toBeGreaterThan(0);
+		await waitForFile(brokerDiscovery.brokerDiscoveryPath(dir));
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery?.pid).toBe(child.pid);
+		process.kill(child.pid, "SIGTERM");
+		const [code] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect([0, 143]).toContain(code);
+		expect(await readBrokerExitRecord(dir)).toMatchObject({
+			mode: "owned-root",
+			reason: "signal",
+			signal: "SIGTERM",
+			pid: child.pid,
+		});
+		expect(await readBrokerStartupExitRecord(dir)).toBeUndefined();
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
 
 it("surfaces a startup signal record through the broker supervisor", async () => {
 	if (process.platform === "win32") return;

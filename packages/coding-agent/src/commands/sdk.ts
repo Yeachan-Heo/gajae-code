@@ -1298,13 +1298,15 @@ export default class Sdk extends Command {
 			writtenAt: Date.now(),
 		});
 		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
-			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
-				agentDir,
-				record,
-				BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
-			);
+			if (!startupExitWrite) {
+				startupExitWrite = writeBrokerStartupExitRecordSynchronously(agentDir, record)
+					? Promise.resolve({ kind: "written" as const })
+					: writeBrokerStartupExitRecordBounded(agentDir, record, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
+			}
 			return startupExitWrite;
 		};
+		const brokerReadyForSignal = (): Broker | undefined =>
+			runningBroker ?? (broker?.ownsDiscovery ? broker : undefined);
 		const writeStartupExitLog = (
 			record: BrokerStartupExitRecord & Record<string, unknown>,
 			message: string,
@@ -1358,9 +1360,11 @@ export default class Sdk extends Command {
 						: pendingShutdownSignal;
 			if (!signal) return;
 			pendingShutdownSignal = signal;
-			if (runningBroker) {
+			const activeBroker = brokerReadyForSignal();
+			if (activeBroker) {
+				runningBroker = activeBroker;
 				stopSweep?.();
-				await runningBroker.stop({ kind: "signal", signal });
+				await activeBroker.stop({ kind: "signal", signal });
 				return;
 			}
 			await exitDuringStartup("startup-signal", 0, signal);
@@ -1371,9 +1375,11 @@ export default class Sdk extends Command {
 			signalHandled = true;
 			pendingShutdownSignal = signal;
 			const exitCode = 0;
-			if (runningBroker) {
+			const activeBroker = brokerReadyForSignal();
+			if (activeBroker) {
+				runningBroker = activeBroker;
 				stopSweep?.();
-				void runningBroker.stop({ kind: "signal", signal });
+				void activeBroker.stop({ kind: "signal", signal });
 			} else {
 				const exitRecord = makeStartupExitRecord("startup-signal", exitCode, signal);
 				writeStartupExitLog(exitRecord, `SDK broker startup interrupted by ${signal} before readiness.`);
@@ -1470,6 +1476,15 @@ export default class Sdk extends Command {
 						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
 							? restartRequestEnv
 							: undefined;
+					const testPostPublicationDelayMs = Number(
+						process.env.GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS ?? 0,
+					);
+					const startupPostPublicationDelayMs =
+						Number.isSafeInteger(testPostPublicationDelayMs) &&
+						testPostPublicationDelayMs > 0 &&
+						testPostPublicationDelayMs <= 10_000
+							? testPostPublicationDelayMs
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
@@ -1484,10 +1499,12 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(startupPostPublicationDelayMs === undefined ? {} : { startupPostPublicationDelayMs }),
 						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
 					await candidate.start();
+					if (candidate.ownsDiscovery) runningBroker = candidate;
 					return candidate;
 				} finally {
 					clearTimeout(startupWatchdog);
@@ -1540,6 +1557,13 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (!broker.ownsDiscovery) {
+			if (pendingShutdownSignal) {
+				if (runningBroker) await runningBroker.completion;
+				else await finishPendingStartupSignal();
+				removeSignalHandlers();
+				unregisterPostmortem();
+				return;
+			}
 			// Another broker owns discovery; this process exits cleanly (code 0) as
 			// the race loser. Record why so a caller polling for a winner that never
 			// appears can diagnose the loss instead of seeing only a bare exit 0.
@@ -1551,10 +1575,6 @@ export default class Sdk extends Command {
 				pid: process.pid,
 				...(losingIncarnation === undefined ? {} : { incarnation: losingIncarnation }),
 			});
-			if (pendingShutdownSignal) {
-				await finishPendingStartupSignal();
-				return;
-			}
 			removeSignalHandlers();
 			unregisterPostmortem();
 			return;

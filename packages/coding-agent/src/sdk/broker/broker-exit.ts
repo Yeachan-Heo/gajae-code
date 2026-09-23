@@ -180,7 +180,10 @@ export function writeBrokerStartupExitRecordSynchronously(agentDir: string, reco
 	const serialized = JSON.stringify(record);
 	if (!isBrokerStartupExitRecord(record) || Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
 		return false;
-	const destination = brokerStartupExitRecordPath(agentDir);
+	return writeAtomicExitRecordSynchronously(brokerStartupExitRecordPath(agentDir), serialized);
+}
+
+function writeAtomicExitRecordSynchronously(destination: string, serialized: string): boolean {
 	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
 	let descriptor: number | undefined;
 	let published = false;
@@ -213,6 +216,14 @@ export function writeBrokerStartupExitRecordSynchronously(agentDir: string, reco
 /** Atomically persist the latest bounded graceful-exit reason for supervisors. */
 export async function writeBrokerExitRecord(agentDir: string, record: BrokerExitRecord): Promise<void> {
 	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record);
+}
+
+/** Persist an exit synchronously when a process signal can preempt async writes. */
+export function writeBrokerExitRecordSynchronously(agentDir: string, record: BrokerExitRecord): boolean {
+	const serialized = JSON.stringify(record);
+	if (!isBrokerExitRecord(record) || Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
+		return false;
+	return writeAtomicExitRecordSynchronously(brokerExitRecordPath(agentDir), serialized);
 }
 
 /** Read the bounded previous-exit record; malformed or absent files are ignored. */
