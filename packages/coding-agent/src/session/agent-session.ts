@@ -23788,48 +23788,6 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
-		const resolveSameKindPeer = async (
-			excludedRowId: number | undefined,
-			credentialKind: "oauth" | "api_key" | undefined,
-		): Promise<{ rowId: number | undefined; credentialKind: "oauth" | "api_key" | undefined; peerSelected: boolean }> => {
-			if (credentialKind === "oauth") {
-				const peers = authStorage
-					.listCredentialInventory(provider)
-					.filter(
-						credential =>
-							!credential.disabled &&
-							credential.id !== excludedRowId &&
-							credential.credentialKind === credentialKind,
-					);
-				for (const peer of peers) {
-					try {
-						await this.#modelRegistry.getApiKey(model, credentialSessionId, {
-							credentialSelector: { kind: "id", value: String(peer.id) },
-						});
-					} catch (error) {
-						const peerStillActive = authStorage
-							.listCredentialInventory(provider)
-							.some(credential => credential.id === peer.id && !credential.disabled);
-						if (peerStillActive) throw error;
-						continue;
-					}
-					const rowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-					const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
-					if (rowId === peer.id && selectedKind === credentialKind)
-						return { rowId, credentialKind: selectedKind, peerSelected: true };
-				}
-			} else {
-				await this.#modelRegistry.getApiKey(model, credentialSessionId);
-			}
-			const rowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
-			return {
-				rowId,
-				credentialKind: selectedKind,
-				peerSelected:
-					credentialKind !== undefined && rowId !== undefined && rowId !== excludedRowId && selectedKind === credentialKind,
-			};
-		};
 		if (trigger.class !== "auth") {
 			if (
 				trigger.class === "credential" &&
@@ -23837,42 +23795,40 @@ export class AgentSession {
 			)
 				return "unchanged";
 			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			const beforeType = authStorage.getSessionCredentialType(provider, credentialSessionId);
-			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+			const markResult = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				// Account-model rejection retains default backoff, not response retry-after.
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
-			if (!remaining) {
-				if (beforeType === undefined) return "unchanged";
-				const failedRowAtMark = before ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-				const failedRowStillActive = authStorage
-					.listCredentialInventory(provider)
-					.some(
-						credential =>
-							credential.id === failedRowAtMark &&
-							failedRowAtMark !== undefined &&
-							!credential.disabled &&
-							credential.credentialKind === beforeType,
-					);
-				if (failedRowStillActive) return "exhausted";
-				const after = await resolveSameKindPeer(failedRowAtMark, beforeType);
-				if (!after.peerSelected) return "unchanged";
-				return before === undefined ? "alternate" : "rotated";
+			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
+			if (remainingCredentialIds.length === 0) {
+				return state === "marked" || failedRowId !== undefined ? "exhausted" : "unchanged";
 			}
-			const failedRowAtMark = before ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			const after = await resolveSameKindPeer(failedRowAtMark, beforeType);
-			if (
-				before !== undefined &&
-				after.peerSelected &&
-				after.rowId !== undefined &&
-				after.rowId !== before &&
-				after.credentialKind === beforeType
-			) {
-				return "rotated";
+			if (credentialKind === undefined) return "unchanged";
+			for (const peerId of remainingCredentialIds) {
+				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				try {
+					await this.#modelRegistry.getApiKey(model, credentialSessionId, {
+						credentialSelector: { kind: "id", value: String(peerId) },
+					});
+				} catch (error) {
+					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
+					continue;
+				}
+				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
+				if (
+					selectedRowId === peerId &&
+					selectedKind === credentialKind &&
+					authStorage.isCredentialAvailable(provider, peerId)
+				) {
+					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
+						? "rotated"
+						: "alternate";
+				}
 			}
-			return "alternate";
+			return "exhausted";
 		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 
@@ -24067,7 +24023,7 @@ export class AgentSession {
 		if (canRotateCodexCredential && trigger.class === "credential") {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
-			credentialRotated = mark === "rotated";
+			credentialRotated = mark === "rotated" || (managedFallback && mark === "alternate");
 			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
 					? {

@@ -22,7 +22,7 @@ describe("usage-limit mark captures one stored row", () => {
 				});
 				const entered = Promise.withResolvers<void>();
 				const release = Promise.withResolvers<UsageReport | null>();
-				let pending: Promise<boolean> | undefined;
+				let pending: ReturnType<typeof storage.markUsageLimitReached> | undefined;
 				vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
 					const credential = credentials[provider];
 					return credential ? { apiKey: credential.access, newCredentials: credential } : null;
@@ -48,6 +48,7 @@ describe("usage-limit mark captures one stored row", () => {
 					);
 					const rows = store.listAuthCredentials(provider);
 					const target = rows[2]!;
+					let currentRows = rows;
 					await storage.getApiKey(provider, "mark-session", {
 						credentialSelector: { kind: "id", value: String(target.id) },
 					});
@@ -69,16 +70,25 @@ describe("usage-limit mark captures one stored row", () => {
 						});
 						expect(storage.getSessionCredentialRowId(provider, "mark-session")).toBe(rows[1]!.id);
 					} else {
-						const current =
+						currentRows =
 							mutation === "reorder"
 								? [rows[2]!, rows[0]!, rows[1]!]
 								: rows.filter(row => row.id !== (mutation === "remove-target" ? target.id : rows[0]!.id));
-						vi.spyOn(store, "listAuthCredentials").mockImplementation(() => current);
+						vi.spyOn(store, "listAuthCredentials").mockImplementation(() => currentRows);
 						await storage.reload();
 					}
 					parked = false;
 					release.resolve(null);
-					expect(await pending).toBe(mutation !== "remove-target");
+					const result = await pending;
+					expect(result.state).toBe(mutation === "remove-target" ? "not-marked" : "marked");
+					expect(result.failedRowId).toBe(target.id);
+					expect(result.credentialKind).toBe("oauth");
+					expect([...result.remainingCredentialIds].sort((a, b) => a - b)).toEqual(
+						currentRows
+							.filter(row => row.id !== target.id)
+							.map(row => row.id)
+							.sort((a, b) => a - b),
+					);
 					if (mutation === "remove-target") {
 						expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
 					} else {
@@ -112,8 +122,14 @@ describe("usage-limit mark captures one stored row", () => {
 		const storage = await AuthStorage.create(path.join(root, "auth.db"));
 		try {
 			await storage.set(provider, { type: "api_key", key: "synthetic-key" });
-			expect(await storage.markUsageLimitReached(provider, "unknown")).toBe(false);
-			expect(await storage.markUsageLimitReached(provider, "unknown", { rowId: -1 })).toBe(false);
+			expect(await storage.markUsageLimitReached(provider, "unknown")).toEqual({
+				state: "not-marked",
+				remainingCredentialIds: [],
+			});
+			expect(await storage.markUsageLimitReached(provider, "unknown", { rowId: -1 })).toEqual({
+				state: "not-marked",
+				remainingCredentialIds: [],
+			});
 			expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
 		} finally {
 			storage.close();

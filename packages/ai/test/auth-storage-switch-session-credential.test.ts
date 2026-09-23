@@ -78,7 +78,11 @@ describe("mid-session credential switch", () => {
 		// Drive session-a onto row A, then exhaust it so it's backoff-blocked.
 		storage.switchSessionCredential("anthropic", "session-a", { kind: "id", value: String(rowA.id) });
 		expect(await storage.getApiKey("anthropic", "session-a")).toBe("token-account-a");
-		expect(await storage.markUsageLimitReached("anthropic", "session-a", { retryAfterMs: 60_000 })).toBe(true);
+		const result = await storage.markUsageLimitReached("anthropic", "session-a", { retryAfterMs: 60_000 });
+		expect(result.state).toBe("marked");
+		expect(result.failedRowId).toBe(rowA.id);
+		expect(result.credentialKind).toBe("oauth");
+		expect(result.remainingCredentialIds).toEqual([rowB.id]);
 
 		// Attempting to switch back to the still-blocked row A does not force it —
 		// #resolveOAuthSelection's blocked check safely ignores the sticky pointer.
