@@ -1556,8 +1556,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			getComposerBottomOffset: () =>
 				this.petFloorContainer.render(this.ui.terminal.columns).length +
 				this.hookWidgetContainerBelow.render(this.ui.terminal.columns).length,
-			syncManagedItermCursor: (row, column) =>
-				this.#itermPetTransport?.refreshManagedClient(row, column) ?? Promise.resolve(false),
+			syncManagedItermCursor: (row, column, signal) =>
+				this.#itermPetTransport?.refreshManagedClient(row, column, signal) ?? Promise.resolve(false),
 		});
 	}
 

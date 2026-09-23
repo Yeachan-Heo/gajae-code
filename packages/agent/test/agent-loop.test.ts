@@ -1369,6 +1369,18 @@ describe("agentLoop with AgentMessage", () => {
 			expect(text).toContain("Tool execution was aborted");
 			expect(text).not.toContain("Tool execution was aborted.:");
 		}
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		const turnEndIndex = events.findIndex(event => event.type === "turn_end");
+		const agentEndIndex = events.findIndex(event => event.type === "agent_end");
+		expect(assistantEnds).toHaveLength(1);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(assistantEnds[0] ? events.indexOf(assistantEnds[0]) : -1).toBeLessThan(turnEndIndex);
+		expect(turnEndIndex).toBeLessThan(agentEndIndex);
+		expect(agentEndIndex).toBe(events.length - 1);
 	});
 	it("does not wait forever for a non-cooperative tool after abort", async () => {
 		const toolSchema = z.object({ value: z.string() });

@@ -283,7 +283,7 @@ export class GajaePetWidget {
 	#itermOwner = `gajae-pet-${Math.random().toString(36).slice(2)}`;
 	#itermGeneration = 0;
 	#itermSubmitPending = false;
-	#syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
+	#syncManagedItermCursor: (row: number, column: number, signal: AbortSignal) => Promise<boolean>;
 
 	constructor(options: {
 		ui: TUI;
@@ -292,7 +292,7 @@ export class GajaePetWidget {
 		floorContainer: Container;
 		isWorking: () => boolean;
 		getComposerBottomOffset: () => number;
-		syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
+		syncManagedItermCursor: (row: number, column: number, signal: AbortSignal) => Promise<boolean>;
 		forcePixelProtocol?: "sixel" | "kitty";
 		autoFlexGapMs?: [number, number] | null;
 	}) {
@@ -793,7 +793,8 @@ export class GajaePetWidget {
 				),
 				afterPrefix:
 					mode === "managed"
-						? async () => (current() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
+						? async signal =>
+								current() ? await this.#syncManagedItermCursor(rect.row, rect.column, signal) : false
 						: undefined,
 				replayPrefix: mode === "managed" ? new TextEncoder().encode(cursorPosition) : undefined,
 				records: encodedRecords,
