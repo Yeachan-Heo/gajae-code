@@ -3513,6 +3513,7 @@ export class AgentSession {
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#providerRetryMaxAttempts: number | undefined;
+	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
 	/** One content-free retry is allowed after Codex says the active account lacks the model. */
 	#codexCredentialModelUnavailableRetried = false;
@@ -18238,6 +18239,8 @@ export class AgentSession {
 			{ role: "default", entries: [...entries], origin: "runtime", identity, explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
+		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 		this.#defaultFallbackExhaustedLastTurn = false;
 		this.#seedDefaultFallbackResolutionForController(
 			this.#defaultFallbackController,
@@ -23159,6 +23162,8 @@ export class AgentSession {
 			return existing;
 		}
 		this.#defaultFallbackController = new FallbackChainController(chain, this.settings.get("fallback.maxAttempts"));
+		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 		return this.#defaultFallbackController;
 	}
 
