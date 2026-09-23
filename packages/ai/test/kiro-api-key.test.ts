@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { fetchKiroApiModels, isKiroApiKey, parseKiroApiEvents, toKiroModelId } from "../src/providers/kiro-api-key";
+import { getBundledModels } from "../src/models";
+import {
+	fetchKiroApiModels,
+	isKiroApiKey,
+	kiroApiStaticModels,
+	parseKiroApiEvents,
+	toKiroModelId,
+} from "../src/providers/kiro-api-key";
 
 const originalFetch = globalThis.fetch;
 
@@ -41,6 +48,15 @@ test("discovers models with the API-key endpoint contract", async () => {
 	expect(request?.headers.get("x-amz-target")).toBe("AmazonCodeWhispererService.ListAvailableModels");
 	expect(JSON.parse(request?.body ?? "{}")).toEqual({ origin: "AI_EDITOR" });
 	expect(models.map(model => model.id)).toEqual(["claude-opus-4.8", "claude-opus-4-8"]);
+});
+
+test("does not advertise image input for static or bundled Kiro Opus 5.5 models", () => {
+	const opus55Ids = ["claude-opus-5-5", "claude-opus-5.5"];
+	for (const catalog of [kiroApiStaticModels(), getBundledModels("kiro")]) {
+		const opus55Models = catalog.filter(model => opus55Ids.includes(model.id));
+		expect(opus55Models.map(model => model.id).sort()).toEqual(opus55Ids);
+		for (const model of opus55Models) expect(model.input).toEqual(["text"]);
+	}
 });
 
 test("redacts the API key from discovery errors", async () => {

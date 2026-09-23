@@ -31839,8 +31839,7 @@
 				"maxLevel": "high"
 			},
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"cost": {
 				"input": 0,
@@ -31864,8 +31863,7 @@
 				"maxLevel": "high"
 			},
 			"input": [
-				"text",
-				"image"
+				"text"
 			],
 			"cost": {
 				"input": 0,
