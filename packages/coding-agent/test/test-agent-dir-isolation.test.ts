@@ -226,8 +226,10 @@ describe("preload fail-closed behavior (real preload path)", () => {
 	}, 30_000);
 
 	test("an explicit trusted non-default pin survives the real preload", async () => {
-		const pinned = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-pinned-"));
+		const pinned = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-test-agent-"));
+		const sentinel = path.join(pinned, "owned-marker");
 		try {
+			await fs.promises.writeFile(sentinel, "keep this explicit pin");
 			const probe = Bun.spawnSync({
 				cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
 				env: { ...process.env, GJC_CODING_AGENT_DIR: pinned, PI_CODING_AGENT_DIR: "" },
@@ -236,6 +238,8 @@ describe("preload fail-closed behavior (real preload path)", () => {
 			});
 			expect(probe.exitCode).toBe(0);
 			expect(probe.stdout.toString().trim()).toBe(pinned);
+			expect(fs.statSync(pinned).isDirectory()).toBe(true);
+			expect(await fs.promises.readFile(sentinel, "utf8")).toBe("keep this explicit pin");
 		} finally {
 			await fs.promises.rm(pinned, { recursive: true, force: true });
 		}
@@ -256,12 +260,13 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		await fs.promises.rm(adopted, { recursive: true, force: true });
 	}, 30_000);
 
-	test("removes isolated temp dirs on exit after writing to the log sink", async () => {
+	test("removes isolated temp dirs between files after writing to the log sink", async () => {
 		const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-exit-cleanup-"));
 		const preload = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
 		const loggerModule = path.resolve(import.meta.dir, "../../utils/src/logger.ts");
 		const reportPath = path.join(tempRoot, "cleanup-report.json");
-		const testPath = path.join(tempRoot, "preload-cleanup.test.ts");
+		const testPath = path.join(tempRoot, "01-preload-cleanup.test.ts");
+		const boundaryTestPath = path.join(tempRoot, "02-preload-cleanup-boundary.test.ts");
 		const testSource = `
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -273,7 +278,7 @@ const agentDir = process.env.GJC_CODING_AGENT_DIR!;
 const logDir = process.env.GJC_LOG_DIR!;
 const reportPath = process.env.GJC_TEST_PRELOAD_CLEANUP_REPORT!;
 
-test("isolated directories and log sink are live until exit", async () => {
+test("isolated directories and log sink are live before file completion", async () => {
 	const tempRoot = path.resolve(os.tmpdir());
 	for (const [dir, prefix] of [[agentDir, "gjc-test-agent-"], [logDir, "gjc-test-logs-"]] as const) {
 		expect(path.dirname(path.resolve(dir))).toBe(tempRoot);
@@ -300,7 +305,24 @@ test("isolated directories and log sink are live until exit", async () => {
 	await Bun.write(reportPath, JSON.stringify({ agentDir, logDir, marker, logContents }));
 });
 `;
-		await fs.promises.writeFile(testPath, testSource);
+		const boundaryTestSource = `
+import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+
+const report = JSON.parse(fs.readFileSync(${JSON.stringify(reportPath)}, "utf8")) as {
+	agentDir: string;
+	logDir: string;
+};
+
+test("the prior file's directories are removed before the runner exits", () => {
+	expect(fs.existsSync(report.agentDir)).toBe(false);
+	expect(fs.existsSync(report.logDir)).toBe(false);
+});
+`;
+		await Promise.all([
+			fs.promises.writeFile(testPath, testSource),
+			fs.promises.writeFile(boundaryTestPath, boundaryTestSource),
+		]);
 
 		const childEnv: Record<string, string | undefined> = {
 			...process.env,
@@ -317,12 +339,15 @@ test("isolated directories and log sink are live until exit", async () => {
 		delete childEnv.XDG_STATE_HOME;
 
 		try {
-			const child = Bun.spawn([process.execPath, "test", "--preload", preload, testPath], {
-				cwd: tempRoot,
-				env: childEnv,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+			const child = Bun.spawn(
+				[process.execPath, "test", "--parallel=1", "--preload", preload, testPath, boundaryTestPath],
+				{
+					cwd: tempRoot,
+					env: childEnv,
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
 			const [stdout, stderr, exitCode] = await Promise.all([
 				new Response(child.stdout).text(),
 				new Response(child.stderr).text(),
