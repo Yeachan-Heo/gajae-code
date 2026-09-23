@@ -159,12 +159,14 @@ describe("credential marking before re-resolution", () => {
 					});
 					const blockedRowId = storage.getSessionCredentialRowId(provider, preblockedSession);
 					if (blockedRowId === undefined) throw new Error("Missing secondary OAuth row");
-					expect(
-						await storage.markUsageLimitReached(provider, preblockedSession, {
-							rowId: blockedRowId,
-							retryAfterMs: 120_000,
-						}),
-					).toBe(true);
+					const markResult = await storage.markUsageLimitReached(provider, preblockedSession, {
+						rowId: blockedRowId,
+						retryAfterMs: 120_000,
+					});
+					expect(markResult.state).toBe("marked");
+					expect(markResult.failedRowId).toBe(blockedRowId);
+					expect(markResult.credentialKind).toBe("oauth");
+					expect(markResult.remainingCredentialIds).toHaveLength(1);
 				}
 				storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
 				if (scenario === "no-oauth") {
@@ -342,11 +344,12 @@ async function runManagedFallbackQuotaScenario(options: {
 			});
 			const blockedRowId = storage.getSessionCredentialRowId(provider, preblockedSessionId);
 			if (blockedRowId === undefined) throw new Error(`Missing ${accountId} OAuth row to preblock`);
-			const hasRemaining = await storage.markUsageLimitReached(provider, preblockedSessionId, {
+			const markResult = await storage.markUsageLimitReached(provider, preblockedSessionId, {
 				rowId: blockedRowId,
 				retryAfterMs: 120_000,
 			});
-			if (!hasRemaining) throw new Error(`Could not preblock ${accountId} OAuth row`);
+			if (markResult.remainingCredentialIds.length === 0)
+				throw new Error(`Could not preblock ${accountId} OAuth row`);
 		}
 		storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
 		if (options.runtimeApiKey !== undefined) storage.setRuntimeApiKey(provider, options.runtimeApiKey);
