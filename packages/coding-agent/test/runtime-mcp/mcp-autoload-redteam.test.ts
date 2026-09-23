@@ -932,30 +932,67 @@ describe("red-team: conventional MCP autoload", () => {
 			}
 		}, 30_000);
 
-		it("publishes newly connected conventional servers into the session catalog", async () => {
+		it("does not trust caller-supplied plugin metadata for a session-owned manager", async () => {
 			await writeProjectConfig(".gjc/mcp.json", {
 				mcpServers: { solo: demoConfig() },
 			});
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			let childSession: AgentSession | undefined;
 			try {
 				if (!mcpManager) throw new Error("session-owned MCP manager was not created");
+				const child = await createAgentSession({
+					...isolatedSessionOptions(),
+					inheritedMcpManager: mcpManager,
+					parentTaskPrefix: "0-Forged-Source",
+				});
+				childSession = child.session;
+				const ownerSyncs = Promise.withResolvers<void>();
+				const childSyncs = Promise.withResolvers<void>();
+				let ownerSyncCount = 0;
+				let childSyncCount = 0;
+				const freshName = "mcp__fresh_hello";
+				const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+				vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+					this: AgentSession,
+					previousNames,
+					nextTools,
+					options,
+				) {
+					await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+					if (!nextTools.some(tool => tool.name === freshName)) return;
+					if (this === session && ++ownerSyncCount === 2) ownerSyncs.resolve();
+					if (this === child.session && ++childSyncCount === 2) childSyncs.resolve();
+				});
+
 				const result = await mcpManager.connectServers(
 					{ fresh: demoConfig() },
 					{
 						fresh: {
-							provider: "native",
-							providerName: "GJC",
+							provider: "gjc-plugins",
+							providerName: "Untrusted caller metadata",
 							level: "project",
 							path: path.join(projectDir, ".gjc", "mcp.json"),
 						},
 					},
 				);
 				expect(result.connectedServers).toContain("fresh");
-				for (let attempt = 0; attempt < 50 && !session.getAllToolNames().includes("mcp__fresh_hello"); attempt++) {
-					await Bun.sleep(10);
-				}
-				expect(session.getAllToolNames()).toContain("mcp__fresh_hello");
+				expect(mcpManager.getSource("fresh")?.provider).toBe("gjc-plugins");
+				await Promise.all([ownerSyncs.promise, childSyncs.promise]);
+				expect(session.getAllToolNames()).toContain(freshName);
+				expect(child.session.getAllToolNames()).toContain(freshName);
+				await session.setActiveToolsByName(["read"]);
+				await child.session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).not.toContain(freshName);
+				expect(child.session.getActiveToolNames()).not.toContain(freshName);
+				await child.session.setActiveToolsByName([freshName]);
+				expect(child.session.getActiveToolNames()).toContain(freshName);
+				await child.session.setActiveToolsByName(["read"]);
+				expect(child.session.getActiveToolNames()).not.toContain(freshName);
+				await child.session.dispose();
+				childSession = undefined;
+				expect(mcpManager.getConnectedServers()).toContain("fresh");
 			} finally {
+				if (childSession) await childSession.dispose();
 				await session.dispose();
 			}
 		}, 30_000);

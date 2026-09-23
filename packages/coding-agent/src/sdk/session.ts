@@ -3315,6 +3315,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const connectedPluginNames = new Set(
 				result.connectedServers.filter(name => pluginNames.has(name) && !failedPluginNames.has(name)),
 			);
+			const trustedPluginServerNames = new Set(
+				[...pluginMcpProvenance.keys()].filter(name => !failedPluginNames.has(name)),
+			);
+			const connectedTrustedPluginNames = new Set(
+				[...connectedPluginNames].filter(name => trustedPluginServerNames.has(name)),
+			);
 			const unsettledPluginNames = [...pluginNames].filter(
 				name =>
 					!failedPluginNames.has(name) &&
@@ -3380,12 +3386,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				ownedMcpManagerToolNames = successfulTools.map(tool => tool.name);
 				cwdCapturingToolNames.push(...successfulTools.map(tool => tool.name));
 				for (const name of conventionalServerNames) ownedConventionalMcpServerNames.add(name);
-				pluginMcpManagerServers.set(owned, connectedPluginNames);
+				pluginMcpManagerServers.set(owned, trustedPluginServerNames);
 				conventionalMcpManagerServers.set(owned, conventionalServerNames);
 				for (const tool of successfulTools) {
 					const serverName = tool.mcpServerName;
 					if (serverName === undefined) continue;
-					if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
+					if (connectedTrustedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
 					else {
 						conventionalMcpToolNames.push(tool.name);
 					}
@@ -3395,7 +3401,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// fallback needs reconnects; a full reload would disconnect and lose the
 				// plugin-bundle configs because native discovery does not reload them.
 				if (pluginNames.size > 0) {
-					if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0) {
+					if (connectedTrustedPluginNames.size > 0 && unsettledConventionalNames.length === 0) {
 						owned.sealConnectionSet();
 					} else {
 						owned.freezeConnectionSet();
@@ -5365,19 +5371,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (session.isDisposed || mcpManager !== manager) return;
 						const pluginServerNames = new Set(pluginMcpManagerServers.get(manager));
 						const conventionalServerNames = new Set(conventionalMcpManagerServers.get(manager));
+						// Plugin authority is fixed from validated bundle provenance when
+						// this manager is created. SourceMeta can be caller-supplied later.
 						for (const serverName of manager.getAllServerNames()) {
-							const source = manager.getSource(serverName);
-							if (source?.provider === "gjc-plugins") pluginServerNames.add(serverName);
-							else if (source) conventionalServerNames.add(serverName);
+							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
 						}
 						for (const tool of tools) {
 							const serverName = tool.mcpServerName;
 							if (!serverName) continue;
-							const source = manager.getSource(serverName);
-							if (source?.provider === "gjc-plugins") pluginServerNames.add(serverName);
-							else if (source) conventionalServerNames.add(serverName);
+							if (!pluginServerNames.has(serverName)) conventionalServerNames.add(serverName);
 						}
-						pluginMcpManagerServers.set(manager, pluginServerNames);
 						conventionalMcpManagerServers.set(manager, conventionalServerNames);
 						const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
 						for (const serverName of nextCachedConventionalMcpServerNames) {
