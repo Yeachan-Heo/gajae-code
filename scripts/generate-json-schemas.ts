@@ -158,6 +158,11 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.minimum = 1;
 		schema.maximum = 10;
 	}
+	if (settingPath === "task.decision.timeoutMs") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 60_000;
+	}
 	return schema;
 }
 

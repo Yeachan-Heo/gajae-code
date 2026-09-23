@@ -217,7 +217,7 @@ function resolveMode(options?: TaskDecisionStoreOptions): TaskCollectionMode | u
 	if (configured === "metadata" || configured === "content") return configured;
 	if (configured !== undefined) return undefined;
 	if (options?.mode === "metadata" || options?.mode === "content") return options.mode;
-	return options?.decisionEnabled ? "metadata" : undefined;
+	return undefined;
 }
 
 function defaultRoot(): string {

@@ -3033,8 +3033,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					context: options.context,
 				},
 				{
-					decisionEnabled:
-						decisionContext !== undefined || options.settings?.get("task.decision.enabled") === true,
+					mode: options.settings?.get("task.decision.collection") ?? "off",
 				},
 			);
 		} catch {
@@ -3094,7 +3093,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			executionOptions = {
 				...options,
 				modelOverride: [applied.selector],
-				thinkingLevel: applied.effort,
+				thinkingLevel: applied.effort ?? options.thinkingLevel,
 				autoroutingCandidates: [applied.selector],
 				autoroutingPreflight: Boolean(options.autoroutingPreflight),
 				routing: {

@@ -1297,9 +1297,20 @@
 							],
 							"default": "shadow"
 						},
+						"collection": {
+							"type": "string",
+							"enum": [
+								"off",
+								"metadata",
+								"content"
+							],
+							"default": "off"
+						},
 						"timeoutMs": {
-							"type": "number",
-							"default": 5000
+							"type": "integer",
+							"default": 5000,
+							"minimum": 1,
+							"maximum": 60000
 						},
 						"kevEndpoint": {
 							"type": "string",

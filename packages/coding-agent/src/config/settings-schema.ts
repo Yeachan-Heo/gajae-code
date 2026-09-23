@@ -3797,6 +3797,12 @@ export const SETTINGS_SCHEMA = {
 		default: "shadow",
 	},
 
+	"task.decision.collection": {
+		type: "enum",
+		values: ["off", "metadata", "content"] as const,
+		default: "off",
+	},
+
 	"task.decision.timeoutMs": {
 		type: "number",
 		default: 5000,
