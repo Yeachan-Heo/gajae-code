@@ -659,9 +659,7 @@ export async function resolveKevServiceChannel(
 ): Promise<KevServiceChannel | undefined> {
 	try {
 		const stateDir = path.resolve(deps.stateDir ?? getAgentDir());
-		const pointer = options.root
-			? undefined
-			: await readPrivate(path.join(stateDir, "kev-root.json"), pointerSchema);
+		const pointer = options.root ? undefined : await readPrivate(path.join(stateDir, "kev-root.json"), pointerSchema);
 		const root = resolveRootSync(stateDir, pointer?.root, options.root);
 		if (!(await checkDirectory(root))) return undefined;
 		const service = await readService(root);

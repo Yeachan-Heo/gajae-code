@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { KevControlReply } from "../src/setup/kev-supervisor";
 import type { DecisionErrorCode, DecisionProbabilities, DecisionRequest } from "../src/task/decision-model";
 import { JevDecisionProvider, KevDecisionProvider } from "../src/task/decision-providers";
-import type { KevControlReply } from "../src/setup/kev-supervisor";
 
 const request: DecisionRequest = {
 	role: "executor",
