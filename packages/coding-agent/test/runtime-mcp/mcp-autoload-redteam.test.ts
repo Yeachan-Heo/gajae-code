@@ -313,8 +313,9 @@ describe("red-team: conventional MCP autoload", () => {
 				this: AgentSession,
 				previousNames,
 				nextTools,
+				options,
 			) {
-				await replaceNamedCustomTools.call(this, previousNames, nextTools);
+				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
 				if (nextTools.includes(cachedTool)) cachedToolPublishedCheck.resolve();
 				if (nextTools.includes(reconnectedTool)) reconnectedToolPublished = true;
 				if (nextTools.includes(pluginTool)) {
@@ -379,6 +380,9 @@ describe("red-team: conventional MCP autoload", () => {
 				await pluginToolPublishedCheck.promise;
 				expect(pluginToolPublished).toBe(true);
 				expect(session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+				await session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+				expect(session.getSelectedMCPToolNames()).not.toContain("mcp__domain_docs_lookup");
 
 				// Simulate the conventional manager's reconnect publication while
 				// retaining the plugin tool in the manager's complete snapshot.

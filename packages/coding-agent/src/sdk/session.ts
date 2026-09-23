@@ -2526,6 +2526,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			await session.replaceNamedCustomTools(
 				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
 				nextCustomTools,
+				{ mandatoryMCPToolNames: pluginMcpToolNames },
 			);
 			wireOwnedMcpToolSync();
 		};
@@ -5310,7 +5311,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						ownedPluginServersConnected = [...pluginServerNames].some(
 							name => manager.getConnectionStatus(name) === "connected",
 						);
-						await session.replaceNamedCustomTools(previousNames, nextTools);
+						await session.replaceNamedCustomTools(previousNames, nextTools, {
+							mandatoryMCPToolNames: pluginMcpToolNames,
+						});
 						const hasPublishedCachedTool = nextTools.some(
 							tool =>
 								tool.mcpServerName !== undefined && cachedConventionalMcpServerNames.has(tool.mcpServerName),
