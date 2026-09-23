@@ -342,6 +342,8 @@ export interface MCPManagerOptions {
 	sessionId?: string;
 	/** Idle retention for shared pool entries. */
 	sharedPoolIdleMs?: number;
+	/** Limit tool-cache reads and writes to this manager's conventional servers. */
+	toolCacheServerNames?: ReadonlySet<string>;
 	/** Test seam for deterministic reconnect backoff scheduling. */
 	sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 	/** Test seam for fencing the acquisition-to-registration replacement race. */
@@ -456,11 +458,18 @@ export class MCPManager {
 	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
 	#scopedLifecycleEpoch = 0;
 	readonly #toolsOnly: boolean;
+	readonly #toolCacheServerNames: ReadonlySet<string> | undefined;
 	#toolsOnlyConfigLoaded = false;
 	#connectionSetSealed = false;
 
 	#serverError(message: string): string {
 		return this.#toolsOnly ? "MCP server unavailable" : message;
+	}
+
+	#shouldCacheServerTools(name: string): boolean {
+		return (
+			this.toolCache !== null && (this.#toolCacheServerNames === undefined || this.#toolCacheServerNames.has(name))
+		);
 	}
 
 	#removePendingAcquireCleanup(name: string, error: MCPPoolAcquireAbortError): void {
@@ -969,6 +978,7 @@ export class MCPManager {
 		options: MCPManagerOptions = {},
 	) {
 		this.#toolsOnly = options.toolsOnly === true;
+		this.#toolCacheServerNames = options.toolCacheServerNames ? new Set(options.toolCacheServerNames) : undefined;
 		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
 		this.#sleep = options.sleep ?? delay;
 		this.#afterLeaseAcquiredForTests = options.afterLeaseAcquiredForTests;
@@ -1381,7 +1391,8 @@ export class MCPManager {
 					);
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
+					if (!this.#toolsOnly && this.#shouldCacheServerTools(name))
+						void this.toolCache?.set(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -1452,6 +1463,7 @@ export class MCPManager {
 				if (this.toolCache && !this.#toolsOnly) {
 					await Promise.all(
 						pendingTasks.map(async task => {
+							if (!this.#shouldCacheServerTools(task.name)) return;
 							const cached = await this.toolCache?.get(task.name, task.config);
 							if (cached) {
 								cachedTools.set(task.name, cached);
@@ -2866,7 +2878,7 @@ export class MCPManager {
 				reconnect,
 				this.#exactToolOptions(name, config.sharing === "shared"),
 			);
-			void this.toolCache?.set(name, config, serverTools);
+			if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2936,7 +2948,7 @@ export class MCPManager {
 			reconnect,
 			this.#exactToolOptions(name, connection.config.sharing === "shared"),
 		);
-		void this.toolCache?.set(name, connection.config, serverTools);
+		if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

@@ -10,7 +10,13 @@ import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
-import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
+import type {
+	JsonRpcMessage,
+	MCPServerConfig,
+	MCPServerConnection,
+	MCPToolDefinition,
+	MCPTransport,
+} from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure, MCPHttpRequestError } from "../../src/runtime-mcp/types";
 import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
@@ -198,6 +204,40 @@ describe("MCP manager lifecycle cleanup", () => {
 		} finally {
 			closeRelease.resolve();
 			pendingTools.reject(new Error("abandoned tools/list"));
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
+
+	test("limits session manager cache reads and writes to allowed server names", async () => {
+		const cachedTools = [{ name: "stale_plugin", inputSchema: { type: "object" } }];
+		const cacheGet = vi.fn(async (_name: string, _config: MCPServerConfig) => cachedTools);
+		const cacheSet = vi.fn(async (_name: string, _config: MCPServerConfig, _tools: MCPToolDefinition[]) => {});
+		const cache = { get: cacheGet, set: cacheSet } as unknown as MCPToolCache;
+		const manager = new MCPManager(process.cwd(), cache, {
+			toolCacheServerNames: new Set(["conventional"]),
+		});
+		const pendingPluginTools = Promise.withResolvers<never>();
+		vi.spyOn(mcpClient, "connectToServer").mockImplementation(async name => makeConnection(name, async () => {}));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async connection => {
+			if (connection.name === "plugin-pending") return await pendingPluginTools.promise;
+			return [{ name: `tool_${connection.name}`, inputSchema: { type: "object" } }];
+		});
+		try {
+			const result = await manager.connectServers(
+				{
+					conventional: { type: "http", url: "http://127.0.0.1:1" },
+					"plugin-success": { type: "http", url: "http://127.0.0.1:2" },
+					"plugin-pending": { type: "http", url: "http://127.0.0.1:3" },
+				},
+				{},
+			);
+			expect(cacheGet).not.toHaveBeenCalled();
+			expect(cacheSet.mock.calls.map(([name]) => name)).toEqual(["conventional"]);
+			expect(result.tools.some(tool => tool.mcpServerName === "plugin-pending")).toBe(false);
+			expect(result.tools.some(tool => tool.mcpServerName === "plugin-success")).toBe(true);
+		} finally {
+			pendingPluginTools.reject(new Error("abandoned plugin tools/list"));
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 		}

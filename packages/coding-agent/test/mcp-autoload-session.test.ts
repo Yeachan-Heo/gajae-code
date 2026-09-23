@@ -13,7 +13,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
 import { DeferredMCPTool, loadAllMCPConfigs, type MCPLoadResult, MCPManager, MCPToolCache } from "../src/runtime-mcp";
@@ -148,9 +148,11 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		await fs.promises.writeFile(configPath, JSON.stringify(configDocument, null, 2));
 		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
 
-		const options = isolatedSessionOptions();
+		const sessionAgentDir = path.join(tempHome, ".gjc", "session-profile");
+		await fs.promises.mkdir(sessionAgentDir, { recursive: true });
+		const options = { ...isolatedSessionOptions(), agentDir: sessionAgentDir };
 		const loaded = await loadAllMCPConfigs(projectDir, {
-			agentDir,
+			agentDir: sessionAgentDir,
 			enableProjectConfig: true,
 			autoloadOnly: true,
 			nativeOnly: true,
@@ -159,7 +161,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const config = loaded.configs["slow-demo"];
 		if (!config) throw new Error("slow-demo config was not loaded");
 
-		const storage = await AgentStorage.open();
+		const storage = await AgentStorage.open(getAgentDbPath(sessionAgentDir), { isolated: true });
 		try {
 			await new MCPToolCache(storage).set("slow-demo", config, [
 				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },

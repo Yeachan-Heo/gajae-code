@@ -2366,7 +2366,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let ownsMcpManager = false;
 		let ownedMcpToolCache: MCPToolCache | null | undefined;
 		const getOwnedMcpToolCache = async (): Promise<MCPToolCache | null> => {
-			if (ownedMcpToolCache === undefined) ownedMcpToolCache = await resolveMCPToolCache();
+			if (ownedMcpToolCache === undefined)
+				ownedMcpToolCache = await resolveMCPToolCache(undefined, getAgentDbPath(agentDir));
 			return ownedMcpToolCache;
 		};
 		const cwdCapturingToolNames: string[] = [];
@@ -3356,10 +3357,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// own bypass of the same mismatch at the manager boundary).
 				const mergedSourceMetas = mergedSources as Record<string, SourceMeta>;
 				if (Object.keys(mergedConfigs).length > 0) {
+					const conventionalCacheServerNames = new Set(
+						Object.keys(conventionalConfigs).filter(name => !pluginNames.has(name)),
+					);
 					const owned = new MCPManager(
 						cwd,
-						Object.keys(conventionalConfigs).length > 0 ? await getOwnedMcpToolCache() : null,
-						{ sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") },
+						conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
+						{
+							sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
+							toolCacheServerNames: conventionalCacheServerNames,
+						},
 					);
 					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();

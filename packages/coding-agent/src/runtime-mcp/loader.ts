@@ -44,10 +44,13 @@ export interface MCPToolsLoadOptions {
 	sharedPoolIdleMs?: number;
 }
 
-export async function resolveMCPToolCache(storage?: AgentStorage | null): Promise<MCPToolCache | null> {
+export async function resolveMCPToolCache(
+	storage?: AgentStorage | null,
+	dbPath?: string,
+): Promise<MCPToolCache | null> {
 	if (storage === null) return null;
 	try {
-		const resolved = storage ?? (await AgentStorage.open());
+		const resolved = storage ?? (await AgentStorage.open(dbPath));
 		return new MCPToolCache(resolved);
 	} catch (error) {
 		logger.warn("MCP tool cache unavailable", { error: String(error) });
