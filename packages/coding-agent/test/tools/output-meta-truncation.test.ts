@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "@gajae-code/ai";
 import { Settings } from "../../src/config/settings";
 import { truncateHead, truncateMiddleWindows } from "../../src/session/streaming-output";
 import {
@@ -7,7 +8,9 @@ import {
 	outputMeta,
 	resolveBashOutputSinkHeadBytes,
 	resolveBashOutputSinkTailBytes,
+	wrapToolWithMetaNotice,
 } from "../../src/tools/output-meta";
+import { ToolError } from "../../src/tools/tool-errors";
 
 describe("output truncation metadata plumbing", () => {
 	test("defaults Bash capture to a 1 KiB tail while preserving explicit retention budgets", () => {
@@ -21,6 +24,27 @@ describe("output truncation metadata plumbing", () => {
 		const result = truncateHead("one\ntwo\nthree", { maxLines: 2, maxBytes: 100 });
 		const meta = outputMeta().truncation(result, { direction: "head", noticeOwner: "body" }).get();
 		expect(meta?.truncation?.noticeOwner).toBe("body");
+	});
+
+	test("preserves designed tool errors through the output wrapper", async () => {
+		const expected = new ToolError("Tool call rejected by user (refuse)");
+		const tool = wrapToolWithMetaNotice({
+			name: "refuse",
+			label: "Refuse",
+			description: "refuses",
+			parameters: z.object({}),
+			execute: async (_toolCallId: string, _params: Record<string, never>) => {
+				throw expected;
+			},
+		});
+
+		let thrown: unknown;
+		try {
+			await tool.execute("call-1", {});
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBe(expected);
 	});
 
 	test("uses actual windows for truncationWindows and forwards noticeOwner", () => {

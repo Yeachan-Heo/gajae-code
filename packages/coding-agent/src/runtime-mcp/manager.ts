@@ -35,6 +35,7 @@ import {
 	MCPPoolLeaseReleaseError,
 } from "./pool";
 import type { MCPProtocolObservation } from "./protocol";
+import { DEFAULT_MCP_STARTUP_WAIT_MS, MAX_MCP_STARTUP_WAIT_MS, MCP_STARTUP_WAIT_GRACE_MS } from "./startup-policy";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
@@ -51,7 +52,7 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 } from "./types";
-import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
+import { MCPExpectedFailure, MCPHttpRequestError, MCPJsonRpcError, MCPNotificationMethods } from "./types";
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
@@ -101,16 +102,23 @@ type RetiredLeaseRelease = {
 	promise: Promise<void>;
 };
 
-const STARTUP_TIMEOUT_MS = 250;
-const STARTUP_TIMEOUT_GRACE_MS = 500;
+const STARTUP_TIMEOUT_MS = DEFAULT_MCP_STARTUP_WAIT_MS;
+const STARTUP_TIMEOUT_GRACE_MS = MCP_STARTUP_WAIT_GRACE_MS;
 /**
  * Default ceiling on how long `discoverAndConnect` waits for a server batch to
  * come up. Deliberately short: a config with a large `timeout` must not be able
  * to hang ordinary startup. ACP lifecycle launches carry their own, larger
  * budget derived from the readiness deadline (see `maxStartupTimeoutMs`).
  */
-const MAX_STARTUP_TIMEOUT_MS = 1_750;
+const MAX_STARTUP_TIMEOUT_MS = MAX_MCP_STARTUP_WAIT_MS;
 const DEFAULT_EXACT_CONFIG_STARTUP_TIMEOUT_MS = 30_000;
+const MCP_STARTUP_TIMEOUT_PREFIX = "MCP server connection timed out during startup:";
+
+export function isMCPStartupTimeoutError(error: unknown): boolean {
+	return typeof error === "string"
+		? error.startsWith(MCP_STARTUP_TIMEOUT_PREFIX)
+		: error instanceof Error && error.message.startsWith(MCP_STARTUP_TIMEOUT_PREFIX);
+}
 
 export function resolveStartupTimeoutMs(configs: MCPServerConfig[], maxStartupTimeoutMs?: number): number {
 	const ceiling =
@@ -148,6 +156,24 @@ export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedM
 	const timeout = config.timeout;
 	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return false;
 	return elapsedMs < timeout;
+}
+
+/** Keep startup logs bounded and free of remote response text. */
+function classifyMCPStartupFailure(error: unknown): string {
+	if (error instanceof MCPExpectedFailure) {
+		return error.cause === undefined ? "expected-mcp-failure" : classifyMCPStartupFailure(error.cause);
+	}
+	if (error instanceof MCPHttpRequestError) {
+		return Number.isInteger(error.status) && error.status >= 100 && error.status <= 599
+			? `http-status:${error.status}`
+			: "http-request-error";
+	}
+	if (error instanceof MCPJsonRpcError) {
+		return Number.isInteger(error.code) && Math.abs(error.code) <= 1_000_000
+			? `json-rpc-code:${error.code}`
+			: "json-rpc-error";
+	}
+	return "transport-error";
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
@@ -260,6 +286,22 @@ export interface MCPLoadResult {
 	exaApiKeys: string[];
 }
 
+export type MCPToolCatalogPublication = "unpublished" | "published" | "fenced";
+
+/**
+ * Atomic view of the manager's fenced tool catalog and its publication state.
+ *
+ * `unpublished` is reserved for the initial deferred window where no manager
+ * catalog has been published and no exact control is fencing it. An empty
+ * `published` or `fenced` catalog is authoritative and must not be replaced
+ * with an in-flight discovery result.
+ */
+export interface MCPToolCatalogSnapshot {
+	tools: CustomTool<TSchema, MCPToolDetails>[];
+	publication: MCPToolCatalogPublication;
+	generation: number;
+}
+
 /** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
@@ -300,6 +342,8 @@ export interface MCPManagerOptions {
 	sessionId?: string;
 	/** Idle retention for shared pool entries. */
 	sharedPoolIdleMs?: number;
+	/** Limit tool-cache reads and writes to this manager's conventional servers. */
+	toolCacheServerNames?: ReadonlySet<string>;
 	/** Test seam for deterministic reconnect backoff scheduling. */
 	sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 	/** Test seam for fencing the acquisition-to-registration replacement race. */
@@ -377,6 +421,8 @@ export class MCPManager {
 	readonly #retiredLeaseReleases = new Set<RetiredLeaseRelease>();
 	#nextScopedOperationId = 1;
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
+	#toolCatalogGeneration = 0;
+	#toolCatalogPublished = false;
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
@@ -412,11 +458,19 @@ export class MCPManager {
 	#scopedLifecycle: "open" | "disconnecting" | "reconnecting" = "open";
 	#scopedLifecycleEpoch = 0;
 	readonly #toolsOnly: boolean;
+	#toolCacheServerNames: Set<string> | undefined;
 	#toolsOnlyConfigLoaded = false;
+	#connectionSetMutationBlocked = false;
 	#connectionSetSealed = false;
 
 	#serverError(message: string): string {
 		return this.#toolsOnly ? "MCP server unavailable" : message;
+	}
+
+	#shouldCacheServerTools(name: string): boolean {
+		return (
+			this.toolCache !== null && (this.#toolCacheServerNames === undefined || this.#toolCacheServerNames.has(name))
+		);
 	}
 
 	#removePendingAcquireCleanup(name: string, error: MCPPoolAcquireAbortError): void {
@@ -522,11 +576,25 @@ export class MCPManager {
 		return this.#scopedLifecycleEpoch;
 	}
 	#assertConnectionSetMutable(): void {
-		if (this.#connectionSetSealed) throw new Error("MCP manager connection set is sealed");
+		if (this.#connectionSetMutationBlocked) {
+			throw new Error(
+				this.#connectionSetSealed ? "MCP manager connection set is sealed" : "MCP manager connection set is frozen",
+			);
+		}
+	}
+
+	/** Block config mutations and reloads while keeping existing servers reconnectable. */
+	freezeConnectionSet(): void {
+		this.#connectionSetMutationBlocked = true;
 	}
 
 	sealConnectionSet(): void {
+		this.freezeConnectionSet();
 		this.#connectionSetSealed = true;
+	}
+
+	isConnectionSetMutationBlocked(): boolean {
+		return this.#connectionSetMutationBlocked;
 	}
 
 	isConnectionSetSealed(): boolean {
@@ -925,6 +993,7 @@ export class MCPManager {
 		options: MCPManagerOptions = {},
 	) {
 		this.#toolsOnly = options.toolsOnly === true;
+		this.#toolCacheServerNames = options.toolCacheServerNames ? new Set(options.toolCacheServerNames) : undefined;
 		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
 		this.#sleep = options.sleep ?? delay;
 		this.#afterLeaseAcquiredForTests = options.afterLeaseAcquiredForTests;
@@ -1081,6 +1150,11 @@ export class MCPManager {
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
 		});
+		if (this.#toolCacheServerNames !== undefined) {
+			this.#toolCacheServerNames = new Set(
+				Object.keys(configs).filter(name => sources[name]?.provider !== "gjc-plugins"),
+			);
+		}
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);
 		if (configurationWarning) result.errors.set("$config", "MCP configuration unavailable");
 		result.exaApiKeys = exaApiKeys;
@@ -1134,6 +1208,13 @@ export class MCPManager {
 					"MCP connection cleanup pending";
 				errors.set(name, this.#serverError(message));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: message,
+					});
+				}
 				continue;
 			}
 			if (sources[name]) {
@@ -1163,14 +1244,29 @@ export class MCPManager {
 				this.#pendingToolLoads.has(name) ||
 				this.#pendingReconnections.has(name)
 			) {
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason: "connection already pending",
+					});
+				}
 				continue;
 			}
 
 			// Validate config
 			const validationErrors = validateServerConfig(name, config);
 			if (validationErrors.length > 0) {
-				errors.set(name, this.#serverError(validationErrors.join("; ")));
+				const reason = validationErrors.join("; ");
+				errors.set(name, this.#serverError(reason));
 				reportedErrors.add(name);
+				if (!this.#toolsOnly) {
+					logger.warn("Skipping MCP autoload registration", {
+						path: `mcp:${name}`,
+						serverName: name,
+						reason,
+					});
+				}
 				continue;
 			}
 
@@ -1315,16 +1411,23 @@ export class MCPManager {
 					);
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
+					if (!this.#toolsOnly && this.#shouldCacheServerTools(name))
+						void this.toolCache?.set(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
 					this.#retainConnectionCleanupFailure(name, error);
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
+					if (!allowBackgroundLogging || this.#toolsOnly || reportedErrors.has(name)) return;
 					const message = error instanceof Error ? error.message : String(error);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
+					errors.set(name, this.#serverError(message));
+					reportedErrors.add(name);
+					logger.error("MCP tool load failed", {
+						path: `mcp:${name}`,
+						serverName: name,
+						error: classifyMCPStartupFailure(error),
+					});
 				});
 		}
 
@@ -1380,6 +1483,7 @@ export class MCPManager {
 				if (this.toolCache && !this.#toolsOnly) {
 					await Promise.all(
 						pendingTasks.map(async task => {
+							if (!this.#shouldCacheServerTools(task.name)) return;
 							const cached = await this.toolCache?.get(task.name, task.config);
 							if (cached) {
 								cachedTools.set(task.name, cached);
@@ -1388,41 +1492,55 @@ export class MCPManager {
 					);
 				}
 
-				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
-				if (pendingWithoutCache.length > 0) {
-					// The startup wait elapsing means "stop blocking session start", not
-					// "this server failed". A server whose operator declared a `timeout`
-					// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
-					// is still inside that window it keeps connecting in the background
-					// under `connectToServer`'s own timeout, and the background tool load
-					// adopts it. Only a server that declared no window, or already spent it,
-					// is torn down and reported. Exact-config (`toolsOnly`) startup still
-					// fails fast: it builds a catalog once, so a missing server is an error.
-					const startupElapsedMs = Date.now() - startupStartedAt;
-					for (const task of pendingWithoutCache) {
-						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
-							logger.warn("MCP server still connecting after the startup wait", {
-								path: `mcp:${task.name}`,
-								startupWaitMs: startupTimeoutMs,
-								declaredTimeoutMs: task.config.timeout,
-							});
-							continue;
-						}
-						const message = `MCP server connection timed out during startup: ${task.name}`;
-						errors.set(task.name, this.#serverError(message));
-						reportedErrors.add(task.name);
-						task.connectionAbort.abort(new Error(message));
-						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
-						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
-							this.#pendingToolLoads.delete(task.name);
-						this.#pendingConnectionControllers.delete(task.name);
-						void this.#disconnectServer(task.name, { preserveConfig: this.#toolsOnly }).catch(error => {
-							this.#logLeaseReleaseFailure(task.name, undefined, error);
+				// Cached tools are only a fallback snapshot; they do not exempt the live
+				// connection from the startup cleanup contract. The startup wait elapsing
+				// means "stop blocking session start", not "this server failed". A server
+				// whose operator declared a `timeout` (`gjc mcp add --timeout`) asked to
+				// wait that long for it, so while it is still inside that window it keeps
+				// connecting in the background under `connectToServer`'s own timeout, and
+				// the background tool load adopts it. Only a server that declared no
+				// window, or already spent it, is torn down and reported. Exact-config
+				// (`toolsOnly`) startup still fails fast: it builds a catalog once, so a
+				// missing server is an error.
+				// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
+				// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
+				// registered if it eventually connects.
+				const startupElapsedMs = Date.now() - startupStartedAt;
+				for (const task of pendingTasks) {
+					if (task.tracked.status !== "pending") continue;
+					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
+						logger.warn("MCP server still connecting after the startup wait", {
+							path: `mcp:${task.name}`,
+							serverName: task.name,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+						});
+						continue;
+					}
+					const message = `MCP server connection timed out during startup: ${task.name}`;
+					if (!this.#toolsOnly) {
+						logger.warn("MCP server connection timed out during startup", {
+							path: `mcp:${task.name}`,
+							serverName: task.name,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+							remediation: "Set a per-server timeout with `gjc mcp add --timeout <ms>` for slower servers.",
 						});
 					}
-					// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
-					// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
-					// registered if it eventually connects.
+					errors.set(task.name, this.#serverError(message));
+					reportedErrors.add(task.name);
+					task.connectionAbort.abort(new Error(message));
+					if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
+					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
+						this.#pendingToolLoads.delete(task.name);
+					this.#pendingConnectionControllers.delete(task.name);
+					void this.#disconnectServer(task.name, {
+						preserveConfig: this.#toolsOnly || cachedTools.has(task.name),
+						preserveSource: cachedTools.has(task.name),
+						preserveTools: cachedTools.has(task.name),
+					}).catch(error => {
+						this.#logLeaseReleaseFailure(task.name, undefined, error);
+					});
 				}
 			}
 
@@ -1460,6 +1578,15 @@ export class MCPManager {
 					const reason = task.tracked.reason;
 					this.#retainConnectionCleanupFailure(name, reason);
 					const message = reason instanceof Error ? reason.message : String(reason);
+					if (!(this.#toolsOnly && reason instanceof MCPExpectedFailure)) {
+						logger.warn("MCP server connection failed during startup", {
+							path: `mcp:${name}`,
+							serverName: name,
+							error: classifyMCPStartupFailure(reason),
+							remediation:
+								"Check the server command and set --timeout <ms> when startup is expected to be slow.",
+						});
+					}
 					errors.set(name, this.#serverError(message));
 					reportedErrors.add(name);
 					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {
@@ -1504,7 +1631,7 @@ export class MCPManager {
 		}
 
 		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#tools = allTools;
+		if (shouldPublishToolSnapshot) this.#publishToolCatalog(allTools);
 		allowBackgroundLogging = true;
 
 		return {
@@ -1517,13 +1644,14 @@ export class MCPManager {
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
 		if (!this.#isExactToolPublicationAllowed(name)) return;
-		this.#tools = this.#tools.filter(
+		const publishedTools = this.#tools.filter(
 			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
 		);
-		if (!this.#suppressedServers.has(name)) this.#tools.push(...tools);
+		if (!this.#suppressedServers.has(name)) publishedTools.push(...tools);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
-		sortMCPToolsByName(this.#tools);
+		sortMCPToolsByName(publishedTools);
+		this.#publishToolCatalog(publishedTools);
 	}
 
 	#exactToolOptions(
@@ -1610,6 +1738,32 @@ export class MCPManager {
 	 */
 	getTools(): CustomTool<TSchema, MCPToolDetails>[] {
 		return this.#tools.filter(tool => !tool.mcpServerName || this.#isExactToolPublicationAllowed(tool.mcpServerName));
+	}
+
+	/**
+	 * Read the fenced catalog and publication state atomically.
+	 *
+	 * An empty catalog is still authoritative after publication or while an
+	 * exact control is in flight. Deferred startup may fall back to its discovery
+	 * result only for the explicit `unpublished` state.
+	 */
+	getToolCatalogSnapshot(): MCPToolCatalogSnapshot {
+		const exactControlFence =
+			this.#toolsOnly &&
+			(this.#suppressedServers.size > 0 ||
+				this.#pendingExactSuspensions.size > 0 ||
+				this.#pendingExactControlServers.size > 0);
+		return {
+			tools: this.getTools(),
+			publication: exactControlFence ? "fenced" : this.#toolCatalogPublished ? "published" : "unpublished",
+			generation: this.#toolCatalogGeneration,
+		};
+	}
+
+	#publishToolCatalog(tools: CustomTool<TSchema, MCPToolDetails>[]): void {
+		this.#tools = tools;
+		this.#toolCatalogGeneration++;
+		this.#toolCatalogPublished = true;
 	}
 
 	#isExactToolPublicationAllowed(name: string): boolean {
@@ -1801,7 +1955,7 @@ export class MCPManager {
 					if (!candidate.publish) throw new Error("Exact MCP reset candidate does not support atomic publication");
 					candidate.publish();
 				}
-				this.#tools = tools;
+				this.#publishToolCatalog(tools);
 				this.#suppressedServers.clear();
 				this.#pendingExactSuspensions.clear();
 				this.#drainDeferredSharedRebinds();
@@ -1899,7 +2053,7 @@ export class MCPManager {
 				...serverTools,
 			];
 			sortMCPToolsByName(publishedTools);
-			this.#tools = publishedTools;
+			this.#publishToolCatalog(publishedTools);
 			this.#suppressedServers.delete(name);
 			this.#pendingExactControlServers.delete(name);
 			this.#drainDeferredSharedRebinds();
@@ -2290,7 +2444,10 @@ export class MCPManager {
 		await this.#disconnectServer(name);
 	}
 
-	async #disconnectServer(name: string, options: { preserveConfig?: boolean } = {}): Promise<void> {
+	async #disconnectServer(
+		name: string,
+		options: { preserveConfig?: boolean; preserveSource?: boolean; preserveTools?: boolean } = {},
+	): Promise<void> {
 		const nextEpoch = (this.#disconnectEpochs.get(name) ?? 0) + 1;
 		this.#disconnectEpochs.set(name, nextEpoch);
 		this.#pendingConnectionControllers.get(name)?.abort(new Error(`MCP server disconnected: ${name}`));
@@ -2300,7 +2457,7 @@ export class MCPManager {
 		this.#pendingConnections.delete(name);
 		this.#pendingToolLoads.delete(name);
 		this.#pendingReconnections.delete(name);
-		this.#sources.delete(name);
+		if (!options.preserveSource) this.#sources.delete(name);
 		if (!options.preserveConfig) this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		const connection = this.#connections.get(name);
@@ -2330,14 +2487,21 @@ export class MCPManager {
 			if (this.#connections.get(name) === connection) this.#connections.delete(name);
 		}
 
-		// Remove tools from this server and notify consumers
-		const hadTools = this.#tools.some(
-			tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
-		);
-		this.#tools = this.#tools.filter(
-			tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
-		);
-		if (hadTools) this.#onToolsChanged?.(this.#tools);
+		// Keep a published cache fallback available while its expired live connection closes.
+		if (!options.preserveTools) {
+			const hadTools = this.#tools.some(
+				tool => (tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name,
+			);
+			const remainingTools = this.#tools.filter(
+				tool => !((tool instanceof MCPTool || tool instanceof DeferredMCPTool) && tool.mcpServerName === name),
+			);
+			if (hadTools) {
+				this.#publishToolCatalog(remainingTools);
+				this.#onToolsChanged?.(this.#tools);
+			} else {
+				this.#tools = remainingTools;
+			}
+		}
 
 		// Notify prompt consumers so stale commands are cleared
 		if (connection?.prompts?.length) this.#onPromptsChanged?.(name);
@@ -2444,7 +2608,7 @@ export class MCPManager {
 			this.#pendingExactSuspensions.clear();
 			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
-			this.#tools = [];
+			this.#publishToolCatalog([]);
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures,
@@ -2734,7 +2898,7 @@ export class MCPManager {
 				reconnect,
 				this.#exactToolOptions(name, config.sharing === "shared"),
 			);
-			void this.toolCache?.set(name, config, serverTools);
+			if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2804,7 +2968,7 @@ export class MCPManager {
 			reconnect,
 			this.#exactToolOptions(name, connection.config.sharing === "shared"),
 		);
-		void this.toolCache?.set(name, connection.config, serverTools);
+		if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

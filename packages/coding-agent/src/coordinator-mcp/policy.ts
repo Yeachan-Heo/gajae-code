@@ -275,11 +275,16 @@ export async function assertCoordinatorSessionLocations(
 	]);
 	// Reauthorize both persisted locations independently. A managed worktree may
 	// differ from the requested cwd, but neither may escape the current roots.
-	if (
-		!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform)) ||
-		!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform))
-	)
-		throw new Error("coordinator_workdir_outside_allowed_roots");
+	const escaped: string[] = [];
+	if (!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform))) escaped.push(`cwd ${canonicalCwd}`);
+	if (!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform)))
+		escaped.push(`workspace ${canonicalWorkspace}`);
+	if (escaped.length > 0)
+		// The message stays exact because isSessionAuthorityError() in server.ts matches it
+		// verbatim; the escaping location rides in `cause` so a caller that logs can name it.
+		throw new Error("coordinator_workdir_outside_allowed_roots", {
+			cause: new Error(`outside allowed roots: ${escaped.join(", ")}`),
+		});
 }
 
 export async function assertCoordinatorArtifactPath(

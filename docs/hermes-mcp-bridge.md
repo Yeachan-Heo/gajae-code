@@ -347,6 +347,8 @@ A delegated prompt accepted through `gjc_delegate_execute` (which routes to `tur
 
 Coordinator clients must persist the returned `session_id` and `turn_id`, observe lifecycle through `gjc_coordinator_watch_events` (`turn.waiting_for_answer`, `question.opened`, `turn.completed`, and `turn.failed`), and reconcile after disconnect/restart rather than blindly replaying the prompt. Read the authoritative turn or question details with the existing read tools; `gjc_coordinator_read_turn`, `gjc_coordinator_await_turn`, and Q26 `turn.result` reconciliation (`accepted` / `in_flight` / `terminal_ok` / `failed`) remain compatibility paths. The bounded `await_turn` poll timeout (`timeout_ms`) is distinct from the SDK prompt terminal deadline; await time-outs do not kill the turn.
 
+When an `await_turn` observation window expires while the turn is still nonterminal, its payload retains the legacy `ok:false, reason:"timeout"` fields and adds `wait_expired:true`. Both MCP handlers return this observation with `isError:false`; it must not be counted as a server failure. The turn's status and completion evidence remain authoritative: wait again on the same `turn_id`, without resubmitting the prompt. Invalid requests and SDK request failures still return MCP errors. Nested delegate `completion` snapshots carry the same observation marker without changing their committed replay semantics.
+
 ## Smoke check
 
 ```bash

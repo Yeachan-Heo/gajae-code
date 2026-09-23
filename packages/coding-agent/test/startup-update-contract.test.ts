@@ -14,6 +14,7 @@ import {
 	runRootCommand,
 	StartupUpdateOrchestrator,
 	type StartupUpdateRoute,
+	shouldNotifyModelFallback,
 } from "../src/main";
 import { getSettingsForTab } from "../src/modes/components/settings-defs";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
@@ -62,11 +63,13 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		},
 		extensionRunner: undefined,
 		getConfiguredModelChain: () => undefined,
+		hasRecoveredDefaultFallbackChain: () => false,
 		setConfiguredModelChain: () => {},
 		seedDefaultFallbackResolution: () => {},
 		setModelTemporary: async (model: typeof testModel) => {
 			activeModel = model;
 		},
+		subscribe: () => () => {},
 		dispose: async () => {},
 	} as unknown as AgentSession;
 	return {
@@ -78,6 +81,12 @@ function fakeSessionResult(): CreateAgentSessionResult {
 }
 
 describe("startup update contract", () => {
+	it("suppresses model fallback notifications only during interactive auth bootstrap", () => {
+		expect(shouldNotifyModelFallback(true, true)).toBe(false);
+		expect(shouldNotifyModelFallback(undefined, true)).toBe(true);
+		expect(shouldNotifyModelFallback(true, false)).toBe(true);
+	});
+
 	it("keeps the concise startup-check metadata accurate", () => {
 		const setting = SETTINGS_SCHEMA["startup.checkUpdate"];
 

@@ -33,6 +33,23 @@ function createLifecycleIndependentSessionManager(): SessionManager {
 	}
 }
 
+async function waitForFollowUp(agent: Agent, text: string): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (
+		!agent
+			.snapshotFollowUp()
+			.some(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(part => part.type === "text" && part.text === text),
+			)
+	) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for queued follow-up: ${text}`);
+		await Bun.sleep(1);
+	}
+}
+
 afterEach(async () => {
 	await session?.dispose();
 	authStorage?.close();
@@ -433,6 +450,9 @@ test.serial("releases a deferred SDK follow-up only after queued work drains", a
 		onPreflightAcceptCommit: () => {},
 	} as never);
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	// Hold scheduled delivery before dequeue so release is observable even when
+	// the continuation runs before the assertion. Session disposal cancels this wait.
+	session.extendStartupTurnBarrier(new Promise<void>(() => {}));
 
 	// agent_end while queued work is still pending must hold the SDK follow-up.
 	agent.emitExternalEvent({ type: "agent_end", messages: [] });
@@ -443,7 +463,7 @@ test.serial("releases a deferred SDK follow-up only after queued work drains", a
 	// Once the queue drains, the next agent_end releases it as its own run.
 	agent.removeQueuedMessages(candidate => candidate === unrelated);
 	agent.emitExternalEvent({ type: "agent_end", messages: [] });
-	await Bun.sleep(20);
+	await waitForFollowUp(agent, "owned follow-up");
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned follow-up" }] });
 });
@@ -486,18 +506,21 @@ test.serial("releases the next deferred SDK follow-up when a released one is can
 	} as never);
 	// Both SDK follow-ups are deferred behind the pre-existing queued work.
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
+	// Keep m1 cancellable after release, before any continuation can consume it.
+	// Session disposal cancels the parked startup wait.
+	session.extendStartupTurnBarrier(new Promise<void>(() => {}));
 
 	// agent_end releases only the first deferred follow-up.
 	agent.removeQueuedMessages(candidate => candidate === unrelated);
 	agent.emitExternalEvent({ type: "agent_end", messages: [] });
-	await Bun.sleep(20);
+	await waitForFollowUp(agent, "owned m1");
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned m1" }] });
 
 	// Cancelling m1 before its scheduled continuation starts must advance the
 	// deferred queue to m2; no further agent_end will arrive to release it.
 	firstController.abort();
-	await Bun.sleep(20);
+	await waitForFollowUp(agent, "owned m2");
 	expect(agent.snapshotFollowUp()).toHaveLength(1);
 	expect(agent.snapshotFollowUp()[0]).toMatchObject({ content: [{ type: "text", text: "owned m2" }] });
 });

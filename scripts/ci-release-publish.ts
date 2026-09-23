@@ -546,7 +546,9 @@ async function packPackageTwice(pkg: PublishPackage): Promise<Buffer> {
 		try {
 			const copiedPackageDir = path.join(temporaryRoot, "package");
 			const packOutputDir = path.join(temporaryRoot, "tarballs");
-			await fs.cp(pkgDir, copiedPackageDir, { recursive: true, force: false, errorOnExist: true });
+			await fs.cp(pkgDir, copiedPackageDir, {
+				recursive: true, force: false, errorOnExist: true,
+			});
 			await fs.mkdir(packOutputDir);
 			const result = await $`npm pack --ignore-scripts --json --pack-destination ${packOutputDir}`.cwd(copiedPackageDir).quiet().nothrow();
 			if (result.exitCode !== 0) throw new Error(`npm pack failed for ${pkg.dir}: ${outputOf(result)}`);

@@ -12,6 +12,8 @@
  * (automation); the default human output stays a concise per-daemon result.
  */
 
+import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import type { DaemonAction, DaemonOperationResult, DaemonRecovery, DaemonStatus } from "./control-types";
 
 /** Canonical daemon actions accepted as the leading verb. */
@@ -39,8 +41,14 @@ export function resolveDaemonAction(token: string | undefined): DaemonAction | u
 	return DAEMON_ACTION_ALIASES[token];
 }
 
-/** Exit codes for `gjc daemon`. Backward compatible: success 0, any failure 1. */
-export const DAEMON_EXIT = { ok: 0, failure: 1 } as const;
+/** Public input failures exit 2; operational failures retain exit 1. */
+export const DAEMON_EXIT = { ok: 0, failure: 1, usage: 2 } as const;
+
+/** A refused result may follow a successful stop or spawn; snapshots and prose
+ * do not prove that no effect occurred. Only completed results prove applied. */
+export function daemonOperationOutcome(result: DaemonOperationResult): "applied" | "unknown" {
+	return result.ok ? "applied" : "unknown";
+}
 
 /** Human-facing headline when a spawn/reload is refused by a live foreign identity. */
 export const OWNERSHIP_MISMATCH_MESSAGE =
@@ -59,6 +67,10 @@ export function ownershipMismatchRecovery(): DaemonRecovery {
 	};
 }
 
+function safeDaemonText(value: string): string {
+	return truncateToWidth(replaceTabs(sanitizeDisplayLine(value).replaceAll(/[\u2028\u2029]/gu, " ")), 512);
+}
+
 function timestamp(ms: number | undefined): string | undefined {
 	if (ms === undefined) return undefined;
 	const date = new Date(ms);
@@ -73,31 +85,31 @@ export function formatDaemonStatus(status: DaemonStatus, opts: { verbose?: boole
 	const lines: string[] = [];
 	if (!status.configured) {
 		lines.push(`${status.kind}: not configured`);
-		if (status.runtime.warning) lines.push(`  warning: ${status.runtime.warning}`);
+		if (status.runtime.warning) lines.push(`  warning: ${safeDaemonText(status.runtime.warning)}`);
 		return lines.join("\n");
 	}
 
 	const meta: string[] = [];
 	if (status.pid !== undefined) meta.push(`pid ${status.pid}`);
-	if (status.ownerId) meta.push(`owner ${status.ownerId}`);
+	if (status.ownerId) meta.push(`owner ${safeDaemonText(status.ownerId)}`);
 	const rootCount = status.rootCount ?? status.roots?.length ?? 0;
 	if (rootCount > 0) meta.push(`${rootCount} root${rootCount === 1 ? "" : "s"}`);
 
 	let head = `${status.kind}: ${status.health}`;
 	if (meta.length > 0) head += ` (${meta.join(", ")})`;
-	if (status.detail) head += ` — ${status.detail}`;
+	if (status.detail) head += ` — ${safeDaemonText(status.detail)}`;
 	lines.push(head);
-	if (status.runtime.warning) lines.push(`  warning: ${status.runtime.warning}`);
+	if (status.runtime.warning) lines.push(`  warning: ${safeDaemonText(status.runtime.warning)}`);
 
 	if (opts.verbose) {
-		lines.push(`  runtime: ${status.runtime.mode} (${status.runtime.execPath})`);
+		lines.push(`  runtime: ${status.runtime.mode} (${safeDaemonText(status.runtime.execPath)})`);
 		const started = timestamp(status.startedAt);
 		if (started) lines.push(`  started: ${started}`);
 		const heartbeat = timestamp(status.heartbeatAt);
 		if (heartbeat) lines.push(`  heartbeat: ${heartbeat}`);
 		const roots = status.roots ?? [];
 		lines.push(`  roots: ${rootCount}`);
-		for (const root of roots) lines.push(`    - ${root}`);
+		for (const root of roots) lines.push(`    - ${safeDaemonText(root)}`);
 	}
 
 	return lines.join("\n");
@@ -108,13 +120,15 @@ export function formatDaemonStatus(status: DaemonStatus, opts: { verbose?: boole
  * <message>` head line, then any warnings, then actionable recovery steps.
  */
 export function formatDaemonResult(result: DaemonOperationResult): string {
-	const lines = [`${result.kind} ${result.action}: ${result.ok ? "ok" : "failed"} — ${result.message}`];
-	for (const warning of result.warnings) lines.push(`  warning: ${warning}`);
+	const lines = [
+		`${result.kind} ${result.action}: ${result.ok ? "ok" : "failed"} — ${safeDaemonText(result.message)}`,
+	];
+	for (const warning of result.warnings) lines.push(`  warning: ${safeDaemonText(warning)}`);
 	if (result.recovery) {
-		lines.push(`  ${result.recovery.summary}`);
+		lines.push(`  ${safeDaemonText(result.recovery.summary)}`);
 		lines.push("  to recover:");
 		result.recovery.steps.forEach((step, i) => {
-			lines.push(`    ${i + 1}. ${step}`);
+			lines.push(`    ${i + 1}. ${safeDaemonText(step)}`);
 		});
 	}
 	return lines.join("\n");

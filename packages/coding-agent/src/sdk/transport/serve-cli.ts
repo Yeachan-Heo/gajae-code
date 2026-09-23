@@ -1,8 +1,17 @@
+import * as crypto from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
+import {
+	normalizePublicCommandFailure,
+	type PublicCommandDiagnosticCode,
+	PublicCommandFailure,
+} from "../../cli/public-command-errors";
+import { normalizeBrokerInput } from "../broker/broker";
 import type { BrokerDiscovery } from "../broker/discovery";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError, SdkDiscoveryError } from "../client";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
+import type { ServeHandle } from "./index";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
 
 type ServeMode = { kind: "stdio" } | { kind: "socket"; socketPath: string };
@@ -13,16 +22,21 @@ interface ServeArguments {
 	pendingCeiling?: string;
 }
 
-function usageError(message: string): never {
-	throw new CliParseError(`gjc sdk serve: ${message}`);
+/**
+ * Usage failures keep a static, allowlisted reason instead of the parser's raw text:
+ * the concrete diagnostic is what makes an unknown flag or a missing operand
+ * actionable, and it never echoes caller argv back into output or the evidence store.
+ */
+function usageError(diagnostic: PublicCommandDiagnosticCode): never {
+	throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect", diagnostics: [diagnostic] });
 }
 
 /**
  * A `gjc sdk serve` operational failure with a stable machine-readable code and a
  * documented exit code, mirroring `SdkSessionCliError`. Usage errors keep their own
- * `CliParseError` path; this type covers only failures an embedder must branch on.
+ * public failure envelope; this type covers only failures an embedder must branch on.
  */
-export class SdkServeError extends Error {
+export class SdkServeError extends PublicCommandFailure {
 	/**
 	 * Diagnostics for a broker-teardown failure that happened alongside this primary
 	 * failure. It rides beside `details` rather than inside it because `details`
@@ -36,8 +50,65 @@ export class SdkServeError extends Error {
 		readonly exitCode: 1,
 		readonly details?: unknown,
 	) {
-		super(message);
+		super(sdkServeFailureInput(code));
 		this.name = "SdkServeError";
+		this.message = message;
+	}
+}
+
+function sdkServeFailureInput(code: string): {
+	kind:
+		| "usage"
+		| "invalid_json"
+		| "unavailable"
+		| "broker_unavailable"
+		| "endpoint_stale"
+		| "broker_restarting"
+		| "authorization_denied"
+		| "timeout"
+		| "wait_timeout"
+		| "uncertain_after_send"
+		| "daemon_unhealthy"
+		| "daemon_stale"
+		| "daemon_mixed"
+		| "operation_failed"
+		| "internal";
+	proof?: "pre-send" | "pre-effect" | "accepted" | "completed" | "sent" | "unknown";
+} {
+	switch (code) {
+		case "broker_restarting":
+			return { kind: "broker_restarting", proof: "pre-effect" };
+		case "broker_unavailable":
+		case "broker_discovery_unreadable":
+			return { kind: "broker_unavailable", proof: "pre-effect" };
+		case "endpoint_stale":
+			return { kind: "endpoint_stale", proof: "pre-effect" };
+		case "authorization_denied":
+		case "unauthorized":
+		case "forbidden":
+		case "master_context_required":
+		case "adapter_operation_prohibited":
+		case "endpoint_credential_forbidden":
+			return { kind: "authorization_denied", proof: "pre-effect" };
+		case "timeout":
+			return { kind: "timeout", proof: "unknown" };
+		case "uncertain_after_send":
+			return { kind: "uncertain_after_send", proof: "sent" };
+		case "usage":
+		case "invalid_input":
+		case "invalid_json":
+			return { kind: "usage", proof: "pre-effect" };
+		case "unavailable":
+		case "unsupported_platform":
+		case "not_found":
+		case "ambiguous_session":
+			return { kind: "unavailable", proof: "pre-effect" };
+		case "no_live_endpoint":
+			return { kind: "endpoint_stale", proof: "pre-effect" };
+		case "multiple_live_endpoints":
+			return { kind: "usage", proof: "pre-effect" };
+		default:
+			return { kind: "operation_failed" };
 	}
 }
 
@@ -91,7 +162,10 @@ async function brokerCloseFailure(broker: SdkClient): Promise<Error | undefined>
  */
 export function resolveServeOutcome(primary: Error | undefined, cleanup: Error | undefined): Error | undefined {
 	if (primary) {
-		if (cleanup && primary instanceof SdkServeError) primary.cleanupError = cleanupDiagnostics(cleanup);
+		if (cleanup && primary instanceof SdkServeError) {
+			primary.cleanupError = cleanupDiagnostics(cleanup);
+			primary.input.diagnostics = [...(primary.input.diagnostics ?? []), "broker_cleanup_failed"];
+		}
 		return primary;
 	}
 	if (!cleanup) return undefined;
@@ -99,9 +173,9 @@ export function resolveServeOutcome(primary: Error | undefined, cleanup: Error |
 	return new SdkServeError("serve_cleanup_failed", `SDK broker cleanup failed: ${cleanup.message}`, 1, diagnostics);
 }
 
-function readFlagValue(argv: string[], index: number, flag: string): string {
+function readFlagValue(argv: string[], index: number): string {
 	const value = argv[index + 1];
-	if (value === undefined || value.startsWith("-")) usageError(`${flag} requires a value`);
+	if (value === undefined || value.startsWith("-")) usageError("usage_missing_value");
 	return value;
 }
 
@@ -113,29 +187,29 @@ function parseServeArguments(argv: string[]): ServeArguments {
 	for (let index = 0; index < argv.length; index++) {
 		switch (argv[index]) {
 			case "--stdio":
-				if (stdio) usageError("--stdio may only be specified once");
+				if (stdio) usageError("usage_duplicate_option");
 				stdio = true;
 				break;
 			case "--socket":
-				if (socketPath !== undefined) usageError("--socket may only be specified once");
-				socketPath = readFlagValue(argv, index, "--socket");
+				if (socketPath !== undefined) usageError("usage_duplicate_option");
+				socketPath = readFlagValue(argv, index);
 				index++;
 				break;
 			case "--session":
-				if (sessionId !== undefined) usageError("--session may only be specified once");
-				sessionId = readFlagValue(argv, index, "--session");
+				if (sessionId !== undefined) usageError("usage_duplicate_option");
+				sessionId = readFlagValue(argv, index);
 				index++;
 				break;
 			case "--pending-ceiling":
-				if (pendingCeiling !== undefined) usageError("--pending-ceiling may only be specified once");
-				pendingCeiling = readFlagValue(argv, index, "--pending-ceiling");
+				if (pendingCeiling !== undefined) usageError("usage_duplicate_option");
+				pendingCeiling = readFlagValue(argv, index);
 				index++;
 				break;
 			default:
-				usageError(`unknown argument: ${argv[index]}`);
+				usageError("usage_unknown_argument");
 		}
 	}
-	if (stdio === (socketPath !== undefined)) usageError("specify exactly one of --stdio or --socket <path>");
+	if (stdio === (socketPath !== undefined)) usageError("usage_transport_exclusive");
 	return { mode: stdio ? { kind: "stdio" } : { kind: "socket", socketPath: socketPath! }, sessionId, pendingCeiling };
 }
 
@@ -143,14 +217,32 @@ function parseServeArguments(argv: string[]): ServeArguments {
 export function resolveServePendingCeiling(flagValue: string | undefined, envValue: string | undefined): number {
 	const value = flagValue ?? envValue;
 	if (value === undefined) return DEFAULT_PENDING_CEILING_BYTES;
-	if (!/^\d+$/.test(value)) usageError("--pending-ceiling must be a positive integer");
+	if (!/^\d+$/.test(value)) usageError("usage_invalid_option_value");
 	const ceiling = Number(value);
-	if (!Number.isSafeInteger(ceiling) || ceiling < MIN_PENDING_CEILING_BYTES)
-		usageError(`--pending-ceiling must be an integer of at least ${MIN_PENDING_CEILING_BYTES}`);
+	if (!Number.isSafeInteger(ceiling) || ceiling < MIN_PENDING_CEILING_BYTES) usageError("usage_invalid_option_value");
 	return ceiling;
 }
 
-type BrokerSessionRow = { sessionId: string; live: boolean; ambiguous: boolean };
+type BrokerTranscriptIdentity = {
+	dev: string;
+	ino: string;
+	size: number;
+	mtimeMs: number;
+	mtimeNs: string;
+	sha256: string;
+};
+type BrokerSavedSession = { id: string; path: string; identity: BrokerTranscriptIdentity };
+type BrokerSessionLocator = { cwd: string; worktreeRoot: string | null; stateRoot: string };
+type BrokerSessionRow = {
+	sessionId: string;
+	live: boolean;
+	ambiguous: boolean;
+	terminal?: boolean;
+	hostUnregisteredReason?: "process_exited" | "detached_idle";
+	terminalUncertain?: boolean;
+	locator?: BrokerSessionLocator;
+	savedSession?: BrokerSavedSession;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -167,29 +259,158 @@ function brokerResult(value: unknown): Record<string, unknown> {
 	return isRecord(value) && isRecord(value.result) ? value.result : {};
 }
 
-function brokerSessionRows(sessions: readonly unknown[]): BrokerSessionRow[] {
+function brokerSessionLocator(value: unknown): BrokerSessionLocator | undefined {
+	if (!isRecord(value)) return undefined;
+	const { cwd, worktreeRoot, stateRoot } = value;
+	return typeof cwd === "string" &&
+		cwd.length > 0 &&
+		(worktreeRoot === null || typeof worktreeRoot === "string") &&
+		typeof stateRoot === "string" &&
+		stateRoot.length > 0
+		? { cwd, worktreeRoot, stateRoot }
+		: undefined;
+}
+
+function brokerSavedSession(value: unknown): BrokerSavedSession | undefined {
+	if (!isRecord(value) || typeof value.id !== "string" || !value.id || typeof value.path !== "string" || !value.path)
+		return undefined;
+	if (!isRecord(value.identity)) return undefined;
+	const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = value.identity;
+	if (
+		typeof dev !== "string" ||
+		!/^[0-9]+$/.test(dev) ||
+		typeof ino !== "string" ||
+		!/^[0-9]+$/.test(ino) ||
+		typeof size !== "number" ||
+		!Number.isSafeInteger(size) ||
+		size < 0 ||
+		typeof mtimeMs !== "number" ||
+		!Number.isFinite(mtimeMs) ||
+		mtimeMs < 0 ||
+		typeof mtimeNs !== "string" ||
+		!/^[0-9]+$/.test(mtimeNs) ||
+		typeof sha256 !== "string" ||
+		!/^[a-f0-9]{64}$/.test(sha256)
+	)
+		return undefined;
+	return { id: value.id, path: value.path, identity: { dev, ino, size, mtimeMs, mtimeNs, sha256 } };
+}
+
+function brokerSessionRows(sessions: readonly unknown[], savedSession?: unknown): BrokerSessionRow[] {
+	const pageSavedSession = brokerSavedSession(savedSession);
 	return sessions.flatMap(item => {
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
-		return [{ sessionId: item.sessionId, live: item.live === true, ambiguous: item.ambiguous === true }];
+		const locator = brokerSessionLocator(item.locator);
+		const saved = pageSavedSession?.id === item.sessionId ? pageSavedSession : brokerSavedSession(item.savedSession);
+		const hostUnregisteredReason =
+			item.hostUnregisteredReason === "process_exited" || item.hostUnregisteredReason === "detached_idle"
+				? item.hostUnregisteredReason
+				: undefined;
+		const terminalUncertain = item.terminalUncertain === true || item.terminal_uncertain === true;
+		return [
+			{
+				sessionId: item.sessionId,
+				live: item.live === true,
+				ambiguous: item.ambiguous === true,
+				...(item.terminal === true ? { terminal: true } : {}),
+				...(hostUnregisteredReason === undefined ? {} : { hostUnregisteredReason }),
+				...(terminalUncertain ? { terminalUncertain: true } : {}),
+				...(locator === undefined ? {} : { locator }),
+				...(saved === undefined ? {} : { savedSession: saved }),
+			},
+		];
 	});
 }
 
 /** Exhausts strict broker `session.list` pages into one full session snapshot. */
-export async function listBrokerSessions(broker: SdkClient, explicitSessionId?: string): Promise<BrokerSessionRow[]> {
+export async function listBrokerSessions(
+	broker: Pick<SdkClient, "global">,
+	explicitSessionId?: string,
+	cwd?: string,
+): Promise<BrokerSessionRow[]> {
 	try {
 		const pages = await traverseSessionList(
-			{ ...(explicitSessionId ? { resolveSessionId: explicitSessionId } : {}) },
+			{
+				...(explicitSessionId ? { resolveSessionId: explicitSessionId } : {}),
+				...(cwd === undefined ? {} : { cwd }),
+			},
 			async input => await broker.global("session.list", input),
 			response => {
 				brokerResult(response);
 				return sessionListPageFromResponse(response);
 			},
 		);
-		return pages.flatMap(page => brokerSessionRows(page.sessions));
+		return pages.flatMap(page =>
+			brokerSessionRows(page.sessions, isRecord(page.page) ? page.page.savedSession : undefined),
+		);
 	} catch (error) {
 		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
 		throw error;
 	}
+}
+
+function endpointStaleError(sessionId: string): Error {
+	// A typed error, because `toServeError` only passes `SdkServeError` through: a plain
+	// Error here is rewritten to `serve_failed`, which hides the one code that tells a
+	// caller recovery was attempted and the endpoint is still not live.
+	return new SdkServeError("endpoint_stale", `session ${sessionId} endpoint is not live`, 1);
+}
+
+async function recoverBrokerSession(broker: SdkClient, row: BrokerSessionRow, sessionId: string): Promise<void> {
+	const locator = row.locator;
+	const authority =
+		row.savedSession?.id === sessionId
+			? row.savedSession
+			: locator === undefined
+				? undefined
+				: (await listBrokerSessions(broker, sessionId, locator.cwd)).find(
+						candidate => candidate.sessionId === sessionId,
+					)?.savedSession;
+	if (locator === undefined || authority?.id !== sessionId) throw endpointStaleError(sessionId);
+	const normalized = normalizeBrokerInput("session.resume", { sessionId, cwd: locator.cwd });
+	if (!("input" in normalized)) {
+		brokerResult(normalized);
+		throw endpointStaleError(sessionId);
+	}
+	const input = {
+		...normalized.input,
+		sessionPath: authority.path,
+		sessionIdentity: authority.identity,
+	};
+	const timeoutMs = lifecycleRequestTimeoutMs("session.resume", input);
+	brokerResult(
+		await broker.global("session.resume", input, {
+			idempotencyKey: crypto.randomUUID(),
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+		}),
+	);
+}
+
+/** Resolves an explicit or automatic serve target, reattaching one stale explicit session at most once. */
+export async function resolveServeSession(broker: SdkClient, explicitSessionId?: string): Promise<string> {
+	const sessions = await listBrokerSessions(broker, explicitSessionId);
+	if (explicitSessionId !== undefined) {
+		const row = sessions.find(session => session.sessionId === explicitSessionId);
+		// An indexed, unambiguous row that is not live is the recoverable
+		// self-reap case (#5633). Every other targeting outcome — unindexed,
+		// ambiguous, no explicit id — stays the selector's to report, so this
+		// decision does not depend on the selector's error text.
+		// Recovery requires durable retirement provenance. A non-live row without a terminal
+		// retirement event may only have stale heartbeat evidence, which does not prove that the
+		// previous host exited and must not authorize a second host for the same transcript.
+		if (
+			row !== undefined &&
+			!row.ambiguous &&
+			!row.terminalUncertain &&
+			!row.live &&
+			row.terminal === true &&
+			(row.hostUnregisteredReason === "process_exited" || row.hostUnregisteredReason === "detached_idle")
+		) {
+			await recoverBrokerSession(broker, row, explicitSessionId);
+			return selectBrokerSession(await listBrokerSessions(broker, explicitSessionId), explicitSessionId);
+		}
+	}
+	return selectBrokerSession(sessions, explicitSessionId);
 }
 
 /** Selects the session to serve through broker `session.list` truth (C10); exported for tests. */
@@ -198,14 +419,52 @@ export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessio
 		const row = sessions.find(session => session.sessionId === explicitSessionId);
 		if (!row) throw new SdkServeError("not_found", `session ${explicitSessionId} is not indexed by the broker`, 1);
 		if (row.ambiguous) throw new SdkServeError("ambiguous_session", "session id maps to more than one state root", 1);
+		if (row.terminalUncertain)
+			throw new SdkServeError("terminal_uncertain", `session ${explicitSessionId} ownership is uncertain`, 1);
 		if (!row.live) throw new SdkServeError("endpoint_stale", `session ${explicitSessionId} endpoint is not live`, 1);
 		return row.sessionId;
 	}
-	const live = sessions.filter(session => session.live && !session.ambiguous);
+	const live = sessions.filter(session => session.live && !session.ambiguous && !session.terminalUncertain);
 	if (live.length === 0) throw new SdkServeError("no_live_endpoint", "no live session endpoint", 1);
 	if (live.length > 1)
 		throw new SdkServeError("multiple_live_endpoints", "more than one live session; specify --session <id>", 1);
 	return live[0]!.sessionId;
+}
+
+/** Only SDK-owned error codes carry classification authority at preflight. */
+function servePreflightFailure(error: unknown): PublicCommandFailure {
+	if (!(error instanceof SdkClientError)) return normalizePublicCommandFailure(error);
+	switch (error.code) {
+		case "broker_restarting":
+			return new PublicCommandFailure({ kind: "broker_restarting", proof: "pre-effect" });
+		case "broker_unavailable":
+			return new PublicCommandFailure({ kind: "broker_unavailable", proof: "pre-effect" });
+		case "endpoint_stale":
+			return new PublicCommandFailure({ kind: "endpoint_stale", proof: "pre-effect" });
+		case "authorization_denied":
+		case "unauthorized":
+		case "forbidden":
+		case "master_context_required":
+		case "adapter_operation_prohibited":
+		case "endpoint_credential_forbidden":
+			return new PublicCommandFailure({ kind: "authorization_denied", proof: "pre-effect" });
+		case "timeout":
+			return new PublicCommandFailure({ kind: "timeout", proof: "unknown" });
+		case "unavailable":
+			return new PublicCommandFailure({ kind: "unavailable", proof: "unknown" });
+		case "uncertain_after_send":
+			return new PublicCommandFailure({ kind: "uncertain_after_send", proof: "sent" });
+		default:
+			return normalizePublicCommandFailure(error);
+	}
+}
+
+/** Bounded dependency seam for preflight tests; production keeps the same transport factories. */
+export interface SdkServeDependencies {
+	readDiscovery: (agentDir: string) => Promise<{ url: string; token: string } | null>;
+	connect: (url: string, token: string) => Promise<Pick<SdkClient, "global" | "close">>;
+	startStdio: typeof startStdioServe;
+	startSocket: typeof startSocketServe;
 }
 
 /**
@@ -214,7 +473,63 @@ export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessio
  * and `session.get_endpoint` mints the exact credential — never a direct
  * endpoint-file read. A missing or unreachable broker fails closed.
  */
-export async function runSdkServe(argv: string[]): Promise<void> {
+export async function runSdkServe(argv: string[], dependencies?: SdkServeDependencies): Promise<void> {
+	if (dependencies !== undefined) {
+		await runSdkServePublic(argv, dependencies);
+		return;
+	}
+	await runSdkServeTyped(argv);
+}
+
+/** Public-boundary adapter used by dependency-injected preflight tests and the CLI scanner. */
+async function runSdkServePublic(argv: string[], dependencies: SdkServeDependencies): Promise<void> {
+	let broker: Pick<SdkClient, "global" | "close"> | undefined;
+	let transport: ServeHandle | undefined;
+	try {
+		const parsed = parseServeArguments(argv);
+		if (parsed.mode.kind === "socket" && process.platform === "win32")
+			throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
+		const pendingCeilingBytes = resolveServePendingCeiling(
+			parsed.pendingCeiling,
+			process.env.GJC_SDK_SERVE_PENDING_CEILING_BYTES,
+		);
+		const discovery = await dependencies.readDiscovery(getAgentDir());
+		if (!discovery) throw new PublicCommandFailure({ kind: "broker_unavailable", proof: "pre-effect" });
+		try {
+			broker = await dependencies.connect(discovery.url, discovery.token);
+		} catch (error) {
+			if (error instanceof SdkClientError || error instanceof PublicCommandFailure) throw error;
+			throw new PublicCommandFailure({ kind: "broker_unavailable", proof: "pre-effect" });
+		}
+		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
+		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
+		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
+		const token = typeof endpoint.token === "string" ? endpoint.token : "";
+		// An endpoint without its minted credential cannot authenticate any relayed
+		// client, so starting the listener would advertise a serve that always fails.
+		if (!url || !token) throw new PublicCommandFailure({ kind: "unavailable", proof: "pre-effect" });
+		const options = { url, token, pendingCeilingBytes };
+		transport =
+			parsed.mode.kind === "stdio"
+				? await dependencies.startStdio(options)
+				: await dependencies.startSocket({ ...options, socketPath: parsed.mode.socketPath });
+	} catch (error) {
+		// No transport handle has transferred ownership. Cleanup diagnostics are
+		// attached to the original failure instance, never substituted for it, and
+		// broker credentials never reach a raw error.
+		const failure = servePreflightFailure(error);
+		try {
+			await broker?.close();
+		} catch {
+			failure.input.diagnostics = [...(failure.input.diagnostics ?? []), "broker_cleanup_failed"];
+		}
+		throw failure;
+	}
+	await ownSdkServeTransport(transport!, () => broker!.close());
+}
+
+/** Native serve path: operational failures remain typed for direct SDK embedders. */
+async function runSdkServeTyped(argv: string[]): Promise<void> {
 	const parsed = parseServeArguments(argv);
 	if (parsed.mode.kind === "socket" && process.platform === "win32")
 		throw new SdkServeError("unsupported_platform", "--socket is unavailable on Windows.", 1);
@@ -231,8 +546,9 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		throw new SdkServeError("broker_unavailable", "SDK broker is not reachable", 1);
 	}
 	let primary: Error | undefined;
+	let transport: ServeHandle | undefined;
 	try {
-		const sessionId = selectBrokerSession(await listBrokerSessions(broker, parsed.sessionId), parsed.sessionId);
+		const sessionId = await resolveServeSession(broker, parsed.sessionId);
 		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" && endpoint.token ? endpoint.token : undefined;
@@ -241,26 +557,65 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		// connection failure and this stable malformed-endpoint code is lost.
 		if (!url || !token) throw new SdkServeError("unavailable", "broker returned an invalid endpoint record", 1);
 		const options = { url, token, pendingCeilingBytes };
-		const handle =
+		transport =
 			parsed.mode.kind === "stdio"
 				? await startStdioServe(options)
 				: await startSocketServe({ ...options, socketPath: parsed.mode.socketPath });
-		const stop = () => {
-			void handle.close();
-		};
-		process.once("SIGINT", stop);
-		process.once("SIGTERM", stop);
-		try {
-			await handle.done;
-		} finally {
-			process.removeListener("SIGINT", stop);
-			process.removeListener("SIGTERM", stop);
-		}
 	} catch (error) {
 		primary = toServeError(error);
 	}
+	if (transport) {
+		// Once the relay owns stdout, post-start failures must never cross back into
+		// the public command renderer. That boundary writes JSON to stdout, which is
+		// the stdio frame channel; the transport owner reports only a fixed stderr
+		// diagnostic and exit status instead.
+		await ownSdkServeTransport(transport, () => broker.close());
+		return;
+	}
 	// Teardown always runs, but never through a `finally` throw: a rejected
-	// `broker.close()` there would replace the typed failure with its own.
+	// broker.close() there would replace the typed failure with its own.
 	const failure = resolveServeOutcome(primary, await brokerCloseFailure(broker));
 	if (failure) throw failure;
+}
+
+/**
+ * Acquiring a ServeHandle transfers output/termination ownership to transport.
+ * This boundary never rejects into the ordinary public command writer, even
+ * when no frame has been written. Raw relay framing remains transport-owned.
+ */
+export async function ownSdkServeTransport(handle: ServeHandle, closeBroker: () => Promise<void>): Promise<void> {
+	let failed = false;
+	const reportFailure = (): void => {
+		process.exitCode = 1;
+		if (failed) return;
+		failed = true;
+		try {
+			process.stderr.write(`${JSON.stringify({ type: "transport_error", code: "serve_failed" })}\n`);
+		} catch {
+			// A broken diagnostic stream cannot transfer ownership back to the CLI.
+		}
+	};
+	const stop = (): void => {
+		void handle.close().catch(reportFailure);
+	};
+	try {
+		process.once("SIGINT", stop);
+		process.once("SIGTERM", stop);
+		await handle.done;
+	} catch {
+		reportFailure();
+	} finally {
+		process.removeListener("SIGINT", stop);
+		process.removeListener("SIGTERM", stop);
+		try {
+			await handle.close();
+		} catch {
+			reportFailure();
+		}
+		try {
+			await closeBroker();
+		} catch {
+			reportFailure();
+		}
+	}
 }

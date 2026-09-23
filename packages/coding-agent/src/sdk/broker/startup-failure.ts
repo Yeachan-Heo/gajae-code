@@ -5,6 +5,8 @@ import { processIncarnation } from "./process-incarnation";
 export interface BrokerStartupFailureMarker {
 	version: 2;
 	reason: string;
+	/** Validated manual lock cleanup command, stored separately when it cannot fit in `reason`. */
+	cleanupCommand?: string;
 	exitCode: number | null;
 	signal: string | null;
 	writtenAt: number;
@@ -23,9 +25,80 @@ export interface BrokerStartupFailureMarker {
 
 const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
 const MAX_BROKER_STARTUP_FAILURE_REASON = 512;
+// Windows extended paths can be 32,767 UTF-16 code units and PowerShell quoting
+// can double every apostrophe; this also comfortably covers POSIX PATH_MAX paths.
+const MAX_BROKER_STARTUP_FAILURE_CLEANUP_COMMAND = 66_000;
+const FILE_LOCK_CLEANUP_GUIDANCE =
+	"; manual cleanup is appropriate only after independently verifying this exact directory still belongs to the dead owner and no successor has taken it: ";
+const FILE_LOCK_OWNER_GUIDANCE =
+	"; a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying";
+const COMPACT_FILE_LOCK_CLEANUP_GUIDANCE =
+	"Manual cleanup is appropriate only after independently verifying this exact directory still belongs to the dead owner and no successor has taken it: ";
+
+function decodeFileLockCleanupCommand(command: string): string | undefined {
+	if (command.length === 0 || command.length > MAX_BROKER_STARTUP_FAILURE_CLEANUP_COMMAND) return undefined;
+	const prefix = process.platform === "win32" ? "Remove-Item -LiteralPath '" : "rm -rf -- '";
+	const suffix = process.platform === "win32" ? "' -Recurse -Force" : "'";
+	if (!command.startsWith(prefix) || !command.endsWith(suffix)) return undefined;
+
+	const encodedPath = command.slice(prefix.length, -suffix.length);
+	const quoteEscape = process.platform === "win32" ? "''" : "'\\''";
+	const decodedPath = encodedPath.replaceAll(quoteEscape, "'");
+	if (!decodedPath || decodedPath.replaceAll("'", quoteEscape) !== encodedPath) return undefined;
+	return decodedPath;
+}
+
+function validatedFileLockCleanupCommand(reason: string): string | undefined {
+	let guidanceIndex = reason.indexOf(FILE_LOCK_CLEANUP_GUIDANCE);
+	while (guidanceIndex >= 0) {
+		const command = reason.slice(guidanceIndex + FILE_LOCK_CLEANUP_GUIDANCE.length);
+		const lockPath = decodeFileLockCleanupCommand(command);
+		if (lockPath) {
+			const beforeCleanup = reason.slice(0, guidanceIndex);
+			const lockAndOwnerGuidance = ` (${lockPath})${FILE_LOCK_OWNER_GUIDANCE}`;
+			const acquisition = beforeCleanup.endsWith(lockAndOwnerGuidance)
+				? beforeCleanup.slice(0, -lockAndOwnerGuidance.length)
+				: "";
+			if (/^Failed to acquire lock for [\s\S]+ after \d+ attempts: [\s\S]+$/.test(acquisition)) {
+				return command;
+			}
+		}
+		guidanceIndex = reason.indexOf(FILE_LOCK_CLEANUP_GUIDANCE, guidanceIndex + 1);
+	}
+	return undefined;
+}
+
+function boundedFailureDetails(reason: string): { reason: string; cleanupCommand?: string } {
+	if (reason.length <= MAX_BROKER_STARTUP_FAILURE_REASON) return { reason };
+
+	const cleanupCommand = validatedFileLockCleanupCommand(reason);
+	if (cleanupCommand) {
+		const compactReason = `${COMPACT_FILE_LOCK_CLEANUP_GUIDANCE}${cleanupCommand}`;
+		if (compactReason.length <= MAX_BROKER_STARTUP_FAILURE_REASON) return { reason: compactReason };
+		return { reason: COMPACT_FILE_LOCK_CLEANUP_GUIDANCE, cleanupCommand };
+	}
+
+	return { reason: reason.slice(0, MAX_BROKER_STARTUP_FAILURE_REASON) };
+}
 
 export function brokerStartupFailurePath(agentDir: string): string {
 	return path.join(agentDir, "sdk", BROKER_STARTUP_FAILURE_FILE);
+}
+
+/** Whether validated compact cleanup guidance targets the exact lock path. */
+export function brokerStartupFailureCleanupTargetsLock(
+	marker: BrokerStartupFailureMarker | undefined,
+	lockPath: string,
+): boolean {
+	if (!marker) return false;
+	if (marker.cleanupCommand !== undefined) {
+		return (
+			marker.reason === COMPACT_FILE_LOCK_CLEANUP_GUIDANCE &&
+			decodeFileLockCleanupCommand(marker.cleanupCommand) === lockPath
+		);
+	}
+	if (!marker.reason.startsWith(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE)) return false;
+	return decodeFileLockCleanupCommand(marker.reason.slice(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE.length)) === lockPath;
 }
 
 function boundedMarker(
@@ -35,9 +108,10 @@ function boundedMarker(
 	pid: number,
 	incarnation: string,
 ): BrokerStartupFailureMarker {
+	const boundedFailure = boundedFailureDetails(reason);
 	return {
 		version: 2,
-		reason: reason.slice(0, MAX_BROKER_STARTUP_FAILURE_REASON),
+		...boundedFailure,
 		exitCode,
 		signal,
 		writtenAt: Date.now(),
@@ -84,6 +158,11 @@ export async function readBrokerStartupFailureMarker(
 			marker.version !== 2 ||
 			typeof marker.reason !== "string" ||
 			marker.reason.length === 0 ||
+			marker.reason.length > MAX_BROKER_STARTUP_FAILURE_REASON ||
+			(marker.cleanupCommand !== undefined &&
+				(typeof marker.cleanupCommand !== "string" ||
+					marker.reason !== COMPACT_FILE_LOCK_CLEANUP_GUIDANCE ||
+					decodeFileLockCleanupCommand(marker.cleanupCommand) === undefined)) ||
 			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
 			(marker.signal !== null && typeof marker.signal !== "string") ||
 			typeof marker.writtenAt !== "number" ||

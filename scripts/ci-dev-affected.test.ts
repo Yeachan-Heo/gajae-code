@@ -2,7 +2,8 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -42,6 +43,24 @@ test("the production SDK host suites run sequentially and stop after a failure",
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
+
+test("derives Telegram daemon guard coverage from the manifest inventory", async () => {
+	const claimed = Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory));
+	expect(claimed.length).toBeGreaterThan(0);
+	expect(claimed.every(isTelegramDaemonGenerationGuardFile)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(claimed)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/unrelated.ts"])).toBe(false);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/new-telegram-daemon.ts"])).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/daemon-paths-v2.ts"])).toBe(true);
+
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+	const guardStart = workflow.indexOf("  telegram-daemon-generation:\n");
+	const guardEnd = workflow.indexOf("\n  windows-dev-doctor:", guardStart);
+	const guard = workflow.slice(guardStart, guardEnd);
+	expect(workflow).toContain("has_protected_daemon_decl: ${{ steps.plan.outputs.has_protected_daemon_decl }}");
+	expect(guard).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+	expect(guard).not.toContain("needs.affected-plan.outputs.changed_paths");
+});
 
 describe("planTasks command shape (issue #622)", () => {
 	test("no scheduled command uses the false-green standalone `bun --cwd <dir>` form", () => {
@@ -173,7 +192,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
 		expect(workflow).toContain(
-			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')",
+			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.has_protected_daemon_decl }}",
 		);
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
@@ -1401,6 +1420,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+
+	test("model-registry changes schedule the availability-split regression suite", () => {
+		const keys = targeted(["packages/coding-agent/src/config/model-registry.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/model-registry-runtime-provider.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/model-profile-activation.test.ts");
+	});
 	test("managed-session-scope changes schedule the owner-only self-heal budget regression", () => {
 		const keys = targeted(["packages/coding-agent/src/session/internal/managed-session-scope.ts"]).map(
 			task => task.key,
@@ -2002,5 +2027,62 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
+	});
+});
+
+/**
+ * #5583/#5623 review round 4: `schemas/*.json` is generated from
+ * `settings-schema.ts`, and the `--check` gate that catches drift between them
+ * lives only inside `ci:check:full`. Neither planner selected that for a change
+ * confined to those two files, so a settings change could ship with a stale
+ * generated schema and a green affected run.
+ */
+describe("generated JSON schema sync selection", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const schemaPackages = [codingAgent];
+	const SETTINGS_SCHEMA = "packages/coding-agent/src/config/settings-schema.ts";
+	const CHECK_SCHEMAS = ["bun", "run", "check:schemas"];
+
+	function plans(paths: readonly string[]) {
+		return [planTasks(paths, schemaPackages), planTargetedTasks(paths, schemaPackages, [])];
+	}
+
+	test("isSchemaContractPath matches both sides of the generated contract", () => {
+		expect(isSchemaContractPath("schemas/config.schema.json")).toBe(true);
+		expect(isSchemaContractPath(SETTINGS_SCHEMA)).toBe(true);
+		expect(isSchemaContractPath("packages/coding-agent/src/config/settings.ts")).toBe(false);
+		expect(isSchemaContractPath("packages/coding-agent/schemas/other.json")).toBe(false);
+	});
+
+	test("changing the generated schema alone selects the sync check in both planners", () => {
+		for (const tasks of plans(["schemas/config.schema.json"])) {
+			const task = tasks.find(candidate => candidate.key === "check-schemas");
+			expect(task).toBeDefined();
+			expect(task?.command).toEqual(CHECK_SCHEMAS);
+			expect(task?.cwd).toBeUndefined();
+		}
+	});
+
+	test("changing the settings schema alone selects the sync check in both planners", () => {
+		for (const tasks of plans([SETTINGS_SCHEMA])) {
+			expect(tasks.find(candidate => candidate.key === "check-schemas")?.command).toEqual(CHECK_SCHEMAS);
+		}
+	});
+
+	test("an unrelated path never selects the sync check", () => {
+		for (const tasks of plans(["packages/coding-agent/src/edit/foo.ts"])) {
+			expect(tasks.map(task => task.key)).not.toContain("check-schemas");
+		}
+	});
+
+	test("the sync check is a single planned task, so it flows into the normal shard aggregate", () => {
+		for (const tasks of plans(["schemas/config.schema.json", SETTINGS_SCHEMA])) {
+			expect(tasks.filter(task => task.key === "check-schemas")).toHaveLength(1);
+			expect(describeTasks(tasks).find(entry => entry.key === "check-schemas")).toBeDefined();
+		}
 	});
 });

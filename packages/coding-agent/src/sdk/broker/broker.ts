@@ -37,7 +37,12 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
-import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	getBrokerIdentityKey,
+} from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
@@ -335,7 +340,7 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 		: "terminal_error";
 }
 
-type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
+export type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
 type SessionListCursor = {
 	sessions: IndexedSession[];
@@ -564,6 +569,26 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 	);
 }
 
+/** Exact admission predicate for the child host row published after launch. */
+export function spawnRegistrationMatches(
+	candidate: IndexedSession,
+	expected: { childId: string; cwd: string; stateRoot: string },
+): boolean {
+	return (
+		candidate.sessionId === expected.childId &&
+		candidate.endpointGeneration > 0 &&
+		candidate.live &&
+		!candidate.terminal &&
+		!candidate.terminalUncertain &&
+		// The child publishes a realpath-canonicalized locator while the launch
+		// spec carries the caller's lexical spelling. Compare path identity so a
+		// symlinked workspace (macOS /var vs /private/var) cannot strand a valid
+		// registration behind different spellings.
+		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(expected.cwd) &&
+		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(expected.stateRoot)
+	);
+}
+
 /** Rebuilds the provider proof from durable authority facts only. */
 function spawnProofFromAuthority(authority: SpawnAuthorityV1): SpawnSubstrateProof {
 	return {
@@ -636,7 +661,7 @@ function normalizeAliasedString(
 	return { value: values[0] };
 }
 
-function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
+export function normalizeBrokerInput(operation: string, input: Record<string, unknown>): InputNormalization {
 	const normalized: Record<string, unknown> = { ...input };
 	const session = normalizeAliasedString(input, "sessionId", ["id"]);
 	if (session.error) return error("invalid_input", session.error);
@@ -940,13 +965,29 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
 		case "session.delete":
 		case "session.reconcile_uncertain":
 			return { sessionId: id };
+		case "session.close":
+			return { sessionId: id, ...closeTargetAuthority(input) };
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+function closeTargetAuthority(input: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	if (
+		typeof input.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(input.endpointGeneration) ||
+		input.endpointGeneration <= 0 ||
+		typeof input.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation };
 }
 
 /**
@@ -1428,11 +1469,17 @@ export class Broker {
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
 		if (isBrokerResponse(admission)) return admission;
-		const lifecycleIdentity = await deriveIdempotencyIdentity(
+		// session.spawn predates target-bound lifecycle identities and its durable
+		// authority store already binds the raw request. Keep the v3 identity for
+		// new claims, while recognizing the v4 identity written by the short-lived
+		// target-bound implementation so an upgrade cannot admit a second child.
+		const targetBoundIdentity = await deriveIdempotencyIdentity(
 			this.settings.agentDir,
 			"session.spawn",
 			idempotencyKey!,
 		);
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const lifecycleIdentity = this.#spawnAuthority?.claim(targetBoundIdentity) ? targetBoundIdentity : legacyIdentity;
 		const active = this.#spawnInFlight.get(lifecycleIdentity);
 		if (active) {
 			if (this.#spawnTasks.get(active) !== admission.task)
@@ -1563,8 +1610,11 @@ export class Broker {
 				);
 			if (decision.kind === "in_progress")
 				return finish(error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
-			if (decision.kind === "terminal_uncertain")
+			if (decision.kind === "terminal_uncertain") {
+				if (decision.claim.substrateProof !== undefined && decision.claim.authorityRef === undefined)
+					return finish(await this.#reconcileUncertainRegistration(lifecycleIdentity, decision.claim));
 				return finish(error("terminal_uncertain", "session.spawn outcome is uncertain"));
+			}
 			if (decision.kind === "terminal") return finish(this.#spawnTerminalResponse(decision.claim));
 			if (decision.kind === "replay")
 				return finish(await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
@@ -1617,6 +1667,53 @@ export class Broker {
 				? spawnFailureError(claim.failure)
 				: error("spawn_failed", "session.spawn was rejected before seed handoff");
 		return error("resource_gone", "session.spawn claim is closed");
+	}
+
+	/** Re-prove an unbound launch on an idempotent retry instead of fencing it forever. */
+	async #reconcileUncertainRegistration(lifecycleIdentity: string, claim: SpawnClaimV2): Promise<BrokerResponse> {
+		const proof = claim.substrateProof;
+		if (claim.state !== "uncertain" || claim.authorityRef !== undefined || !claim.childId || proof === undefined)
+			return error("terminal_uncertain", "session.spawn registration authority is unavailable for reconciliation");
+		const provider = this.#spawnSubstrateProvider();
+		let verdict: "verified" | "mismatch" | "gone";
+		try {
+			verdict = await provider.verify(proof);
+		} catch {
+			return error("terminal_uncertain", "session.spawn registration proof could not be re-verified");
+		}
+		if (verdict === "mismatch")
+			return error("terminal_uncertain", "session.spawn registration proof no longer matches the launch");
+		if (verdict === "verified") {
+			try {
+				const closed = await provider.close(proof);
+				if (!closed.ok)
+					return error(
+						"terminal_uncertain",
+						"session.spawn child registration remains unresolved after the bounded close attempt",
+					);
+			} catch {
+				return error("terminal_uncertain", "session.spawn child registration close could not be verified");
+			}
+		}
+		const failure: SpawnSubstrateFailure = {
+			substrateKind: proof.substrateKind,
+			code: "child_registration_reconciled_failed",
+			message:
+				verdict === "gone"
+					? "session.spawn child host exited before registration"
+					: "session.spawn child host was closed before registration",
+		};
+		try {
+			await this.#spawnAuthority?.persistTransition(lifecycleIdentity, {
+				claimId: claim.claimId,
+				from: "uncertain",
+				to: "pre_send_rejected",
+				failure,
+			});
+		} catch {
+			return error("terminal_uncertain", "session.spawn registration reconciliation could not be persisted");
+		}
+		return spawnFailureError(failure);
 	}
 
 	#spawnSubstrateProvider(): SpawnSubstrateProvider {
@@ -1694,8 +1791,26 @@ export class Broker {
 						code: "substrate_proof_failed",
 						message: "session.spawn substrate lacks lifecycle process authority",
 					};
-					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "unresolved") {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "child_registration_release_unproven",
+									message: "session.spawn child registration could not prove substrate release",
+								},
+							})
+						).claim;
+						launchedProof = undefined;
+						return error(
+							"terminal_uncertain",
+							"session.spawn substrate release could not be proven after the launch proof failed",
+						);
+					}
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1704,8 +1819,18 @@ export class Broker {
 							failure,
 						})
 					).claim;
+					launchedProof = undefined;
 					return spawnFailureError(failure);
 				}
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "substrate_starting",
+						to: "substrate_starting",
+						childId: prep.childId,
+						substrateProof: launched.proof,
+					})
+				).claim;
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
@@ -1715,18 +1840,44 @@ export class Broker {
 				});
 				if (!registration.ok) {
 					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
-					await this.#releaseUnownedSubstrate(provider, launchedProof);
-					launchedProof = undefined;
+					const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+					if (release === "closed" || release === "gone") {
+						const failure: SpawnSubstrateFailure = {
+							substrateKind: launched.proof.substrateKind,
+							code: startupFailure === undefined ? "child_registration_timeout" : "child_registration_failed",
+							message:
+								startupFailure === undefined
+									? "session.spawn child host did not register before the bounded admission deadline"
+									: `session.spawn child host failed during ${startupFailure.phase}/${startupFailure.reason}`,
+						};
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "pre_send_rejected",
+								failure,
+							})
+						).claim;
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					}
+					const unresolvedRelease: SpawnSubstrateFailure = {
+						substrateKind: launched.proof.substrateKind,
+						code: "child_registration_release_unproven",
+						message: "session.spawn child registration could not prove substrate release",
+					};
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
 							from: "substrate_starting",
 							to: "uncertain",
+							failure: unresolvedRelease,
 						})
 					).claim;
+					launchedProof = undefined;
 					return error(
 						"terminal_uncertain",
-						"session.spawn child registration is uncertain" +
+						"session.spawn child registration is uncertain (substrate release could not be proven)" +
 							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
 					);
 				}
@@ -1892,15 +2043,72 @@ export class Broker {
 		} catch {
 			// Once a substrate exists the outcome is ambiguous even before handoff:
 			// reporting an ordinary failure would downgrade retained uncertainty.
-			const ambiguous = handedOff || launchedProof !== undefined;
+			let ambiguous = handedOff || launchedProof !== undefined;
 			// A launched substrate with no persisted authority is invisible to the
 			// reaper, so in-process cleanup is its only chance. This must run on
 			// EVERY post-launch failure exit, not just a returned registration
 			// failure: a throw from awaitRegistration, verify, close, or a durable
 			// transition all land here.
-			if (!handedOff) await this.#releaseUnownedSubstrate(provider, launchedProof);
+			if (!handedOff) {
+				const release = await this.#releaseUnownedSubstrate(provider, launchedProof);
+				if ((release === "closed" || release === "gone") && current.state === "substrate_starting") {
+					const failure: SpawnSubstrateFailure = {
+						substrateKind: launchedProof?.substrateKind ?? "headless",
+						code: "child_registration_failed",
+						message: "session.spawn child host failed before registration",
+					};
+					try {
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "pre_send_rejected",
+							failure,
+						});
+						launchedProof = undefined;
+						return spawnFailureError(failure);
+					} catch {
+						// The substrate is closed, but a failed terminal write still leaves
+						// the durable claim unresolved for the next broker recovery pass.
+					}
+				} else if (release === "unresolved" && current.state === "substrate_starting") {
+					try {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launchedProof?.substrateKind ?? "headless",
+									code: "child_registration_release_unproven",
+									message: "session.spawn child registration could not prove substrate release",
+								},
+							})
+						).claim;
+						launchedProof = undefined;
+					} catch {
+						// Preserve the generic durable-state uncertainty if the reason itself
+						// cannot be appended.
+					}
+				} else if (release === "absent" && current.state === "substrate_starting") {
+					try {
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+							})
+						).claim;
+						ambiguous = true;
+					} catch {
+						// Keep the generic failure when even the uncertainty transition cannot be written.
+					}
+				}
+			}
 			return ambiguous
-				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
+				? error(
+						"terminal_uncertain",
+						current.failure?.message ?? "session.spawn state could not be advanced durably",
+					)
 				: error("spawn_failed", "session.spawn could not be advanced durably");
 		}
 	}
@@ -1914,22 +2122,26 @@ export class Broker {
 	async #releaseUnownedSubstrate(
 		provider: SpawnSubstrateProvider,
 		proof: SpawnSubstrateProof | undefined,
-	): Promise<void> {
-		if (!proof) return;
+	): Promise<"closed" | "gone" | "absent" | "unresolved"> {
+		// A launch that throws before returning proof has no substrate identity to
+		// classify as gone; keep the claim uncertain instead of fabricating a kind.
+		if (!proof) return "absent";
 		let verdict: "verified" | "mismatch" | "gone";
 		try {
 			verdict = await provider.verify(proof);
 		} catch {
 			// An unprovable substrate is never mutated; uncertainty is retained by
 			// the caller's durable transition instead.
-			return;
+			return "unresolved";
 		}
-		if (verdict !== "verified") return;
+		if (verdict === "gone") return "gone";
+		if (verdict !== "verified") return "unresolved";
 		try {
-			await provider.close(proof);
+			return (await provider.close(proof)).ok ? "closed" : "unresolved";
 		} catch {
 			// The substrate may survive. The caller still records uncertainty, which
 			// is the honest durable outcome for an unclosed unowned substrate.
+			return "unresolved";
 		}
 	}
 
@@ -2102,21 +2314,9 @@ export class Broker {
 				await this.index.refresh();
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
-				const row = this.index.listSessionIdentities().find(
-					candidate =>
-						candidate.sessionId === input.childId &&
-						candidate.endpointGeneration > 0 &&
-						candidate.live &&
-						!candidate.terminal &&
-						!candidate.terminalUncertain &&
-						// Path IDENTITY, not spelling. The child publishes a
-						// realpath-canonicalized locator while the launch spec carries the
-						// caller's lexical path, so `path.resolve` never reconciles a
-						// symlinked workspace (macOS /var vs /private/var) and a
-						// legitimate child would never match.
-						resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.cwd) &&
-						resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(input.stateRoot),
-				);
+				const row = this.index
+					.listSessionIdentities()
+					.find(candidate => spawnRegistrationMatches(candidate, input));
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;
 					// An incarnation-less row is incomplete endpoint evidence; a partial pin
@@ -3449,7 +3649,9 @@ export class Broker {
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry = this.ledger.get(identity);
+		const entry =
+			this.ledger.get(identity) ??
+			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
 		if (!entry) return error("not_found", "lifecycle operation was not found");
 		if (entry.fingerprint !== requestedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");
@@ -3509,10 +3711,10 @@ export class Broker {
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
+		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
 			const page = await this.#sessionListPage(input, this.index.listSessions());
@@ -3582,8 +3784,64 @@ export class Broker {
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
-		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const identity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			operation === "session.create" ? undefined : target,
+		);
 		const operationKey = `${operation}\0${idempotencyKey}`;
+		const requestedRequestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, operation, idempotencyKey);
+		const legacyTargetIdentity = await deriveLegacyTargetIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			target,
+		);
+		const metadata = {
+			operationKey,
+			fingerprint,
+			...(operation === "session.close" && typeof input.sessionId === "string"
+				? { intendedSessionId: input.sessionId }
+				: {}),
+		};
+		if (!this.ledger.get(identity)) {
+			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
+			const sameCloseSession =
+				operation === "session.close" &&
+				(matchingOperation?.intendedSessionId === input.sessionId ||
+					matchingOperation?.resultSessionId === input.sessionId);
+			if (
+				matchingOperation &&
+				!sameCloseSession &&
+				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
+			)
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			const matchingLegacy = matchingOperation;
+			if (matchingLegacy) {
+				if (matchingLegacy.identity === legacyIdentity || matchingLegacy.identity === legacyTargetIdentity)
+					await this.ledger.migrateIdentity(matchingLegacy.identity, identity, metadata);
+			} else if (this.ledger.get(legacyIdentity)) {
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			} else {
+				const legacyTargetEntry = this.ledger.get(legacyTargetIdentity);
+				if (legacyTargetEntry) {
+					if (legacyTargetEntry.requestHash !== requestedRequestHash)
+						return error("idempotency_conflict", "idempotency key was used with a different request");
+					await this.ledger.migrateIdentity(legacyTargetIdentity, identity, metadata);
+					// Exact target-derived legacy identity migrated without granting new authority.
+				} else if (
+					this.ledger.hasLegacyIdentity(
+						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
+					)
+				) {
+					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
+				}
+			}
+		}
 
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
@@ -3653,7 +3911,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
+			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;

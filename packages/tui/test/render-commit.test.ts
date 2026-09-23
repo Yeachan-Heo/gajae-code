@@ -441,7 +441,7 @@ describe("generation-scoped render commits", () => {
 		if (lease.status !== "acquired") throw new Error("lease not acquired");
 		const flushGate = Promise.withResolvers<void>();
 		const flushStarted = Promise.withResolvers<void>();
-		terminal.flush = async () => {
+		(terminal as unknown as { flush: () => Promise<boolean> }).flush = async () => {
 			flushStarted.resolve();
 			await flushGate.promise;
 			return true;

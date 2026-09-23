@@ -4,7 +4,7 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
-import { getMCPConfigPath } from "@gajae-code/utils";
+import { getMCPConfigPath, logger } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
 import type { Settings } from "../config/settings";
@@ -15,6 +15,14 @@ import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
 import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
+
+function logSkippedServer(name: string, reason: string): void {
+	logger.warn("Skipping MCP autoload registration", {
+		path: `mcp:${name}`,
+		serverName: name,
+		reason,
+	});
+}
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
@@ -174,9 +182,16 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	for (const server of servers) {
 		const config = convertToLegacyConfig(server);
 		if (config.enabled === false || disabledServers.has(server.name)) {
+			if (!exactConfig) {
+				logSkippedServer(
+					server.name,
+					config.enabled === false ? "registration is disabled" : "server is listed in disabledServers",
+				);
+			}
 			continue;
 		}
 		if (autoloadOnly && config.autoload === false) {
+			if (!exactConfig) logSkippedServer(server.name, "autoload is disabled for this registration");
 			continue;
 		}
 		configs[server.name] = config;

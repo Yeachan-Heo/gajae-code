@@ -4,8 +4,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
+import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
+import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
+import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
@@ -26,13 +28,14 @@ import {
 	type SessionLifecycleLaunchRequest,
 	type SessionLifecycleTranscriptIdentity,
 	sessionHostAttachedClients,
-	sessionHostWorkInFlight,
+	sessionHostWorkLeaseActive,
 	startBrokerDeadRegistrationSweep,
 	writeSessionLifecycleFailure,
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
+import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
@@ -250,28 +253,27 @@ const SESSION_HOST_ATTACHMENT_POLL_MS = 30_000;
  * an observed count of zero. Every reachable state therefore carries a finite
  * bound.
  *
- * `readWorkInFlight` reports whether the host is running agent work right now.
- * Work is positive proof a client did come for this host: a prompt can only
- * arrive over an endpoint a client dialed. Live work therefore restarts both
- * windows, which is what keeps a mid-prompt host alive whether its count reads
- * zero or stops being readable at all. That still bounds a host whose SDK
- * runtime never came up: with no transport it can never receive a prompt, so it
- * never reports work and its window keeps running from process start. And any
- * real turn ends, after which the window resumes; live work defers a bound, it
- * never removes it.
+ * `readWorkLease` reports whether the host's authoritative session-work lease
+ * is held. A lease is positive proof a client did come for this host: a prompt
+ * can only arrive over an endpoint a client dialed. Live work therefore
+ * restarts both windows, which is what keeps a mid-prompt host alive whether
+ * its count reads zero or stops being readable at all. That still bounds a
+ * host whose SDK runtime never came up: with no transport it can never receive
+ * a prompt, so it never acquires work and its window keeps running from process
+ * start. Releasing the lease resumes the applicable bound.
  */
 export async function watchSessionHostClientAttachment(deps: {
 	readAttachedClients: () => number | undefined;
-	readWorkInFlight?: () => boolean;
+	readWorkLease?: () => boolean;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	idleGraceMs?: number;
 	firstAttachGraceMs?: number;
 	pollMs?: number;
-}): Promise<void> {
+}): Promise<"detached_idle"> {
 	const now = deps.now ?? Date.now;
 	const sleep = deps.sleep ?? (async ms => await Bun.sleep(ms));
-	const readWorkInFlight = deps.readWorkInFlight ?? (() => false);
+	const readWorkLease = deps.readWorkLease ?? (() => false);
 	const idleGraceMs = deps.idleGraceMs ?? SESSION_HOST_DETACHED_IDLE_GRACE_MS;
 	const firstAttachGraceMs = deps.firstAttachGraceMs ?? SESSION_HOST_FIRST_ATTACH_GRACE_MS;
 	const pollMs = deps.pollMs ?? SESSION_HOST_ATTACHMENT_POLL_MS;
@@ -281,7 +283,7 @@ export async function watchSessionHostClientAttachment(deps: {
 	let unattendedSince = now();
 	for (;;) {
 		const attached = deps.readAttachedClients();
-		if (readWorkInFlight()) {
+		if (readWorkLease()) {
 			unattendedSince = now();
 			detachedSince = null;
 		}
@@ -294,9 +296,9 @@ export async function watchSessionHostClientAttachment(deps: {
 			// registration stops publishing a count instead of reporting zero.
 			// Both accrue against the idle bound rather than running forever.
 			detachedSince ??= now();
-			if (now() - detachedSince >= idleGraceMs) return;
+			if (now() - detachedSince >= idleGraceMs) return "detached_idle";
 		} else if (now() - unattendedSince >= firstAttachGraceMs) {
-			return;
+			return "detached_idle";
 		}
 		await sleep(pollMs);
 	}
@@ -686,10 +688,10 @@ export async function runSessionHost(
 		lifecycleTranscriptPath = session.sessionManager.getSessionFile();
 	});
 	let sessionDisposal: Promise<void> | undefined;
-	const disposeSession = (): Promise<void> => {
+	const disposeSession = (reason?: "detached_idle"): Promise<void> => {
 		sessionDisposal ??= (async () => {
 			try {
-				await session.dispose();
+				await session.dispose(reason === undefined ? {} : { sessionShutdownReason: reason });
 			} catch (error) {
 				if (!isSessionDisposalIncompleteError(error)) throw error;
 				await session.awaitDisposeCompletion();
@@ -735,8 +737,8 @@ export async function runSessionHost(
 		return failureRollback;
 	};
 	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (): Promise<void> => {
-		await disposeSession();
+	const exitAfterSessionDisposal = async (reason?: "detached_idle"): Promise<void> => {
+		await disposeSession(reason);
 		let failure: SdkStartupFailure | undefined;
 		try {
 			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
@@ -766,11 +768,11 @@ export async function runSessionHost(
 		process.exit(process.exitCode ?? 0);
 	};
 	let stopping = false;
-	const stop = () => {
+	const stop = (reason?: "detached_idle") => {
 		if (capability.result?.status === "started") {
 			if (stopping) return;
 			stopping = true;
-			void exitAfterSessionDisposal();
+			void exitAfterSessionDisposal(reason);
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
@@ -858,31 +860,53 @@ export async function runSessionHost(
 		await Bun.sleep(5_000);
 	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
-	process.once("SIGTERM", stop);
-	process.once("SIGINT", stop);
+	process.once("SIGTERM", () => stop());
+	process.once("SIGINT", () => stop());
 	// Two independent bounds, either of which reaps this detached host through
 	// the same graceful teardown a SIGTERM would take. The first covers a broker
 	// that is gone for good; the second covers the opposite case, a perfectly
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
-	await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir }),
+	const reapReason = await Promise.race([
+		watchSessionHostBrokerLiveness({ agentDir }).then(() => undefined),
 		watchSessionHostClientAttachment({
 			readAttachedClients: sessionHostAttachedClients,
-			readWorkInFlight: sessionHostWorkInFlight,
+			readWorkLease: sessionHostWorkLeaseActive,
 		}),
 	]);
-	stop();
+	stop(reapReason);
 	await new Promise<void>(() => {});
 }
 
-export type SdkInternalArgv = { action: "broker-internal"; agentDir: string } | { action: "session-host-internal" };
+export type SdkInternalArgv =
+	| { action: "broker-internal"; agentDir: string }
+	| { action: "session-host-internal" }
+	| { action: "stderr-drain-internal"; logPath: string; maxBytes: number };
 
 /** Parses the exact private argv contracts used by SDK child-process spawns. */
 export function parseSdkInternalArgv(argv: readonly string[]): SdkInternalArgv {
 	if (argv[0] === "session-host-internal" && argv.length === 1) return { action: "session-host-internal" };
-	if (argv[0] === "broker-internal" && argv.length === 3 && argv[1] === "--agent-dir" && argv[2])
+	if (
+		argv[0] === "broker-internal" &&
+		argv.length === 3 &&
+		argv[1] === "--agent-dir" &&
+		typeof argv[2] === "string" &&
+		isSafeSdkInternalAgentDir(argv[2])
+	)
 		return { action: "broker-internal", agentDir: argv[2] };
+	if (
+		argv[0] === "stderr-drain-internal" &&
+		argv.length === 5 &&
+		argv[1] === "--path" &&
+		argv[2] &&
+		path.isAbsolute(argv[2]) &&
+		argv[3] === "--max-bytes"
+	) {
+		const maxBytes = parsePositiveTimeout(argv[4], "--max-bytes");
+		if (maxBytes !== undefined && maxBytes <= 64 * 1024) {
+			return { action: "stderr-drain-internal", logPath: argv[2], maxBytes };
+		}
+	}
 	throw new CliParseError("Invalid internal SDK invocation.");
 }
 
@@ -911,12 +935,12 @@ class SdkServeHelp extends Command {
 
 class SdkSessionHelp extends Command {
 	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
+		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|close|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
 	static args = {
 		verb: Args.string({
 			description: "Session verb",
 			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "retire", "raw"],
+			options: ["list", "inspect", "send", "status", "tail", "close", "retire", "raw"],
 		}),
 		target: Args.string({
 			description: "Session id (or the raw kind control|query|global for `raw`)",
@@ -943,7 +967,8 @@ class SdkSessionHelp extends Command {
 		}),
 		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
 		cursor: Flags.string({
-			description: "Raw query continuation cursor, saved checkpoint token, or search continuation cursor",
+			description:
+				"Raw query continuation/search cursor, or session tail checkpoint claim (tail also requires --after-transcript-id)",
 		}),
 		scope: Flags.string({
 			description:
@@ -960,6 +985,10 @@ class SdkSessionHelp extends Command {
 		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
 		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
+		"after-transcript-id": Flags.string({
+			description:
+				"tail --cursor (required): omit transcript rows up to and including this row id (the caller already has them)",
+		}),
 		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
 	};
 	async run(): Promise<void> {}
@@ -1061,6 +1090,7 @@ class SdkSessionCommand extends Command {
 			strict: Boolean(flagRec.strict),
 			untilIdle: Boolean(flagRec["until-idle"]),
 			allEvents: Boolean(flagRec["all-events"]),
+			afterTranscriptId: flagRec["after-transcript-id"] as string | undefined,
 			page: Boolean(flagRec.page),
 			limit: flagRec.limit as number | undefined,
 			agentDir: flagRec["agent-dir"] as string | undefined,
@@ -1100,93 +1130,121 @@ class SdkGuidesCommand extends Command {
 		});
 	}
 }
-
 export default class Sdk extends Command {
-	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
+	static description = "SDK command runtime; public grammar and help are registry-owned.";
 	static hidden = false;
 	static delegateHelp = true;
-	static args = {
-		action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }),
-	};
-	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
-		const action = this.argv[0];
-		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			const helpAction =
-				action === "serve"
-					? "sdk serve"
-					: action === "search"
-						? "sdk search"
-						: action === "spawn"
-							? "sdk spawn"
-							: action === "session"
-								? "sdk session"
-								: action === "guides"
-									? "sdk guides"
-									: "sdk";
-			const helpCommand =
-				action === "serve"
-					? SdkServeHelp
-					: action === "search"
-						? SdkSearchCommand
-						: action === "spawn"
-							? SdkSpawnCommand
-							: action === "session"
-								? SdkSessionCommand
-								: action === "guides"
-									? SdkGuidesCommand
-									: Sdk;
-			renderCommandHelp("gjc", helpAction, helpCommand);
-			return;
-		}
-		if (action === "search") {
-			await new SdkSearchCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "spawn") {
-			await new SdkSpawnCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "session") {
-			await new SdkSessionCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "guides") {
-			await new SdkGuidesCommand(this.argv.slice(1), this.config).run();
-			return;
-		}
-		if (action === "serve") {
-			try {
-				await runSdkServe(this.argv.slice(1));
-			} catch (error) {
-				if (!(error instanceof SdkServeError)) throw error;
-				// stdout is the frame channel in --stdio mode, so the envelope goes to
-				// stderr; returning instead of rethrowing is what keeps a session-selection
-				// failure from reaching the embedder as an uncaught exception.
-				process.stderr.write(
-					`${JSON.stringify({
-						ok: false,
-						error: {
-							code: error.code,
-							message: error.message,
-							...(error.details === undefined ? {} : { details: error.details }),
-							// A broker teardown that failed alongside the primary failure is
-							// recorded on the error; dropping it here would hide from the
-							// embedder that the session may not have been released cleanly.
-							...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
-						},
-					})}\n`,
-				);
-				process.exitCode = error.exitCode;
+		if (
+			this.argv[0] !== "broker-internal" &&
+			this.argv[0] !== "session-host-internal" &&
+			this.argv[0] !== "stderr-drain-internal"
+		) {
+			const scan = scanPublicCommand("sdk", this.argv);
+			if (scan.kind !== "operation") throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
+			const { args, flags } = scan;
+			const operation = scan.descriptor.command[1];
+			const stringFlag = (name: string): string | undefined => flags[name] as string | undefined;
+			const timeoutMs = flags["timeout-ms"] === undefined ? undefined : Number(flags["timeout-ms"]);
+			if (operation === "spawn") {
+				const spawn = await runSdkSpawn({
+					cwd: stringFlag("cwd"),
+					prompt: stringFlag("prompt"),
+					model: stringFlag("model"),
+					profile: stringFlag("profile"),
+					agentDir: stringFlag("agent-dir"),
+					idempotencyKey: stringFlag("idempotency-key"),
+				});
+				process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
+				return;
 			}
-			return;
+			if (operation === "search") {
+				const search = await runSdkSearch({
+					agentDir: stringFlag("agent-dir"),
+					repo: stringFlag("repo"),
+					scope: stringFlag("scope"),
+					limit: flags.limit as number | undefined,
+					cursor: stringFlag("cursor"),
+				});
+				process.stdout.write(
+					`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`,
+				);
+				return;
+			}
+			if (operation === "session") {
+				await runSdkSessionCli({
+					action: scan.descriptor.command[2],
+					rawAction: scan.descriptor.command[3],
+					sessionId: args.sessionId as string | undefined,
+					opRef: (args.opRef as string | undefined) ?? stringFlag("op-ref"),
+					operation: stringFlag("op"),
+					query: stringFlag("query"),
+					text: stringFlag("text"),
+					jsonInput: stringFlag("json-input"),
+					jsonInputFile: stringFlag("json-input-file"),
+					jsonInputStdin: Boolean(flags["json-input-stdin"]),
+					confirm: Boolean(flags.confirm),
+					idempotencyKey: stringFlag("idempotency-key"),
+					cursor: stringFlag("cursor"),
+					afterTranscriptId: stringFlag("after-transcript-id"),
+					wait: Boolean(flags.wait),
+					timeoutMs,
+					strict: Boolean(flags.strict),
+					untilIdle: Boolean(flags["until-idle"]),
+					allEvents: Boolean(flags["all-events"]),
+					page: Boolean(flags.page),
+					limit: flags.limit as number | undefined,
+					agentDir: stringFlag("agent-dir"),
+					repo: stringFlag("repo"),
+					scope: stringFlag("scope"),
+					json: flags.json === true,
+				});
+				return;
+			}
+			if (operation === "guides") {
+				await runSdkGuidesCli({
+					action: scan.descriptor.command[2],
+					guideId: args.guideId as string | undefined,
+					url: stringFlag("url"),
+					agentDir: stringFlag("agent-dir"),
+					timeoutMs,
+				});
+				return;
+			}
+			if (operation === "serve") {
+				try {
+					await runSdkServe(scan.operationArgv.slice(1));
+				} catch (error) {
+					if (!(error instanceof SdkServeError)) throw error;
+					// A command invoked outside the public family dispatcher still owns its
+					// stderr envelope. The dispatcher itself keeps the typed failure for the
+					// shared JSON/text boundary so it can render the full contract.
+					if (this.config?.commands instanceof Map && this.config.commands.has("sdk")) throw error;
+					process.stderr.write(
+						`${JSON.stringify({
+							ok: false,
+							error: {
+								code: error.code,
+								message: error.message,
+								...(error.details === undefined ? {} : { details: error.details }),
+								...(error.cleanupError === undefined ? {} : { cleanupError: error.cleanupError }),
+							},
+						})}\n`,
+					);
+					process.exitCode = error.exitCode;
+				}
+				return;
+			}
+			throw new PublicCommandFailure({ kind: "usage", proof: "pre-effect" });
 		}
-		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve, search, spawn, session, or guides.");
+
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
+			return;
+		}
+		if (internal.action === "stderr-drain-internal") {
+			await runSdkStderrDrainer(internal.logPath, internal.maxBytes);
 			return;
 		}
 		const agentDir = path.resolve(internal.agentDir);

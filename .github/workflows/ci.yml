@@ -255,12 +255,28 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Download native addon(s)
+         - name: Restore native addon(s) from this run
+           id: native_restore
            if: ${{ matrix.native }}
+           continue-on-error: true
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               name: main-native-${{ github.run_id }}
               path: packages/natives/native
+         - name: Rebuild native addon(s) when this run's artifact has expired
+           if: ${{ matrix.native && steps.native_restore.outcome == 'failure' }}
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: |
+              # `main-native-<run_id>` is retained for one day because a normal run
+              # consumes it inside that same run. Re-running a run older than that
+              # finds no artifact to download, which is not a code failure: rebuild
+              # the same variants from the same source rather than failing every
+              # native shard on an expired artifact (#5715).
+              echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
+              bun run ci:build:native
          - name: Run task shard
            env:
               GITHUB_ACTIONS: ""
@@ -285,11 +301,24 @@ jobs:
               path: ~/.bun/install/cache
               key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
          - run: bun install --frozen-lockfile
-         - name: Download native addon(s)
+         - name: Restore native addon(s) from this run
+           id: native_restore
+           continue-on-error: true
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
               name: main-native-${{ github.run_id }}
               path: packages/natives/native
+         - name: Rebuild native addon(s) when this run's artifact has expired
+           if: ${{ steps.native_restore.outcome == 'failure' }}
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: |
+              # Same recovery as the shard lane: an expired run-scoped artifact on a
+              # re-run is not a code failure (#5715).
+              echo "::notice::main-native-${{ github.run_id }} is no longer retained; rebuilding the native addon from source for this re-run."
+              bun run ci:build:native
          - name: Run ACP conformance
            run: |
               # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
@@ -347,6 +376,46 @@ jobs:
    # platform, then standalone binaries. Rehearsals stop after binary verification;
    # nightly publication waits for `nightly_gate` before touching npm or GitHub.
    # ---------------------------------------------------------------------------
+   mupdf_source:
+      if: ${{ needs.release_metadata.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [release_metadata]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 90
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - run: bun install --frozen-lockfile
+         - name: Install pinned Emscripten SDK
+           shell: bash
+           run: |
+              git clone --depth 1 --branch 4.0.8 https://github.com/emscripten-core/emsdk.git "$RUNNER_TEMP/emsdk"
+              actual_commit="$(git -C "$RUNNER_TEMP/emsdk" rev-parse HEAD)"
+              test "$actual_commit" = "419021fa040428bc69ef1559b325addb8e10211f" || {
+                 echo "Unexpected emsdk commit: $actual_commit" >&2
+                 exit 1
+              }
+              "$RUNNER_TEMP/emsdk/emsdk" install 4.0.8
+              "$RUNNER_TEMP/emsdk/emsdk" activate 4.0.8
+              echo "EMSDK=$RUNNER_TEMP/emsdk" >> "$GITHUB_ENV"
+         - name: Build MuPDF release materials
+           shell: bash
+           run: |
+              source "$EMSDK/emsdk_env.sh"
+              bun scripts/prepare-mupdf-release-materials.ts --output-dir "$RUNNER_TEMP/mupdf-release-materials"
+         - name: Upload version-qualified MuPDF source materials
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version || format('rehearsal-{0}', github.run_id) }}
+              path: ${{ runner.temp }}/mupdf-release-materials
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+
    native:
       if: ${{ always() && needs.release_metadata.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
       needs: [release_metadata]
@@ -376,8 +445,8 @@ jobs:
               nightly_version: ${{ needs.release_metadata.outputs.nightly_version }}
 
    binaries:
-      if: ${{ always() && needs.release_metadata.result == 'success' && needs.native.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
-      needs: [native, release_metadata]
+      if: ${{ always() && needs.release_metadata.result == 'success' && needs.native.result == 'success' && needs.mupdf_source.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [native, release_metadata, mupdf_source]
       timeout-minutes: 60
       runs-on: ${{ matrix.os }}
       strategy:
@@ -406,6 +475,11 @@ jobs:
          - name: Stage nightly release version
            if: ${{ needs.release_metadata.outputs.nightly_version != '' }}
            run: bun scripts/nightly-release.ts stage --version "${{ needs.release_metadata.outputs.nightly_version }}" --source-sha "${{ github.sha }}"
+         - name: Download MuPDF release materials
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version || format('rehearsal-{0}', github.run_id) }}
+              path: ${{ runner.temp }}/mupdf-release-materials
          - name: Download native addon(s)
            uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
            with:
@@ -418,6 +492,7 @@ jobs:
          - name: Build release binary
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
+              GJC_MUPDF_RELEASE_MATERIALS_DIR: ${{ runner.temp }}/mupdf-release-materials
            run: bun run ci:release:build-binaries
          - name: Smoke memory-guard native route (Windows)
            if: runner.os == 'Windows'
@@ -826,8 +901,8 @@ jobs:
       # GitHub Release, and verifies it. Repository code may execute here
       # because no npm credential capability exists in this job.
       # always(): see release_approval. Only a successful publish finalizes.
-      if: ${{ always() && needs.publish.result == 'success' }}
-      needs: [publish, release_metadata]
+      if: ${{ always() && needs.publish.result == 'success' && needs.mupdf_source.result == 'success' }}
+      needs: [publish, release_metadata, mupdf_source]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
       permissions:
@@ -854,6 +929,11 @@ jobs:
            with:
               name: release-notes-${{ needs.release_metadata.outputs.version }}
               path: ${{ runner.temp }}/release-notes
+         - name: Download verified MuPDF corresponding source
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: mupdf-release-materials-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/mupdf-release-materials
          - name: Verify release notes integrity
            shell: bash
            run: |
@@ -902,6 +982,11 @@ jobs:
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-expected-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-channel-v1.json
+                 ${{ runner.temp }}/mupdf-release-materials/mupdf-source.tar.gz
+                 ${{ runner.temp }}/mupdf-release-materials/mupdf-build-recipe.txt
+                 ${{ runner.temp }}/mupdf-release-materials/mupdf-notices.txt
+                 ${{ runner.temp }}/mupdf-release-materials/mupdf-provenance.json
+                 ${{ runner.temp }}/mupdf-release-materials/mupdf-built.wasm
          - name: Verify immutable GitHub Release
            env:
               GH_TOKEN: ${{ github.token }}
@@ -926,6 +1011,8 @@ jobs:
                     "gjc-linux-x64", "gjc-linux-arm64", "gjc-darwin-arm64", "gjc-darwin-x64", "gjc-windows-x64.exe",
                     "gajae-release-binaries-v1.json", "gajae-release-binaries.sha256",
                     "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json", "gajae-release-channel-v1.json",
+                    "mupdf-source.tar.gz", "mupdf-build-recipe.txt", "mupdf-notices.txt", "mupdf-provenance.json",
+                    "mupdf-built.wasm",
                  ];
                  const assets = new Set(release.assets.map(asset => asset.name));
                  const missing = expectedAssets.filter(name => !assets.has(name));

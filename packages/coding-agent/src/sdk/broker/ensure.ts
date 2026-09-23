@@ -18,11 +18,23 @@ import {
 	resolveSdkInternalSpawnCommand,
 	type SdkInternalSpawnCommand,
 } from "./runtime";
-import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
+import {
+	BrokerStartupError,
+	type BrokerStartupFailureMarker,
+	brokerStartupFailureCleanupTargetsLock,
+	clearBrokerStartupFailureMarker,
+	readBrokerStartupFailureMarker,
+} from "./startup-failure";
 
 function resolveExpectedBrokerGeneration(): string {
 	const v = (packageJson as { version?: unknown }).version;
 	return typeof v === "string" && v.length > 0 ? v : "unknown";
+}
+
+function brokerStartupFailureReason(marker: BrokerStartupFailureMarker | undefined): string {
+	if (!marker) return "Detached SDK broker exited before publishing discovery.";
+	if (marker.cleanupCommand && marker.reason.endsWith(": ")) return `${marker.reason}${marker.cleanupCommand}`;
+	return marker.reason;
 }
 
 export function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
@@ -712,7 +724,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const startupLockPath = path.join(settings.agentDir, "sdk", STARTUP_LOCK_TARGET_NAME);
 		let startupFenceContention =
 			exitedBeforeDiscovery &&
-			trustedMarker?.reason.startsWith(`Failed to acquire lock for ${startupLockPath} after `) === true;
+			(trustedMarker?.reason.startsWith(`Failed to acquire lock for ${startupLockPath} after `) === true ||
+				brokerStartupFailureCleanupTargetsLock(trustedMarker, `${startupLockPath}.lock`));
 		if (!startupFenceContention && exitedBeforeDiscovery && child.exitCode !== 0) {
 			try {
 				startupFenceContention = (await fs.stat(`${startupLockPath}.lock`)).isDirectory();
@@ -760,7 +773,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				? new BrokerStartupError({
 						exitCode: child.exitCode,
 						signal: child.signalCode,
-						reason: trustedMarker?.reason ?? "Detached SDK broker exited before publishing discovery.",
+						reason: brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
 					})
 				: discoveryError
@@ -888,4 +901,9 @@ export function registerBrokerOwnerForTest(
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
 	return registerBrokerOwner(agentDir, child, timing);
+}
+
+/** Test hook: exercises the same trusted-marker reason reconstruction used by ensureBroker. */
+export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
+	return brokerStartupFailureReason(marker);
 }

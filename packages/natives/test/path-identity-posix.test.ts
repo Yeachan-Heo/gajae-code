@@ -299,6 +299,35 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect(await fs.readFile(published, "utf8")).toBe("authorized");
 	});
 
+	it("keeps allowHardLink permissive for one-link cleanup while requiring aliases explicitly", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "single-link.tmp");
+		await fs.writeFile(file, "authorized");
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+		const identity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("authorized"),
+			quarantineName: "single-link.tmp.cleanup",
+			allowHardLink: true,
+		};
+
+		expect(exactUnlinkDirect(file, { ...identity, requireHardLink: true })).toEqual({
+			ok: false,
+			code: "identity_mismatch",
+		});
+		expect(await fs.readFile(file, "utf8")).toBe("authorized");
+		expect(exactUnlinkDirect(file, identity)).toEqual({ ok: true });
+		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("retains a same-object content mutation when its authorized digest is stale", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);

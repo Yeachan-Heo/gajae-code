@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -190,6 +190,171 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			const result = await reapScrubbedProtocolRemnants(dir);
 			expect(result).toEqual({ reaped: count, failures: 0 });
 			expect((await fsp.readdir(dir)).filter(name => name.startsWith(REMNANT_PREFIX))).toEqual([]);
+		});
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"does not unlink a replacement planted after staging alias validation",
+		async () => {
+			for (const mode of ["sync", "async"] as const) {
+				await withTempDir(`gjc-remnant-alias-race-${mode}-`, async dir => {
+					const destination = path.join(dir, "session.jsonl");
+					const staging = path.join(dir, `.session.jsonl.00000000-0000-0000-0000-000000000001.replacement`);
+					const authorized = `${staging}.authorized`;
+					fs.writeFileSync(destination, "live transcript\n");
+					fs.linkSync(destination, staging);
+
+					const realExactUnlinkDirect = native.exactUnlinkDirect;
+					const exactUnlinkDirect = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) {
+								fs.renameSync(pathname, authorized);
+								fs.writeFileSync(pathname, "attacker replacement\n");
+							}
+							return realExactUnlinkDirect(pathname, identity);
+						});
+					try {
+						const result =
+							mode === "sync"
+								? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+								: await reapScrubbedProtocolRemnants(dir, -60_000);
+						expect(result).toEqual({ reaped: 0, failures: 0 });
+						expect(await fsp.readFile(staging, "utf8")).toBe("attacker replacement\n");
+						expect(await fsp.readFile(destination, "utf8")).toBe("live transcript\n");
+						expect(await fsp.readFile(authorized, "utf8")).toBe("live transcript\n");
+					} finally {
+						exactUnlinkDirect.mockRestore();
+					}
+				});
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"does not delete the transcript's last link when the destination disappears after alias validation",
+		async () => {
+			for (const mode of ["sync", "async"] as const) {
+				await withTempDir(`gjc-remnant-alias-last-link-${mode}-`, async dir => {
+					const destination = path.join(dir, "session.jsonl");
+					const staging = path.join(dir, `.session.jsonl.00000000-0000-0000-0000-000000000001.replacement`);
+					const contents = "live transcript\n";
+					await fsp.writeFile(destination, contents);
+					await fsp.link(destination, staging);
+					const aged = new Date(Date.now() - 60 * 60 * 1000);
+					await fsp.utimes(staging, aged, aged);
+
+					const realExactUnlinkDirect = native.exactUnlinkDirect;
+					const exactUnlinkDirect = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) fs.unlinkSync(destination);
+							return realExactUnlinkDirect(pathname, identity);
+						});
+					try {
+						const result =
+							mode === "sync"
+								? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+								: await reapScrubbedProtocolRemnants(dir, -60_000);
+						expect(result).toEqual({ reaped: 0, failures: 0 });
+						expect(await fsp.readFile(staging, "utf8")).toBe(contents);
+						await expect(fsp.stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+					} finally {
+						exactUnlinkDirect.mockRestore();
+					}
+				});
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"reaps a replacement quarantine left behind immediately after its rename",
+		async () => {
+			for (const mode of ["sync", "async"] as const) {
+				await withTempDir(`gjc-remnant-reap-crash-${mode}-`, async dir => {
+					const destination = path.join(dir, "session.jsonl");
+					const staging = path.join(dir, `.session.jsonl.00000000-0000-0000-0000-000000000001.replacement`);
+					const contents = "live transcript\n";
+					await fsp.writeFile(destination, contents);
+					await fsp.link(destination, staging);
+					const aged = new Date(Date.now() - 60 * 60 * 1000);
+					await fsp.utimes(staging, aged, aged);
+
+					const realExactUnlinkDirect = native.exactUnlinkDirect;
+					const crashAfterRename = vi
+						.spyOn(native, "exactUnlinkDirect")
+						.mockImplementation((pathname, identity) => {
+							if (pathname === staging) {
+								fs.renameSync(pathname, path.join(dir, identity.quarantineName!));
+								return { ok: false, code: "simulated_process_exit" };
+							}
+							return realExactUnlinkDirect(pathname, identity);
+						});
+					try {
+						const firstPass =
+							mode === "sync"
+								? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+								: await reapScrubbedProtocolRemnants(dir, -60_000);
+						expect(firstPass).toEqual({ reaped: 0, failures: 1 });
+					} finally {
+						crashAfterRename.mockRestore();
+					}
+
+					const secondPass =
+						mode === "sync"
+							? reapScrubbedProtocolRemnantsSync(dir, -60_000)
+							: await reapScrubbedProtocolRemnants(dir, -60_000);
+					expect(secondPass).toEqual({ reaped: 1, failures: 0 });
+					expect(await fsp.readFile(destination, "utf8")).toBe(contents);
+					await expect(fsp.stat(staging)).rejects.toMatchObject({ code: "ENOENT" });
+				});
+			}
+		},
+	);
+
+	it("keeps async alias scans off the event loop and yields between inspected candidates", async () => {
+		await withTempDir("gjc-remnant-alias-yield-", async dir => {
+			const count = 512;
+			for (let index = 0; index < count; index++) {
+				const suffix = index.toString(16).padStart(12, "0");
+				await fsp.writeFile(
+					path.join(dir, `.missing.${`00000000-0000-0000-0000-${suffix}`}.replacement`),
+					"staging",
+				);
+			}
+			const names = await fsp.readdir(dir);
+			// `fsp.readdir` and `fsp.lstat` are both overloaded. `vi.spyOn` resolves each
+			// to its last overload (`Dirent[]`, and the `Stats` form), while the code
+			// under test calls the plain `string[]` / default-options forms. Cast the
+			// mock to the declared function type so the spy keeps the real signature
+			// instead of forcing a `bigint` result the callers never ask for.
+			const readdir = vi
+				.spyOn(fsp, "readdir")
+				.mockResolvedValue(names as unknown as Awaited<ReturnType<typeof fsp.readdir>>);
+			const syncLstat = vi.spyOn(fs, "lstatSync");
+			const realLstat = fsp.lstat.bind(fsp);
+			const asyncLstat = vi.spyOn(fsp, "lstat").mockImplementation((async (
+				pathname: Parameters<typeof fsp.lstat>[0],
+				options?: Parameters<typeof fsp.lstat>[1],
+			) => {
+				await new Promise<void>(resolve => setTimeout(resolve, 0));
+				return await realLstat(pathname, options);
+			}) as typeof fsp.lstat);
+			let timerFired = false;
+			const timer = setTimeout(() => {
+				timerFired = true;
+			}, 0);
+			try {
+				expect(await reapScrubbedProtocolRemnants(dir, -60_000)).toEqual({ reaped: 0, failures: 0 });
+				expect(asyncLstat).toHaveBeenCalled();
+				expect(timerFired).toBe(true);
+				expect(syncLstat).not.toHaveBeenCalled();
+			} finally {
+				clearTimeout(timer);
+				asyncLstat.mockRestore();
+				syncLstat.mockRestore();
+				readdir.mockRestore();
+			}
 		});
 	});
 

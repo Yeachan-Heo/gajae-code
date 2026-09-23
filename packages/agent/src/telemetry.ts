@@ -37,6 +37,7 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
 	type Attributes,
@@ -1878,7 +1879,7 @@ export function finishExecuteToolSpan(
 				? options.errorObject.name || "Error"
 				: STATUS_ERROR_TYPE[status];
 	}
-	if (status === "error" && options.errorObject instanceof Error) {
+	if (status === "error" && options.errorObject instanceof Error && !isDesignedError(options.errorObject)) {
 		try {
 			recordHandledError(`Tool ${options.toolName}`, options.errorObject);
 		} catch {}

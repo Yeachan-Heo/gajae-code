@@ -10,11 +10,13 @@ import McpServe, {
 	formatCoordinatorCheckPayload,
 	probeCoordinatorBrokerCheck,
 } from "../src/commands/mcp-serve";
+import { acquireFileLock, FileLockAcquireError } from "../src/config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../src/coordinator/contract";
+import { coordinatorNamespaceIdentity } from "../src/coordinator-mcp/policy";
 import {
 	assertCloseAdmission,
 	type CanonicalSessionSnapshotV1,
@@ -30,8 +32,10 @@ import {
 	initializeCoordinatorNamespace,
 	readSessionTransaction,
 	reconcileCreationRemoteVerifier,
+	repairLegacyReportIds,
 	rotateClaimedCreationVerifier,
 	startCreationRemote,
+	transactionLockPath,
 	transactionPath,
 	withNamespaceRegistry,
 	withSessionTransaction,
@@ -745,7 +749,19 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 				delete event.public_delivery;
 			}
 			await fs.writeFile(file, JSON.stringify(legacy));
-			const migrated = await readSessionTransaction(paths, sessionId);
+			const originalBytes = await Bun.file(file).text();
+			const release = await acquireFileLock(transactionLockPath(paths, sessionId));
+			let migrated: CoordinatorSessionTransactionV1 | null;
+			try {
+				migrated = await readSessionTransaction(paths, sessionId);
+				expect(await Bun.file(file).text()).toBe(originalBytes);
+				await repairLegacyReportIds(paths, sessionId);
+				expect(await Bun.file(file).text()).toBe(originalBytes);
+				const signal = AbortSignal.abort(new Error("read cancelled"));
+				await expect(readSessionTransaction(paths, sessionId, { signal })).rejects.toThrow("read cancelled");
+			} finally {
+				await release();
+			}
 			expect(migrated).toMatchObject({
 				creation_intent_digest: expect.stringMatching(/^[a-f0-9]{64}$/),
 				canonical: {
@@ -942,4 +958,245 @@ describe("coordinator WAL delivery paging and capacity compaction", () => {
 			expect(archive.turns["old-1"]).toMatchObject({ turn_id: "old-1", status: "completed" });
 		});
 	});
+
+	it("keeps the prompt request that proves an active turn's runtime receipt", async () => {
+		await withTempRoot(async root => {
+			const namespaceId = "namespace-capacity-receipt";
+			const paths = coordinatorStatePaths(path.join(root, "state"), namespaceId);
+			const sessionId = await seedCapacitySession(paths, namespaceId, root);
+			const promptKey = sha256("receipt-prompt-key");
+			// Timestamps must predate RETENTION_MS so the retention sweep actually
+			// considers this request; a recent request is never a regression subject.
+			const retired = "2026-01-01T00:00:00.000Z";
+			// An acknowledged active turn proves its runtime receipt only through the
+			// prompt request that carries it. Retention used to drop that request once
+			// it was completed and old, which left the WAL failing its own receipt
+			// invariant on the very next read — permanently, for the whole namespace.
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				const source = transaction.canonical.turns["turn-source"];
+				source.prompt = { ...source.prompt, created_at: retired };
+				source.created_at = retired;
+				source.updated_at = retired;
+				source.started_at = retired;
+				source.delivery = {
+					...source.delivery,
+					delivered: true,
+					prompt_acknowledged: true,
+					state: "acknowledged",
+					runtime_command_id: "command-receipt",
+					runtime_turn_id: "runtime-turn-receipt",
+				} as typeof source.delivery;
+				transaction.requests.prompts[promptKey] = {
+					request_id: "request-receipt",
+					key_digest: promptKey,
+					request_digest: sha256("receipt-request"),
+					operation: "turn.prompt",
+					coordinator_turn_id: "turn-source",
+					phase: "completed",
+					canonical_prompt: { text: "prompt-turn-source" },
+					sdk_idempotency_key: "idempotency-receipt",
+					runtime_receipt: {
+						accepted: true,
+						command_id: "command-receipt",
+						turn_id: "runtime-turn-receipt",
+					},
+					created_at: retired,
+					updated_at: retired,
+				} as (typeof transaction.requests.prompts)[string];
+			});
+			// Any later write runs compaction, which is where retention used to
+			// delete the receipt-bearing request and corrupt the WAL.
+			await withSessionTransaction(paths, sessionId, async transaction => {
+				transaction.canonical.session.updated_at = "2026-09-30T00:00:00.000Z";
+			});
+			// Before the fix this read threw state_corrupt instead of returning.
+			const reloaded = await readSessionTransaction(paths, sessionId);
+			expect(reloaded?.requests.prompts[promptKey]?.runtime_receipt?.accepted).toBe(true);
+			expect(reloaded?.canonical.turns["turn-source"]?.status).toBe("active");
+		});
+	});
+
+	it("migrates legacy report ids onto the canonical digest form", async () => {
+		await withTempRoot(async root => {
+			const namespaceId = "namespace-legacy-report";
+			const paths = coordinatorStatePaths(path.join(root, "state"), namespaceId);
+			const sessionId = await seedCapacitySession(paths, namespaceId, root);
+			// Reports minted before COORDINATOR_REPORT_ID_PATTERN carry a uuid-shaped
+			// id. The reader rejects that shape, and because the reader backs the
+			// namespace-wide scan, one historical report bricked every coordination
+			// read rather than only its own session.
+			const legacyReportId = "report-9ae9a2fd-3939-46c7-8178-185e2d9a84b1";
+			const file = transactionPath(paths, sessionId);
+			const raw = JSON.parse(await fs.readFile(file, "utf8")) as {
+				canonical: { reports: Record<string, unknown> };
+				requests: { operations: Record<string, Record<string, unknown>> };
+				outbox: Record<string, Record<string, unknown>>;
+			};
+			raw.canonical.reports[legacyReportId] = {
+				schema_version: 1,
+				report_id: legacyReportId,
+				operation_id: "report:i50-rp4",
+				session_id: sessionId,
+				turn_id: "",
+				status: "probe",
+				summary: "",
+				blocker: null,
+				pr_url: null,
+				evidence_paths: [],
+				created_at: "2026-08-18T13:19:54.844Z",
+			};
+			raw.requests.operations["report-operation"] = {
+				operation_id: "report-operation",
+				tool: "gjc_coordinator_report_status",
+				key_digest: sha256("report-operation-key"),
+				request_digest: sha256("report-operation-request"),
+				local_id: legacyReportId,
+				phase: "completed",
+				intent: { session_id: sessionId },
+				created_at: "2026-08-18T13:19:54.844Z",
+				updated_at: "2026-08-18T13:19:54.844Z",
+			};
+			raw.outbox["legacy-report-event"] = {
+				id: "legacy-report-event",
+				transaction_revision: 1,
+				kind: "report.written",
+				entity: "report",
+				entity_id: legacyReportId,
+				payload: { session_id: sessionId, report_id: legacyReportId, status: "probe" },
+				emitted: false,
+				public_event_id: "legacy-report-event",
+				public_delivery: {
+					public_event_id: "legacy-report-event",
+					state: "pending",
+					claim_fence: null,
+					claim_expires_at: null,
+					journal_seq: null,
+					acknowledged_at: null,
+				},
+			};
+			await fs.writeFile(file, JSON.stringify(raw));
+			// Before the fix this read threw state_corrupt instead of returning.
+			const release = await acquireFileLock(transactionLockPath(paths, sessionId));
+			try {
+				expect((await readSessionTransaction(paths, sessionId))?.canonical.reports[legacyReportId]).toBeUndefined();
+				await expect(repairLegacyReportIds(paths, sessionId)).rejects.toBeInstanceOf(FileLockAcquireError);
+				await expect(
+					repairLegacyReportIds(paths, sessionId, { signal: AbortSignal.abort(new Error("repair cancelled")) }),
+				).rejects.toThrow("repair cancelled");
+				expect(await Bun.file(file).json()).toEqual(raw);
+			} finally {
+				await release();
+			}
+			const reloaded = await readSessionTransaction(paths, sessionId);
+			if (!reloaded) throw new Error("legacy transaction did not reload");
+			expect(reloaded?.canonical.reports[legacyReportId]).toBeUndefined();
+			const migrated = Object.entries(reloaded.canonical.reports).find(
+				([, report]) => report.operation_id === "report:i50-rp4",
+			);
+			if (!migrated) throw new Error("legacy report did not migrate");
+			const [migratedReportId, migratedReport] = migrated;
+			expect(migratedReportId).toMatch(/^report-[a-f0-9]{64}$/);
+			expect(migratedReport).toMatchObject({ report_id: migratedReportId, status: "probe" });
+			expect(migratedReportId).toBe(reloaded.requests.operations["report-operation"]?.local_id);
+			const reportEvent = reloaded.outbox["legacy-report-event"];
+			expect(reportEvent.entity_id).toBe(migratedReportId);
+			expect(reportEvent.payload.report_id).toBe(migratedReportId);
+			await repairLegacyReportIds(paths, sessionId);
+			const persisted = JSON.parse(await fs.readFile(file, "utf8")) as CoordinatorSessionTransactionV1;
+			expect(persisted.canonical.reports[legacyReportId]).toBeUndefined();
+			expect(persisted.requests.operations["report-operation"]?.local_id).toBe(migratedReportId);
+		});
+	});
+
+	it(
+		"recovers namespace event reads with a legacy-id WAL beside a corrupt peer",
+		async () => {
+			await withTempRoot(async root => {
+				const stateRoot = path.join(root, "state");
+				const env = {
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_PROFILE: "coordinator-wal-test",
+					GJC_COORDINATOR_MCP_REPO: "namespace-recovery",
+				};
+				const namespaceId = coordinatorNamespaceIdentity(env);
+				const paths = coordinatorStatePaths(stateRoot, namespaceId);
+				const healthySessionId = "session-healthy";
+				const legacySessionId = "session-legacy";
+				const corruptSessionId = "session-corrupt";
+				await initializeCoordinatorNamespace(paths);
+				for (const [sessionId, eventKind] of [
+					[healthySessionId, "healthy.session.registered"],
+					[legacySessionId, "legacy.session.registered"],
+					[corruptSessionId, "corrupt.session.registered"],
+				] as const) {
+					await createSessionTransaction(paths, {
+						kind: "register",
+						session: capacitySessionSnapshot(namespaceId, sessionId, root),
+						initial_state: "ready_for_input",
+						initial_events: [
+							{
+								kind: eventKind,
+								entity: "session",
+								entity_id: sessionId,
+								created_at: "2026-08-22T00:00:00.000Z",
+							},
+						],
+					});
+				}
+				const legacyReportId = "report-9ae9a2fd-3939-46c7-8178-185e2d9a84b1";
+				const legacyFile = transactionPath(paths, legacySessionId);
+				const legacyRaw = JSON.parse(await fs.readFile(legacyFile, "utf8")) as {
+					canonical: { reports: Record<string, unknown> };
+				};
+				legacyRaw.canonical.reports[legacyReportId] = {
+					schema_version: 1,
+					report_id: legacyReportId,
+					operation_id: "namespace-recovery-report",
+					session_id: legacySessionId,
+					turn_id: "",
+					status: "probe",
+					summary: "legacy report",
+					blocker: null,
+					pr_url: null,
+					evidence_paths: [],
+					created_at: "2026-08-18T13:19:54.844Z",
+				};
+				await fs.writeFile(legacyFile, JSON.stringify(legacyRaw));
+				const projections = path.join(stateRoot, "v1", namespaceId, "projections", "reports");
+				await fs.mkdir(projections, { recursive: true });
+				await fs.writeFile(
+					path.join(projections, `${legacyReportId}.json`),
+					JSON.stringify(legacyRaw.canonical.reports[legacyReportId]),
+				);
+				await fs.writeFile(transactionPath(paths, corruptSessionId), '{"schema_version":1');
+
+				const server = createCoordinatorMcpServer({ env });
+				try {
+					const watch = await server.callTool("gjc_coordinator_watch_events", {
+						timeout_ms: 0,
+						after_seq: 0,
+						limit: 50,
+					});
+					expect(watch).toMatchObject({ ok: true });
+					expect(JSON.stringify(watch)).toContain(healthySessionId);
+					expect(JSON.stringify(watch)).toContain(legacySessionId);
+					expect(await fs.stat(path.join(projections, `${legacyReportId}.json`)).catch(() => null)).toBeNull();
+					const migratedFiles = await fs.readdir(projections);
+					expect(migratedFiles.some(file => /^report-[a-f0-9]{64}\.json$/.test(file))).toBe(true);
+
+					const scopedCorrupt = await server.callTool("gjc_coordinator_watch_events", {
+						session_id: corruptSessionId,
+						timeout_ms: 0,
+						after_seq: 0,
+						limit: 50,
+					});
+					expect(scopedCorrupt).toMatchObject({ ok: false, error: { code: "unavailable" } });
+				} finally {
+					await server.close();
+				}
+			});
+		},
+		{ timeout: 15_000 },
+	);
 });

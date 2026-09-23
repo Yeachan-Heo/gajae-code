@@ -166,6 +166,19 @@ function successfulPublication(primitive: NativeNoReplaceResult["primitive"]): N
 	};
 }
 
+function sharingViolationPublication(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "sharing_violation",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "sharing_violation",
+		primitive: "windows_rename_noreplace",
+		phase: "rename",
+		diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+	};
+}
+
 const primaryPrimitive =
 	process.platform === "linux"
 		? "renameat2_noreplace"
@@ -174,6 +187,47 @@ const primaryPrimitive =
 			: process.platform === "win32"
 				? "windows_rename_noreplace"
 				: undefined;
+
+describe.skipIf(process.platform !== "linux")("file lock receipt producer validation", () => {
+	test("accepts the native receipt when ambient platform metadata is spoofed", async () => {
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!descriptor?.configurable) throw new Error("process_platform_not_configurable");
+		const { file, lock } = await makeFixture();
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("renameat2_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async () => {
+				throw new Error("unexpected directory publication fallback");
+			},
+		});
+		try {
+			Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+			await expect(withFileLock(file, async () => "entered", quickAcquire)).resolves.toBe("entered");
+		} finally {
+			Object.defineProperty(process, "platform", descriptor);
+		}
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("rejects a receipt whose primitive does not match the requested operation", async () => {
+		const { file, lock } = await makeFixture();
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return successfulPublication("mkdirat_renameat_noreplace");
+			},
+			renameDirectoryNoReplacePathAsync: async () => {
+				throw new Error("unexpected directory publication fallback");
+			},
+		});
+		await expect(withFileLock(file, async () => "entered", quickAcquire)).rejects.toThrow(
+			"invalid primary success receipt",
+		);
+		await expect(fs.lstat(lock)).resolves.toBeTruthy();
+	});
+});
 
 describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific success receipts", () => {
 	for (const operation of ["primary", "directory"] as const) {
@@ -187,8 +241,13 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 			"unsupported",
 			"unknown",
 		];
+		const primaryPrimitives = new Set<NativeNoReplaceResult["primitive"]>([
+			"renameat2_noreplace",
+			"renameatx_np_excl",
+			"windows_rename_noreplace",
+		]);
 		const invalidResults: [string, NativeNoReplaceResult][] = primitives
-			.filter(primitive => primitive !== expected)
+			.filter(primitive => (operation === "primary" ? !primaryPrimitives.has(primitive) : primitive !== expected))
 			.map(primitive => [`wrong primitive ${primitive}`, successfulPublication(primitive)]);
 		const valid = successfulPublication(expected ?? "unsupported");
 		invalidResults.push(
@@ -294,7 +353,46 @@ describe.skipIf(primaryPrimitive === undefined)("file lock operation-specific su
 	}
 });
 
+test("retries a pre-mutation sharing violation and publishes the file lock", async () => {
+	const { root, file, lock } = await makeFixture();
+	let attempts = 0;
+	FileLockTestHooks.nativePublicationBindings = () => ({
+		renameNoReplacePathAsync: async (source, destination) => {
+			attempts++;
+			if (attempts < 3) return sharingViolationPublication();
+			await fs.rename(source, destination);
+			return successfulPublication(primaryPrimitive ?? "windows_rename_noreplace");
+		},
+		renameDirectoryNoReplacePathAsync,
+	});
+
+	await expect(
+		withFileLock(file, async () => await Bun.file(path.join(lock, "info")).text(), quickAcquire),
+	).resolves.toContain('"pid"');
+	expect(attempts).toBe(3);
+	await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	expect(await fs.readdir(root)).toEqual([]);
+});
+
 describe.skipIf(process.platform !== "linux")("file lock committed publication reconciliation", () => {
+	test("accepts a committed fallback receipt when ambient platform metadata is spoofed", async () => {
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		if (!descriptor?.configurable) throw new Error("process_platform_not_configurable");
+		const { file, lock } = await makeFixture();
+		const publication = installPublicationFailure();
+		let entered = 0;
+		try {
+			Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+			await expect(withFileLock(file, async () => ++entered, quickAcquire)).resolves.toBe(1);
+		} finally {
+			Object.defineProperty(process, "platform", descriptor);
+		}
+		expect(entered).toBe(1);
+		expect(publication.primary).toBe(1);
+		expect(publication.fallback).toBe(1);
+		await expect(fs.lstat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("enters once, releases the real tree, and reacquires a new generation", async () => {
 		const { root, file, lock } = await makeFixture();
 		const publication = installPublicationFailure();

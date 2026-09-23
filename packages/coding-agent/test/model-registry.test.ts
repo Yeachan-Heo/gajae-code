@@ -7,6 +7,7 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getBundledModels,
 	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
@@ -1150,6 +1151,66 @@ describe("ModelRegistry", () => {
 
 			settings.setDisabledProviders(["anthropic"]);
 			expect(registry.getAvailable()).not.toBe(initial);
+		});
+
+		test("uses successful LiteLLM discovery as authoritative for available models", async () => {
+			const liveIds = ["openai/gpt-5.4", "proxy-only-model"];
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			expect(bundledIds).toContain("openai/gpt-5.4");
+			expect(bundledIds).toContain("abacusai/Dracarys-72B-Instruct");
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+
+			using _hook = mockOpenAiCompatibleModels("http://localhost:4000/v1/models", liveIds);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...liveIds].sort());
+			} finally {
+				await registry.dispose();
+			}
+		});
+
+		test("falls back to the bundled LiteLLM catalog when discovery is unavailable", async () => {
+			const bundledIds = getBundledModels("litellm").map(model => model.id);
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: "http://localhost:4000/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+				},
+			});
+			using _hook = hookFetch(input => {
+				const requestUrl = String(input);
+				if (requestUrl === "http://localhost:4000/v1/models") {
+					return new Response("proxy unavailable", { status: 503 });
+				}
+				throw new Error(`Unexpected URL: ${requestUrl}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated());
+			try {
+				await registry.refreshProvider("litellm", "online");
+
+				const availableIds = registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id)
+					.sort();
+				expect(availableIds).toEqual([...bundledIds].sort());
+			} finally {
+				await registry.dispose();
+			}
 		});
 
 		test("invalidates available models when a runtime API-key override is set", async () => {
@@ -3524,6 +3585,44 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 		});
 
+		test("explicit model definitions remain authoritative over same-id discovery", async () => {
+			writeRawModelsJson({
+				"explicit-discovery": {
+					baseUrl: "https://provider.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "explicit-model",
+							name: "Configured model",
+							contextWindow: 123_456,
+							maxTokens: 7_654,
+						},
+					],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			using _hook = hookFetch(
+				() =>
+					new Response(
+						JSON.stringify({ data: [{ id: "explicit-model", owned_by: "anthropic" }, { id: "live-model" }] }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+			);
+			await registry.refreshProvider("explicit-discovery", "online");
+
+			expect(registry.find("explicit-discovery", "explicit-model")).toMatchObject({
+				api: "openai-responses",
+				name: "Configured model",
+				contextWindow: 123_456,
+				maxTokens: 7_654,
+			});
+			expect(registry.find("explicit-discovery", "live-model")).toBeDefined();
+		});
+
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -3557,7 +3656,14 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
-			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({
+				preset: "commandcode-goat",
+				modelsPath: presetModelsPath,
+				probeDiscovery: async () => ({
+					models: ["goat-model"],
+					endpoint: "https://api.commandcode.ai/provider/v1/models",
+				}),
+			});
 			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
 
 			using _hook = hookFetch(input => {
@@ -8878,7 +8984,8 @@ describe("ModelRegistry", () => {
 			]);
 
 			await registry.refreshProvider("discovery-provider", "online");
-			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.error).toContain("returned no models");
 			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
 				{ provider: "mixed", connectionKind: "credentialless" },
 			]);
@@ -8933,7 +9040,8 @@ describe("ModelRegistry", () => {
 			hasModels = false;
 			await registry.refreshProvider("credentialless-discovery", "online");
 
-			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.error).toContain("returned no models");
 			expect(registry.find("credentialless-discovery", "discovered-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
 		});

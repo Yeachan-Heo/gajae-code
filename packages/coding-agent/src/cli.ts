@@ -1,14 +1,16 @@
 #!/usr/bin/env bun
 
+import type { CommandEntry } from "@gajae-code/utils/cli";
 /** Lightweight CLI bootstrap. Heavy command registration is loaded only after
  * security admission; `gjc doctor` stays reachable when normal startup breaks. */
-import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION } from "@gajae-code/utils/dirs";
+import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { startTiming } from "@gajae-code/utils/logger";
 import {
 	BASH_SHELL_RUNTIME_ARG,
 	BASH_SHELL_SUPERVISOR_ARG,
 	BASH_SHELL_WORKER_ARG,
 } from "./exec/bash-shell-worker-protocol";
+import { runSdkStderrDrainerFromArgv } from "./sdk/broker/stderr-drainer";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -27,6 +29,49 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.exit(1);
 }
 process.title = APP_NAME;
+
+/** Public-family hooks kept available for private-worker tests without loading the full registry. */
+export const commands: CommandEntry[] = [
+	{ name: "sdk", load: () => import("./commands/sdk").then(module => module.default) },
+	{ name: "daemon", load: () => import("./commands/daemon").then(module => module.default) },
+];
+
+async function installRuntimeGlobals(writeNoFileWarning?: (text: string) => void): Promise<void> {
+	const { installH2Fetch } = await import("@gajae-code/ai/utils/h2-fetch");
+	// Activate HTTP/2 for all `fetch()` calls (provider streams, OAuth, model
+	// discovery, web tools). Bun's HTTP/2 client is gated on a startup flag we
+	// can't toggle from JS, so we patch globalThis.fetch to pass
+	// `protocol: "http2"` per request, with transparent HTTP/1.1 fallback on
+	// `HTTP2Unsupported`. See @gajae-code/ai/utils/h2-fetch for details.
+	installH2Fetch();
+
+	const { warnIfMacOSNoFileLimitTooLow } = await import("./cli/nofile-limit");
+	warnIfMacOSNoFileLimitTooLow({ writeStderr: writeNoFileWarning });
+
+	// Secondary in-process scrub of the macOS malloc-stack-logging vars. The real
+	// boundary is the darwin re-exec guard at the top of runCli(): Bun snapshots the
+	// spawn-default environment at startup, so deleting these here does NOT clean the
+	// env children inherit by default — it only tidies `process.env` for code that
+	// reads it directly. Kept as belt-and-braces for the rare re-exec-unavailable
+	// fallback; managed spawns already use filterProcessEnv and the native PTY lane
+	// strips them independently.
+	delete process.env.MallocStackLogging;
+	delete process.env.MallocStackLoggingNoCompact;
+}
+
+async function dispatchPublicFamily(argv: string[]): Promise<void> {
+	const family = argv[0];
+	if (family !== "sdk" && family !== "daemon") return;
+	const { dispatchPublicCommand } = await import("./cli/public-command-entry");
+	const load = commands.find(entry => entry.name === family)!.load;
+	await dispatchPublicCommand(argv.slice(1), {
+		bin: APP_NAME,
+		version: VERSION,
+		command: family,
+		load,
+		setup: report => installRuntimeGlobals(text => report({ code: "macos_nofile_limit_low", successStderr: text })),
+	});
+}
 
 function isDoctorArgv(argv: readonly string[]): boolean {
 	return argv[0] === "doctor";
@@ -91,6 +136,21 @@ export async function runCli(argv: string[]): Promise<void> {
 			await completeManagedOwnerRecovery(admission.context);
 			return;
 		}
+	}
+	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
+		// Private lifecycle stderr drainer: must stay ahead of the public sdk family
+		// dispatcher, which would otherwise reject the private argv as a usage error.
+		try {
+			await runSdkStderrDrainerFromArgv(argv.slice(2));
+		} catch {
+			process.stderr.write("gjc sdk: invalid internal stderr drainer invocation\n");
+			process.exitCode = 2;
+		}
+		return;
+	}
+	if (argv[0] === "sdk" || argv[0] === "daemon") {
+		await dispatchPublicFamily(argv);
+		return;
 	}
 	if (argv.length === 1 && argv[0] === "--supports-macos-community-app") {
 		process.stdout.write("macos-community-app-offer\n");

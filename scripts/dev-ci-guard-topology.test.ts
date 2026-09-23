@@ -107,7 +107,18 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 			expect({ scenario: scenario.name, group: evaluate(document.concurrency.group) }).toEqual({
 				scenario: scenario.name, group: headOnlyDispatch ? "dev-ci-dispatch-34300623114" : `Dev CI-refs/pull/5367/merge${scenario.skip ? "-metadata-edit" : ""}`,
 			});
-			expect(Boolean(evaluate(document.concurrency["cancel-in-progress"]))).toBe(!scenario.skip && !headOnlyDispatch);
+			// Only a superseding pull_request run may cancel its predecessor: a new
+			// push to the same PR head supersedes the previous validation of that
+			// head. A `push` to `dev` is a distinct integration state, not a
+			// superseded one, and `dev` has a single ref, so cancelling there meant
+			// every push run killed its predecessor and `dev` was never verified as
+			// a whole (#5709). An ordinary `workflow_dispatch` is likewise removed
+			// from the cancelling set so a manual validation cannot kill the
+			// integration run already in flight.
+			expect({ scenario: scenario.name, cancel: Boolean(evaluate(document.concurrency["cancel-in-progress"])) }).toEqual({
+				scenario: scenario.name,
+				cancel: scenario.event === "pull_request" && !scenario.skip,
+			});
 			// GitHub publishes contexts even for skipped jobs: evaluate their names
 			// independently of scheduling so metadata cannot forge code evidence.
 			for (const [id, canonical, nonCode] of [
@@ -153,14 +164,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const d = await workflow();
 		const guard = requiredJob(d, "telegram-daemon-generation");
 		const guardCondition = String(guard.if);
-		expect(guardCondition).toContain("telegram-daemon");
-		expect(guardCondition).toContain("chat-daemon");
-		expect(guardCondition).toContain("telegram-daemon-generation-guard.ts");
+		expect(guardCondition).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+		expect(guardCondition).not.toContain("needs.affected-plan.outputs.changed_paths");
 		const affected = requiredJob(d, "affected");
 		expect(affected.needs).toContain("telegram-daemon-generation");
 		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
-		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toContain("telegram-daemon-generation-guard.ts");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.has_protected_daemon_decl }}");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 		expect(requiredEnvValue(aggregateStep, "CI_DEV_AFFECTED_PLAN")).toBe(
 			"${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json",
@@ -409,9 +419,13 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(source).toContain("head_ref_force_pushed");
 		// Ties refuse: GitHub serializes both sides to whole seconds.
 		expect(source).toContain("return submitted <= known;");
+		// No force-push on record means no re-binding vector, so the check must not fall
+		// back to the contributor-settable committer date in either direction (#5692).
+		expect(source).toContain('if (appearance.kind === "unconstrained") return false;');
+		expect(source).toContain('return { kind: "unconstrained" };');
 		// A present-but-unparseable force-push time refuses rather than falling back to the
 		// contributor-settable committer date.
-		expect(source).toContain("if (present.some(value => !Number.isFinite(Date.parse(value)))) return undefined;");
+		expect(source).toContain('if (present.some(value => !Number.isFinite(Date.parse(value)))) return { kind: "unreadable" };');
 		// Selection precedes freshness, so an unreadable later withdrawal cannot be filtered
 		// out and let an earlier approval become the reviewer's last word.
 		const decision = source.slice(source.indexOf('} else if (verdict === "merge-approved")'));

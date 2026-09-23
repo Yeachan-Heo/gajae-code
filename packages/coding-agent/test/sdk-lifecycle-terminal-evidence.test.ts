@@ -134,12 +134,23 @@ it("returns the real terminal outcome when a slow spawn is stamped by a concurre
 		const recovery = await new LifecycleLedger(agentDir).open();
 		expect(recovery.get(inFlight.identity)?.state).toBe("terminal_uncertain");
 
-		expect(await lifecycle).toMatchObject({
+		const response = await lifecycle;
+		expect(structuredClone(response)).toMatchObject({
 			ok: false,
 			error: {
 				code: "terminal_uncertain",
-				message: "Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+				message: expect.stringContaining(
+					"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation. Original launch failure: Session ",
+				),
 			},
+		});
+		if (response.ok) throw new Error("Expected uncertain startup cleanup");
+		expect(response.error.message).toContain(
+			"did not become ready and its spawned process could not be verified dead. [lifecycle-diagnostic-v1] stage=readiness waiting_for=session_ready",
+		);
+		expect(await recovery.readTerminal(inFlight.identity, inFlight.requestHash)).toMatchObject({
+			kind: "terminal",
+			entry: { state: "terminal_uncertain", response },
 		});
 		const rows = await ledgerRows(agentDir);
 		expect(

@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getMCPConfigPath, setAgentDir } from "@gajae-code/utils";
+import { getMCPConfigPath, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 import type { MCPServer } from "../../src/capability/mcp";
 import { normalizeClaudeMcpJson, normalizeCodexMcpToml, validateMCPCompatServer } from "../../src/discovery/mcp-compat";
@@ -202,6 +202,30 @@ describe("conventional MCP filtering", () => {
 
 		const autoloadOnly = await loadAllMCPConfigs(projectDir, { filterExa: false, autoloadOnly: true });
 		expect(Object.keys(autoloadOnly.configs)).toEqual(["eager"]);
+	});
+
+	it("logs the reason when autoload intentionally skips a registration", async () => {
+		await writeProjectConfig(".gjc/mcp.json", {
+			mcpServers: {
+				lazy: { type: "stdio", command: "lazy-bin", autoload: false },
+			},
+		});
+
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const loaded = await loadAllMCPConfigs(projectDir, { filterExa: false, autoloadOnly: true });
+			expect(Object.keys(loaded.configs)).toEqual([]);
+			expect(warning).toHaveBeenCalledWith(
+				"Skipping MCP autoload registration",
+				expect.objectContaining({
+					path: "mcp:lazy",
+					serverName: "lazy",
+					reason: "autoload is disabled for this registration",
+				}),
+			);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	it("enableProjectConfig:false drops project-level servers but keeps user ones", async () => {

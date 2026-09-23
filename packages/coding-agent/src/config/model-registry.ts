@@ -44,6 +44,9 @@ import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-com
 import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import {
 	detectDiscoveredApiFamily,
+	isSafeCatalogModelId,
+	MODELS_LIST_REQUEST_TIMEOUT_MS,
+	readBoundedModelsJson,
 	resolveLoopbackOpenAIBaseUrl,
 } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
@@ -142,6 +145,36 @@ function redactDiscoveryUrl(value: string | URL): string {
 	} catch {
 		return "(invalid URL)";
 	}
+}
+
+/**
+ * Scrub resolved credential material from a discovery failure before it is
+ * published to discovery state, cache provenance, or the logger. Mutates
+ * Error messages and stacks in place to preserve class/identity; wraps non-Errors.
+ */
+export function scrubDiscoveryError(error: unknown, secrets: ReadonlyArray<string | undefined>): unknown {
+	const redact = (text: string): string => {
+		let scrubbed = text;
+		for (const secret of secrets) {
+			if (secret) scrubbed = scrubbed.split(secret).join("[redacted]");
+		}
+		return scrubbed;
+	};
+	if (error instanceof Error) {
+		const seen = new Set<Error>();
+		const scrubError = (current: Error): void => {
+			if (seen.has(current)) return;
+			seen.add(current);
+			current.message = redact(current.message);
+			if (typeof current.stack === "string") current.stack = redact(current.stack);
+			if (current.cause instanceof Error) scrubError(current.cause);
+			else if (typeof current.cause === "string") current.cause = redact(current.cause);
+		};
+		scrubError(error);
+		return error;
+	}
+	if (typeof error === "string") return redact(error);
+	return error;
 }
 
 /** Whether a structured transport code proves that no listener accepted the connection. */
@@ -742,13 +775,26 @@ function registryModelMetadataWithoutApiSpecificFields(model: Model<Api>): Parti
 	return metadata;
 }
 
-function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
-	if (models.some(model => model.id === selector || `${model.provider}/${model.id}` === selector)) return true;
-	const suffix = splitSelectorThinkingSuffix(selector);
-	const baseSelector = suffix.thinkingLevel === undefined ? selector : suffix.selector;
+export function registrySelectorResolvesToModel(selector: string, models: readonly Model<Api>[]): boolean {
+	const normalizedSelector = selector.trim().toLowerCase();
+	if (
+		models.some(
+			model =>
+				model.id.toLowerCase() === normalizedSelector ||
+				`${model.provider}/${model.id}`.toLowerCase() === normalizedSelector,
+		)
+	)
+		return true;
+	const suffix = splitSelectorThinkingSuffix(normalizedSelector);
+	const baseSelector = suffix.thinkingLevel === undefined ? normalizedSelector : suffix.selector;
 	const parsed = parseModelString(baseSelector);
-	if (parsed) return models.some(model => model.provider === parsed.provider && model.id === parsed.id);
-	return models.some(model => model.id === baseSelector || model.id.endsWith(`/${baseSelector}`));
+	if (parsed)
+		return models.some(
+			model => model.provider.toLowerCase() === parsed.provider && model.id.toLowerCase() === parsed.id,
+		);
+	return models.some(
+		model => model.id.toLowerCase() === baseSelector || model.id.toLowerCase().endsWith(`/${baseSelector}`),
+	);
 }
 
 function filterMaterializedRegistryProfiles(
@@ -3249,7 +3295,7 @@ export class ModelRegistry {
 			);
 			if (
 				evidence !== undefined &&
-				state?.status === "ok" &&
+				(state?.status === "ok" || state?.status === "empty") &&
 				discovery.fetched &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
@@ -3287,8 +3333,8 @@ export class ModelRegistry {
 	}
 
 	#profileAvailabilityEvidenceFingerprint(): string {
-		return JSON.stringify(
-			[...this.#descriptorDiscoveryEvidence.entries()]
+		return JSON.stringify({
+			descriptor: [...this.#descriptorDiscoveryEvidence.entries()]
 				.sort(([left], [right]) => left.localeCompare(right))
 				.map(([provider, evidence]) => [
 					provider,
@@ -3300,7 +3346,15 @@ export class ModelRegistry {
 					[...evidence.modelIds].sort(),
 					evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
 				]),
-		);
+			configured: [...this.#configuredDiscoveryEvidence.entries()]
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([provider, evidence]) => [
+					provider,
+					evidence.authGeneration,
+					evidence.endpoint,
+					[...evidence.modelIds].sort(),
+				]),
+		});
 	}
 
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
@@ -3496,8 +3550,14 @@ export class ModelRegistry {
 						await this.#discoverModelsByProviderType(provider, apiKey),
 					);
 				} catch (error) {
-					discoveryFailureEvidence = error;
-					throw error;
+					// ONE credential-safe discovery error boundary: transport
+					// layers may echo request details (including the bearer)
+					// in failure text. Scrub resolved credential material
+					// before the error reaches discovery state, cache
+					// provenance, or the logger below.
+					const scrubbedError = scrubDiscoveryError(error, [apiKey, preflightApiKey]);
+					discoveryFailureEvidence = scrubbedError;
+					throw scrubbedError;
 				}
 			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
@@ -3569,24 +3629,35 @@ export class ModelRegistry {
 		};
 	}
 
-	#discoverModelsByProviderType(
+	async #discoverModelsByProviderType(
 		providerConfig: DiscoveryProviderConfig,
 		apiKey: string | undefined,
 	): Promise<Model<Api>[]> {
+		let models: Model<Api>[];
 		switch (providerConfig.discovery.type) {
 			case "ollama":
-				return this.#discoverOllamaModels(providerConfig, apiKey);
+				models = await this.#discoverOllamaModels(providerConfig, apiKey);
+				break;
 			case "llama.cpp":
-				return this.#discoverLlamaCppModels(providerConfig, apiKey);
+				models = await this.#discoverLlamaCppModels(providerConfig, apiKey);
+				break;
 			case "lm-studio":
 			case "omlx":
 			case "vllm":
 			case "sglang":
 			case "openai-models-list":
-				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
+				models = await this.#discoverOpenAIModelsList(providerConfig, apiKey);
+				break;
 			case "models-dev":
-				return this.#discoverModelsDevProvider(providerConfig);
+				models = await this.#discoverModelsDevProvider(providerConfig);
+				break;
 		}
+		if (providerConfig.discovery.type === "openai-models-list" && models.length === 0) {
+			throw new Error(
+				`Model discovery for ${redactDiscoveryUrl(providerConfig.baseUrl ?? "")} returned no models; add --model <id> or fix the endpoint catalog.`,
+			);
+		}
+		return models;
 	}
 
 	async #discoverBuiltInProviderModels(
@@ -4222,7 +4293,7 @@ export class ModelRegistry {
 			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
 				? { redirect: "error" as const }
 				: {}),
-			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : 5_000),
+			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : MODELS_LIST_REQUEST_TIMEOUT_MS),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
@@ -4234,16 +4305,31 @@ export class ModelRegistry {
 			}
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
-		const payload: unknown = await response.json();
+		// Shared 1MB bounded reader (same as the setup probe): a timeout
+		// bounds wall clock, not bytes buffered.
+		let payload: unknown;
+		try {
+			payload = await readBoundedModelsJson(response);
+		} catch {
+			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
+		}
 		if (!isRecord(payload) || !Array.isArray(payload.data)) {
 			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
 		const models = payload.data;
 		const discovered: Model<Api>[] = [];
 		for (const item of models) {
-			if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
-			const id = item.id;
+			// Shared catalog admission: the setup probe applies the same
+			// check, so IDs that appear only between requests cannot enter
+			// the live catalog or cache unsanitized.
+			if (!isRecord(item) || !isSafeCatalogModelId(item.id)) continue;
+			const id = item.id.trim();
 			const referenceModel = resolveCustomModelReference(id);
+			// Names render directly in the model selector: apply the same
+			// text-safety admission, falling back to the reference name or
+			// the safe ID.
+			const rawName = typeof item.name === "string" ? item.name.trim() : "";
+			const name = rawName && isSafeCatalogModelId(rawName) ? rawName : (referenceModel?.name ?? id);
 			const discoveredMaxTokens = firstPositiveDiscoveryNumber(
 				item.max_completion_tokens,
 				item.max_tokens,
@@ -4253,7 +4339,7 @@ export class ModelRegistry {
 			discovered.push(
 				enrichModelThinking({
 					id,
-					name: typeof item.name === "string" ? item.name : (referenceModel?.name ?? id),
+					name,
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
@@ -5226,8 +5312,10 @@ export class ModelRegistry {
 	}
 
 	/**
-	 * Get only models that have auth configured.
-	 * This is a fast check that doesn't refresh OAuth tokens.
+	 * Get selectable models with auth configured.
+	 * This is a fast check that doesn't refresh OAuth tokens. A current,
+	 * authoritative live catalog also limits each provider to its enrolled ids;
+	 * bundled entries remain the fallback until that evidence exists.
 	 */
 	getAvailable(): Model<Api>[] {
 		this.#synchronizeEnvironmentCredentials();
@@ -5241,10 +5329,80 @@ export class ModelRegistry {
 		) {
 			return this.#availableModelsCache;
 		}
-		this.#availableModelsCache = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
+		const authoritativeDiscoveryIds = new Map<string, ReadonlySet<string> | undefined>();
+		const bundledIdsByProvider = new Map<string, Set<string>>();
+		this.#availableModelsCache = this.#models.filter(model => {
+			if (!this.#isModelAvailable(model, disabledProviders)) return false;
+
+			let liveIds = authoritativeDiscoveryIds.get(model.provider);
+			if (!authoritativeDiscoveryIds.has(model.provider)) {
+				liveIds = this.#getAuthoritativeDiscoveredModelIds(model.provider);
+				authoritativeDiscoveryIds.set(model.provider, liveIds);
+			}
+			// Undefined means discovery has not run successfully for the current
+			// provider context. Keep the bundled catalog as the explicit fallback.
+			if (liveIds === undefined) return true;
+			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
+
+			const activity = this.#providerActivity.get(model.provider);
+			if (!activity?.staticModelIds.has(model.id)) return liveIds.has(model.id);
+
+			let bundledIds = bundledIdsByProvider.get(model.provider);
+			if (!bundledIds) {
+				bundledIds = new Set(
+					(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+						candidate => candidate.id,
+					),
+				);
+				bundledIdsByProvider.set(model.provider, bundledIds);
+			}
+			return !bundledIds.has(model.id) || liveIds.has(model.id);
+		});
 		this.#availableModelsDisabledProviders = disabledProviderKey;
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
+	}
+
+	/**
+	 * Return the current live model ids only when discovery produced an
+	 * authoritative catalog for the provider and endpoint. An unavailable or
+	 * failed discovery returns undefined so callers retain the bundled fallback.
+	 */
+	#getAuthoritativeDiscoveredModelIds(provider: string): ReadonlySet<string> | undefined {
+		const descriptorEvidence = this.#descriptorDiscoveryEvidence.get(provider);
+		if (descriptorEvidence?.profileFresh && descriptorEvidence.profileModelIds !== undefined) {
+			try {
+				if (
+					descriptorEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
+					descriptorEvidence.profileEndpoint ===
+						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
+				) {
+					return descriptorEvidence.profileModelIds;
+				}
+			} catch {
+				// A provider context that can no longer be verified must use its fallback.
+			}
+		}
+
+		const configuredEvidence = this.#configuredDiscoveryEvidence.get(provider);
+		if (!configuredEvidence) return undefined;
+		const discoveryState = this.#discoveryManager.getState(provider);
+		if (
+			discoveryState?.status !== "ok" &&
+			discoveryState?.status !== "cached" &&
+			discoveryState?.status !== "empty"
+		) {
+			return undefined;
+		}
+		try {
+			return configuredEvidence.authGeneration === this.#getProviderEvidenceGeneration(provider) &&
+				configuredEvidence.endpoint ===
+					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(provider) ?? "")
+				? configuredEvidence.modelIds
+				: undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	#synchronizeEnvironmentCredentials(): void {

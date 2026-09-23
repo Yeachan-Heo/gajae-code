@@ -16,6 +16,7 @@ import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/s
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { TempDir } from "@gajae-code/utils";
 
 describe("AgentSession handoff", () => {
@@ -410,12 +411,119 @@ describe("AgentSession handoff", () => {
 		expect(handoffSpy).not.toHaveBeenCalled();
 		const startEvents = events.filter(event => event.type === "auto_compaction_start");
 		expect(startEvents).toHaveLength(1);
-		expect(startEvents[0]).toMatchObject({ type: "auto_compaction_start", reason: "overflow" });
+		expect(startEvents[0]).toMatchObject({
+			type: "auto_compaction_start",
+			reason: "overflow",
+			action: "context-full",
+		});
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
+		expect(endEvents[0]).toMatchObject({ action: "context-full" });
 		expect(endEvents[0]).not.toMatchObject({
 			errorMessage: "Auto-handoff failed: no handoff document was generated",
 		});
+	});
+
+	it("records zero-progress recovery across handoff no-op maintenance", async () => {
+		const { sessionPath } = activeStateModule.getSkillActiveStatePaths(tempDir.path(), session.sessionId);
+		await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+		await Bun.write(
+			sessionPath,
+			JSON.stringify({
+				version: 1,
+				active_skills: [
+					{ skill: "ultragoal", phase: "active", active: true, updated_at: new Date().toISOString() },
+				],
+			}),
+		);
+		const workflowDir = path.join(tempDir.path(), ".gjc", `_session-${session.sessionId}`, "ultragoal");
+		await fs.mkdir(workflowDir, { recursive: true });
+		await Bun.write(
+			path.join(workflowDir, "goals.json"),
+			JSON.stringify({
+				version: 1,
+				brief: "zero-progress test",
+				gjcGoalMode: "aggregate",
+				gjcObjective: "Preserve workflow recovery progress",
+				goals: [
+					{
+						id: "G001",
+						title: "Observe recovery",
+						objective: "Observe recovery",
+						status: "active",
+						createdAt: new Date().toISOString(),
+						updatedAt: new Date().toISOString(),
+					},
+				],
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			}),
+		);
+
+		session.settings.set("compaction.strategy", "handoff");
+		session.settings.set("contextPromotion.enabled", false);
+		session.settings.set("compaction.keepRecentTokens", 100_000);
+		const handoffSpy = vi.spyOn(session, "handoff").mockResolvedValue(undefined);
+		const model = session.model;
+		if (!model) throw new Error("Expected model to be set");
+		const overflowAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "overflow" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "error",
+			errorMessage: "maximum context length is 200000 tokens, however you requested 200001 tokens",
+			usage: {
+				input: 120_000,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 120_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: overflowAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [overflowAssistant] });
+		await waitFor(() => events.filter(event => event.type === "auto_compaction_end").length === 1);
+		await session.waitForIdle();
+
+		// Two idle no-op observations bring the same durable projection to the
+		// stalled threshold. Both still use the handoff strategy, but the mocked
+		// handoff result forces the context-full fallback to discover no history.
+		await session.runIdleCompaction();
+		await session.runIdleCompaction();
+		expect(handoffSpy).toHaveBeenCalledTimes(2);
+
+		// Trigger one more no-op threshold maintenance. Its auto-continue prompt
+		// renders the stalled marker only when all three earlier observations,
+		// including the overflow no-op, were recorded.
+		session.settings.set("compaction.autoContinue", true);
+		session.settings.set("compaction.thresholdPercent", 1);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "threshold response" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "stop",
+			usage: {
+				input: 190_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 191_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage(assistant);
+		session.agent.emitExternalEvent({ type: "message_end", message: assistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistant] });
+		await waitFor(() => promptSpy.mock.calls.length === 1);
+		expect(JSON.stringify(promptSpy.mock.calls)).toContain("STALLED:");
 	});
 
 	it("uses handoff strategy for threshold-triggered auto maintenance", async () => {

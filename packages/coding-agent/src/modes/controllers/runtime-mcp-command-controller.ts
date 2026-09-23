@@ -1606,7 +1606,7 @@ export class MCPCommandController {
 		if (!this.ctx.mcpManager) {
 			return;
 		}
-		if (this.ctx.mcpManager.isConnectionSetSealed()) {
+		if (this.ctx.mcpManager.isConnectionSetMutationBlocked()) {
 			throw new Error("This session's plugin-bundle MCP connections are fixed for its lifetime.");
 		}
 

@@ -15,12 +15,13 @@ import { AuthStorage, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../../src/cli/mcp-cli";
 import { installGjcBundle } from "../../src/extensibility/gjc-plugins";
-import { MCPManager } from "../../src/runtime-mcp";
+import { DeferredMCPTool, MCPManager, MCPTool } from "../../src/runtime-mcp";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import type { MCPStdioServerConfig } from "../../src/runtime-mcp/types";
 
@@ -256,6 +257,216 @@ describe("red-team: conventional MCP autoload", () => {
 			}
 		}, 30_000);
 
+		it("keeps a mixed manager reconnectable while cached conventional tools are published", async () => {
+			const pluginBundlePath = path.join(projectDir, "mixed-reconnect-plugin");
+			await writeProjectConfig("mixed-reconnect-plugin/gajae-plugin.json", {
+				kind: "gajae-code-plugin",
+				name: "mixed-reconnect-plugin",
+				version: "1.0.0",
+				mcps: [{ name: "domain_docs", transport: "http", url: "https://example.com/mcp" }],
+			});
+			const r = await installGjcBundle({ cwd: projectDir }, "project", pluginBundlePath);
+			expect(r.ok).toBe(true);
+			await writeProjectConfig(".gjc/mcp.json", { mcpServers: { "slow-demo": demoConfig() } });
+			const [cachedTool] = DeferredMCPTool.fromTools(
+				"slow-demo",
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+				async () => {
+					throw new Error("cached server is disconnected");
+				},
+			);
+			if (!cachedTool) throw new Error("cached MCP tool was not created");
+			const [reconnectedTool] = MCPTool.fromTools(
+				{ name: "slow-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!reconnectedTool) throw new Error("reconnected MCP tool was not created");
+			const [pluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!pluginTool) throw new Error("late plugin MCP tool was not created");
+			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+				tools: [cachedTool],
+				errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
+				connectedServers: [],
+				exaApiKeys: [],
+			});
+			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
+			const sealConnectionSet = vi.spyOn(MCPManager.prototype, "sealConnectionSet");
+			const cachedToolPublishedCheck = Promise.withResolvers<void>();
+			const reconnectSyncSealCheck = Promise.withResolvers<void>();
+			const pluginToolPublishedCheck = Promise.withResolvers<void>();
+			const removedSnapshotSealCheck = Promise.withResolvers<void>();
+			const setOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+			let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+			vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+				setOnToolsChanged.call(this, handler);
+				publishToolsChanged = handler;
+			});
+			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+			let reconnectedToolPublished = false;
+			let pluginToolPublished = false;
+			let latePluginConnected = false;
+			let cachedServerToolsRemoved = false;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+				options,
+			) {
+				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
+				if (nextTools.includes(cachedTool)) cachedToolPublishedCheck.resolve();
+				if (nextTools.includes(reconnectedTool)) reconnectedToolPublished = true;
+				if (nextTools.includes(pluginTool)) {
+					pluginToolPublished = true;
+					pluginToolPublishedCheck.resolve();
+				}
+				if (reconnectedToolPublished && nextTools.length === 0) cachedServerToolsRemoved = true;
+			});
+			const getSource = MCPManager.prototype.getSource;
+			vi.spyOn(MCPManager.prototype, "getSource").mockImplementation(function (this: MCPManager, name) {
+				if (name === "domain_docs") {
+					return {
+						provider: "gjc-plugins",
+						providerName: "GJC plugin bundle",
+						level: "project",
+						path: path.join(projectDir, ".gjc", "mcp.json"),
+					};
+				}
+				return getSource.call(this, name);
+			});
+			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
+			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
+				const status =
+					name === "domain_docs"
+						? latePluginConnected
+							? "connected"
+							: "connecting"
+						: name === "slow-demo" && reconnectedToolPublished
+							? "connected"
+							: getConnectionStatus.call(this, name);
+				if (reconnectedToolPublished && name === "slow-demo" && status === "connected") {
+					reconnectSyncSealCheck.resolve();
+				}
+				if (cachedServerToolsRemoved && name === "slow-demo" && status === "connected") {
+					removedSnapshotSealCheck.resolve();
+				}
+				return status;
+			});
+
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				// The owned-manager tool sync is fire-and-forget. Wait until the
+				// cached fallback has entered the live session catalog.
+				await cachedToolPublishedCheck.promise;
+				expect(connectServers).toHaveBeenCalledTimes(1);
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("slow-demo");
+				expect(mcpManager).toBeDefined();
+				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
+				expect(sealConnectionSet).not.toHaveBeenCalled();
+				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+				expect(mcpManager?.isConnectionSetMutationBlocked()).toBe(true);
+				await expect(mcpManager?.discoverAndConnect({ nativeOnly: true })).rejects.toThrow(
+					"connection set is frozen",
+				);
+
+				// A plugin MCP can finish after the cached fallback. Its late tools
+				// must join the session catalog despite the conventional cache scope.
+				if (!publishToolsChanged) throw new Error("MCP tools-changed handler was not registered");
+				latePluginConnected = true;
+				publishToolsChanged([cachedTool, pluginTool]);
+				await pluginToolPublishedCheck.promise;
+				expect(pluginToolPublished).toBe(true);
+				expect(session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+				await session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+				expect(session.getSelectedMCPToolNames()).not.toContain("mcp__domain_docs_lookup");
+
+				// Simulate the conventional manager's reconnect publication while
+				// retaining the plugin tool in the manager's complete snapshot.
+				publishToolsChanged([reconnectedTool, pluginTool]);
+				await reconnectSyncSealCheck.promise;
+				expect(reconnectedToolPublished).toBe(true);
+				expect(sealConnectionSet).not.toHaveBeenCalled();
+				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+				expect(mcpManager?.isConnectionSetMutationBlocked()).toBe(true);
+
+				// Once the cached server's tools leave the live catalog, the hold must
+				// clear and restore the mixed-session fixed-connection contract.
+				publishToolsChanged([]);
+				await removedSnapshotSealCheck.promise;
+				expect(sealConnectionSet).toHaveBeenCalledTimes(1);
+				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("seals connected ordinary conventional tools before asynchronous publication", async () => {
+			const pluginBundlePath = path.join(projectDir, "ordinary-seal-plugin");
+			await writeProjectConfig("ordinary-seal-plugin/gajae-plugin.json", {
+				kind: "gajae-code-plugin",
+				name: "ordinary-seal-plugin",
+				version: "1.0.0",
+				mcps: [{ name: "domain_docs", transport: "http", url: "https://example.com/mcp" }],
+			});
+			const r = await installGjcBundle({ cwd: projectDir }, "project", pluginBundlePath);
+			expect(r.ok).toBe(true);
+			await runMCPCommand({
+				action: "add",
+				name: "fast-demo",
+				commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+				flags: { project: true, timeout: 5_000 },
+				cwd: projectDir,
+			});
+
+			const [conventionalTool] = MCPTool.fromTools(
+				{ name: "fast-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			);
+			const [pluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!conventionalTool || !pluginTool) throw new Error("MCP test tools were not created");
+
+			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+				tools: [pluginTool, conventionalTool],
+				errors: new Map(),
+				connectedServers: ["domain_docs", "fast-demo"],
+				exaApiKeys: [],
+			});
+			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([pluginTool, conventionalTool]);
+			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockReturnValue("connected");
+			const syncStarted = Promise.withResolvers<void>();
+			const syncGate = Promise.withResolvers<void>();
+			const replaceTools = AgentSession.prototype.replaceNamedCustomTools;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+			) {
+				if (nextTools.includes(conventionalTool)) {
+					syncStarted.resolve();
+					await syncGate.promise;
+				}
+				return await replaceTools.call(this, previousNames, nextTools);
+			});
+
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				await syncStarted.promise;
+				expect(connectServers).toHaveBeenCalledTimes(1);
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
+				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+			} finally {
+				syncGate.resolve();
+				await session.dispose();
+			}
+		});
+
 		it("plugin-bundle MCPs override conventional entries on name collisions; both load otherwise", async () => {
 			const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
 			expect(r.ok).toBe(true);
@@ -415,6 +626,34 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
 				const result = await mcpManager?.discoverAndConnect({ nativeOnly: true });
 				expect(result?.connectedServers).toContain("solo");
+			} finally {
+				await session.dispose();
+			}
+		}, 30_000);
+
+		it("publishes newly connected conventional servers into the session catalog", async () => {
+			await writeProjectConfig(".gjc/mcp.json", {
+				mcpServers: { solo: demoConfig() },
+			});
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				if (!mcpManager) throw new Error("session-owned MCP manager was not created");
+				const result = await mcpManager.connectServers(
+					{ fresh: demoConfig() },
+					{
+						fresh: {
+							provider: "native",
+							providerName: "GJC",
+							level: "project",
+							path: path.join(projectDir, ".gjc", "mcp.json"),
+						},
+					},
+				);
+				expect(result.connectedServers).toContain("fresh");
+				for (let attempt = 0; attempt < 50 && !session.getAllToolNames().includes("mcp__fresh_hello"); attempt++) {
+					await Bun.sleep(10);
+				}
+				expect(session.getAllToolNames()).toContain("mcp__fresh_hello");
 			} finally {
 				await session.dispose();
 			}

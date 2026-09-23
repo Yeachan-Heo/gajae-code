@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Performance
+
+- Avoid unsupported Kitty placement extraction on ordinary non-Kitty input frames.
+- Reuse unchanged editor logical-line layouts, including keyboard shrink/join paths that previously retained deleted-line cache entries.
+- Reuse the byte/line admission decision for exact cached Markdown highlights instead of rescanning unchanged fenced code.
+- Add a native-highlight input-to-synchronized-write benchmark with same-frame visibility checks. Scheduling, preparation, force precedence, and output revisions are unchanged.
+
+- Avoid allocating fallback arrays while attributing Kitty placements during frame assembly. Emitted terminal bytes are unchanged.
+
+- Hold the raw frame by reference instead of copying every transcript line during frame assembly. Emitted terminal bytes are unchanged.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

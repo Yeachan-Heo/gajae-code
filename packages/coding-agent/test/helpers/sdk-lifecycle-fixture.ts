@@ -23,7 +23,10 @@ export type LifecycleFixture = {
 	repo: string;
 	agentDir: string;
 	stateRoot: string;
-	invokeScenario: (global: LifecycleGlobal) => Promise<void>;
+	invokeScenario: (
+		global: LifecycleGlobal,
+		conflictCode?: "idempotency_conflict" | "operation_failed",
+	) => Promise<void>;
 	cleanup: () => Promise<void>;
 };
 
@@ -242,7 +245,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 		repo,
 		agentDir,
 		stateRoot,
-		async invokeScenario(global) {
+		async invokeScenario(global, conflictCode = "idempotency_conflict") {
 			const created = success(
 				await global(
 					"session.create",
@@ -266,14 +269,14 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 					{ cwd: repo, target: { path: repo }, stateRoot, body: "changed" },
 					"create-key",
 				),
-			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			).toMatchObject({ ok: false, error: { code: conflictCode } });
 			const createdEndpoint = await assertReady(stateRoot, createdId);
 
 			const createdClosed = success(await global("session.close", { sessionId: createdId }, "close-created-key"));
 			await assertClosed(agentDir, stateRoot, createdId, createdEndpoint);
 			expect(
 				await global("session.close", { sessionId: createdId, body: "changed" }, "close-created-key"),
-			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			).toMatchObject({ ok: false, error: { code: conflictCode } });
 			expect(success(await global("session.close", { sessionId: createdId }, "close-created-key"))).toEqual(
 				createdClosed,
 			);
@@ -332,7 +335,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 					},
 					"resume-key",
 				),
-			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			).toMatchObject({ ok: false, error: { code: conflictCode } });
 			success(await global("session.close", { sessionId: sourceId }, "close-resumed-key"));
 			await assertClosed(agentDir, stateRoot, sourceId, resumedEndpoint);
 
@@ -379,7 +382,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 					},
 					"fork-key",
 				),
-			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			).toMatchObject({ ok: false, error: { code: conflictCode } });
 			const forkPath = await eventually(async () => {
 				const candidates = await listManagedSessionCandidates({ scope: resolved.scope });
 				return candidates.kind === "complete"
@@ -433,7 +436,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 					{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: sourcePath },
 					"delete-key",
 				),
-			).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+			).toMatchObject({ ok: false, error: { code: conflictCode } });
 		},
 		async cleanup() {
 			await cleanupFixtureRoot(cleanup);

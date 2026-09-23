@@ -1,4 +1,5 @@
 import { isCompiledBinary, logger, Snowflake } from "@gajae-code/utils";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import { registerResourceOwner } from "../../runtime/process-lifecycle";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
@@ -460,13 +461,11 @@ function reasonToError(reason: unknown, fallback: string): Error {
 }
 
 function errorFromPayload(payload: RunErrorPayload): Error {
-	if (payload.isAbort) {
-		const err = new ToolAbortError(payload.message || "Execution aborted");
-		if (payload.stack) err.stack = payload.stack;
-		return err;
-	}
-	const ctor = payload.isToolError ? ToolError : Error;
-	const error = new ctor(payload.message);
+	const error = payload.isDesigned
+		? payload.isAbort
+			? new ToolAbortError(payload.message || "Execution aborted")
+			: new ToolError(payload.message)
+		: new Error(payload.message);
 	if (payload.name) error.name = payload.name;
 	if (payload.stack) error.stack = payload.stack;
 	return error;
@@ -479,7 +478,8 @@ function toErrorPayload(error: unknown): RunErrorPayload {
 			message: error.message,
 			stack: error.stack,
 			isAbort: error.name === "AbortError" || error.name === "ToolAbortError",
-			isToolError: error instanceof ToolError || error.name === "ToolError",
+			isToolError: error instanceof ToolError,
+			isDesigned: isDesignedError(error),
 		};
 	}
 	return { message: String(error) };

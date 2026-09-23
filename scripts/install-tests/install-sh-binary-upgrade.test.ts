@@ -1300,22 +1300,22 @@ exec /bin/cp "$@"
 		expect(fs.readFileSync(lockFile, "utf8")).toBe(claim);
 	});
 
-	test("refuses to replace a destination symlink", async () => {
-		const payload = fakeGjcScript({ version: VERSION });
-		writeCurlShim(sandbox.shimDir, {
-			assets: {
-				[hostBinaryName()]: payload,
-				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
-			},
-		});
+	test.each([false, true])("refuses a destination symlink before network access (dangling=%s)", async dangling => {
+		const networkMarker = path.join(sandbox.root, "network-called");
+		const curlPath = path.join(sandbox.shimDir, "curl");
+		await Bun.write(curlPath, '#!/bin/sh\nprintf called > "$GJC_TEST_NETWORK_MARKER"\nexit 91\n');
+		fs.chmodSync(curlPath, 0o755);
 		const dest = path.join(sandbox.installDir, "gjc");
 		const real = path.join(sandbox.installDir, "real-gjc");
-		fs.writeFileSync(real, "managed\n");
+		if (!dangling) await Bun.write(real, "managed\n");
 		fs.symlinkSync(real, dest);
-		const result = await runInstaller([]);
+		const result = await runInstaller([], { GJC_TEST_NETWORK_MARKER: networkMarker });
 		expect(result.exitCode).not.toBe(0);
 		expect(result.stderr + result.stdout).toContain("Refusing to replace symlink");
-		expect(fs.readFileSync(real, "utf8")).toBe("managed\n");
+		expect(await Bun.file(networkMarker).exists()).toBe(false);
+		if (dangling) expect(await Bun.file(real).exists()).toBe(false);
+		else expect(await Bun.file(real).text()).toBe("managed\n");
 		expect(fs.lstatSync(dest).isSymbolicLink()).toBe(true);
+		expect(fs.existsSync(path.join(sandbox.installDir, ".gjc-install.lock"))).toBe(false);
 	});
 });

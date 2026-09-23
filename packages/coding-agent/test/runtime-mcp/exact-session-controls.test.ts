@@ -237,6 +237,41 @@ describe("exact-config MCP session controls", () => {
 		expect(manager.getTools()).toHaveLength(0);
 	});
 
+	test("catalog snapshots distinguish an unpublished catalog from a fenced empty publication", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gjc-exact-mcp-catalog-snapshot-"));
+		roots.push(root);
+		const configPath = join(root, "mcp.json");
+		await Bun.write(
+			configPath,
+			JSON.stringify({ mcpServers: { exact: { type: "http", url: "http://127.0.0.1:1" } } }),
+		);
+		const live = connection("exact", []);
+		vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(live);
+		vi.spyOn(mcpClient, "listTools").mockResolvedValue([{ name: "lookup", inputSchema: { type: "object" } }]);
+		const manager = new MCPManager(root, null, { toolsOnly: true });
+		managers.push(manager);
+
+		expect(manager.getToolCatalogSnapshot()).toMatchObject({ publication: "unpublished", generation: 0, tools: [] });
+		await manager.discoverAndConnect({ configPath });
+		const published = manager.getToolCatalogSnapshot();
+		expect(published.publication).toBe("published");
+		expect(published.generation).toBeGreaterThan(0);
+		expect(published.tools).toHaveLength(1);
+
+		const suspension = await manager.prepareExactServerControl("suspend", "exact");
+		expect(manager.getToolCatalogSnapshot()).toMatchObject({
+			publication: "fenced",
+			generation: published.generation,
+			tools: [],
+		});
+		await suspension.commit();
+		expect(manager.getToolCatalogSnapshot()).toMatchObject({
+			publication: "fenced",
+			generation: published.generation,
+			tools: [],
+		});
+	});
+
 	test("prepared resume aborts a duplicate tool catalog instead of overwriting it", async () => {
 		const root = await mkdtemp(join(tmpdir(), "gjc-exact-mcp-duplicate-"));
 		roots.push(root);

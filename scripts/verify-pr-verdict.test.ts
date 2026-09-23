@@ -1,5 +1,8 @@
 import { describe, expect, test, vi } from "bun:test";
+import { Glob } from "bun";
+import { parse } from "yaml";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import {
@@ -55,7 +58,7 @@ describe("authenticated approval API evidence", () => {
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
-				return Response.json([]);
+				return Response.json([{ event: "head_ref_force_pushed", created_at: headCommittedAt }]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-agent/permission") return Response.json({ permission: scenario.permission });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -64,11 +67,12 @@ describe("authenticated approval API evidence", () => {
 			const approval = await authenticatedApproval(event, "review-agent", head, "test-token");
 			expect(approval).toEqual(scenario.approved ? { login: "review-agent", headSha: head } : {});
 			expect(validatePrContract(validInput({ authenticatedReviewerLogin: approval.login, authenticatedReviewHeadSha: approval.headSha })).ok).toBe(scenario.approved);
-			// Reviews, then the head commit, then the PR timeline whose force-push events
-			// are the server-observed freshness authority; the permission call only
-			// follows a surviving approval.
+			// Reviews, then the PR timeline whose force-push events are the only
+			// server-observed freshness authority. The commit is no longer fetched at all,
+			// because its committer date is contributor-controlled in both directions and
+			// therefore cannot be a floor. The permission call follows a surviving approval.
 			const expectsPermission = scenario.name === "valid exact-head approval" || scenario.name === "revoked collaborator permission";
-			expect(requests.length).toBe(expectsPermission ? 4 : 3);
+			expect(requests.length).toBe(expectsPermission ? 3 : 2);
 		} finally {
 			spy.mockRestore();
 		}
@@ -1274,12 +1278,15 @@ describe("push preflight independent-review evidence (issue #5483 review)", () =
 			body: riskClassifiedBody,
 			comments: riskClassifiedComments,
 			reviews: context => reviewerApproval(context, "APPROVED", "1970-01-01T00:00:00Z"),
+			// A force-push is what re-binds `commit_id`; without one on record there is no
+			// re-binding vector and nothing to refuse.
+			forcePushedAt: "2020-01-01T00:00:00Z\n",
 			permission: "write",
 		});
 		expect(result.exitCode).toBe(1);
 		// Must read as a re-bound stale approval, NOT as a missing one: the remedies differ.
 		expect(result.stderr).toContain("submitted BEFORE that head commit existed");
-		expect(result.stderr).toContain("re-pointed a stale review after a force-push");
+		expect(result.stderr).toContain("observed to re-point stale approvals after a force-push");
 	});
 
 	test("a backdated head commit cannot revive a stale approval (#5692 review)", async () => {
@@ -1441,7 +1448,9 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
 				return Response.json({ commit: { committer: { date: headCommittedAt } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
-				return Response.json([]);
+				// The head appeared at a force-push; the committer date is no longer a
+				// freshness floor because a contributor can set it in either direction.
+				return Response.json([{ event: "head_ref_force_pushed", created_at: headCommittedAt }]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission") return Response.json({ permission: "write" });
 			throw new Error(`Unexpected endpoint: ${endpoint}`);
 		}, { preconnect: originalFetch.preconnect });
@@ -1461,13 +1470,13 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 	});
 
 	test.each([
-		{ name: "commits API failure", commits: () => new Response("nope", { status: 500 }) },
-		{ name: "missing committer date", commits: () => Response.json({ commit: { committer: {} } }) },
-		{ name: "unparseable committer date", commits: () => Response.json({ commit: { committer: { date: "not-a-date" } } }) },
-	])("an unreadable head commit date refuses the approval rather than admitting it: $name", async scenario => {
-		// The first cut of #5692 skipped the precedence test entirely when the head date was
-		// absent, so a failed commit lookup ADMITTED the approval — a fail-open in the guard
-		// that exists to fail closed (#5692 review).
+		// The committer date is no longer a freshness floor in either direction, so an
+		// unreadable COMMIT is irrelevant. What must refuse is an unreadable force-push,
+		// because a force-push on record is the only re-binding vector (#5692 review).
+		{ name: "timeline read failure", timeline: () => new Response("nope", { status: 503 }) },
+		{ name: "force-push with a null time", timeline: () => Response.json([{ event: "head_ref_force_pushed", created_at: null }]) },
+		{ name: "force-push with an unparseable time", timeline: () => Response.json([{ event: "head_ref_force_pushed", created_at: "not-a-date" }]) },
+	])("unreadable server force-push evidence refuses the approval: $name", async scenario => {
 		const originalFetch = globalThis.fetch;
 		const previousToken = Bun.env.GITHUB_TOKEN;
 		Bun.env.GITHUB_TOKEN = "test-token";
@@ -1475,7 +1484,79 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 			const endpoint = String(input);
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
 				return Response.json([review("review-bot", "APPROVED")]);
-			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`) return scenario.commits();
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline")) return scenario.timeline();
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("unreadable timeline evidence is diagnosed as a read failure, not a stale approval (#5692 review)", async () => {
+		// The remedies differ. A stale approval needs a new review; a read failure needs a
+		// re-run. The message said "the head commit date" after the commit date stopped
+		// being consulted at all, and recommended a new review, which would not clear it.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
+				return new Response("unavailable", { status: 503 });
+			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
+				return Response.json({ permission: "write" });
+			throw new Error(`Unexpected endpoint: ${endpoint}`);
+		}, { preconnect: originalFetch.preconnect });
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
+		try {
+			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
+			// The evidence must classify the refusal as unreadable, which is what selects
+			// the read-failure diagnostic over the stale-approval one.
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: false,
+				refusedApproval: "unreadable",
+			});
+			// And the message that classification selects must name the real blocker and
+			// the real remedy: no commit-date language, no "get a new review".
+			const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+			const unreadableBranch = source.slice(source.indexOf('refused === "unreadable"'), source.indexOf("} else {", source.indexOf('refused === "unreadable"')));
+			expect(unreadableBranch).toContain("force-push evidence could not be read");
+			expect(unreadableBranch).toContain("Re-run once the timeline is readable");
+			expect(unreadableBranch).not.toContain("head commit date");
+			expect(unreadableBranch).not.toContain("a review submitted after the current head is required");
+		} finally {
+			spy.mockRestore();
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
+		}
+	});
+
+	test("a future-dated commit cannot block a genuine approval when no force-push occurred (#5692 review)", async () => {
+		// The no-force-push branch previously used the committer date as the floor, so an
+		// author could forward-date their commit and refuse every legitimate approval on
+		// their own PR. With no force-push there is no re-binding vector at all.
+		const originalFetch = globalThis.fetch;
+		const previousToken = Bun.env.GITHUB_TOKEN;
+		Bun.env.GITHUB_TOKEN = "test-token";
+		const replacement: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0]) => {
+			const endpoint = String(input);
+			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/pulls/5416/reviews"))
+				return Response.json([review("review-bot", "APPROVED")]);
+			if (endpoint === `https://api.github.com/repos/owner/repo/commits/${head}`)
+				return Response.json({ commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
 			if (endpoint.startsWith("https://api.github.com/repos/owner/repo/issues/5416/timeline"))
 				return Response.json([]);
 			if (endpoint === "https://api.github.com/repos/owner/repo/collaborators/review-bot/permission")
@@ -1485,12 +1566,14 @@ describe("server independent-reviewer evidence (issue #5483 review)", () => {
 		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(replacement);
 		try {
 			const evidence = await fetchIndependentReviewerEvidence(event, "review-bot", head);
-			expect(evidence.approvedHead).toBe(false);
-			// Refused, but NOT claimed re-bound: precedence was never proven.
-			expect(evidence.refusedApproval).toBe("unreadable");
+			expect({ approvedHead: evidence.approvedHead, refusedApproval: evidence.refusedApproval }).toEqual({
+				approvedHead: true,
+				refusedApproval: undefined,
+			});
 		} finally {
 			spy.mockRestore();
-			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN; else Bun.env.GITHUB_TOKEN = previousToken;
+			if (previousToken === undefined) delete Bun.env.GITHUB_TOKEN;
+			else Bun.env.GITHUB_TOKEN = previousToken;
 		}
 	});
 
@@ -1704,8 +1787,14 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The branch-protection rollout contract is documented in the workflow.
 	expect(workflow).toContain("Branch-protection rollout contract");
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
-	// instead of failing the job on the 404.
-	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// instead of failing the job on the 404. Every other lookup failure must fail
+	// validation, rather than preserving an old approval as if this were an issue.
+	expect(workflow).toContain('if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then');
+	expect(workflow).toContain('grep -qF "HTTP 404" "$lookup_error"');
+	expect(workflow).toContain('exit "$lookup_status"');
+	// The automatic approval job never runs for comment events: its job check binds to
+	// the default-branch SHA, so any verdict it published landed on `main` (#5694).
+	expect(workflow).toContain("if: ${{ always() && github.event_name != 'issue_comment' }}");
 	// A trusted base missing ANY required validator capability can never authorize.
 	// One marker was not enough: `main` carried the self-review validator but not the
 	// approval freshness rule, so a comment-triggered re-validation ran the old
@@ -1770,8 +1859,26 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	expect(fallible[0]?.[1].length).toBe(2);
 	// A failure after the head SHA is known but before the approval is raised must still
 	// leave the approval revoked. Gated on failure() so it cannot fire on the happy path.
+	// Revocation must be restricted to self-review comment events. `issue_comment` fires
+	// for every comment by anyone, so revoking on all of them let any commenter red the
+	// exact-head approval and, with `cancel-in-progress`, keep an authorized PR blocked
+	// indefinitely without changing any authorization evidence (#5740 review).
+	expect(workflow).toContain("steps.pr.outputs.self_review_event == 'true'");
+	expect(workflow.match(/self_review_event == 'true'/g)).toHaveLength(2);
+	// The untrusted comment body must reach the script through the environment. Inline
+	// `${{ github.event.comment.body }}` in a `run:` block is shell injection from an
+	// untrusted author — the exact thing this workflow exists to avoid.
+	expect(workflow).toContain("COMMENT_BODY: ${{ github.event.comment.body }}");
+	expect(workflow).toContain('"${COMMENT_BODY:-}" == *"$record_marker"*');
+	// The marker alone is not enough: anyone can write it, so gating on the string only
+	// would let a third party force revocation and reinstate the denial of service behind
+	// one extra step. A self-review record is author-owned by definition.
+	expect(workflow).toContain('"${COMMENT_AUTHOR:-}" == "${PR_AUTHOR:-}"');
+	expect(workflow).toContain("COMMENT_AUTHOR: ${{ github.event.comment.user.login }}");
+	expect(workflow).toContain("PR_AUTHOR: ${{ github.event.issue.user.login }}");
+	expect(workflow).not.toContain('comment_body="${{ github.event.comment.body }}"');
 	expect(workflow).toContain("name: Keep the approval revoked when revalidation does not complete");
-	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.head_sha != '' }}");
+	expect(workflow).toContain("if: ${{ failure() && github.event_name == 'issue_comment' && steps.pr.outputs.self_review_event == 'true' && steps.pr.outputs.head_sha != '' }}");
 	expect(workflow).toContain('-f \'output[title]="Merge approval (re-validation failed)"\'');
 	// Within the publication step the contract result is written before the approval is
 	// raised, so a failed contract write cannot leave a green approval.
@@ -1781,6 +1888,92 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
 	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
+});
+
+test("issue-comment PR lookup skips only confirmed 404 and fails closed for other errors", async () => {
+	const document = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+	};
+	const resolver = document.jobs?.validate?.steps?.find(step => step.name === "Resolve PR head/base from the event or the comment's PR");
+	if (!resolver?.run) throw new Error("Missing PR resolver run block");
+	// Exercise the checked-in resolver itself with only the event expressions bound to
+	// fixture values. The fake gh command returns a real 404-shaped failure or a
+	// transient non-404 failure; no duplicate classifier is used in the test.
+	const script = resolver.run
+		.replaceAll("${{ github.event.pull_request.number }}", "")
+		.replaceAll("${{ github.event.pull_request.head.repo.full_name }}", "owner/repo")
+		.replaceAll("${{ github.event.pull_request.head.sha }}", "b".repeat(40))
+		.replaceAll("${{ github.event.pull_request.base.sha }}", "a".repeat(40))
+		.replaceAll("${{ github.event.issue.number }}", "123")
+		.replaceAll("${{ github.repository }}", "owner/repo");
+
+	async function runResolver(errorText: string, status: number): Promise<{ exitCode: number; output: string; stderr: string }> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pr-validation-lookup-"));
+		try {
+			const bin = path.join(root, "bin");
+			await fs.mkdir(bin);
+			const gh = path.join(bin, "gh");
+			await fs.writeFile(gh, `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(errorText)} >&2\nexit ${status}\n`, { mode: 0o755 });
+			const output = path.join(root, "github-output");
+			await fs.writeFile(output, "");
+			const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+			const child = Bun.spawn(["bash", "-e", "-u", "-o", "pipefail", "-c", script], {
+				cwd: root,
+				env: {
+					...inheritedEnv,
+					PATH: `${bin}:${inheritedEnv.PATH ?? ""}`,
+					RUNNER_TEMP: root,
+					GITHUB_OUTPUT: output,
+					COMMENT_BODY: "",
+					COMMENT_PREVIOUS_BODY: "",
+					COMMENT_AUTHOR: "",
+					PR_AUTHOR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			return { exitCode: await child.exited, output: await Bun.file(output).text(), stderr: `${stdout}${stderr}` };
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	const notFound = await runResolver("gh: Not Found (HTTP 404)", 1);
+	expect(notFound.exitCode).toBe(0);
+	expect(notFound.output).toContain("skip=true");
+
+	const transientFailure = await runResolver("gh: Service Unavailable (HTTP 503)", 1);
+	expect(transientFailure.exitCode).not.toBe(0);
+	expect(transientFailure.output).not.toContain("skip=true");
+	expect(transientFailure.stderr).toContain("HTTP 503");
+});
+
+test("issue_comment events never run the default-SHA merge-approval job", async () => {
+	const workflow = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { outputs?: Record<string, string>; if?: string; steps?: Array<{ name?: string; if?: string }> }>;
+	};
+	const validate = workflow.jobs?.validate;
+	const mergeApproval = workflow.jobs?.["merge-approval"];
+
+	// issue_comment runs from the default branch, so the automatic job check is bound
+	// to `main`, never to the PR head. Gating on the resolver's skip output was not
+	// enough: a dev-PR comment awaiting approval, a failed validation, or a non-404
+	// lookup error (where no skip is written) all still published a red "Merge
+	// approval" on `main` (#5694, Codex P1/P2). The exclusion must therefore be by
+	// event name, with nothing left for the resolver to opt into.
+	expect(mergeApproval?.if).toBe("${{ always() && github.event_name != 'issue_comment' }}");
+	expect(validate?.outputs).toEqual({ merge_authorized: "${{ steps.validate.outputs.merge_authorized }}" });
+	// The exact-head verdict for comment events comes from the head-bound check-run
+	// publication in the validate job, which is the only path that names the PR head.
+	const publish = validate?.steps?.find(step => step.name === "Publish head-bound check results for comment-triggered validation");
+	expect(publish?.if).toBe("${{ always() && github.event_name == 'issue_comment' && steps.pr.outputs.skip != 'true' }}");
+	// PR-bound events keep the fail-closed automatic gate: nothing but the event name
+	// may switch it off, so a failed or cancelled contract still yields a red approval.
+	expect(mergeApproval?.if).not.toContain("needs.validate.outputs");
 });
 
 test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
@@ -1814,6 +2007,517 @@ test("the stale-base markers survive comment stripping but not code removal (#56
 			satisfiableByProse: false,
 		});
 	}
+});
+
+test("every malformed-record diagnostic matches its parser field for field (#5740 review)", async () => {
+	// Both messages described grammar the regexes reject: the verdict one omitted
+	// `merge-self-approved`, and the self-review one omitted it AND offered
+	// `extra:gpt-heavy`. Follow either exactly and the record still fails to parse — an
+	// unreachable remedy handed to someone already stuck on malformed input.
+	//
+	// My first guard here was itself too narrow: it looked for `verdict:<...>`, which
+	// only the self-review message has, so the ordinary verdict diagnostic was never
+	// inspected and dropping `merge-self-approved` from it still passed (#5740 review).
+	//
+	// This asserts SET EQUALITY per field, in both directions. Advertising something the
+	// parser rejects fails, and so does quietly accepting something never advertised.
+	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+	const line = (needle: string): string => {
+		const found = source.split("\n").find((candidate) => candidate.includes(needle));
+		expect({ needle, found: found !== undefined }).toEqual({ needle, found: true });
+		return found ?? "";
+	};
+	// `independent:[^\s]+` and `independent:login` are the same alternative with a
+	// different placeholder, so compare on the head of a parameterised value.
+	const head = (alternative: string): string => alternative.split(":")[0] ?? alternative;
+	const set = (raw: string): string[] => [...new Set(raw.split("|").map(head))].sort();
+	const compare = (field: string, pattern: string, message: string, accepted: string, advertised: string): void => {
+		const acceptedSet = set(source.match(new RegExp(`${pattern}[^\n]*?${accepted}\\(([^)]*)\\)`))?.[1] ?? "");
+		const advertisedSet = set(line(message).match(new RegExp(`${advertised}<([^>]*)>`))?.[1] ?? "");
+		expect(acceptedSet.length).toBeGreaterThan(0);
+		expect({ field, advertised: advertisedSet }).toEqual({ field, advertised: acceptedSet });
+	};
+	// Domain 1 — the ordinary verdict line. This is the message my previous guard missed.
+	compare("verdict verb", "VERDICT_PATTERN", "Malformed ${VERDICT_PREFIX} line", "v1 ", "VERDICT_PREFIX} ");
+	compare("verdict reviewer", "VERDICT_PATTERN", "Malformed ${VERDICT_PREFIX} line", "reviewer:", "reviewer:");
+	// Domain 2 — the self-review record, every enumerated field of it.
+	const selfReview = "Malformed ${SELF_REVIEW_PREFIX} line";
+	compare("self-review verb", "SELF_REVIEW_PATTERN", selfReview, "verdict:", "verdict:");
+	compare("self-review risk", "SELF_REVIEW_PATTERN", selfReview, "risk:", "risk:");
+	compare("self-review extra", "SELF_REVIEW_PATTERN", selfReview, "extra:", "extra:");
+});
+
+test("every expression expanded into a workflow run scalar is explicitly justified (#5740 review)", async () => {
+	// Author-controlled text expanded into a `run:` body is shell injection. I introduced
+	// exactly that while fixing something else, so this guard exists to make the CLASS
+	// impossible rather than the one instance I happened to hit.
+	//
+	// THREE earlier versions were each too narrow and each passed a live vector:
+	//   1. it skipped shell comment lines — but GitHub expands `${{ }}` before bash sees
+	//      the script, so a multiline body injects an executable line from behind a `#`;
+	//   2. it matched only `run: |` block scalars, only `github.event.*`, and a hardcoded
+	//      file list;
+	//   3. it hand-parsed YAML line by line, which cannot see a flow-style or quoted key
+	//      (`- { "run": ... }`), an aliased scalar (`run: *anchor`), or the valid `|2-`
+	//      indicator order — and its `[^}]+?` matcher could not cross an ordinary brace,
+	//      so `${{ format('{0}', github.event.comment.body) }}` was INVISIBLE to it.
+	//
+	// Hand-parsing the YAML was the root mistake, so this parses it. Traversal is
+	// semantic: any string under a `run` or `script` key, wherever it appears, with
+	// aliases already resolved by the parser. Expression extraction is terminator-aware
+	// and fails closed on anything it cannot classify.
+	const justified = new Map<string, string>([
+		// Keyed by FILE and expression, not expression alone. A global key means an
+		// allowlisted name such as `inputs.hash` silently covers a NEW composite action
+		// whose caller feeds it PR text — the justification would be true of the old
+		// producer and false of the new one (#5740 review).
+		[".github/actions/build-native/action.yml\tinputs.hash", "hex digest computed in-workflow; ci.yml is the only caller"],
+		[".github/actions/build-native/action.yml\tinputs.nightly_version", "same generated version; ci.yml is the only caller"],
+		[".github/workflows/ci.yml\tgithub.ref", "ref name; writing one requires push access to this protected path"],
+		[".github/workflows/ci.yml\tgithub.run_id", "integer assigned by GitHub"],
+		[".github/workflows/ci.yml\tgithub.sha", "40-hex, server-computed"],
+		[".github/workflows/ci.yml\tmatrix.binary_path", "workflow-fixed matrix literal"],
+		[".github/workflows/ci.yml\tneeds.acp_conformance.result", "closed result enum"],
+		[".github/workflows/ci.yml\tneeds.check.result", "closed result enum"],
+		[".github/workflows/ci.yml\tneeds.main_native.result", "closed result enum"],
+		[".github/workflows/ci.yml\tneeds.main_plan.result", "closed result enum"],
+		[".github/workflows/ci.yml\tneeds.main_shards.result", "closed result enum"],
+		[".github/workflows/ci.yml\tneeds.release_metadata.outputs.nightly_version", "generated by scripts/nightly-release.ts"],
+		[".github/workflows/ci.yml\tneeds.test.result", "closed result enum"],
+		[".github/workflows/dev-ci.yml\tmatrix.group", "workflow-fixed matrix literal"],
+		[".github/workflows/dev-ci.yml\tneeds.affected-evidence-producer.outputs.artifact_digest", "digest written by a trusted job"],
+		[".github/workflows/dev-ci.yml\tneeds.affected-evidence-producer.outputs.artifact_id", "id written by a trusted job"],
+		[".github/workflows/dev-ci.yml\tneeds.affected-evidence-producer.result", "closed result enum"],
+		[".github/workflows/dev-ci.yml\tneeds.affected-plan.result", "closed result enum"],
+		[".github/workflows/dev-ci.yml\tneeds.gjc-state-gates-matrix.result", "closed result enum"],
+		[".github/workflows/dev-ci.yml\tneeds.gjc-state-gates-native.result", "closed result enum"],
+		[".github/workflows/dev-ci.yml\tneeds.gjc-state-gates-relevance.outputs.relevant", "literal true|false"],
+		[".github/workflows/dev-ci.yml\tneeds.gjc-state-gates-relevance.result", "closed result enum"],
+		[".github/workflows/pr-validation.yml\tgithub.event.issue.number", "integer assigned by GitHub"],
+		[".github/workflows/pr-validation.yml\tgithub.event.pull_request.base.sha", "40-hex, server-computed"],
+		[".github/workflows/pr-validation.yml\tgithub.event.pull_request.head.repo.full_name", "repo name charset"],
+		[".github/workflows/pr-validation.yml\tgithub.event.pull_request.head.sha", "40-hex, server-computed"],
+		[".github/workflows/pr-validation.yml\tgithub.event.pull_request.number", "integer assigned by GitHub"],
+		[".github/workflows/pr-validation.yml\tgithub.repository", "repo name charset"],
+		[".github/workflows/pr-validation.yml\tgithub.run_id", "integer assigned by GitHub"],
+		[".github/workflows/pr-validation.yml\tgithub.server_url", "fixed origin"],
+		[".github/workflows/pr-validation.yml\tsteps.pr.outputs.base_sha", "from the event or the API, both 40-hex"],
+		[".github/workflows/pr-validation.yml\tsteps.pr.outputs.head_sha", "from the event or the API, both 40-hex"],
+		[".github/workflows/pr-validation.yml\tsteps.validate.outcome", "success|failure|cancelled|skipped"],
+		[".github/workflows/pr-validation.yml\tsteps.validate.outputs.merge_authorized", "literal true|false written by the step above"],
+	]);
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	// A GHA expression contains `{` only inside a single-quoted literal, so skip those
+	// and take the first `}}` outside a string. Anything unterminated is a failure, not
+	// a skip — that is precisely how the brace bypass hid.
+	const expressionsIn = (scalar: string): { found: string[]; unterminated: boolean } => {
+		const found: string[] = [];
+		for (let at = scalar.indexOf("${{"); at !== -1; at = scalar.indexOf("${{", at)) {
+			let cursor = at + 3;
+			let quoted = false;
+			let end = -1;
+			while (cursor < scalar.length) {
+				const character = scalar[cursor];
+				if (character === "'") quoted = !quoted;
+				else if (!quoted && character === "}" && scalar[cursor + 1] === "}") {
+					end = cursor;
+					break;
+				}
+				cursor++;
+			}
+			if (end === -1) return { found, unterminated: true };
+			found.push(scalar.slice(at + 3, end).trim());
+			at = end + 2;
+		}
+		return { found, unterminated: false };
+	};
+	const shellScalars = (node: unknown, key?: string): string[] => {
+		if (typeof node === "string") return key === "run" || key === "script" ? [node] : [];
+		if (Array.isArray(node)) return node.flatMap((item) => shellScalars(item, key));
+		if (node !== null && typeof node === "object") {
+			return Object.entries(node).flatMap(([childKey, value]) => shellScalars(value, childKey));
+		}
+		return [];
+	};
+	const counts = new Map<string, number>();
+	for (const file of files) {
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const document = parse(await Bun.file(file).text()) as unknown;
+		const found = shellScalars(document);
+		counts.set(relative, found.length);
+		for (const scalar of found) {
+			const { found, unterminated } = expressionsIn(scalar);
+			expect({ file: relative, unterminated }).toEqual({ file: relative, unterminated: false });
+			for (const expression of found) {
+				const scoped = justified.has(`${relative}\t${expression}`);
+				expect({ file: relative, expression, justified: scoped }).toEqual({
+					file: relative,
+					expression,
+					justified: true,
+				});
+			}
+		}
+	}
+	// An AGGREGATE floor does not notice one file going silent: renaming every `run:`
+	// key in pr-validation.yml — the file with `checks: write` — made it contribute
+	// zero scalars while dev-ci.yml alone still cleared 100, and the guard stayed
+	// green. So the floor is per file, and every known file must still be there.
+	const expected = new Map<string, number>([
+		[".github/actions/build-native/action.yml", 7],
+		[".github/workflows/ci.yml", 33],
+		[".github/workflows/dev-ci.yml", 73],
+		[".github/workflows/pr-validation.yml", 7],
+		[".github/workflows/public-site-sync.yml", 4],
+		[".github/workflows/spoofed-version-sync.yml", 2],
+	]);
+	const missing = [...expected.keys()].filter((name) => !counts.has(name));
+	expect({ missing }).toEqual({ missing: [] });
+	for (const [name, minimum] of expected) {
+		const seen = counts.get(name) ?? 0;
+		expect({ name, atLeast: minimum, seen: seen >= minimum }).toEqual({ name, atLeast: minimum, seen: true });
+	}
+});
+
+test("every env value bound from an expression is read as a quoted word (#5740 review)", async () => {
+	// The injection guard forces untrusted text out of the expression layer and into
+	// `env:`. That is only half of the rule. A shell that reads $PR_BODY unquoted, or
+	// evals it, re-opens the identical class one layer down — the value is now a shell
+	// word rather than shell source, but word splitting and globbing still act on it,
+	// and `eval` promotes it straight back to source.
+	//
+	// Nothing enforced the second half, so this closes the class rather than the
+	// instance. Today every use is already quoted; this keeps it that way.
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	// Originally this classified which bindings were "author-controlled" by pattern.
+	// That classification MISSED one: CI_DEV_CHANGED_PATHS carries the PR's own changed
+	// file paths, which a contributor picks by adding a file. A rule that depends on me
+	// correctly enumerating untrusted sources fails the moment I miss one, and I did.
+	//
+	// So there is no classification. EVERY env value bound from an expression must be
+	// read as a quoted word. Nothing legitimately needs word splitting on one of these,
+	// and the rule cannot be defeated by a source shape I failed to anticipate.
+	//
+	// Discovery was ALSO lexical — a raw-text regex that only matched `NAME: ${{ ... }}`
+	// at the start of a line. `env:` with a quoted key (`"NAME": ${{ ... }}`), a flow
+	// mapping, or an alias was invisible, so a later `eval "$NAME"` was invisible too
+	// (#5740 review). It now reads the same parsed YAML graph as the run-scalar guard.
+	const envNames = (node: unknown, key?: string): string[] => {
+		if (key === "env" && node !== null && typeof node === "object" && !Array.isArray(node)) {
+			return Object.entries(node)
+				.filter(([, value]) => typeof value === "string" && value.includes("${{"))
+				.map(([name]) => name);
+		}
+		if (Array.isArray(node)) return node.flatMap((item) => envNames(item, key));
+		if (node !== null && typeof node === "object") {
+			return Object.entries(node).flatMap(([childKey, value]) => envNames(value, childKey));
+		}
+		return [];
+	};
+	const names = new Set<string>();
+	for (const file of files) {
+		for (const name of envNames(parse(await Bun.file(file).text()))) names.add(name);
+	}
+	// If this ever empties, the scan broke rather than the risk disappearing.
+	expect(names.size).toBeGreaterThanOrEqual(70);
+	let inspected = 0;
+	for (const file of files) {
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const lines = (await Bun.file(file).text()).split("\n");
+		for (const [index, line] of lines.entries()) {
+			for (const name of names) {
+				if (new RegExp(`^\\s+${name}:`).test(line)) continue; // the binding itself
+				for (const use of line.matchAll(new RegExp(`\\$\\{?${name}\\b`, "g"))) {
+					inspected++;
+					// Counting quotes on the line is not enough: `x="$(cmd "arg")"` resets
+					// quoting inside the command substitution, and my first version
+					// reported two real, correctly quoted uses as bare. A guard that
+					// cries wolf gets deleted, so walk the shell contexts properly.
+					const evaluated = /\beval\b/.test(line);
+					const quoted = ((): boolean => {
+						const stack: { double: boolean; single: boolean }[] = [{ double: false, single: false }];
+						for (let at = 0; at < (use.index ?? 0); at++) {
+							const top = stack[stack.length - 1];
+							if (top === undefined) break;
+							const character = line[at];
+							if (character === "\\" && top.double) {
+								at++;
+								continue;
+							}
+							if (character === "'" && !top.double) top.single = !top.single;
+							else if (character === '"' && !top.single) top.double = !top.double;
+							else if (!top.single && character === "$" && line[at + 1] === "(") {
+								stack.push({ double: false, single: false });
+								at++;
+							} else if (!top.single && character === ")" && stack.length > 1) stack.pop();
+						}
+						const top = stack[stack.length - 1];
+						// Single quotes suppress expansion entirely, so they are safe too.
+						return top !== undefined && (top.double || top.single);
+					})();
+					expect({ file: relative, line: index + 1, name, quoted, evaluated }).toEqual({
+						file: relative,
+						line: index + 1,
+						name,
+						quoted: true,
+						evaluated: false,
+					});
+				}
+			}
+		}
+	}
+	expect(inspected).toBeGreaterThan(0);
+});
+
+// GitHub expands `${{ ... }}` into the run scalar BEFORE any interpreter sees it, so a
+// parser handed the raw body is not reading the program that runs. PowerShell in
+// particular reads `${{` as a braced variable name and reports "Use `{ instead of { in
+// variable names" for every expression-bearing step -- a diagnostic about a body that
+// never exists at runtime. Substitute expressions with a benign literal first, which is
+// what the runner effectively does. Nesting rule matches the justification guard: `{`
+// appears inside an expression only within a single-quoted literal.
+const substituteWorkflowExpressions = (scalar: string, replacement = "EXPR"): string => {
+	let out = "";
+	let at = 0;
+	while (at < scalar.length) {
+		const open = scalar.indexOf("${{", at);
+		if (open === -1) return out + scalar.slice(at);
+		out += scalar.slice(at, open);
+		let cursor = open + 3;
+		let quoted = false;
+		let end = -1;
+		while (cursor < scalar.length) {
+			const character = scalar[cursor];
+			if (character === "'") quoted = !quoted;
+			else if (!quoted && character === "}" && scalar[cursor + 1] === "}") {
+				end = cursor;
+				break;
+			}
+			cursor++;
+		}
+		// An unterminated expression is left verbatim: the parser should see the broken
+		// text rather than have this helper quietly repair it.
+		if (end === -1) return out + scalar.slice(open);
+		out += replacement;
+		at = end + 2;
+	}
+	return out;
+};
+
+// Parse a PowerShell body with PowerShell's own AST parser, without executing it.
+// Returns "" when clean, or the parser's diagnostics. Mirrors the established pattern
+// in scripts/install-tests/install-ps1-compat.test.ts.
+const parsePowerShell = async (pwshPath: string, body: string): Promise<string> => {
+	const file = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pwsh-parse-")), "step.ps1");
+	await Bun.write(file, body);
+	const script = [
+		"$errors = $null",
+		`[System.Management.Automation.Language.Parser]::ParseFile('${file}', [ref]$null, [ref]$errors) | Out-Null`,
+		"if ($errors -and $errors.Count -gt 0) { $errors | ForEach-Object { Write-Output $_.Message }; exit 1 }",
+		"exit 0",
+	].join("; ");
+	const proc = Bun.spawn([pwshPath, "-NoProfile", "-Command", script], { stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+	return exitCode === 0 ? "" : stdout.trim() || `PowerShell parser exited ${exitCode}`;
+};
+
+test("every run scalar is checked by the interpreter that will actually run it (#5740 review)", async () => {
+	// YAML validity and TypeScript tests both passed while the Dev CI PR contract
+	// bootstrap could not be parsed by bash at all. Two of my own prose comments
+	// ("timeline's", "bootstrap's") sat inside a single-quoted `bun -e '...'`
+	// argument; the apostrophe closed the quote and handed the rest of the JavaScript
+	// to the shell. Every PR targeting dev failed that required job, and it stayed
+	// hidden because pushing straight to dev never runs it. Nothing I had was capable
+	// of noticing, because nothing asked bash. So ask bash.
+	//
+	// Getting to "which steps are bash" took three tries, each one assuming away a
+	// case: first any non-`bash` shell string was silently skipped, then omitted was
+	// taken to mean bash regardless of `defaults.run.shell`, and then regardless of
+	// the RUNNER — but GitHub defaults an omitted shell to pwsh on Windows, and four
+	// live jobs rely on that. bash -n was validating PowerShell and reporting success
+	// (#5740 review).
+	//
+	// So the shell is now RESOLVED: step override, then nearest declared default,
+	// then the platform default of each runner the job can expand to. Anything that
+	// cannot be resolved fails rather than being assumed.
+	const files: string[] = [];
+	for (const dir of ["../.github/workflows", "../.github/actions"]) {
+		const root = new URL(dir, import.meta.url).pathname;
+		if (!(await fs.stat(root).then(() => true).catch(() => false))) continue;
+		for await (const found of new Glob("**/*.{yml,yaml}").scan({ cwd: root, absolute: true })) files.push(found);
+	}
+	files.sort();
+	type Step = { name?: string; run?: unknown; shell?: unknown };
+	type Job = {
+		"runs-on"?: unknown;
+		strategy?: { matrix?: Record<string, unknown> };
+		defaults?: { run?: { shell?: unknown } };
+		steps?: unknown;
+	};
+	type Doc = { jobs?: Record<string, Job>; runs?: { steps?: unknown }; defaults?: { run?: { shell?: unknown } } };
+	// Every runner label a job can expand to, or [] when that cannot be decided here.
+	const runners = (job: Job): string[] => {
+		const declared = job["runs-on"];
+		const labels = typeof declared === "string" ? [declared] : Array.isArray(declared) ? declared : [];
+		const concrete = labels.filter((label): label is string => typeof label === "string" && !label.includes("${{"));
+		if (concrete.length > 0) return concrete;
+		// `runs-on: ${{ matrix.os }}` — take the values the matrix actually declares.
+		const matrix = job.strategy?.matrix ?? {};
+		const direct = Array.isArray(matrix.os) ? matrix.os : [];
+		const included = Array.isArray(matrix.include)
+			? matrix.include.map((entry) => (entry as { os?: unknown }).os)
+			: [];
+		return [...direct, ...included].filter((value): value is string => typeof value === "string");
+	};
+	const platformShell = (runner: string): string => (/windows/i.test(runner) ? "pwsh" : "bash");
+	const stepsOf = (node: unknown): Step[] => {
+		if (!Array.isArray(node)) return [];
+		return node.filter((entry): entry is Step => entry !== null && typeof entry === "object");
+	};
+	let checked = 0;
+	const powershell: { file: string; unit: string; step: string; body: string }[] = [];
+	for (const file of files) {
+		const relative = file.slice(file.indexOf("/.github/") + 1);
+		const document = parse(await Bun.file(file).text()) as Doc;
+		const workflowDefault = document.defaults?.run?.shell;
+		const units: { label: string; steps: Step[]; shells: string[] }[] = [];
+		for (const [jobName, job] of Object.entries(document.jobs ?? {})) {
+			const resolved = runners(job);
+			// An unresolvable runner is a failure, not an assumption.
+			expect({ file: relative, job: jobName, runnerResolved: resolved.length > 0 }).toEqual({
+				file: relative,
+				job: jobName,
+				runnerResolved: true,
+			});
+			const declaredDefault = job.defaults?.run?.shell ?? workflowDefault;
+			const shells =
+				declaredDefault === undefined
+					? [...new Set(resolved.map(platformShell))]
+					: [String(declaredDefault)];
+			units.push({ label: `job ${jobName}`, steps: stepsOf(job.steps), shells });
+		}
+		// A composite action has no runner context; GitHub requires an explicit shell
+		// on every run step, so an omission there is itself the defect.
+		if (document.runs?.steps !== undefined) units.push({ label: "composite", steps: stepsOf(document.runs.steps), shells: [] });
+		for (const unit of units) {
+			for (const step of unit.steps) {
+				if (typeof step.run !== "string") continue;
+				const where = { file: relative, unit: unit.label, step: step.name ?? "(unnamed)" };
+				const effective =
+					step.shell === undefined ? unit.shells : [typeof step.shell === "string" ? step.shell : JSON.stringify(step.shell)];
+				expect({ ...where, shellResolved: effective.length > 0 }).toEqual({ ...where, shellResolved: true });
+				for (const shell of effective) {
+					if (shell === "pwsh" || shell === "powershell") {
+						// Recognising pwsh is not validating it. The previous version counted
+						// these and moved on, so the test's own name was false for eleven live
+						// steps and a malformed PowerShell body kept both floors satisfied
+						// (#5740 review). Parse them with PowerShell's own AST parser.
+						powershell.push({ ...where, body: step.run });
+						continue;
+					}
+					// Anything unrecognised is refused rather than skipped: a silent skip
+					// is indistinguishable from approval.
+					expect({ ...where, shell, recognised: shell === "bash" }).toEqual({ ...where, shell, recognised: true });
+					checked++;
+					const parsed = Bun.spawnSync(["bash", "-n"], { stdin: Buffer.from(step.run), stderr: "pipe" });
+					const diagnostic = new TextDecoder().decode(parsed.stderr).trim().split("\n")[0] ?? "";
+					expect({ ...where, parses: parsed.exitCode === 0, diagnostic: parsed.exitCode === 0 ? "" : diagnostic }).toEqual({
+						...where,
+						parses: true,
+						diagnostic: "",
+					});
+				}
+			}
+		}
+	}
+	// Both dimensions pinned: a collapse in either means the resolver broke rather
+	// than the workflows getting safer.
+	expect({ bash: checked >= 95, pwsh: powershell.length >= 20 }).toEqual({ bash: true, pwsh: true });
+
+	// PowerShell bodies are parsed by PowerShell. When pwsh is absent the guard says
+	// so out loud rather than reporting success it did not earn -- GitHub's Linux
+	// runners ship pwsh, so CI exercises this even though a mac dev box may not.
+	const pwshPath = Bun.which("pwsh");
+	if (pwshPath === null) {
+		console.warn(`pwsh not installed: ${powershell.length} PowerShell run scalars were NOT syntax-checked`);
+		return;
+	}
+	for (const candidate of powershell) {
+		const diagnostics = await parsePowerShell(pwshPath, substituteWorkflowExpressions(candidate.body));
+		expect({ file: candidate.file, step: candidate.step, diagnostics }).toEqual({
+			file: candidate.file,
+			step: candidate.step,
+			diagnostics: "",
+		});
+	}
+	// Each body costs one pwsh start, and the runner needs roughly a second apiece, so
+	// the default 5s budget expires mid-sweep. bun then SIGTERMs the child and the test
+	// reports the kill as a PARSER VERDICT -- `PowerShell parser exited 143` against a
+	// workflow step that is perfectly valid. Every PR whose affected shard covers this
+	// file went red on that, so the budget is explicit and sized for the sweep.
+}, 180_000);
+
+test("workflow expressions are substituted before an interpreter parses the body", () => {
+	// Raw `${{ }}` made PowerShell report "Use `{ instead of { in variable names" for a
+	// perfectly valid step, because the runner had already replaced the expression by the
+	// time pwsh ran. That diagnostic was invisible while the sweep was still timing out.
+	expect(substituteWorkflowExpressions('--version "${{ needs.meta.outputs.v }}"')).toBe('--version "EXPR"');
+	expect(substituteWorkflowExpressions("a ${{ x }} b ${{ y }} c")).toBe("a EXPR b EXPR c");
+	// A brace inside a single-quoted literal belongs to the expression, not to its end.
+	expect(substituteWorkflowExpressions("${{ hashFiles('**/{a,b}.lock') }}")).toBe("EXPR");
+	// Nothing to substitute must change nothing at all.
+	expect(substituteWorkflowExpressions("echo ${VAR} $env:PATH")).toBe("echo ${VAR} $env:PATH");
+	// An unterminated expression is handed over verbatim rather than silently repaired.
+	expect(substituteWorkflowExpressions("echo ${{ broken")).toBe("echo ${{ broken");
+});
+
+test("the PowerShell parse helper surfaces diagnostics rather than swallowing them (#5740 review)", async () => {
+	// pwsh is absent on this mac dev box, so the guard above skips its 23 bodies and
+	// says so. That skip must not also hide a broken helper: if the plumbing were
+	// wrong, the check would silently pass on CI too, where pwsh IS present.
+	//
+	// So exercise the helper against stub parsers with the real contract -- write the
+	// body to a file, invoke the binary, map exit code and stdout -- and prove both
+	// directions without needing PowerShell here.
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pwsh-stub-"));
+	const write = async (name: string, script: string): Promise<string> => {
+		const file = path.join(directory, name);
+		await Bun.write(file, script);
+		await fs.chmod(file, 0o755);
+		return file;
+	};
+	const clean = await write("clean", "#!/bin/sh\nexit 0\n");
+	expect(await parsePowerShell(clean, "Write-Host 'ok'")).toBe("");
+
+	const broken = await write("broken", "#!/bin/sh\necho 'Missing closing } in statement block.'\nexit 1\n");
+	expect(await parsePowerShell(broken, "if ($x) { Write-Host 'x'")).toBe("Missing closing } in statement block.");
+
+	// A parser that fails without printing must still be reported, not read as clean.
+	const silent = await write("silent", "#!/bin/sh\nexit 7\n");
+	expect(await parsePowerShell(silent, "whatever")).toBe("PowerShell parser exited 7");
+
+	// And the body must actually reach the parser as a file it can read. The stub takes
+	// the path out of the command it was handed, the way the real parser does. Picking
+	// the newest `gjc-pwsh-parse-*` directory instead made this assertion depend on every
+	// other run sharing the machine's temp dir, and it failed against a sibling run's
+	// leftovers rather than against anything this test did.
+	const echoes = await write(
+		"echoes",
+		"#!/bin/sh\nsed -n '2p' \"$(printf '%s' \"$3\" | sed -n \"s/.*ParseFile('\\\\([^']*\\\\)'.*/\\\\1/p\")\"\nexit 1\n",
+	);
+	expect(await parsePowerShell(echoes, "line one\nline two")).toBe("line two");
+	await fs.rm(directory, { recursive: true, force: true });
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
@@ -1882,7 +2586,14 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("name: PR contract bootstrap");
 	expect(workflow).not.toContain("pull_request_review:");
 	expect(workflow).toContain("if: ${{ github.event_name == 'pull_request' }}");
-	expect(workflow).toContain("bun --no-env-file --config=\"$empty_bunfig\" -e '");
+	// This pinned the MECHANISM (`-e '<program>'`) rather than the property. That exact
+	// mechanism was the defect: an apostrophe in the JavaScript closed the shell quote
+	// and broke the job for every PR to dev. The property that matters is that the
+	// trusted program runs with the contributor's environment and bunfig neutralised.
+	expect(workflow).toContain("bun --no-env-file --config=\"$empty_bunfig\"");
+	// A quoted heredoc keeps the shell and JavaScript grammars apart; an unquoted one
+	// would expand `$` and backticks out of the program before Bun ever saw it.
+	expect(workflow).toContain("cat > \"$program\" <<'GJC_BOOTSTRAP_PROGRAM'");
 	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
 	expect(workflow).toContain("bun scripts/verify-gjc-state-writers.ts --fail --root .");
 	expect(workflow).toContain("Expected exactly one verdict line");
@@ -1932,12 +2643,15 @@ test("the merge-approval gate is a separate, fail-closed check in both workflows
 	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
 	expect(devCi).toContain("throw new Error(`Stale verdict digest");
 	expect(devCi).toContain("merge-approved cannot be self-approved");
-	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
-	// job as Success for required checks, so `needs:` alone would publish a green
-	// approval check for a red contract; always() plus an explicit result test cannot.
+	// Fail closed on a failed/cancelled upstream job. GitHub reports a SKIPPED job as
+	// Success for required checks, so `needs:` alone would publish a green approval
+	// check for a red contract; always() plus an explicit result test cannot. Both
+	// gates are switched off only by event name: the Dev CI gate for anything but a
+	// pull_request, the PR-contract gate for issue_comment runs whose job check would
+	// bind to the default-branch SHA rather than the PR head (#5694).
 	expect(prContract).toContain("needs: [validate]");
 	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
-	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() && github.event_name != 'issue_comment' }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
 		expect(workflow).toContain(guard);
 		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
 		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');

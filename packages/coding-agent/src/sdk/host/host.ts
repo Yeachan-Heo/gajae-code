@@ -103,6 +103,8 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
  *  must see the same capability-gated event kinds on both legs, or live and
  *  replay delivery diverge for the same subscriber. */
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+/** Capability for non-replayable streamed turn content. */
+export const TURN_STREAM_CAPABILITY = "turn_stream";
 /** Capability used by notification adapters that observe a host without owning its work. */
 export const SESSION_HOST_OBSERVER_CAPABILITY = "session_host_observer_v1";
 export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
@@ -378,7 +380,9 @@ export class SessionSdkHost {
 		return "activated";
 	}
 
-	async stop(options: { allowLockContention?: boolean } = {}): Promise<"stopped" | "already"> {
+	async stop(
+		options: { allowLockContention?: boolean; unregisterReason?: "detached_idle" } = {},
+	): Promise<"stopped" | "already"> {
 		if (this.#stopPromise) return this.#stopPromise;
 		if (!this.#started) return "already";
 		const stopPromise = this.#stopStartedHost(options);
@@ -390,7 +394,10 @@ export class SessionSdkHost {
 		}
 	}
 
-	async #stopStartedHost(options: { allowLockContention?: boolean }): Promise<"stopped"> {
+	async #stopStartedHost(options: {
+		allowLockContention?: boolean;
+		unregisterReason?: "detached_idle";
+	}): Promise<"stopped"> {
 		// Fence before the first await: everything after this point is teardown,
 		// and no in-flight activation may publish readiness across it.
 		this.#stopping = true;
@@ -402,6 +409,7 @@ export class SessionSdkHost {
 					sessionId: this.#options.sessionId,
 					stateRoot: this.#options.stateRoot,
 					endpointGeneration: this.events.generation,
+					...(options.unregisterReason === undefined ? {} : { reason: options.unregisterReason }),
 				});
 			} catch (error) {
 				// A live broker may hold the shared session-index lock beyond the

@@ -135,6 +135,18 @@ describe("AgentSession MCP discovery", () => {
 		const refreshedIndex = session.getDiscoverableToolSearchIndex();
 		expect(refreshedIndex).not.toBe(firstIndex);
 		expect(refreshedIndex.documents.map(document => document.tool.name)).toEqual(["mcp__pager_list"]);
+
+		await session.replaceNamedCustomTools(
+			["mcp__pager_list"],
+			[createMcpCustomTool("mcp__docs_lookup", "docs", "lookup", "Lookup internal docs", ["query"])],
+			{ mandatoryMCPToolNames: ["mcp__docs_lookup"] },
+		);
+		expect(session.getToolByName("mcp__pager_list")).toBeUndefined();
+		expect(session.getActiveToolNames()).toContain("mcp__docs_lookup");
+		expect(session.getDiscoverableTools({ source: "mcp" })).toEqual([]);
+		const swappedIndex = session.getDiscoverableToolSearchIndex();
+		expect(swappedIndex).not.toBe(refreshedIndex);
+		expect(swappedIndex.documents).toEqual([]);
 	});
 
 	it("reports only currently active MCP tools in non-discovery sessions", async () => {

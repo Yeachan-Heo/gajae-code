@@ -421,8 +421,14 @@ async function startTurn(fixture: Fixture): Promise<{ pending: Promise<{ stopRea
 	const started = workingUpdates(fixture.updates);
 	const expectedDelivery = fixture.promptDeliveryCount() + 1;
 	const pending = prompt(fixture, "work");
+	// A working phase can be published before the host's agent_start is ingested.
+	// Wait for its inference watchdog before capturing timers or advancing the clock.
 	await waitFor(
-		() => fixture.promptDeliveryCount() === expectedDelivery && workingUpdates(fixture.updates) > started,
+		() =>
+			fixture.promptDeliveryCount() === expectedDelivery &&
+			workingUpdates(fixture.updates) > started &&
+			fixture.clock.pending === 1 &&
+			fixture.clock.armed?.at === fixture.clock.now() + ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 		"turn start",
 	);
 	return { pending };

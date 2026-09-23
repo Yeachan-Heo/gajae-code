@@ -78,7 +78,10 @@ export interface LoadPageOptions {
 
 export interface LoadPageResult {
 	content: string;
+	/** The bounded response bytes retained for binary classification/conversion. */
+	buffer?: Uint8Array;
 	contentType: string;
+	contentDisposition?: string;
 	finalUrl: string;
 	ok: boolean;
 	status?: number;
@@ -173,6 +176,7 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 				}
 
 				const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+				const contentDisposition = response.headers.get("content-disposition") || undefined;
 				const finalUrl = logicalUrl;
 
 				const reader = response.body?.getReader();
@@ -196,16 +200,33 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 					}
 				}
 
-				const content = Buffer.concat(chunks).toString("utf-8");
+				const bytes = Buffer.concat(chunks);
+				const content = bytes.toString("utf-8");
+				const buffer =
+					contentType.length === 0 ||
+					contentType === "application/octet-stream" ||
+					contentType === "binary/octet-stream" ||
+					contentType === "unknown" ||
+					contentDisposition !== undefined
+						? bytes
+						: undefined;
 				if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
 					continue attempts;
 				}
 
 				if (!response.ok) {
-					return { content, contentType, finalUrl, ok: false, status: response.status };
+					return {
+						content,
+						buffer,
+						contentType,
+						contentDisposition,
+						finalUrl,
+						ok: false,
+						status: response.status,
+					};
 				}
 
-				return { content, contentType, finalUrl, ok: true, status: response.status };
+				return { content, buffer, contentType, contentDisposition, finalUrl, ok: true, status: response.status };
 			}
 			return {
 				content: "",

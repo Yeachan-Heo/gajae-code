@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { getEmbeddedDefaultGjcSkills } from "@gajae-code/coding-agent/defaults/gjc-defaults";
 import { getActiveSkills, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
 import { InternalUrlRouter } from "@gajae-code/coding-agent/internal-urls";
 import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
@@ -259,6 +260,17 @@ describe("read tool ACP fs routing", () => {
 			if (previousSkillHandler) router.register(previousSkillHandler);
 			else router.unregister("skill");
 		}
+	});
+
+	it("routes selectors from embedded bundled skill paths", async () => {
+		const body = await getEmbeddedDefaultGjcSkills().find(skill => skill.name === "ultragoal")!.loadContent!();
+		const lines = body.split("\n");
+		const result = await new ReadTool(createSession(tmpDir)).execute("embedded-range", {
+			path: "embedded:gjc/skills/ultragoal/SKILL.md:10-20",
+		});
+		const text = textOutput(result);
+		expect(text).toContain(lines[9]!);
+		expect(text).not.toContain(lines[1]!);
 	});
 
 	it("reads internal URLs without a selector and preserves valid selectors", async () => {

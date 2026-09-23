@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Performance
+
+- Bound stream abort-race retention to the current read and reuse history hashes when checking append-only context rewrites.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

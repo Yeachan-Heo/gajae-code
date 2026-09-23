@@ -109,7 +109,10 @@ describe("provider slash command", () => {
 		expect(parsed.providers["local-claude"]?.apiKey).toBeUndefined();
 		expect(parsed.providers["local-claude"]?.apiKeyEnv).toBe(TEST_PROVIDER_KEY_ENV);
 		expect(parsed.providers["local-claude"]?.models.map(model => model.id)).toEqual(["claude-proxy"]);
-		expect(outputs.join("\n")).toContain("GJC_…_KEY");
+		const output = outputs.join("\n");
+		expect(output).toContain("API key: *** (environment variable)");
+		expect(output).not.toContain(TEST_PROVIDER_KEY_ENV);
+		expect(output).not.toContain("GJC_…_KEY");
 		expect(refreshedMode).toBe("offline");
 		expect(configChanged).toBe(true);
 	});

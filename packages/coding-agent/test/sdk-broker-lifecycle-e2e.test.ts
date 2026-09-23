@@ -19,6 +19,7 @@ import {
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
+	lifecycleFailureMessage,
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
@@ -63,6 +64,14 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 }
+
+test("formats cause-bearing diagnostics for children that started and exited", () => {
+	const child = { exitCode: 23, signalCode: null } as never;
+	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
+		"Session exited before readiness. (exit=23)",
+	);
+});
+
 async function incarnation(pid: number): Promise<string> {
 	const value = processIncarnation(pid);
 	if (!value) throw new Error(`Process ${pid} has no readable incarnation.`);
@@ -407,6 +416,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 			GJC_AGENT_DIR: agentDir,
 			GJC_CODING_AGENT_DIR: agentDir,
 			GJC_SESSION_ID: sessionId,
+			GJC_STATE_ROOT: stateRoot,
 			GJC_LIFECYCLE_REQUEST_ID: "subprocess-proof",
 			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
 		},
@@ -2598,8 +2608,50 @@ test("broker preserves spawn_failed when the ChildProcess emits an error before 
 			broker.handleRequest("session.create", { cwd: root }, "child-error-before-pid"),
 		).resolves.toMatchObject({
 			ok: false,
-			error: { code: "spawn_failed" },
+			error: { code: "spawn_failed", message: expect.stringContaining("ENOENT") },
 		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker reports child exit status without publishing detached-host stderr", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-diagnostic-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => ({
+			file: process.execPath,
+			args: ["-e", "process.stderr.write('child-startup-failed' + 'x'.repeat(64 * 1024)); process.exit(23)"],
+		}));
+		await broker.start();
+		await expect(
+			broker.handleRequest(
+				"session.create",
+				{ cwd: root, readinessTimeoutMs: 4_000 },
+				"child-diagnostic-before-readiness",
+			),
+		).resolves.toMatchObject({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				message: expect.stringContaining("exit=23"),
+			},
+		});
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: 4_000 },
+			"child-diagnostic-before-readiness",
+		);
+		expect(response).toMatchObject({
+			ok: false,
+			error: { message: expect.stringContaining("exit=23") },
+		});
+		expect(JSON.stringify(response)).not.toContain("child-startup-failed");
+		const sdkDirectory = path.join(root, ".gjc", "state", "sdk");
+		const names = await fs.readdir(sdkDirectory).catch(() => [] as string[]);
+		expect(names.some(name => name.includes(".lifecycle.stderr.") && name.endsWith(".log"))).toBe(false);
 	} finally {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
@@ -5550,6 +5602,7 @@ test("session-host-internal exits with a sanitized startup failure before writin
 				GJC_AGENT_DIR: agentDir,
 				GJC_CODING_AGENT_DIR: agentDir,
 				GJC_SESSION_ID: sessionId,
+				GJC_STATE_ROOT: stateRoot,
 				GJC_LIFECYCLE_REQUEST_ID: "startup-failure-proof",
 				GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify({
 					operation: "session.create",
@@ -5668,9 +5721,11 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
 		if (!response.ok && response.error.code === "terminal_uncertain") {
-			expect(response.error.message).toBe(
+			expect(response.error.message).toContain(
 				"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
 			);
+			expect(response.error.message).toContain("stage=readiness");
+			expect(response.error.message).toContain("waiting_for=session_ready");
 			const replay = await broker.handleRequest("session.create", input, "profile-cutoff");
 			expect(replay).toEqual(response);
 			return;
@@ -6036,6 +6091,11 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		});
 		const sdkEntries = await fs.readdir(path.join(root, ".gjc", "state", "sdk"));
 		expect(sdkEntries.some(entry => entry.includes(".lifecycle.failure."))).toBe(false);
+		// A successful launch retires its startup stderr artifact as soon as the
+		// broker is done reading it; the host's later output must not accumulate
+		// under the agent directory (#5739 review).
+		const agentSdkEntries = await fs.readdir(path.join(agentDir, "sdk"));
+		expect(agentSdkEntries.filter(entry => entry.startsWith("lifecycle-spawn."))).toEqual([]);
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

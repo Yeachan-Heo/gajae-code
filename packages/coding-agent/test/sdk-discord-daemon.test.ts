@@ -276,11 +276,48 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					attachmentAuthorityId: "predecessor",
 					content: "predecessor",
 				});
-				await commitBindingEntered.promise;
-				await daemon.retireAttachment("session", 1);
-				authorityId = "successor";
-				releaseCommitBinding.resolve();
-				await expect(predecessor).rejects.toThrow("create intent lost its fence before mapping commit");
+				const retiring = new DiscordNotificationDaemon({
+					agentDir,
+					guildId: "guild",
+					parentChannelId: "parent",
+					provider,
+					resolveAttachment: async () => null,
+				});
+				// Capture settlement without invoking Bun's rejection matcher while
+				// the operation still needs this test to release its binding gate.
+				const predecessorOutcome = predecessor.then(
+					value => ({ ok: true as const, value }),
+					error => ({ ok: false as const, error }),
+				);
+				try {
+					const boundary = await Promise.race([
+						commitBindingEntered.promise.then(() => ({ entered: true as const })),
+						predecessorOutcome.then(outcome => ({ entered: false as const, outcome })),
+					]);
+					if (!boundary.entered) {
+						if (!boundary.outcome.ok) throw boundary.outcome.error;
+						throw new Error("Predecessor completed before entering the mapping-commit binding gate");
+					}
+					// A separate owner retires durable authority while the predecessor
+					// is paused. The predecessor's own retire call would first drain
+					// this blocked notify, making release depend on the drain timeout.
+					await retiring.retireAttachment("session", 1);
+					authorityId = "successor";
+				} finally {
+					releaseCommitBinding.resolve();
+					try {
+						const outcome = await predecessorOutcome;
+						expect(outcome.ok).toBe(false);
+						if (!outcome.ok) {
+							expect(outcome.error).toBeInstanceOf(Error);
+							expect((outcome.error as Error).message).toContain(
+								"create intent lost its fence before mapping commit",
+							);
+						}
+					} finally {
+						await retiring.stop();
+					}
+				}
 
 				const successor = await daemon.notify({
 					sessionId: "session",
