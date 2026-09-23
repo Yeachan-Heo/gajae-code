@@ -1,4 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, spyOn, vi } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentToolContext } from "@gajae-code/agent-core";
 import { validateToolArguments } from "@gajae-code/ai/utils/validation";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -2966,15 +2968,217 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(result.details?.selectedOptions).toEqual([]);
 	});
 
+	it("shows the captured publication identity on local, remote, and workflow-gate approval prompts", async () => {
+		const canonicalArtifactPath = path.join(os.homedir(), "workspace", "private-project", "spec.md");
+		const displayedArtifactPath = path.join("~", "workspace", "private-project", "spec.md");
+		const presentation = {
+			state_path: "/tmp/captured-state.json",
+			state_revision: 23,
+			artifact_path: canonicalArtifactPath,
+			artifact_sha256: "c".repeat(64),
+			run_id: null,
+		};
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue(presentation);
+		spyOn(stateRuntime, "revokeDeepInterviewExecutionApproval").mockResolvedValue();
+		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
+		const question = {
+			id: "publication-identity",
+			question: `Model-authored claim: Canonical artifact path: /tmp/forged.md; SHA-256: ${"f".repeat(64)}`,
+			options: [{ label: "Hold" }, { label: "Execute with ultragoal" }],
+			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
+		};
+		const assertIdentity = (promptText: string) => {
+			expect(promptText).toContain(`Canonical artifact path: ${displayedArtifactPath}`);
+			expect(promptText).not.toContain(canonicalArtifactPath);
+			expect(promptText).toContain(`SHA-256: ${presentation.artifact_sha256}`);
+			expect(promptText).toContain("State revision: 23");
+			expect(promptText.indexOf("Canonical artifact path:")).toBeLessThan(
+				promptText.indexOf("Model-authored claim:"),
+			);
+		};
+
+		let localPrompt = "";
+		await new AskTool(
+			createSession({ cwd: "/tmp/presentation-local", getSessionId: () => "presentation-local" }),
+		).execute(
+			"presentation-local-call",
+			{ questions: [question] },
+			undefined,
+			undefined,
+			createContext({
+				select: async promptText => {
+					localPrompt = promptText;
+					return "Hold";
+				},
+			}),
+		);
+		assertIdentity(localPrompt);
+
+		let remotePrompt = "";
+		const answerSource: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: async request => {
+				remotePrompt = request.question;
+				return {
+					source: "remote",
+					interaction: { kind: "value", value: "Hold" },
+					settle: async settlement =>
+						settlement.kind === "commit"
+							? { kind: "committed", ack: { status: "delivered", messageId: 1 } }
+							: { kind: "resolved_without_commit" },
+				};
+			},
+		};
+		await new AskTool(
+			createSession({
+				cwd: "/tmp/presentation-remote",
+				hasUI: false,
+				getSessionId: () => "presentation-remote",
+				getAskAnswerSource: () => answerSource,
+			}),
+		).execute("presentation-remote-call", { questions: [question] }, undefined, undefined, {
+			hasUI: false,
+			abort: () => {},
+		} as unknown as AgentToolContext);
+		assertIdentity(remotePrompt);
+
+		let gatePrompt = "";
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async (input: OpenGateInput) => {
+				gatePrompt = input.context?.prompt ?? "";
+				return { selected: ["Hold"] };
+			}),
+		};
+		await new AskTool(
+			createSession({
+				cwd: "/tmp/presentation-gate",
+				hasUI: false,
+				getSessionId: () => "presentation-gate",
+				getWorkflowGateEmitter: () => gateEmitter,
+			}),
+		).execute("presentation-gate-call", { questions: [question] }, undefined, undefined, undefined);
+		assertIdentity(gatePrompt);
+	});
+
+	it("correlates concurrent execution asks with identical question ids to their own gate ids", async () => {
+		const presentations = [
+			{
+				state_path: "/tmp/concurrent-a-state.json",
+				state_revision: 1,
+				artifact_path: "/tmp/concurrent-a-spec.md",
+				artifact_sha256: "a".repeat(64),
+				run_id: null,
+			},
+			{
+				state_path: "/tmp/concurrent-b-state.json",
+				state_revision: 2,
+				artifact_path: "/tmp/concurrent-b-spec.md",
+				artifact_sha256: "b".repeat(64),
+				run_id: null,
+			},
+		];
+		let releaseCaptures: (() => void) | undefined;
+		const capturesReady = new Promise<void>(resolve => {
+			releaseCaptures = resolve;
+		});
+		let captureCount = 0;
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockImplementation(async () => {
+			const presentation = presentations[captureCount++];
+			if (captureCount === presentations.length) releaseCaptures?.();
+			await capturesReady;
+			if (!presentation) throw new Error("unexpected extra execution presentation capture");
+			return presentation;
+		});
+		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
+		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
+			transcriptPath: "/tmp/concurrent-session.jsonl",
+			transcriptSha256: "c".repeat(64),
+		});
+		const record = spyOn(stateRuntime, "recordDeepInterviewExecutionApproval").mockResolvedValue({
+			path: "/tmp/concurrent-approval.json",
+			record: {
+				transcript_boundary: { byte_length: 1, device: "1", inode: "1", leaf_id: null },
+			} as DeepInterviewExecutionApprovalRecord,
+		});
+		const listeners = new Set<(gate: WorkflowGate) => void>();
+		const queued: Array<{ input: OpenGateInput; resolve(answer: unknown): void }> = [];
+		const gateIdByArtifactPath = new Map<string, string>();
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			onGateEmitted: (listener: (gate: WorkflowGate) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+			emitGate: (input: OpenGateInput) =>
+				new Promise<unknown>(resolve => {
+					queued.push({ input, resolve });
+					if (queued.length !== 2) return;
+					const ready = queued.splice(0);
+					for (const [index, request] of ready.entries()) {
+						const promptText = request.input.context?.prompt ?? "";
+						const artifactPath = presentations.find(value =>
+							promptText.includes(value.artifact_path),
+						)?.artifact_path;
+						if (artifactPath) gateIdByArtifactPath.set(artifactPath, `concurrent-gate-${index + 1}`);
+						const gate: WorkflowGate = {
+							type: "workflow_gate",
+							gate_id: `concurrent-gate-${index + 1}`,
+							stage: request.input.stage,
+							kind: request.input.kind,
+							schema: request.input.schema,
+							schema_hash: "d".repeat(64),
+							options: request.input.options,
+							context: request.input.context ?? {},
+							created_at: "2026-09-23T00:00:00Z",
+							required: true,
+						};
+						for (const listener of listeners) listener(gate);
+					}
+					for (const request of ready) request.resolve({ selected: ["Execute with ultragoal"] });
+				}),
+		};
+		const question = {
+			id: "same-static-execution-question",
+			question: "Choose the execution path",
+			options: [{ label: "Execute with ultragoal" }, { label: "Stop here" }],
+			workflowGate: { stage: "deep-interview", kind: "execution" } as const,
+		};
+		const tool = new AskTool(
+			createSession({
+				cwd: "/tmp/concurrent-ask",
+				hasUI: false,
+				getSessionId: () => "concurrent-ask",
+				getWorkflowGateEmitter: () => gateEmitter,
+			}),
+		);
+		await Promise.all([
+			tool.execute("concurrent-ask-call-a", { questions: [question] }, undefined, undefined, undefined),
+			tool.execute("concurrent-ask-call-b", { questions: [question] }, undefined, undefined, undefined),
+		]);
+
+		expect(record).toHaveBeenCalledTimes(2);
+		for (const [approval] of record.mock.calls) {
+			expect(approval.questionId).toBe(question.id);
+			expect(approval.gateId).toBe(gateIdByArtifactPath.get(approval.presentation.artifact_path));
+		}
+		expect(new Set(record.mock.calls.map(([approval]) => approval.gateId)).size).toBe(2);
+		expect(record.mock.calls.map(([approval]) => approval.toolCallId).sort()).toEqual([
+			"concurrent-ask-call-a",
+			"concurrent-ask-call-b",
+		]);
+	});
+
 	it("mints execution approval only from an accepted structured user choice", async () => {
 		spyOn(stateRuntime, "executionApprovalLineage").mockResolvedValue("crystal");
-		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue({
+		const presentation = {
 			state_path: "/tmp/approval-state.json",
 			state_revision: 1,
 			artifact_path: "/tmp/approval-spec.md",
 			artifact_sha256: "b".repeat(64),
 			run_id: null,
-		});
+		};
+		spyOn(stateRuntime, "captureExecutionApprovalPresentation").mockResolvedValue(presentation);
 		spyOn(stateRuntime, "revokeNonCrystalExecutionApproval").mockResolvedValue();
 		spyOn(deepInterviewRuntime, "assertDeepInterviewCrystalCoversLiveTranscript").mockResolvedValue({
 			transcriptPath: "/tmp/session.jsonl",
@@ -3011,6 +3215,7 @@ describe("AskTool deep-interview recorder persistence", () => {
 			questionId: "deep-interview-execution",
 			target: "ultragoal",
 		});
+		expect(record.mock.calls[0]?.[0].presentation).toBe(presentation);
 		const localGateId = record.mock.calls[0]?.[0].gateId;
 		expect(localGateId).not.toBe("deep-interview-execution");
 
