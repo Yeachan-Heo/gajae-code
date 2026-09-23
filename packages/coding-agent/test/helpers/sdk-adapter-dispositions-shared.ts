@@ -129,6 +129,12 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"compaction.run": "invalid_request",
 	"session.handoff": "invalid_request",
 	"session.export_html": "invalid_request",
+	// The parity probe supplies no upload descriptor; these machine-only controls
+	// must reach the host and reject the missing input rather than silently succeed.
+	"turn.image.begin": "invalid_input",
+	"turn.image.append": "invalid_input",
+	"turn.image.finish": "invalid_input",
+	"turn.image.discard": "invalid_input",
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
 	"turn.result": "invalid_request",
