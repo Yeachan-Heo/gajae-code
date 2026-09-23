@@ -26,6 +26,7 @@ import {
 	type DeepInterviewIntentReview,
 	MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
 	MAX_INITIAL_CONTEXT_LENGTH,
+	MAX_USER_RESPONSE_LENGTH,
 	normalizeDeepInterviewEnvelope,
 	reviewDeepInterviewIntent,
 } from "./deep-interview-state";
@@ -842,13 +843,54 @@ export async function authoritativeConversationSnapshot(
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
 		const messages: CrystalSnapshot["messages"] = [];
 		const askToolResultIndices: number[] = [];
-		for (const entry of activeSessionEntries(entries)) {
+		const activeEntries = activeSessionEntries(entries);
+		const askCalls = new Map<string, { entryIndex: number; questionIds: Set<string> }>();
+		const duplicateAskCallIds = new Set<string>();
+		const seenToolCallIds = new Set<string>();
+		const seenAskResultCallIds = new Set<string>();
+		const duplicateAskResultCallIds = new Set<string>();
+		for (const [entryIndex, entry] of activeEntries.entries()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message as unknown;
+			if (!isRecord(message)) continue;
+			if (message.role === "toolResult" && message.toolName === "ask" && typeof message.toolCallId === "string") {
+				if (seenAskResultCallIds.has(message.toolCallId)) duplicateAskResultCallIds.add(message.toolCallId);
+				else seenAskResultCallIds.add(message.toolCallId);
+			}
+			if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+			for (const block of message.content) {
+				if (!isRecord(block) || block.type !== "toolCall" || typeof block.id !== "string") continue;
+				if (seenToolCallIds.has(block.id)) duplicateAskCallIds.add(block.id);
+				else seenToolCallIds.add(block.id);
+				if (block.name !== "ask") continue;
+				if (typeof block.id !== "string" || !isRecord(block.arguments) || !Array.isArray(block.arguments.questions))
+					continue;
+				const questionIds = new Set<string>();
+				let validQuestions = true;
+				for (const question of block.arguments.questions) {
+					if (
+						!isRecord(question) ||
+						typeof question.id !== "string" ||
+						question.id.trim() === "" ||
+						questionIds.has(question.id)
+					) {
+						validQuestions = false;
+						break;
+					}
+					questionIds.add(question.id);
+				}
+				if (!validQuestions || questionIds.size === 0) continue;
+				if (askCalls.has(block.id)) duplicateAskCallIds.add(block.id);
+				else askCalls.set(block.id, { entryIndex, questionIds });
+			}
+		}
+		for (const [entryPosition, entry] of activeEntries.entries()) {
 			if (entry.type !== "message") continue;
 			const index = messages.length;
 			const message = entry.message as unknown;
 			if (!isRecord(message) || typeof message.role !== "string")
 				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
-			const role =
+			let role =
 				message.role === "user" && (message.attribution === "agent" || message.synthetic === true)
 					? "developer"
 					: ["custom", "hookMessage"].includes(message.role)
@@ -859,8 +901,84 @@ export async function authoritativeConversationSnapshot(
 			if (!["user", "assistant", "system", "developer", "tool", "toolResult"].includes(role))
 				throw new DeepInterviewCommandError(2, "live session transcript contains an unsupported message role");
 			let projectedContent: string;
-			if (role === "toolResult" && message.toolName === "ask") askToolResultIndices.push(index);
-			if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
+			if (role === "toolResult" && message.toolName === "ask") {
+				askToolResultIndices.push(index);
+				const callId = message.toolCallId;
+				const call =
+					typeof callId === "string" && !duplicateAskCallIds.has(callId) && !duplicateAskResultCallIds.has(callId)
+						? askCalls.get(callId)
+						: undefined;
+				const details = isRecord(message.details) ? message.details : undefined;
+				const evidence = details?.userAnswerEvidence;
+				if (
+					message.isError === false &&
+					typeof callId === "string" &&
+					call !== undefined &&
+					call.entryIndex < entryPosition &&
+					isRecord(evidence) &&
+					Object.keys(evidence).length === 3 &&
+					Object.hasOwn(evidence, "version") &&
+					Object.hasOwn(evidence, "toolCallId") &&
+					Object.hasOwn(evidence, "answers") &&
+					evidence.version === 1 &&
+					evidence.toolCallId === callId &&
+					Array.isArray(evidence.answers) &&
+					evidence.answers.length > 0 &&
+					evidence.answers.length <= call.questionIds.size
+				) {
+					const answers: string[] = [];
+					const seenQuestionIds = new Set<string>();
+					let validEvidence = true;
+					for (const answer of evidence.answers) {
+						if (
+							!isRecord(answer) ||
+							Object.keys(answer).length !== 2 ||
+							!Object.hasOwn(answer, "questionId") ||
+							!Object.hasOwn(answer, "answer") ||
+							typeof answer.questionId !== "string" ||
+							!call.questionIds.has(answer.questionId) ||
+							seenQuestionIds.has(answer.questionId) ||
+							typeof answer.answer !== "string" ||
+							answer.answer.trim() === "" ||
+							[...answer.answer].length > MAX_USER_RESPONSE_LENGTH
+						) {
+							validEvidence = false;
+							break;
+						}
+						const resultDetails = details?.results;
+						const answerMatchesToolDetails = Array.isArray(resultDetails)
+							? resultDetails.some(
+									result =>
+										isRecord(result) &&
+										result.id === answer.questionId &&
+										result.customInput === answer.answer,
+								)
+							: call.questionIds.size === 1 && details?.customInput === answer.answer;
+						if (!answerMatchesToolDetails) {
+							validEvidence = false;
+							break;
+						}
+						seenQuestionIds.add(answer.questionId);
+						answers.push(answer.answer);
+					}
+					if (validEvidence) {
+						role = "user";
+						projectedContent = answers.join("\n");
+					} else {
+						projectedContent = "";
+					}
+				} else {
+					projectedContent = "";
+				}
+			} else {
+				projectedContent = "";
+			}
+			const askAnswerProjection = role === "user" && message.role === "toolResult" && message.toolName === "ask";
+			if (askAnswerProjection) {
+				// Only Ask's per-call evidence receipt projects custom text as authored
+				// user content. The underlying message remains a toolResult in the
+				// canonical transcript and is still tracked by askToolResultIndices.
+			} else if (["bashExecution", "pythonExecution", "fileMention"].includes(message.role)) {
 				projectedContent = `[${message.role} sha256:${createHash("sha256").update(JSON.stringify(message)).digest("hex")}]`;
 			} else if (typeof message.content === "string") {
 				projectedContent = message.content;
