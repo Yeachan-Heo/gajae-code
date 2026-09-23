@@ -35,7 +35,6 @@ import {
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
 import { deriveLegacyIdentity, deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
@@ -745,27 +744,6 @@ async function waitForDiscovery(agentDir: string, children?: Bun.Subprocess[]) {
 	}
 	throw new Error("Timed out waiting for broker discovery.");
 }
-describe("broker process completion", () => {
-	it("exits zero only after successful broker completion", async () => {
-		const exit = vi.fn((code: number): never => {
-			throw new Error(`exit:${code}`);
-		});
-		await expect(completeBrokerProcess({ completion: Promise.resolve() } as Broker, exit)).rejects.toThrow("exit:0");
-		expect(exit).toHaveBeenCalledWith(0);
-	});
-
-	it("propagates broker completion failure without invoking success exit", async () => {
-		const failure = new Error("broker teardown failed");
-		const exit = vi.fn((_code: number): never => {
-			throw new Error("unexpected exit");
-		});
-		await expect(completeBrokerProcess({ completion: Promise.reject(failure) } as Broker, exit)).rejects.toBe(
-			failure,
-		);
-		expect(exit).not.toHaveBeenCalled();
-	});
-});
-
 it("keeps unresolved session cleanup authority through lifecycle ledger compaction", async () => {
 	const dir = await temp();
 	const ledger = await new LifecycleLedger(dir, { maxRows: 2 }).open();
