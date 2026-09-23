@@ -23,6 +23,7 @@ import {
 	truncateToWidth,
 } from "./render-utils";
 import {
+	SUBAGENT_ACTIVITY_BUCKET_MS,
 	type SubagentLiveProgress,
 	type SubagentSnapshot,
 	type SubagentToolDetails,
@@ -192,7 +193,7 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 }
 
 // Live stats ride the cheap status line (rebuilt every render), never the cached
-// body, so the "last activity" age stays fresh without busting the body cache.
+// body. Quantize age to the producer cadence so incidental renders do not churn it.
 function formatLiveStats(progress: SubagentLiveProgress, theme: Theme, nowMs: number): string {
 	const parts: string[] = [];
 	if (progress.toolCount) parts.push(`${progress.toolCount} ${progress.toolCount === 1 ? "tool" : "tools"}`);
@@ -204,7 +205,9 @@ function formatLiveStats(progress: SubagentLiveProgress, theme: Theme, nowMs: nu
 		);
 	}
 	if (progress.lastActivityMs !== undefined && progress.status === "running") {
-		parts.push(`last activity ${formatDuration(Math.max(0, nowMs - progress.lastActivityMs))} ago`);
+		const ageMs = Math.max(0, nowMs - progress.lastActivityMs);
+		const ageBucketMs = Math.floor(ageMs / SUBAGENT_ACTIVITY_BUCKET_MS) * SUBAGENT_ACTIVITY_BUCKET_MS;
+		parts.push(`last activity ${formatDuration(ageBucketMs)} ago`);
 	}
 	return parts.map(part => `${theme.sep.dot}${theme.fg("dim", part)}`).join("");
 }

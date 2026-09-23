@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Theme } from "../../src/modes/theme/theme";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
 import type { AgentProgress } from "../../src/task/types";
@@ -89,39 +89,39 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("read");
 		expect(out).toContain("recent output available (1 line)");
 	});
-	it("renders tool count, context, and a fresh last-activity age on the live status line", () => {
-		const details: SubagentToolDetails = {
-			subagents: [
-				snapshot({
-					id: "0-Stats",
-					liveProgressAvailable: true,
-					progress: progress({
+	it("quantizes last-activity age on the producer cadence", () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(20_000);
+		try {
+			const details: SubagentToolDetails = {
+				subagents: [
+					snapshot({
 						id: "0-Stats",
-						currentTool: "read",
-						toolCount: 12,
-						contextTokens: 48_000,
-						contextWindow: 200_000,
-						lastActivityMs: Date.now() - 7_000,
+						liveProgressAvailable: true,
+						progress: progress({
+							id: "0-Stats",
+							currentTool: "read",
+							toolCount: 12,
+							contextTokens: 48_000,
+							contextWindow: 200_000,
+							lastActivityMs: 13_000,
+						}),
 					}),
-				}),
-			],
-		};
-		const first = render(details);
-		expect(first).toContain("12 tools");
-		expect(first).toContain("48K/200K ctx");
-		expect(first).toMatch(/last activity 7(\.\d)?s ago/);
+				],
+			};
+			const first = render(details);
+			expect(first).toContain("12 tools");
+			expect(first).toContain("48K/200K ctx");
+			expect(first).toMatch(/last activity 5(?:\.0)?s ago/);
 
-		// Same snapshot, later render: the age advances without a new producer update.
-		const later = render({
-			subagents: [
-				snapshot({
-					id: "0-Stats",
-					liveProgressAvailable: true,
-					progress: { ...details.subagents[0]!.progress!, lastActivityMs: Date.now() - 65_000 },
-				}),
-			],
-		});
-		expect(later).toMatch(/last activity 1m/);
+			// Re-rendering the same snapshot inside one age bucket must not mutate its row.
+			now.mockReturnValue(22_999);
+			expect(render(details)).toBe(first);
+
+			now.mockReturnValue(23_000);
+			expect(render(details)).toMatch(/last activity 10(?:\.0)?s ago/);
+		} finally {
+			now.mockRestore();
+		}
 	});
 
 	it("omits live stats when the live producer is gone", () => {
