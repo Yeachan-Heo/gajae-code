@@ -145,6 +145,20 @@ describe("fresh-subagent decision integration", () => {
 		expect(f.observations[0]?.effective_effort).toBe("low");
 	});
 
+	test("a decided tier that fails preflight still falls back to the original route", async () => {
+		const f = await fixture({ decide: async () => recommendation });
+		const attempts: string[] = [];
+		vi.spyOn(sdk, "createAgentSession").mockImplementation(async init => {
+			attempts.push(init.model?.id ?? "unknown");
+			throw Object.assign(new Error("synthetic transient failure"), { transient: true });
+		});
+		const result = await runSubprocess({ ...f.options, autoroutingPreflight: true });
+		expect(result.exitCode).toBe(1);
+		// The decision reorders the route; it must not delete the caller's own model.
+		expect(attempts[0]).toBe(selected.id);
+		expect(attempts).toContain(original.id);
+	});
+
 	test("failure preserves original pins and runs once across preflight fallback attempts", async () => {
 		let calls = 0;
 		const f = await fixture({

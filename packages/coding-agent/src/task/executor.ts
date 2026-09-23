@@ -3093,11 +3093,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		const outcome = await decisionPromise;
 		const applied = applyTaskDecision(decisionContext, outcome);
 		if (applied.selector) {
+			// The decision reorders the route, it does not truncate it. Keeping the
+			// original candidates behind the chosen selector means a tier that fails
+			// preflight falls back to the route the caller asked for instead of
+			// terminating a task that had a usable model all along.
+			const fallbacks =
+				options.autoroutingCandidates ?? normalizeModelPatterns(options.modelOverride ?? options.agent.model);
+			const candidates = [...new Set([applied.selector, ...fallbacks])];
 			executionOptions = {
 				...options,
-				modelOverride: [applied.selector],
+				modelOverride: candidates,
 				thinkingLevel: applied.effort ?? options.thinkingLevel,
-				autoroutingCandidates: [applied.selector],
+				autoroutingCandidates: candidates,
 				autoroutingPreflight: Boolean(options.autoroutingPreflight),
 				routing: {
 					...(options.routing ?? {
