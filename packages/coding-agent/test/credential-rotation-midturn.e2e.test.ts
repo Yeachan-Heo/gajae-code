@@ -275,7 +275,8 @@ async function runManagedFallbackQuotaScenario(options: {
 	trigger?: "quota" | "rate_limit";
 	preblockedAccounts?: readonly string[];
 	runtimeApiKey?: string;
-}): Promise<{ models: string[]; keys: string[]; markCount: number }> {
+	predecessorModel?: Model;
+}): Promise<{ models: string[]; keys: string[]; markCount: number; activeIndex?: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
 	let session: AgentSession | undefined;
 	const usageProvider: UsageProvider = {
@@ -304,6 +305,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	const model = getBundledModel(provider, "gpt-5.1-codex");
 	const fallback = getBundledModel("openai", "gpt-4o-mini");
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+	const initialModel = options.predecessorModel ?? model;
 	try {
 		await storage.set(provider, [
 			...options.accounts.map(accountId => ({
@@ -336,12 +338,12 @@ async function runManagedFallbackQuotaScenario(options: {
 			"fallback.maxAttempts": options.maxAttempts ?? 3,
 			"retry.baseDelayMs": 1,
 		});
-		settings.setModelRole("default", selector(model));
+		settings.setModelRole("default", selector(initialModel));
 		const calls: Array<{ model: string; key: string }> = [];
 		const quotaKeys = new Set(options.quotaKeys);
 		const success = createMockModel({ responses: [{ content: ["accepted"] }] });
 		const agent = new Agent({
-			initialState: { model, systemPrompt: ["Synthetic test"], tools: [], messages: [] },
+			initialState: { model: initialModel, systemPrompt: ["Synthetic test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
 			getApiKey: async requestedProvider => {
 				if (!session) throw new Error("Session not initialized");
@@ -362,7 +364,10 @@ async function runManagedFallbackQuotaScenario(options: {
 			settings,
 			modelRegistry: registry,
 		});
-		session.setConfiguredModelChain("default", [selector(model), selector(fallback)], "test");
+		const entries = options.predecessorModel
+			? [selector(options.predecessorModel), selector(model), selector(fallback)]
+			: [selector(model), selector(fallback)];
+		session.setConfiguredModelChain("default", entries, "test");
 		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
 		await session.prompt("recover from a Codex quota error");
 		await session.waitForIdle();
@@ -370,6 +375,9 @@ async function runManagedFallbackQuotaScenario(options: {
 			models: calls.map(call => call.model),
 			keys: calls.map(call => call.key),
 			markCount: markUsageLimitReached.mock.calls.length,
+			...(options.predecessorModel
+				? { activeIndex: session.getDefaultFallbackRuntimeState().controller.activeIndex }
+				: {}),
 		};
 	} finally {
 		await session?.dispose();
@@ -450,6 +458,50 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
 			markCount: 2,
 		});
+	});
+
+	test("tries every Codex credential even when the credential pool exceeds the model retry budget", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b", "c"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+			maxAttempts: 1,
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "TOKEN-c", "fallback-test-key"],
+			markCount: 3,
+		});
+	});
+
+	test("keeps the active non-head fallback entry when quota rotation retries it", async () => {
+		const predecessor = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!predecessor || !model) throw new Error("Missing bundled non-head fallback fixture models");
+		const previousAnthropicApiKey = Bun.env.ANTHROPIC_API_KEY;
+		const previousAnthropicOAuthToken = Bun.env.ANTHROPIC_OAUTH_TOKEN;
+		delete Bun.env.ANTHROPIC_API_KEY;
+		delete Bun.env.ANTHROPIC_OAUTH_TOKEN;
+		try {
+			const result = await runManagedFallbackQuotaScenario({
+				accounts: ["a", "b"],
+				quotaKeys: ["TOKEN-a"],
+				predecessorModel: predecessor,
+			});
+			expect(result).toEqual({
+				models: [selector(model), selector(model)],
+				keys: ["TOKEN-a", "TOKEN-b"],
+				markCount: 1,
+				activeIndex: 1,
+			});
+		} finally {
+			if (previousAnthropicApiKey === undefined) delete Bun.env.ANTHROPIC_API_KEY;
+			else Bun.env.ANTHROPIC_API_KEY = previousAnthropicApiKey;
+			if (previousAnthropicOAuthToken === undefined) delete Bun.env.ANTHROPIC_OAUTH_TOKEN;
+			else Bun.env.ANTHROPIC_OAUTH_TOKEN = previousAnthropicOAuthToken;
+		}
 	});
 
 	test("does not mutate credentials pinned by a runtime API key", async () => {
