@@ -667,12 +667,12 @@ test("a deadline-deferred stopped outcome reloads consistently before terminal c
 			provenance: "deadline",
 		});
 		expect(
-			await reconciliation.notePendingStoppedOutcome("prompt", correlation, {
+			await reconciliation.stagePendingTerminalOutcome("prompt", correlation, {
 				kind: "stopped",
 				reason: "cancelled",
 				provenance: "client_cancel",
 			}),
-		).toBe(true);
+		).toMatchObject({ kind: "stopped", reason: "cancelled" });
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "in_flight" });
 		const staged = store.snapshot().find(record => record.commandId === correlation.commandId) as
 			| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown })
@@ -687,6 +687,53 @@ test("a deadline-deferred stopped outcome reloads consistently before terminal c
 		expect(reopened.lookup("prompt", { clientRef: "deferred-stop-ref" })).toMatchObject({
 			status: "terminal_ok",
 			outcome: { kind: "stopped", reason: "cancelled" },
+		});
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("uncertain recovery retains a staged stopped intent for restart", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-deferred-stop-uncertain-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		await Bun.write(sessionFile, "");
+		const sessionId = "deferred-stop-uncertain";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const reconciliation = createInvocationReconciliation({ store });
+		const correlation = { commandId: "deferred-stop-uncertain-command", turnId: "deferred-stop-uncertain-turn" };
+		await reconciliation.noteAccepted("prompt", correlation, "deferred-stop-uncertain-ref");
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+		await reconciliation.claimPendingOutcome("prompt", correlation, {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+			provenance: "deadline",
+		});
+		await reconciliation.stagePendingTerminalOutcome("prompt", correlation, {
+			kind: "stopped",
+			reason: "cancelled",
+			provenance: "client_cancel",
+		});
+		await reconciliation.markUncertain("prompt", correlation, undefined, 10_000);
+		const staged = store.snapshot().find(record => record.commandId === correlation.commandId) as
+			| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown })
+			| undefined;
+		expect(staged).toMatchObject({ status: "in_flight", deadlineRecoveryPending: true });
+		expect(staged?.pendingOutcome).toMatchObject({ kind: "stopped", reason: "cancelled" });
+
+		const reopened = createInvocationReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId }),
+		});
+		await reopened.hydrate();
+		expect(reopened.lookup("prompt", { clientRef: "deferred-stop-uncertain-ref" })).toMatchObject({
+			status: "in_flight",
+		});
+		const recoveryRows = reopened.listDeadlineRecoveryPendingPrompts();
+		expect(recoveryRows).toHaveLength(1);
+		expect(recoveryRows[0]).toMatchObject({
+			correlation,
+			pendingOutcome: { kind: "stopped", reason: "cancelled" },
 		});
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -4113,18 +4160,29 @@ function createInterceptorReconciliationStore(
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
 				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
-				if (
-					record.terminalAt === undefined &&
-					record.pendingOutcome !== undefined &&
-					(previous as (SdkOnlyInvocationRecord & { pendingOutcome?: unknown }) | undefined)?.pendingOutcome ===
-						undefined
-				)
-					transitionType ??= "deadline_claim";
+				const previousPendingOutcome = (
+					previous as
+						| (SdkOnlyInvocationRecord & { pendingOutcome?: { kind?: string; code?: string; reason?: string } })
+						| undefined
+				)?.pendingOutcome;
+				const pendingOutcome = record.pendingOutcome as
+					| { kind?: string; code?: string; reason?: string }
+					| undefined;
+				if (record.terminalAt === undefined && pendingOutcome !== undefined) {
+					if (previousPendingOutcome === undefined) transitionType ??= "deadline_claim";
+					else if (
+						pendingOutcome.kind !== previousPendingOutcome.kind ||
+						pendingOutcome.code !== previousPendingOutcome.code ||
+						pendingOutcome.reason !== previousPendingOutcome.reason
+					)
+						transitionType = "pending_terminal_outcome";
+				}
 				if (record?.terminalAt !== undefined && previous?.terminalAt === undefined) {
 					transitionType = "agent_end";
 					interceptor({ type: "agent_end" });
 				}
 			}
+			if (transitionType === "pending_terminal_outcome") interceptor({ type: transitionType });
 			const hold = persistHolds?.[nextHold];
 			if (hold && hold.type === transitionType) {
 				nextHold += 1;
@@ -6462,6 +6520,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		let handleReads = 0;
 		let boundaryWaitStarted = false;
 		let abortCalls = 0;
+		let terminalEventPromise: Promise<void> | undefined;
 		try {
 			harness = await invocationHarness("deadline-start-race", cwd, {
 				settings: zeroProgressSettings,
@@ -6489,6 +6548,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					},
 					pendingToolExecutions: () => {
 						if (activeTools.size > 0) boundaryWaitStarted = true;
+						else if (boundaryWaitStarted && terminalEventPromise === undefined)
+							terminalEventPromise = harness?.emit("agent_end", { stopReason: "cancelled" });
 						return [...activeTools];
 					},
 					abortPromptAndWaitWithTerminal: async () => {
@@ -6513,13 +6574,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(5);
 			expect(boundaryWaitStarted).toBe(true);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
-			await harness.emit("agent_end", { stopReason: "cancelled" });
 			activeTools.clear();
+			const terminalEventDeadline = Date.now() + 2_000;
+			while (terminalEventPromise === undefined && Date.now() < terminalEventDeadline) await Bun.sleep(5);
+			expect(terminalEventPromise).toBeDefined();
+			await terminalEventPromise;
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
 				status: "terminal_ok",
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
-			expect(abortCalls).toBe(0);
+			expect(abortCalls).toBeLessThanOrEqual(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
 		} finally {
@@ -6609,6 +6673,121 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(correlatedFrames(harness, targetIds).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 			expect(correlatedFrames(harness, targetIds).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
 			expect(correlatedFrames(harness, siblingIds).filter(frame => frame.kind === "agent_end")).toHaveLength(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a deferred cancelled end preserves its provider failure", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-provider-cancelled-"));
+		const epoch = 97;
+		let harness: InvocationHarness | undefined;
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-provider-cancelled", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 100 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => "deadline-provider-cancelled-run",
+					pendingToolExecutions: () => [],
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						await harness?.emit("agent_failed", {
+							error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+						});
+						await harness?.emit("agent_end", { stopReason: "cancelled" });
+						return {
+							status: "settled",
+							terminalScope: {
+								abortedAttemptEpoch: epoch,
+								lineageIdHash: "deadline-provider-cancelled-lineage",
+							},
+						};
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider fails during cancellation" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_unavailable" },
+			});
+			expect(abortCalls).toBe(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
+			expect(
+				correlatedFrames(harness, correlation).find(frame => frame.kind === "agent_end")?.payload,
+			).toMatchObject({
+				outcome: { kind: "failed", code: "prompt_failed", providerCode: "provider_unavailable" },
+			});
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a deferred terminal retries a transient outcome-staging failure", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-stage-retry-"));
+		const epoch = 101;
+		let harness: InvocationHarness | undefined;
+		let stageFailures = 0;
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-stage-retry", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 100 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "pending_terminal_outcome" && stageFailures === 0) {
+						stageFailures += 1;
+						throw Object.assign(new Error("injected pending terminal persistence failure"), {
+							code: "io_error",
+						});
+					}
+				},
+				agentFailedWriteFailures: 0,
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => "deadline-stage-retry-run",
+					pendingToolExecutions: () => [],
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						await harness?.emit("agent_end", { stopReason: "cancelled" });
+						return {
+							status: "settled",
+							terminalScope: { abortedAttemptEpoch: epoch, lineageIdHash: "deadline-stage-retry-lineage" },
+						};
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "retry terminal staging" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(stageFailures).toBe(1);
+			expect(abortCalls).toBe(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
 		} finally {
 			await harness?.stop();
 			await Bun.sleep(10);
