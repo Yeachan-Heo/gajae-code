@@ -5593,28 +5593,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			manager.setOnToolsChanged(tools => {
 				void syncOwnedMcpTools(tools);
 			});
+			const catalog = manager.getToolCatalogSnapshot();
 			if (initialTools !== undefined) {
-				void syncOwnedMcpTools(initialTools);
-			} else {
-				const catalog = manager.getToolCatalogSnapshot();
-				if (catalog.publication === "published") {
-					const failedPluginServers = failedPluginMcpManagerServers.get(manager);
-					const catalogTools = catalog.tools
-						.filter(tool => {
-							const serverName = tool.mcpServerName;
-							return (
-								serverName !== undefined &&
-								(!failedPluginServers?.has(serverName) ||
-									manager.getConnectionStatus(serverName) === "connected")
-							);
-						})
-						.map(tool => tool as CustomTool);
-					if (!sameMcpToolSnapshot(catalogTools, ownedMcpManagerTools)) {
-						void syncOwnedMcpTools(catalog.tools.map(tool => tool as CustomTool));
-					}
-				} else if (!pluginMcpCleanupFailures.has(manager)) {
-					void syncOwnedMcpTools(ownedMcpManagerTools);
+				// Deferred startup already registered its captured result. Re-read
+				// after that await so a publication during registration is not lost.
+				const currentTools =
+					catalog.publication === "published" ? catalog.tools.map(tool => tool as CustomTool) : initialTools;
+				void syncOwnedMcpTools(currentTools);
+			} else if (catalog.publication === "published") {
+				const failedPluginServers = failedPluginMcpManagerServers.get(manager);
+				const catalogTools = catalog.tools
+					.filter(tool => {
+						const serverName = tool.mcpServerName;
+						return (
+							serverName !== undefined &&
+							(!failedPluginServers?.has(serverName) || manager.getConnectionStatus(serverName) === "connected")
+						);
+					})
+					.map(tool => tool as CustomTool);
+				if (!sameMcpToolSnapshot(catalogTools, ownedMcpManagerTools)) {
+					void syncOwnedMcpTools(catalog.tools.map(tool => tool as CustomTool));
 				}
+			} else if (!pluginMcpCleanupFailures.has(manager)) {
+				void syncOwnedMcpTools(ownedMcpManagerTools);
 			}
 		};
 		const wireOwnedMcpManagerLifecycle = (): void => {

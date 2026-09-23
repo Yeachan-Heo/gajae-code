@@ -16,7 +16,14 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { DeferredMCPTool, loadAllMCPConfigs, type MCPLoadResult, MCPManager, MCPToolCache } from "../src/runtime-mcp";
+import {
+	DeferredMCPTool,
+	loadAllMCPConfigs,
+	type MCPLoadResult,
+	MCPManager,
+	MCPTool,
+	MCPToolCache,
+} from "../src/runtime-mcp";
 import * as mcpClient from "../src/runtime-mcp/client";
 import { AgentStorage } from "../src/session/agent-storage";
 
@@ -330,6 +337,75 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			await session.dispose();
 		}
 	}, 45_000);
+
+	it("reconciles the current conventional catalog after deferred registration yields", async () => {
+		const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+		stdout.mockRestore();
+
+		const [startupTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{ name: "hello", inputSchema: { type: "object", properties: {} } },
+		]);
+		const [lateTool] = MCPTool.fromTools({ name: "demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0], [
+			{ name: "late_lookup", inputSchema: { type: "object", properties: {} } },
+		]);
+		if (!startupTool || !lateTool) throw new Error("MCP regression tools were not created");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [startupTool],
+			errors: new Map(),
+			connectedServers: ["demo"],
+			exaApiKeys: [],
+		});
+
+		const { session, mcpManager, startDeferredMcpConfig } = await createAgentSession({
+			...isolatedSessionOptions(),
+			deferMcpConfigStartup: true,
+		});
+		try {
+			if (!mcpManager) throw new Error("Expected the deferred session-owned manager");
+			if (!startDeferredMcpConfig) throw new Error("Expected a deferred startup handle");
+			let lateCatalogPublished = false;
+			vi.spyOn(mcpManager, "getToolCatalogSnapshot").mockImplementation(() => ({
+				tools: lateCatalogPublished ? [startupTool, lateTool] : [startupTool],
+				publication: "published",
+				generation: lateCatalogPublished ? 2 : 1,
+			}));
+			const originalRefreshMCPTools = AgentSession.prototype.refreshMCPTools;
+			vi.spyOn(AgentSession.prototype, "refreshMCPTools").mockImplementation(async function (
+				this: AgentSession,
+				tools,
+				options,
+			) {
+				await originalRefreshMCPTools.call(this, tools, options);
+				if (this === session) lateCatalogPublished = true;
+			});
+			const lateToolReconciled = Promise.withResolvers<void>();
+			const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+				options,
+			) {
+				await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+				if (this === session && nextTools.some(tool => tool.name === lateTool.name)) {
+					lateToolReconciled.resolve();
+				}
+			});
+
+			await expect(startDeferredMcpConfig()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			await lateToolReconciled.promise;
+			expect(session.getAllToolNames()).toContain(lateTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it("holds the first prompt until deferred conventional startup completes", async () => {
 		// The gated prompt passes model-credential preflight once the barrier
