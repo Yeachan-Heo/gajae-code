@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Fixed
+
+- Split directed SDK delivery drops into bounded, per-cause diagnostics without parsing oversized frames before the response ceiling check.
+
+### Performance
+
+- Reuse completed-line syntax checkpoints when a fenced code block grows by appending, keeping the existing synchronous colored output. Prefix edits, language/theme changes, and first-time large blocks still fully parse.
+
 ## [0.17.2] - 2026-09-18
 
 ## [0.17.1] - 2026-09-17

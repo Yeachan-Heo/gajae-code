@@ -48,6 +48,18 @@ function rawSkillPrefixForName(authority: string, skillName: string): string | u
 	return undefined;
 }
 
+function splitSkillPathSel(rawPath: string, authorityEnd: number): { path: string; sel?: string } {
+	const suffix = rawPath.slice(authorityEnd);
+	const suffixQueryOrFragment = suffix.search(/[?#]/);
+	const pathnameEnd = suffixQueryOrFragment === -1 ? rawPath.length : authorityEnd + suffixQueryOrFragment;
+	const pathnameTarget = splitPathAndSel(rawPath.slice(authorityEnd, pathnameEnd));
+	if (pathnameTarget.sel === undefined) return { path: rawPath };
+	return {
+		path: `${rawPath.slice(0, authorityEnd)}${pathnameTarget.path}${rawPath.slice(pathnameEnd)}`,
+		sel: pathnameTarget.sel,
+	};
+}
+
 function tryMacOSScreenshotPath(filePath: string): string {
 	// macOS writes a narrow no-break space before AM/PM, but the model normalizes it
 	// to a plain space. The original name is not always `…PM.png`: attachment paths
@@ -177,6 +189,9 @@ export function splitInternalUrlSel(
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
 	const scheme = schemeMatch[1].toLowerCase();
+	// `embedded://gjc/<path>` identifies a bundled file, so the selector always
+	// trails the path rather than the identifier-shaped authority.
+	if (scheme === "embedded") return splitPathAndSel(rawPath);
 	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
@@ -185,7 +200,14 @@ export function splitInternalUrlSel(
 	const authority = rawPath.slice(schemeEnd, authorityEnd);
 	const authoritySuffix = rawPath.slice(authorityEnd);
 	const firstColon = authority.indexOf(":");
-	if (firstColon === -1) return { path: rawPath };
+	if (firstColon === -1) {
+		if (scheme === "skill") {
+			// Skill relative paths carry selectors after the authority (for example,
+			// `skill://foo/docs/reference.md:10-20`).
+			return splitSkillPathSel(rawPath, authorityEnd);
+		}
+		return { path: rawPath };
+	}
 	if (firstColon === 0) return { path: rawPath };
 
 	if (scheme === "skill") {
@@ -197,7 +219,9 @@ export function splitInternalUrlSel(
 			// Let the resolver report malformed URL encoding when no selector boundary
 			// can be established from the raw authority.
 		}
-		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) return { path: rawPath };
+		if (decodedAuthority !== undefined && activeSkillNames.includes(decodedAuthority)) {
+			return splitSkillPathSel(rawPath, authorityEnd);
+		}
 		const rawSkillPrefix = activeSkillNames
 			.map(name => ({ name, prefix: rawSkillPrefixForName(authority, name) }))
 			.filter(item => item.prefix !== undefined)
@@ -217,7 +241,7 @@ export function splitInternalUrlSel(
 			return { path: `${rawPath.slice(0, schemeEnd + firstColon)}${authoritySuffix}`, sel: firstTail };
 		}
 		const selectorColon = authority.indexOf(":", firstColon + 1);
-		if (selectorColon === -1) return { path: rawPath };
+		if (selectorColon === -1) return splitSkillPathSel(rawPath, authorityEnd);
 		return {
 			path: `${rawPath.slice(0, schemeEnd + selectorColon)}${authoritySuffix}`,
 			sel: authority.slice(selectorColon + 1),

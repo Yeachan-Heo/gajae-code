@@ -71,10 +71,25 @@ jobs:
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then
-            echo "::notice::issue #$number is not a pull request; the PR contract does not apply"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # A confirmed HTTP 404 means this issue is not a pull request and is the
+          # only lookup failure that may safely skip. Any other error leaves the PR
+          # identity unknown; fail the validation job instead of skipping, so the run
+          # is visibly red rather than silently treated as a non-PR comment. No head
+          # is resolved, so nothing is published against any SHA: the automatic
+          # approval job is excluded for comment events and the head-bound steps
+          # require a resolved head.
+          lookup_error="$RUNNER_TEMP/gjc-pr-lookup.err"
+          if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then
+            :
+          else
+            lookup_status=$?
+            if grep -qF "HTTP 404" "$lookup_error"; then
+              echo "::notice::issue #$number is not a pull request; the PR contract does not apply"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::could not resolve issue #$number as a pull request (gh api exited $lookup_status): $(tr '\n' ' ' < "$lookup_error")"
+            exit "$lookup_status"
           fi
           base_ref="$(printf '%s' "$pr_json" | jq -r '.base.ref')"
           if [[ "$base_ref" != "dev" ]]; then
@@ -319,12 +334,20 @@ jobs:
   merge-approval:
     name: Merge approval
     needs: [validate]
-    # always() is load-bearing. GitHub reports a SKIPPED job as Success for required
-    # checks (https://docs.github.com/en/pull-requests/reference/status-checks), so a
+    # always() is load-bearing for PR-bound events. GitHub reports a SKIPPED job as
+    # Success for required checks
+    # (https://docs.github.com/en/pull-requests/reference/status-checks), so a
     # plain `needs:` would skip this job when the contract job fails and publish a GREEN
-    # merge-approval check for a red contract — the precise hole this must not open.
-    # The job therefore always runs and decides from the upstream result plus its output.
-    if: ${{ always() }}
+    # merge-approval check for a red contract.
+    #
+    # issue_comment runs are excluded as a whole, not by the resolver's outcome. Their
+    # automatic job check is bound to the default-branch SHA (`github.sha` is `main`,
+    # never the PR head), so every verdict it published — pending approval, failed
+    # validation, a comment on an ordinary issue — landed as a red "Merge approval" on
+    # `main` (#5694). The exact-head verdict for a comment event is published by the
+    # validate job's head-bound check-run step instead; when PR resolution itself fails
+    # there is no head to protect and the validate job's own failure is the signal.
+    if: ${{ always() && github.event_name != 'issue_comment' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     # Reads only the upstream job's result and output: no checkout, no bun, no token.

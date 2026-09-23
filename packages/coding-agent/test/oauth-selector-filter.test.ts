@@ -221,10 +221,94 @@ describe("OAuth selector filtering", () => {
 				},
 			);
 
+			// Login defaults to the first selectable recovery action; move back to
+			// the disabled account to verify it still cannot be selected.
+			selector.handleInput("\x1b[A");
 			selector.handleInput("\n");
 
 			expect(selected).toEqual([]);
 			expect(renderedText(selector)).toContain("This account is not selectable.");
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
+	test("a disabled OAuth account defaults Enter to adding a fresh account", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const added: boolean[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "expired-refresh",
+					expires: Date.now() - 60_000,
+					accountId: "expired-account",
+					email: "expired@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+			expect(authStorage.disableCredentialById(credential.id, "oauth refresh failed: invalid_grant")).toBe(true);
+
+			selector = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAddAccount: () => {
+						added.push(true);
+					},
+				},
+			);
+
+			selector.handleInput("\n");
+
+			expect(added).toEqual([true]);
+			expect(renderedText(selector)).not.toContain("This account is not selectable.");
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
+	test("a selectable OAuth account remains the default login choice", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const selected: unknown[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "active-access",
+					refresh: "active-refresh",
+					expires: Date.now() + 60_000,
+					accountId: "active-account",
+					email: "active@example.com",
+				},
+			]);
+			const credential = authStorage.listCredentialInventory("anthropic")[0];
+			if (!credential) throw new Error("Expected OAuth credential fixture");
+
+			selector = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountSelect: value => {
+						selected.push(value);
+					},
+					onAddAccount: () => {},
+				},
+			);
+
+			selector.handleInput("\n");
+
+			expect(selected).toEqual([{ kind: "id", value: String(credential.id) }]);
 		} finally {
 			selector?.dispose();
 			authStorage.close();

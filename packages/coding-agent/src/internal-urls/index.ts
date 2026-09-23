@@ -10,6 +10,7 @@
 
 export * from "./agent-protocol";
 export * from "./artifact-protocol";
+export * from "./embedded-protocol";
 export * from "./gjc-protocol";
 export * from "./issue-pr-protocol";
 export * from "./json-query";

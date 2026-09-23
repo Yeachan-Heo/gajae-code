@@ -1,13 +1,14 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage } from "@gajae-code/ai";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { ModelRegistry, ModelsConfigFile } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { applyStartupModelProfiles } from "../src/main";
-import { createLifecycleAgentSession } from "../src/sdk/lifecycle-session";
+import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../src/sdk/lifecycle-session";
 
 /**
  * The coordinator model pin (#4707) validates a selector against its own
@@ -132,6 +133,99 @@ describe("lifecycle session explicit model pin", () => {
 			expect(String(created.session.thinkingLevel)).toBe("high");
 		} finally {
 			await created.session.dispose();
+		}
+	}, 30_000);
+
+	test("refreshes a discovery-only configured default before fresh lifecycle admission", async () => {
+		const cwd = tempCwd();
+		const provider = "lifecycle-discovery-provider";
+		const modelId = "discovered-default-model";
+		const requests: Array<{ url: string | undefined; authorization: string | undefined }> = [];
+		const server = http.createServer((request, response) => {
+			requests.push({ url: request.url, authorization: request.headers.authorization });
+			response.writeHead(200, { "content-type": "application/json" });
+			response.end(JSON.stringify({ data: [{ id: modelId }] }));
+		});
+		const listening = Promise.withResolvers<void>();
+		server.once("listening", listening.resolve);
+		server.once("error", listening.reject);
+		server.listen(0, "127.0.0.1");
+		await listening.promise;
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("Discovery server address unavailable");
+
+		const modelsPath = path.join(cwd, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"providers:",
+				`  ${provider}:`,
+				`    baseUrl: http://127.0.0.1:${address.port}/v1`,
+				"    api: openai-completions",
+				"    auth: none",
+				"    discovery:",
+				"      type: openai-models-list",
+				"    models: []",
+				"",
+			].join("\n"),
+		);
+		const originalRelocate = ModelsConfigFile.relocate.bind(ModelsConfigFile);
+		const relocateSpy = vi
+			.spyOn(ModelsConfigFile, "relocate")
+			.mockImplementation(configPath => originalRelocate(configPath ?? modelsPath));
+		const backgroundRefreshSpy = vi
+			.spyOn(ModelRegistry.prototype, "refreshInBackground")
+			.mockImplementation(() => {});
+		const settings = Settings.isolated({ modelRoles: { default: `${provider}/${modelId}` } });
+		let created: CreateLifecycleAgentSessionResult | undefined;
+		let explicit: CreateLifecycleAgentSessionResult | undefined;
+		try {
+			created = await createLifecycleAgentSession({
+				cwd,
+				agentDir: cwd,
+				authStorage,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+			});
+			if ("failure" in created) throw new Error(`Lifecycle construction failed: ${created.failure.message}`);
+
+			expect(created.session.model).toMatchObject({ provider, id: modelId });
+			expect(requests).toEqual([{ url: "/v1/models", authorization: undefined }]);
+
+			explicit = await createLifecycleAgentSession({
+				cwd,
+				agentDir: cwd,
+				authStorage,
+				modelRegistry: created.session.modelRegistry,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings: Settings.isolated(),
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+				modelId: `${provider}/${modelId}`,
+			});
+			if ("failure" in explicit)
+				throw new Error(`Explicit lifecycle construction failed: ${explicit.failure.message}`);
+			expect(explicit.session.model).toMatchObject({ provider, id: modelId });
+		} finally {
+			if (explicit && !("failure" in explicit)) await explicit.session.dispose();
+			if (created && !("failure" in created)) await created.session.dispose();
+			backgroundRefreshSpy.mockRestore();
+			relocateSpy.mockRestore();
+			const closed = Promise.withResolvers<void>();
+			server.close(error => (error ? closed.reject(error) : closed.resolve()));
+			await closed.promise;
 		}
 	}, 30_000);
 });

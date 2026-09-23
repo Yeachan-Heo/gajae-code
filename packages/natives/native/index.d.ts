@@ -591,7 +591,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_17_2(): void
+export declare function __piNativesV0_17_4(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1970,6 +1970,12 @@ export interface NativeExactFileIdentity {
    * hard links. Remaining links are retained after exact quarantine cleanup.
    */
   allowHardLink?: boolean
+  /**
+   * Require the authorized regular file to retain at least two hard links at
+   * every identity check. This is used by cleanup paths that remove only a
+   * surplus alias while preserving the live transcript link.
+   */
+  requireHardLink?: boolean
 }
 
 /** Typed result of an identity-bound regular-file deletion or directory detach. */
@@ -2261,6 +2267,8 @@ export interface PtyStartOptions {
   cwd?: string
   /** Environment variables for this command. */
   env?: Record<string, string>
+  /** Environment variable names to remove from the child process. */
+  unsetEnv?: Array<string>
   /** Timeout in milliseconds before cancelling. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */
@@ -2526,6 +2534,8 @@ export interface ShellRunOptions {
   cwd?: string
   /** Environment variables to apply for this command only. */
   env?: Record<string, string>
+  /** Environment variable names to mask for this command only. */
+  unsetEnv?: Array<string>
   /** Timeout in milliseconds before cancelling the command. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */

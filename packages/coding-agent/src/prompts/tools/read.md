@@ -73,6 +73,8 @@ For `.sqlite`, `.sqlite3`, `.db`, `.db3`:
 
 `agent://<id>`, `artifact://<id>`, `rule://<name>`, and `local://<name>.md` resolve transparently and accept the same line selectors as filesystem paths. Use `artifact://<id>` to recover full output that a previous bash/eval/tool result spilled or truncated.
 
+Bundled skills have no filesystem home, so the skill tool and skill discovery report them as `embedded:gjc/skills/<name>/SKILL.md`; read that identifier verbatim. Bundled skill fragments, when surfaced, likewise use `embedded:gjc/skill-fragments/...` identifiers.
+
 <critical>
 - Always include `path`; never call `read` with `{}`.
 - For line ranges, append the selector to `path`.

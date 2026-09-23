@@ -1787,8 +1787,14 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The branch-protection rollout contract is documented in the workflow.
 	expect(workflow).toContain("Branch-protection rollout contract");
 	// Ordinary issues are not pull requests: the resolve step must skip cleanly
-	// instead of failing the job on the 404.
-	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// instead of failing the job on the 404. Every other lookup failure must fail
+	// validation, rather than preserving an old approval as if this were an issue.
+	expect(workflow).toContain('if pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>"$lookup_error")"; then');
+	expect(workflow).toContain('grep -qF "HTTP 404" "$lookup_error"');
+	expect(workflow).toContain('exit "$lookup_status"');
+	// The automatic approval job never runs for comment events: its job check binds to
+	// the default-branch SHA, so any verdict it published landed on `main` (#5694).
+	expect(workflow).toContain("if: ${{ always() && github.event_name != 'issue_comment' }}");
 	// A trusted base missing ANY required validator capability can never authorize.
 	// One marker was not enough: `main` carried the self-review validator but not the
 	// approval freshness rule, so a comment-triggered re-validation ran the old
@@ -1882,6 +1888,92 @@ test("comment-triggered validation publishes a head-bound check run under the re
 	// The revoking write must be a hard failure: a neutral conclusion is not blocking,
 	// so it would replace a stale green with something that still permits the merge.
 	expect(workflow).toContain('-f conclusion="failure" \\\n            -f \'output[title]="Merge approval (re-validating)"\'');
+});
+
+test("issue-comment PR lookup skips only confirmed 404 and fails closed for other errors", async () => {
+	const document = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { steps?: Array<{ name?: string; run?: string }> }>;
+	};
+	const resolver = document.jobs?.validate?.steps?.find(step => step.name === "Resolve PR head/base from the event or the comment's PR");
+	if (!resolver?.run) throw new Error("Missing PR resolver run block");
+	// Exercise the checked-in resolver itself with only the event expressions bound to
+	// fixture values. The fake gh command returns a real 404-shaped failure or a
+	// transient non-404 failure; no duplicate classifier is used in the test.
+	const script = resolver.run
+		.replaceAll("${{ github.event.pull_request.number }}", "")
+		.replaceAll("${{ github.event.pull_request.head.repo.full_name }}", "owner/repo")
+		.replaceAll("${{ github.event.pull_request.head.sha }}", "b".repeat(40))
+		.replaceAll("${{ github.event.pull_request.base.sha }}", "a".repeat(40))
+		.replaceAll("${{ github.event.issue.number }}", "123")
+		.replaceAll("${{ github.repository }}", "owner/repo");
+
+	async function runResolver(errorText: string, status: number): Promise<{ exitCode: number; output: string; stderr: string }> {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-pr-validation-lookup-"));
+		try {
+			const bin = path.join(root, "bin");
+			await fs.mkdir(bin);
+			const gh = path.join(bin, "gh");
+			await fs.writeFile(gh, `#!/usr/bin/env bash\nprintf '%s\\n' ${JSON.stringify(errorText)} >&2\nexit ${status}\n`, { mode: 0o755 });
+			const output = path.join(root, "github-output");
+			await fs.writeFile(output, "");
+			const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+			const child = Bun.spawn(["bash", "-e", "-u", "-o", "pipefail", "-c", script], {
+				cwd: root,
+				env: {
+					...inheritedEnv,
+					PATH: `${bin}:${inheritedEnv.PATH ?? ""}`,
+					RUNNER_TEMP: root,
+					GITHUB_OUTPUT: output,
+					COMMENT_BODY: "",
+					COMMENT_PREVIOUS_BODY: "",
+					COMMENT_AUTHOR: "",
+					PR_AUTHOR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+			]);
+			return { exitCode: await child.exited, output: await Bun.file(output).text(), stderr: `${stdout}${stderr}` };
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	}
+
+	const notFound = await runResolver("gh: Not Found (HTTP 404)", 1);
+	expect(notFound.exitCode).toBe(0);
+	expect(notFound.output).toContain("skip=true");
+
+	const transientFailure = await runResolver("gh: Service Unavailable (HTTP 503)", 1);
+	expect(transientFailure.exitCode).not.toBe(0);
+	expect(transientFailure.output).not.toContain("skip=true");
+	expect(transientFailure.stderr).toContain("HTTP 503");
+});
+
+test("issue_comment events never run the default-SHA merge-approval job", async () => {
+	const workflow = parse(await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text()) as {
+		jobs?: Record<string, { outputs?: Record<string, string>; if?: string; steps?: Array<{ name?: string; if?: string }> }>;
+	};
+	const validate = workflow.jobs?.validate;
+	const mergeApproval = workflow.jobs?.["merge-approval"];
+
+	// issue_comment runs from the default branch, so the automatic job check is bound
+	// to `main`, never to the PR head. Gating on the resolver's skip output was not
+	// enough: a dev-PR comment awaiting approval, a failed validation, or a non-404
+	// lookup error (where no skip is written) all still published a red "Merge
+	// approval" on `main` (#5694, Codex P1/P2). The exclusion must therefore be by
+	// event name, with nothing left for the resolver to opt into.
+	expect(mergeApproval?.if).toBe("${{ always() && github.event_name != 'issue_comment' }}");
+	expect(validate?.outputs).toEqual({ merge_authorized: "${{ steps.validate.outputs.merge_authorized }}" });
+	// The exact-head verdict for comment events comes from the head-bound check-run
+	// publication in the validate job, which is the only path that names the PR head.
+	const publish = validate?.steps?.find(step => step.name === "Publish head-bound check results for comment-triggered validation");
+	expect(publish?.if).toBe("${{ always() && github.event_name == 'issue_comment' && steps.pr.outputs.skip != 'true' }}");
+	// PR-bound events keep the fail-closed automatic gate: nothing but the event name
+	// may switch it off, so a failed or cancelled contract still yields a red approval.
+	expect(mergeApproval?.if).not.toContain("needs.validate.outputs");
 });
 
 test("the stale-base markers survive comment stripping but not code removal (#5692 review)", async () => {
@@ -1982,6 +2074,7 @@ test("every expression expanded into a workflow run scalar is explicitly justifi
 		[".github/actions/build-native/action.yml\tinputs.hash", "hex digest computed in-workflow; ci.yml is the only caller"],
 		[".github/actions/build-native/action.yml\tinputs.nightly_version", "same generated version; ci.yml is the only caller"],
 		[".github/workflows/ci.yml\tgithub.ref", "ref name; writing one requires push access to this protected path"],
+		[".github/workflows/ci.yml\tgithub.run_id", "integer assigned by GitHub"],
 		[".github/workflows/ci.yml\tgithub.sha", "40-hex, server-computed"],
 		[".github/workflows/ci.yml\tmatrix.binary_path", "workflow-fixed matrix literal"],
 		[".github/workflows/ci.yml\tneeds.acp_conformance.result", "closed result enum"],
@@ -2187,6 +2280,41 @@ test("every env value bound from an expression is read as a quoted word (#5740 r
 	expect(inspected).toBeGreaterThan(0);
 });
 
+// GitHub expands `${{ ... }}` into the run scalar BEFORE any interpreter sees it, so a
+// parser handed the raw body is not reading the program that runs. PowerShell in
+// particular reads `${{` as a braced variable name and reports "Use `{ instead of { in
+// variable names" for every expression-bearing step -- a diagnostic about a body that
+// never exists at runtime. Substitute expressions with a benign literal first, which is
+// what the runner effectively does. Nesting rule matches the justification guard: `{`
+// appears inside an expression only within a single-quoted literal.
+const substituteWorkflowExpressions = (scalar: string, replacement = "EXPR"): string => {
+	let out = "";
+	let at = 0;
+	while (at < scalar.length) {
+		const open = scalar.indexOf("${{", at);
+		if (open === -1) return out + scalar.slice(at);
+		out += scalar.slice(at, open);
+		let cursor = open + 3;
+		let quoted = false;
+		let end = -1;
+		while (cursor < scalar.length) {
+			const character = scalar[cursor];
+			if (character === "'") quoted = !quoted;
+			else if (!quoted && character === "}" && scalar[cursor + 1] === "}") {
+				end = cursor;
+				break;
+			}
+			cursor++;
+		}
+		// An unterminated expression is left verbatim: the parser should see the broken
+		// text rather than have this helper quietly repair it.
+		if (end === -1) return out + scalar.slice(open);
+		out += replacement;
+		at = end + 2;
+	}
+	return out;
+};
+
 // Parse a PowerShell body with PowerShell's own AST parser, without executing it.
 // Returns "" when clean, or the parser's diagnostics. Mirrors the established pattern
 // in scripts/install-tests/install-ps1-compat.test.ts.
@@ -2326,13 +2454,32 @@ test("every run scalar is checked by the interpreter that will actually run it (
 		return;
 	}
 	for (const candidate of powershell) {
-		const diagnostics = await parsePowerShell(pwshPath, candidate.body);
+		const diagnostics = await parsePowerShell(pwshPath, substituteWorkflowExpressions(candidate.body));
 		expect({ file: candidate.file, step: candidate.step, diagnostics }).toEqual({
 			file: candidate.file,
 			step: candidate.step,
 			diagnostics: "",
 		});
 	}
+	// Each body costs one pwsh start, and the runner needs roughly a second apiece, so
+	// the default 5s budget expires mid-sweep. bun then SIGTERMs the child and the test
+	// reports the kill as a PARSER VERDICT -- `PowerShell parser exited 143` against a
+	// workflow step that is perfectly valid. Every PR whose affected shard covers this
+	// file went red on that, so the budget is explicit and sized for the sweep.
+}, 180_000);
+
+test("workflow expressions are substituted before an interpreter parses the body", () => {
+	// Raw `${{ }}` made PowerShell report "Use `{ instead of { in variable names" for a
+	// perfectly valid step, because the runner had already replaced the expression by the
+	// time pwsh ran. That diagnostic was invisible while the sweep was still timing out.
+	expect(substituteWorkflowExpressions('--version "${{ needs.meta.outputs.v }}"')).toBe('--version "EXPR"');
+	expect(substituteWorkflowExpressions("a ${{ x }} b ${{ y }} c")).toBe("a EXPR b EXPR c");
+	// A brace inside a single-quoted literal belongs to the expression, not to its end.
+	expect(substituteWorkflowExpressions("${{ hashFiles('**/{a,b}.lock') }}")).toBe("EXPR");
+	// Nothing to substitute must change nothing at all.
+	expect(substituteWorkflowExpressions("echo ${VAR} $env:PATH")).toBe("echo ${VAR} $env:PATH");
+	// An unterminated expression is handed over verbatim rather than silently repaired.
+	expect(substituteWorkflowExpressions("echo ${{ broken")).toBe("echo ${{ broken");
 });
 
 test("the PowerShell parse helper surfaces diagnostics rather than swallowing them (#5740 review)", async () => {
@@ -2360,8 +2507,15 @@ test("the PowerShell parse helper surfaces diagnostics rather than swallowing th
 	const silent = await write("silent", "#!/bin/sh\nexit 7\n");
 	expect(await parsePowerShell(silent, "whatever")).toBe("PowerShell parser exited 7");
 
-	// And the body must actually reach the parser as a file it can read.
-	const echoes = await write("echoes", "#!/bin/sh\nsed -n '2p' \"$(ls -t \"${TMPDIR:-/tmp}\"/gjc-pwsh-parse-*/step.ps1 | head -1)\"\nexit 1\n");
+	// And the body must actually reach the parser as a file it can read. The stub takes
+	// the path out of the command it was handed, the way the real parser does. Picking
+	// the newest `gjc-pwsh-parse-*` directory instead made this assertion depend on every
+	// other run sharing the machine's temp dir, and it failed against a sibling run's
+	// leftovers rather than against anything this test did.
+	const echoes = await write(
+		"echoes",
+		"#!/bin/sh\nsed -n '2p' \"$(printf '%s' \"$3\" | sed -n \"s/.*ParseFile('\\\\([^']*\\\\)'.*/\\\\1/p\")\"\nexit 1\n",
+	);
 	expect(await parsePowerShell(echoes, "line one\nline two")).toBe("line two");
 	await fs.rm(directory, { recursive: true, force: true });
 });
@@ -2489,12 +2643,15 @@ test("the merge-approval gate is a separate, fail-closed check in both workflows
 	expect(devCi).toContain("Verdict ${verdict} intentionally blocks merge.");
 	expect(devCi).toContain("throw new Error(`Stale verdict digest");
 	expect(devCi).toContain("merge-approved cannot be self-approved");
-	// Fail closed on a skipped/failed/cancelled upstream job. GitHub reports a SKIPPED
-	// job as Success for required checks, so `needs:` alone would publish a green
-	// approval check for a red contract; always() plus an explicit result test cannot.
+	// Fail closed on a failed/cancelled upstream job. GitHub reports a SKIPPED job as
+	// Success for required checks, so `needs:` alone would publish a green approval
+	// check for a red contract; always() plus an explicit result test cannot. Both
+	// gates are switched off only by event name: the Dev CI gate for anything but a
+	// pull_request, the PR-contract gate for issue_comment runs whose job check would
+	// bind to the default-branch SHA rather than the PR head (#5694).
 	expect(prContract).toContain("needs: [validate]");
 	expect(devCi).toContain("needs: [pr-contract-bootstrap]");
-	for (const [workflow, guard] of [[prContract, "if: ${{ always() }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
+	for (const [workflow, guard] of [[prContract, "if: ${{ always() && github.event_name != 'issue_comment' }}"], [devCi, "if: ${{ always() && github.event_name == 'pull_request' }}"]] as const) {
 		expect(workflow).toContain(guard);
 		expect(workflow).toContain('if [[ "${CONTRACT_RESULT:-}" != "success" ]]; then');
 		expect(workflow).toContain('if [[ "${MERGE_AUTHORIZED:-}" != "true" ]]; then');

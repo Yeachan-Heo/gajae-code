@@ -120,6 +120,10 @@ export interface SubagentLiveProgress {
 	currentTool?: string;
 	recentTool?: string;
 	recentOutputSummary?: { lineCount: number };
+	toolCount?: number;
+	contextTokens?: number;
+	contextWindow?: number;
+	lastActivityMs?: number;
 	fastMode?: boolean;
 	retryState?: {
 		attempt: number;
@@ -145,6 +149,14 @@ function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
 		...(progress.recentOutput.length > 0
 			? { recentOutputSummary: { lineCount: Math.min(progress.recentOutput.length, 6) } }
 			: {}),
+		...(progress.toolCount > 0 ? { toolCount: progress.toolCount } : {}),
+		...(progress.contextTokens !== undefined && progress.contextTokens > 0
+			? { contextTokens: progress.contextTokens }
+			: {}),
+		...(progress.contextWindow !== undefined && progress.contextWindow > 0
+			? { contextWindow: progress.contextWindow }
+			: {}),
+		...(progress.lastActivityMs !== undefined ? { lastActivityMs: progress.lastActivityMs } : {}),
 		...(progress.fastMode ? { fastMode: true } : {}),
 		...(progress.retryState
 			? {
@@ -1104,11 +1116,15 @@ function previewJobOutput(
  * unsafe.
  *
  * Time-derived fields are intentionally excluded so the panel does not churn while
- * idle: raw durations (`durationMs`), current-tool elapsed (`currentToolStartMs`),
+ * idle (the child's last-event timestamp is included; it moves only on real
+ * activity): raw durations (`durationMs`), current-tool elapsed (`currentToolStartMs`),
  * and retry countdowns (`retryState.startedAtMs`) are omitted. Idle duration and
  * countdown ticking is sacrificed by design; every real transition still changes
  * the signature.
  */
+/** Shared cadence for await progress refreshes and rendered last-activity age. */
+export const SUBAGENT_ACTIVITY_BUCKET_MS = 5_000;
+
 export function subagentAwaitRenderedStateSignature(
 	subagents: readonly SubagentSnapshot[],
 	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
@@ -1156,6 +1172,16 @@ function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unkno
 		currentTool: progress.currentTool ?? null,
 		recentTool: progress.recentTool ?? null,
 		recentOutputSummary: progress.recentOutputSummary ?? null,
+		toolCount: progress.toolCount ?? 0,
+		contextTokens: progress.contextTokens ?? null,
+		contextWindow: progress.contextWindow ?? null,
+		// Event timestamp, bucketed: it only moves when the child actually does
+		// something (idle gating holds), and the bucket keeps a streaming child from
+		// re-emitting on every delta. The status-line age is quantized to this cadence.
+		lastActivityBucket:
+			progress.lastActivityMs === undefined
+				? null
+				: Math.floor(progress.lastActivityMs / SUBAGENT_ACTIVITY_BUCKET_MS),
 		fastMode: progress.fastMode ?? false,
 		retryFailure: progress.retryFailure ?? null,
 		retryState: progress.retryState

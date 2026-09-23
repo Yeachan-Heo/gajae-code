@@ -12,6 +12,7 @@ import {
 	deleteManagedSessionCandidate,
 	listManagedCandidates,
 	MANAGED_SESSION_BINDING_FILE,
+	type ManagedScopeResolution,
 	ManagedSessionScopeTestHooks,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
@@ -474,6 +475,109 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 });
 
 describe("managed session write protocol", () => {
+	it("reports the identity failure that stopped a managed startup instead of a blanket binding_invalid", async () => {
+		const { scope } = await fixture();
+		expect(prepareManagedSessionScopeForWriteSync(scope).kind).toBe("resolved");
+
+		// The managed storage identity guards only run under the Windows
+		// verify-first policy, so a Windows identity failure is invisible to every
+		// other platform's CI. Reproduce that failure and assert the operator is
+		// told which invariant broke instead of a blanket `binding_invalid`.
+		const real = syncFs.lstatSync;
+		const lstat = vi.spyOn(syncFs, "lstatSync");
+		lstat.mockImplementation(((target: string, options?: { bigint?: boolean }) => {
+			if (target === scope.directoryPath) throw new Error("identity_mismatch");
+			return (real as (...args: unknown[]) => unknown)(target, options);
+		}) as typeof syncFs.lstatSync);
+
+		let prepared: ManagedScopeResolution;
+		try {
+			prepared = prepareManagedSessionScopeForWriteSync(scope, "windows-existing-verify-first");
+		} finally {
+			lstat.mockRestore();
+		}
+
+		expect(prepared.kind).toBe("error");
+		if (prepared.kind !== "error") throw new Error("Expected a prepare failure");
+		expect(prepared.cause?.classification).toBe("identity_mismatch");
+		expect(prepared.cause?.diagnostic).toMatch(/^prepare:/);
+		expect(JSON.stringify(prepared.cause)).not.toContain(scope.directoryPath);
+		expect(prepared.message).not.toContain(scope.directoryPath);
+	});
+
+	it("separates an external holder's errno from a corrupted binding without leaking the path", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+
+		// An external holder (AV scanner, indexer, cloud-sync agent) denying the
+		// managed scope is operationally distinct from a corrupted binding, and
+		// only the errno separates them.
+		const denied = Object.assign(new Error(`EPERM: operation not permitted, open '${scope.directoryPath}'`), {
+			code: "EPERM",
+			path: scope.directoryPath,
+		});
+		// Both retained-native and pathname-backed stores enter this publication
+		// boundary. A staging-file open is not part of every platform's path.
+		const prototype = managedSessionStorage.ManagedSessionDescendantStore.prototype;
+		const realPublish = prototype.publishNoReplaceSync;
+		let injected = 0;
+		const publish = vi.spyOn(prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: managedSessionStorage.ManagedSessionDescendantStore,
+			relativePath: string,
+			bytes: Uint8Array,
+		): void {
+			if (relativePath === MANAGED_SESSION_BINDING_FILE) {
+				injected += 1;
+				throw denied;
+			}
+			return realPublish.call(this, relativePath, bytes);
+		});
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		} finally {
+			publish.mockRestore();
+		}
+
+		expect(injected).toBe(1);
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({ classification: "EPERM", diagnostic: "prepare:binding_publish" });
+		expect(startupError.message).toBe("Could not prepare managed session scope (EPERM: prepare:binding_publish).");
+		expect(startupError.message).not.toContain(scope.directoryPath);
+		expect(JSON.stringify(startupError.cause)).not.toContain(scope.directoryPath);
+		// The injected failure must not damage the existing binding or leak the spy.
+		expect(SessionManager.managedDestination(cwd, agentDir).directory).toBe(scope.directoryPath);
+	});
+
+	it("still redacts an unclassified startup failure that embeds its pathname", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const agentDir = path.dirname(sessionsRoot);
+		SessionManager.managedDestination(cwd, agentDir);
+		const locks = path.join(scope.directoryPath, ".gjc-managed-session-internal", "locks");
+		await fs.rm(locks, { recursive: true, force: true });
+		await fs.writeFile(locks, "not-a-directory\n", { mode: 0o600 });
+
+		let failure: unknown;
+		try {
+			SessionManager.managedDestination(cwd, agentDir);
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBeInstanceOf(Error);
+		const startupError = failure as Error;
+		expect(startupError.cause).toEqual({
+			classification: "binding_invalid",
+			diagnostic: "prepare:locks_directory",
+		});
+		expect(startupError.message).not.toContain(locks);
+	});
+
 	it("accepts partial scrubbed replay trees but rejects moved or rootless entries", () => {
 		const expected = {
 			rootDev: "1",
@@ -631,6 +735,42 @@ describe("managed session write protocol", () => {
 		const interruptedReplay = await openManagedCandidateForWrite(scope, legacyCandidate);
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
 		expect(await committedReceiptNames(receipts)).toHaveLength(1);
+	});
+	it("coalesces a migrated legacy transcript without full-reading unrelated v2 transcripts", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const source = path.join(legacy, "2026-01-01_session-a.jsonl");
+		await fs.writeFile(source, transcript("session-a", cwd));
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const unrelated = ["session-b", "session-c", "session-d"].map(id =>
+			path.join(scope.directoryPath, `2026-01-02_${id}.jsonl`),
+		);
+		for (const [index, file] of unrelated.entries())
+			await fs.writeFile(file, transcript(["session-b", "session-c", "session-d"][index]!, cwd), { mode: 0o600 });
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("listing incomplete");
+		const legacyCandidate = listed.owned.find(candidate => candidate.provenance === "legacy");
+		if (!legacyCandidate) throw new Error("legacy candidate missing");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error("migration failed");
+
+		const capture = vi.spyOn(managedSessionStorage, "captureManagedFileNoFollow");
+		const coalesced = listManagedCandidates(scope);
+		const fullyRead = capture.mock.calls.map(([pathname]) => pathname);
+		capture.mockRestore();
+
+		if (coalesced.kind !== "complete") throw new Error("listing incomplete");
+		expect(coalesced.owned.map(candidate => [candidate.sessionId, candidate.migrationState]).sort()).toEqual([
+			["session-a", "migrated_v2"],
+			["session-b", "native_v2"],
+			["session-c", "native_v2"],
+			["session-d", "native_v2"],
+		]);
+		// Only the matching (source, destination) pair is verified byte-for-byte.
+		for (const file of unrelated) expect(fullyRead).not.toContain(file);
+		expect(fullyRead).toContain(opened.path);
+		expect(fullyRead).toContain(source);
 	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
@@ -3130,11 +3270,11 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
 		await fs.writeFile(pathname, "", { mode: 0o600 });
 		await fs.utimes(pathname, aged, aged);
-		const unlinkSync = syncFs.unlinkSync;
-		const unlink = vi.spyOn(syncFs, "unlinkSync").mockImplementation(((file: syncFs.PathLike) => {
+		const exactUnlinkDirect = native.exactUnlinkDirect;
+		const unlink = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((file, identity) => {
 			if (file === pathname) throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
-			return unlinkSync(file);
-		}) as typeof syncFs.unlinkSync);
+			return exactUnlinkDirect(file, identity);
+		});
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({

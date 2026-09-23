@@ -19,6 +19,13 @@ const agents = [
 	},
 ];
 
+const profileRoleAgents = ["architect", "executor", "planner", "critic"].map(name => ({
+	name,
+	description: `${name} agent`,
+	systemPrompt: name,
+	source: "bundled" as const,
+}));
+
 function session(settingsOverrides: Record<string, unknown> = {}, overrides: Partial<ToolSession> = {}): ToolSession {
 	return {
 		cwd: process.cwd(),
@@ -55,6 +62,71 @@ describe("TaskTool autorouting integration surfaces", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		AsyncJobManager.setInstance(new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: async () => {} }));
+	});
+
+	it("passes active profile role bindings to detached role tasks", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: profileRoleAgents,
+			projectAgentsDir: null,
+		});
+		AsyncJobManager.setInstance(new AsyncJobManager({ maxRunningJobs: 4, onJobComplete: async () => {} }));
+		const captured: Array<{ agent: string; modelOverride?: string | string[] }> = [];
+		const stub = async (options: Parameters<typeof runSubprocess>[0]) => {
+			captured.push({ agent: options.agent.name, modelOverride: options.modelOverride });
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				assignment: options.assignment,
+				exitCode: 0,
+				output: "ok",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 1,
+				modelOverride: options.modelOverride,
+			} as SingleResult;
+		};
+		const settings = Settings.isolated({ "task.agentModelOverrides": {} });
+		const profile = {
+			name: "open-weights-kimi",
+			requiredProviders: [],
+			modelMapping: {
+				default: "kimi-k3:high",
+				executor: "deepseek-v4-flash:high",
+				architect: "kimi-k3:xhigh",
+				planner: "kimi-k3:xhigh",
+				critic: "deepseek-v4-flash:xhigh",
+			},
+			source: "builtin" as const,
+		};
+		const tool = await TaskTool.create(
+			session({}, {
+				settings,
+				modelRegistry: { getAvailable: () => [], getModelProfile: () => profile } as never,
+				getActiveModelProfile: () => profile.name,
+				getActiveModelString: () => "kimi-k3:high",
+			} as never),
+			{ runSubprocess: stub },
+		);
+
+		for (const agent of profileRoleAgents) {
+			await tool.execute(`profile-${agent.name}`, {
+				agent: agent.name,
+				tasks: [{ id: agent.name, description: agent.name, assignment: "test" }],
+			} as never);
+		}
+		await AsyncJobManager.instance()!.waitForAll();
+
+		expect(captured).toEqual([
+			{ agent: "architect", modelOverride: ["kimi-k3:xhigh"] },
+			{ agent: "executor", modelOverride: ["deepseek-v4-flash:high"] },
+			{ agent: "planner", modelOverride: ["kimi-k3:xhigh"] },
+			{ agent: "critic", modelOverride: ["deepseek-v4-flash:xhigh"] },
+		]);
+		expect(settings.get("task.agentModelOverrides")).toEqual({});
 	});
 
 	it("exposes an additive tier parameter while disabled and omits routing guidance", async () => {

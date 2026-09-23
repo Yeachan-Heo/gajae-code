@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-23
+
+## [0.17.3] - 2026-09-22
+
+### Added
+
+- `CommandEntry` accepts an optional `dispatch(argv, context)` hook, so a registered command family can own its own inert parsing, help, lazy loading and failure rendering before the generic help and command-load path runs. `gjc sdk` and `gjc daemon` use it to intercept their family argv and keep private worker grammar out of public discovery.
+
+### Fixed
+
+- Keep test log isolation away from inherited operator sinks, including XDG paths and symlinked descendants.
+
 ## [0.17.2] - 2026-09-18
 
 ### Fixed

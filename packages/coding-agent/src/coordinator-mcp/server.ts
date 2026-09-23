@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
-import { withFileLock } from "../config/file-lock";
+import { isFileLockAcquireTimeout, withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -27,6 +27,7 @@ import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agen
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { endpointIncarnation } from "../sdk/broker/endpoint-authority";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
+import { DEAD_HOST_HEARTBEAT_SILENCE_MS } from "../sdk/broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
@@ -39,6 +40,7 @@ import {
 	SessionActivationError,
 } from "../sdk/session-activation";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../sdk/session-list";
+import { sanitizeSdkStartupMessage } from "../sdk/startup-capability";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
@@ -144,6 +146,7 @@ import {
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
+	repairLegacyReportIds,
 	repairProjections,
 	replaceCreationRetirementIntent,
 	rotateClaimedCreationVerifier,
@@ -516,6 +519,11 @@ const OBSERVED_BROKER_FAILURE_CODES = new Set([
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
+function coordinatorKnownSecrets(): string[] {
+	return Object.entries(process.env)
+		.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
+		.map(([, value]) => value!);
+}
 /**
  * Pagination window for `readCompleteQ12Snapshot`: it stops starting pages once
  * this much time has passed and gives each page only the remainder as its reply
@@ -527,6 +535,26 @@ const Q12_SNAPSHOT_BUDGET_MS = 5_000;
 const MAX_RUNTIME_SESSIONS_PER_WATCH_PASS = 4;
 const MAX_Q12_ATTEMPTS_PER_WATCH_PASS = 2;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * A delete intent is superseded once another deletion for the same session and
+ * endpoint incarnation has completed: force eviction retires a stale endpoint under
+ * its own record and leaves behind the intent an earlier idle reap admitted.
+ */
+function isSupersededDeletionIntent(
+	entry: NamespaceDeletionEntryV1,
+	deletions: readonly NamespaceDeletionEntryV1[],
+): boolean {
+	return (
+		entry.phase === "intent" &&
+		deletions.some(
+			other =>
+				other !== entry &&
+				other.session_id === entry.session_id &&
+				other.endpoint_incarnation === entry.endpoint_incarnation &&
+				other.phase === "completed",
+		)
+	);
+}
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1315,6 +1343,11 @@ interface CoordinatorToolIdempotencyRecord {
 	request_digest: string;
 	state: "in_progress" | "completed";
 	response?: Record<string, unknown>;
+	/** Reused-session delegate prompt-claim provenance, written under the key lock:
+	 * `false` when the attempt starts, `true` immediately before the canonical prompt
+	 * claim. A same-key retry may claim afresh only on an explicit `false`; `true` or
+	 * an absent marker (unknown provenance) keeps missing live state fail-closed. */
+	delegate_prompt_claim_started?: boolean;
 	admission?: DelegateAdmissionCheckpoint;
 	delegate_response_pin?: DelegateResponsePinV1;
 	created_at: string;
@@ -1394,7 +1427,24 @@ function boundedPublicValue(value: unknown, budget: { remaining: number }, depth
 					: undefined;
 			const code =
 				typeof rawCode === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, rawCode) ? rawCode : "unavailable";
-			output[key] = { code, message: PUBLIC_ERROR_MESSAGES[code] };
+			const rawDiagnostic =
+				field && typeof field === "object" && !Array.isArray(field)
+					? (field as Record<string, unknown>).diagnostic
+					: undefined;
+			const boundedDiagnostic =
+				typeof rawDiagnostic === "string" ? boundedPublicValue(rawDiagnostic, budget, depth + 1) : undefined;
+			const rawMessage =
+				field && typeof field === "object" && !Array.isArray(field)
+					? (field as Record<string, unknown>).message
+					: undefined;
+			output[key] = {
+				code,
+				message:
+					code === "spawn_failed" && typeof rawMessage === "string" && boundedDiagnostic !== undefined
+						? boundedPublicValue(rawMessage, budget, depth + 1)
+						: PUBLIC_ERROR_MESSAGES[code],
+				...(boundedDiagnostic === undefined ? {} : { diagnostic: boundedDiagnostic }),
+			};
 		} else {
 			output[key] = sensitivePublicField(key) ? "[redacted]" : boundedPublicValue(field, budget, depth + 1);
 		}
@@ -3856,7 +3906,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	): Promise<Map<string, string>> {
 		const authorized = new Map<string, string>();
 		for (const sessionId of new Set(sessionIds)) {
-			const transaction = await readSessionTransaction(questionPaths, sessionId);
+			// A corrupt or unreadable peer session must never abort authorization for
+			// every other session. Only the explicitly scoped session may propagate,
+			// otherwise one bad WAL record makes namespace-wide reads permanently
+			// unavailable instead of degrading to the sessions that are still sound.
+			let transaction: CoordinatorSessionTransactionV1 | null;
+			try {
+				transaction = await readSessionTransaction(questionPaths, sessionId);
+			} catch (error) {
+				logger.warn("Coordinator authorization skipped unreadable session", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				// Only a structurally corrupt WAL is degradable for an unscoped
+				// namespace sweep. Cancellation, I/O, and unexpected invariant errors
+				// must remain visible instead of silently shrinking authorization.
+				if (scopedSessionId === sessionId || !(error instanceof Error && error.message === "state_corrupt"))
+					throw error;
+				continue;
+			}
 			if (!transaction) {
 				if (scopedSessionId === sessionId && !allowMissingSessionIds.has(sessionId))
 					throw new Error("resource_gone");
@@ -4455,6 +4523,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				questionId: string;
 				eventId: string;
 			}> = [];
+			let pendingGateCount = 0;
 			let q12Admitted = true;
 			let liveInFlightAskAdmitted = false;
 			let liveInFlightCandidate = false;
@@ -4544,10 +4613,19 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						byRuntimeTurn.set(runtimeTurnId, owners);
 					}
 					for (const row of items as WorkflowGateQueryRecord[]) {
-						if (!row || typeof row !== "object" || row.tag !== "pending" || typeof row.gate_id !== "string") {
+						if (!row || typeof row !== "object" || typeof row.gate_id !== "string") {
 							diagnostic("invalid_gate_row");
 							continue;
 						}
+						// Accepted and quarantined rows are durable diagnostics, not actionable
+						// questions. They remain in Q12 so SDK clients can explain a completed or
+						// lost gate, but reconciliation must not classify them as malformed.
+						if (row.tag === "accepted" || row.tag === "quarantined") continue;
+						if (row.tag !== "pending") {
+							diagnostic("invalid_gate_row");
+							continue;
+						}
+						pendingGateCount++;
 						const gate = row as WorkflowGateQueryRecord & WorkflowGate;
 						const authorityId = createHash("sha256")
 							.update(
@@ -4793,7 +4871,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// even while an authenticated, acknowledged turn is still running.
 			// Nonempty snapshots still require an admitted ask; all writer, waiting
 			// token and terminal fences above remain authoritative.
-			if (!q12Admitted || (liveInFlightCandidate && items.length > 0 && !liveInFlightAskAdmitted))
+			if (!q12Admitted || (liveInFlightCandidate && pendingGateCount > 0 && !liveInFlightAskAdmitted))
 				return {
 					ok: true,
 					schema_version: 1,
@@ -5138,6 +5216,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return asRecord(response.error)?.code === "ambiguous";
 	}
 
+	function isTransientDelegateAuthorityFailure(response: Record<string, unknown>): boolean {
+		if (response.ok !== false) return false;
+		return asRecord(response.error)?.code === "unavailable";
+	}
+
 	function publicErrorCode(code: unknown): string {
 		return typeof code === "string" && Object.hasOwn(PUBLIC_ERROR_MESSAGES, code) ? code : "unavailable";
 	}
@@ -5148,7 +5231,22 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const messageCode =
 			error instanceof Error && Object.hasOwn(PUBLIC_ERROR_MESSAGES, error.message) ? error.message : undefined;
 		const code = publicErrorCode(directCode ?? messageCode);
-		return { ok: false, error: { code, message: PUBLIC_ERROR_MESSAGES[code] } };
+		const diagnostic =
+			error instanceof SdkClientError && code === "spawn_failed"
+				? sanitizeSdkStartupMessage(error.message, coordinatorKnownSecrets())
+				: undefined;
+		const message =
+			diagnostic && diagnostic !== PUBLIC_ERROR_MESSAGES[code]
+				? `${PUBLIC_ERROR_MESSAGES[code]} Cause: ${diagnostic}`
+				: PUBLIC_ERROR_MESSAGES[code];
+		return {
+			ok: false,
+			error: {
+				code,
+				message,
+				...(diagnostic && diagnostic !== PUBLIC_ERROR_MESSAGES[code] ? { diagnostic } : {}),
+			},
+		};
 	}
 	function sdkError(error: unknown): Record<string, unknown> {
 		return publicError(error);
@@ -5768,6 +5866,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		workspace: string;
 		endpointGeneration: number;
 		endpointIncarnation: string;
+		/** Host liveness the broker reports for the indexed row; absent when unreported. */
+		live?: boolean;
+		/** Last host heartbeat the broker recorded for the row (epoch ms); absent when unreported. */
+		lastHeartbeatAt?: number;
+		/** True when more than one unresolved state-root authority claims this session. */
+		ambiguous?: boolean;
+		/** True when teardown ownership is unresolved and must not be force-retired. */
+		terminalUncertain?: boolean;
+		/** True when the exact broker row is already terminal. */
+		terminal?: boolean;
 	};
 
 	async function exactBrokerSessionAuthority(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5787,17 +5895,35 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			if (sameCanonicalPath(canonicalWorkspace, workspace, platform))
 				matches.push({ session, workspace: canonicalWorkspace });
 		}
-		if (matches.length !== 1)
+		if (matches.length === 0)
 			throw new SdkClientError(
 				"not_found",
 				"Session is not uniquely indexed in the requested coordinator workspace.",
+			);
+		if (matches.length !== 1)
+			throw new SdkClientError(
+				"ambiguous",
+				"Session has multiple broker authority rows in the requested coordinator workspace.",
 			);
 		const match = matches[0]!;
 		const endpointGeneration = brokerEndpointGeneration(match.session);
 		const endpointIncarnation = brokerEndpointIncarnation(match.session, sessionId);
 		if (endpointGeneration === null || endpointIncarnation === null)
 			throw new SdkClientError("endpoint_stale", "Broker session has no usable endpoint incarnation.");
-		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
+		return {
+			workspace: match.workspace,
+			endpointGeneration,
+			endpointIncarnation,
+			...(typeof match.session.live === "boolean" ? { live: match.session.live } : {}),
+			...(typeof match.session.lastHeartbeatAt === "number"
+				? { lastHeartbeatAt: match.session.lastHeartbeatAt }
+				: {}),
+			...(typeof match.session.ambiguous === "boolean" ? { ambiguous: match.session.ambiguous } : {}),
+			...(typeof match.session.terminalUncertain === "boolean"
+				? { terminalUncertain: match.session.terminalUncertain }
+				: {}),
+			...(typeof match.session.terminal === "boolean" ? { terminal: match.session.terminal } : {}),
+		};
 	}
 
 	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
@@ -5886,13 +6012,49 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const sessionId = brokerSessionId(session);
 		return sessionId !== null && registered.has(sessionId);
 	}
+	async function reportProjectionFilesForSession(sessionId: string): Promise<string[]> {
+		const reportsDirectory = path.join(namespaceDir, "reports");
+		const entries = await fs.readdir(reportsDirectory, { withFileTypes: true }).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			throw error;
+		});
+		const files: string[] = [];
+		for (const entry of entries) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			const file = path.join(reportsDirectory, entry.name);
+			try {
+				const report = asRecord(await readJsonFile(file));
+				if (report?.session_id === sessionId) files.push(file);
+			} catch (error) {
+				logger.warn("Coordinator report projection scan skipped unreadable file", {
+					file,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return files;
+	}
+	async function removeStaleReportProjections(
+		sessionId: string,
+		retainedReportIds: ReadonlySet<string>,
+	): Promise<void> {
+		for (const file of await reportProjectionFilesForSession(sessionId)) {
+			const reportId = path.basename(file, ".json");
+			if (retainedReportIds.has(reportId)) continue;
+			await fs.rm(file, { force: true });
+		}
+	}
 	async function removeReapedProjection(
 		sessionId: string,
 		turnIds: readonly string[],
 		reportIds: readonly string[],
 	): Promise<void> {
 		for (const turnId of turnIds) await fs.rm(turnFile(namespaceDir, turnId), { force: true });
-		for (const reportId of reportIds) await fs.rm(reportProjectionFile(namespaceDir, reportId), { force: true });
+		for (const reportId of reportIds) {
+			if (COORDINATOR_REPORT_ID_PATTERN.test(reportId))
+				await fs.rm(reportProjectionFile(namespaceDir, reportId), { force: true });
+		}
+		for (const file of await reportProjectionFilesForSession(sessionId)) await fs.rm(file, { force: true });
 		await fs.rm(sessionFile(sessionId), { force: true });
 		await fs.rm(sessionStateFile(namespaceDir, sessionId), { force: true });
 		await fs.rm(activeTurnFile(namespaceDir, sessionId), { force: true });
@@ -6082,19 +6244,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// manifest first, even while the session projection remains readable, so a
 			// verification-uncertain retry never reaches broker close again.
 			await ensureQuestionStateReady();
-			let pendingDeletion = await withNamespaceRegistry(
-				questionPaths,
-				async registry =>
-					Object.values(registry.deletions)
+			let pendingDeletion = await withNamespaceRegistry(questionPaths, async registry => {
+				const deletions = Object.values(registry.deletions);
+				return (
+					deletions
 						.filter(
 							entry =>
 								entry.session_id === id &&
 								(entry.phase === "intent" ||
 									entry.phase === "broker_closed" ||
-									entry.phase === "cleanup_pending"),
+									entry.phase === "cleanup_pending") &&
+								!isSupersededDeletionIntent(entry, deletions),
 						)
-						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null,
-			);
+						.sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0] ?? null
+				);
+			});
 			if (pendingDeletion?.phase === "intent") {
 				try {
 					await recoverIntentDeletion(pendingDeletion);
@@ -6122,7 +6286,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const deletion = await withNamespaceRegistry(questionPaths, async registry => {
 					const matching = Object.values(registry.deletions).filter(entry => entry.session_id === id);
 					return (
-						matching.find(entry => entry.phase !== "completed") ??
+						matching.find(entry => entry.phase !== "completed" && !isSupersededDeletionIntent(entry, matching)) ??
 						matching.find(entry => entry.safe_response !== undefined) ??
 						null
 					);
@@ -6251,6 +6415,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+			const projectedReportIds = (await reportProjectionFilesForSession(id)).map(file =>
+				path.basename(file, ".json"),
+			);
 			const deletionEntry = {
 				deletion_id: deletionId,
 				session_id: id,
@@ -6267,7 +6434,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					session: false,
 					events: false,
 					turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
-					report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+					report_ids: [
+						...new Set([
+							...(canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : []),
+							...projectedReportIds,
+						]),
+					],
 				},
 				authority_digest: deletionKey,
 				created_at: new Date().toISOString(),
@@ -6288,7 +6460,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			const projectionIds = {
 				turnIds: Object.keys(admitted.canonical.turns),
-				reportIds: Object.keys(admitted.canonical.reports),
+				reportIds: [
+					...new Set([
+						...Object.keys(admitted.canonical.reports),
+						...(await reportProjectionFilesForSession(id)).map(file => path.basename(file, ".json")),
+					]),
+				],
 			};
 			await ensureQuestionStateReady();
 			const deletionPhase = await withNamespaceRegistry(
@@ -6445,8 +6622,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	/**
 	 * Prove a stored endpoint identity (workspace + generation + incarnation) is no
 	 * longer current against the live broker index. Returns true only when the
-	 * broker row is absent (not_found) or its generation/incarnation/workspace has
-	 * rotated away from the stored triple. A transient authority-read failure
+	 * broker row is absent (not_found), its generation/incarnation/workspace has
+	 * rotated away from the stored triple, or the broker reports the row not live
+	 * and its host has been silent for DEAD_HOST_HEARTBEAT_SILENCE_MS. A transient
+	 * authority-read failure
 	 * returns false: we cannot prove the endpoint recovered, but we also must not
 	 * force-evict on a flake — the normal reap path will retry.
 	 */
@@ -6460,6 +6639,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const workspace = await canonicalBrokerWorkspace(persistedWorkspace);
 			const authority = await exactBrokerSessionAuthority(id, workspace);
 			return (
+				// The broker can keep indexing a session's exact identity after its host is
+				// gone; it then reports the row as not live and answers close with
+				// endpoint_stale, so an identity match alone does not prove a live endpoint.
+				// `live` alone is heartbeat-derived and flips after a short gap, so also
+				// require the host to have been silent far beyond the broker's freshness
+				// window before treating the row as dead.
+				(authority.ambiguous !== true &&
+					authority.terminalUncertain !== true &&
+					authority.live === false &&
+					authority.lastHeartbeatAt !== undefined &&
+					Date.now() - authority.lastHeartbeatAt >= DEAD_HOST_HEARTBEAT_SILENCE_MS) ||
 				!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
 				authority.endpointGeneration !== persistedGeneration ||
 				authority.endpointIncarnation !== persistedIncarnation
@@ -6571,8 +6761,50 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			// projection-only delete.
 			return;
 		}
+		const brokerSessionSnapshot = canonicalTransaction.canonical.session.broker;
+		const brokerWorkspace = optionalString(brokerSessionSnapshot.workspace);
+		const brokerGeneration =
+			typeof brokerSessionSnapshot.endpoint_generation === "number" &&
+			Number.isSafeInteger(brokerSessionSnapshot.endpoint_generation) &&
+			brokerSessionSnapshot.endpoint_generation > 0
+				? brokerSessionSnapshot.endpoint_generation
+				: null;
+		if (
+			!brokerWorkspace ||
+			brokerGeneration === null ||
+			brokerSessionSnapshot.endpoint_incarnation !== persistedIncarnation
+		)
+			return;
+		// The stale proof above is a read. Before deleting coordinator state, ask the
+		// broker to atomically fence the exact generation/incarnation under its index
+		// lock. A successor, fresh heartbeat, ambiguous row, or terminal-uncertain
+		// authority refuses this request. A missing row is already fenced and is safe
+		// to treat as retired: the preceding reap close observed the same endpoint.
+		try {
+			const fence = strictBrokerSessionClose(
+				await brokerSession(
+					brokerWorkspace,
+					"session.close",
+					{
+						cwd: brokerWorkspace,
+						sessionId,
+						endpointGeneration: brokerGeneration,
+						endpointIncarnation: persistedIncarnation,
+						forceRetireStale: true,
+					},
+					`coordinator-reaper-fence:${sessionId}:${persistedIncarnation}`,
+				),
+				sessionId,
+			);
+			if (fence.retired !== true) return;
+		} catch (error) {
+			if (!(error instanceof SdkClientError) || error.code !== "not_found") return;
+		}
 		const deletionId = `force-evict:${sessionId}:${persistedIncarnation}`;
 		const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+		const projectedReportIds = (await reportProjectionFilesForSession(sessionId)).map(file =>
+			path.basename(file, ".json"),
+		);
 		const now = new Date().toISOString();
 		const entry: NamespaceDeletionEntryV1 = {
 			deletion_id: deletionId,
@@ -6590,7 +6822,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				session: false,
 				events: false,
 				turn_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.turns) : [],
-				report_ids: canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : [],
+				report_ids: [
+					...new Set([
+						...(canonicalTransaction ? Object.keys(canonicalTransaction.canonical.reports) : []),
+						...projectedReportIds,
+					]),
+				],
 			},
 			authority_digest: deletionKey,
 			created_at: now,
@@ -6666,7 +6903,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			},
 			reapSession: async (sessionId: string): Promise<void> => {
 				const result = await reapSession(sessionId, { reason: "idle_reaper" });
-				if (!result.ok) throw new Error(result.reason ?? "session_reap_failed");
+				if (result.ok) return;
+				// reapSession reports a broker close the endpoint could not serve as
+				// close_failed with the broker code in `detail`. The reaper only counts
+				// endpoint_stale toward force eviction, so pass that code through;
+				// markSessionDead still re-proves staleness under the session lock.
+				const staleClose =
+					result.reason === "close_failed" &&
+					(result.detail === "endpoint_stale" || result.detail === "not_found");
+				throw new Error(staleClose ? "endpoint_stale" : (result.reason ?? "session_reap_failed"));
 			},
 			markSessionDead: async (sessionId: string): Promise<void> => {
 				// Force-evict a session that cannot be reaped normally (endpoint_stale
@@ -7466,6 +7711,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					await writeTurnRecord(namespaceDir, turnFromCanonical(turn));
 				for (const report of Object.values(canonical.reports))
 					await writeJsonFile(reportProjectionFile(namespaceDir, report.report_id), report);
+				await removeStaleReportProjections(sessionId, new Set(Object.keys(canonical.reports)));
 				const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
 				const active = activeId ? canonical.turns[activeId] : null;
 				if (active) await writeActiveTurn(namespaceDir, turnFromCanonical(active));
@@ -7544,8 +7790,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		await exportRetainedDeliveries(32, options.signal);
 	}
 
-	async function recoverCanonicalSessionProjection(sessionId: string): Promise<void> {
-		const transaction = await readSessionTransaction(questionPaths, sessionId);
+	async function recoverCanonicalSessionProjection(
+		sessionId: string,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
+		const transaction = await repairLegacyReportIds(questionPaths, sessionId, options);
 		if (!transaction) return;
 		const applied = Math.min(
 			transaction.projection.applied_turns_revision,
@@ -7554,10 +7803,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			transaction.projection.applied_active_revision,
 			transaction.projection.applied_events_revision,
 		);
-		if (applied < transaction.revision) await repairCanonicalProjections(sessionId);
+		if (applied < transaction.revision) await repairCanonicalProjections(sessionId, options);
 	}
 
-	async function recoverCanonicalNamespaceProjections(scopedSessionId: string | null = null): Promise<void> {
+	async function recoverCanonicalNamespaceProjections(
+		scopedSessionId: string | null = null,
+		options: { signal?: AbortSignal } = {},
+	): Promise<void> {
 		await ensureQuestionStateReady();
 		const roster = await readSchedulerRoster(questionPaths);
 		const persisted = await fs.readdir(questionPaths.sessions).catch(() => []);
@@ -7572,13 +7824,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const transaction = await readSessionTransaction(questionPaths, sessionId);
 				if (!transaction) continue;
 				await assertPersistedSessionAuthority(transaction.canonical.session);
-				await recoverCanonicalSessionProjection(sessionId);
+				await recoverCanonicalSessionProjection(sessionId, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "state_corrupt" && (scopedSessionId !== null || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				// Degrade per session instead of aborting the namespace sweep: one
+				// unreadable record must not make every coordination read fail.
+				// Log before classifying so the skipped session is always nameable
+				// from the outside — state_corrupt is precisely the shape the two
+				// WAL defects surface as, and silencing it hides the cause.
+				logger.warn("Coordinator projection recovery skipped session", {
+					sessionId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				const isCorruptWal = error instanceof Error && error.message === "state_corrupt";
+				const isAuthorityFailure = isSessionAuthorityError(error);
+				if (!isCorruptWal && !isAuthorityFailure && !isFileLockAcquireTimeout(error)) throw error;
+				if (scopedSessionId === sessionId && !isCorruptWal) throw error;
 			}
 		}
 	}
@@ -7900,12 +8160,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			try {
 				await reconcileSessionRuntime(entry.session_id, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 		}
 		if (processedCursor && !options.signal?.aborted)
@@ -7934,7 +8194,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await reconcileSessionRuntime(sessionId, options);
 				await reconcileQuestions(sessionId, options);
 			} catch (error) {
-				if (!(error instanceof Error) || (error.message !== "resource_gone" && !isSessionAuthorityError(error)))
+				if (
+					!(error instanceof Error) ||
+					(error.message !== "resource_gone" &&
+						error.message !== "state_corrupt" &&
+						!isSessionAuthorityError(error))
+				)
 					throw error;
 			}
 		}
@@ -7968,12 +8233,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			try {
 				await reconcileQuestions(entry.session_id, options);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						(prioritySessionId !== undefined || !isSessionAuthorityError(error)))
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 		}
 		if (processedCursor && !options.signal?.aborted)
@@ -8013,14 +8278,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				await assertPersistedSessionAuthority(transaction.canonical.session);
 				turn = await readActiveTurn(namespaceDir, entry.session_id);
 			} catch (error) {
-				if (
-					!(error instanceof Error) ||
-					(error.message !== "resource_gone" &&
-						error.message !== "coordinator_workdir_outside_allowed_roots" &&
-						error.message !== "coordinator_workdir_roots_required" &&
-						error.message !== "coordinator_workspace_required")
-				)
-					throw error;
+				const degradable =
+					error instanceof Error &&
+					(error.message === "resource_gone" ||
+						isSessionAuthorityError(error) ||
+						(error.message === "state_corrupt" && prioritySessionId === undefined));
+				if (!degradable) throw error;
 			}
 			processedCursor = entry.session_id;
 			if (!turn) continue;
@@ -8109,9 +8372,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				};
 				const binding = await exactBrokerSessionBinding(sessionId, cwd);
 				const priorSession = asRecord(await readJsonFile(sessionFile(sessionId)));
+				const priorWorkspace = optionalString(priorSession?.broker_workspace);
 				const priorAuthority =
 					priorSession &&
-					priorSession.broker_workspace === binding.workspace &&
+					priorWorkspace !== null &&
+					sameCanonicalPath(priorWorkspace, binding.workspace, platform) &&
 					priorSession.endpoint_generation === binding.endpointGeneration &&
 					optionalString(priorSession.endpoint_incarnation) === binding.endpointIncarnation
 						? (priorSession.sidecar_verifier as { key_id: string; public_key: string } | undefined)
@@ -8636,14 +8901,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						// repair. The fresh journal snapshot below is the first public read after
 						// that repair/export sequence, so events are visible after the caller's
 						// cursor without allowing recovery to erase a terminal observation.
-						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32);
 					} catch (error) {
 						if (!(error instanceof Error && error.message === "resource_gone")) throw error;
 					}
 				} else if (!watchController.signal.aborted && Date.now() < absoluteDeadline) {
-					await recoverCanonicalNamespaceProjections(prioritySessionId ?? null);
 					try {
+						await recoverCanonicalNamespaceProjections(prioritySessionId ?? null, reconcileOptions);
 						await exportRetainedDeliveries(32, watchController.signal);
 						await reconcileWatchAdmissions(prioritySessionId, reconcileOptions);
 						await reconcileActiveTurnAcknowledgements(
@@ -8962,6 +9227,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							let initialDelegateRequest: CoordinatorSessionTransactionV1["recovery"]["initial_delegate_request"];
 							if (reusedSessionId) {
 								sessionId = reusedSessionId;
+								// Record that this attempt has not claimed a prompt before any step
+								// that can fail transiently. Only this explicit marker lets a same-key
+								// retry claim afresh; a receipt without it has unknown provenance.
+								if (!recovering && outer.value.delegate_prompt_claim_started === undefined)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: false,
+									});
 								const prior = await readSessionTransaction(questionPaths, sessionId);
 								const prompt = prior?.requests.prompts[requestKey];
 								delegateEffectStarted ||= Boolean(prompt && prompt.phase !== "claimed");
@@ -8993,13 +9266,58 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Coordinator session is bound to another workspace.",
 										},
 									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
-								if (
-									!sameCanonicalPath(
-										optionalString(existing.broker_workspace) ?? "",
-										canonicalCwd,
+								// Delegate-created managed-worktree sessions retain the caller's
+								// repository cwd separately from the broker's execution worktree.
+								// Resolve endpoint authority in that persisted broker workspace;
+								// using canonicalCwd here searches the parent repository and makes
+								// every follow-up appear unindexed even while its endpoint is live.
+								const persistedBrokerWorkspace = optionalString(existing.broker_workspace);
+								if (!persistedBrokerWorkspace)
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								let bindingWorkspace: string;
+								try {
+									bindingWorkspace = await canonicalBrokerWorkspace(persistedBrokerWorkspace);
+								} catch (error) {
+									if (!(error instanceof SdkClientError) || error.code !== "not_found") throw error;
+									return {
+										ok: false,
+										error: {
+											code: "endpoint_stale",
+											message: "Coordinator session endpoint authority is stale.",
+										},
+									};
+								}
+								// The caller cwd guard only proves args.cwd is inside the current roots.
+								// The persisted pair is what the delegate actually dispatches through, so
+								// reauthorize it against the current policy before it becomes binding scope:
+								// a narrowed managed-worktree root or a redirected projection must not let
+								// a reused delegate reach a workspace the coordinator no longer owns.
+								try {
+									await assertCoordinatorSessionLocations(config, existingCwd, bindingWorkspace, {
+										canonicalizePath: services.canonicalizePath,
 										platform,
-									) ||
+									});
+								} catch (error) {
+									if (!isSessionAuthorityError(error)) throw error;
+									return {
+										ok: false,
+										error: {
+											code: "workspace_mismatch",
+											message: "Coordinator session workspace is outside the allowed roots.",
+										},
+									};
+								}
+								const binding = await exactBrokerSessionBinding(sessionId, bindingWorkspace);
+								if (
+									// The caller cwd guard above prevents cross-workspace reuse; this
+									// comparison fences the persisted endpoint identity itself.
+									!sameCanonicalPath(binding.workspace, bindingWorkspace, platform) ||
 									existing.endpoint_generation !== binding.endpointGeneration ||
 									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
 								)
@@ -9129,8 +9447,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									(await readCanonicalActiveTurn(sessionId));
 								const priorTransaction = await readSessionTransaction(questionPaths, sessionId);
 								const priorPrompt = priorTransaction?.requests.prompts[requestKey];
+								// A reused session has no creation authority to recover through, so a
+								// same-key retry after a pre-admission failure (for example a transient
+								// workspace canonicalization error) would otherwise seal as uncertain. The
+								// outer receipt records whether a prompt claim began: an explicit `false`
+								// proves none was claimed and this retry may claim afresh. `true` or an
+								// absent marker means missing live state is still not proof that nothing
+								// was dispatched.
+								const requireClaimedPrompt =
+									recovering && (!reusedSessionId || outer.value.delegate_prompt_claim_started !== false);
 								if (
-									recovering &&
+									requireClaimedPrompt &&
 									!priorPrompt &&
 									!hasInitialDelegatePromptAuthority(priorTransaction, initialDelegateRequest)
 								)
@@ -9160,13 +9487,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										turn_id: previousActiveTurn.turn_id,
 									};
 								}
+								if (outer.value.delegate_prompt_claim_started !== true)
+									await writeCoordinatorIdempotencyFile(idempotencyFile(idempotencyKey), {
+										...(outer.value as unknown as CoordinatorToolIdempotencyRecord),
+										delegate_prompt_claim_started: true,
+									});
 								const promptKey = await claimCanonicalPrompt(
 									sessionId,
 									taggedPrompt,
 									operation,
 									idempotencyKey,
 									true,
-									recovering,
+									requireClaimedPrompt,
 									initialDelegateRequest,
 								);
 								if (reserved?.terminal_fence && !(await promptReceipt(sessionId, promptKey))) {
@@ -9313,6 +9645,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					true,
 					response =>
 						(!delegateResponseComplete && (creationRemoteStarted || delegateEffectStarted)) ||
+						isTransientDelegateAuthorityFailure(response) ||
 						isRouterRequestAmbiguous(response),
 				);
 			}
@@ -10662,16 +10995,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							}
 							if (status !== "accepted")
 								throw new SdkClientError("terminal_uncertain", "Workflow gate answer was not accepted.");
-							const resolvedAt =
-								typeof resolution?.resolved_at === "string" ? resolution.resolved_at : new Date().toISOString();
+							const reportedResolvedAt =
+								typeof resolution?.resolved_at === "string" &&
+								Number.isFinite(Date.parse(resolution.resolved_at))
+									? resolution.resolved_at
+									: undefined;
+							// The gate timestamp is remote metadata; retention must age the local receipt from
+							// the coordinator's own persistence time so a skewed or replayed response cannot
+							// delete a fresh answer.
+							const persistedAt = new Date().toISOString();
+							const resolvedAt = reportedResolvedAt ?? persistedAt;
 							await withAdmittedSessionTransaction(questionPaths, sessionId, async transaction => {
 								const question = transaction.canonical.questions[questionId];
 								if (!question || question.claim_fence_epoch !== (claimed as { fence: number }).fence)
 									throw new Error("terminal_uncertain");
 								question.status = "answered";
-								question.answered_at = resolvedAt;
-								question.updated_at = resolvedAt;
-								question.history.push({ at: resolvedAt, status: "answered", reason: null });
+								question.answered_at = persistedAt;
+								question.updated_at = persistedAt;
+								question.history.push({ at: persistedAt, status: "answered", reason: null });
 								const authority = transaction.canonical.gate_authorities[question.authority_id];
 								if (authority)
 									authority.outcome = { state: "answered", turn_id: turnId, question_id: questionId };
@@ -10689,7 +11030,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									resolved_at: resolvedAt,
 								};
 								request.phase = "completed";
-								request.updated_at = resolvedAt;
+								request.updated_at = persistedAt;
 							});
 							return {
 								ok: true,

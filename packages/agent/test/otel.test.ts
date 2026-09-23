@@ -6,12 +6,16 @@
  * lifecycle hook dispatch.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentRunCoverage, AgentRunSummary } from "@gajae-code/agent-core/run-collector";
 import {
 	type AgentTelemetryConfig,
 	type ChatUsageEvent,
 	detectGatewayFromHeaders,
+	finishExecuteToolSpan,
 	GenAIAttr,
 	GenAIOperation,
 	OpenAIAttr,
@@ -27,6 +31,8 @@ import type { Message } from "@gajae-code/ai";
 import { z } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import type { EventStream } from "@gajae-code/ai/utils/event-stream";
+import { getHandledErrorLogPath, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils/dirs";
+import { resetHandledErrorDedupeForTest } from "@gajae-code/utils/postmortem";
 import { context, SpanStatusCode, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import {
@@ -35,6 +41,7 @@ import {
 	type ReadableSpan,
 	SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
+import { ToolError } from "../../coding-agent/src/tools/tool-errors";
 import { createUserMessage } from "./helpers";
 
 const MOCK_IDENT = { id: "mock-model", provider: "mock-provider" } as const;
@@ -319,6 +326,33 @@ describe("agent-loop OTEL instrumentation", () => {
 		expect(tool?.status.code).toBe(SpanStatusCode.ERROR);
 		expect(tool?.attributes[GenAIAttr.ErrorType]).toBe("Error");
 		expect(tool?.events.some(e => e.name === "exception")).toBe(true);
+	});
+
+	it("records unexpected tool errors but excludes designed tool outcomes", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telemetry-errors-"));
+		resetHandledErrorDedupeForTest();
+		setAgentDir(agentDir);
+		try {
+			finishExecuteToolSpan(undefined, undefined, {
+				isError: true,
+				status: "error",
+				errorObject: new ToolError("Tool call rejected by user (bash)"),
+				toolCallId: "designed-1",
+				toolName: "bash",
+			});
+			expect(await Bun.file(getHandledErrorLogPath()).exists()).toBe(false);
+
+			finishExecuteToolSpan(undefined, undefined, {
+				isError: true,
+				status: "error",
+				errorObject: new Error("unexpected tool failure"),
+				toolCallId: "unexpected-1",
+				toolName: "bash",
+			});
+			expect(await Bun.file(getHandledErrorLogPath()).exists()).toBe(true);
+		} finally {
+			resetAgentDirFromEnvironment();
+		}
 	});
 
 	it("emits ERROR status on chat spans when stopReason is error", async () => {

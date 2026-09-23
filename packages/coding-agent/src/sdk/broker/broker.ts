@@ -37,7 +37,12 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
-import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	getBrokerIdentityKey,
+} from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
@@ -960,13 +965,29 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
 		case "session.resume":
-		case "session.close":
 		case "session.delete":
 		case "session.reconcile_uncertain":
 			return { sessionId: id };
+		case "session.close":
+			return { sessionId: id, ...closeTargetAuthority(input) };
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+function closeTargetAuthority(input: Record<string, unknown>): {
+	endpointGeneration?: number;
+	endpointIncarnation?: string;
+} {
+	if (
+		typeof input.endpointGeneration !== "number" ||
+		!Number.isSafeInteger(input.endpointGeneration) ||
+		input.endpointGeneration <= 0 ||
+		typeof input.endpointIncarnation !== "string" ||
+		!/^[a-f0-9]{64}$/u.test(input.endpointIncarnation)
+	)
+		return {};
+	return { endpointGeneration: input.endpointGeneration, endpointIncarnation: input.endpointIncarnation };
 }
 
 /**
@@ -1448,11 +1469,17 @@ export class Broker {
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
 		if (isBrokerResponse(admission)) return admission;
-		const lifecycleIdentity = await deriveIdempotencyIdentity(
+		// session.spawn predates target-bound lifecycle identities and its durable
+		// authority store already binds the raw request. Keep the v3 identity for
+		// new claims, while recognizing the v4 identity written by the short-lived
+		// target-bound implementation so an upgrade cannot admit a second child.
+		const targetBoundIdentity = await deriveIdempotencyIdentity(
 			this.settings.agentDir,
 			"session.spawn",
 			idempotencyKey!,
 		);
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const lifecycleIdentity = this.#spawnAuthority?.claim(targetBoundIdentity) ? targetBoundIdentity : legacyIdentity;
 		const active = this.#spawnInFlight.get(lifecycleIdentity);
 		if (active) {
 			if (this.#spawnTasks.get(active) !== admission.task)
@@ -3622,7 +3649,9 @@ export class Broker {
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry = this.ledger.get(identity);
+		const entry =
+			this.ledger.get(identity) ??
+			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
 		if (!entry) return error("not_found", "lifecycle operation was not found");
 		if (entry.fingerprint !== requestedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");
@@ -3682,10 +3711,10 @@ export class Broker {
 				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
-		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
+		const fingerprint = lifecycleFingerprint(operation, input);
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
 			const page = await this.#sessionListPage(input, this.index.listSessions());
@@ -3755,8 +3784,64 @@ export class Broker {
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
-		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const identity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			operation === "session.create" ? undefined : target,
+		);
 		const operationKey = `${operation}\0${idempotencyKey}`;
+		const requestedRequestHash = createHash("sha256")
+			.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyIdentity(this.settings.agentDir, operation, idempotencyKey);
+		const legacyTargetIdentity = await deriveLegacyTargetIdentity(
+			this.settings.agentDir,
+			operation,
+			idempotencyKey,
+			target,
+		);
+		const metadata = {
+			operationKey,
+			fingerprint,
+			...(operation === "session.close" && typeof input.sessionId === "string"
+				? { intendedSessionId: input.sessionId }
+				: {}),
+		};
+		if (!this.ledger.get(identity)) {
+			const matchingOperation = this.ledger.findAnyByOperationKey(operationKey);
+			const sameCloseSession =
+				operation === "session.close" &&
+				(matchingOperation?.intendedSessionId === input.sessionId ||
+					matchingOperation?.resultSessionId === input.sessionId);
+			if (
+				matchingOperation &&
+				!sameCloseSession &&
+				(matchingOperation.fingerprint !== fingerprint || matchingOperation.requestHash !== requestedRequestHash)
+			)
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			const matchingLegacy = matchingOperation;
+			if (matchingLegacy) {
+				if (matchingLegacy.identity === legacyIdentity || matchingLegacy.identity === legacyTargetIdentity)
+					await this.ledger.migrateIdentity(matchingLegacy.identity, identity, metadata);
+			} else if (this.ledger.get(legacyIdentity)) {
+				return error("idempotency_conflict", "idempotency key was used with a different request");
+			} else {
+				const legacyTargetEntry = this.ledger.get(legacyTargetIdentity);
+				if (legacyTargetEntry) {
+					if (legacyTargetEntry.requestHash !== requestedRequestHash)
+						return error("idempotency_conflict", "idempotency key was used with a different request");
+					await this.ledger.migrateIdentity(legacyTargetIdentity, identity, metadata);
+					// Exact target-derived legacy identity migrated without granting new authority.
+				} else if (
+					this.ledger.hasLegacyIdentity(
+						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
+					)
+				) {
+					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
+				}
+			}
+		}
 
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
@@ -3826,7 +3911,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
+			const begun = await this.ledger.begin(identity, requestHash, metadata);
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;

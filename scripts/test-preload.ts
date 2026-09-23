@@ -1,7 +1,8 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
+import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
 import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
-import { decideLogDirIsolation } from "./test-log-dir-isolation";
+import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -59,6 +60,35 @@ if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 // behaviour changes.
 const projectEnv = projectEnvSnapshot(process.cwd());
 
+// Capture the operator's canonical user-state decision before replacing the
+// agent directory with a per-process temp profile. The static import above
+// initializes the resolver before this preload mutates isolation variables; the
+// pre-isolation snapshot is needed to identify an inherited XDG sink that
+// belongs to the operator's default profile.
+const preIsolationHome = getTrustedHomeDir();
+const profileMarkerKey = "GJC_TEST_PRELOAD_PROFILE_AUTHORITY";
+const profileMarker = process.env[profileMarkerKey];
+// Environment variables provide no authenticated provenance: the initial
+// operator or CI environment can forge this marker just as easily as an
+// ancestor preload can set it. Treat any marker as the default-profile lane,
+// which may isolate a custom profile unnecessarily but cannot mistake its
+// inherited XDG sink for an unrelated path and append to the operator sink.
+// Only an absent marker lets the resolver classify the current profile.
+const preIsolationXdgEligible = profileMarker !== undefined ? true : getAgentProfileAuthority() === "default";
+process.env.GJC_TEST_PRELOAD_PROFILE_AUTHORITY = preIsolationXdgEligible ? "default" : "custom";
+const logDirProvenanceKey = "GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE";
+const logDirProvenance = process.env[logDirProvenanceKey];
+// `undefined` means this is the first preload in the process tree. Once a
+// parent has marked its selected value, equality means the child inherited the
+// pin while inequality means the child explicitly replaced it.
+const inheritedLogDir = logDirProvenance === undefined ? undefined : logDirProvenance === process.env.GJC_LOG_DIR;
+const preIsolationLogEnv = {
+	GJC_LOG_DIR: process.env.GJC_LOG_DIR,
+	GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+	PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+	XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+};
+
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -76,7 +106,7 @@ const projectEnv = projectEnvSnapshot(process.cwd());
 // would silently run the suite against the operator's live agent dir, which is
 // the exact destructive regression this preload exists to prevent.
 const isolation = decideAgentDirIsolation({
-	home: os.homedir(),
+	home: preIsolationHome,
 	env: {
 		GJC_CODING_AGENT_DIR: process.env.GJC_CODING_AGENT_DIR,
 		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
@@ -98,6 +128,11 @@ if (isolation.action === "isolate") {
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 }
 
+// `dirs.ts` was loaded above to capture the operator profile. Rebuild its
+// resolver after the agent isolation variables change so production consumers
+// in this test process resolve the isolated profile, not the pre-isolation one.
+resetAgentDirFromEnvironment();
+
 // Isolate the log sink for every test process (issue #5618). The agent-dir
 // isolation above does not cover logging: `getLogsDir()` resolves
 // `rootSubdir("logs", "state")` — the REAL config root — so fixtures that drive
@@ -110,11 +145,13 @@ if (isolation.action === "isolate") {
 // intended: they inherit the same isolated sink.
 //
 // A caller that pinned GJC_LOG_DIR explicitly means it (e.g. a fixture asserting
-// on log content), so that is honored untouched — but only when the pin is
-// trusted. A nonblank value is not evidence of intent on its own: Bun overlays
-// `cwd/.env` into `process.env` before any module runs, so a checkout that
-// declares GJC_LOG_DIR would otherwise be honored here and isolation would never
-// happen. The decision (including that distrust rule) lives in
+// on log content), so that is honored untouched when the child replaced its
+// parent's marked value. An unknown or inherited value that resolves to the
+// canonical shared user sink is isolated instead. A nonblank value is not
+// evidence of intent on its own: Bun overlays `cwd/.env` into `process.env`
+// before any module runs, so a checkout that declares GJC_LOG_DIR would
+// otherwise be honored here and isolation would never happen. The decision
+// (including that distrust rule and the shared-sink guard) lives in
 // ./test-log-dir-isolation.ts so it is unit-testable without importing this
 // preload's side effects.
 //
@@ -124,8 +161,15 @@ if (isolation.action === "isolate") {
 // run the suite against the operator's live log sink, which is the regression
 // this exists to prevent.
 const logIsolation = decideLogDirIsolation({
-	env: { GJC_LOG_DIR: process.env.GJC_LOG_DIR },
+	env: preIsolationLogEnv,
 	projectEnv,
+	inheritedLogDir,
+	sharedLogDir: defaultLogDirFor({
+		home: preIsolationHome,
+		env: preIsolationLogEnv,
+		projectEnv,
+		xdgEligible: preIsolationXdgEligible,
+	}),
 });
 if (logIsolation.action === "fail") {
 	throw new Error(
@@ -144,6 +188,9 @@ if (logIsolation.action === "isolate") {
 		);
 	}
 }
+// Propagate the selected value so a nested preload can distinguish a pin it
+// inherited from its parent from a value the child explicitly supplied.
+process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
 //
 // Recursive-deletion boundary (issue #4794). An operator's real home was
 // destroyed by test cleanup activity; this preload now installs a

@@ -2266,6 +2266,88 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		await expect(attempt).rejects.toThrow(/could not be reaped on this host/);
 	});
 
+	test("reports repeated identity-bound owner_changed refusals for the same dead owner", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		const timestamp = Date.now() - 60_000;
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp });
+		let refusalCount = 0;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				refusalCount++;
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries: 3, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.holder).toContain("(dead but not reaped)");
+		expect(lockError.removalFailure).toMatchObject({
+			outcome: "owner_changed",
+			message: expect.stringContaining("identity-bound removal guard returned owner_changed"),
+		});
+		expect(lockError.message).toContain("could not be reaped on this host");
+		const cleanupCommand =
+			process.platform === "win32"
+				? `Remove-Item -LiteralPath '${lockDir.replace(/'/g, "''")}' -Recurse -Force`
+				: `rm -rf -- '${lockDir.replace(/'/g, "'\\''")}'`;
+		expect(lockError.removalFailure?.manualCleanupCommand).toBe(cleanupCommand);
+		expect(lockError.message).toContain(cleanupCommand);
+		expect(refusalCount).toBe(3);
+		expect(await fs.readFile(path.join(lockDir, "info"), "utf8")).toContain(`"timestamp":${timestamp}`);
+	});
+
+	test("does not report a refusal after a byte-identical legacy lock directory is replaced", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "index.jsonl");
+		const lockDir = `${file}.lock`;
+		const infoPath = path.join(lockDir, "info");
+		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
+		const legacyInfoBytes = await fs.readFile(infoPath, "utf8");
+		const retries = 3;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => ({ ok: false, code: "identity_mismatch" }),
+		});
+		const realSleep = Bun.sleep;
+		let sleeps = 0;
+		vi.spyOn(Bun, "sleep").mockImplementation((async (ms?: number) => {
+			sleeps++;
+			if (sleeps === retries) {
+				renameSync(lockDir, `${lockDir}.previous`);
+				mkdirSync(lockDir);
+				writeFileSync(infoPath, legacyInfoBytes);
+			}
+			return await realSleep(ms ?? 0);
+		}) as typeof Bun.sleep);
+
+		let observed: unknown;
+		try {
+			await withFileLock(file, async () => undefined, { retries, retryDelayMs: 1 });
+		} catch (error) {
+			observed = error;
+		}
+		expect(observed).toBeInstanceOf(FileLockAcquireError);
+		const lockError = observed as FileLockAcquireError;
+		expect(lockError.code).toBe("acquire_timeout");
+		expect(lockError.removalFailure).toBeUndefined();
+		expect(lockError.message).not.toContain("could not be reaped on this host");
+		expect(lockError.message).not.toContain("rm -rf");
+		expect(lockError.message).not.toContain("Remove-Item -LiteralPath");
+		expect(await fs.readFile(infoPath, "utf8")).toBe(legacyInfoBytes);
+	});
+
 	test("surfaces the native refusal code when strict removal is refused", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "index.jsonl");
@@ -2312,7 +2394,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		const lockDir = `${file}.lock`;
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 60_000 });
 		let replaced = false;
-		FileLockTestHooks.nativeExactRemovalProbe = () => false;
+		FileLockTestHooks.nativeExactRemovalProbe = () => true;
 		FileLockTestHooks.nativeQuarantineBindings = () => ({
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: () => {
@@ -2329,7 +2411,7 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 						}),
 					);
 				}
-				return { ok: false, code: "sharing_violation" };
+				return { ok: false, code: "identity_mismatch" };
 			},
 		});
 
@@ -2345,6 +2427,10 @@ describe("withFileLock stale-removal diagnostics (#5434)", () => {
 		expect(lockError.holder).toContain("(live)");
 		expect(lockError.removalFailure).toBeUndefined();
 		expect(lockError.message).not.toContain("could not be reaped");
+		expect(lockError.message).not.toContain("rm -rf");
+		expect(lockError.message).not.toContain("Remove-Item -LiteralPath");
+		expect(await fs.exists(lockDir)).toBe(true);
+		expect(JSON.parse(await fs.readFile(path.join(lockDir, "info"), "utf8")).pid).toBe(process.pid);
 	});
 
 	test("drops a recorded refusal when a live successor takes over during the final retry sleep", async () => {

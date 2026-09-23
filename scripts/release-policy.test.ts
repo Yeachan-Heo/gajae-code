@@ -25,18 +25,22 @@ function jobSection(workflowText: string, jobName: string): string {
 }
 
 describe("stable release policy", () => {
-	test("tag releases resolve metadata, build natives, then binaries, then prepare, then publish npm, then finalize the GitHub Release", async () => {
+	test("tag releases verify MuPDF source and natives before binaries, then prepare, publish npm, and finalize the GitHub Release", async () => {
 		const ci = await workflow();
-		const stages = ["release_metadata", "native", "binaries", "release_prepare", "release_approval", "publish", "release_finalize"];
+		const stages = ["release_metadata", "mupdf_source", "native", "binaries", "release_prepare", "release_approval", "publish", "release_finalize"];
 		const positions = stages.map(stage => ci.indexOf(`   ${stage}:`));
 		for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
 
+		const mupdfSource = jobSection(ci, "mupdf_source");
+		expect(mupdfSource).toContain("needs: [release_metadata]");
+		expect(mupdfSource).toContain('node-version: "24"');
+		expect(mupdfSource).toContain("retention-days: 30");
 		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
-		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata]");
+		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata, mupdf_source]");
 		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		expect(jobSection(ci, "publish")).toContain("needs: [release_prepare, release_approval, release_metadata]");
-		expect(jobSection(ci, "release_finalize")).toContain("needs: [publish, release_metadata]");
-		for (const stage of ["native", "binaries"]) {
+		expect(jobSection(ci, "release_finalize")).toContain("needs: [publish, release_metadata, mupdf_source]");
+		for (const stage of ["mupdf_source", "native", "binaries"]) {
 			const section = jobSection(ci, stage);
 			expect(section).toContain("startsWith(github.ref, 'refs/tags/v')");
 			expect(section).toContain("inputs.rehearsal == 'tag-build-verify'");
@@ -50,6 +54,9 @@ describe("stable release policy", () => {
 		const finalize = jobSection(ci, "release_finalize");
 		expect(finalize).toContain("softprops/action-gh-release");
 		expect(finalize).toContain("draft: false");
+		expect(finalize).toContain("mupdf-release-materials/mupdf-source.tar.gz");
+		expect(finalize).toContain("mupdf-release-materials/mupdf-provenance.json");
+		expect(finalize).toContain("mupdf-release-materials/mupdf-built.wasm");
 	});
 
 	test("stable tags and nightly publication lanes are non-cancelling", async () => {

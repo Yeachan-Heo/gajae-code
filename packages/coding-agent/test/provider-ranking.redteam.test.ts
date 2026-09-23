@@ -328,6 +328,7 @@ describe("/provider preset CLI surface", () => {
 			"alibaba-token-plan",
 			"minimax",
 			"minimax-cn",
+			"ionet",
 			"litellm",
 			"openai-compatible-proxy",
 		]);

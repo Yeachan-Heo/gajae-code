@@ -161,6 +161,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		MCPManager.resetForTests();
+		await modelRegistry.dispose();
 		authStorage.close();
 		setAgentDir(originalAgentDir);
 		if (tempDir && fs.existsSync(tempDir)) {
@@ -259,6 +260,64 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			await session.dispose();
 		}
 	});
+	it("uses the discovery result while the deferred manager catalog is still unpublished", async () => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, "deferred-unpublished-mcp.json");
+		const discoveredTool = createMcpCustomTool("mcp__discovered_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([discoveredTool]));
+		// The first deferred publication window: discovery already returned loaded
+		// tools but the manager has not published its first catalog yet (#5753).
+		// Only this explicit state may fall back to the discovery result.
+		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
+			tools: [],
+			publication: "unpublished",
+			generation: 0,
+		});
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 1, hasErrors: false });
+			expect(session.getAllToolNames()).toContain(discoveredTool.name);
+			expect(session.getActiveToolNames()).toContain(discoveredTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
+	it.each([
+		["published", 1],
+		["fenced", 1],
+	] as const)("does not replay a stale discovery snapshot over an empty %s catalog", async (publication, generation) => {
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		const configPath = path.join(tempDir, `deferred-${publication}-mcp.json`);
+		const staleTool = createMcpCustomTool("mcp__stale_lookup", "exact", "lookup");
+		vi.spyOn(MCPManager.prototype, "discoverAndConnect").mockResolvedValue(createMcpLoadResult([staleTool]));
+		// `published`: a connected server legitimately exposes zero tools after
+		// discovery copied a now-stale result. `fenced`: an exact suspend/disconnect
+		// wins the race before the SDK continuation consumes the discovery result.
+		// Either empty catalog is authoritative and must not be replaced.
+		vi.spyOn(MCPManager.prototype, "getToolCatalogSnapshot").mockReturnValue({
+			tools: [],
+			publication,
+			generation,
+		});
+
+		const { session, startDeferredMcpConfig } = await createAgentSession({
+			...createIsolatedSessionOptions(),
+			mcpConfigPath: configPath,
+			deferMcpConfigStartup: true,
+		});
+		try {
+			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			expect(session.getAllToolNames()).not.toContain(staleTool.name);
+			expect(session.getActiveToolNames()).not.toContain(staleTool.name);
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it(
 		"keeps deferred MCP startup and tool use alive across a logical session transition",
@@ -277,17 +336,17 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				mcpConfigPath: configPath,
 				deferMcpConfigStartup: true,
 			});
-			const taskFallbackRoot = path.join(tempDir, "task-fallback-artifacts");
-			const taskFallbackManager = new ArtifactManager(taskFallbackRoot);
-			expect(await taskFallbackManager.save("task predecessor", "task")).toBe("0");
-			session.sessionManager.adoptArtifactManager(taskFallbackManager);
-			let transitionCleanupCount = 0;
-			session.registerToolSessionTransitionCleanup(() => {
-				transitionCleanupCount++;
-				session.sessionManager.releaseArtifactManager(taskFallbackManager);
-				fs.rmSync(taskFallbackRoot, { recursive: true, force: true });
-			});
 			try {
+				const taskFallbackRoot = path.join(tempDir, "task-fallback-artifacts");
+				const taskFallbackManager = new ArtifactManager(taskFallbackRoot);
+				expect(await taskFallbackManager.save("task predecessor", "task")).toBe("0");
+				session.sessionManager.adoptArtifactManager(taskFallbackManager);
+				let transitionCleanupCount = 0;
+				session.registerToolSessionTransitionCleanup(() => {
+					transitionCleanupCount++;
+					session.sessionManager.releaseArtifactManager(taskFallbackManager);
+					fs.rmSync(taskFallbackRoot, { recursive: true, force: true });
+				});
 				expect(await session.newSession()).toBe(true);
 				expect(transitionCleanupCount).toBe(1);
 				expect(fs.existsSync(taskFallbackRoot)).toBe(false);
@@ -470,8 +529,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	it("keeps only post-overlap idle wakes across concurrent aborts", async () => {
 		const abortIdle = Promise.withResolvers<void>();
 		const { session } = await createAgentSession(createIsolatedSessionOptions());
-		vi.useFakeTimers();
 		try {
+			vi.useFakeTimers();
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			vi.spyOn(session.agent, "waitForIdle").mockImplementation(async () => await abortIdle.promise);
 			session.yieldQueue.register<string>("overlapping-abort-idle-test", {
@@ -529,39 +588,44 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		const firstBarrier = Promise.withResolvers<void>();
 		const secondBarrier = Promise.withResolvers<void>();
 		const { session: firstSession } = await createAgentSession(createIsolatedSessionOptions());
-		const { session: secondSession } = await createAgentSession(createIsolatedSessionOptions());
 		try {
-			const firstPrompt = vi.spyOn(firstSession.agent, "prompt").mockResolvedValue(undefined);
-			const secondPrompt = vi.spyOn(secondSession.agent, "prompt").mockResolvedValue(undefined);
-			firstSession.extendStartupTurnBarrier(firstBarrier.promise);
-			secondSession.extendStartupTurnBarrier(secondBarrier.promise);
-			for (const [session, kind] of [
-				[firstSession, "first-session-idle"],
-				[secondSession, "second-session-idle"],
-			] as const) {
-				session.yieldQueue.register<string>(kind, {
-					build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
-				});
-				session.yieldQueue.enqueue(kind, kind);
+			const { session: secondSession } = await createAgentSession(createIsolatedSessionOptions());
+			try {
+				const firstPrompt = vi.spyOn(firstSession.agent, "prompt").mockResolvedValue(undefined);
+				const secondPrompt = vi.spyOn(secondSession.agent, "prompt").mockResolvedValue(undefined);
+				firstSession.extendStartupTurnBarrier(firstBarrier.promise);
+				secondSession.extendStartupTurnBarrier(secondBarrier.promise);
+				for (const [session, kind] of [
+					[firstSession, "first-session-idle"],
+					[secondSession, "second-session-idle"],
+				] as const) {
+					session.yieldQueue.register<string>(kind, {
+						build: entries => ({ role: "user", content: entries.join("\n"), timestamp: Date.now() }),
+					});
+					session.yieldQueue.enqueue(kind, kind);
+				}
+				const firstFlush = firstSession.yieldQueue.flush("idle");
+				const secondFlush = secondSession.yieldQueue.flush("idle");
+				await Bun.sleep(10);
+
+				firstBarrier.resolve();
+				await firstFlush;
+				await firstSession.waitForIdle();
+				expect(firstPrompt).toHaveBeenCalledTimes(1);
+				expect(secondPrompt).not.toHaveBeenCalled();
+
+				secondBarrier.resolve();
+				await secondFlush;
+				await secondSession.waitForIdle();
+				expect(secondPrompt).toHaveBeenCalledTimes(1);
+			} finally {
+				firstBarrier.resolve();
+				secondBarrier.resolve();
+				await secondSession.dispose();
 			}
-			const firstFlush = firstSession.yieldQueue.flush("idle");
-			const secondFlush = secondSession.yieldQueue.flush("idle");
-			await Bun.sleep(10);
-
-			firstBarrier.resolve();
-			await firstFlush;
-			await firstSession.waitForIdle();
-			expect(firstPrompt).toHaveBeenCalledTimes(1);
-			expect(secondPrompt).not.toHaveBeenCalled();
-
-			secondBarrier.resolve();
-			await secondFlush;
-			await secondSession.waitForIdle();
-			expect(secondPrompt).toHaveBeenCalledTimes(1);
 		} finally {
 			firstBarrier.resolve();
-			secondBarrier.resolve();
-			await Promise.all([firstSession.dispose(), secondSession.dispose()]);
+			await firstSession.dispose();
 		}
 	});
 	it("preserves persisted MCP selections while the deferred catalog is pending", async () => {
@@ -579,15 +643,19 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 					createMcpCustomTool("mcp__exact_drop", "exact", "drop"),
 				],
 			});
-			await firstSession.activateDiscoveredTools(["mcp__exact_keep"]);
-			if (selectedMcpToolNames.length === 0) {
-				await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
+			let sessionFile: string | undefined;
+			try {
+				await firstSession.activateDiscoveredTools(["mcp__exact_keep"]);
+				if (selectedMcpToolNames.length === 0) {
+					await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
+				}
+				expect(firstSession.getSelectedMCPToolNames()).toEqual(selectedMcpToolNames);
+				expect(firstSession.sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(true);
+				sessionFile = firstSession.sessionFile;
+				await firstSession.sessionManager.rewriteEntries();
+			} finally {
+				await firstSession.dispose();
 			}
-			expect(firstSession.getSelectedMCPToolNames()).toEqual(selectedMcpToolNames);
-			expect(firstSession.sessionManager.buildSessionContext().hasPersistedMCPToolSelection).toBe(true);
-			const sessionFile = firstSession.sessionFile;
-			await firstSession.sessionManager.rewriteEntries();
-			await firstSession.dispose();
 
 			const discovery = Promise.withResolvers<MCPLoadResult>();
 			mockDeferredExactMcpLoad(discovery);
@@ -627,12 +695,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			mcpConfigPath: path.join(tempDir, "deferred-dispose.json"),
 			deferMcpConfigStartup: true,
 		});
-		const startup = startDeferredMcpConfig!();
-		const disposal = session.dispose();
-		discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__late_tool", "exact", "late")]));
-		await expect(startup).resolves.toEqual({ loadedToolCount: 0, hasErrors: false });
-		await disposal;
-		expect(session.getAllToolNames()).not.toContain("mcp__late_tool");
+		try {
+			const startup = startDeferredMcpConfig!();
+			const disposal = session.dispose();
+			discovery.resolve(createMcpLoadResult([createMcpCustomTool("mcp__late_tool", "exact", "late")]));
+			await expect(startup).resolves.toEqual({ loadedToolCount: 0, hasErrors: false });
+			await disposal;
+			expect(session.getAllToolNames()).not.toContain("mcp__late_tool");
+		} finally {
+			await session.dispose();
+		}
 
 		const { session: disposedSession, startDeferredMcpConfig: startAfterDispose } = await createAgentSession({
 			...createIsolatedSessionOptions(),
@@ -975,14 +1047,39 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		await expect(createAgentSession(createIsolatedSessionOptions())).rejects.toMatchObject({
 			code: "MCP_MANAGER_CLEANUP_FAILED",
 		});
-		expect(disconnectAll).toHaveBeenCalledTimes(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
+	});
+	it("retries transient cleanup after an enableMCP:false startup failure", async () => {
+		const startupError = new Error("plugin startup failed");
+		const cleanupError = new Error("plugin cleanup failed");
+		const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
+		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		expect(installed.ok).toBe(true);
+
+		let failure: unknown;
+		try {
+			await createAgentSession({ ...createIsolatedSessionOptions(), enableMCP: false });
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBe(startupError);
+		expect(connectServers).toHaveBeenCalledTimes(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 
 	it("preserves plugin MCP cleanup diagnostics alongside a setup failure", async () => {
 		const startupError = new Error("plugin startup failed");
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -995,9 +1092,11 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				error: "plugin startup failed",
 				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
 			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();
 		}
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 	it("preserves a frozen primary MCP startup error when cleanup also fails", async () => {
 		const startupError = Object.freeze(new Error("frozen MCP startup failure"));
@@ -1079,7 +1178,10 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -1089,13 +1191,18 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				([message]) => message === "Failed to wire GJC plugin MCP servers",
 			);
 			expect(cleanupWarning).toBeDefined();
-			expect(cleanupWarning?.[1]).toMatchObject({ error: "<unprintable error>" });
+			expect(cleanupWarning?.[1]).toMatchObject({
+				error: "<unprintable error>",
+				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
+			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 			const serialized = JSON.stringify(cleanupWarning?.[1]);
 			expect(serialized).toContain("<unprintable error>");
 			expect(serialized).toContain("MCP_MANAGER_CLEANUP_FAILED");
 		} finally {
 			await session.dispose();
 		}
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 	it("serializes explicit MCP startup and cleanup proxy diagnostics safely", async () => {
 		const trapError = new Error("explicit MCP hostile trap");
@@ -1335,10 +1442,14 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			customTools: [createMcpCustomTool("mcp__github_create_issue", "github", "create_issue")],
 		});
 
-		expect(session.systemPrompt.join("\n")).not.toContain("### MCP tool discovery");
-		expect(session.systemPrompt.join("\n")).not.toContain(
-			"call `search_tool_bm25` before concluding no such tool exists",
-		);
+		try {
+			expect(session.systemPrompt.join("\n")).not.toContain("### MCP tool discovery");
+			expect(session.systemPrompt.join("\n")).not.toContain(
+				"call `search_tool_bm25` before concluding no such tool exists",
+			);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it(
@@ -1364,12 +1475,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				enableLsp: false,
 			});
 
-			const prompt = session.systemPrompt.join("\n");
-			const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
-			expect(session.getActiveToolNames()).not.toContain("todo_write");
-			expect(prompt).toContain("SearchTools: `search_tool_bm25`");
-			expect(searchTool?.description).toContain("Search hidden tool metadata");
-			expect(searchTool?.description).toContain("total_tools");
+			try {
+				const prompt = session.systemPrompt.join("\n");
+				const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
+				expect(session.getActiveToolNames()).not.toContain("todo_write");
+				expect(prompt).toContain("SearchTools: `search_tool_bm25`");
+				expect(searchTool?.description).toContain("Search hidden tool metadata");
+				expect(searchTool?.description).toContain("total_tools");
+			} finally {
+				await session.dispose();
+			}
 		},
 		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
@@ -1396,19 +1511,23 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			],
 		});
 
-		expect(session.getActiveToolNames()).toContain("mcp__github_create_issue");
-		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
-		expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toContain(
-			"mcp__slack_post_message",
-		);
-		expect(session.systemPrompt.join("\n")).toContain("mcp__github_create_issue");
+		try {
+			expect(session.getActiveToolNames()).toContain("mcp__github_create_issue");
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue"]);
+			expect(session.getDiscoverableTools({ source: "mcp" }).map(tool => tool.name)).toContain(
+				"mcp__slack_post_message",
+			);
+			expect(session.systemPrompt.join("\n")).toContain("mcp__github_create_issue");
 
-		await session.activateDiscoveredTools(["mcp__slack_post_message"]);
+			await session.activateDiscoveredTools(["mcp__slack_post_message"]);
 
-		expect(session.getActiveToolNames()).toEqual(
-			expect.arrayContaining(["read", "search_tool_bm25", "mcp__slack_post_message"]),
-		);
-		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue", "mcp__slack_post_message"]);
+			expect(session.getActiveToolNames()).toEqual(
+				expect.arrayContaining(["read", "search_tool_bm25", "mcp__slack_post_message"]),
+			);
+			expect(session.getSelectedMCPToolNames()).toEqual(["mcp__github_create_issue", "mcp__slack_post_message"]);
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it("activates configured discovery default servers in discovery mode", async () => {
@@ -1500,9 +1619,13 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			customTools: [createMcpCustomTool("mcp__github_create_issue", "github", "create_issue")],
 		});
 
-		const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
-		expect(searchTool?.description).toContain("total_tools");
-		expect(searchTool?.description).toContain("server name");
+		try {
+			const searchTool = session.agent.state.tools.find(tool => tool.name === "search_tool_bm25");
+			expect(searchTool?.description).toContain("total_tools");
+			expect(searchTool?.description).toContain("server name");
+		} finally {
+			await session.dispose();
+		}
 	});
 
 	it(
@@ -1528,15 +1651,19 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				enableLsp: false,
 			});
 
-			expect(await session.activateDiscoveredTools(["todo_write"])).toEqual(["todo_write"]);
-			expect(session.getSelectedDiscoveredToolNames()).toContain("todo_write");
+			try {
+				expect(await session.activateDiscoveredTools(["todo_write"])).toEqual(["todo_write"]);
+				expect(session.getSelectedDiscoveredToolNames()).toContain("todo_write");
 
-			await session.setActiveToolsByName(["read", "search_tool_bm25"]);
+				await session.setActiveToolsByName(["read", "search_tool_bm25"]);
 
-			expect(session.getActiveToolNames()).not.toContain("todo_write");
-			expect(session.getSelectedDiscoveredToolNames()).not.toContain("todo_write");
-			expect(await session.activateDiscoveredTools(["todo_write"])).toEqual(["todo_write"]);
-			expect(session.getActiveToolNames()).toContain("todo_write");
+				expect(session.getActiveToolNames()).not.toContain("todo_write");
+				expect(session.getSelectedDiscoveredToolNames()).not.toContain("todo_write");
+				expect(await session.activateDiscoveredTools(["todo_write"])).toEqual(["todo_write"]);
+				expect(session.getActiveToolNames()).toContain("todo_write");
+			} finally {
+				await session.dispose();
+			}
 		},
 		SLOW_SDK_TEST_TIMEOUT_MS,
 	);
@@ -1568,18 +1695,24 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
 				],
 			});
-			await firstSession.activateDiscoveredTools(["mcp__slack_post_message"]);
-			firstSession.sessionManager.appendThinkingLevelChange(ThinkingLevel.Off);
-			firstSession.sessionManager.appendServiceTierChange("priority");
-			expect(firstSession.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Off);
-			expect(firstSession.getSelectedMCPToolNames()).toEqual(["mcp__slack_post_message"]);
-			const sessionFile = firstSession.sessionFile;
-			expect(sessionFile).toBeDefined();
-			await firstSession.sessionManager.rewriteEntries();
-			fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
-			const persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
-			const persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
-			await firstSession.dispose();
+			let sessionFile: string | undefined;
+			let persistedBeforeResume: string;
+			let persistedMtimeBeforeResume: number;
+			try {
+				await firstSession.activateDiscoveredTools(["mcp__slack_post_message"]);
+				firstSession.sessionManager.appendThinkingLevelChange(ThinkingLevel.Off);
+				firstSession.sessionManager.appendServiceTierChange("priority");
+				expect(firstSession.sessionManager.buildSessionContext().thinkingLevel).toBe(ThinkingLevel.Off);
+				expect(firstSession.getSelectedMCPToolNames()).toEqual(["mcp__slack_post_message"]);
+				sessionFile = firstSession.sessionFile;
+				expect(sessionFile).toBeDefined();
+				await firstSession.sessionManager.rewriteEntries();
+				fs.utimesSync(sessionFile!, oldSessionMtime, oldSessionMtime);
+				persistedBeforeResume = fs.readFileSync(sessionFile!, "utf8");
+				persistedMtimeBeforeResume = fs.statSync(sessionFile!).mtimeMs;
+			} finally {
+				await firstSession.dispose();
+			}
 			const resumedManager = await SessionManager.open(sessionFile!, tempDir);
 			const { session: resumedSession } = await createAgentSession({
 				cwd: tempDir,
@@ -1706,12 +1839,16 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 					createMcpCustomTool("mcp__slack_post_message", "slack", "post_message"),
 				],
 			});
-			await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
-			expect(firstSession.getSelectedMCPToolNames()).toEqual([]);
-			const sessionFile = firstSession.sessionFile;
-			expect(sessionFile).toBeDefined();
-			await firstSession.sessionManager.rewriteEntries();
-			await firstSession.dispose();
+			let sessionFile: string | undefined;
+			try {
+				await firstSession.setActiveToolsByName(["read", "search_tool_bm25"]);
+				expect(firstSession.getSelectedMCPToolNames()).toEqual([]);
+				sessionFile = firstSession.sessionFile;
+				expect(sessionFile).toBeDefined();
+				await firstSession.sessionManager.rewriteEntries();
+			} finally {
+				await firstSession.dispose();
+			}
 
 			const resumedManager = await SessionManager.open(sessionFile!, tempDir);
 			const { session: resumedSession } = await createAgentSession({

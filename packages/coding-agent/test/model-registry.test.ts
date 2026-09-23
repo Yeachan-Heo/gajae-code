@@ -398,6 +398,63 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("getProviderBaseUrl follows the catalog after a models config reload", async () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://second.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			await registry.refresh("offline");
+
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://second.example.com/v1");
+			expect(registry.getProviderBaseUrl("no-such-provider")).toBeUndefined();
+		});
+
+		test("getProviderBaseUrl reflects in-place changes to the catalog returned by getAll()", () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+			// `getAll()` exposes the live catalog to extensions; lookups must not be served
+			// from a snapshot taken before an in-place edit.
+			const model = registry.getAll().find(candidate => candidate.provider === "base-url-proxy");
+			if (!model) throw new Error("proxy model missing");
+			model.baseUrl = "https://edited.example.com/v1";
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://edited.example.com/v1");
+		});
+
+		test("getProviderBaseUrl env fallback still applies to providers without a catalog base URL", () => {
+			const restore = setEnvForTest("MY_LATE_PROXY_BASE_URL", "https://late.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://late.example.com/v1");
+				Bun.env.MY_LATE_PROXY_BASE_URL = "https://later.example.com/v1";
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://later.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+
 		test("does not apply OPENAI_BASE_URL to OpenAI Codex models", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
 			try {
@@ -827,7 +884,7 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			const opusVariants = registry.getCanonicalVariants("claude-opus-5");
+			const opusVariants = registry.getCanonicalVariants("claude-opus-5-5");
 			const haikuVariants = registry.getCanonicalVariants("claude-haiku-4-5");
 
 			expect(opusVariants.some(variant => variant.selector === "demo/anthropic/claude-opus-latest")).toBe(true);
@@ -1509,7 +1566,7 @@ describe("ModelRegistry", () => {
 			});
 			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: false,
-				candidates: registry.getAll().reverse(),
+				candidates: registry.getAll().slice().reverse(),
 				sessionId: "sticky-session",
 			});
 			expect(resolved).toBe(initial);
@@ -3585,6 +3642,44 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 		});
 
+		test("explicit model definitions remain authoritative over same-id discovery", async () => {
+			writeRawModelsJson({
+				"explicit-discovery": {
+					baseUrl: "https://provider.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "explicit-model",
+							name: "Configured model",
+							contextWindow: 123_456,
+							maxTokens: 7_654,
+						},
+					],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			using _hook = hookFetch(
+				() =>
+					new Response(
+						JSON.stringify({ data: [{ id: "explicit-model", owned_by: "anthropic" }, { id: "live-model" }] }),
+						{
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						},
+					),
+			);
+			await registry.refreshProvider("explicit-discovery", "online");
+
+			expect(registry.find("explicit-discovery", "explicit-model")).toMatchObject({
+				api: "openai-responses",
+				name: "Configured model",
+				contextWindow: 123_456,
+				maxTokens: 7_654,
+			});
+			expect(registry.find("explicit-discovery", "live-model")).toBeDefined();
+		});
+
 		test("newly discovered ids inherit provider fields, not another model's custom fields", async () => {
 			writeRawModelsJson({
 				openai: {
@@ -3618,7 +3713,14 @@ describe("ModelRegistry", () => {
 			await addApiCompatibleProvider({ preset: "minimax", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "zai", modelsPath: presetModelsPath });
 			await addApiCompatibleProvider({ preset: "cline-pass", modelsPath: presetModelsPath });
-			await addApiCompatibleProvider({ preset: "commandcode-goat", modelsPath: presetModelsPath });
+			await addApiCompatibleProvider({
+				preset: "commandcode-goat",
+				modelsPath: presetModelsPath,
+				probeDiscovery: async () => ({
+					models: ["goat-model"],
+					endpoint: "https://api.commandcode.ai/provider/v1/models",
+				}),
+			});
 			authStorage.setRuntimeApiKey("commandcode-goat", "test-key");
 
 			using _hook = hookFetch(input => {
@@ -8939,7 +9041,8 @@ describe("ModelRegistry", () => {
 			]);
 
 			await registry.refreshProvider("discovery-provider", "online");
-			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.status).toBe("unavailable");
+			expect(registry.getProviderDiscoveryState("discovery-provider")?.error).toContain("returned no models");
 			expect(activeRowsFor(registry, ["discovery-provider", "mixed"])).toEqual([
 				{ provider: "mixed", connectionKind: "credentialless" },
 			]);
@@ -8994,7 +9097,8 @@ describe("ModelRegistry", () => {
 			hasModels = false;
 			await registry.refreshProvider("credentialless-discovery", "online");
 
-			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("empty");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.status).toBe("cached");
+			expect(registry.getProviderDiscoveryState("credentialless-discovery")?.error).toContain("returned no models");
 			expect(registry.find("credentialless-discovery", "discovered-model")).toBeDefined();
 			expect(activeRowsFor(registry, ["credentialless-discovery"])).toEqual([]);
 		});

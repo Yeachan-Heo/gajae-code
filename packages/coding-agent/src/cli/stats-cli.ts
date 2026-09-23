@@ -168,7 +168,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 async function printStatsSummary(): Promise<void> {
 	const { getDashboardStats } = await import("@gajae-code/stats");
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder } = stats;
+	const { overall, byModel, byFolder, byAgent } = stats;
 
 	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
 
@@ -192,6 +192,15 @@ async function printStatsSummary(): Promise<void> {
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
 				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+			);
+		}
+	}
+
+	if (byAgent.length > 0) {
+		console.log(chalk.bold("\nBy Agent Role:"));
+		for (const agent of byAgent) {
+			console.log(
+				`  ${agent.agent}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}
@@ -231,6 +240,7 @@ ${chalk.bold("Examples:")}
 ${chalk.bold("Metrics:")}
   - Total requests and error rate
   - Token usage (input, output, cache)
+  - Role usage (default, executor, planner, architect, critic)
   - Cost breakdown
   - Average duration and time to first token (TTFT)
   - Tokens per second throughput

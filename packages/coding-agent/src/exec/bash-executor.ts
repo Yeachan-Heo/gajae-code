@@ -319,6 +319,8 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/** Environment names to hide from this command's inherited environment. */
+	unsetEnv?: string[];
 	/** Artifact path/id for full output storage */
 	artifactPath?: string;
 	artifactId?: string;
@@ -578,6 +580,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			command: finalCommand,
 			cwd: commandCwd,
 			env: commandEnv,
+			unsetEnv: options?.unsetEnv,
 			timeoutMs: executionTimeoutMs,
 			signal: runAbortController.signal,
 		};

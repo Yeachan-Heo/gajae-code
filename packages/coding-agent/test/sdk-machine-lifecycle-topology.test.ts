@@ -95,6 +95,7 @@ async function daemonGlobal(
 			"session",
 			"raw",
 			"global",
+			"--json",
 			"--op",
 			operation,
 			"--json-input",
@@ -117,6 +118,29 @@ async function daemonGlobal(
 	const output = result(JSON.parse(stdout));
 	expect(exitCode, stderr).toBe(output.ok ? 0 : 1);
 	expect(stderr).not.toContain("token");
+	if (!output.ok) {
+		// #5470 projects broker failures into a credential-free public envelope.
+		// Keep domain-code assertions on MCP; CLI callers retain reconciliation references.
+		expect(stderr).toBe("");
+		expect(output).toMatchObject({
+			schema: "gjc.command-error",
+			version: 1,
+			command: ["sdk", "session", "raw", "global"],
+			error: {
+				code: idempotencyKey.startsWith("collision-")
+					? expect.stringMatching(/^(operation_failed|endpoint_stale)$/)
+					: "operation_failed",
+				outcomeCertainty: "unknown",
+				references: expect.arrayContaining([{ kind: "idempotencyKey", value: idempotencyKey }]),
+			},
+		});
+		// lifecycle.execute may throw before runGlobal adds the input sessionId;
+		// returned endpoint-stale outcomes do carry that reconciliation reference.
+		if (output.error?.code === "endpoint_stale" && typeof input.sessionId === "string")
+			expect(output).toMatchObject({
+				error: { references: expect.arrayContaining([{ kind: "sessionId", value: input.sessionId }]) },
+			});
+	}
 	return output;
 }
 
@@ -203,8 +227,9 @@ test("shipped mcp-serve sdk stdio drives authenticated G03-G07 lifecycle topolog
 
 test("shipped sdk session raw global CLI drives authenticated G03-G07 lifecycle topology with durable effects", async () => {
 	const life = await fixture();
-	await life.invokeScenario((operation, input, idempotencyKey) =>
-		daemonGlobal(life.repo, life.agentDir, operation, input, idempotencyKey),
+	await life.invokeScenario(
+		(operation, input, idempotencyKey) => daemonGlobal(life.repo, life.agentDir, operation, input, idempotencyKey),
+		"operation_failed",
 	);
 }, 120_000);
 
@@ -473,8 +498,8 @@ test("shared-agent shipped ingresses reject crossed saved-session workspace iden
 			),
 		),
 	]);
-	for (const response of [mcp, daemon])
-		expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(mcp).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+	expect(daemon).toMatchObject({ ok: false, error: { code: "operation_failed" } });
 	for (const workspace of [A, B]) {
 		expect(
 			await fs.access(path.join(workspace.stateRoot, "sdk", `${workspace.source.id}.json`)).then(
@@ -521,8 +546,14 @@ test("shared-agent shipped MCP and daemon reject foreign saved-session forks wit
 				life.environment,
 			);
 		const [left, right] = await Promise.all([invoke(leftAdapter, A, B, "a"), invoke(rightAdapter, B, A, "b")]);
-		for (const response of [left, right])
-			expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		for (const [response, adapter] of [
+			[left, leftAdapter],
+			[right, rightAdapter],
+		] as const)
+			expect(response).toMatchObject({
+				ok: false,
+				error: { code: adapter === "mcp" ? "invalid_input" : "operation_failed" },
+			});
 		expect(await Promise.all([sdkDirectoryEntries(A.stateRoot), sdkDirectoryEntries(B.stateRoot)])).toEqual(
 			sdkBefore,
 		);

@@ -447,23 +447,47 @@ process.exitCode = await child.exited;`;
 	}, 15_000);
 
 	it("routes every advertised SDK family and rejects the removed daemon session route", async () => {
-		const sdkHelp = Bun.spawnSync(["bun", cliEntry, "sdk", "--help"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const sdkHelpOutput = `${sdkHelp.stdout.toString()}\n${sdkHelp.stderr.toString()}`;
-		expect(sdkHelp.exitCode, sdkHelpOutput).toBe(0);
-		for (const token of ["serve", "session", "guides"]) expect(sdkHelp.stdout.toString()).toContain(token);
+		// #5470: help is command-local; failures require --json for machine output.
+		const expectUsage = (args: string[], command: string[]) => {
+			const child = Bun.spawnSync(["bun", cliEntry, ...args, "--json"], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			expect(child.exitCode, child.stderr.toString()).toBe(2);
+			expect(child.stderr.toString()).toBe("");
+			expect(JSON.parse(child.stdout.toString())).toMatchObject({
+				schema: "gjc.command-error",
+				version: 1,
+				command,
+				ok: false,
+				error: { code: "usage", category: "usage", outcomeCertainty: "not-applied", retryability: "no" },
+			});
+		};
+		const helpEntries = (command: string[], section: string): string => {
+			let args = [...command, "--help", "--help-section", section, "--json"];
+			const entries: unknown[] = [];
+			for (let page = 0; ; page++) {
+				expect(page).toBeLessThan(100);
+				const help = Bun.spawnSync(["bun", cliEntry, ...args], {
+					cwd: repoRoot,
+					stderr: "pipe",
+					stdout: "pipe",
+				});
+				expect(help.exitCode, help.stderr.toString()).toBe(0);
+				expect(help.stderr.toString()).toBe("");
+				const document = JSON.parse(help.stdout.toString());
+				expect(document).toMatchObject({ schema: "gjc.command-help", command, section });
+				entries.push(...document.entries);
+				if (document.next?.section !== section) break;
+				args = document.next.argv;
+			}
+			return JSON.stringify(entries);
+		};
+		const sdkHelp = helpEntries(["sdk"], "children");
+		for (const token of ["serve", "session", "guides"]) expect(sdkHelp).toContain(token);
 
-		const serve = Bun.spawnSync(["bun", cliEntry, "sdk", "serve"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const serveOutput = `${serve.stdout.toString()}\n${serve.stderr.toString()}`;
-		expect(serve.exitCode, serveOutput).toBe(2);
-		expect(serveOutput).toContain("gjc sdk serve: specify exactly one of");
+		expectUsage(["sdk", "serve"], ["sdk", "serve"]);
 
 		const guideAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-command-"));
 		try {
@@ -478,58 +502,35 @@ process.exitCode = await child.exited;`;
 		} finally {
 			await fs.rm(guideAgentDir, { recursive: true, force: true });
 		}
-		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const helpOutput = `${help.stdout.toString()}\n${help.stderr.toString()}`;
-		expect(help.exitCode, helpOutput).toBe(0);
-		for (const token of [
-			"list",
-			"inspect",
-			"send",
-			"status",
-			"tail",
-			"raw",
-			"--until-idle",
-			"--strict",
-			"--all-events",
-		])
-			expect(help.stdout.toString()).toContain(token);
-		expect(help.stdout.toString()).not.toContain("elevate");
-		expect(help.stdout.toString()).not.toContain("show-endpoint-credential");
+		const sessionHelp = helpEntries(["sdk", "session"], "children");
+		for (const token of ["list", "inspect", "send", "status", "tail", "raw"]) expect(sessionHelp).toContain(token);
+		expect(sessionHelp).not.toContain("elevate");
+		expect(sessionHelp).not.toContain("show-endpoint-credential");
+		const tailHelp = helpEntries(["sdk", "session", "tail"], "options");
+		for (const flag of ["--until-idle", "--strict", "--all-events"]) expect(tailHelp).toContain(flag);
+		expect(tailHelp).not.toContain("elevate");
+		expect(tailHelp).not.toContain("show-endpoint-credential");
 
-		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const missingOutput = `${missingVerb.stdout.toString()}\n${missingVerb.stderr.toString()}`;
-		expect(missingVerb.exitCode, missingOutput).toBe(2);
-		expect(JSON.parse(missingVerb.stdout.toString())).toMatchObject({
-			ok: false,
-			error: { code: "usage" },
-		});
-
-		const unknownVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "bogus"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const unknownOutput = `${unknownVerb.stdout.toString()}\n${unknownVerb.stderr.toString()}`;
-		expect(unknownVerb.exitCode, unknownOutput).toBe(2);
-		expect(unknownVerb.stderr.toString()).toContain("Expected verb to be one of");
+		expectUsage(["sdk", "session"], ["sdk", "session"]);
+		expectUsage(["sdk", "session", "bogus"], ["sdk", "session"]);
 
 		// `gjc daemon session` is deleted without an alias (DR-13).
-		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list"], {
+		// The default-status grammar treats these tokens as unknown daemon kinds.
+		// #5470 keeps unknown-kind rejection at exit 1, before settings or controllers.
+		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list", "--json"], {
 			cwd: repoRoot,
 			stderr: "pipe",
 			stdout: "pipe",
 		});
-		const daemonOutput = `${daemonSession.stdout.toString()}\n${daemonSession.stderr.toString()}`;
-		expect(daemonSession.exitCode, daemonOutput).toBe(2);
-		expect(daemonSession.stderr.toString()).toContain("Expected action to be one of");
+		expect(daemonSession.exitCode, daemonSession.stderr.toString()).toBe(1);
+		expect(daemonSession.stderr.toString()).toBe("");
+		expect(JSON.parse(daemonSession.stdout.toString())).toMatchObject({
+			schema: "gjc.command-error",
+			version: 1,
+			command: ["daemon"],
+			ok: false,
+			error: { code: "operation_failed", category: "operation", outcomeCertainty: "not-applied" },
+		});
 	}, 30_000);
 });
 

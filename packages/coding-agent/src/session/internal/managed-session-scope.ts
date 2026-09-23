@@ -195,18 +195,40 @@ export type ManagedScopeResolution =
 	  };
 
 /**
- * Classify a failure for the operator-visible `cause`.
- *
- * Must agree with {@link managedScopeErrorCode}: the reported `code` and the
- * `cause.classification` printed in the startup error are produced by separate
- * helpers, so a message recognized by one and not the other still surfaces to
- * the operator as `binding_invalid`.
+ * Fixed, path-free identity tokens thrown as plain errors by the managed
+ * storage guards (`assertManagedPathIdentity`). They carry no pathname, so
+ * propagating them keeps startup redaction intact while telling the operator
+ * which invariant actually failed instead of a blanket `binding_invalid`.
  */
-function managedScopeFailureCause(error: unknown): { readonly classification: string } {
-	const security = managedSecurityFailureClassification(error);
-	if (security) return { classification: security };
-	return { classification: managedScopeErrorCode(error instanceof Error ? error.message : "") };
-}
+const managedScopeIdentityFailureCodes = new Set(["identity_mismatch", "reparse_point", "not_directory", "not_file"]);
+
+/**
+ * Fixed, path-free errno tokens. A managed scope that fails to prepare because
+ * another process holds the object (AV scanners, indexers, cloud-sync agents)
+ * is operationally distinct from a corrupted binding, and only the errno
+ * distinguishes them. Node places the pathname in `.message`/`.path`, never in
+ * `.code`, so the token alone is safe to surface.
+ */
+const managedScopeErrnoFailureCodes = new Set([
+	"EACCES",
+	"EPERM",
+	"EBUSY",
+	"EROFS",
+	"ENOSPC",
+	"EMFILE",
+	"ENFILE",
+	"ELOOP",
+	"ENOTDIR",
+]);
+
+const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
+	"atomic_unavailable",
+	"invalid_request",
+	"durability_failed",
+	"durability_not_provable",
+	"migration_busy",
+	"capacity_exceeded",
+]);
 
 /**
  * A scope whose directory outgrew a scan budget. The binding is untouched and
@@ -217,14 +239,21 @@ function isManagedScopeCapacityMessage(message: string): boolean {
 	return message === "artifact_capacity_exceeded" || message === "managed_replace_cleanup_receipt_limit_exceeded";
 }
 
-const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
-	"atomic_unavailable",
-	"invalid_request",
-	"durability_failed",
-	"durability_not_provable",
-	"migration_busy",
-	"capacity_exceeded",
-]);
+/**
+ * Recover the path-free classification for a failure that carries no security
+ * classification of its own.
+ *
+ * `managedScopeFailureCodes` deliberately stays out of this: those tokens are
+ * already reported through `code`, and the `code`/`classification` split is
+ * pinned behaviour. This only rescues the identity and errno failures that
+ * otherwise reach the operator as an undifferentiated `binding_invalid`.
+ */
+function managedScopeResidualClassification(error: unknown): string | undefined {
+	if (!(error instanceof Error)) return undefined;
+	if (managedScopeIdentityFailureCodes.has(error.message)) return error.message;
+	const errno = (error as NodeJS.ErrnoException).code;
+	return errno !== undefined && managedScopeErrnoFailureCodes.has(errno) ? errno : undefined;
+}
 
 /**
  * Preserve a recognized native/publication failure as its own error code.
@@ -240,12 +269,23 @@ function managedScopeErrorCode(message: string): ManagedScopeErrorCode {
 		: "binding_invalid";
 }
 
+function managedScopeFailureCause(error: unknown): { readonly classification: string } {
+	const security = managedSecurityFailureClassification(error);
+	if (security) return { classification: security };
+	const residual = managedScopeResidualClassification(error);
+	if (residual) return { classification: residual };
+	return {
+		classification: managedScopeErrorCode(error instanceof Error ? error.message : ""),
+	};
+}
+
 function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
 	if (!(error instanceof Error)) return fallback;
 	if (error.message === "content_too_large" || isManagedScopeCapacityMessage(error.message)) return error.message;
-	return managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode) ? error.message : fallback;
+	if (managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode)) return error.message;
+	return managedScopeResidualClassification(error) ?? fallback;
 }
 
 export interface ManagedCandidate {
@@ -1812,6 +1852,16 @@ function receiptMatches(
 				tree?: unknown;
 			};
 		};
+		// A receipt is keyed by its source and names exactly one destination. The
+		// resume listing probes every (legacy source, v2 destination) pair, so reject
+		// on these cheap receipt fields before hashing both transcripts and walking
+		// the artifact manifest; the full conjunction below would be false anyway.
+		if (
+			record.destination?.path !== destination.path ||
+			record.source?.path !== source.path ||
+			record.source?.sha256 !== source.identity.sha256
+		)
+			return false;
 		const exact = (
 			recorded: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown } | undefined,
 			candidate: ManagedCandidate,

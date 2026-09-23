@@ -5,6 +5,7 @@ import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { withFileLock } from "../../config/file-lock";
 import { repo } from "../../utils/git";
+import { endpointIncarnation } from "./endpoint-authority";
 import { processIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSessionIndexEventVersion,
@@ -349,6 +350,8 @@ function sameIndexChangeStamp(a: SessionIndexChangeStamp, b: SessionIndexChangeS
 const ROTATE_BYTES = 4 * 1024 * 1024;
 /** Coalesced heartbeat checkpoint rate cap (C2): at most one per session per minute. */
 export const SESSION_HEARTBEAT_INTERVAL_MS = 60_000;
+/** A stale-host retirement requires silence well beyond the broker freshness window. */
+export const DEAD_HOST_HEARTBEAT_SILENCE_MS = 10 * SESSION_HEARTBEAT_INTERVAL_MS;
 export const DEFAULT_SESSION_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_SESSION_RETENTION_MAX_ROWS = 25_000;
 
@@ -1696,6 +1699,82 @@ export class SessionIndex {
 			});
 		});
 	}
+
+	/**
+	 * Atomically fence an exact, long-silent dead-host authority before a caller
+	 * removes state outside the broker index. The comparison and terminal event
+	 * append share the machine-global index lock, so a heartbeat, successor
+	 * registration, or unresolved-authority update that wins the lock prevents
+	 * destructive coordinator cleanup.
+	 */
+	async retireStaleIfCurrent(expected: {
+		sessionId: string;
+		workspace: string;
+		endpointGeneration: number;
+		endpointIncarnation: string;
+	}): Promise<"retired" | "already_retired" | "not_found" | "stale"> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		// Process-incarnation observations are gathered before the lock. The locked
+		// projection then uses this fixed batch, avoiding an unbounded OS probe while
+		// holding the machine-global index lock.
+		const probed = new Map<string, string | undefined>();
+		for (const row of reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities) {
+			const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+			if (recordedIncarnation === undefined || !alive(row.pid)) continue;
+			probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+		}
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return "not_found";
+				throw error;
+			}
+			return await withSessionIndexLock("stale session retirement", this.#agentDir, async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot retire a session from a corrupt session index");
+				const current = this.listSessions(probed).sessions.find(
+					session => session.sessionId === expected.sessionId,
+				);
+				if (!current) return "not_found";
+				if (
+					resolveEquivalentPath(current.locator.cwd) !== resolveEquivalentPath(expected.workspace) ||
+					current.endpointGeneration !== expected.endpointGeneration ||
+					endpointIncarnation(current, expected.sessionId) !== expected.endpointIncarnation
+				)
+					return "stale";
+				if (current.ambiguous || current.terminalUncertain) return "stale";
+				if (current.terminal) return "already_retired";
+				if (
+					current.live !== false ||
+					current.lastHeartbeatAt === undefined ||
+					this.#policy.clock() - current.lastHeartbeatAt < DEAD_HOST_HEARTBEAT_SILENCE_MS
+				)
+					return "stale";
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					version: SESSION_INDEX_EVENT_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: Date.now(),
+					type: "session_closed",
+					sessionId: current.sessionId,
+					locator: current.locator,
+					endpointGeneration: current.endpointGeneration,
+					pid: current.pid,
+					...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+					...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+					...(current.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: current.endpointMtimeMs }),
+					...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
+					...(current.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: current.lifecycleRequestId }),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return "retired";
+			});
+		});
+	}
+
 	async unregisterIfCurrent(
 		expected: Pick<
 			SessionIndexEvent,
@@ -1877,10 +1956,10 @@ export class SessionIndex {
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
 
-	listSessions(): SessionList {
+	listSessions(probedIncarnations?: ReadonlyMap<string, string | undefined>): SessionList {
 		return {
 			indexSeq: this.indexSeq,
-			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
+			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).sessions,
 			warnings: this.#warnings,
 		};
 	}

@@ -161,7 +161,7 @@ export function normalizeSdkStartupFailure(
 }
 
 /** Collect process-scoped credentials without exposing a raw-secret API. */
-function lifecycleKnownSecrets(): string[] {
+export function lifecycleKnownSecrets(): string[] {
 	return Object.entries(process.env)
 		.filter(([name, value]) => value && /(?:token|secret|password|credential|api[_-]?key|auth)/iu.test(name))
 		.map(([, value]) => value!);

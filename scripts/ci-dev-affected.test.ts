@@ -2,7 +2,9 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
+import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { enumerateTestFiles } from "./run-bun-test-files";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -42,6 +44,24 @@ test("the production SDK host suites run sequentially and stop after a failure",
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
 }
+
+test("derives Telegram daemon guard coverage from the manifest inventory", async () => {
+	const claimed = Object.values(telegramDaemonGenerationManifest.inventory).flatMap(inventory => Object.keys(inventory));
+	expect(claimed.length).toBeGreaterThan(0);
+	expect(claimed.every(isTelegramDaemonGenerationGuardFile)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(claimed)).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/unrelated.ts"])).toBe(false);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/new-telegram-daemon.ts"])).toBe(true);
+	expect(needsTelegramDaemonGenerationGuard(["packages/coding-agent/src/sdk/bus/daemon-paths-v2.ts"])).toBe(true);
+
+	const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+	const guardStart = workflow.indexOf("  telegram-daemon-generation:\n");
+	const guardEnd = workflow.indexOf("\n  windows-dev-doctor:", guardStart);
+	const guard = workflow.slice(guardStart, guardEnd);
+	expect(workflow).toContain("has_protected_daemon_decl: ${{ steps.plan.outputs.has_protected_daemon_decl }}");
+	expect(guard).toContain("needs.affected-plan.outputs.has_protected_daemon_decl == 'true'");
+	expect(guard).not.toContain("needs.affected-plan.outputs.changed_paths");
+});
 
 describe("planTasks command shape (issue #622)", () => {
 	test("no scheduled command uses the false-green standalone `bun --cwd <dir>` form", () => {
@@ -173,7 +193,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
 		expect(workflow).toContain(
-			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')",
+			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.has_protected_daemon_decl }}",
 		);
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
@@ -929,6 +949,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/agent-core", "test:@gajae-code/agent-core",
 			"check:@gajae-code/ai", "test:@gajae-code/ai",
 			"check:@gajae-code/coding-agent",
+			"test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
@@ -1110,9 +1131,11 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/startup-update-contract.test.ts",
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
 		"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
+		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
+		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1152,6 +1175,18 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
 		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
+	});
+
+	test("the Cargo owner-session regression's direct PR task requires Rust", () => {
+		const testFile = "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts";
+		const tasks = targeted([testFile]);
+		expect(testFiles).toContain(testFile);
+		const directTask = describeTasks(tasks).find(entry => entry.key === `test:${testFile}`);
+		const unrelatedTask = describeTasks(targeted(["packages/coding-agent/test/edit/foo.test.ts"])).find(
+			entry => entry.key === "test:packages/coding-agent/test/edit/foo.test.ts",
+		);
+		expect(directTask?.rust).toBe(true);
+		expect(unrelatedTask?.rust).toBe(false);
 	});
 
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
@@ -1413,25 +1448,25 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		);
 		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
 	});
+	const extensibilityOwnerTests = [
+		"packages/coding-agent/test/function-hooks.test.ts",
+		"packages/coding-agent/test/extensions-discovery.test.ts",
+		"packages/coding-agent/test/extensions-runner.test.ts",
+		"packages/coding-agent/test/extensions-wrapper.test.ts",
+		"packages/coding-agent/test/hook-event-normalization.test.ts",
+		"packages/coding-agent/test/gjc-plugin-schema.test.ts",
+		"packages/coding-agent/test/gjc-plugin-aliases.test.ts",
+		"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
+		"packages/coding-agent/test/gjc-plugin-registry.test.ts",
+		"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
+		"packages/coding-agent/test/gjc-plugin-loader.test.ts",
+		"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
+		"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
+		"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
+		"packages/coding-agent/test/gjc-plugin-observability.test.ts",
+		"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
+	];
 	test("extensibility sources select the bounded Function Hooks/plugin owner shard", () => {
-		const ownerTests = [
-			"packages/coding-agent/test/function-hooks.test.ts",
-			"packages/coding-agent/test/extensions-discovery.test.ts",
-			"packages/coding-agent/test/extensions-runner.test.ts",
-			"packages/coding-agent/test/extensions-wrapper.test.ts",
-			"packages/coding-agent/test/hook-event-normalization.test.ts",
-			"packages/coding-agent/test/gjc-plugin-schema.test.ts",
-			"packages/coding-agent/test/gjc-plugin-aliases.test.ts",
-			"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
-			"packages/coding-agent/test/gjc-plugin-registry.test.ts",
-			"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
-			"packages/coding-agent/test/gjc-plugin-loader.test.ts",
-			"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
-			"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
-			"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
-			"packages/coding-agent/test/gjc-plugin-observability.test.ts",
-			"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
-		];
 		const changedSources = [
 			"packages/coding-agent/src/extensibility/extensions/function-hooks.ts",
 			"packages/coding-agent/src/extensibility/extensions/function-hooks-internal.ts",
@@ -1446,14 +1481,21 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/extensibility/gjc-plugins/registry.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts",
-			"packages/coding-agent/src/sdk/session.ts",
 		];
 		for (const changedSource of changedSources) {
 			const keys = targeted([changedSource]).map(task => task.key);
-			for (const ownerTest of ownerTests) expect(keys).toContain(`test:${ownerTest}`);
+			for (const ownerTest of extensibilityOwnerTests) expect(keys).toContain(`test:${ownerTest}`);
+			expect(keys).not.toContain("test:packages/coding-agent/test/sdk-mcp-discovery.test.ts");
 			expect(keys).not.toContain("test:@gajae-code/coding-agent");
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
 		}
+	});
+	test("SDK session changes select MCP discovery cleanup without widening extension owners", () => {
+		const keys = targeted(["packages/coding-agent/src/sdk/session.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-mcp-discovery.test.ts");
+		for (const ownerTest of extensibilityOwnerTests) expect(keys).toContain(`test:${ownerTest}`);
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
 	});
 	test("never emits a runnable task for a nonexistent test path", () => {
 		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
@@ -1765,6 +1807,23 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
 	});
 
+	test("push mode runs the Cargo owner-session regression directly with Rust, outside general shards", async () => {
+		const testFile = "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts";
+		const files = await enumerateTestFiles("packages/coding-agent");
+		expect(files).not.toContain(testFile);
+
+		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
+		const entries = describeTasks(tasks);
+		const directTask = entries.find(entry => entry.key === `test:${testFile}`);
+		expect(directTask).toMatchObject({
+			command: ["bun", "test", testFile],
+			rust: true,
+		});
+		const generalShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(generalShards).toHaveLength(8);
+		expect(generalShards.every(entry => !entry.rust)).toBe(true);
+	});
+
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {
 		const ai: WorkspacePackage = {
 			name: "@gajae-code/ai",
@@ -1927,10 +1986,11 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 	}
 
 	test("default env emits the complete task union and omits root-check", () => {
-		const keys = withEnv(
+		const tasks = withEnv(
 			{ CI_CODING_AGENT_TEST_SHARDS: undefined, CI_RUST_TEST_PARTITIONS: undefined },
-			() => planFullTasks(fullModePackages).map(task => task.key),
+			() => planFullTasks(fullModePackages),
 		);
+		const keys = tasks.map(task => task.key);
 		// root-check is covered by the dedicated native-free `check` job.
 		expect(keys).not.toContain("root-check");
 		expect(keys).toContain("native-linux-x64");
@@ -1943,6 +2003,16 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
+		const entries = describeTasks(tasks);
+		const cargoTask = entries.find(
+			entry => entry.key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		);
+		expect(cargoTask).toMatchObject({
+			command: ["bun", "test", "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"],
+			rust: true,
+		});
+		const codingAgentShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(codingAgentShards.every(entry => !entry.rust)).toBe(true);
 		// Default rust-test stays a single unpartitioned task.
 		expect(keys).toContain("rust-test");
 		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);
@@ -2008,5 +2078,62 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
+	});
+});
+
+/**
+ * #5583/#5623 review round 4: `schemas/*.json` is generated from
+ * `settings-schema.ts`, and the `--check` gate that catches drift between them
+ * lives only inside `ci:check:full`. Neither planner selected that for a change
+ * confined to those two files, so a settings change could ship with a stale
+ * generated schema and a green affected run.
+ */
+describe("generated JSON schema sync selection", () => {
+	const codingAgent: WorkspacePackage = {
+		name: "@gajae-code/coding-agent",
+		dir: "packages/coding-agent",
+		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const schemaPackages = [codingAgent];
+	const SETTINGS_SCHEMA = "packages/coding-agent/src/config/settings-schema.ts";
+	const CHECK_SCHEMAS = ["bun", "run", "check:schemas"];
+
+	function plans(paths: readonly string[]) {
+		return [planTasks(paths, schemaPackages), planTargetedTasks(paths, schemaPackages, [])];
+	}
+
+	test("isSchemaContractPath matches both sides of the generated contract", () => {
+		expect(isSchemaContractPath("schemas/config.schema.json")).toBe(true);
+		expect(isSchemaContractPath(SETTINGS_SCHEMA)).toBe(true);
+		expect(isSchemaContractPath("packages/coding-agent/src/config/settings.ts")).toBe(false);
+		expect(isSchemaContractPath("packages/coding-agent/schemas/other.json")).toBe(false);
+	});
+
+	test("changing the generated schema alone selects the sync check in both planners", () => {
+		for (const tasks of plans(["schemas/config.schema.json"])) {
+			const task = tasks.find(candidate => candidate.key === "check-schemas");
+			expect(task).toBeDefined();
+			expect(task?.command).toEqual(CHECK_SCHEMAS);
+			expect(task?.cwd).toBeUndefined();
+		}
+	});
+
+	test("changing the settings schema alone selects the sync check in both planners", () => {
+		for (const tasks of plans([SETTINGS_SCHEMA])) {
+			expect(tasks.find(candidate => candidate.key === "check-schemas")?.command).toEqual(CHECK_SCHEMAS);
+		}
+	});
+
+	test("an unrelated path never selects the sync check", () => {
+		for (const tasks of plans(["packages/coding-agent/src/edit/foo.ts"])) {
+			expect(tasks.map(task => task.key)).not.toContain("check-schemas");
+		}
+	});
+
+	test("the sync check is a single planned task, so it flows into the normal shard aggregate", () => {
+		for (const tasks of plans(["schemas/config.schema.json", SETTINGS_SCHEMA])) {
+			expect(tasks.filter(task => task.key === "check-schemas")).toHaveLength(1);
+			expect(describeTasks(tasks).find(entry => entry.key === "check-schemas")).toBeDefined();
+		}
 	});
 });

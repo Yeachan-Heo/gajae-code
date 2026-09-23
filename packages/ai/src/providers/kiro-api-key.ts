@@ -231,6 +231,13 @@ const STATIC_KIRO_API_CATALOG: Array<{
 		image: true,
 	},
 	{
+		modelId: "claude-opus-5.5",
+		modelName: "Claude Opus 5.5",
+		maxInputTokens: 1_000_000,
+		maxOutputTokens: 128_000,
+		image: false,
+	},
+	{
 		modelId: "gpt-5.6-luna",
 		modelName: "GPT 5.6 Luna",
 		maxInputTokens: 272_000,

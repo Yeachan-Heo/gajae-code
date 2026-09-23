@@ -8,6 +8,7 @@ import type {
 	ChatCompletionContentPartImage,
 	ChatCompletionContentPartText,
 	ChatCompletionMessageParam,
+	ChatCompletionToolChoiceOption,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
@@ -1884,25 +1885,6 @@ function buildParams(
 		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
 	}
 
-	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
-		// DeepSeek reasoning models accept tools/tool_choice, but reject that
-		// control field while thinking is enabled. Keep the tool-selection
-		// contract and suppress reasoning for this single request.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-	}
-
-	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
-		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
-		// with thinking enabled`. Suppress thinking for this single forced-tool
-		// turn while keeping the tool-selection contract intact.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-		if (compat.thinkingFormat === "zai") {
-			params.thinking = { type: "disabled" };
-		}
-	}
-
 	// OpenRouter provider routing preferences
 	if (model.baseUrl.includes("openrouter.ai") && compat.openRouterRouting) {
 		params.provider = compat.openRouterRouting;
@@ -1922,13 +1904,46 @@ function buildParams(
 	if (compat.extraBody) {
 		// The resolved output limit owns the selected wire field; extraBody is a
 		// free-form compatibility escape hatch and must not add a competing
-		// max-token field or overwrite the resolved budget.
-		const { max_tokens, max_completion_tokens, max_output_tokens, ...restExtra } = compat.extraBody as Record<
-			string,
-			unknown
-		>;
+		// max-token field or overwrite the resolved budget. tool_choice follows
+		// the same discipline on both sides: an injected default (an endpoint
+		// whose tool_choice default is "none", like IO Intelligence, would
+		// otherwise stop tool calls) may only fill the gap on an ordinary turn
+		// that offers tools but resolved no directive of its own. Explicit
+		// directives — forced tools, retry reminders — stay untouched, and
+		// turns that deliberately carry no tools keep their stripped shape
+		// instead of re-adding tool_choice with an empty tools list.
+		const { max_tokens, max_completion_tokens, max_output_tokens, tool_choice, ...restExtra } =
+			compat.extraBody as Record<string, unknown>;
+		if (
+			tool_choice !== undefined &&
+			params.tool_choice === undefined &&
+			Array.isArray(params.tools) &&
+			params.tools.length > 0
+		) {
+			params.tool_choice = tool_choice as ChatCompletionToolChoiceOption;
+		}
 		Object.assign(params, restExtra);
 	}
+
+	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
+		// DeepSeek reasoning models accept tools/tool_choice, but reject that
+		// control field while thinking is enabled. Keep the tool-selection
+		// contract and suppress reasoning for this single request.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+	}
+
+	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
+		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
+		// with thinking enabled`. Suppress thinking for this single forced-tool
+		// turn while keeping the tool-selection contract intact.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+		if (compat.thinkingFormat === "zai") {
+			params.thinking = { type: "disabled" };
+		}
+	}
+
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
 	if (!supportsReasoningParams) {
 		delete params.reasoning;

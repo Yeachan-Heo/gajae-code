@@ -4,6 +4,24 @@ import { createLazyService, type LazyService } from "./lazy-service";
 
 type FetchWithPreconnect = typeof fetch & { preconnect?: (url: string) => void };
 
+function withDefaultPort(baseUrl: string): { normalized: string; fallback?: string } {
+	try {
+		const parsed = new URL(baseUrl);
+		if (parsed.port || parsed.protocol !== "https:") return { normalized: baseUrl };
+		const port = "443";
+		const path = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+		const authority = parsed.host;
+		const normalized = `${parsed.protocol}//${authority}:${port}${path}`;
+		// Bun 1.4.0 rejects the default port after WHATWG URL normalization. Its
+		// HTTP-form URL still reaches the same port and keeps the TCP warmup alive
+		// until the runtime accepts the canonical HTTPS form.
+		const fallback = parsed.protocol === "https:" ? `http://${authority}:${port}${path}` : undefined;
+		return { normalized, fallback };
+	} catch {
+		return { normalized: baseUrl };
+	}
+}
+
 /** Runtime network prewarm and first-request latency diagnostics. */
 export interface NetworkPrewarmRuntime {
 	enabled: boolean;
@@ -30,11 +48,18 @@ export function createNetworkPrewarmService(settings: Settings): LazyService<Net
 						if (!enabled || !baseUrl) return;
 						const preconnect = (globalThis.fetch as FetchWithPreconnect).preconnect;
 						if (typeof preconnect !== "function") return;
+						const { normalized, fallback } = withDefaultPort(baseUrl);
 						try {
-							preconnect(baseUrl);
+							preconnect(normalized);
 						} catch (error) {
-							// Preserve the legacy best-effort optimization contract while keeping
-							// the diagnostic visible to debug logging.
+							if (fallback) {
+								try {
+									preconnect(fallback);
+									return;
+								} catch {
+									// Fall through to the best-effort diagnostic below.
+								}
+							}
 							logger.debug("Model-host preconnect failed", {
 								baseUrl,
 								error: error instanceof Error ? error.message : String(error),

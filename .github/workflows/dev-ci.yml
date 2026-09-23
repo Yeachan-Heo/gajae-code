@@ -361,6 +361,7 @@ jobs:
       has_risk_canaries: ${{ steps.plan.outputs.has_risk_canaries }}
       has_darwin_arm64_tab_worker_smoke: ${{ steps.plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       has_windows_session_path: ${{ steps.plan.outputs.has_windows_session_path }}
+      has_protected_daemon_decl: ${{ steps.plan.outputs.has_protected_daemon_decl }}
       changed_paths: ${{ steps.plan.outputs.changed_paths }}
       plan_mode: ${{ steps.plan.outputs.plan_mode }}
       plan_digest: ${{ steps.plan.outputs.plan_digest }}
@@ -434,7 +435,7 @@ jobs:
   telegram-daemon-generation:
     name: Telegram daemon generation guard
     needs: [affected-plan]
-    if: ${{ needs.affected-plan.outputs.relevant == 'true' && (contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/host/host.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/client/discovery.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-guard.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-manifest.json')) }}
+    if: ${{ needs.affected-plan.outputs.relevant == 'true' && needs.affected-plan.outputs.has_protected_daemon_decl == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     env:
@@ -483,7 +484,9 @@ jobs:
           git remote add guard-head "https://github.com/${HEAD_REPOSITORY}.git"
           git remote add guard-base "https://github.com/${BASE_REPOSITORY}.git"
           git fetch --no-tags guard-head "refs/heads/${HEAD_REF}:refs/remotes/guard-head/${HEAD_REF}"
+          head_ref_sha="$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
           base_ref_sha=''
+          head_ref_descends_from_event_head=''
           case "${GUARD_EVENT_NAME}" in
             pull_request)
               # The immutable event base object remains authoritative while a queued
@@ -497,15 +500,27 @@ jobs:
               ;;
             push)
               git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              if git merge-base --is-ancestor "${GITHUB_HEAD_SHA}" "${head_ref_sha}"; then
+                head_ref_descends_from_event_head=true
+              else
+                status=$?
+                if [ "${status}" -eq 1 ]; then
+                  echo "::error::Fetched push head ref ${HEAD_REF} does not descend from immutable event head ${GITHUB_HEAD_SHA}."
+                else
+                  echo "::error::Could not prove immutable event head ${GITHUB_HEAD_SHA} is an ancestor of fetched push head ref ${HEAD_REF} (merge-base exit ${status})."
+                fi
+                exit 1
+              fi
               ;;
           esac
           {
             echo "GUARD_CHECKED_OUT_HEAD=$(git rev-parse --verify HEAD^{commit})"
-            echo "GUARD_HEAD_REF_SHA=$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
+            echo "GUARD_HEAD_REF_SHA=${head_ref_sha}"
+            echo "GUARD_HEAD_REF_DESCENDS_FROM_EVENT_HEAD=${head_ref_descends_from_event_head}"
             echo "GUARD_BASE_OBJECT_SHA=$(git rev-parse --verify "${GITHUB_BASE_SHA}^{commit}")"
             echo "GUARD_BASE_REF_SHA=${base_ref_sha}"
           } >> "${GITHUB_ENV}"
-          printf 'guard evidence: base %s@%s; head %s@%s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${HEAD_REPOSITORY}" "${HEAD_REF}"
+          printf 'guard evidence: base %s@%s; event head %s; fetched head %s@%s; descendant proof %s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${GITHUB_HEAD_SHA}" "${HEAD_REPOSITORY}" "${head_ref_sha}" "${head_ref_descends_from_event_head:-not-applicable}"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.4.0"
@@ -1033,7 +1048,7 @@ jobs:
           CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_RESULT: ${{ needs.windows-native-build-toolchain.result }}
           CI_DEV_WINDOWS_NATIVE_TOOLCHAIN_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/build-native.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/scripts/rust-toolchain-path.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/build-native-profile.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/ci-build-native.ts') }}
           CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
-          CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/host/host.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/client/discovery.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-guard.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-manifest.json') }}
+          CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.has_protected_daemon_decl }}
           CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}
           CI_DEV_TELEGRAM_WINDOWS_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/ps.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-shell/src/process.rs') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.d.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.js') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/path-identity-windows.test.ts') }}
           CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-darwin-arm64-tab-worker-smoke.result }}
@@ -1081,7 +1096,7 @@ jobs:
       CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_RESULT: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke == 'true' && 'success' || 'skipped' }}
       CI_DEV_DARWIN_ARM64_TAB_WORKER_SMOKE_REQUIRED: ${{ needs.affected-plan.outputs.has_darwin_arm64_tab_worker_smoke }}
       CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}
-      CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/host/host.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/client/discovery.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-guard.ts') || contains(needs.affected-plan.outputs.changed_paths, 'scripts/telegram-daemon-generation-manifest.json') }}
+      CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.has_protected_daemon_decl }}
       CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}
       CI_DEV_TELEGRAM_WINDOWS_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon-control.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/coding-agent/src/sdk/broker/process-incarnation.ts') || contains(needs.affected-plan.outputs.changed_paths, 'daemon-control.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'notifications-telegram-daemon.test.ts') || contains(needs.affected-plan.outputs.changed_paths, 'chat-daemon') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/path_identity.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-natives/src/ps.rs') || contains(needs.affected-plan.outputs.changed_paths, 'crates/pi-shell/src/process.rs') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.d.ts') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/native/index.js') || contains(needs.affected-plan.outputs.changed_paths, 'packages/natives/test/path-identity-windows.test.ts') }}
     steps:

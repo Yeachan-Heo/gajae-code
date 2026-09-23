@@ -66,8 +66,8 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 			sessionManager.appendMessage(assistant);
 		}
 	}
-	function replaceSession(model: Model, settingsOverrides: Record<string, unknown> = {}): void {
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
+	function replaceSession(model: Model | undefined, settingsOverrides: Record<string, unknown> = {}): void {
+		if (model) authStorage.setRuntimeApiKey(model.provider, "test-key");
 		const agent = new Agent({
 			initialState: {
 				model,
@@ -105,9 +105,10 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 		await session.runIdleCompaction();
 		await session.runIdleCompaction();
 
-		// One maintenance attempt may try multiple model candidates. The retry must
-		// not start a second attempt with the same unchanged request.
-		expect(compactSpy).toHaveBeenCalledTimes(2);
+		// Recovery only tries the active model unless an explicit role fallback is
+		// configured. The retry must not start a second attempt with the same
+		// unchanged request.
+		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(events).toHaveLength(2);
 		expect(events[0]).toMatchObject({
 			errorMessage: expect.stringContaining("prompt is too long"),
@@ -134,7 +135,28 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 
 		await session.runIdleCompaction();
 
-		expect(compactSpy).toHaveBeenCalledTimes(4);
+		expect(compactSpy).toHaveBeenCalledTimes(2);
+	});
+	it("reports automatic compaction without an active model as a failure event", async () => {
+		await session.dispose();
+		replaceSession(undefined);
+		appendConversation("missing active model");
+		const events: Extract<AgentSessionEvent, { type: "auto_compaction_end" }>[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") events.push(event);
+		});
+
+		await session.runIdleCompaction();
+
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			type: "auto_compaction_end",
+			action: "context-full",
+			aborted: false,
+			willRetry: false,
+			errorMessage: expect.stringContaining("No model selected"),
+		});
+		expect(events[0]?.skipped).toBeUndefined();
 	});
 	it("does not retry a Kimi Code compaction first-event timeout on the same candidate", async () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.5");
@@ -204,7 +226,7 @@ describe("AgentSession oversized auto-maintenance guard", () => {
 
 			const matchingCalls = compactSpy.mock.calls.filter(([, candidate]) => candidate.id === testCase.model.id);
 			expect(matchingCalls).toHaveLength(1);
-			expect(compactSpy.mock.calls.length).toBeGreaterThan(matchingCalls.length);
+			expect(compactSpy.mock.calls.length).toBe(matchingCalls.length);
 			expect(waitSpy).not.toHaveBeenCalled();
 			expect(events).toHaveLength(1);
 			expect(events[0]).toMatchObject({ willRetry: false });

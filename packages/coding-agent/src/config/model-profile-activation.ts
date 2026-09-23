@@ -10,6 +10,7 @@ import {
 	formatModelProfileDisplayLabel,
 	type ModelProfileDefinition,
 	PROXY_ROUTABLE_PROVIDER_IDS,
+	type ResolvedProfileBinding,
 	resolveProfileBindings,
 } from "./model-profiles";
 
@@ -21,11 +22,13 @@ import {
 	isAuthenticated,
 	kNoAuth,
 	type ModelRegistry,
+	registrySelectorResolvesToModel,
 } from "./model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelString,
 	parseModelString,
+	resolveConfiguredModelPatterns,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
 	splitSelectorThinkingSuffix,
@@ -645,6 +648,245 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
+/** Resolve a removed saved-session default through the durable profile without mutating persistent state. */
+export async function resolveMissingSessionModelRecovery(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get" | "getModelRole">;
+	defaultEntries: readonly string[];
+	skips: Array<{ selector: string; reason: string }>;
+	savedDefault: string | undefined;
+	credentialSessionId: string;
+	aliasIntent?: "preset-equivalent";
+}): Promise<
+	| {
+			profileName: string;
+			entries: string[];
+			model?: Model<Api>;
+			thinkingLevel?: ThinkingLevel;
+			explicitThinkingLevel: boolean;
+			activeIndex: number;
+			skips: Array<{ selector: string; reason: string }>;
+	  }
+	| undefined
+> {
+	const allSelectorsUnknown =
+		options.skips.length === options.defaultEntries.length &&
+		options.skips.every(skip => skip.reason === "unknown_model");
+	if (!allSelectorsUnknown) return undefined;
+	const fullCatalog = options.modelRegistry.getAll();
+	const savedSelectorsMissingFromCatalog = resolveConfiguredModelPatterns(
+		options.defaultEntries,
+		options.settings,
+	).every(selector => {
+		if (
+			resolveModelRoleValue(selector, fullCatalog, {
+				settings: options.settings,
+				modelRegistry: options.modelRegistry,
+				credentialSessionId: options.credentialSessionId,
+				...(options.aliasIntent ? { aliasIntent: options.aliasIntent } : {}),
+			}).model
+		)
+			return false;
+		return !registrySelectorResolvesToModel(selector, fullCatalog);
+	});
+	const savedConcreteDefault = options.savedDefault ? parseModelString(options.savedDefault) : undefined;
+	const savedConcreteDefaultMissingFromCatalog =
+		savedConcreteDefault === undefined ||
+		!fullCatalog.some(
+			model =>
+				model.provider.toLowerCase() === savedConcreteDefault.provider.toLowerCase() &&
+				model.id.toLowerCase() === savedConcreteDefault.id.toLowerCase(),
+		);
+	const durableProfile = options.settings.get("modelProfile.default");
+	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !durableProfile)
+		return undefined;
+	return resolveModelProfileDefaultChain({
+		modelRegistry: options.modelRegistry,
+		settings: options.settings,
+		profileName: durableProfile,
+		credentialSessionId: options.credentialSessionId,
+	});
+}
+
+/** Resolve a durable profile's effective default chain without mutating session or settings state. */
+export async function resolveModelProfileDefaultChain(options: {
+	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
+	settings: Pick<Settings, "get">;
+	profileName: string;
+	credentialSessionId: string;
+}): Promise<{
+	profileName: string;
+	entries: string[];
+	model?: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	explicitThinkingLevel: boolean;
+	activeIndex: number;
+	skips: Array<{ selector: string; reason: string }>;
+}> {
+	const profiles = options.modelRegistry.getModelProfiles();
+	const profileName = validateModelProfileName(options.profileName, profiles, options.modelRegistry.getError?.());
+	const profile = profiles.get(profileName) ?? options.modelRegistry.getModelProfile(profileName)!;
+	const profileLabel = formatModelProfileDisplayLabel(profile);
+	const requiredProviders = aggregateModelProfileRequiredProviders(profile.requiredProviders, profile);
+	const alternativeGroups = profile.alternativeProviderGroups ?? [];
+	const alternativeSet = new Set(alternativeGroups.flat());
+	const requiredProviderSet = new Set(requiredProviders);
+	const authenticatedProviders = new Set<string>();
+	const missingProviders: string[] = [];
+	const configuredProviderIds = options.modelRegistry.getConfiguredProviderIds?.();
+	if (configuredProviderIds !== undefined || options.modelRegistry.isKnownProvider !== undefined) {
+		const isProviderKnown = (provider: string): boolean =>
+			(options.modelRegistry.isKnownProvider?.(provider) ?? false) ||
+			isKnownProvider(provider) ||
+			configuredProviderIds?.includes(provider) === true;
+		const unknownProviderIds = new Set<string>();
+		for (const provider of requiredProviders) {
+			if (!alternativeSet.has(provider) && !isProviderKnown(provider)) unknownProviderIds.add(provider);
+		}
+		for (const group of alternativeGroups) {
+			if (group.some(isProviderKnown)) continue;
+			for (const provider of group) {
+				if (!isProviderKnown(provider)) unknownProviderIds.add(provider);
+			}
+		}
+		const unknownProviders = [...unknownProviderIds].sort();
+		if (unknownProviders.length > 0) throw new ModelProfileUnknownProviderError(profileLabel, unknownProviders);
+	}
+	for (const provider of new Set([
+		...requiredProviders,
+		...alternativeSet,
+		...deriveModelProfileMappedProviders(profile),
+	])) {
+		let apiKey: string | undefined;
+		try {
+			apiKey = await options.modelRegistry.getApiKeyForProvider(provider, options.credentialSessionId);
+		} catch (error) {
+			if (requiredProviderSet.has(provider) && !alternativeSet.has(provider)) throw error;
+			continue;
+		}
+		if (apiKey === kNoAuth || isAuthenticated(apiKey)) authenticatedProviders.add(provider);
+		else if (requiredProviderSet.has(provider)) missingProviders.push(provider);
+	}
+	const proxyProvider = profile.source !== "user" ? resolveProxyProviderId(options.settings) : undefined;
+	const proxyMode = profile.source !== "user" ? resolveProxyMode(options.settings) : "fallback";
+	const proxyRoutableProviders =
+		profile.source === "user"
+			? new Set<string>()
+			: profile.source === "registry"
+				? new Set([
+						...PROXY_ROUTABLE_PROVIDER_IDS,
+						...profile.requiredProviders,
+						...deriveModelProfileMappedProviders(profile),
+					])
+				: PROXY_ROUTABLE_PROVIDER_IDS;
+	if (proxyMode === "always" && proxyProvider === undefined)
+		throw new Error('modelProfile.proxyMode "always" requires modelProfile.proxyProvider');
+	const proxyApiKey =
+		proxyProvider === undefined
+			? undefined
+			: await options.modelRegistry.getApiKeyForProvider(proxyProvider, options.credentialSessionId);
+	if (
+		proxyProvider !== undefined &&
+		!isModelProfileProxyConfigured(proxyProvider, configuredProviderIds, proxyApiKey === kNoAuth)
+	) {
+		throw new Error(
+			`modelProfile.proxyProvider "${proxyProvider}" is not configured. Configure it with \`gjc setup provider\` before activating a preset.`,
+		);
+	}
+	const proxyAuthenticated = proxyApiKey !== undefined && (proxyApiKey === kNoAuth || isAuthenticated(proxyApiKey));
+	if (proxyMode === "always" && !proxyAuthenticated)
+		throw new ModelProfileCredentialError(profileLabel, [proxyProvider!]);
+	const strictMissing = missingProviders.filter(
+		provider => !proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictMissing.length > 0) throw new ModelProfileCredentialError(profileLabel, strictMissing);
+	const strictRoutableMissing = missingProviders.filter(
+		provider => proxyRoutableProviders.has(provider) && !alternativeSet.has(provider),
+	);
+	if (strictRoutableMissing.length > 0 && !proxyAuthenticated) {
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			proxyProvider === undefined ? strictRoutableMissing : [proxyProvider],
+		);
+	}
+	for (const group of alternativeGroups) {
+		if (group.some(provider => authenticatedProviders.has(provider))) continue;
+		const allRoutable = group.every(provider => proxyRoutableProviders.has(provider));
+		if (allRoutable && proxyAuthenticated) continue;
+		throw new ModelProfileCredentialError(
+			profileLabel,
+			allRoutable && proxyProvider !== undefined ? [proxyProvider] : [...group],
+		);
+	}
+	const availableModels =
+		options.modelRegistry.getAvailableForProfileActivation?.() ??
+		options.modelRegistry.getAvailable?.() ??
+		options.modelRegistry.getAll();
+	let bindings = resolveProfileBindings(profile);
+	if (alternativeGroups.length > 0)
+		bindings = rewriteBindingsProviders(bindings, authenticatedProviders, alternativeGroups);
+	if (proxyProvider !== undefined && proxyAuthenticated && profile.source !== "user") {
+		bindings = rewriteBindingsForProxy(
+			bindings,
+			proxyProvider,
+			proxyMode,
+			availableModels,
+			authenticatedProviders,
+			proxyRoutableProviders,
+		);
+	}
+	await preflightModelProfileRoleBindings({
+		profile,
+		bindings,
+		roleCatalogModels: options.modelRegistry.getAll(),
+		settings: options.settings as Settings,
+		modelRegistry: options.modelRegistry as ModelRegistry,
+		sessionId: "",
+		credentialSessionId: options.credentialSessionId,
+		profileLabel,
+	});
+	if (!bindings.defaultSelector)
+		return { profileName, entries: [], explicitThinkingLevel: false, activeIndex: 0, skips: [] };
+	const defaultChain = normalizeModelSelectorValue(
+		await resolveAndClampSelectorValue(
+			bindings.defaultSelector,
+			availableModels,
+			{
+				settings: options.settings as Settings,
+				modelRegistry: options.modelRegistry as ModelRegistry,
+				sessionId: "",
+				credentialSessionId: options.credentialSessionId,
+				aliasIntent: "preset-equivalent",
+			},
+			profileLabel,
+			"default",
+		),
+	);
+	const resolution = await resolveModelChainWithAuth(
+		defaultChain,
+		{
+			getAvailable: () => availableModels,
+			getApiKey: (model, sessionId) =>
+				options.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+			resolveCanonicalModel: options.modelRegistry.resolveCanonicalModel?.bind(options.modelRegistry),
+			getCanonicalVariants: options.modelRegistry.getCanonicalVariants?.bind(options.modelRegistry),
+			getCanonicalId: options.modelRegistry.getCanonicalId?.bind(options.modelRegistry),
+			resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
+			lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
+			clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+		} as ModelRegistry,
+		options.settings as Settings,
+		options.credentialSessionId,
+		{
+			managedFallback: true,
+			aliasIntent: "preset-equivalent",
+			canonicalSessionId: null,
+			credentialSessionId: options.credentialSessionId,
+		},
+	);
+	return { profileName, entries: defaultChain, ...resolution };
+}
+
 export function rewriteSelectorForProxy(
 	selector: string,
 	proxyProvider: string,
@@ -890,6 +1132,49 @@ async function resolveAndClampSelectorValue(
 		);
 	}
 	return clamped.length === 1 && typeof selectorValue === "string" ? clamped[0] : clamped;
+}
+
+/** Resolve every non-default binding under the profile activation contract without installing it. */
+async function preflightModelProfileRoleBindings(options: {
+	profile: ModelProfileDefinition;
+	bindings: ResolvedProfileBinding;
+	roleCatalogModels: Model<Api>[];
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	sessionId: string;
+	credentialSessionId: string;
+	profileLabel: string;
+}): Promise<{
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Record<string, ModelSelectorValue>;
+}> {
+	const resolveBindings = async (bindings: Record<string, ModelSelectorValue>) => {
+		const resolved: Record<string, ModelSelectorValue> = {};
+		for (const [role, selectorValue] of Object.entries(bindings) as [
+			GjcModelAssignmentTargetId,
+			ModelSelectorValue,
+		][]) {
+			resolved[role] = await resolveAndClampSelectorValue(
+				selectorValue,
+				options.roleCatalogModels,
+				{
+					settings: options.settings,
+					modelRegistry: options.modelRegistry,
+					sessionId: options.sessionId,
+					credentialSessionId: options.credentialSessionId,
+					aliasIntent: "preset-equivalent",
+					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(options.profile),
+				},
+				options.profileLabel,
+				role,
+			);
+		}
+		return resolved;
+	};
+	return {
+		modelRoles: await resolveBindings(options.bindings.modelRoles),
+		agentModelOverrides: await resolveBindings(options.bindings.agentModelOverrides),
+	};
 }
 
 async function concretizeProfileSelectorValue(
@@ -1186,47 +1471,16 @@ export async function prepareModelProfileActivation(
 			throw new Error(`Model profile "${profileLabel}" default selectors did not resolve to an authenticated model`);
 		}
 
-		const modelRoles: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.modelRoles) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			modelRoles[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
-
-		const agentModelOverrides: Record<string, ModelSelectorValue> = {};
-		for (const [role, selectorValue] of Object.entries(bindings.agentModelOverrides) as [
-			GjcModelAssignmentTargetId,
-			ModelSelectorValue,
-		][]) {
-			agentModelOverrides[role] = await resolveAndClampSelectorValue(
-				selectorValue,
-				roleCatalogModels,
-				{
-					settings: options.settings as Settings,
-					modelRegistry: options.modelRegistry as ModelRegistry,
-					sessionId: options.session.sessionId,
-					credentialSessionId,
-					aliasIntent: "preset-equivalent",
-					requireQualifiedResolution: requiresQualifiedModelProfileRoleResolution(profile),
-				},
-				profileLabel,
-				role,
-			);
-		}
+		const { modelRoles, agentModelOverrides } = await preflightModelProfileRoleBindings({
+			profile,
+			bindings,
+			roleCatalogModels,
+			settings: options.settings as Settings,
+			modelRegistry: options.modelRegistry as ModelRegistry,
+			sessionId: options.session.sessionId,
+			credentialSessionId,
+			profileLabel,
+		});
 
 		return {
 			profileName,
@@ -1274,15 +1528,58 @@ export async function prepareModelProfileActivation(
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
 	} catch (error) {
-		restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+		try {
+			restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+		} catch (rollbackError) {
+			throw incompleteModelProfileRollbackError("preparation", "profile preflight", error, [
+				{ stage: "restore canonical model variant", error: rollbackError },
+			]);
+		}
 		throw error;
 	}
+}
+
+function modelProfileFailureReason(error: unknown, stage: string): string {
+	try {
+		if (error instanceof ModelProfileCredentialError) return "required credentials unavailable";
+		if (error instanceof Error && error.message.startsWith("No API key for ")) return "credentials unavailable";
+	} catch {
+		// An exotic error getter must not replace the activation failure.
+	}
+	return stage.includes("settings") || stage.startsWith("persist ") || stage.endsWith(" setting")
+		? "settings write failed"
+		: "operation failed";
+}
+
+class ModelProfileActivationStageError extends Error {
+	readonly stage: string;
+
+	constructor(stage: string, error: unknown) {
+		super(`${stage} (${modelProfileFailureReason(error, stage)})`, { cause: error });
+		this.name = "ModelProfileActivationStageError";
+		this.stage = stage;
+	}
+}
+
+function incompleteModelProfileRollbackError(
+	phase: "preparation" | "activation",
+	stage: string,
+	error: unknown,
+	rollbackErrors: readonly { stage: string; error: unknown }[],
+): AggregateError {
+	const primary = new ModelProfileActivationStageError(stage, error);
+	const incomplete = rollbackErrors.map(failure => new ModelProfileActivationStageError(failure.stage, failure.error));
+	return new AggregateError(
+		[primary, ...incomplete],
+		`Model profile ${phase} failed at ${primary.message}; rollback incomplete: ${incomplete.map(failure => failure.message).join("; ")}. Prior state may be unverified.`,
+	);
 }
 
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	let activationStage = "default chain";
 	let modelMutationStarted = false;
 	let overridesChanged = false;
 	let modelRolesChanged = false;
@@ -1313,15 +1610,21 @@ export async function applyPreparedModelProfileActivation(
 			}
 		}
 		if (prepared.defaultModel) {
-			modelMutationStarted = true;
+			activationStage = "model selection";
 			await prepared.session.setModelTemporary(
 				prepared.defaultModel,
 				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{ cause: "profile-activation" },
+				{
+					cause: "profile-activation",
+					onMutationStarted: () => {
+						modelMutationStarted = true;
+					},
+				},
 			);
 		}
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.
+		activationStage = "model role overrides";
 		prepared.settings.override("modelRoles", {
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
@@ -1330,6 +1633,7 @@ export async function applyPreparedModelProfileActivation(
 		// Always reinstall the agent role layer from the durable base plus the
 		// new profile's roles: a default-only or role-free successor must drop
 		// the previous profile's role-agent mappings rather than inheriting them.
+		activationStage = "agent role overrides";
 		prepared.settings.override("task.agentModelOverrides", {
 			...prepared.baseAgentModelOverrides,
 			...prepared.agentModelOverrides,
@@ -1337,65 +1641,74 @@ export async function applyPreparedModelProfileActivation(
 		overridesChanged = true;
 		if (options.persistDefault) {
 			persistentMutationStarted = true;
+			activationStage = "persist model roles";
 			prepared.settings.set("modelRoles", {});
+			activationStage = "persist agent roles";
 			prepared.settings.set("task.agentModelOverrides", {});
 			if (prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit) {
+				activationStage = "persist thinking level";
 				prepared.settings.set("defaultThinkingLevel", prepared.defaultThinkingLevel);
 			}
+			activationStage = "persist default profile";
 			prepared.settings.set("modelProfile.default", prepared.profileName);
+			activationStage = "forward settings flush";
 			await prepared.settings.flushOrThrow();
 		}
+		activationStage = "active profile marker";
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
+			activationStage = "canonical model variant";
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
+			activationStage = "resume default model";
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
 		}
+		activationStage = "installed role tracking";
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
 		);
 	} catch (error) {
-		const rollbackErrors: unknown[] = [];
-		const restore = (action: () => void): void => {
+		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
+		const restore = (stage: string, action: () => void): void => {
 			try {
 				action();
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage, error: rollbackError });
 			}
 		};
 		if (persistentMutationStarted) {
-			restore(() =>
+			restore("restore default profile setting", () =>
 				prepared.previousPersistedDefaultProfile === undefined
 					? prepared.settings.unset("modelProfile.default")
 					: prepared.settings.set("modelProfile.default", prepared.previousPersistedDefaultProfile),
 			);
-			restore(() =>
+			restore("restore model role setting", () =>
 				prepared.previousPersistedModelRoles === undefined
 					? prepared.settings.unset("modelRoles")
 					: prepared.settings.set("modelRoles", prepared.previousPersistedModelRoles),
 			);
-			restore(() =>
+			restore("restore agent role setting", () =>
 				prepared.previousPersistedAgentModelOverrides === undefined
 					? prepared.settings.unset("task.agentModelOverrides")
 					: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
 			);
-			restore(() =>
+			restore("restore thinking level setting", () =>
 				prepared.previousPersistedDefaultThinkingLevel === undefined
 					? prepared.settings.unset("defaultThinkingLevel")
 					: prepared.settings.set("defaultThinkingLevel", prepared.previousPersistedDefaultThinkingLevel),
 			);
 		}
 		if (modelRolesChanged) {
-			restore(() =>
+			restore("restore model role overrides", () =>
 				prepared.previousModelRolesOverride === undefined
 					? prepared.settings.clearOverride("modelRoles")
 					: prepared.settings.override("modelRoles", prepared.previousModelRolesOverride),
 			);
 		}
 		if (overridesChanged) {
-			restore(() =>
+			restore("restore agent role overrides", () =>
 				prepared.previousAgentModelOverridesOverride === undefined
 					? prepared.settings.clearOverride("task.agentModelOverrides")
 					: prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverridesOverride),
@@ -1416,15 +1729,17 @@ export async function applyPreparedModelProfileActivation(
 					throw new Error("Model-less profile activation rollback is unavailable");
 				}
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage: "restore live model", error: rollbackError });
 			}
 		}
 		if (resumeDefaultChanged) {
-			restore(() => prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel));
+			restore("restore resume default", () =>
+				prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel),
+			);
 		}
 		if (defaultChainChanged) {
 			const previousChain = prepared.previousDefaultChainState;
-			restore(() =>
+			restore("restore default chain", () =>
 				prepared.session.setConfiguredModelChain(
 					"default",
 					previousChain?.entries ??
@@ -1437,26 +1752,25 @@ export async function applyPreparedModelProfileActivation(
 			);
 		}
 		if (prepared.previousDefaultFallbackRuntimeState) {
-			restore(() =>
+			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
 		}
-		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
-		restore(() =>
+		restore("restore active profile", () =>
+			prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+		);
+		restore("restore canonical model variant", () =>
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
 		);
 		if (persistentMutationStarted) {
 			try {
 				await prepared.settings.flushOrThrow();
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage: "restore settings flush", error: rollbackError });
 			}
 		}
 		if (rollbackErrors.length > 0) {
-			throw new AggregateError(
-				[error, ...rollbackErrors],
-				"Model profile activation failed and rollback was incomplete",
-			);
+			throw incompleteModelProfileRollbackError("activation", activationStage, error, rollbackErrors);
 		}
 		throw error;
 	}
@@ -1727,4 +2041,35 @@ export async function activateModelProfile(
 ): Promise<void> {
 	const prepared = await prepareModelProfileActivation(options);
 	await applyPreparedModelProfileActivation(prepared, applyOptions);
+}
+
+/** Install only a profile's runtime role layer, preserving session model and configured-chain intent. */
+export async function applyModelProfileRuntimeBindings(options: PrepareModelProfileActivationOptions): Promise<void> {
+	const prepared = await prepareModelProfileActivation(options);
+	try {
+		prepared.settings.override("modelRoles", {
+			...prepared.baseModelRoles,
+			...prepared.modelRoles,
+		});
+		prepared.settings.override("task.agentModelOverrides", {
+			...prepared.baseAgentModelOverrides,
+			...prepared.agentModelOverrides,
+		});
+		prepared.session.setActiveModelProfile?.(prepared.profileName);
+		prepared.session.noteProfileInstalledOverrides?.(
+			Object.keys(prepared.modelRoles),
+			Object.keys(prepared.agentModelOverrides),
+			prepared.previousModel,
+		);
+		try {
+			await prepared.session.syncEagerDelegation?.();
+		} catch (error) {
+			logger.warn("Failed to sync eager delegation after recovered profile runtime bindings", {
+				profile: prepared.profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	} finally {
+		restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+	}
 }

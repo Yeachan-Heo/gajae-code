@@ -198,6 +198,7 @@ gjc setup provider --preset glm
 gjc setup provider --preset alibaba-token-plan
 gjc setup provider --preset cline-pass
 gjc setup provider --preset commandcode-goat
+gjc setup provider --preset ionet
 ```
 
 The same presets are available inside the TUI:
@@ -209,9 +210,10 @@ The same presets are available inside the TUI:
 /provider add --preset alibaba-token-plan
 /provider add --preset cline-pass
 /provider add --preset commandcode-goat
+/provider add --preset ionet
 ```
 
-Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, or `CMD_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. Create the corresponding API key in the provider dashboard before inference; plan entitlement is enforced by the provider.
+Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, or `IONET_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. Create the corresponding API key in the provider dashboard before inference.
 
 ## Signed remote preset registry
 
@@ -414,7 +416,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 ## OpenAI-compatible proxy configuration
 
 OpenAI-compatible proxy providers should use schema-supported provider keys first:
-The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
+The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. For a fully custom id, `gjc setup provider --compat openai --provider <id> --base-url <url> --api-key-env <ENV> --discover [--model <id>]` (or `/provider add` with `--discover`) persists the same live discovery without requiring manual model ids. The Add-custom-provider wizard automatically probes after OpenAI-compatible URL and credentials are supplied, offers the discovered catalog, and retains retry and manual entry when discovery fails or returns no models. Anthropic-compatible setup keeps manual entry. Leaving discovery cancels its preview; cancellation before the atomic configuration commit prevents saving the provider, and credential-restoration failures are reported without secret material. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
 
 ```yaml
 providers:
@@ -987,7 +989,7 @@ Request shaping:
 - `maxTokensField` — `"max_completion_tokens"` or `"max_tokens"`. Default: auto.
 - `supportsToolChoice` — emit the `tool_choice` parameter when the caller forces a specific tool. Default: `true`. Set `false` for endpoints that 400 on `tool_choice` (e.g. DeepSeek when reasoning is on).
 - `disableReasoningOnForcedToolChoice` — drop `reasoning_effort` / OpenRouter `reasoning` whenever `tool_choice` forces a call. Default: auto (Kimi/Anthropic-fronted endpoints).
-- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
+- `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.). A `tool_choice` here acts as an endpoint default rather than an override: it applies only on a turn that offers tools and resolved no directive of its own, so forced-tool directives are preserved and deliberate no-tools turns are left untouched.
 
 Reasoning / thinking:
 

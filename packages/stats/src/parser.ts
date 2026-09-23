@@ -1,9 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type AssistantMessage, getPriorityPremiumRequests, type ServiceTier } from "@gajae-code/ai";
+import { getPriorityPremiumRequests, type ServiceTier } from "@gajae-code/ai";
 import { getSessionsDir, isEnoent } from "@gajae-code/utils";
 import type {
-	MessageStats,
+	AgentRole,
+	ParsedMessageStats,
+	SessionAssistantMessage,
 	SessionEntry,
 	SessionMessageEntry,
 	SessionServiceTierChangeEntry,
@@ -25,34 +27,70 @@ function extractFolderFromPath(sessionPath: string): string {
 	return projectDir.replace(/^--/, "/").replace(/--/g, "/");
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonemptyString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function isNonnegativeNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 /**
  * Check if an entry is an assistant message.
  */
 function isAssistantMessage(entry: SessionEntry): entry is SessionMessageEntry {
-	if (entry.type !== "message") return false;
+	if (!isObject(entry) || entry.type !== "message") return false;
 	const msgEntry = entry as SessionMessageEntry;
 	// Legacy sessions (pre-id tracking) recorded message entries without an `id`.
 	// They're not linkable and would violate the messages.entry_id NOT NULL
 	// constraint, so skip them at the parser boundary.
 	if (typeof msgEntry.id !== "string" || msgEntry.id.length === 0) return false;
-	return msgEntry.message?.role === "assistant";
+	return isObject(msgEntry.message) && msgEntry.message.role === "assistant";
 }
 
 /**
  * Check if an entry is a user message (non-toolResult).
  */
 function isUserMessage(entry: SessionEntry): entry is SessionMessageEntry {
-	if (entry.type !== "message") return false;
+	if (!isObject(entry) || entry.type !== "message") return false;
 	const msgEntry = entry as SessionMessageEntry;
 	if (typeof msgEntry.id !== "string" || msgEntry.id.length === 0) return false;
-	return msgEntry.message?.role === "user";
+	return isObject(msgEntry.message) && msgEntry.message.role === "user";
 }
 
 /**
  * Check if an entry is a service-tier change.
  */
 function isServiceTierChange(entry: SessionEntry): entry is SessionServiceTierChangeEntry {
-	return entry.type === "service_tier_change";
+	return isObject(entry) && entry.type === "service_tier_change";
+}
+
+function inferAgentRoleFromPath(sessionPath: string): AgentRole {
+	const relativePath = path.relative(getSessionsDir(), sessionPath);
+	const pathDepth = relativePath.split(path.sep).filter(Boolean).length;
+	// Root transcripts live directly under a project directory. Task transcripts
+	// live in a directory nested beneath their parent transcript, so legacy child
+	// sessions without a persisted identity must not be mistaken for `default`.
+	return pathDepth <= 2 ? "default" : "unknown";
+}
+
+function agentRoleFromSessionEntry(entry: unknown): AgentRole | undefined {
+	if (!isObject(entry) || entry.type !== "configured_model_chain") return undefined;
+	if (entry.role !== "default" || entry.origin !== "subagent") return undefined;
+	if (!isNonemptyString(entry.identity)) return "unknown";
+	switch (entry.identity) {
+		case "executor":
+		case "planner":
+		case "architect":
+		case "critic":
+			return entry.identity;
+		default:
+			return "other";
+	}
 }
 
 /**
@@ -107,9 +145,22 @@ function extractStats(
 	folder: string,
 	entry: SessionMessageEntry,
 	currentServiceTier: ServiceTier | undefined,
-): MessageStats | null {
-	const msg = entry.message as AssistantMessage;
+	agentRole: AgentRole,
+): ParsedMessageStats | null {
+	const msg = entry.message as SessionAssistantMessage;
 	if (msg?.role !== "assistant") return null;
+	// Incomplete historical metadata cannot be safely attributed or counted.
+	// Skip malformed rows, as with legacy entries lacking an ID; do not invent usage.
+	if (!isNonemptyString(msg.model) || !isNonemptyString(msg.provider) || !isNonemptyString(msg.api)) return null;
+	if (!isNonnegativeNumber(msg.timestamp) || !isObject(msg.usage)) return null;
+	if (
+		!isNonnegativeNumber(msg.usage.input) ||
+		!isNonnegativeNumber(msg.usage.output) ||
+		!isNonnegativeNumber(msg.usage.cacheRead) ||
+		!isNonnegativeNumber(msg.usage.cacheWrite) ||
+		!isNonnegativeNumber(msg.usage.totalTokens)
+	)
+		return null;
 
 	// Backfill: when the session recorded `priority` as the active service tier
 	// at this point but the AI usage payload was captured before priority
@@ -117,24 +168,25 @@ function extractStats(
 	// "Premium Reqs" stat aggregates priority traffic on re-sync. Trust any
 	// non-zero value already in `usage.premiumRequests` (Copilot multipliers or
 	// the new AI code path) and only synthesise when the field is missing/zero.
-	const recorded = msg.usage.premiumRequests ?? 0;
+	const recorded = isNonnegativeNumber(msg.usage.premiumRequests) ? msg.usage.premiumRequests : 0;
 	const derived = recorded > 0 ? recorded : getPriorityPremiumRequests(currentServiceTier, msg.provider);
-	const usage = derived === recorded ? msg.usage : { ...msg.usage, premiumRequests: derived };
+	const usage = { ...msg.usage, premiumRequests: derived };
 
 	return {
 		sessionFile,
 		entryId: entry.id,
 		folder,
+		agent: agentRole,
 		model: msg.model,
 		provider: msg.provider,
 		api: msg.api,
 		timestamp: msg.timestamp,
-		duration: msg.duration ?? null,
-		ttft: msg.ttft ?? null,
+		duration: isNonnegativeNumber(msg.duration) ? msg.duration : null,
+		ttft: isNonnegativeNumber(msg.ttft) ? msg.ttft : null,
 		// Historical session entries may omit stopReason. Keep the stats schema
 		// non-nullable while preserving those requests instead of aborting sync.
-		stopReason: msg.stopReason ?? "unknown",
-		errorMessage: msg.errorMessage ?? null,
+		stopReason: isNonemptyString(msg.stopReason) ? msg.stopReason : "unknown",
+		errorMessage: typeof msg.errorMessage === "string" ? msg.errorMessage : null,
 		usage,
 	};
 }
@@ -166,14 +218,20 @@ function parseSessionEntriesLenient(bytes: Uint8Array): { entries: SessionEntry[
 	return { entries, read: cursor };
 }
 
-function scanLastServiceTier(bytes: Uint8Array): ServiceTier | undefined {
+function scanSessionMetadata(
+	bytes: Uint8Array,
+	initialAgentRole: AgentRole,
+): { serviceTier: ServiceTier | undefined; agentRole: AgentRole } {
 	let cursor = 0;
 	let currentServiceTier: ServiceTier | undefined;
+	let currentAgentRole = initialAgentRole;
 
 	while (cursor < bytes.length) {
 		const { values, error, read, done } = Bun.JSONL.parseChunk(bytes, cursor, bytes.length);
 		for (const value of values as SessionEntry[]) {
 			if (isServiceTierChange(value)) currentServiceTier = value.serviceTier ?? undefined;
+			const agentRole = agentRoleFromSessionEntry(value);
+			if (agentRole !== undefined) currentAgentRole = agentRole;
 		}
 
 		if (error) {
@@ -188,26 +246,22 @@ function scanLastServiceTier(bytes: Uint8Array): ServiceTier | undefined {
 		if (done) break;
 	}
 
-	return currentServiceTier;
+	return { serviceTier: currentServiceTier, agentRole: currentAgentRole };
 }
 /**
  * Parse a session file and extract all assistant message stats.
  * Uses incremental reading with offset tracking.
  *
- * Service-tier carry-over: `currentServiceTier` is a session-scoped piece of
- * state derived from `service_tier_change` entries that affects whether
- * subsequent OpenAI assistant replies count as premium requests. Incremental
- * syncs that resume past the most-recent tier change would otherwise lose
- * that state and silently record `premiumRequests = 0` for priority traffic
- * (the coding-agent stopped folding the tier into `usage.premiumRequests`
- * after 13f59162e — the parser is now the sole source of truth). When
- * `fromOffset > 0` we therefore scan the bytes preceding `fromOffset`
- * for the latest service-tier value before parsing the unprocessed tail.
- * The scan only keeps the current tier and does not materialize prefix
- * entries, preserving offset-based memory behavior for large sessions.
+ * Service-tier and agent-role carry-over are session-scoped state. Incremental
+ * syncs that resume after either metadata entry would otherwise lose the
+ * context needed to attribute priority requests and assistant usage. When
+ * `fromOffset > 0`, scan the prefix for the current values before parsing the
+ * unprocessed tail. The scan keeps only current metadata and does not
+ * materialize prefix entries, preserving offset-based memory behavior for
+ * large sessions.
  */
 export interface ParseSessionResult {
-	stats: MessageStats[];
+	stats: ParsedMessageStats[];
 	userStats: UserMessageStats[];
 	userLinks: UserMessageLink[];
 	newOffset: number;
@@ -222,20 +276,29 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 	}
 
 	const folder = extractFolderFromPath(sessionPath);
-	const stats: MessageStats[] = [];
+	const stats: ParsedMessageStats[] = [];
 	const userStats: UserMessageStats[] = [];
 	const userLinks: UserMessageLink[] = [];
 	const userByEntryId = new Map<string, UserMessageStats>();
 	const start = Math.max(0, Math.min(fromOffset, bytes.length));
+	const initialAgentRole = inferAgentRoleFromPath(sessionPath);
 	const unprocessed = bytes.subarray(start);
 	const { entries, read } = parseSessionEntriesLenient(unprocessed);
 	let currentServiceTier: ServiceTier | undefined;
+	let currentAgentRole = initialAgentRole;
 	if (start > 0) {
-		currentServiceTier = scanLastServiceTier(bytes.subarray(0, start));
+		const metadata = scanSessionMetadata(bytes.subarray(0, start), initialAgentRole);
+		currentServiceTier = metadata.serviceTier;
+		currentAgentRole = metadata.agentRole;
 	}
 	for (const entry of entries) {
 		if (isServiceTierChange(entry)) {
 			currentServiceTier = entry.serviceTier ?? undefined;
+			continue;
+		}
+		const agentRole = agentRoleFromSessionEntry(entry);
+		if (agentRole !== undefined) {
+			currentAgentRole = agentRole;
 			continue;
 		}
 		if (isUserMessage(entry)) {
@@ -247,13 +310,13 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 			continue;
 		}
 		if (isAssistantMessage(entry)) {
-			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier);
+			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier, currentAgentRole);
 			if (msgStats) stats.push(msgStats);
 			// Link assistant's responding model back to the user message it answered.
 			const parentId = (entry as SessionMessageEntry).parentId;
-			if (parentId) {
-				const msg = entry.message as AssistantMessage;
-				if (msg.model && msg.provider) {
+			if (isNonemptyString(parentId)) {
+				const msg = entry.message as SessionAssistantMessage;
+				if (isNonemptyString(msg.model) && isNonemptyString(msg.provider)) {
 					// Emit unconditionally. The aggregator's UPDATE is guarded by
 					// `model IS NULL` so this is idempotent: a no-op for already
 					// linked rows, a fix-up for fresh inserts (which start NULL
@@ -328,7 +391,7 @@ export async function getSessionEntry(sessionPath: string, entryId: string): Pro
 
 	const { entries } = parseSessionEntriesLenient(bytes);
 	for (const entry of entries) {
-		if ("id" in entry && entry.id === entryId) {
+		if (isObject(entry) && "id" in entry && entry.id === entryId) {
 			return entry;
 		}
 	}

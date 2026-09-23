@@ -55,13 +55,25 @@ the broker is replaced by one running that checkout's source:
 
 ### Startup-control provenance errors
 
-If `session/new` rejects with `-32603` and
-`requires a newer GJC SDK session with startup control provenance`, the broker
-or session host is older than the ACP front end; the external client is
-supported. The check requires the host capability `primaryControlSurface`,
-which landed after v0.16.7 in `be4c88383` (#5411). A v0.16.7 host can report
-`promptTerminalOutcomeVersion: 1` while omitting `primaryControlSurface`, so
-the front end correctly rejects that half-upgraded session.
+Attaching to a session reads the host capability `primaryControlSurface`, which
+landed after v0.16.7 in `be4c88383` (#5411). Two different failures surface
+here, and they have different fixes:
+
+- `is served by a live GJC host that predates startup control provenance` — the
+  broker or session host is older than the ACP front end; the external client is
+  supported. Upgrading the client does not upgrade an already-running host, so
+  the live host has to be stopped before the current build can resume the session
+  from its stored record. A v0.16.7 host can report
+  `promptTerminalOutcomeVersion: 1` while omitting `primaryControlSurface`, so
+  the front end correctly rejects that half-upgraded session.
+- `did not answer runtime.capabilities` — the host never answered the query at
+  all, and any reported reason is a bounded safe category, with unrecognized
+  failures reduced to `query failed` rather than raw host error text. The host's
+  build age is unproven here; treat it as a transport or startup problem first.
+
+Neither field is defaulted when the other is present: accepting a half-answered
+provenance would hand ACP the permission and lifecycle authority #5411 exists to
+withhold from a host of unknown origin.
 
 Restart the broker from the same checkout, closing its existing session hosts:
 

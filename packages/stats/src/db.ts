@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import { type GeneratedProvider, getBundledModel, type Usage } from "@gajae-code/ai";
 import { getConfigRootDir, getStatsDbPath } from "@gajae-code/utils";
 import type {
+	AgentRole,
+	AgentStats,
 	AggregatedStats,
 	BehaviorModelStats,
 	BehaviorOverallStats,
@@ -13,6 +15,7 @@ import type {
 	ModelPerformancePoint,
 	ModelStats,
 	ModelTimeSeriesPoint,
+	ParsedMessageStats,
 	TimeSeriesPoint,
 	UserMessageLink,
 	UserMessageStats,
@@ -32,10 +35,28 @@ interface CostBackfillRow {
 	cache_write_tokens: number;
 }
 
+interface AgentStatsRow {
+	agent: AgentRole;
+	total_requests: number;
+	failed_requests: number;
+	total_input_tokens: number | null;
+	total_output_tokens: number | null;
+	total_cache_read_tokens: number | null;
+	total_cache_write_tokens: number | null;
+	total_premium_requests: number | null;
+	total_cost: number | null;
+	avg_duration: number | null;
+	avg_ttft: number | null;
+	avg_tokens_per_second: number | null;
+	first_timestamp: number | null;
+	last_timestamp: number | null;
+}
+
 let db: Database | null = null;
 
 const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
+const AGENT_ROLE_BACKFILL_KEY = "agent_role_attribution_v1";
 const USER_MESSAGES_BACKFILL_KEY = "user_messages_v5";
 const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
 const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v1";
@@ -60,6 +81,7 @@ export async function initDb(): Promise<Database> {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_file TEXT NOT NULL,
 			entry_id TEXT NOT NULL,
+			agent TEXT NOT NULL DEFAULT 'unknown',
 			folder TEXT NOT NULL,
 			model TEXT NOT NULL,
 			provider TEXT NOT NULL,
@@ -129,6 +151,10 @@ export async function initDb(): Promise<Database> {
 	if (!messageColumns.some(column => column.name === "premium_requests")) {
 		db.exec("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
 	}
+	if (!messageColumns.some(column => column.name === "agent")) {
+		db.exec("ALTER TABLE messages ADD COLUMN agent TEXT NOT NULL DEFAULT 'unknown'");
+	}
+	db.exec("CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent)");
 	db.exec("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
 	// Each behavior-metric bump invalidates previously-ingested rows. We detect
 	// the stale schema by column name and drop the table; `IF NOT EXISTS` above
@@ -178,6 +204,7 @@ export async function initDb(): Promise<Database> {
 			CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_model ON user_messages(timestamp, model, provider);
 		`);
 	}
+	backfillAgentRoleAttribution(db);
 	backfillUserMessages(db);
 	repairUserMessageLinks(db);
 	backfillPriorityPremiumRequests(db);
@@ -228,12 +255,32 @@ function calculateCatalogCost(provider: string, modelId: string, tokens: CostTok
 	};
 }
 
-function resolveStoredCost(stats: MessageStats): UsageCost {
-	if (stats.usage.cost.total !== 0) {
-		return stats.usage.cost;
-	}
-
-	return calculateCatalogCost(stats.provider, stats.model, stats.usage) ?? stats.usage.cost;
+function resolveStoredCost(stats: ParsedMessageStats): UsageCost {
+	const raw = stats.usage.cost;
+	const recorded = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+	const keys = ["input", "output", "cacheRead", "cacheWrite", "total"] as const;
+	// Complete zero-cost payloads historically request catalog pricing. A partial
+	// payload is different: preserve every valid recorded value, including zero.
+	const allZero = keys.every(key => recorded[key] === 0);
+	const catalog = calculateCatalogCost(stats.provider, stats.model, stats.usage);
+	const component = (key: keyof ModelCost): number => {
+		if (!allZero && finite(recorded[key])) return recorded[key];
+		const fallback = catalog?.[key];
+		return finite(fallback) ? fallback : 0;
+	};
+	const input = component("input");
+	const output = component("output");
+	const cacheRead = component("cacheRead");
+	const cacheWrite = component("cacheWrite");
+	const sum = input + output + cacheRead + cacheWrite;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		total: !allZero && finite(recorded.total) ? recorded.total : finite(sum) ? sum : 0,
+	};
 }
 
 function backfillMissingCatalogCosts(database: Database): void {
@@ -242,6 +289,7 @@ function backfillMissingCatalogCosts(database: Database): void {
 			SELECT id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
 			FROM messages
 			WHERE cost_total = 0 AND total_tokens > 0
+				AND cost_input = 0 AND cost_output = 0 AND cost_cache_read = 0 AND cost_cache_write = 0
 		`)
 		.all() as CostBackfillRow[];
 
@@ -299,24 +347,22 @@ export function setFileOffset(sessionFile: string, offset: number, lastModified:
 /**
  * Insert message stats into the database.
  */
-export function insertMessageStats(stats: MessageStats[]): number {
+export function insertMessageStats(stats: ParsedMessageStats[]): number {
 	if (!db || stats.length === 0) return 0;
 
-	// Use UPSERT so a re-sync can fix up `premium_requests` for rows persisted
-	// before priority service-tier traffic was counted as premium. The guard
-	// `WHERE messages.premium_requests < excluded.premium_requests` keeps every
-	// other column immutable and never demotes an existing count (e.g. when a
-	// later parse drops back to 0 for the same row).
+	// Re-syncs repair role attribution for existing rows and only promote
+	// `premium_requests`; every other message field stays immutable.
 	const stmt = db.prepare(`
 		INSERT INTO messages (
-			session_file, entry_id, folder, model, provider, api, timestamp,
+			session_file, entry_id, agent, folder, model, provider, api, timestamp,
 			duration, ttft, stop_reason, error_message,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
 			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(session_file, entry_id) DO UPDATE SET
-			premium_requests = excluded.premium_requests
-		WHERE messages.premium_requests < excluded.premium_requests
+			agent = excluded.agent,
+			premium_requests = MAX(messages.premium_requests, excluded.premium_requests)
+		WHERE messages.agent <> excluded.agent OR messages.premium_requests < excluded.premium_requests
 	`);
 
 	let inserted = 0;
@@ -326,6 +372,7 @@ export function insertMessageStats(stats: MessageStats[]): number {
 			const result = stmt.run(
 				s.sessionFile,
 				s.entryId,
+				s.agent,
 				s.folder,
 				s.model,
 				s.provider,
@@ -515,6 +562,41 @@ export function getStatsByFolder(cutoff?: number): FolderStats[] {
 }
 
 /**
+ * Get stats grouped by the persisted agent role.
+ */
+export function getStatsByAgent(cutoff?: number): AgentStats[] {
+	if (!db) return [];
+
+	const hasCutoff = cutoff !== undefined && cutoff > 0;
+	const stmt = db.prepare(`
+		SELECT
+			agent,
+			COUNT(*) as total_requests,
+			SUM(CASE WHEN stop_reason = 'error' THEN 1 ELSE 0 END) as failed_requests,
+			SUM(input_tokens) as total_input_tokens,
+			SUM(output_tokens) as total_output_tokens,
+			SUM(cache_read_tokens) as total_cache_read_tokens,
+			SUM(cache_write_tokens) as total_cache_write_tokens,
+			SUM(premium_requests) as total_premium_requests,
+			SUM(cost_total) as total_cost,
+			AVG(duration) as avg_duration,
+			AVG(ttft) as avg_ttft,
+			AVG(CASE WHEN duration > 0 THEN output_tokens * 1000.0 / duration ELSE NULL END) as avg_tokens_per_second,
+			MIN(timestamp) as first_timestamp,
+			MAX(timestamp) as last_timestamp
+		FROM messages
+		${hasCutoff ? "WHERE timestamp >= ?" : ""}
+		GROUP BY agent
+		ORDER BY total_requests DESC, agent ASC
+	`);
+	const rows = (hasCutoff ? stmt.all(cutoff) : stmt.all()) as AgentStatsRow[];
+	return rows.map(row => ({
+		agent: row.agent,
+		...buildAggregatedStats([row]),
+	}));
+}
+
+/**
  * Get time series data.
  */
 export function getTimeSeries(hours = 24, cutoff?: number | null, bucketMs = 60 * 60 * 1000): TimeSeriesPoint[] {
@@ -658,6 +740,7 @@ function rowToMessageStats(row: any): MessageStats {
 		sessionFile: row.session_file,
 		entryId: row.entry_id,
 		folder: row.folder,
+		agent: row.agent as AgentRole,
 		model: row.model,
 		provider: row.provider,
 		api: row.api,
@@ -805,6 +888,19 @@ function repairUserMessageLinks(database: Database): void {
 	database
 		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
 		.run(USER_MESSAGE_LINKS_REPAIR_KEY, BACKFILL_PENDING);
+}
+
+/** Reparse existing sessions so stored assistant rows gain role attribution. */
+function backfillAgentRoleAttribution(database: Database): void {
+	const row = database.prepare("SELECT value FROM meta WHERE key = ?").get(AGENT_ROLE_BACKFILL_KEY) as
+		| { value: string }
+		| undefined;
+	if (!shouldResetBackfill(row?.value)) return;
+
+	database.exec("DELETE FROM file_offsets");
+	database
+		.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
+		.run(AGENT_ROLE_BACKFILL_KEY, BACKFILL_PENDING);
 }
 
 /**

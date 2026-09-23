@@ -87,6 +87,7 @@ export function resolveStartupModelRefreshSelectors(
 export async function refreshMissingQualifiedModelProviders(
 	selectors: ModelSelectorValue | undefined,
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getRefreshableProviders" | "refreshProvider">,
+	credentialSessionId?: string,
 ): Promise<boolean> {
 	const refreshedProviders = new Set<string>();
 	for (const selector of normalizeModelSelectorValue(selectors)) {
@@ -104,7 +105,11 @@ export async function refreshMissingQualifiedModelProviders(
 		)
 			continue;
 
-		await modelRegistry.refreshProvider(provider, "online-if-uncached");
+		if (credentialSessionId === undefined) {
+			await modelRegistry.refreshProvider(provider, "online-if-uncached");
+		} else {
+			await modelRegistry.refreshProvider(provider, "online-if-uncached", credentialSessionId);
+		}
 		refreshedProviders.add(provider);
 	}
 	return refreshedProviders.size > 0;

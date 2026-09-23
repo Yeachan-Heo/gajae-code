@@ -13,6 +13,7 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	resolveModelProfileDefaultChain,
 	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
@@ -184,7 +185,12 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
+		async setModelTemporary(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			options?: { onMutationStarted?: () => void },
+		) {
+			options?.onMutationStarted?.();
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
@@ -383,6 +389,233 @@ describe("model profile activation", () => {
 		// persisted for later profile execution, so it must resolve against the
 		// catalog that fresh live profile evidence narrowed.
 		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
+	});
+
+	test("durable default recovery excludes a bundled default absent from the activation catalog", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "excluded-bundled-default",
+			requiredProviders: ["anthropic"],
+			modelMapping: { default: "anthropic/claude-opus-5" },
+			source: "builtin",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getAvailableForProfileActivation = vi.fn(() => [] as Model[]);
+		const registry = {
+			...baseRegistry,
+			getAvailable: baseRegistry.getAll,
+			getAvailableForProfileActivation,
+		} as unknown as ModelRegistry;
+
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
+		expect(recovery).toMatchObject({
+			profileName: profile.name,
+			entries: ["anthropic/claude-opus-5"],
+			activeIndex: 1,
+			skips: [{ selector: "anthropic/claude-opus-5", reason: "unknown_model" }],
+		});
+		expect(recovery.model).toBeUndefined();
+	});
+
+	test.each([
+		"user",
+		"registry",
+	] as const)("durable %s profile recovery rejects an unresolved qualified executor when its default resolves", async source => {
+		const profile: ModelProfileDefinition = {
+			name: `${source}-unresolved-executor`,
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/missing-executor" },
+			source,
+		};
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: fakeRegistry({ profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+	});
+
+	test("durable default recovery rejects unknown required providers before credential probing", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "unknown-recovery-provider",
+			requiredProviders: ["future-provider"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async () => "key-provider-a");
+		const registry = {
+			...baseRegistry,
+			getConfiguredProviderIds: () => ["provider-a"],
+			isKnownProvider: (provider: string) => provider === "provider-a",
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toBeInstanceOf(ModelProfileUnknownProviderError);
+		expect(getApiKeyForProvider).not.toHaveBeenCalled();
+	});
+
+	test("durable default recovery accepts a credentialless OpenCodex proxy", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "credentialless-opencodex-recovery",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "registry",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const proxyModel = model("opencodex", "provider-a/default");
+		const registry = {
+			...baseRegistry,
+			getAll: () => [...baseRegistry.getAll(), proxyModel],
+			getAvailable: () => [proxyModel],
+			getAvailableForProfileActivation: () => [proxyModel],
+			getConfiguredProviderIds: () => [],
+			isKnownProvider: (provider: string) => provider === "provider-a" || provider === "opencodex",
+			getApiKeyForProvider: async (provider: string) => (provider === "opencodex" ? kNoAuth : "key-provider-a"),
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated({
+				"modelProfile.proxyProvider": "opencodex",
+				"modelProfile.proxyMode": "always",
+			}),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.model).toMatchObject({ provider: "opencodex", id: "provider-a/default" });
+	});
+
+	test("durable default recovery ignores an optional mapped provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "optional-mapped-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default", executor: "provider-b/executor" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "provider-b") throw new Error("optional provider lookup failed");
+				return "key-provider-a";
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).resolves.toMatchObject({
+			profileName: profile.name,
+			entries: ["provider-a/default"],
+			model: expect.objectContaining({ provider: "provider-a", id: "default" }),
+			activeIndex: 0,
+			skips: [],
+		});
+	});
+
+	test("durable default recovery retains a Cursor head and applies managed fallback safety", async () => {
+		const cursor = { ...model("cursor", "agent"), api: "cursor-agent" } as Model;
+		const fallback = model("provider-a", "default");
+		const profile: ModelProfileDefinition = {
+			name: "cursor-recovery",
+			requiredProviders: [],
+			modelMapping: { default: ["cursor/agent", "provider-a/default"] },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = { ...baseRegistry, getAll: () => [cursor, fallback] } as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["cursor/agent", "provider-a/default"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(1);
+		expect(recovery.skips[0]?.reason).toContain("requires provider-side tool execution");
+	});
+
+	test("durable default recovery does not probe a throwing fallback after a callable head", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "callable-head",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: ["provider-a/default", "provider-b/tail"] },
+			source: "user",
+		};
+		const head = model("provider-a", "default");
+		const tail = model("provider-b", "tail");
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const getApiKeyForProvider = vi.fn(async (provider: string) => {
+			if (provider === "provider-b") throw new Error("tail credential lookup must not run");
+			return "key-provider-a";
+		});
+		const registry = {
+			...baseRegistry,
+			getAll: () => [head, tail],
+			getApiKeyForProvider,
+		} as unknown as ModelRegistry;
+
+		const recovery = await resolveModelProfileDefaultChain({
+			modelRegistry: registry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+			credentialSessionId: "resume-session",
+		});
+
+		expect(recovery.entries).toEqual(["provider-a/default", "provider-b/tail"]);
+		expect(recovery.model).toMatchObject({ provider: "provider-a", id: "default" });
+		expect(recovery.activeIndex).toBe(0);
+	});
+
+	test("durable default recovery rejects a required provider auth probe failure", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "required-provider",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getApiKeyForProvider: async () => {
+				throw new Error("required provider lookup failed");
+			},
+		} as unknown as ModelRegistry;
+
+		await expect(
+			resolveModelProfileDefaultChain({
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+				credentialSessionId: "resume-session",
+			}),
+		).rejects.toThrow("required provider lookup failed");
 	});
 
 	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
@@ -1037,6 +1270,37 @@ describe("model profile activation", () => {
 		).rejects.toThrow('Model profile "hard-required" requires credentials for: provider-a.');
 	});
 
+	test("preflight retains its original cause when sticky-variant restoration also fails", async () => {
+		const rollbackFailure = new Error("secret-sticky-variant");
+		const registry = {
+			...fakeRegistry({ missingProviders: ["provider-a"] }),
+			getSessionCanonicalVariant: () => "provider-c/default",
+			clearCanonicalVariant: () => true,
+			restoreSessionCanonicalVariant: () => {
+				throw rollbackFailure;
+			},
+		};
+		let failure: unknown;
+		try {
+			await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages[0]?.cause).toBeInstanceOf(ModelProfileCredentialError);
+		expect(stages[1]?.cause).toBe(rollbackFailure);
+		expect(aggregate.message).toContain("profile preflight (required credentials unavailable)");
+		expect(aggregate.message).toContain("restore canonical model variant (operation failed)");
+		expect(aggregate.message).not.toContain("secret-sticky-variant");
+	});
+
 	test("accepts the kNoAuth sentinel for required keyless providers", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "keyless-required",
@@ -1077,6 +1341,41 @@ describe("model profile activation", () => {
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 	});
 
+	test("rollback restores the previous live model even when its credentials are unavailable", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-credential-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async (candidate: Model) => (candidate.provider === "provider-c" ? undefined : kNoAuth),
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("forward flush failed"));
+
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("rollback restores a model-less session without creating resume lineage", async () => {
 		const session = fakeSession();
 		session.model = undefined;
@@ -1094,6 +1393,169 @@ describe("model profile activation", () => {
 		);
 		expect(session.model).toBeUndefined();
 		expect(session.resumeDefaultSelectors).toEqual([]);
+	});
+
+	test("does not disturb the old session when target authentication fails before mutation", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-pre-mutation-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async () => undefined,
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const append = vi.spyOn(manager, "appendModelChange");
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"No API key for provider-a/default",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(append).not.toHaveBeenCalled();
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("model-less rollback disables forward append-only context", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-append-only-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const agent = new Agent({ initialState: { model: undefined, systemPrompt: [], tools: [], messages: [] } });
+			const targetModel = model("anthropic", "claude-test");
+			const profile: ModelProfileDefinition = {
+				name: "append-only-profile",
+				requiredProviders: ["anthropic"],
+				modelMapping: { default: "anthropic/claude-test" },
+				source: "user",
+			};
+			const base = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...base,
+				getAll: () => [...base.getAll(), targetModel],
+				getApiKey: async () => kNoAuth,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: profile.name,
+			});
+			vi.spyOn(settings, "flushOrThrow").mockImplementationOnce(async () => {
+				expect(agent.appendOnlyContext).toBeDefined();
+				throw new Error("forward flush failed");
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBeUndefined();
+			expect(agent.appendOnlyContext).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("reports a second settings flush failure without claiming durable recovery", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const firstFailure = new Error("forward secret-settings-value");
+		const secondFailure = new Error("rollback secret-settings-value");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(firstFailure)
+			.mockRejectedValueOnce(secondFailure);
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		expect((aggregate.errors as Error[]).map(stage => stage.cause)).toEqual([firstFailure, secondFailure]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("secret-settings-value");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.model?.id).toBe("initial");
+	});
+
+	test("labels independent rollback failures without exposing error contents", async () => {
+		const session = fakeSession();
+		session.setConfiguredModelChain("default", ["provider-c/default"]);
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const original = new Error("forward flush token-secret-123");
+		const modelRollback = new Error("rollback model token-secret-123");
+		const rollbackFlush = new Error("rollback flush token-secret-123");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(original)
+			.mockRejectedValueOnce(rollbackFlush);
+		session.restoreModelSelectionForRollback = async () => {
+			throw modelRollback;
+		};
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages.map(stage => stage.cause)).toEqual([original, modelRollback, rollbackFlush]);
+		expect(stages.map(stage => stage.message)).toEqual([
+			"forward settings flush (settings write failed)",
+			"restore live model (operation failed)",
+			"restore settings flush (settings write failed)",
+		]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore live model (operation failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("token-secret-123");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		// The failed live-model restore leaves a different runtime model despite the restored settings.
+		expect(session.model?.id).toBe("default");
 	});
 
 	test("rolls back partial synchronous persistent writes before durable flush", async () => {

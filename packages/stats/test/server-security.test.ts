@@ -24,6 +24,7 @@ const EMPTY_DASHBOARD: DashboardStats = {
 	},
 	byModel: [],
 	byFolder: [],
+	byAgent: [],
 	timeSeries: [],
 	modelSeries: [],
 	modelPerformanceSeries: [],

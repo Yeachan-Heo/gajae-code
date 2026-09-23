@@ -15,8 +15,14 @@ function makeSession(
 		provider: "openai-codex",
 		contextWindow: 200_000,
 	},
+	options: {
+		credentialSessionId?: string;
+		codexCredentials?: Array<{ accountId: string }>;
+		activeCodexCredentialIndex?: number;
+	} = {},
 ): AgentSession {
 	const usageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 };
+	const codexCredentials = options.codexCredentials ?? [{ accountId: "account-default" }];
 	return {
 		state: { messages: [], model },
 		messages: [],
@@ -24,7 +30,17 @@ function makeSession(
 		agent: { state: { tools: [] } },
 		skills: [],
 		model,
-		modelRegistry: { isUsingOAuth: () => false },
+		modelRegistry: {
+			isUsingOAuth: () => false,
+			getAuthStorageOwner: () => ({}),
+			authStorage: {
+				getOAuthAccountId: (provider: string, sessionId?: string) => {
+					if (provider !== "openai-codex" || sessionId !== options.credentialSessionId) return undefined;
+					return codexCredentials[options.activeCodexCredentialIndex ?? 0]?.accountId;
+				},
+			},
+		},
+		credentialSessionId: options.credentialSessionId,
 		isStreaming: false,
 		isFastModeActive: () => false,
 		fetchUsageReports,
@@ -68,6 +84,7 @@ describe("status line usage segment", () => {
 			{
 				provider: "openai-codex",
 				fetchedAt: now,
+				metadata: { accountId: "account-default" },
 				limits: [
 					{
 						id: "openai-codex:primary",
@@ -101,12 +118,195 @@ describe("status line usage segment", () => {
 		component.dispose();
 	});
 
+	it("uses the active Codex credential's usage regardless of report order", async () => {
+		const now = Date.now();
+		const inactiveReport = {
+			provider: "openai-codex",
+			fetchedAt: now,
+			metadata: { accountId: "account-first" },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { provider: "openai-codex", accountId: "account-first", windowId: "5h" },
+					window: { id: "5h", resetsAt: now + 180 * 60_000 },
+					amount: { usedFraction: 0.95, unit: "percent" },
+				},
+				{
+					id: "openai-codex:secondary",
+					scope: { provider: "openai-codex", accountId: "account-first", windowId: "7d" },
+					window: { id: "7d", resetsAt: now + 49 * 3_600_000 },
+					amount: { usedFraction: 0.9, unit: "percent" },
+				},
+			],
+		};
+		const activeReport = {
+			provider: "openai-codex",
+			fetchedAt: now,
+			metadata: { accountId: "account-active" },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { provider: "openai-codex", accountId: "account-active", windowId: "5h" },
+					window: { id: "5h", resetsAt: now + 180 * 60_000 },
+					amount: { usedFraction: 0.12, unit: "percent" },
+				},
+				{
+					id: "openai-codex:secondary",
+					scope: { provider: "openai-codex", accountId: "account-active", windowId: "7d" },
+					window: { id: "7d", resetsAt: now + 49 * 3_600_000 },
+					amount: { usedFraction: 0.23, unit: "percent" },
+				},
+			],
+		};
+
+		for (const reports of [
+			[inactiveReport, activeReport],
+			[activeReport, inactiveReport],
+		]) {
+			const selection = {
+				credentialSessionId: "session-active",
+				codexCredentials: [{ accountId: "account-first" }, { accountId: "account-active" }],
+				activeCodexCredentialIndex: 1,
+			};
+			const session = makeSession(async () => reports, undefined, selection);
+			const component = new StatusLineComponent(session);
+			component.updateSettings({
+				preset: "custom",
+				leftSegments: [],
+				rightSegments: ["usage"],
+				showSkillHud: false,
+			});
+
+			const text = await waitForUsageText(component);
+
+			expect(text).toContain("5h 12%");
+			expect(text).toContain("7d 23%");
+			expect(text).not.toContain("95%");
+			expect(text).not.toContain("90%");
+
+			selection.activeCodexCredentialIndex = 0;
+			const switchedText = stripAnsi(component.getTopBorder(120).content);
+			expect(switchedText).toContain("5h 95%");
+			expect(switchedText).toContain("7d 90%");
+			component.dispose();
+		}
+	});
+
+	it("does not attribute a singleton Codex report when the active account is unknown", async () => {
+		const now = Date.now();
+		const session = makeSession(
+			async () => [
+				{
+					provider: "openai-codex",
+					fetchedAt: now,
+					metadata: { accountId: "account-unverified" },
+					limits: [
+						{
+							id: "openai-codex:primary",
+							scope: { provider: "openai-codex", accountId: "account-unverified", windowId: "5h" },
+							window: { id: "5h", resetsAt: now + 180 * 60_000 },
+							amount: { usedFraction: 0.81, unit: "percent" },
+						},
+					],
+				},
+			],
+			undefined,
+			{ credentialSessionId: "session-unresolved", codexCredentials: [] },
+		);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).not.toContain("5h");
+		expect(text).not.toContain("81%");
+		component.dispose();
+	});
+
+	it("rejects Codex reports with conflicting report and limit account IDs", async () => {
+		const now = Date.now();
+		const session = makeSession(async () => [
+			{
+				provider: "openai-codex",
+				fetchedAt: now,
+				metadata: { accountId: "account-default" },
+				limits: [
+					{
+						id: "openai-codex:primary",
+						scope: { provider: "openai-codex", accountId: "account-other", windowId: "5h" },
+						window: { id: "5h", resetsAt: now + 180 * 60_000 },
+						amount: { usedFraction: 0.81, unit: "percent" },
+					},
+				],
+			},
+		]);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).not.toContain("5h");
+		expect(text).not.toContain("81%");
+		component.dispose();
+	});
+
+	it("does not pick a duplicate active-account report by array order", async () => {
+		const now = Date.now();
+		const highUsageReport = {
+			provider: "openai-codex",
+			fetchedAt: now,
+			metadata: { accountId: "account-default" },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { provider: "openai-codex", accountId: "account-default", windowId: "5h" },
+					window: { id: "5h", resetsAt: now + 180 * 60_000 },
+					amount: { usedFraction: 0.95, unit: "percent" },
+				},
+			],
+		};
+		const lowUsageReport = {
+			provider: "openai-codex",
+			fetchedAt: now,
+			metadata: { accountId: "account-default" },
+			limits: [
+				{
+					id: "openai-codex:primary",
+					scope: { provider: "openai-codex", accountId: "account-default", windowId: "5h" },
+					window: { id: "5h", resetsAt: now + 180 * 60_000 },
+					amount: { usedFraction: 0.12, unit: "percent" },
+				},
+			],
+		};
+
+		for (const reports of [
+			[highUsageReport, lowUsageReport],
+			[lowUsageReport, highUsageReport],
+		]) {
+			const component = new StatusLineComponent(makeSession(async () => reports));
+			component.updateSettings({
+				preset: "custom",
+				leftSegments: [],
+				rightSegments: ["usage"],
+				showSkillHud: false,
+			});
+
+			const text = await waitForUsageText(component);
+
+			expect(text).not.toContain("5h");
+			expect(text).not.toContain("95%");
+			expect(text).not.toContain("12%");
+			component.dispose();
+		}
+	});
+
 	it("renders remaining quota when usage mode is remaining", async () => {
 		const now = Date.now();
 		const session = makeSession(async () => [
 			{
 				provider: "openai-codex",
 				fetchedAt: now,
+				metadata: { accountId: "account-default" },
 				limits: [
 					{
 						id: "openai-codex:primary",
@@ -146,6 +346,7 @@ describe("status line usage segment", () => {
 			{
 				provider: "openai-codex",
 				fetchedAt: now,
+				metadata: { accountId: "account-default" },
 				limits: [
 					{
 						id: "openai-codex:primary",
@@ -175,6 +376,7 @@ describe("status line usage segment", () => {
 			{
 				provider: "openai-codex",
 				fetchedAt: now,
+				metadata: { accountId: "account-default" },
 				limits: [
 					{
 						id: "openai-codex:primary",
@@ -444,6 +646,7 @@ describe("status line usage segment", () => {
 				{
 					provider: "openai-codex",
 					fetchedAt: now,
+					metadata: { accountId: "account-default" },
 					limits: [
 						{
 							id: "openai-codex:primary",
@@ -478,6 +681,7 @@ describe("status line usage segment", () => {
 				{
 					provider: "openai-codex",
 					fetchedAt: now,
+					metadata: { accountId: "account-default" },
 					limits: [
 						{
 							id: "openai-codex:primary",
