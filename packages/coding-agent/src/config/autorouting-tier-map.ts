@@ -73,7 +73,7 @@ export const CURATED_TIER_LABELS = {
 	],
 } as const satisfies CuratedTierLabels;
 
-/** Generated from packages/ai/src/models.json at feature land: 3919 in-scope baseline skips. */
+/** Generated from packages/ai/src/models.json at feature land: 3936 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
 	"kiro/claude-opus-5-5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kiro/claude-opus-5.5": { rationale: "post-rebase catalog addition from dev; not yet curated" },
