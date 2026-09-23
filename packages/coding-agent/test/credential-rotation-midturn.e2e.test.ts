@@ -291,6 +291,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	runtimeApiKey?: string;
 	predecessorModel?: Model;
 	removeFailedCredentialDuringMark?: boolean;
+	unknownRowIdBeforeMark?: boolean;
 }): Promise<{ models: string[]; keys: string[]; markCount: number; activeIndex?: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
 	let session: AgentSession | undefined;
@@ -321,6 +322,8 @@ async function runManagedFallbackQuotaScenario(options: {
 	const fallback = getBundledModel("openai", "gpt-4o-mini");
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
 	const initialModel = options.predecessorModel ?? model;
+	let restoreUnknownRowId: (() => void) | undefined;
+	let unknownRowIdInjected = false;
 	try {
 		await storage.set(provider, [
 			...options.accounts.map(accountId => ({
@@ -368,6 +371,11 @@ async function runManagedFallbackQuotaScenario(options: {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
 				if (requestedModel.provider === provider && quotaKeys.has(key)) {
+					if (options.unknownRowIdBeforeMark && !unknownRowIdInjected) {
+						const rowIdSpy = vi.spyOn(storage, "getSessionCredentialRowId").mockReturnValueOnce(undefined);
+						restoreUnknownRowId = () => rowIdSpy.mockRestore();
+						unknownRowIdInjected = true;
+					}
 					return usageLimitStream(requestedModel, options.trigger ?? "quota", options.providerRetryMaxAttempts);
 				}
 				return success.stream(requestedModel, context, streamOptions);
@@ -413,6 +421,7 @@ async function runManagedFallbackQuotaScenario(options: {
 				: {}),
 		};
 	} finally {
+		restoreUnknownRowId?.();
 		await session?.dispose();
 		storage.close();
 		await fs.rm(root, { recursive: true, force: true });
@@ -424,6 +433,22 @@ describe("managed fallback quota credential rotation", () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!model) throw new Error("Missing bundled Codex fixture model");
 		const result = await runManagedFallbackQuotaScenario({ accounts: ["a", "b"], quotaKeys: ["TOKEN-a"] });
+		expect(result).toEqual({
+			models: [selector(model), selector(model)],
+			keys: ["TOKEN-a", "TOKEN-b"],
+			markCount: 1,
+		});
+	});
+
+	test("retries managed fallback when row identity is unknown but a peer remains", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a"],
+			maxAttempts: 1,
+			unknownRowIdBeforeMark: true,
+		});
 		expect(result).toEqual({
 			models: [selector(model), selector(model)],
 			keys: ["TOKEN-a", "TOKEN-b"],
