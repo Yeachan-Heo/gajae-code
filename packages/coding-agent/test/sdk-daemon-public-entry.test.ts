@@ -22,13 +22,21 @@ describe("inert public command entry scanner", () => {
 		expect(result.operationArgv).toEqual(["session", "raw", "query", "session-id", "--query", "session.inspect"]);
 	});
 
-	it("accepts session-family agent-dir placement while retaining leaf placement", () => {
+	it("accepts family and leaf agent-dir placements for each session verb", () => {
 		const agentDir = "/tmp/gjc-agent";
 		for (const argv of [
 			["session", "--agent-dir", agentDir, "list", "--scope", "all"],
 			["session", "--agent-dir", agentDir, "inspect", "session-id"],
+			["session", "--agent-dir", agentDir, "send", "session-id", "--text", "hello"],
+			["session", "--agent-dir", agentDir, "status", "session-id", "operation-ref"],
+			["session", "--agent-dir", agentDir, "tail", "session-id"],
+			["session", "--agent-dir", agentDir, "raw", "query", "session-id", "--query", "session.checkpoint"],
 			["session", "list", "--scope", "all", "--agent-dir", agentDir],
 			["session", "inspect", "session-id", "--agent-dir", agentDir],
+			["session", "send", "session-id", "--text", "hello", "--agent-dir", agentDir],
+			["session", "status", "session-id", "operation-ref", "--agent-dir", agentDir],
+			["session", "tail", "session-id", "--agent-dir", agentDir],
+			["session", "raw", "query", "session-id", "--query", "session.checkpoint", "--agent-dir", agentDir],
 		]) {
 			const result = scanPublicCommand("sdk", argv);
 			expect(result.kind).toBe("operation");
@@ -61,6 +69,16 @@ describe("inert public command entry scanner", () => {
 		]);
 		expect(rawControl.kind).toBe("usage");
 		expect(rawControl.issues.some(issue => issue.code === "unknown-flag")).toBe(true);
+	});
+
+	it("preserves scoped repo options on list and tail", () => {
+		const repo = "/tmp/gjc-repo";
+		const list = scanPublicCommand("sdk", ["session", "list", "--scope", "repo", "--repo", repo]);
+		const tail = scanPublicCommand("sdk", ["session", "tail", "session-id", "--repo", repo]);
+		expect(list.kind).toBe("operation");
+		expect(list.flags.repo).toBe(repo);
+		expect(tail.kind).toBe("operation");
+		expect(tail.flags.repo).toBe(repo);
 	});
 
 	it("does not infer help or JSON from operands, equals values or tokens after --", () => {
