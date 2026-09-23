@@ -21,6 +21,7 @@ import type {
 	ExtensionContextActions,
 	ExtensionUIContext,
 } from "../src/extensibility/extensions/types";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 
 test("extension API cannot set the private recovery bypass", () => {
 	const api = undefined as ExtensionAPI | undefined;
@@ -2297,131 +2298,197 @@ test("SDK host preserves positioned live order and replay parity for every attac
 });
 
 test("SDK host preserves ordered prompt image blocks in the host payload", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-prompt-images-${Date.now()}`;
-	const sent: CapturedSendCall[] = [];
-	const sessionContext = context(cwd, sessionId);
-	const handlers = start(sessionContext, undefined, (...args) => {
-		captureInternalSend(sent, args[0], args[1]);
+	const releases: string[] = [];
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		return {
+			images: reservation.images,
+			release: () => {
+				releases.push("released");
+				reservation.release();
+			},
+		};
 	});
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-
-	const control = async (requestId: string, operation: string, input: Record<string, unknown>) => {
-		const frame = JSON.stringify({
-			type: "control_request",
-			id: requestId,
-			operation,
-			input,
+	try {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
+		dirs.push(cwd);
+		const sessionId = `sdk-prompt-images-${Date.now()}`;
+		const sent: CapturedSendCall[] = [];
+		const live = { idle: true };
+		const sessionContext = context(cwd, sessionId, "main", live);
+		const handlers = start(sessionContext, undefined, (...args) => {
+			captureInternalSend(sent, args[0], args[1]);
 		});
-		expect(Buffer.byteLength(frame)).toBeLessThan(256 * 1024);
-		socket.send(frame);
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
-			`${requestId} response`,
-		);
-		return frames.find(frame => frame.type === "control_response" && frame.id === requestId)!;
-	};
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
 
-	const prompt = async (requestId: string, input: Record<string, unknown>) => {
-		socket.send(
-			JSON.stringify({
-				type: "control_command",
-				sessionId,
-				token: endpoint.token,
-				requestId,
-				command: { type: "control_request", id: requestId, operation: "turn.prompt", input },
+		const control = async (requestId: string, operation: string, input: Record<string, unknown>) => {
+			const frame = JSON.stringify({
+				type: "control_request",
+				id: requestId,
+				operation,
+				input,
+			});
+			expect(Buffer.byteLength(frame)).toBeLessThan(256 * 1024);
+			socket.send(frame);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
+				`${requestId} response`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === requestId)!;
+		};
+
+		const prompt = async (requestId: string, input: Record<string, unknown>) => {
+			socket.send(
+				JSON.stringify({
+					type: "control_command",
+					sessionId,
+					token: endpoint.token,
+					requestId,
+					command: { type: "control_request", id: requestId, operation: "turn.prompt", input },
+				}),
+			);
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === requestId),
+				`${requestId} response`,
+			);
+		};
+
+		await prompt("text-and-images", {
+			text: "Compare these screenshots.",
+			images: [{ data: "cG5nLWJ5dGVz", mimeType: "image/png" }, { data: "ZGVmYXVsdC1taW1l" }],
+		});
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		await prompt("images-only", {
+			text: "",
+			images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+		});
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		const original = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		expect(original.length).toBeGreaterThan(256 * 1024);
+		const digest = Buffer.from(await crypto.subtle.digest("SHA-256", original)).toString("hex");
+		const stage = async (name: string): Promise<string> => {
+			const begun = await control(`${name}-begin`, "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: original.length,
+				sha256: digest,
+			});
+			const uploadId = (begun.result as { id: string }).id;
+			expect(uploadId).toMatch(/^[0-9a-f]{8}-/);
+			expect(begun).toMatchObject({ ok: true, result: { id: uploadId, nextSequence: 0 } });
+			let sequence = 0;
+			for (let offset = 0; offset < original.length; offset += 96 * 1024) {
+				const response = await control(`${name}-chunk-${sequence}`, "turn.image.append", {
+					id: uploadId,
+					sequence,
+					data: original.subarray(offset, offset + 96 * 1024).toString("base64"),
+				});
+				expect(response).toMatchObject({ ok: true, result: { nextSequence: ++sequence } });
+			}
+			expect(await control(`${name}-finish`, "turn.image.finish", { id: uploadId })).toMatchObject({ ok: true });
+			return uploadId;
+		};
+		const uploadId = await stage("stage");
+		expect(
+			await control("staged-image", "turn.prompt", { text: "Read this image", stagedImages: [{ id: uploadId }] }),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toEqual([]);
+		expect((sent[2]?.[0] as Array<{ type: string; data?: string }>)[1]?.data).toBe(original.toString("base64"));
+
+		expect(sent).toEqual([
+			[
+				[
+					{ type: "text", text: "Compare these screenshots." },
+					{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
+					{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
+				],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+			[
+				[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+			[
+				[
+					{ type: "text", text: "Read this image" },
+					{ type: "image", data: original.toString("base64"), mimeType: "image/png" },
+				],
+				{
+					preflightSignal: expect.any(AbortSignal),
+					onQueuedPromoted: expect.any(Function),
+					onDispatchDisposition: expect.any(Function),
+				},
+			],
+		]);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		const rejectedId = await stage("rejected");
+		expect(
+			await control("rejected-image", "turn.prompt", {
+				text: "Reject",
+				stagedImages: [{ id: rejectedId }],
+				clientRef: " ",
 			}),
-		);
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_command_result" && frame.requestId === requestId),
-			`${requestId} response`,
-		);
-	};
-
-	await prompt("text-and-images", {
-		text: "Compare these screenshots.",
-		images: [{ data: "cG5nLWJ5dGVz", mimeType: "image/png" }, { data: "ZGVmYXVsdC1taW1l" }],
-	});
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	await prompt("images-only", {
-		text: "",
-		images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-	});
-	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	const original = Buffer.from(
-		await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
-	);
-	expect(original.length).toBeGreaterThan(256 * 1024);
-	const digest = Buffer.from(await crypto.subtle.digest("SHA-256", original)).toString("hex");
-	const begun = await control("stage-begin", "turn.image.begin", {
-		mimeType: "image/png",
-		byteLength: original.length,
-		sha256: digest,
-	});
-	const uploadId = (begun.result as { id: string }).id;
-	expect(uploadId).toMatch(/^[0-9a-f]{8}-/);
-	expect(begun).toMatchObject({ ok: true, result: { id: uploadId, nextSequence: 0 } });
-	let sequence = 0;
-	for (let offset = 0; offset < original.length; offset += 96 * 1024) {
-		const response = await control(`stage-chunk-${sequence}`, "turn.image.append", {
-			id: uploadId,
-			sequence,
-			data: original.subarray(offset, offset + 96 * 1024).toString("base64"),
-		});
-		expect(response).toMatchObject({ ok: true, result: { nextSequence: ++sequence } });
+		).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		expect(sent).toHaveLength(3);
+		expect(releases).toHaveLength(1);
+		live.idle = false;
+		const busyId = await stage("busy");
+		expect(
+			await control("busy-image", "turn.prompt", {
+				text: "Busy",
+				stagedImages: [{ id: busyId }],
+			}),
+		).toMatchObject({ ok: false, error: { code: "busy" } });
+		expect(sent).toHaveLength(3);
+		expect(releases).toHaveLength(2);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		expect(releases).toHaveLength(3);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		expect(releases).toHaveLength(3);
+		live.idle = true;
+		const racedId = await stage("race");
+		expect(
+			await control("raced-image", "turn.prompt", {
+				text: "Diverted after idle snapshot",
+				stagedImages: [{ id: racedId }],
+			}),
+		).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(releases).toHaveLength(3);
+		expect(sent).toHaveLength(4);
+		// The agent queue can remove a prompt diverted after the host's idle snapshot.
+		sent[3]?.[1]?.onQueuedPromoted?.({ startsOwnRun: false, removed: true });
+		expect(releases).toHaveLength(4);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		expect(releases).toHaveLength(4);
+	} finally {
+		redeemSpy.mockRestore();
 	}
-	expect(await control("stage-finish", "turn.image.finish", { id: uploadId })).toMatchObject({ ok: true });
-	expect(
-		await control("staged-image", "turn.prompt", { text: "Read this image", stagedImages: [{ id: uploadId }] }),
-	).toMatchObject({ ok: true, result: { accepted: true } });
-	expect((sent[2]?.[0] as Array<{ type: string; data?: string }>)[1]?.data).toBe(original.toString("base64"));
-
-	expect(sent).toEqual([
-		[
-			[
-				{ type: "text", text: "Compare these screenshots." },
-				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
-				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
-			],
-			{
-				preflightSignal: expect.any(AbortSignal),
-				onQueuedPromoted: expect.any(Function),
-				onDispatchDisposition: expect.any(Function),
-			},
-		],
-		[
-			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{
-				preflightSignal: expect.any(AbortSignal),
-				onQueuedPromoted: expect.any(Function),
-				onDispatchDisposition: expect.any(Function),
-			},
-		],
-		[
-			[
-				{ type: "text", text: "Read this image" },
-				{ type: "image", data: original.toString("base64"), mimeType: "image/png" },
-			],
-			{
-				preflightSignal: expect.any(AbortSignal),
-				onQueuedPromoted: expect.any(Function),
-				onDispatchDisposition: expect.any(Function),
-			},
-		],
-	]);
 });
 
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
