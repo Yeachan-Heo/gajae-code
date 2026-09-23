@@ -5947,6 +5947,7 @@ export class AgentSession {
 		nextTools: CustomTool[],
 		options?: { mandatoryMCPToolNames?: readonly string[] },
 	): Promise<void> {
+		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
 		const previousActive = this.getActiveToolNames();
 		for (const name of previous) this.#toolRegistry.delete(name);
@@ -5966,10 +5967,13 @@ export class AgentSession {
 			);
 		}
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
-		await this.#applyActiveToolsByName([
-			...previousActive.filter(name => !previous.has(name)),
-			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
-		]);
+		await this.#applyActiveToolsByName(
+			[
+				...previousActive.filter(name => !previous.has(name)),
+				...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+			],
+			{ previousSelectedMCPToolNames },
+		);
 	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
@@ -11893,6 +11897,7 @@ export class AgentSession {
 		options: {
 			selectedMCPToolNames?: string[];
 			activeMCPToolNames?: string[];
+			mandatoryMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
 		} = {},
 	): Promise<void> {
@@ -11927,6 +11932,11 @@ export class AgentSession {
 		}
 
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
+		if (options.mandatoryMCPToolNames !== undefined) {
+			this.#mandatoryMCPToolNames = new Set(
+				options.mandatoryMCPToolNames.map(name => name.toLowerCase()).filter(name => this.#toolRegistry.has(name)),
+			);
+		}
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
 		if (options.selectedMCPToolNames) {

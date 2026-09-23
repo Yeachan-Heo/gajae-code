@@ -2519,7 +2519,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
 				await session.replaceOwnedMcpManager(nextManager);
-				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[]);
+				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
+					mandatoryMCPToolNames: pluginMcpToolNames,
+				});
 			}
 			cwdCapturingToolNames.length = 0;
 			cwdCapturingToolNames.push(...nextCwdCapturing);
