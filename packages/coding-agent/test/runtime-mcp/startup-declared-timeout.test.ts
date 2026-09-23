@@ -189,7 +189,7 @@ describe("MCP startup and the declared connection window", () => {
 				([message]) => message === "MCP server connection failed during startup",
 			);
 			expect(startupWarning).toBeDefined();
-			expect(startupWarning?.[1]).toMatchObject({ error: "expected-mcp-failure" });
+			expect(startupWarning?.[1]).toMatchObject({ error: "http-status:500" });
 			expect(JSON.stringify(startupWarning)).not.toContain(secret);
 		} finally {
 			warning.mockRestore();

@@ -160,6 +160,9 @@ export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedM
 
 /** Keep startup logs bounded and free of remote response text. */
 function classifyMCPStartupFailure(error: unknown): string {
+	if (error instanceof MCPExpectedFailure) {
+		return error.cause === undefined ? "expected-mcp-failure" : classifyMCPStartupFailure(error.cause);
+	}
 	if (error instanceof MCPHttpRequestError) {
 		return Number.isInteger(error.status) && error.status >= 100 && error.status <= 599
 			? `http-status:${error.status}`
@@ -170,7 +173,6 @@ function classifyMCPStartupFailure(error: unknown): string {
 			? `json-rpc-code:${error.code}`
 			: "json-rpc-error";
 	}
-	if (error instanceof MCPExpectedFailure) return "expected-mcp-failure";
 	return "transport-error";
 }
 

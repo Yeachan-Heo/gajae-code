@@ -218,7 +218,9 @@ describe("MCP manager lifecycle cleanup", () => {
 			);
 			expect(result.errors.has("late")).toBe(false);
 
-			backgroundFailure.reject(new MCPHttpRequestError(502, `remote response included ${secret}`));
+			backgroundFailure.reject(
+				new MCPExpectedFailure(new MCPHttpRequestError(502, `remote response included ${secret}`)),
+			);
 			await waitFor(() => result.errors.get("late")?.includes(secret) === true);
 			expect(result.errors.get("late")).toContain(secret);
 			const loggedFailure = error.mock.calls.find(([message]) => message === "MCP tool load failed");
