@@ -27,7 +27,6 @@ import {
 	reconcileBrokerGenerationForStartup,
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
-import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
@@ -120,8 +119,12 @@ async function writeBrokerStartupFailureMarkerBounded(
 	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
 ): Promise<boolean> {
 	const settled = Promise.withResolvers<boolean>();
-	const timer = setTimeout(() => settled.resolve(false), BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
-	void writeBrokerStartupFailureMarker(agentDir, failure).then(
+	const abortController = new AbortController();
+	const timer = setTimeout(() => {
+		abortController.abort();
+		settled.resolve(false);
+	}, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
+	void writeBrokerStartupFailureMarker(agentDir, failure, abortController.signal).then(
 		written => settled.resolve(written),
 		() => settled.resolve(false),
 	);
@@ -1524,9 +1527,11 @@ export default class Sdk extends Command {
 		let startupExitTask: Promise<boolean> | undefined;
 		const startupStartedAt = process.hrtime.bigint();
 		let startupExitWrite: Promise<BrokerStartupExitWriteStatus> | undefined;
+		const startupAbortController = new AbortController();
+		const startupSignalExitCode = (signal: "SIGTERM" | "SIGINT"): 130 | 143 => (signal === "SIGINT" ? 130 : 143);
 		const makeStartupExitRecord = (
 			reason: "startup-deadline" | "startup-signal",
-			exitCode: 0 | 1,
+			exitCode: 1 | 130 | 143,
 			signal: "SIGTERM" | "SIGINT" | null,
 			timeoutMs?: number,
 		): BrokerStartupExitRecord & Record<string, unknown> => ({
@@ -1565,7 +1570,7 @@ export default class Sdk extends Command {
 		};
 		const exitDuringStartup = (
 			reason: "startup-deadline" | "startup-signal",
-			exitCode: 0 | 1,
+			exitCode: 1 | 130 | 143,
 			signal: "SIGTERM" | "SIGINT" | null,
 			timeoutMs?: number,
 		): Promise<boolean> => {
@@ -1617,40 +1622,13 @@ export default class Sdk extends Command {
 				await activeBroker.stop({ kind: "signal", signal });
 				return;
 			}
-			await exitDuringStartup("startup-signal", 0, signal);
+			startupAbortController.abort();
+			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
 		});
-		let signalHandled = false;
-		const stopForSignal = (signal: "SIGTERM" | "SIGINT"): void => {
-			if (signalHandled || startupExitRequested) return;
-			signalHandled = true;
-			pendingShutdownSignal = signal;
-			const exitCode = 0;
-			const activeBroker = brokerReadyForSignal();
-			if (activeBroker) {
-				runningBroker = activeBroker;
-				stopSweep?.();
-				void activeBroker.stop({ kind: "signal", signal });
-			} else {
-				void exitDuringStartup("startup-signal", exitCode, signal);
-			}
-			void postmortem.quit(exitCode);
-		};
-		const onSigterm = (): void => stopForSignal("SIGTERM");
-		const onSigint = (): void => stopForSignal("SIGINT");
-		const removeSignalHandlers = (): void => {
-			process.off("SIGTERM", onSigterm);
-			process.off("SIGINT", onSigint);
-		};
-		process.prependListener("SIGTERM", onSigterm);
-		process.prependListener("SIGINT", onSigint);
 		const finishPendingStartupSignal = async (): Promise<boolean> => {
 			const signal = pendingShutdownSignal;
 			if (!signal) return false;
-			const exitCode = 0;
-			await exitDuringStartup("startup-signal", exitCode, signal);
-			removeSignalHandlers();
-			unregisterPostmortem();
-			process.exit(exitCode);
+			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
 			return true;
 		};
 		try {
@@ -1668,6 +1646,7 @@ export default class Sdk extends Command {
 				}, watchdogMs);
 				try {
 					const existing = await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+					if (startupAbortController.signal.aborted) return undefined;
 					if (existing) {
 						logger.info("sdk broker: startup reused an existing owner", {
 							reason: "existing-owner-reused",
@@ -1698,6 +1677,7 @@ export default class Sdk extends Command {
 					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000) {
 						await Bun.sleep(startupDelayMs);
 					}
+					if (startupAbortController.signal.aborted) return undefined;
 					// The real broker-internal entry point is the only place that reads this
 					// launcher-supplied environment variable; it is validated here and handed
 					// to Broker as a typed setting, never read a second time inside broker.ts
@@ -1716,8 +1696,17 @@ export default class Sdk extends Command {
 						testPostPublicationDelayMs <= 10_000
 							? testPostPublicationDelayMs
 							: undefined;
+					const testPrePublicationDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_PRE_PUBLICATION_DELAY_MS ?? 0);
+					const startupPrePublicationDelayMs =
+						Number.isSafeInteger(testPrePublicationDelayMs) &&
+						testPrePublicationDelayMs > 0 &&
+						testPrePublicationDelayMs <= 10_000
+							? testPrePublicationDelayMs
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
+						startupAbortSignal: startupAbortController.signal,
+						onStartupReady: () => clearTimeout(startupWatchdog),
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
 							"sdk.masterOrphanGraceMs",
 						),
@@ -1730,6 +1719,14 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(startupPrePublicationDelayMs === undefined
+							? {}
+							: {
+									startupPrePublicationDelayMs,
+									startupPrePublicationTestHook: async () => {
+										await emitBrokerStartupTestSignal("pre-publication-ready");
+									},
+								}),
 						...(startupPostPublicationDelayMs === undefined ? {} : { startupPostPublicationDelayMs }),
 						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
@@ -1774,7 +1771,6 @@ export default class Sdk extends Command {
 				exitCode: 1,
 				markerWritten,
 			});
-			removeSignalHandlers();
 			unregisterPostmortem();
 			throw error;
 		}
@@ -1783,7 +1779,6 @@ export default class Sdk extends Command {
 				await finishPendingStartupSignal();
 				return;
 			}
-			removeSignalHandlers();
 			unregisterPostmortem();
 			return;
 		}
@@ -1791,8 +1786,6 @@ export default class Sdk extends Command {
 			if (pendingShutdownSignal) {
 				if (runningBroker) await runningBroker.completion;
 				else await finishPendingStartupSignal();
-				removeSignalHandlers();
-				unregisterPostmortem();
 				return;
 			}
 			// Another broker owns discovery; this process exits cleanly (code 0) as
@@ -1806,7 +1799,6 @@ export default class Sdk extends Command {
 				pid: process.pid,
 				...(losingIncarnation === undefined ? {} : { incarnation: losingIncarnation }),
 			});
-			removeSignalHandlers();
 			unregisterPostmortem();
 			return;
 		}
@@ -1815,11 +1807,11 @@ export default class Sdk extends Command {
 		// gone; the sweep is the broker-side half of the host reaping bound.
 		stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
 		try {
-			await completeBrokerProcess(runningBroker);
+			await runningBroker.completion;
 		} finally {
 			stopSweep?.();
-			removeSignalHandlers();
-			unregisterPostmortem();
+			if (!pendingShutdownSignal) unregisterPostmortem();
 		}
+		if (!pendingShutdownSignal) process.exit(0);
 	}
 }

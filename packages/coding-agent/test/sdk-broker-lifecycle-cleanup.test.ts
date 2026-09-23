@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileLockAcquireError } from "../src/config/file-lock";
@@ -41,6 +41,42 @@ test("write creates the marker at the expected path and read round-trips it", as
 		expect(typeof marker?.writtenAt).toBe("number");
 		expect(Number.isFinite(marker?.writtenAt)).toBe(true);
 	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("aborted write does not publish a marker after its temporary write completes", async () => {
+	const agentDir = await makeAgentDir();
+	const controller = new AbortController();
+	const writeStarted = Promise.withResolvers<void>();
+	const finishWrite = Promise.withResolvers<void>();
+	const originalWrite = Bun.write.bind(Bun);
+	const writeSpy = spyOn(Bun, "write").mockImplementation(async (destination, contents) => {
+		if (typeof destination !== "string" || typeof contents !== "string")
+			throw new Error("Expected a string path and serialized marker contents.");
+		writeStarted.resolve();
+		await finishWrite.promise;
+		return originalWrite(destination, contents);
+	});
+	let writePromise: Promise<boolean> | undefined;
+	try {
+		writePromise = writeBrokerStartupFailureMarker(
+			agentDir,
+			{ reason: "late startup failure", exitCode: 1, signal: null, pid: process.pid },
+			controller.signal,
+		);
+		await writeStarted.promise;
+		controller.abort();
+		finishWrite.resolve();
+
+		expect(await writePromise).toBe(false);
+		expect(await readBrokerStartupFailureMarker(agentDir)).toBeUndefined();
+		const entries = await fs.readdir(path.dirname(brokerStartupFailurePath(agentDir)));
+		expect(entries.filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+	} finally {
+		finishWrite.resolve();
+		await writePromise?.catch(() => undefined);
+		writeSpy.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 });

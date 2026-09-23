@@ -39,7 +39,7 @@ export interface BrokerStartupExitRecord {
 	uptimeMs: number;
 	pid: number;
 	signal: "SIGINT" | "SIGTERM" | null;
-	exitCode: 0 | 1;
+	exitCode: 1 | 130 | 143;
 	timeoutMs: number | null;
 	writtenAt: number;
 }
@@ -107,6 +107,7 @@ function isBrokerExitRecord(value: unknown): value is BrokerExitRecord {
 function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const record = value as Partial<BrokerStartupExitRecord>;
+	const signalExitCode = record.signal === "SIGINT" ? 130 : record.signal === "SIGTERM" ? 143 : null;
 	const keys = Object.keys(record).sort();
 	return (
 		keys.join(",") ===
@@ -135,11 +136,11 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 		Number.isSafeInteger(record.pid) &&
 		(record.pid as number) > 0 &&
 		(record.signal === null || record.signal === "SIGINT" || record.signal === "SIGTERM") &&
-		(record.exitCode === 0 || record.exitCode === 1) &&
+		(record.exitCode === 1 || record.exitCode === 130 || record.exitCode === 143) &&
 		(record.timeoutMs === null || (Number.isSafeInteger(record.timeoutMs) && (record.timeoutMs as number) > 0)) &&
 		(record.reason === "startup-deadline"
 			? record.exitCode === 1 && record.signal === null && record.timeoutMs !== null
-			: record.exitCode === 0 && record.signal !== null && record.timeoutMs === null) &&
+			: record.exitCode === signalExitCode && signalExitCode !== null && record.timeoutMs === null) &&
 		Number.isSafeInteger(record.writtenAt) &&
 		(record.writtenAt as number) > 0
 	);
