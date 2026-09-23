@@ -500,6 +500,10 @@ describe("subagentAwaitRenderedStateSignature", () => {
 			s => ({ ...s, progress: { ...baseProgress, recentTool: "read", currentTool: undefined } }),
 			s => ({ ...s, progress: { ...baseProgress, recentOutputSummary: { lineCount: 2 } } }),
 			s => ({ ...s, progress: { ...baseProgress, fastMode: true } }),
+			s => ({ ...s, progress: { ...baseProgress, toolCount: 4 } }),
+			s => ({ ...s, progress: { ...baseProgress, contextTokens: 12_000 } }),
+			s => ({ ...s, progress: { ...baseProgress, contextWindow: 200_000 } }),
+			s => ({ ...s, progress: { ...baseProgress, lastActivityMs: 1_234 } }),
 			s => ({ ...s, progress: { ...baseProgress, status: "completed" } }),
 			s => ({
 				...s,
@@ -758,13 +762,25 @@ describe("subagent await progress visibility boundary", () => {
 		manager.registerSubagentRecord(runningRecord("0-Vis", jobId));
 		manager.recordSubagentProgress(
 			"0-Vis",
-			makeProgress({ id: "0-Vis", currentTool: "read", recentOutput: ["secret-marker-text"] }),
+			makeProgress({
+				id: "0-Vis",
+				currentTool: "read",
+				recentOutput: ["secret-marker-text"],
+				toolCount: 7,
+				contextTokens: 42_000,
+				contextWindow: 200_000,
+				lastActivityMs: 1_700_000_000_000,
+			}),
 		);
 
 		const result = await tool.execute("await", { action: "await", ids: ["0-Vis"], timeout_ms: 5 });
 
 		const snap = result.details?.subagents.find(s => s.id === "0-Vis");
 		expect(snap?.progress?.currentTool).toBe("read");
+		expect(snap?.progress?.toolCount).toBe(7);
+		expect(snap?.progress?.contextTokens).toBe(42_000);
+		expect(snap?.progress?.contextWindow).toBe(200_000);
+		expect(snap?.progress?.lastActivityMs).toBe(1_700_000_000_000);
 		expect(snap?.progress?.recentOutputSummary).toEqual({ lineCount: 1 });
 
 		const modelText = result.content.map(part => ("text" in part ? part.text : "")).join("\n");

@@ -554,7 +554,10 @@ export class ToolExecutionComponent extends Container {
 			this.#toolName === "task" &&
 			(this.#result?.details as { async?: { state?: string } } | undefined)?.async?.state === "running";
 		const isPartialTask = this.#isPartial && this.#toolName === "task" && !isBackgroundAsyncTask;
-		const needsSpinner = isStreamingArgs || isPartialTask;
+		// A partial `subagent` await animates too: its per-subagent status line carries
+		// the spinner and the ticking "last activity" age (the heavy body stays cached).
+		const isPartialSubagentAwait = this.#isPartial && this.#toolName === "subagent";
+		const needsSpinner = isStreamingArgs || isPartialTask || isPartialSubagentAwait;
 		if (needsSpinner && !this.#spinnerAnimation) {
 			this.#spinnerAnimation = registerAnimationCallback(() => {
 				if (this.#disposed) return;

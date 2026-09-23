@@ -29,6 +29,10 @@ function progress(overrides: Partial<AgentProgress> & Pick<AgentProgress, "id">)
 		...(overrides.recentOutput && overrides.recentOutput.length > 0
 			? { recentOutputSummary: { lineCount: Math.min(overrides.recentOutput.length, 6) } }
 			: {}),
+		...(overrides.toolCount ? { toolCount: overrides.toolCount } : {}),
+		...(overrides.contextTokens ? { contextTokens: overrides.contextTokens } : {}),
+		...(overrides.contextWindow ? { contextWindow: overrides.contextWindow } : {}),
+		...(overrides.lastActivityMs !== undefined ? { lastActivityMs: overrides.lastActivityMs } : {}),
 		...(overrides.fastMode ? { fastMode: true } : {}),
 		...(retryState
 			? {
@@ -85,6 +89,56 @@ describe("subagentToolRenderer", () => {
 		expect(out).toContain("read");
 		expect(out).toContain("recent output available (1 line)");
 	});
+	it("renders tool count, context, and a fresh last-activity age on the live status line", () => {
+		const details: SubagentToolDetails = {
+			subagents: [
+				snapshot({
+					id: "0-Stats",
+					liveProgressAvailable: true,
+					progress: progress({
+						id: "0-Stats",
+						currentTool: "read",
+						toolCount: 12,
+						contextTokens: 48_000,
+						contextWindow: 200_000,
+						lastActivityMs: Date.now() - 7_000,
+					}),
+				}),
+			],
+		};
+		const first = render(details);
+		expect(first).toContain("12 tools");
+		expect(first).toContain("48K/200K ctx");
+		expect(first).toMatch(/last activity 7(\.\d)?s ago/);
+
+		// Same snapshot, later render: the age advances without a new producer update.
+		const later = render({
+			subagents: [
+				snapshot({
+					id: "0-Stats",
+					liveProgressAvailable: true,
+					progress: { ...details.subagents[0]!.progress!, lastActivityMs: Date.now() - 65_000 },
+				}),
+			],
+		});
+		expect(later).toMatch(/last activity 1m/);
+	});
+
+	it("omits live stats when the live producer is gone", () => {
+		const out = render({
+			subagents: [
+				snapshot({
+					id: "0-Gone",
+					liveProgressAvailable: false,
+					progress: progress({ id: "0-Gone", toolCount: 3, contextTokens: 9_000, lastActivityMs: 1 }),
+				}),
+			],
+		});
+		expect(out).not.toContain("3 tools");
+		expect(out).not.toContain("ctx");
+		expect(out).not.toContain("last activity");
+	});
+
 	it("renders the fast glyph on the model line only when fast mode is enabled", () => {
 		const out = render({
 			subagents: [
