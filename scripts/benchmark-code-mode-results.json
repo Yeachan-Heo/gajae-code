@@ -1,0 +1,300 @@
+{
+  "formatVersion": 1,
+  "benchmark": "issue-5792-code-mode-measurement",
+  "executionStatus": "complete",
+  "decisionEligible": true,
+  "validityStatus": "isolated decision-eligible rerun",
+  "harnessCommit": "54100eaef9904859006b7a40765b6c2d8f22a203",
+  "startedAt": "2026-09-23T22:05:23.652Z",
+  "finishedAt": "2026-09-23T22:48:34.573Z",
+  "workspaceSnapshot": {
+    "commit": "6a4de2c932e5079646e45066654fb9aae871c168",
+    "isolation": "clean origin/dev worktree; output outside search corpus"
+  },
+  "model": {
+    "requested": "openai/gpt-5.5",
+    "resolved": "openai/gpt-5.5",
+    "armA": "openai/gpt-5.5",
+    "armB": "openai/gpt-5.5"
+  },
+  "contract": {
+    "taskCount": 8,
+    "repetitionsPerTaskPerArm": 3,
+    "scheduledPairedRuns": 24,
+    "fixedScheduleSeed": 5792,
+    "maxAttemptsPerScheduledRun": 2,
+    "runTimeoutMs": 30000,
+    "handlerSetupTimeoutMs": 30000,
+    "setupCleanupTimeoutMs": 10000,
+    "runTimeoutScope": "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
+    "roundTripDefinition": "AgentSession turn_start events (one model request/response cycle per round trip).",
+    "assistantTurnDefinition": "Assistant-role turn_end events; turns-to-green stops at the first final answer that passes task-specific answer-term, JSON/evidence, and dependent-trace validation.",
+    "providerInputTokenDefinition": "SessionStats input + cacheRead + cacheWrite reported on assistant messages; null means no assistant usage was available.",
+    "percentReductionWhenBaselineIsZero": "0% if both arms used zero requests; -100% if B used requests and A used zero, a conservative undefined-baseline penalty.",
+    "percentReductionStorage": "Fractions (0.25 = 25%) in paired metrics.",
+    "decisionRule": "Pass iff median paired request reduction >= 1, median paired percent reduction >= 25%, task-clustered bootstrap 95% CI lower bound > 0, Arm B green rate >= 80%, and B green rate is no more than 10 percentage points below A.",
+    "bootstrap": {
+      "method": "resample whole task clusters with replacement; retain all three repetition pairs within each sampled task",
+      "iterations": 10000,
+      "seed": 11538935
+    }
+  },
+  "taskCount": 8,
+  "repetitionsPerTaskPerArm": 3,
+  "scheduledPairedRuns": 24,
+  "runCounts": {
+    "scheduled": 48,
+    "green": 2,
+    "failed": 46,
+    "retries": 47,
+    "errors": 222
+  },
+  "runCountsByArm": {
+    "A": {
+      "scheduled": 24,
+      "green": 2,
+      "failed": 22,
+      "failureRate": 0.9166666666666666,
+      "retries": 23,
+      "retryRate": 0.9583333333333334
+    },
+    "B": {
+      "scheduled": 24,
+      "green": 0,
+      "failed": 24,
+      "failureRate": 1,
+      "retries": 24,
+      "retryRate": 1
+    }
+  },
+  "medianByArm": {
+    "A": {
+      "scheduled": 24,
+      "medianRequests": 9.0,
+      "medianTurnsToGreen": 6.5,
+      "medianProviderInputTokens": 74770.0,
+      "totalProviderInputTokens": 2140815,
+      "green": 2,
+      "failed": 22,
+      "failureRate": 0.9166666666666666,
+      "retries": 23
+    },
+    "B": {
+      "scheduled": 24,
+      "medianRequests": 8.5,
+      "medianTurnsToGreen": null,
+      "medianProviderInputTokens": 47449.5,
+      "totalProviderInputTokens": 1138173,
+      "green": 0,
+      "failed": 24,
+      "failureRate": 1.0,
+      "retries": 24
+    }
+  },
+  "decision": {
+    "medianPairedRequestReduction": 0,
+    "medianPairedPercentReduction": 0,
+    "bootstrap95CI": {
+      "lower": -1,
+      "upper": 3
+    },
+    "armAGreenRate": 0.08333333333333333,
+    "armBGreenRate": 0,
+    "completionRateDrop": 0.08333333333333333,
+    "pass": false,
+    "medianPairedPercentReductionPercent": 0
+  },
+  "perTask": [
+    {
+      "taskId": "CM01",
+      "title": "In-process benchmark client setup",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 12,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 216818,
+        "medianModelFacingToolCalls": 12,
+        "medianReadSearchHandlerCalls": 12,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 54468,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 11,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": 4,
+      "pairedMedianPercentReduction": 0.3076923076923077
+    },
+    {
+      "taskId": "CM02",
+      "title": "Codex freeform tool capability",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 72613,
+        "medianModelFacingToolCalls": 7,
+        "medianReadSearchHandlerCalls": 7,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 53066,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 11,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": 0,
+      "pairedMedianPercentReduction": 0
+    },
+    {
+      "taskId": "CM03",
+      "title": "Read tool argument schema",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": 8,
+        "medianProviderInputTokens": 46243,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 1
+      },
+      "B": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 52081,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 18,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -1,
+      "pairedMedianPercentReduction": -0.125
+    },
+    {
+      "taskId": "CM04",
+      "title": "Search result metadata",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": 5,
+        "medianProviderInputTokens": 35259,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 1
+      },
+      "B": {
+        "medianModelRequests": 7,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 33960,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 10,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": 1,
+      "pairedMedianPercentReduction": 0.1111111111111111
+    },
+    {
+      "taskId": "CM05",
+      "title": "Session usage accounting",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 13,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 150212,
+        "medianModelFacingToolCalls": 11,
+        "medianReadSearchHandlerCalls": 11,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 39665,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 9,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": 5,
+      "pairedMedianPercentReduction": 0.38461538461538464
+    },
+    {
+      "taskId": "CM06",
+      "title": "Model round-trip boundaries",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 74771,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 46967,
+        "medianModelFacingToolCalls": 7,
+        "medianReadSearchHandlerCalls": 11,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -1,
+      "pairedMedianPercentReduction": -0.125
+    },
+    {
+      "taskId": "CM07",
+      "title": "Custom tool wire name contract",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 87503,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 59557,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 11,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -1,
+      "pairedMedianPercentReduction": -0.125
+    },
+    {
+      "taskId": "CM08",
+      "title": "Root benchmark command conventions",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 10,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 55288,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 8,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 9,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 38926,
+        "medianModelFacingToolCalls": 7,
+        "medianReadSearchHandlerCalls": 12,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": 1,
+      "pairedMedianPercentReduction": 0.1
+    }
+  ],
+  "sourceRawSha256": "baf78f4bbdfb4d27da49d538a735a96b402635a5b6e8cf38bb28e9382156ea5c",
+  "rawArtifactPath": "scripts/benchmark-code-mode-runs.json.gz",
+  "limitations": [
+    "Results describe only this fixed 8-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
+    "Attempt deadlines cover session creation and agent/tool execution; handler-session setup and cleanup use separately bounded timeouts."
+  ],
+  "priorExploratoryArtifact": "scripts/benchmark-code-mode-exploratory-results.json"
+}
