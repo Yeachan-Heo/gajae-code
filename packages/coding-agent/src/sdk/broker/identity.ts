@@ -51,6 +51,19 @@ export async function deriveIdempotencyIdentity(
 		.digest("hex");
 }
 
+/** Native identity for an idempotency key reserved inside one managed control root. */
+export async function deriveScopedIdempotencyIdentity(
+	agentDir: string,
+	operation: string,
+	callerKey: string,
+	scope: string,
+): Promise<string> {
+	const key = await getBrokerIdentityKey(agentDir);
+	return createHmac("sha256", Buffer.from(key, "hex"))
+		.update(JSON.stringify(["managed-spawn-v1", operation, callerKey, scope]))
+		.digest("hex");
+}
+
 /** Identity format used by lifecycle rows written before target binding. */
 export async function deriveLegacyIdentity(agentDir: string, operation: string, callerKey: string): Promise<string> {
 	const key = await getBrokerIdentityKey(agentDir);

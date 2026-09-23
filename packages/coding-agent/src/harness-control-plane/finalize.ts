@@ -11,7 +11,9 @@
  */
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { type LinuxProcPidProbeResult, probeLinuxProcPidSync } from "../gjc-runtime/linux-proc";
 import {
 	buildReceipt,
 	type CompletionEvidence,
@@ -23,7 +25,7 @@ import {
 	type ValidationEvidence,
 	validateReceipt,
 } from "./receipts";
-import { readReceiptIndex, writeReceiptImmutable } from "./storage";
+import { type ReceiptIndexEntry, readReceiptIndex, writeReceiptImmutable } from "./storage";
 import { extractReviewVerdict, isReviewVerdict, type ReviewVerdict } from "./types";
 
 export interface ValidationCommandSpec {
@@ -37,12 +39,28 @@ export interface ValidationRun {
 	exitStatus: number;
 	pass: boolean;
 }
+export class ValidationObservationUncertainError extends Error {
+	readonly exactCommand: string;
+	readonly cwd: string;
+	constructor(exactCommand: string, cwd: string, cause?: unknown) {
+		super("validation observation is uncertain");
+		this.name = "ValidationObservationUncertainError";
+		this.exactCommand = exactCommand;
+		this.cwd = cwd;
+		if (cause !== undefined) this.cause = cause;
+	}
+}
 
 export interface FinalizeChecks {
-	runValidation(spec: ValidationCommandSpec): Promise<ValidationRun>;
+	runValidation(spec: ValidationCommandSpec, signal?: AbortSignal): Promise<ValidationRun>;
 	resolveCommit(): Promise<string | null>;
 	commitOnBranch(commit: string, branch: string): Promise<boolean>;
 	prOrIssue(): Promise<{ prUrl: string | null; issueArtifact: string | null }>;
+	/** Owner-scoped receipt commit hook; null means lifecycle authority was withdrawn. */
+	writeReceipt?(
+		family: "validation" | "completion" | "review-failure" | "review-verdict",
+		receipt: ReceiptEnvelope<unknown>,
+	): Promise<ReceiptIndexEntry | null>;
 }
 
 export interface FinalizeOptions {
@@ -66,6 +84,8 @@ export interface FinalizeOptions {
 	prTarget?: string | null;
 	validationCommands?: ValidationCommandSpec[];
 	checks: FinalizeChecks;
+	/** Cancels an in-flight validation subprocess when its owning request is withdrawn. */
+	signal?: AbortSignal;
 	clock?: () => number;
 }
 
@@ -84,6 +104,15 @@ function receiptId(prefix: string): string {
 	return `${prefix}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 }
 
+function persistFinalizeReceipt(
+	opts: FinalizeOptions,
+	family: "validation" | "completion" | "review-failure" | "review-verdict",
+	receipt: ReceiptEnvelope<unknown>,
+): Promise<ReceiptIndexEntry | null> {
+	if (opts.checks.writeReceipt) return opts.checks.writeReceipt(family, receipt);
+	return writeReceiptImmutable(opts.root, opts.sessionId, family, receipt.receiptId, receipt);
+}
+
 /** Bound + whitespace-collapse assistant text into a redaction-safe digest summary (never a raw dump). */
 function boundedAssistantSummary(text: string | null): string | null {
 	if (!text) return null;
@@ -93,19 +122,53 @@ function boundedAssistantSummary(text: string | null): string | null {
 }
 
 export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult> {
+	if (opts.signal?.aborted) {
+		return {
+			completed: false,
+			receiptPath: null,
+			validation: [],
+			commitHash: null,
+			prUrl: null,
+			issueArtifact: null,
+			blockers: ["validation-unknown:cancelled"],
+		};
+	}
 	if (opts.reviewOnly) return runReviewFinalize(opts);
 
 	const now = () => new Date(opts.clock ? opts.clock() : Date.now()).toISOString();
 	const blockers: string[] = [];
 	const validation: FinalizeResult["validation"] = [];
 	const validationReceiptIds: string[] = [];
+	const canceled = (
+		commit: string | null,
+		artifact: { prUrl: string | null; issueArtifact: string | null },
+	): FinalizeResult => ({
+		completed: false,
+		receiptPath: null,
+		validation,
+		commitHash: commit,
+		prUrl: artifact.prUrl,
+		issueArtifact: artifact.issueArtifact,
+		blockers: ["validation-unknown:cancelled"],
+	});
 
 	const commit = await opts.checks.resolveCommit();
+	if (opts.signal?.aborted) return canceled(commit, { prUrl: null, issueArtifact: null });
 	const subject: ReceiptSubject = { workspace: opts.workspace, branch: opts.branch, head: commit, commit };
 
 	// 1. Validation receipts.
 	for (const spec of opts.validationCommands ?? []) {
-		const run = await opts.checks.runValidation(spec);
+		let run: ValidationRun;
+		try {
+			run = await opts.checks.runValidation(spec, opts.signal);
+		} catch (caught) {
+			if (caught instanceof ValidationObservationUncertainError) {
+				blockers.push(`validation-unknown:${spec.name}`);
+				break;
+			}
+			throw caught;
+		}
+		if (opts.signal?.aborted) return canceled(commit, { prUrl: null, issueArtifact: null });
 		const evidence: ValidationEvidence = {
 			command: spec.name,
 			exactCommand: run.exactCommand,
@@ -124,25 +187,36 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 			createdAt: now(),
 			valid: run.pass,
 		});
-		await writeReceiptImmutable(opts.root, opts.sessionId, "validation", receipt.receiptId, receipt);
+		const entry = await persistFinalizeReceipt(opts, "validation", receipt);
+		if (!entry) return canceled(commit, { prUrl: null, issueArtifact: null });
 		const outcome = validateReceipt(receipt);
 		validation.push({ name: spec.name, valid: outcome.valid, exitStatus: run.exitStatus });
 		validationReceiptIds.push(receipt.receiptId);
+		if (opts.signal?.aborted) return canceled(commit, { prUrl: null, issueArtifact: null });
 		if (opts.requireTests && !outcome.valid) blockers.push(`validation-failed:${spec.name}`);
 	}
 	if (opts.requireTests && (opts.validationCommands?.length ?? 0) === 0) {
 		blockers.push("validation-required-but-none-run");
 	}
+	const validationUnknown = blockers.some(blocker => blocker.startsWith("validation-unknown:"));
 
-	// 2. Commit on branch.
-	if (opts.requireCommit) {
-		if (!commit) blockers.push("missing-commit");
-		else if (!(await opts.checks.commitOnBranch(commit, opts.branch))) blockers.push("commit-not-on-branch");
+	let artifact: { prUrl: string | null; issueArtifact: string | null } = { prUrl: null, issueArtifact: null };
+	if (!validationUnknown) {
+		// 2. Commit on branch.
+		if (opts.requireCommit) {
+			if (!commit) blockers.push("missing-commit");
+			else {
+				const onBranch = await opts.checks.commitOnBranch(commit, opts.branch);
+				if (opts.signal?.aborted) return canceled(commit, artifact);
+				if (!onBranch) blockers.push("commit-not-on-branch");
+			}
+		}
+
+		// 3. PR / issue artifact.
+		artifact = await opts.checks.prOrIssue();
+		if (opts.signal?.aborted) return canceled(commit, artifact);
+		if (opts.requirePr && !artifact.prUrl && !artifact.issueArtifact) blockers.push("missing-pr-or-issue");
 	}
-
-	// 3. PR / issue artifact.
-	const artifact = await opts.checks.prOrIssue();
-	if (opts.requirePr && !artifact.prUrl && !artifact.issueArtifact) blockers.push("missing-pr-or-issue");
 
 	// B4: cross-validate the persisted validation receipts (validity + commit freshness) before completion.
 	if (blockers.length === 0) {
@@ -170,6 +244,7 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 			blockers,
 		};
 	}
+	if (opts.signal?.aborted) return canceled(commit, artifact);
 
 	// 4. Completion receipt + predicate.
 	const completion: CompletionEvidence = {
@@ -192,7 +267,8 @@ export async function runFinalize(opts: FinalizeOptions): Promise<FinalizeResult
 		createdAt: now(),
 	});
 	const outcome = validateReceipt(receipt);
-	const entry = await writeReceiptImmutable(opts.root, opts.sessionId, "completion", receipt.receiptId, receipt);
+	const entry = await persistFinalizeReceipt(opts, "completion", receipt);
+	if (!entry) return canceled(commit, artifact);
 	return {
 		completed: outcome.valid,
 		receiptPath: entry.path,
@@ -227,6 +303,15 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 		prUrl: null,
 		issueArtifact: null,
 	};
+	if (opts.signal?.aborted) {
+		return {
+			...baseResult,
+			completed: false,
+			receiptPath: null,
+			verdict: null,
+			blockers: ["validation-unknown:cancelled"],
+		};
+	}
 
 	// Explicit operator/loop verdict always wins. Only when none is supplied do we fall back to
 	// extracting a closed-vocabulary verdict from the live RPC owner's final assistant text.
@@ -259,13 +344,16 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 			createdAt: now(),
 		});
 		const outcome = validateReceipt(receipt);
-		const entry = await writeReceiptImmutable(
-			opts.root,
-			opts.sessionId,
-			"review-failure",
-			receipt.receiptId,
-			receipt,
-		);
+		const entry = await persistFinalizeReceipt(opts, "review-failure", receipt);
+		if (!entry) {
+			return {
+				...baseResult,
+				completed: false,
+				receiptPath: null,
+				verdict: null,
+				blockers: ["validation-unknown:cancelled"],
+			};
+		}
 		const blockers = outcome.valid ? [reason] : [reason, ...outcome.reasons];
 		return { ...baseResult, completed: false, receiptPath: entry.path, verdict: null, blockers };
 	}
@@ -289,7 +377,16 @@ async function runReviewFinalize(opts: FinalizeOptions): Promise<FinalizeResult>
 		createdAt: now(),
 	});
 	const outcome = validateReceipt(receipt);
-	const entry = await writeReceiptImmutable(opts.root, opts.sessionId, "review-verdict", receipt.receiptId, receipt);
+	const entry = await persistFinalizeReceipt(opts, "review-verdict", receipt);
+	if (!entry) {
+		return {
+			...baseResult,
+			completed: false,
+			receiptPath: null,
+			verdict: null,
+			blockers: ["validation-unknown:cancelled"],
+		};
+	}
 	// A confirmation-required verdict is recorded but never an autonomous success.
 	const humanActionRequired = verdict === "OWNER_CONFIRMATION_REQUIRED";
 	const completed = outcome.valid && !humanActionRequired;
@@ -308,11 +405,201 @@ function git(workspace: string, args: string[]): string | null {
 	}
 }
 
-/** Real checks: git for commit/branch, gh for PR, Bun.spawn for validation commands. */
-export function defaultFinalizeChecks(workspace: string): FinalizeChecks {
+/** Real checks: git for commit/branch, gh for PR, async Bun.spawn for validation commands. */
+async function discardSpawnStream(stream: ReadableStream<Uint8Array> | null | undefined): Promise<void> {
+	if (!stream) return;
+	const reader = stream.getReader();
+	try {
+		for (;;) {
+			const { done } = await reader.read();
+			if (done) return;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
+type ValidationProcessGroupIdentity = "verified" | "leader-absent" | "unverified";
+
+function validationProcessGroupIdentity(
+	proc: Bun.Subprocess<"ignore", "pipe", "pipe">,
+	startTime: string | undefined,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult,
+): ValidationProcessGroupIdentity {
+	if (process.platform !== "linux") return proc.exitCode === null ? "verified" : "unverified";
+	const leader = probeProcess(proc.pid);
+	if (leader.kind === "absent") return "leader-absent";
+	if (leader.kind !== "live" || startTime === undefined || leader.startTime !== startTime) return "unverified";
+	return "verified";
+}
+
+function validationProcessGroupHasRunningMembers(
+	proc: Bun.Subprocess<"ignore", "pipe", "pipe">,
+	startTime: string | undefined,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult,
+): boolean {
+	const identity = validationProcessGroupIdentity(proc, startTime, probeProcess);
+	if (identity === "unverified") {
+		// We may prove that the group has disappeared, but a failed /proc identity
+		// probe cannot authorize either signaling the group or declaring it clean.
+		try {
+			process.kill(-proc.pid, 0);
+			return true;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ESRCH") return false;
+			if (code === "EPERM") return true;
+			throw error;
+		}
+	}
+	try {
+		process.kill(-proc.pid, 0);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return false;
+		if (code !== "EPERM") throw error;
+	}
+	if (process.platform !== "linux") return true;
+	try {
+		for (const entry of readdirSync("/proc")) {
+			if (!/^\d+$/.test(entry)) continue;
+			let stat: string;
+			try {
+				stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "ENOENT" || code === "ESRCH") continue;
+				return true;
+			}
+			const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			const state = fields[0] ?? "";
+			if (Number(fields[2]) === proc.pid && state !== "Z" && state !== "X") return true;
+		}
+		return false;
+	} catch {
+		// Procfs is not available/readable; conservatively keep waiting for group exit.
+		return true;
+	}
+}
+
+async function waitForValidationProcessGroupExit(
+	proc: Bun.Subprocess<"ignore", "pipe", "pipe">,
+	startTime: string | undefined,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult,
+): Promise<void> {
+	while (validationProcessGroupHasRunningMembers(proc, startTime, probeProcess)) await Bun.sleep(20);
+}
+
+function signalValidationProcess(
+	proc: Bun.Subprocess<"ignore", "pipe", "pipe">,
+	signal: NodeJS.Signals,
+	groupStartTime: string | undefined,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult,
+): void {
+	if (process.platform !== "win32" && Number.isSafeInteger(proc.pid) && proc.pid > 0) {
+		if (validationProcessGroupIdentity(proc, groupStartTime, probeProcess) === "unverified") {
+			// The Subprocess handle is exact authority for its direct child. Never
+			// signal a numeric process group whose leader identity could not be proven.
+			if (proc.exitCode === null) {
+				try {
+					proc.kill(signal);
+				} catch {}
+			}
+			return;
+		}
+		try {
+			// `detached: true` makes the validator the leader of its own POSIX session
+			// and process group, so this also reaches shells and background children.
+			process.kill(-proc.pid, signal);
+			return;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+				// Still signal the exact child as a best effort; group liveness below
+				// remains authoritative and shutdown will not proceed while it exists.
+				try {
+					proc.kill(signal);
+				} catch {}
+				return;
+			}
+		}
+	}
+	try {
+		proc.kill(signal);
+	} catch {
+		// The exact child may already have exited; the exit promise is authoritative.
+	}
+}
+
+async function terminateValidationProcess(
+	proc: Bun.Subprocess<"ignore", "pipe", "pipe">,
+	groupStartTime: string | undefined,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult,
+): Promise<void> {
+	const hasProcessGroup = process.platform !== "win32" && Number.isSafeInteger(proc.pid) && proc.pid > 0;
+	signalValidationProcess(proc, "SIGTERM", groupStartTime, probeProcess);
+	if (hasProcessGroup) {
+		const groupExit = waitForValidationProcessGroupExit(proc, groupStartTime, probeProcess);
+		const exitedGracefully = await Promise.race([groupExit.then(() => true), Bun.sleep(250).then(() => false)]);
+		if (!exitedGracefully) {
+			signalValidationProcess(proc, "SIGKILL", groupStartTime, probeProcess);
+			await groupExit;
+		}
+	} else {
+		const exitedGracefully = await Promise.race([proc.exited.then(() => true), Bun.sleep(250).then(() => false)]);
+		if (!exitedGracefully) signalValidationProcess(proc, "SIGKILL", groupStartTime, probeProcess);
+	}
+	await proc.exited;
+}
+
+export function defaultFinalizeChecks(
+	workspace: string,
+	probeProcess: (pid: number) => LinuxProcPidProbeResult = probeLinuxProcPidSync,
+): FinalizeChecks {
 	return {
-		async runValidation(spec) {
-			const proc = Bun.spawnSync(["bash", "-lc", spec.command], { cwd: workspace, stdout: "pipe", stderr: "pipe" });
+		async runValidation(spec, signal) {
+			if (signal?.aborted) throw new ValidationObservationUncertainError(spec.command, workspace, signal.reason);
+			let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
+			try {
+				proc = Bun.spawn(["bash", "-lc", spec.command], {
+					cwd: workspace,
+					stdout: "pipe",
+					stderr: "pipe",
+					stdin: "ignore",
+					detached: true,
+				});
+			} catch {
+				return { exactCommand: spec.command, cwd: workspace, exitStatus: 1, pass: false };
+			}
+			const spawnLeader =
+				process.platform === "linux" && Number.isSafeInteger(proc.pid) && proc.pid > 0
+					? probeProcess(proc.pid)
+					: undefined;
+			const groupStartTime = spawnLeader?.kind === "live" ? spawnLeader.startTime : undefined;
+			const stdout = discardSpawnStream(proc.stdout);
+			const stderr = discardSpawnStream(proc.stderr);
+			const exited = proc.exited;
+			let abortListener: (() => void) | undefined;
+			const aborted = new Promise<never>((_resolve, reject) => {
+				if (!signal) return;
+				abortListener = () => reject(signal.reason ?? new Error("validation_aborted"));
+				if (signal.aborted) abortListener();
+				else signal.addEventListener("abort", abortListener, { once: true });
+			});
+			try {
+				await Promise.race([Promise.all([stdout, stderr, exited]), aborted]);
+			} catch (cause) {
+				try {
+					await terminateValidationProcess(proc, groupStartTime, probeProcess);
+				} catch (cleanupError) {
+					throw new Error("validation_process_cleanup_failed", {
+						cause: new AggregateError([cause, cleanupError]),
+					});
+				}
+				await Promise.allSettled([stdout, stderr, exited]);
+				throw new ValidationObservationUncertainError(spec.command, workspace, cause);
+			} finally {
+				if (abortListener) signal?.removeEventListener("abort", abortListener);
+			}
 			const exitStatus = proc.exitCode ?? 1;
 			return { exactCommand: spec.command, cwd: workspace, exitStatus, pass: exitStatus === 0 };
 		},
