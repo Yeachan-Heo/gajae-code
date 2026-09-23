@@ -26,7 +26,7 @@ import {
 	resolveGjcTmuxCommand,
 	resolveGjcTmuxProviderContext,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
-import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import { lifecyclePaths } from "../../src/gjc-runtime/tmux-owner-isolation";
 import {
 	__setTmuxProviderAuthorityPlatformForTests,
 	assertGjcTmuxStagedMutationAuthoritySync,

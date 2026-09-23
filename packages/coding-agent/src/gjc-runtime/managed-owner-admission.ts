@@ -2,15 +2,9 @@ import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { openPortableRecoveryFsRoot } from "@gajae-code/natives";
-import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
+import type { ManagedOwnerBinding } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
-import { lifecyclePaths, type ManagedOwnerPredecessorEvidence } from "./tmux-owner-isolation";
-import {
-	persistUltragoalRecoveryDecision,
-	planUltragoalOwnerLossRecovery,
-	type UltragoalRecoveryDecision,
-} from "./ultragoal-owner-loss-recovery";
+import { lifecyclePaths } from "./tmux-owner-isolation";
 
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
@@ -19,16 +13,6 @@ const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 const MANAGED_OWNER_SESSION_ID_ENV = "GJC_COORDINATOR_SESSION_ID";
 const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 
-export interface ManagedOwnerRecoveryContext {
-	root: string;
-	cwd: string;
-	binding: ManagedOwnerBinding;
-	receipt: ManagedOwnerSigabrtReceipt;
-	admission: { session_id: string; endpoint_incarnation: string; owner_generation: string; admitted: true };
-	decision: UltragoalRecoveryDecision;
-	/** Exact transcript selected by the parent launch flow. */
-	transcriptPath: string;
-}
 export type ManagedOwnerAdmission = { kind: "fresh" | "supervised" } | { kind: "blocked" };
 
 function ownerEnvironment(): {
@@ -90,30 +74,6 @@ function isBinding(
 	);
 }
 
-function isReceipt(value: unknown, binding: ManagedOwnerBinding): value is ManagedOwnerSigabrtReceipt {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const receipt = value as Partial<ManagedOwnerSigabrtReceipt>;
-	return (
-		receipt.schema_version === 2 &&
-		receipt.generation === binding.generation &&
-		receipt.session_id === binding.session_id &&
-		receipt.run_id === binding.run_id &&
-		receipt.endpoint_incarnation === binding.endpoint_incarnation &&
-		receipt.child_token === binding.child_token &&
-		receipt.command_sha256 === binding.command_sha256 &&
-		receipt.supervisor_pid === binding.supervisor_pid &&
-		receipt.supervisor_start_time === binding.supervisor_start_time &&
-		typeof receipt.child_pid === "number" &&
-		Number.isSafeInteger(receipt.child_pid) &&
-		receipt.child_pid > 0 &&
-		typeof receipt.child_start_time === "string" &&
-		receipt.signal === "SIGABRT" &&
-		receipt.signal_number === 6 &&
-		(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
-		typeof receipt.received_at === "string"
-	);
-}
-
 function safeChildToken(value: string): boolean {
 	try {
 		assertSafePathComponent(value, "managed owner child token");
@@ -144,40 +104,6 @@ async function readExactJsons(root: string, files: readonly string[]): Promise<E
 				const result = authority.read(file, 64 * 1024);
 				if (!result.ok || !result.data) return { reader: "read_failed" };
 				const content = Buffer.from(result.data).toString("utf8");
-				if (!content.endsWith("\n") || content.indexOf("\n") !== content.length - 1)
-					return { reader: "read_failed" };
-				values.push(JSON.parse(content));
-			}
-			return { values };
-		} finally {
-			authority.close();
-		}
-	} catch {
-		return { reader: "read_failed" };
-	}
-}
-
-async function readPortableExactJsons(root: string, files: readonly string[]): Promise<ExactJsonRead> {
-	try {
-		const authority = openPortableRecoveryFsRoot(root);
-		try {
-			const values: unknown[] = [];
-			for (const file of files) {
-				const first = authority.read(file, 64 * 1024);
-				const second = authority.read(file, 64 * 1024);
-				if (
-					!first.ok ||
-					!first.data ||
-					!first.identity ||
-					!second.ok ||
-					!second.data ||
-					!second.identity ||
-					first.identity.dev !== second.identity.dev ||
-					first.identity.ino !== second.identity.ino ||
-					Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0
-				)
-					return { reader: "read_failed" };
-				const content = Buffer.from(first.data).toString("utf8");
 				if (!content.endsWith("\n") || content.indexOf("\n") !== content.length - 1)
 					return { reader: "read_failed" };
 				values.push(JSON.parse(content));
@@ -281,135 +207,4 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 	)
 		return { kind: "supervised" };
 	return blockAdmission(owner, "exact_child_binding_unavailable", exactReaderDetails(read));
-}
-
-/** Validate and persist predecessor recovery authority in the trusted parent launch process. */
-export async function admitManagedOwnerPredecessorBeforeLaunch(input: {
-	stateDir: string;
-	cwd: string;
-	sessionId: string;
-	ownerGeneration: string;
-	predecessor: ManagedOwnerPredecessorEvidence;
-	transcriptPath: string;
-}): Promise<void> {
-	const owner = {
-		root: lifecyclePaths(input.stateDir, input.sessionId, input.ownerGeneration).root,
-		generation: input.ownerGeneration,
-		sessionId: input.sessionId,
-	};
-	const reject = async (reason: string, details: Record<string, unknown> = {}): Promise<never> => {
-		await blockAdmission(owner, reason, details);
-		throw new Error(reason);
-	};
-	const predecessor = input.predecessor;
-	if (input.sessionId !== predecessor.sessionId || !safeChildToken(predecessor.predecessorToken))
-		return await reject("replacement_predecessor_binding_untrusted");
-	const predecessorRoot = lifecyclePaths(input.stateDir, predecessor.sessionId, predecessor.generation).root;
-	const read = await readPortableExactJsons(predecessorRoot, [
-		`child-${predecessor.predecessorToken}.binding.json`,
-		`sigabrt-${predecessor.predecessorToken}.receipt.json`,
-	]);
-	const [binding, receipt] = exactJsonValues(read);
-	if (
-		!isBinding(binding, {
-			generation: predecessor.generation,
-			sessionId: predecessor.sessionId,
-			runId: predecessor.runId,
-			incarnation: predecessor.incarnation,
-			token: predecessor.predecessorToken,
-		})
-	)
-		return await reject("replacement_predecessor_binding_untrusted", exactReaderDetails(read));
-	if (!isReceipt(receipt, binding)) return await reject("exact_sigabrt_receipt_untrusted", exactReaderDetails(read));
-	const admission = {
-		session_id: input.sessionId,
-		endpoint_incarnation: predecessor.incarnation,
-		owner_generation: predecessor.generation,
-		admitted: true,
-	} as const;
-	const bindingContext = {
-		sessionId: input.sessionId,
-		endpointIncarnation: predecessor.incarnation,
-		ownerGeneration: predecessor.generation,
-		cwd: input.cwd,
-	};
-	const decision = await planUltragoalOwnerLossRecovery({
-		binding: bindingContext,
-		receipt,
-		admission,
-		transcriptPath: input.transcriptPath,
-	});
-	await persistUltragoalRecoveryDecision({
-		cwd: input.cwd,
-		sessionId: input.sessionId,
-		binding: bindingContext,
-		decision,
-	});
-	if (decision.disposition !== "resume") return await reject(decision.reason);
-	const terminal = await completeManagedOwnerRecovery({
-		root: owner.root,
-		cwd: input.cwd,
-		binding,
-		receipt,
-		admission,
-		decision,
-		transcriptPath: input.transcriptPath,
-	});
-	throw new Error(terminal.reason);
-}
-
-/**
- * The ordinary CLI factory has no recovery-owned writer-lease or exact-child
- * reconciliation capability.  Do not route a recovered owner through it: first
- * revalidate the immutable evidence and B0, then publish a terminal handoff.
- */
-export async function completeManagedOwnerRecovery(
-	context: ManagedOwnerRecoveryContext,
-): Promise<{ kind: "handoff"; exitCode: 75; reason: string }> {
-	const recoveryBinding = {
-		sessionId: context.binding.session_id,
-		endpointIncarnation: context.binding.endpoint_incarnation,
-		ownerGeneration: context.binding.generation,
-		cwd: context.cwd,
-	};
-	const revalidated = await planUltragoalOwnerLossRecovery({
-		binding: recoveryBinding,
-		receipt: context.receipt,
-		admission: context.admission,
-		transcriptPath: context.transcriptPath,
-		protectedPaths: context.decision.snapshot?.protectedPaths,
-		sanctionedDeltas: context.decision.snapshot?.sanctionedDeltas,
-		absentArtifacts: context.decision.snapshot?.absentArtifacts,
-		transientHistory: context.decision.snapshot?.transientHistory,
-	});
-	const b0Unchanged =
-		context.decision.snapshot !== undefined &&
-		revalidated.snapshot !== undefined &&
-		context.decision.snapshot.b0.planSha256 === revalidated.snapshot.b0.planSha256 &&
-		context.decision.snapshot.b0.ledgerSha256 === revalidated.snapshot.b0.ledgerSha256;
-	const transcriptUnchanged =
-		context.decision.terminal?.yieldId !== undefined &&
-		revalidated.terminal?.yieldId === context.decision.terminal.yieldId;
-	const reason =
-		revalidated.disposition !== "resume"
-			? `recovery_authority_changed:${revalidated.reason}`
-			: !b0Unchanged
-				? "recovery_b0_changed"
-				: !transcriptUnchanged
-					? "recovery_transcript_changed"
-					: "safe_session_resume_seam_unavailable";
-	const decision: UltragoalRecoveryDecision = { disposition: "handoff", reason };
-	await persistUltragoalRecoveryDecision({
-		cwd: recoveryBinding.cwd,
-		sessionId: recoveryBinding.sessionId,
-		binding: recoveryBinding,
-		decision,
-	});
-	await durableHandoff(context.root, context.binding.generation, context.binding.session_id, reason, {
-		predecessor_run_id: context.binding.run_id,
-		terminal_reconciliation: "unavailable_without_owning_store_cas",
-		b0_preserved: b0Unchanged,
-	});
-	process.exitCode = 75;
-	return { kind: "handoff", exitCode: 75, reason };
 }

@@ -32,12 +32,6 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
-import {
-	captureOwnerGenerationBaselineSync,
-	isExactScopedBootstrapSuccessReceipt,
-	lifecyclePaths,
-	replaceOwnerGenerationSync,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import { __setTmuxProviderAuthorityPlatformForTests } from "@gajae-code/coding-agent/gjc-runtime/tmux-provider-context";
 import {
 	__setCreateOwnerIsolationForTests,
@@ -46,7 +40,12 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
-import { admitManagedOwnerPredecessorBeforeLaunch } from "../../src/gjc-runtime/managed-owner-admission";
+import {
+	captureOwnerGenerationBaselineSync,
+	isExactScopedBootstrapSuccessReceipt,
+	lifecyclePaths,
+	replaceOwnerGenerationSync,
+} from "../../src/gjc-runtime/tmux-owner-isolation";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -3319,7 +3318,7 @@ it.each([
 
 describe("tmux owner isolation launch gate", () => {
 	afterEach(() => {
-		process.exitCode = undefined;
+		process.exitCode = 0;
 		vi.restoreAllMocks();
 		__setCreateOwnerIsolationForTests(null);
 		__setMutationServerProofForTests(null);
@@ -3869,9 +3868,17 @@ describe("tmux owner isolation launch gate", () => {
 			const ownerRoot = lifecyclePaths(root, sessionId, generation).root;
 			fs.mkdirSync(ownerRoot, { recursive: true });
 			const transcriptPath = path.join(root, "predecessor.jsonl");
-			fs.mkdirSync(sessionUltragoalDir(root, sessionId), { recursive: true });
-			fs.writeFileSync(path.join(sessionUltragoalDir(root, sessionId), "goals.json"), '{"goals":[]}');
-			fs.writeFileSync(path.join(sessionUltragoalDir(root, sessionId), "ledger.jsonl"), '{"event":"started"}\n');
+			const ultragoalDir = sessionUltragoalDir(root, sessionId);
+			const goalsPath = path.join(ultragoalDir, "goals.json");
+			const ledgerPath = path.join(ultragoalDir, "ledger.jsonl");
+			fs.mkdirSync(ultragoalDir, { recursive: true });
+			fs.writeFileSync(goalsPath, '{"goals":[]}');
+			fs.writeFileSync(ledgerPath, '{"event":"started"}\n');
+			const beforeGoals = fs.readFileSync(goalsPath, "utf8");
+			const beforeLedger = fs.readFileSync(ledgerPath, "utf8");
+			const dirtyPath = path.join(root, "dirty.ts");
+			const dirtyContent = "export const dirty = true;\n";
+			fs.writeFileSync(dirtyPath, dirtyContent);
 			fs.writeFileSync(
 				transcriptPath,
 				'{"id":"one","parentId":null,"type":"message"}\n{"id":"two","parentId":"one","type":"yield","result":{"status":"success"}}\n{"id":"three","parentId":"two","type":"toolResult","toolCallId":"two","content":[]}\n',
@@ -3886,14 +3893,17 @@ describe("tmux owner isolation launch gate", () => {
 				path.join(ownerRoot, `child-${predecessorToken}.binding.json`),
 				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, created_at: "2026-07-19T00:00:00.000Z" })}\n`,
 			);
+			const receiptPath = path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`);
 			fs.writeFileSync(
-				path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
+				receiptPath,
 				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
 			);
+			const exactReceipt = fs.readFileSync(receiptPath, "utf8");
 			const calls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
 			const diagnostics: string[] = [];
 			const events: string[] = [];
-			const launchPreviousExitCode = process.exitCode;
+			const launchPreviousExitCode = typeof process.exitCode === "number" ? process.exitCode : 0;
+			let launchExitCode: number | undefined;
 			let handled: boolean;
 			try {
 				handled = await launchDefaultTmuxIfNeeded({
@@ -3919,10 +3929,12 @@ describe("tmux owner isolation launch gate", () => {
 						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 					},
 				});
+				launchExitCode = typeof process.exitCode === "number" ? process.exitCode : undefined;
 			} finally {
-				process.exitCode = launchPreviousExitCode ?? 0;
+				process.exitCode = launchPreviousExitCode;
 			}
 			expect(handled).toBe(true);
+			expect(launchExitCode).toBe(75);
 			expect(events).not.toContain("new-session");
 			expect(events).not.toContain("attach-session");
 			expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
@@ -3933,10 +3945,13 @@ describe("tmux owner isolation launch gate", () => {
 				.filter(file => file.startsWith("admission-handoff-"))
 				.map(file => JSON.parse(fs.readFileSync(path.join(ownerRoot, file), "utf8")) as Record<string, unknown>);
 			expect(admissionHandoffs).toHaveLength(1);
+			const attemptedOwnerGeneration = admissionHandoffs[0]?.generation;
+			expect(attemptedOwnerGeneration).toBeString();
+			expect(attemptedOwnerGeneration).not.toBe(generation);
 			expect(admissionHandoffs[0]).toMatchObject({
 				state: "fail_closed_handoff",
 				reason: "safe_session_resume_seam_unavailable",
-				generation,
+				generation: attemptedOwnerGeneration,
 				session_id: sessionId,
 				predecessor_run_id: runId,
 				terminal_reconciliation: "unavailable_without_owning_store_cas",
@@ -3963,6 +3978,22 @@ describe("tmux owner isolation launch gate", () => {
 				reason: "safe_session_resume_seam_unavailable",
 			});
 			expect(recoveryDecision.reason).not.toBe("recovery_transcript_changed");
+			expect(fs.readFileSync(goalsPath, "utf8")).toBe(beforeGoals);
+			expect(fs.readFileSync(ledgerPath, "utf8")).toBe(beforeLedger);
+			expect(fs.readFileSync(dirtyPath, "utf8")).toBe(dirtyContent);
+			expect(fs.readFileSync(receiptPath, "utf8")).toBe(exactReceipt);
+			const recoveryJournalPath = path.join(sessionStateDir(root, sessionId), "ultragoal-owner-loss-recovery.jsonl");
+			const recoveryJournal = fs
+				.readFileSync(recoveryJournalPath, "utf8")
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line) as Record<string, unknown>);
+			const initialRecoveryDecision = recoveryJournal.find(record => record.disposition === "resume");
+			const initialSnapshot = initialRecoveryDecision?.snapshot as { b0?: Record<string, unknown> } | undefined;
+			expect(initialSnapshot?.b0).toMatchObject({
+				planSha256: createHash("sha256").update(beforeGoals).digest("hex"),
+				ledgerSha256: createHash("sha256").update(beforeLedger).digest("hex"),
+			});
 
 			const ownerGeneration = "linux-supervisor-generation";
 			const ownerRunId = "linux-supervisor-run";
@@ -3988,32 +4019,6 @@ describe("tmux owner isolation launch gate", () => {
 			});
 			expect(linuxAdmission.exitCode).toBe(0);
 			expect(JSON.parse(linuxAdmission.stdout)).toMatchObject({ kind: "supervised", exitCode: 0 });
-
-			const receiptPath = path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`);
-			const foreignReceipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
-			foreignReceipt.run_id = "foreign-run";
-			fs.writeFileSync(receiptPath, `${JSON.stringify(foreignReceipt)}\n`);
-			const rejectedEvidencePreviousExitCode = process.exitCode;
-			try {
-				await expect(
-					admitManagedOwnerPredecessorBeforeLaunch({
-						stateDir: root,
-						cwd: root,
-						sessionId,
-						ownerGeneration: "rejected-owner-generation",
-						predecessor: {
-							generation,
-							sessionId,
-							runId,
-							incarnation,
-							predecessorToken,
-						},
-						transcriptPath,
-					}),
-				).rejects.toThrow("exact_sigabrt_receipt_untrusted");
-			} finally {
-				process.exitCode = rejectedEvidencePreviousExitCode ?? 0;
-			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

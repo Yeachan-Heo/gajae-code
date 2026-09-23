@@ -21,7 +21,7 @@ import {
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+} from "../../src/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const supervisorModule = path.join(

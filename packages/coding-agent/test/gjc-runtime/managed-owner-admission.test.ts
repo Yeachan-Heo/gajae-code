@@ -3,10 +3,10 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
-import { runTmuxOwnerIsolationCli } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
-import { admitManagedOwnerPredecessorBeforeLaunch } from "../../src/gjc-runtime/managed-owner-admission";
+import { sessionStateDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import * as managedOwnerAdmission from "../../src/gjc-runtime/managed-owner-admission";
+import { lifecyclePaths } from "../../src/gjc-runtime/tmux-owner-isolation";
+import { runTmuxOwnerIsolationCli } from "../../src/gjc-runtime/tmux-owner-isolation-cli";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const admissionModule = path.join(
@@ -78,82 +78,19 @@ async function writeBinding(root: string, token: string, patch: Record<string, u
 	);
 }
 
-async function recover(
-	stateDir: string,
-	cwd: string,
-	token: string,
-	transcriptPath: string,
-): Promise<{ reason: string | undefined; exitCode: number }> {
-	const previousExitCode = process.exitCode;
-	try {
-		await admitManagedOwnerPredecessorBeforeLaunch({
-			stateDir,
-			cwd,
-			sessionId: "session-2681",
-			ownerGeneration: "replacement-generation-2681",
-			predecessor: {
-				generation: "generation-2681",
-				sessionId: "session-2681",
-				runId: "run-2681",
-				incarnation: "incarnation-2681",
-				predecessorToken: token,
-			},
-			transcriptPath,
-		});
-		return { reason: undefined, exitCode: 0 };
-	} catch (error) {
-		return {
-			reason: error instanceof Error ? error.message : String(error),
-			exitCode: Number(process.exitCode ?? 0),
-		};
-	} finally {
-		process.exitCode = previousExitCode ?? 0;
-	}
-}
-
-async function writeSigabrtReceipt(root: string, token: string): Promise<void> {
-	await fs.writeFile(
-		path.join(root, `sigabrt-${token}.receipt.json`),
-		`${JSON.stringify({
-			schema_version: 2,
-			generation: "generation-2681",
-			session_id: "session-2681",
-			run_id: "run-2681",
-			endpoint_incarnation: "incarnation-2681",
-			child_token: token,
-			command_sha256: crypto
-				.createHash("sha256")
-				.update(JSON.stringify(["gjc", "--resume"]))
-				.digest("hex"),
-			supervisor_pid: 1,
-			supervisor_start_time: "1",
-			child_pid: 2,
-			child_start_time: "2",
-			signal: "SIGABRT",
-			signal_number: 6,
-			exit_code: null,
-			received_at: new Date().toISOString(),
-		})}\n`,
-	);
-}
-
-async function writeRecoveryEvidence(cwd: string): Promise<string> {
-	const ultragoal = sessionUltragoalDir(cwd, "session-2681");
-	await fs.mkdir(ultragoal, { recursive: true });
-	await fs.writeFile(path.join(ultragoal, "goals.json"), '{"goals":[]}');
-	await fs.writeFile(path.join(ultragoal, "ledger.jsonl"), '{"event":"started"}\n');
-	const transcript = path.join(cwd, "predecessor.jsonl");
-	await fs.writeFile(
-		transcript,
-		'{"id":"one","parentId":null,"type":"message"}\n{"id":"two","parentId":"one","type":"yield","result":{"status":"success"}}\n{"id":"three","parentId":"two","type":"toolResult","toolCallId":"two","content":[]}\n',
-	);
-	return transcript;
-}
-
 describe("managed owner admission", () => {
-	it("does not export the internal predecessor recovery mutator as a package subpath", async () => {
-		const specifier = "@gajae-code/coding-agent/gjc-runtime/managed-owner-admission";
-		const source = `try { require.resolve(${JSON.stringify(specifier)}); process.exitCode = 1; } catch (error) { process.exitCode = error && typeof error === "object" && "code" in error && error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED" ? 0 : 2; }`;
+	it("exposes no predecessor recovery mutators and excludes owner admission as a package subpath", async () => {
+		expect(managedOwnerAdmission).not.toHaveProperty("admitManagedOwnerPredecessorBeforeLaunch");
+		expect(managedOwnerAdmission).not.toHaveProperty("completeManagedOwnerRecovery");
+		const specifiers = [
+			"@gajae-code/coding-agent/gjc-runtime/managed-owner-admission",
+			"@gajae-code/coding-agent/gjc-runtime/managed-owner-admission.js",
+			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation",
+			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation.js",
+			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli",
+			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli.js",
+		];
+		const source = `for (const specifier of ${JSON.stringify(specifiers)}) { try { require.resolve(specifier); process.exitCode = 1; break; } catch (error) { if (!(error && typeof error === "object" && "code" in error && error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED")) { process.exitCode = 2; break; } } }`;
 		const child = Bun.spawnSync(["node", "-e", source], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
 		expect(child.exitCode, Buffer.from(child.stderr).toString("utf8")).toBe(0);
 		const packageManifest = (await Bun.file(
@@ -162,6 +99,11 @@ describe("managed owner admission", () => {
 			exports: Record<string, unknown>;
 		};
 		expect(packageManifest.exports["./gjc-runtime/managed-owner-admission"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/managed-owner-admission.js"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation.js"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation-cli"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation-cli.js"]).toBeNull();
 	});
 
 	it("treats a coordinator session ID alone as fresh while rejecting partial owner metadata", async () => {
@@ -270,53 +212,6 @@ describe("managed owner admission", () => {
 			});
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
-		}
-	});
-
-	it("turns a recovery admission into a durable terminal handoff without changing B0 or dirty files", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-"));
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-recovery-cwd-"));
-		try {
-			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
-			await writeBinding(root, "predecessor");
-			await writeSigabrtReceipt(root, "predecessor");
-			const transcript = await writeRecoveryEvidence(cwd);
-			const goals = path.join(sessionUltragoalDir(cwd, "session-2681"), "goals.json");
-			const ledger = path.join(sessionUltragoalDir(cwd, "session-2681"), "ledger.jsonl");
-			const [beforeGoals, beforeLedger] = await Promise.all([
-				fs.readFile(goals, "utf8"),
-				fs.readFile(ledger, "utf8"),
-			]);
-			const dirty = path.join(cwd, "dirty.ts");
-			await fs.writeFile(dirty, "export const dirty = true;\n");
-			const result = await recover(stateDir, cwd, "predecessor", transcript);
-			expect(result.exitCode).toBe(75);
-			expect(result.reason).toBe("safe_session_resume_seam_unavailable");
-			expect(await fs.readFile(dirty, "utf8")).toBe("export const dirty = true;\n");
-			expect(await fs.readFile(goals, "utf8")).toBe(beforeGoals);
-			expect(await fs.readFile(ledger, "utf8")).toBe(beforeLedger);
-			const replacementRoot = lifecyclePaths(stateDir, "session-2681", "replacement-generation-2681").root;
-			const handoffs = (await fs.readdir(replacementRoot)).filter(file => file.startsWith("admission-handoff-"));
-			expect(handoffs).toHaveLength(1);
-			expect(JSON.parse(await fs.readFile(path.join(replacementRoot, handoffs[0]!), "utf8"))).toMatchObject({
-				state: "fail_closed_handoff",
-				reason: "safe_session_resume_seam_unavailable",
-				terminal_reconciliation: "unavailable_without_owning_store_cas",
-				b0_preserved: true,
-			});
-			const recoveryDecision = JSON.parse(
-				await fs.readFile(
-					path.join(sessionStateDir(cwd, "session-2681"), "ultragoal-owner-loss-recovery.json"),
-					"utf8",
-				),
-			) as Record<string, unknown>;
-			expect(recoveryDecision).toMatchObject({
-				disposition: "handoff",
-				reason: "safe_session_resume_seam_unavailable",
-			});
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
 

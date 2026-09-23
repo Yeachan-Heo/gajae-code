@@ -5,6 +5,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	classifyOwnerSessionProbe,
+	isLifecycleAdapterRegistrationValid,
+	isTmuxOwnerIsolationCliArgv,
+	isTrustedLifecycleMutationCaller,
+	runTmuxOwnerIsolationCli,
+	tmuxServerProof,
+} from "../../src/gjc-runtime/tmux-owner-isolation-cli";
+import {
 	__setIntentEvidenceReadHooksForTests,
 	__setOwnerGenerationAfterMarkerForTests,
 	type AttemptCapability,
@@ -34,15 +42,7 @@ import {
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationArgvSha256,
 	tmuxOwnerIsolationBootstrapArgv,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
-import {
-	classifyOwnerSessionProbe,
-	isLifecycleAdapterRegistrationValid,
-	isTmuxOwnerIsolationCliArgv,
-	isTrustedLifecycleMutationCaller,
-	runTmuxOwnerIsolationCli,
-	tmuxServerProof,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
+} from "../../src/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ownerIsolationCliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");

@@ -180,6 +180,11 @@
 		"./config/model-discovery-manager": null,
 		"./config/model-discovery-manager.js": null,
 		"./gjc-runtime/managed-owner-admission": null,
+		"./gjc-runtime/managed-owner-admission.js": null,
+		"./gjc-runtime/tmux-owner-isolation": null,
+		"./gjc-runtime/tmux-owner-isolation.js": null,
+		"./gjc-runtime/tmux-owner-isolation-cli": null,
+		"./gjc-runtime/tmux-owner-isolation-cli.js": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"

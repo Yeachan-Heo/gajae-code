@@ -19,12 +19,6 @@ import {
 	normalizeExactTmuxTarget,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
-	captureOwnerGenerationBaselineSync,
-	lifecyclePaths,
-	observeOwnerTerminal,
-	replaceOwnerGenerationSync,
-} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
-import {
 	__setTmuxProviderAuthorityPlatformForTests,
 	bindGjcTmuxProviderAuthority,
 	persistGjcTmuxProviderAuthoritySync,
@@ -42,6 +36,12 @@ import {
 	removeGjcTmuxSession,
 	statusGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import {
+	captureOwnerGenerationBaselineSync,
+	lifecyclePaths,
+	observeOwnerTerminal,
+	replaceOwnerGenerationSync,
+} from "../../src/gjc-runtime/tmux-owner-isolation";
 import { prepareManagedDirectoryRoot } from "../../src/session/internal/managed-session-storage";
 
 // `Bun.spawnSync` is called in two shapes in production: the array form

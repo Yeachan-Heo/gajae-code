@@ -1,21 +1,24 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { openPortableRecoveryFsRoot } from "@gajae-code/natives";
 import { VERSION } from "@gajae-code/utils/dirs";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
-import { admitManagedOwnerPredecessorBeforeLaunch as admitManagedOwnerPredecessorInParent } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISED_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
+	type ManagedOwnerBinding,
+	type ManagedOwnerSigabrtReceipt,
 	publishManagedOwnerSupervisorAuthoritySync,
 } from "./managed-owner-supervisor";
-import { tmuxRuntimeSessionPath } from "./session-layout";
+import { assertSafePathComponent, tmuxRuntimeSessionPath } from "./session-layout";
 import {
 	coordinatorSidecarSigningBootstrapEnv,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -72,6 +75,11 @@ import {
 	type ProvenTmuxSessionIdentity,
 	proveGjcTmuxSessionMutationTarget,
 } from "./tmux-sessions";
+import {
+	persistUltragoalRecoveryDecision,
+	planUltragoalOwnerLossRecovery,
+	type UltragoalRecoveryDecision,
+} from "./ultragoal-owner-loss-recovery";
 import {
 	buildWindowsPowerShellInnerCommand,
 	GJC_TMUX_LAUNCHED_ENV,
@@ -1281,6 +1289,148 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	rebuildManagedOwnerChildCommand(plan, context, stateDir, sessionId);
 }
 
+type PredecessorJsonRead = { values: unknown[] } | { reader: "read_failed" };
+
+async function readPredecessorJsons(root: string, files: readonly string[]): Promise<PredecessorJsonRead> {
+	try {
+		const authority = openPortableRecoveryFsRoot(root);
+		try {
+			const values: unknown[] = [];
+			for (const file of files) {
+				const first = authority.read(file, 64 * 1024);
+				const second = authority.read(file, 64 * 1024);
+				if (
+					!first.ok ||
+					!first.data ||
+					!first.identity ||
+					!second.ok ||
+					!second.data ||
+					!second.identity ||
+					first.identity.dev !== second.identity.dev ||
+					first.identity.ino !== second.identity.ino ||
+					Buffer.compare(Buffer.from(first.data), Buffer.from(second.data)) !== 0
+				)
+					return { reader: "read_failed" };
+				const content = Buffer.from(first.data).toString("utf8");
+				if (!content.endsWith("\n") || content.indexOf("\n") !== content.length - 1)
+					return { reader: "read_failed" };
+				values.push(JSON.parse(content));
+			}
+			return { values };
+		} finally {
+			authority.close();
+		}
+	} catch {
+		return { reader: "read_failed" };
+	}
+}
+
+function predecessorJsonValues(read: PredecessorJsonRead): unknown[] {
+	return "values" in read ? read.values : [];
+}
+
+function predecessorReaderDetails(read: PredecessorJsonRead): Record<string, unknown> {
+	return "values" in read ? {} : { platform: process.platform, evidence_reader: read.reader };
+}
+
+function predecessorReaderExplanation(details: Record<string, unknown>): string {
+	return details.evidence_reader === "read_failed"
+		? ` (platform ${process.platform}: exact binding evidence unreadable)`
+		: "";
+}
+
+function isManagedOwnerCommand(command: unknown): command is string[] {
+	return (
+		Array.isArray(command) &&
+		command.length > 0 &&
+		command.every(value => typeof value === "string" && value.length > 0)
+	);
+}
+
+function isTrustedPredecessorBinding(
+	value: unknown,
+	expected: { generation: string; sessionId: string; runId: string; incarnation: string; token: string },
+): value is ManagedOwnerBinding {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const binding = value as Partial<ManagedOwnerBinding>;
+	return (
+		binding.schema_version === 2 &&
+		binding.generation === expected.generation &&
+		binding.session_id === expected.sessionId &&
+		binding.run_id === expected.runId &&
+		binding.endpoint_incarnation === expected.incarnation &&
+		binding.child_token === expected.token &&
+		isManagedOwnerCommand(binding.command) &&
+		typeof binding.command_sha256 === "string" &&
+		binding.command_sha256 === crypto.createHash("sha256").update(JSON.stringify(binding.command)).digest("hex") &&
+		typeof binding.supervisor_pid === "number" &&
+		Number.isSafeInteger(binding.supervisor_pid) &&
+		binding.supervisor_pid > 0 &&
+		typeof binding.supervisor_start_time === "string" &&
+		typeof binding.created_at === "string"
+	);
+}
+
+function isTrustedPredecessorReceipt(
+	value: unknown,
+	binding: ManagedOwnerBinding,
+): value is ManagedOwnerSigabrtReceipt {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const receipt = value as Partial<ManagedOwnerSigabrtReceipt>;
+	return (
+		receipt.schema_version === 2 &&
+		receipt.generation === binding.generation &&
+		receipt.session_id === binding.session_id &&
+		receipt.run_id === binding.run_id &&
+		receipt.endpoint_incarnation === binding.endpoint_incarnation &&
+		receipt.child_token === binding.child_token &&
+		receipt.command_sha256 === binding.command_sha256 &&
+		receipt.supervisor_pid === binding.supervisor_pid &&
+		receipt.supervisor_start_time === binding.supervisor_start_time &&
+		typeof receipt.child_pid === "number" &&
+		Number.isSafeInteger(receipt.child_pid) &&
+		receipt.child_pid > 0 &&
+		typeof receipt.child_start_time === "string" &&
+		receipt.signal === "SIGABRT" &&
+		receipt.signal_number === 6 &&
+		(receipt.exit_code === null || Number.isSafeInteger(receipt.exit_code)) &&
+		typeof receipt.received_at === "string"
+	);
+}
+
+async function persistManagedOwnerAdmissionHandoff(
+	root: string,
+	generation: string,
+	sessionId: string,
+	reason: string,
+	details: Record<string, unknown> = {},
+): Promise<void> {
+	await fsPromises.mkdir(root, { recursive: true, mode: 0o700 });
+	const file = path.join(root, `admission-handoff-${crypto.randomUUID()}.json`);
+	const record = {
+		schema_version: 2,
+		generation,
+		session_id: sessionId,
+		state: "fail_closed_handoff",
+		reason,
+		...details,
+		created_at: new Date().toISOString(),
+	};
+	const handle = await fsPromises.open(file, "wx", 0o600);
+	try {
+		await handle.writeFile(`${JSON.stringify(record)}\n`);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	const directory = await fsPromises.open(root, "r");
+	try {
+		await directory.sync();
+	} finally {
+		await directory.close();
+	}
+}
+
 async function admitManagedOwnerPredecessorBeforeLaunch(
 	plan: TmuxLaunchPlan,
 	context: TmuxLaunchContext,
@@ -1296,14 +1446,109 @@ async function admitManagedOwnerPredecessorBeforeLaunch(
 	)
 		throw new Error("managed_owner_predecessor_identity_unavailable");
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
-	await admitManagedOwnerPredecessorInParent({
-		stateDir,
+	const owner = {
+		root: lifecyclePaths(stateDir, plan.sessionId, plan.ownerGeneration).root,
+		generation: plan.ownerGeneration,
+		sessionId: plan.sessionId,
+	};
+	const reject = async (reason: string, details: Record<string, unknown> = {}): Promise<never> => {
+		await persistManagedOwnerAdmissionHandoff(owner.root, owner.generation, owner.sessionId, reason, details);
+		process.stderr.write(`child admission blocked: ${reason}${predecessorReaderExplanation(details)}\n`);
+		process.exitCode = 75;
+		throw new Error(reason);
+	};
+	try {
+		assertSafePathComponent(predecessor.predecessorToken, "managed owner child token");
+	} catch {
+		return await reject("replacement_predecessor_binding_untrusted");
+	}
+	const predecessorRoot = lifecyclePaths(stateDir, predecessor.sessionId, predecessor.generation).root;
+	const read = await readPredecessorJsons(predecessorRoot, [
+		`child-${predecessor.predecessorToken}.binding.json`,
+		`sigabrt-${predecessor.predecessorToken}.receipt.json`,
+	]);
+	const [binding, receipt] = predecessorJsonValues(read);
+	if (
+		!isTrustedPredecessorBinding(binding, {
+			generation: predecessor.generation,
+			sessionId: predecessor.sessionId,
+			runId: predecessor.runId,
+			incarnation: predecessor.incarnation,
+			token: predecessor.predecessorToken,
+		})
+	)
+		return await reject("replacement_predecessor_binding_untrusted", predecessorReaderDetails(read));
+	if (!isTrustedPredecessorReceipt(receipt, binding))
+		return await reject("exact_sigabrt_receipt_untrusted", predecessorReaderDetails(read));
+	const admission = {
+		session_id: plan.sessionId,
+		endpoint_incarnation: predecessor.incarnation,
+		owner_generation: predecessor.generation,
+		admitted: true,
+	} as const;
+	const bindingContext = {
+		sessionId: plan.sessionId,
+		endpointIncarnation: predecessor.incarnation,
+		ownerGeneration: predecessor.generation,
 		cwd: plan.cwd,
-		sessionId: predecessor.sessionId,
-		ownerGeneration: plan.ownerGeneration,
-		predecessor,
-		transcriptPath: context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
+	};
+	const transcriptPath = context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "";
+	const decision = await planUltragoalOwnerLossRecovery({
+		binding: bindingContext,
+		receipt,
+		admission,
+		transcriptPath,
 	});
+	await persistUltragoalRecoveryDecision({
+		cwd: plan.cwd,
+		sessionId: plan.sessionId,
+		binding: bindingContext,
+		decision,
+	});
+	if (decision.disposition !== "resume") return await reject(decision.reason);
+
+	// The ordinary CLI factory has no recovery-owned writer-lease or exact-child
+	// reconciliation capability. Revalidate immutable evidence and B0, then publish
+	// a terminal handoff instead of launching a replacement owner.
+	const revalidated = await planUltragoalOwnerLossRecovery({
+		binding: bindingContext,
+		receipt,
+		admission,
+		transcriptPath,
+		protectedPaths: decision.snapshot?.protectedPaths,
+		sanctionedDeltas: decision.snapshot?.sanctionedDeltas,
+		absentArtifacts: decision.snapshot?.absentArtifacts,
+		transientHistory: decision.snapshot?.transientHistory,
+	});
+	const b0Unchanged =
+		decision.snapshot !== undefined &&
+		revalidated.snapshot !== undefined &&
+		decision.snapshot.b0.planSha256 === revalidated.snapshot.b0.planSha256 &&
+		decision.snapshot.b0.ledgerSha256 === revalidated.snapshot.b0.ledgerSha256;
+	const transcriptUnchanged =
+		decision.terminal?.yieldId !== undefined && revalidated.terminal?.yieldId === decision.terminal.yieldId;
+	const reason =
+		revalidated.disposition !== "resume"
+			? `recovery_authority_changed:${revalidated.reason}`
+			: !b0Unchanged
+				? "recovery_b0_changed"
+				: !transcriptUnchanged
+					? "recovery_transcript_changed"
+					: "safe_session_resume_seam_unavailable";
+	const terminalDecision: UltragoalRecoveryDecision = { disposition: "handoff", reason };
+	await persistUltragoalRecoveryDecision({
+		cwd: bindingContext.cwd,
+		sessionId: bindingContext.sessionId,
+		binding: bindingContext,
+		decision: terminalDecision,
+	});
+	await persistManagedOwnerAdmissionHandoff(owner.root, owner.generation, owner.sessionId, reason, {
+		predecessor_run_id: binding.run_id,
+		terminal_reconciliation: "unavailable_without_owning_store_cas",
+		b0_preserved: b0Unchanged,
+	});
+	process.exitCode = 75;
+	throw new Error(reason);
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {

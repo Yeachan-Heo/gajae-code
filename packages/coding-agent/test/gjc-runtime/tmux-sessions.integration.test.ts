@@ -9,13 +9,13 @@ import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
-import { replaceOwnerGeneration } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	forceCloseGjcTmuxSession,
 	listGjcTmuxSessions,
 	readTmuxSessionTagsForGc,
 	statusGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { replaceOwnerGeneration } from "../../src/gjc-runtime/tmux-owner-isolation";
 
 const tmux = Bun.which("tmux");
 const systemdRun = Bun.which("systemd-run");
