@@ -21,6 +21,34 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
+	it("reports an absent recovery directory as a healthy no-op", async () => {
+		const root = await temporaryDirectory();
+		const authority = openRecoveryFsRoot(root);
+		try {
+			const metrics = authority.recoveryReaperMetrics();
+			expect(metrics).toMatchObject({ ok: true });
+			expect(metrics).not.toHaveProperty("code");
+		} finally {
+			authority.close();
+		}
+	});
+
+	it("reports an unsafe existing recovery directory", async () => {
+		const root = await temporaryDirectory();
+		const recovery = path.join(root, ".gjc-recovery");
+		await fs.mkdir(recovery, { mode: 0o700 });
+		await fs.chmod(recovery, 0o755);
+		const authority = openRecoveryFsRoot(root);
+		try {
+			expect(authority.recoveryReaperMetrics()).toMatchObject({
+				ok: false,
+				code: "recovery_directory_unavailable",
+			});
+		} finally {
+			authority.close();
+		}
+	});
+
 	it("reaps expired completed-predecessor bytes and reports them on root open", async () => {
 		const root = await temporaryDirectory();
 		const recovery = path.join(root, ".gjc-recovery");

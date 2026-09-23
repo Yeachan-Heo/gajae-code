@@ -699,12 +699,12 @@ fn rename_replacement_candidate_no_replace(
 	let destination_after_link = statat(destination_parent, destination_name);
 	if !source_after_link
 		.as_ref()
-		.is_ok_and(|stat| replacement_candidate_link_stat_matches(stat, expected_inode))
+		.is_ok_and(|stat| owner_only_two_link_stat_matches(stat, expected_inode))
 		|| !destination_after_link
 			.as_ref()
-			.is_ok_and(|stat| replacement_candidate_link_stat_matches(stat, expected_inode))
+			.is_ok_and(|stat| owner_only_two_link_stat_matches(stat, expected_inode))
 	{
-		if rollback_replacement_candidate_link(
+		if rollback_owner_only_link_pair(
 			source_parent,
 			source_name,
 			destination_parent,
@@ -724,7 +724,7 @@ fn rename_replacement_candidate_no_replace(
 		(unlinked != 0).then(std::io::Error::last_os_error)
 	};
 	if let Some(_unlink_error) = unlink_error {
-		if !rollback_replacement_candidate_link(
+		if !rollback_owner_only_link_pair(
 			source_parent,
 			source_name,
 			destination_parent,
@@ -739,7 +739,7 @@ fn rename_replacement_candidate_no_replace(
 }
 
 #[cfg(target_os = "linux")]
-fn replacement_candidate_link_stat_matches(stat: &libc::stat, expected_inode: (u64, u64)) -> bool {
+fn owner_only_two_link_stat_matches(stat: &libc::stat, expected_inode: (u64, u64)) -> bool {
 	// SAFETY: geteuid has no preconditions and only reads the effective user ID.
 	let effective_uid = unsafe { libc::geteuid() };
 	(stat.st_mode & libc::S_IFMT) == libc::S_IFREG
@@ -751,7 +751,7 @@ fn replacement_candidate_link_stat_matches(stat: &libc::stat, expected_inode: (u
 }
 
 #[cfg(target_os = "linux")]
-fn open_replacement_candidate_link(parent: &File, name: &CString) -> Result<File, &'static str> {
+fn open_owner_only_link(parent: &File, name: &CString) -> Result<File, &'static str> {
 	// SAFETY: the retained parent and validated name constrain the open to one
 	// child; O_NOFOLLOW and O_NONBLOCK reject link and FIFO substitutions.
 	let fd = unsafe {
@@ -769,18 +769,17 @@ fn open_replacement_candidate_link(parent: &File, name: &CString) -> Result<File
 }
 
 #[cfg(target_os = "linux")]
-fn rollback_replacement_candidate_link(
+fn rollback_owner_only_link_pair(
 	source_parent: &File,
 	source_name: &CString,
 	destination_parent: &File,
 	destination_name: &CString,
 	expected_inode: (u64, u64),
 ) -> bool {
-	let Ok(source_file) = open_replacement_candidate_link(source_parent, source_name) else {
+	let Ok(source_file) = open_owner_only_link(source_parent, source_name) else {
 		return false;
 	};
-	let Ok(destination_file) = open_replacement_candidate_link(destination_parent, destination_name)
-	else {
+	let Ok(destination_file) = open_owner_only_link(destination_parent, destination_name) else {
 		return false;
 	};
 	if crate::path_identity::platform::verify_created_owner_only_file(&source_file).is_err()
@@ -809,8 +808,8 @@ fn rollback_replacement_candidate_link(
 	let Ok(destination_named) = statat(destination_parent, destination_name) else {
 		return false;
 	};
-	if !replacement_candidate_link_stat_matches(&source_named, expected_inode)
-		|| !replacement_candidate_link_stat_matches(&destination_named, expected_inode)
+	if !owner_only_two_link_stat_matches(&source_named, expected_inode)
+		|| !owner_only_two_link_stat_matches(&destination_named, expected_inode)
 	{
 		return false;
 	}
@@ -823,8 +822,8 @@ fn rollback_replacement_candidate_link(
 	let Ok(destination_named) = statat(destination_parent, destination_name) else {
 		return false;
 	};
-	if !replacement_candidate_link_stat_matches(&source_named, expected_inode)
-		|| !replacement_candidate_link_stat_matches(&destination_named, expected_inode)
+	if !owner_only_two_link_stat_matches(&source_named, expected_inode)
+		|| !owner_only_two_link_stat_matches(&destination_named, expected_inode)
 	{
 		return false;
 	}
@@ -836,6 +835,39 @@ fn rollback_replacement_candidate_link(
 		return false;
 	}
 	destination_parent.sync_all().is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn rename_reaper_quarantine_no_replace(
+	recovery: &File,
+	source_name: &CString,
+	quarantine_name: &CString,
+	expected_identity: &RecoveryFsIdentity,
+) -> Result<NoReplacePrimitive, FileNoReplaceError> {
+	let source_stat = statat(recovery, source_name)
+		.map_err(|_| FileNoReplaceError::PreMutation(std::io::Error::from_raw_os_error(libc::EIO)))?;
+	if !reaper_owner_file_stat(&source_stat)
+		|| !stat_matches_regular_identity_after_rename(&source_stat, expected_identity)
+	{
+		return Err(FileNoReplaceError::PreMutation(std::io::Error::from_raw_os_error(libc::EIO)));
+	}
+	let expected_inode = (source_stat.st_dev, source_stat.st_ino);
+	match rename_file_no_replace(recovery, source_name, recovery, quarantine_name, || {}) {
+		Err(FileNoReplaceError::PostMutation(error)) => {
+			if rollback_owner_only_link_pair(
+				recovery,
+				source_name,
+				recovery,
+				quarantine_name,
+				expected_inode,
+			) {
+				Err(FileNoReplaceError::PreMutation(error))
+			} else {
+				Err(FileNoReplaceError::PostMutation(error))
+			}
+		},
+		result => result,
+	}
 }
 
 #[cfg(target_os = "linux")]
@@ -1409,11 +1441,13 @@ impl RecoveryFsFile {
 #[napi]
 pub struct RecoveryFsRoot {
 	#[cfg(target_os = "linux")]
-	root:     Mutex<Option<File>>,
+	root:           Mutex<Option<File>>,
 	#[cfg(target_os = "linux")]
-	recovery: Mutex<Option<File>>,
+	recovery:       Mutex<Option<File>>,
 	#[cfg(target_os = "linux")]
-	reaper:   Arc<Mutex<RecoveryReaperState>>,
+	recovery_error: Option<&'static str>,
+	#[cfg(target_os = "linux")]
+	reaper:         Arc<Mutex<RecoveryReaperState>>,
 }
 
 #[napi]
@@ -1443,6 +1477,9 @@ impl RecoveryFsRoot {
 			let Some(_root) = root_guard.as_ref() else {
 				return RecoveryFsReaperMetrics::failure("closed");
 			};
+			if let Some(code) = self.recovery_error {
+				return RecoveryFsReaperMetrics::failure(code);
+			}
 			let recovery_guard = self.recovery.lock();
 			if let Some(recovery) = recovery_guard.as_ref() {
 				let _ = reap_managed_recovery_if_due(recovery, &self.reaper);
@@ -1495,9 +1532,10 @@ impl RecoveryFsRoot {
 			};
 			let _ = reap_managed_recovery_if_due(&recovery, &self.reaper);
 			Ok(Self {
-				root:     Mutex::new(Some(directory)),
-				recovery: Mutex::new(Some(recovery)),
-				reaper:   Arc::clone(&self.reaper),
+				root:           Mutex::new(Some(directory)),
+				recovery:       Mutex::new(Some(recovery)),
+				recovery_error: self.recovery_error,
+				reaper:         Arc::clone(&self.reaper),
 			})
 		}
 		#[cfg(not(target_os = "linux"))]
@@ -2094,6 +2132,7 @@ pub fn open_recovery_fs_root(path: String) -> napi::Result<RecoveryFsRoot> {
 	{
 		let root = open_root(Path::new(&path)).map_err(napi::Error::from_reason)?;
 		let reaper = Arc::new(Mutex::new(RecoveryReaperState::default()));
+		let mut recovery_error = None;
 		let recovery = match open_existing_directory(&root, ".gjc-recovery") {
 			Ok(recovery) => {
 				if crate::path_identity::platform::verify_retained_owner_only_directory(&recovery)
@@ -2102,13 +2141,22 @@ pub fn open_recovery_fs_root(path: String) -> napi::Result<RecoveryFsRoot> {
 					let _ = reap_managed_recovery(&recovery, &reaper, true);
 					Some(recovery)
 				} else {
+					recovery_error = Some("recovery_directory_unavailable");
 					None
 				}
 			},
 			Err("not_found") => None,
-			Err(_) => None,
+			Err(_) => {
+				recovery_error = Some("recovery_directory_unavailable");
+				None
+			},
 		};
-		Ok(RecoveryFsRoot { root: Mutex::new(Some(root)), recovery: Mutex::new(recovery), reaper })
+		Ok(RecoveryFsRoot {
+			root: Mutex::new(Some(root)),
+			recovery: Mutex::new(recovery),
+			recovery_error,
+			reaper,
+		})
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -2589,7 +2637,11 @@ fn open_existing_directory(root: &File, relative_path: &str) -> Result<File, &'s
 		libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
 	} != 0
 	{
-		return Err("not_found");
+		return Err(if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+			"not_found"
+		} else {
+			"io_error"
+		});
 	}
 	if named.st_mode & libc::S_IFMT != libc::S_IFDIR {
 		return Err("not_directory");
@@ -3734,7 +3786,7 @@ fn reap_managed_recovery_candidate(
 		let Ok(quarantine_name) = CString::new(quarantine_name) else {
 			return ReaperCandidateResult::Failed;
 		};
-		match rename_file_no_replace(recovery, name, recovery, &quarantine_name, || {}) {
+		match rename_reaper_quarantine_no_replace(recovery, name, &quarantine_name, &final_identity) {
 			Ok(_) => {
 				quarantine = Some(quarantine_name);
 				break;
@@ -5591,6 +5643,35 @@ mod tests {
 		assert_eq!(metrics.preserved_candidates, 1);
 		assert!(metrics.scan_limited);
 		assert!(temporary.0.join(name).exists());
+	}
+
+	#[test]
+	fn reaper_rolls_back_quarantine_link_when_source_unlink_fails() {
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let now = RECOVERY_REAPER_REMOVE_TTL_SECS + RECOVERY_REAPER_CLOCK_GRACE_SECS + 10_000;
+		let created_at = now - RECOVERY_REAPER_REMOVE_TTL_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS - 1;
+		let name = recovery_name(".gjc-managed-remove", 929, 1, created_at);
+		write_reaper_file(&temporary.0, &name, b"expired evidence", 0o600);
+		set_retained_publish_faults([
+			RetainedPublishFault::Rename(libc::EINVAL),
+			RetainedPublishFault::Unlink(libc::EIO),
+		]);
+
+		let mut cookie = 0;
+		let metrics = reap_managed_recovery_at(&directory, now, &mut cookie, |_| true);
+
+		assert_eq!(metrics.reaped_files, 0);
+		assert_eq!(metrics.failures, 1);
+		let source = fs::metadata(temporary.0.join(&name)).expect("source evidence remains");
+		assert_eq!(source.nlink(), 1, "failed unlink rolls back only quarantine link");
+		assert_eq!(
+			fs::read_dir(&temporary.0)
+				.expect("recovery directory")
+				.count(),
+			1,
+			"no quarantine hard link remains"
+		);
 	}
 
 	#[test]

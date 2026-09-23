@@ -1184,8 +1184,16 @@ export function retainManagedDirectoryAuthority(
 			canonicalFileId(named.ino).toString(),
 		);
 		const recovery = authority.recoveryReaperMetrics();
-		if (recovery.totalReapedFiles !== "0" || recovery.totalFailures !== "0" || recovery.scanLimited)
+		if (
+			!recovery.ok ||
+			recovery.code ||
+			recovery.totalReapedFiles !== "0" ||
+			recovery.totalFailures !== "0" ||
+			recovery.scanLimited
+		)
 			logger.warn("Managed recovery sidecar reaping", {
+				ok: recovery.ok,
+				code: recovery.code,
 				reapedCount: recovery.totalReapedFiles,
 				reapedBytes: recovery.totalReapedBytes,
 				failureCount: recovery.totalFailures,
