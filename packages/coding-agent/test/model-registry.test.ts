@@ -1547,7 +1547,7 @@ describe("ModelRegistry", () => {
 			});
 			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
 				availableOnly: false,
-				candidates: registry.getAll().reverse(),
+				candidates: registry.getAll().slice().reverse(),
 				sessionId: "sticky-session",
 			});
 			expect(resolved).toBe(initial);
