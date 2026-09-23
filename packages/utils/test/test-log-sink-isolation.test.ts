@@ -89,7 +89,8 @@ test("test logger rejects an inherited operator sink", async () => {
 		expect(result.effectiveLogsDir).not.toBe(inheritedOperatorSink);
 		expect(path.basename(result.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
 		expect(result.markerDir).toBe(result.effectiveLogsDir);
-		expect(await countMarkersInDir(result.effectiveLogsDir ?? "")).toBeGreaterThan(0);
+		// The child reports this only after reading the marker while its isolated
+		// sink is live; its preload removes that sink during shutdown.
 		expect(await countMarkerRecords(operatorHome)).toBe(0);
 	} finally {
 		await Promise.all([
