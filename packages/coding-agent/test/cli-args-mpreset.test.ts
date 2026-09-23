@@ -57,9 +57,9 @@ function fakeRegistry(
 	return registry;
 }
 
-function fakeSession(initial = model("initial-provider", "initial")) {
+function fakeSession(initial: Model | null = model("initial-provider", "initial")) {
 	const session = {
-		model: initial as Model | undefined,
+		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
 		sessionId: "session-1",
 		credentialSessionId: "credential-session-1",
@@ -810,6 +810,180 @@ describe("startup model-profile credential recovery eligibility", () => {
 			}),
 		).toBe(expected);
 	});
+});
+
+test("input-free interactive startup reports a stale persisted default without changing it", async () => {
+	const session = fakeSession(null);
+	const settings = Settings.isolated({ "modelProfile.default": "deleted-profile" });
+	const registry = fakeRegistry([]);
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toHaveLength(1);
+	expect(result.recoverableErrors[0]).toContain("modelProfile.default is stale");
+	expect(result.recoverableErrors[0]).toContain('unknown model profile "deleted-profile"');
+	expect(result.recoverableErrors[0]).toContain("gjc config reset modelProfile.default");
+	expect(settings.get("modelProfile.default")).toBe("deleted-profile");
+	expect(session.setModelTemporaryCalls).toEqual([]);
+	expect(session.model).toBeUndefined();
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+});
+
+test.each([
+	["noninteractive print", false, true, undefined, [], undefined],
+	["redirected terminal", true, false, undefined, [], undefined],
+	["startup prompt", true, true, "hello", [], undefined],
+	["automatic continuation", true, true, undefined, [], "continue-tail"],
+] as const)("stale default stays fatal for %s", async (_name, isInteractive, hasInteractiveTerminal, initialMessage, initialMessages, resumeAction) => {
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session: fakeSession(),
+				settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs: {},
+				isInteractive,
+				hasInteractiveTerminal,
+				initialMessage,
+				initialMessages,
+				resumeAction,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+test("explicit --mpreset remains invalid even when a stale default is recoverable", async () => {
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session: fakeSession(),
+				settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+				modelRegistry: fakeRegistry([]) as never,
+				parsedArgs: { mpreset: "unknown-explicit" },
+				isInteractive: true,
+				hasInteractiveTerminal: true,
+				initialMessage: undefined,
+				initialMessages: [],
+				resumeAction: undefined,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(stderr.join("")).toContain('Unknown model profile "unknown-explicit"');
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
+test("explicit --mpreset activates a healthy profile despite a stale default", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "deleted-profile" });
+	const registry = fakeRegistry([
+		{
+			name: "healthy-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+	]);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings,
+			modelRegistry: registry as never,
+			parsedArgs: { mpreset: "healthy-profile" },
+		});
+		expect(stderr.join("")).toContain("Warning: Configured modelProfile.default is stale");
+		expect(session.model?.provider).toBe("profile-provider");
+		expect(session.model?.id).toBe("default");
+		expect(settings.get("modelProfile.default")).toBe("deleted-profile");
+	} finally {
+		stderrSpy.mockRestore();
+	}
+});
+
+test("explicit --model skips a stale default and retains CLI precedence", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "deleted-profile" });
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await applyStartupModelProfilesOrExit({
+			session,
+			settings,
+			modelRegistry: fakeRegistry([]) as never,
+			parsedArgs: { model: "cli-provider/explicit" },
+			startupModel: model("cli-provider", "explicit"),
+		});
+		expect(stderr.join("")).toContain("Warning: Configured modelProfile.default is stale");
+		expect(session.model?.provider).toBe("cli-provider");
+		expect(session.model?.id).toBe("explicit");
+		expect(settings.get("modelProfile.default")).toBe("deleted-profile");
+	} finally {
+		stderrSpy.mockRestore();
+	}
+});
+
+test("cached unknown default is retried online before entering recovery", async () => {
+	const session = fakeSession();
+	const profile: ModelProfileDefinition = {
+		name: "restored-profile",
+		requiredProviders: ["profile-provider"],
+		modelMapping: { default: "profile-provider/default:medium" },
+		source: "user",
+	};
+	const registry = fakeRegistry([], { profilesAfterRefresh: [profile] });
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "restored-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { mpreset: "restored-profile" },
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+	// The default is found after refresh; neither selection is silently skipped.
+	expect(result.recoverableErrors).toEqual([]);
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(session.setModelTemporaryCalls).toHaveLength(2);
 });
 
 test("root startup recovers a missing credential only for an input-free interactive route", async () => {

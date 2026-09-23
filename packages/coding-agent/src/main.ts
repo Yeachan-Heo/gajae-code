@@ -34,6 +34,7 @@ import {
 	applyModelProfileRuntimeBindings,
 	ModelProfileCredentialError,
 } from "./config/model-profile-activation";
+import { UnknownModelProfileError } from "./config/model-profile-contract";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
 	parseModelString,
@@ -474,9 +475,14 @@ type StartupModelProfileArgs = {
 	preferCachedDefaultProfile?: boolean;
 };
 
+function staleDefaultProfileMessage(error: UnknownModelProfileError): string {
+	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI or run gjc config reset modelProfile.default to clear it.`;
+}
+
 async function applyStartupModelProfilesWithPolicy(
 	args: StartupModelProfileArgs,
 	onCredentialError?: (error: ModelProfileCredentialError) => void,
+	onUnknownDefault?: (error: UnknownModelProfileError) => void,
 ): Promise<void> {
 	const applyProfile = async (
 		profileName: string,
@@ -484,6 +490,7 @@ async function applyStartupModelProfilesWithPolicy(
 		options: {
 			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
 			tolerateCredentialError?: boolean;
+			tolerateUnknownDefault?: boolean;
 			runtimeBindingsOnly?: boolean;
 		} = {},
 	): Promise<boolean> => {
@@ -508,6 +515,11 @@ async function applyStartupModelProfilesWithPolicy(
 				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
+			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				if (onUnknownDefault) onUnknownDefault(error);
+				else process.stderr.write(`${chalk.yellow(`Warning: ${staleDefaultProfileMessage(error)}`)}\n`);
+				return false;
+			}
 			throw error;
 		}
 	};
@@ -515,8 +527,8 @@ async function applyStartupModelProfilesWithPolicy(
 	// An explicit startup selector (--mpreset or --model) fully replaces the
 	// persisted default profile for this session, so a failing default must not
 	// abort a non-interactive run: it is reported as a warning and the explicit
-	// selection proceeds. Without an explicit selector the historic fatal
-	// contract is unchanged.
+	// selection proceeds. Without an explicit selector, failures remain fatal
+	// except for a stale default on input-free interactive startup.
 	const tolerateDefaultProfileFailure = args.parsedArgs.mpreset !== undefined || args.parsedArgs.model !== undefined;
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
@@ -527,7 +539,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
-	const applyConfiguredProfiles = async (): Promise<boolean> => {
+	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
 		let applied = true;
 		if (defaultProfile) {
 			applied =
@@ -536,6 +548,8 @@ async function applyStartupModelProfilesWithPolicy(
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
+					tolerateUnknownDefault:
+						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
@@ -549,12 +563,12 @@ async function applyStartupModelProfilesWithPolicy(
 		let applied: boolean;
 		let refreshedOnline = false;
 		try {
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(false);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			refreshedOnline = true;
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(true);
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
@@ -562,7 +576,7 @@ async function applyStartupModelProfilesWithPolicy(
 		if (defaultProfile || args.parsedArgs.mpreset) {
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 		}
-		await applyConfiguredProfiles();
+		await applyConfiguredProfiles(true);
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
@@ -639,7 +653,11 @@ export async function applyStartupModelProfilesForRoot(
 
 	const recoverableErrors: string[] = [];
 	try {
-		await applyStartupModelProfilesWithPolicy(policyArgs, error => recoverableErrors.push(error.message));
+		await applyStartupModelProfilesWithPolicy(
+			policyArgs,
+			error => recoverableErrors.push(error.message),
+			error => recoverableErrors.push(staleDefaultProfileMessage(error)),
+		);
 	} catch (error) {
 		await exitForStartupModelProfileError(args, error);
 	}
