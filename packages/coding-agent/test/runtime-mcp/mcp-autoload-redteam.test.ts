@@ -21,7 +21,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../../src/cli/mcp-cli";
 import { installGjcBundle } from "../../src/extensibility/gjc-plugins";
-import { DeferredMCPTool, MCPManager } from "../../src/runtime-mcp";
+import { DeferredMCPTool, MCPManager, MCPTool } from "../../src/runtime-mcp";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
 import type { MCPStdioServerConfig } from "../../src/runtime-mcp/types";
 
@@ -276,6 +276,11 @@ describe("red-team: conventional MCP autoload", () => {
 				},
 			);
 			if (!cachedTool) throw new Error("cached MCP tool was not created");
+			const [reconnectedTool] = MCPTool.fromTools(
+				{ name: "slow-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!reconnectedTool) throw new Error("reconnected MCP tool was not created");
 			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
 				tools: [cachedTool],
 				errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
@@ -285,8 +290,18 @@ describe("red-team: conventional MCP autoload", () => {
 			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
 			const sealConnectionSet = vi.spyOn(MCPManager.prototype, "sealConnectionSet");
 			const syncSealCheck = Promise.withResolvers<void>();
+			const reconnectSyncSealCheck = Promise.withResolvers<void>();
+			const removedSnapshotSealCheck = Promise.withResolvers<void>();
+			const setOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+			let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+			vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+				setOnToolsChanged.call(this, handler);
+				publishToolsChanged = handler;
+			});
 			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
 			let cachedToolPublished = false;
+			let reconnectedToolPublished = false;
+			let cachedServerToolsRemoved = false;
 			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
 				this: AgentSession,
 				previousNames,
@@ -294,12 +309,21 @@ describe("red-team: conventional MCP autoload", () => {
 			) {
 				await replaceNamedCustomTools.call(this, previousNames, nextTools);
 				if (nextTools.includes(cachedTool)) cachedToolPublished = true;
+				if (nextTools.includes(reconnectedTool)) reconnectedToolPublished = true;
+				if (reconnectedToolPublished && nextTools.length === 0) cachedServerToolsRemoved = true;
 			});
 			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
 			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
-				const status = getConnectionStatus.call(this, name);
+				const status =
+					name === "slow-demo" && reconnectedToolPublished ? "connected" : getConnectionStatus.call(this, name);
 				if (cachedToolPublished && name === "slow-demo" && status === "disconnected") {
 					syncSealCheck.resolve();
+				}
+				if (reconnectedToolPublished && name === "slow-demo" && status === "connected") {
+					reconnectSyncSealCheck.resolve();
+				}
+				if (cachedServerToolsRemoved && name === "slow-demo" && status === "connected") {
+					removedSnapshotSealCheck.resolve();
 				}
 				return status;
 			});
@@ -316,6 +340,23 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
 				expect(sealConnectionSet).not.toHaveBeenCalled();
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+
+				// Simulate the manager's reconnect publication: its live catalog now
+				// contains MCPTool instead of the cached DeferredMCPTool. Wait until
+				// the serialized post-publication sync checks the connected server.
+				if (!publishToolsChanged) throw new Error("MCP tools-changed handler was not registered");
+				publishToolsChanged([reconnectedTool]);
+				await reconnectSyncSealCheck.promise;
+				expect(reconnectedToolPublished).toBe(true);
+				expect(sealConnectionSet).not.toHaveBeenCalled();
+				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+
+				// Once the cached server's tools leave the live catalog, the hold must
+				// clear and restore the mixed-session fixed-connection contract.
+				publishToolsChanged([]);
+				await removedSnapshotSealCheck.promise;
+				expect(sealConnectionSet).toHaveBeenCalledTimes(1);
+				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
 			} finally {
 				await session.dispose();
 			}

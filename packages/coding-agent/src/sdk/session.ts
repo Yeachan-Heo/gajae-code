@@ -2359,6 +2359,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let ownsMcpManager = false;
 		const cwdCapturingToolNames: string[] = [];
 		const ownedConventionalMcpServerNames = new Set<string>();
+		const cachedConventionalMcpServerNames = new Set<string>();
 		let ownedConventionalMcpToolNames: string[] = [];
 		let publishOwnedConventionalMcpTools = false;
 		let ownedPluginServersConnected = false;
@@ -3171,6 +3172,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
 				throw error;
+			}
+			for (const tool of result.tools) {
+				if (tool instanceof DeferredMCPTool && Object.hasOwn(conventionalConfigs, tool.mcpServerName)) {
+					cachedConventionalMcpServerNames.add(tool.mcpServerName);
+				}
 			}
 			for (const [server, err] of result.errors) {
 				// A server that failed to connect leaves this generation incomplete: its
@@ -5185,15 +5191,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							...ownedConventionalMcpToolNames,
 						);
 						await session.replaceNamedCustomTools(previousNames, nextTools);
-						const hasDisconnectedCachedTool = nextTools.some(
+						const hasPublishedCachedTool = nextTools.some(
 							tool =>
-								tool instanceof DeferredMCPTool &&
-								mcpManager?.getConnectionStatus(tool.mcpServerName) === "disconnected",
+								tool.mcpServerName !== undefined && cachedConventionalMcpServerNames.has(tool.mcpServerName),
 						);
 						// Mixed plugin + conventional sessions defer the seal while a
-						// conventional server is connecting. A cached DeferredMCPTool also
-						// keeps its reconnect path live after cleanup reports disconnected;
-						// derive that hold from this snapshot so removing/replacing the tool
+						// conventional server is connecting. Cached fallback servers retain
+						// their reconnect path while any of their tools remain published,
+						// including after reconnect replaces DeferredMCPTool with MCPTool.
+						// Derive that hold from this snapshot so removing/replacing the tools
 						// restores the fixed-connection plugin contract.
 						if (
 							ownedPluginServersConnected &&
@@ -5202,7 +5208,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							![...ownedConventionalMcpServerNames].some(
 								name => mcpManager?.getConnectionStatus(name) === "connecting",
 							) &&
-							!hasDisconnectedCachedTool
+							!hasPublishedCachedTool
 						) {
 							mcpManager.sealConnectionSet();
 						}
