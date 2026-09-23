@@ -708,6 +708,7 @@ fn portable_component_for_windows(name: &str) -> Result<(), &'static str> {
 	if name.is_empty()
 		|| name == "."
 		|| name == ".."
+		|| name.contains(':')
 		|| path.is_absolute()
 		|| path.components().count() != 1
 	{
@@ -764,39 +765,64 @@ fn portable_regular_result(file: &std::fs::File) -> Result<RecoveryFsResult, &'s
 }
 
 #[cfg(unix)]
+fn portable_named_file_matches(
+	root: &std::fs::File,
+	name: &std::ffi::CString,
+	expected: &RecoveryFsIdentity,
+) -> Result<(), &'static str> {
+	use std::os::fd::{AsRawFd, FromRawFd};
+	// SAFETY: root and name remain live; O_NOFOLLOW rejects a replaced symlink,
+	// and O_NONBLOCK avoids hanging if an attacker replaces the leaf with a FIFO.
+	let fd = unsafe {
+		libc::openat(
+			root.as_raw_fd(),
+			name.as_ptr(),
+			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+		)
+	};
+	if fd < 0 {
+		return Err("identity_mismatch");
+	}
+	// SAFETY: fd is newly owned after successful openat.
+	let named_file = unsafe { std::fs::File::from_raw_fd(fd) };
+	let named = portable_regular_result(&named_file)?
+		.identity
+		.ok_or("identity_mismatch")?;
+	if named.dev != expected.dev || named.ino != expected.ino {
+		return Err("identity_mismatch");
+	}
+	Ok(())
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn clear_portable_errno() {
-	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[cfg(target_os = "linux")]
 	// SAFETY: the platform accessor returns this thread's valid errno pointer.
 	unsafe {
 		*libc::__errno_location() = 0;
 	}
-	#[cfg(any(target_os = "macos", target_os = "ios"))]
+	#[cfg(target_os = "macos")]
 	// SAFETY: the platform accessor returns this thread's valid errno pointer.
 	unsafe {
 		*libc::__error() = 0;
 	}
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn portable_errno() -> i32 {
-	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[cfg(target_os = "linux")]
 	// SAFETY: the platform accessor returns this thread's valid errno pointer.
 	unsafe {
-		return *libc::__errno_location();
+		*libc::__errno_location()
 	}
-	#[cfg(any(target_os = "macos", target_os = "ios"))]
+	#[cfg(target_os = "macos")]
 	// SAFETY: the platform accessor returns this thread's valid errno pointer.
 	unsafe {
-		return *libc::__error();
+		*libc::__error()
 	}
-	#[allow(
-		unreachable_code,
-		reason = "every supported Unix platform returns from its errno branch"
-	)]
-	0
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn portable_root_names(
 	root: &std::fs::File,
 	max_entries: u32,
@@ -858,16 +884,70 @@ fn portable_root_names(
 	}
 }
 
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn portable_root_names(
+	_root: &std::fs::File,
+	_max_entries: u32,
+) -> Result<Vec<String>, &'static str> {
+	Err("unsupported_platform")
+}
+
+#[cfg(unix)]
+fn portable_write_exclusive_unix(
+	root: &std::fs::File,
+	name: &std::ffi::CString,
+	data: &[u8],
+	after_write_before_name_verify: impl FnOnce(),
+) -> RecoveryFsResult {
+	use std::{
+		io::Write,
+		os::fd::{AsRawFd, FromRawFd},
+	};
+	// SAFETY: root and name are live; successful ownership transfers to File.
+	let fd = unsafe {
+		libc::openat(
+			root.as_raw_fd(),
+			name.as_ptr(),
+			libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			0o600,
+		)
+	};
+	if fd < 0 {
+		return RecoveryFsResult::failure(
+			if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+				"already_exists"
+			} else {
+				"io_error"
+			},
+		);
+	}
+	// SAFETY: fd is newly owned after successful openat.
+	let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+	let result = (|| {
+		file.write_all(data).map_err(|_| "io_error")?;
+		file.sync_all().map_err(|_| "fsync_failed")?;
+		let result = portable_regular_result(&file)?;
+		after_write_before_name_verify();
+		let identity = result.identity.as_ref().ok_or("identity_mismatch")?;
+		portable_named_file_matches(root, name, identity)?;
+		root.sync_all().map_err(|_| "fsync_failed")?;
+		Ok(result)
+	})();
+	match result {
+		Ok(result) => result,
+		// Do not unlink by name on failure: after O_EXCL creation an attacker
+		// may have replaced that name, and POSIX has no inode-conditional unlink.
+		// Preserve the untrusted evidence and fail closed instead.
+		Err(code) => RecoveryFsResult::failure(code),
+	}
+}
+
 #[napi]
 impl PortableRecoveryFsRoot {
 	#[napi]
 	pub fn write_exclusive(&self, relative_name: String, data: Uint8Array) -> RecoveryFsResult {
 		#[cfg(unix)]
 		{
-			use std::{
-				io::Write,
-				os::fd::{AsRawFd, FromRawFd},
-			};
 			if data.len() > PORTABLE_ROOT_MAX_WRITE_BYTES {
 				return RecoveryFsResult::failure("content_too_large");
 			}
@@ -880,43 +960,7 @@ impl PortableRecoveryFsRoot {
 			let Some(root) = guard.as_ref() else {
 				return RecoveryFsResult::failure("closed");
 			};
-			// SAFETY: root and name are live; successful ownership transfers to File.
-			let fd = unsafe {
-				libc::openat(
-					root.as_raw_fd(),
-					name.as_ptr(),
-					libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-					0o600,
-				)
-			};
-			if fd < 0 {
-				return RecoveryFsResult::failure(
-					if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
-						"already_exists"
-					} else {
-						"io_error"
-					},
-				);
-			}
-			// SAFETY: fd is newly owned after successful openat.
-			let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-			let result = (|| {
-				file.write_all(data.as_ref()).map_err(|_| "io_error")?;
-				file.sync_all().map_err(|_| "fsync_failed")?;
-				let result = portable_regular_result(&file)?;
-				root.sync_all().map_err(|_| "fsync_failed")?;
-				Ok(result)
-			})();
-			match result {
-				Ok(result) => result,
-				Err(code) => {
-					drop(file);
-					// SAFETY: root and name remain live; cleanup targets only the entry
-					// created exclusively by this call.
-					unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) };
-					RecoveryFsResult::failure(code)
-				},
-			}
+			portable_write_exclusive_unix(root, &name, data.as_ref(), || {})
 		}
 		#[cfg(windows)]
 		{
@@ -4628,6 +4672,24 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir_all(&self.0);
 		}
+	}
+
+	#[test]
+	fn portable_exclusive_write_rejects_replaced_name_without_deleting_replacement() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let name = CString::new("receipt").expect("valid leaf name");
+		let target = temporary.0.join("receipt");
+		let displaced = temporary.0.join("receipt.displaced");
+		let result = portable_write_exclusive_unix(&root, &name, b"original", || {
+			fs::rename(&target, &displaced).expect("displace just-created leaf");
+			fs::write(&target, b"replacement").expect("install replacement leaf");
+		});
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(fs::read(&target).expect("read replacement"), b"replacement");
+		assert_eq!(fs::read(&displaced).expect("read original inode"), b"original");
 	}
 
 	fn managed_file(root: &File, path: &str, contents: &[u8]) -> RecoveryFsIdentity {

@@ -85,6 +85,27 @@ describe.skipIf(process.platform !== "win32")("Windows portable retained recover
 		expect(Buffer.from(authority.read("receipt", 1024).data ?? []).toString()).toBe("replaced\n");
 		expect(authority.close().ok).toBe(true);
 	});
+
+	it("rejects alternate data stream names before creating a stream", async () => {
+		const root = await temporaryDirectory();
+		const receipt = path.join(root, "receipt");
+		await fs.writeFile(receipt, "visible receipt\n");
+		const authority = openPortableRecoveryFsRoot(root);
+
+		expect(authority.writeExclusive("receipt:hidden", Buffer.from("secret"))).toMatchObject({
+			ok: false,
+			code: "invalid_path",
+		});
+		expect(authority.writeExclusive("fresh:hidden:$DATA", Buffer.from("secret"))).toMatchObject({
+			ok: false,
+			code: "invalid_path",
+		});
+		expect(authority.list(1024)).toEqual(["receipt"]);
+		expect(await fs.readFile(receipt, "utf8")).toBe("visible receipt\n");
+		await expect(fs.readFile(path.join(root, "receipt:hidden"))).rejects.toThrow();
+		await expect(fs.readFile(path.join(root, "fresh:hidden:$DATA"))).rejects.toThrow();
+		expect(authority.close()).toMatchObject({ ok: true });
+	});
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
