@@ -5965,7 +5965,7 @@ export class AgentSession {
 				options.mandatoryMCPToolNames.map(name => name.toLowerCase()).filter(name => this.#toolRegistry.has(name)),
 			);
 		}
-		this.#invalidateDiscoveryCaches();
+		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		await this.#applyActiveToolsByName([
 			...previousActive.filter(name => !previous.has(name)),
 			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
