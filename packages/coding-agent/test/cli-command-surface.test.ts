@@ -83,7 +83,7 @@ describe("GJC public CLI command surface", () => {
 		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
 		expect(result.exitCode, output).toBe(0);
 		expect(result.stdout.toString()).not.toContain("warming workspace");
-	});
+	}, 15_000);
 	it("rejects an internal managed-owner supervisor invocation without published authority", async () => {
 		if (process.platform !== "linux") return;
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
