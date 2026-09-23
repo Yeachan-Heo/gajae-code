@@ -5,6 +5,7 @@ export const PET_CAPABILITY_DRAIN_MAX_MS = 100;
 export const PET_CAPABILITY_QUIESCENCE_MS = 25;
 export const PET_CAPABILITY_QUERY_TIMEOUT_MS = 1000;
 export const PET_TOPOLOGY_POLL_MS = 250;
+export const PET_MANAGED_CURSOR_REFRESH_TIMEOUT_MS = 250;
 export type PetTransportMode = "direct" | "managed";
 export type PetUnavailableReason =
 	| "not-iterm2"
@@ -55,7 +56,7 @@ export type PetTransportOutput = Readonly<{
 	): Promise<unknown>;
 }>;
 export type PetTmuxResult = Readonly<{ status: number; stdout: string; stderr?: string }>;
-export type PetTmuxRunner = (argv: readonly string[]) => Promise<PetTmuxResult | string>;
+export type PetTmuxRunner = (argv: readonly string[], signal?: AbortSignal) => Promise<PetTmuxResult | string>;
 export type PetTmuxTopology = Readonly<{
 	clients: number;
 	paneId?: string;
@@ -160,8 +161,12 @@ export function createNativePetTransport(o: {
 	};
 	const tmuxCommand = managed ? resolveGjcTmuxCommand(env) : undefined;
 	const tmux: PetTmuxRunner | undefined = managed
-		? async argv => {
-				const p = Bun.spawn([tmuxCommand!, ...argv], { stdout: "pipe", stderr: "pipe" });
+		? async (argv, signal) => {
+				const p = Bun.spawn([tmuxCommand!, ...argv], {
+					stdout: "pipe",
+					stderr: "pipe",
+					...(signal ? { signal, timeout: PET_MANAGED_CURSOR_REFRESH_TIMEOUT_MS } : {}),
+				});
 				return {
 					status: await p.exited,
 					stdout: await new Response(p.stdout).text(),
@@ -245,7 +250,8 @@ export class ItermPetTransport {
 	get availability() {
 		return { available: this.#available, mode: this.#mode, reason: this.#reason, epoch: this.#epoch };
 	}
-	async refreshManagedClient(row: number, column: number): Promise<boolean> {
+	async refreshManagedClient(row: number, column: number, lifecycleSignal?: AbortSignal): Promise<boolean> {
+		if (lifecycleSignal?.aborted) return false;
 		if (this.#mode === "direct") return true;
 		if (!Number.isInteger(row) || row < 0 || !Number.isInteger(column) || column < 0) return false;
 		if (!this.#available || !this.#tmux || this.#observedClientId === undefined || this.#paneId === undefined)
@@ -253,36 +259,49 @@ export class ItermPetTransport {
 		if (this.#expectedClientId !== undefined && this.#expectedClientId !== this.#observedClientId) return false;
 		const clientId = this.#observedClientId;
 		const epoch = this.#epoch;
-		const deadline = this.#clock.now() + 250;
+		const deadline = this.#clock.now() + PET_MANAGED_CURSOR_REFRESH_TIMEOUT_MS;
+		const timeoutController = new AbortController();
+		const timeout = this.#clock.setTimeout(() => timeoutController.abort(), PET_MANAGED_CURSOR_REFRESH_TIMEOUT_MS);
+		const signal = lifecycleSignal
+			? AbortSignal.any([lifecycleSignal, timeoutController.signal])
+			: timeoutController.signal;
 		const isCurrent = () =>
 			!this.#disposed &&
+			!signal.aborted &&
 			this.#available &&
 			this.#tmux !== undefined &&
 			this.#epoch === epoch &&
 			this.#observedClientId === clientId &&
 			(this.#expectedClientId === undefined || this.#expectedClientId === clientId);
-		while (this.#clock.now() <= deadline) {
-			if (!isCurrent()) return false;
-			try {
-				const pane = result(
-					await this.#tmux(["display-message", "-p", "-t", this.#paneId, "#{cursor_y}\t#{cursor_x}"]),
-				);
-				if (!isCurrent() || pane.status !== 0) return false;
-				const match = /^([0-9]+)\t([0-9]+)$/.exec(pane.stdout.trim());
-				if (!match) return false;
-				const observedRow = Number(match[1]);
-				const observedColumn = Number(match[2]);
-				if (!Number.isSafeInteger(observedRow) || !Number.isSafeInteger(observedColumn)) return false;
-				if (observedRow === row && observedColumn === column)
-					return result(await this.#tmux(["refresh-client", "-t", clientId])).status === 0 && isCurrent();
-			} catch {
-				return false;
+		try {
+			while (this.#clock.now() <= deadline) {
+				if (!isCurrent()) return false;
+				try {
+					const pane = result(
+						await this.#tmux(["display-message", "-p", "-t", this.#paneId, "#{cursor_y}\t#{cursor_x}"], signal),
+					);
+					if (!isCurrent() || pane.status !== 0) return false;
+					const match = /^([0-9]+)\t([0-9]+)$/.exec(pane.stdout.trim());
+					if (!match) return false;
+					const observedRow = Number(match[1]);
+					const observedColumn = Number(match[2]);
+					if (!Number.isSafeInteger(observedRow) || !Number.isSafeInteger(observedColumn)) return false;
+					if (observedRow === row && observedColumn === column) {
+						return (
+							result(await this.#tmux(["refresh-client", "-t", clientId], signal)).status === 0 && isCurrent()
+						);
+					}
+				} catch {
+					return false;
+				}
+				const { promise, resolve } = Promise.withResolvers<void>();
+				this.#clock.setTimeout(resolve, 10);
+				await promise;
 			}
-			const { promise, resolve } = Promise.withResolvers<void>();
-			this.#clock.setTimeout(resolve, 10);
-			await promise;
+			return false;
+		} finally {
+			this.#clock.clearTimeout(timeout);
 		}
-		return false;
 	}
 	subscribe(cb: (a: PetTransportAvailability) => void) {
 		this.#listeners.add(cb);

@@ -430,6 +430,44 @@ describe("TUI raster lease public boundary", () => {
 		expect((await pending).status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).toBe("CALLBACK_PREFIX");
 	});
+	it("unblocks raster ingress when afterPrefix ignores lifecycle abort", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("after-prefix-never-settles"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const callbackStarted = Promise.withResolvers<void>();
+		const releaseCallback = Promise.withResolvers<boolean>();
+		let callbackSignal: AbortSignal | undefined;
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("SAVE_CURSOR"),
+				afterPrefix: async signal => {
+					callbackSignal = signal;
+					callbackStarted.resolve();
+					return releaseCallback.promise;
+				},
+				records: [bytes("STALE_BODY")],
+				abortSuffix: bytes("RESTORE_CURSOR"),
+			},
+		});
+		await callbackStarted.promise;
+
+		tui.stop();
+
+		expect(callbackSignal?.aborted).toBe(true);
+		const settled = await Promise.race([pending.then(() => true), Bun.sleep(100).then(() => false)]);
+		expect(settled).toBe(true);
+		expect((await pending).status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).not.toContain("STALE_BODY");
+
+		tui.start();
+		expect((await tui.queueTerminalOutput("AFTER_RESTART")).status).toBe("written");
+		expect(terminal.getWriteLog().join("")).toContain("AFTER_RESTART");
+		releaseCallback.resolve(true);
+		tui.stop();
+	});
 	it("does not write records when the prefix callback returns false or throws", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("prefix-failure"));
