@@ -15,3 +15,7 @@
 - The public session-creation script normalizes a relative `GJC_SESSION_STATE_DIR` override against its invocation directory before entering the absolute-path owner-isolation protocol. (#5051)
 - Native Windows managed launches use their already-validated provisional psmux authority for the pre-publication pane PID proof, avoiding a circular requirement that the staged generation already be current. (#5051)
 - Managed-owner supervisors publish unexpected-owner-loss evidence when a child exits with status 75; the reserved status is no longer mistaken for a clean cleanup result.
+- Owner-close cleanup and runtime-state projection now accept only complete terminal verdicts bound to the exact session, generation, server, intent, and dispatch. (#5051)
+- Predecessor SIGABRT recovery now uses a private parent-to-helper stdin handoff before session creation; its bearer is not serialized into the tmux pane command, and unsafe resume states persist a durable handoff before new work starts. (#5051)
+- Terminal observer failures no longer suppress child signal delivery, and monitor respawn is guarded by the captured tmux server, session, and pane identity. (#5051)
+- Unsafe foreign tmux names no longer poison GJC session discovery and remain ineligible for garbage collection. (#5051)

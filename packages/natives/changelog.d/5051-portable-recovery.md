@@ -5,3 +5,4 @@
 - Portable retained-root reads report `not_found` only for an absent directory entry; symlinks, permission failures, and other `openat` errors remain untrusted evidence.
 - Portable atomic replacement retains the staged file handle through rename, then requires the installed device/inode and bytes to match that exact staged object before reporting publication success.
 - Native addon validation now rejects same-version retained artifacts that lack `openPortableRecoveryFsRoot` or any retained-root identity, enumeration, read, close, or publication method, allowing normal fallback/reinstall diagnostics instead of a runtime undefined-function failure.
+- Exclusive writes verify the named leaf still has the created inode and never unlink a replacement by name; Windows alternate data stream names are rejected, and unsupported Unix directory enumeration fails closed.
