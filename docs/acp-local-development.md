@@ -67,8 +67,9 @@ here, and they have different fixes:
   `promptTerminalOutcomeVersion: 1` while omitting `primaryControlSurface`, so
   the front end correctly rejects that half-upgraded session.
 - `did not answer runtime.capabilities` — the host never answered the query at
-  all, and the reported reason follows in parentheses. The host's build age is
-  unproven here; treat it as a transport or startup problem first.
+  all, and any reported reason is a bounded safe category, with unrecognized
+  failures reduced to `query failed` rather than raw host error text. The host's
+  build age is unproven here; treat it as a transport or startup problem first.
 
 Neither field is defaulted when the other is present: accepting a half-answered
 provenance would hand ACP the permission and lifecycle authority #5411 exists to

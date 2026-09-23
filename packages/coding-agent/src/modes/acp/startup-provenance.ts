@@ -39,6 +39,21 @@ export function resolveStartupProvenance(input: {
 
 function describeFailure(failure: unknown): string {
 	if (failure === undefined) return "";
-	const reason = failure instanceof Error ? failure.message : String(failure);
-	return reason ? ` (${reason})` : "";
+	let code: unknown;
+	try {
+		if ((typeof failure !== "object" || failure === null) && typeof failure !== "function") return " (query failed)";
+		code = (failure as { code?: unknown }).code;
+	} catch {
+		return " (query failed)";
+	}
+	switch (code) {
+		case "connection_closed":
+			return " (connection closed)";
+		case "timeout":
+			return " (query timed out)";
+		case "uncertain_after_send":
+			return " (query outcome uncertain)";
+		default:
+			return " (query failed)";
+	}
 }
