@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { FileLockAcquireError } from "../src/config/file-lock";
 import { ensureBroker } from "../src/sdk/broker/ensure";
 import {
 	BrokerStartupError,
@@ -56,6 +57,54 @@ test("write truncates a reason longer than 512 characters to exactly 512", async
 		const marker = await readBrokerStartupFailureMarker(agentDir);
 		expect(marker?.reason?.length).toBe(512);
 		expect(marker?.reason).toBe("x".repeat(512));
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("startup error reconstructed from a marker keeps a validated long-path lock cleanup command", async () => {
+	const agentDir = await makeAgentDir();
+	try {
+		const filePath = path.join(agentDir, "sdk", "l".repeat(210), "sessions.index");
+		const lockPath = `${filePath}.lock`;
+		const manualCleanupCommand =
+			process.platform === "win32"
+				? `Remove-Item -LiteralPath '${lockPath.replace(/'/g, "''")}' -Recurse -Force`
+				: `rm -rf -- '${lockPath.replace(/'/g, "'\\''")}'`;
+		const lockError = new FileLockAcquireError(filePath, lockPath, 3, "dead owner", "acquire_timeout", undefined, {
+			outcome: "cleanup_failed",
+			message: "permission denied",
+			manualCleanupCommand,
+		});
+
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: lockError.message,
+			exitCode: 1,
+			signal: null,
+			pid: process.pid,
+		});
+		const marker = await readBrokerStartupFailureMarker(agentDir);
+		expect(marker).toBeDefined();
+		expect(marker?.reason.length).toBeLessThanOrEqual(512);
+		expect(marker?.reason.endsWith(manualCleanupCommand)).toBe(true);
+
+		const callerError = new BrokerStartupError({
+			exitCode: marker?.exitCode ?? null,
+			signal: marker?.signal ?? null,
+			reason: marker?.reason ?? "",
+		});
+		expect(callerError.reason).toContain(manualCleanupCommand);
+		expect(callerError.message).toContain(manualCleanupCommand);
+
+		const unsafeReason = lockError.message.replace(manualCleanupCommand, `${manualCleanupCommand}; echo unsafe-tail`);
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: unsafeReason,
+			exitCode: 1,
+			signal: null,
+			pid: process.pid,
+		});
+		const unsafeMarker = await readBrokerStartupFailureMarker(agentDir);
+		expect(unsafeMarker?.reason).toBe(unsafeReason.slice(0, 512));
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}

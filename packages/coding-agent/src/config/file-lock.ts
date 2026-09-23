@@ -1558,13 +1558,17 @@ async function staleLockSnapshot(
 
 type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
 
-type RecordedStaleRemovalFailure = { owner: FileLockOwnerToken; failure: FileLockStaleRemovalFailure };
+type RecordedStaleRemovalFailure = {
+	owner: FileLockOwnerToken;
+	identity: GenericFileLockDirIdentity;
+	failure: FileLockStaleRemovalFailure;
+};
 
 /**
- * A recorded refusal describes exactly one dead owner generation. Re-read the pathname at
- * exhaustion and report it only while that same generation still owns the directory, so a
- * refusal recorded for a dead generation is never pinned onto a live successor that took
- * the pathname over before the budget ran out.
+ * A recorded refusal describes exactly one dead owner generation and directory identity.
+ * Re-read the pathname at exhaustion and report it only while both still match, so a refusal
+ * recorded for a dead generation is never pinned onto a successor that took the pathname over
+ * before the budget ran out, even if its legacy owner bytes are identical.
  */
 async function staleRemovalFailureForCurrentGeneration(
 	lockPath: string,
@@ -1572,9 +1576,13 @@ async function staleRemovalFailureForCurrentGeneration(
 ): Promise<FileLockStaleRemovalFailure | undefined> {
 	if (!recorded) return undefined;
 	try {
-		const current = await readLockInfo(lockPath);
+		const observation = await readLockInfoObservation(lockPath);
+		if (!observation) return undefined;
+		const current = parseLockInfoBytes(observation.bytes);
 		if (!current || !sameFileLockOwnerToken(current, recorded.owner) || !ownerGenerationIsDead(current))
 			return undefined;
+		const currentIdentity = fileLockDirIdentityFromPathState(observation.state, observation.bytes);
+		if (!sameGenericFileLockDirIdentity(recorded.identity, currentIdentity)) return undefined;
 		return {
 			...recorded.failure,
 			manualCleanupCommand: manualLockCleanupCommand(lockPath),
@@ -2242,7 +2250,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			continue;
 		}
 		staleRemovalFailure =
-			stale.stale && staleRemoval.failure ? { owner: stale.owner, failure: staleRemoval.failure } : undefined;
+			stale.stale && staleRemoval.failure
+				? { owner: stale.owner, identity: stale.identity, failure: staleRemoval.failure }
+				: undefined;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);
 			continue;
