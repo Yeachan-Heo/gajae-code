@@ -1528,6 +1528,18 @@ export default class Sdk extends Command {
 		const startupStartedAt = process.hrtime.bigint();
 		let startupExitWrite: Promise<BrokerStartupExitWriteStatus> | undefined;
 		const startupAbortController = new AbortController();
+		let candidateStartTask: Promise<unknown> | undefined;
+		const waitForStartupAbortCleanup = async (): Promise<void> => {
+			const task = candidateStartTask;
+			if (!task) return;
+			await Promise.race([
+				task.then(
+					() => undefined,
+					() => undefined,
+				),
+				Bun.sleep(BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS),
+			]);
+		};
 		const startupSignalExitCode = (signal: "SIGTERM" | "SIGINT"): 130 | 143 => (signal === "SIGINT" ? 130 : 143);
 		const makeStartupExitRecord = (
 			reason: "startup-deadline" | "startup-signal",
@@ -1548,11 +1560,14 @@ export default class Sdk extends Command {
 			writtenAt: Date.now(),
 		});
 		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
-			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
-				agentDir,
-				record,
-				BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
-			);
+			startupExitWrite ??= (async () => {
+				const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
+				if (Number.isSafeInteger(testDelayMs) && testDelayMs > 0 && testDelayMs <= 10_000) {
+					await emitBrokerStartupTestSignal("startup-exit-record-fallback-waiting");
+					await Bun.sleep(testDelayMs);
+				}
+				return await writeBrokerStartupExitRecordBounded(agentDir, record, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
+			})();
 			return startupExitWrite;
 		};
 		const brokerReadyForSignal = (): Broker | undefined =>
@@ -1585,7 +1600,9 @@ export default class Sdk extends Command {
 					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
 					: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
-			const recordWrittenSynchronously = writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
+			const forceAsyncExitRecordWrite = process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_FORCE_ASYNC === "1";
+			const recordWrittenSynchronously =
+				!forceAsyncExitRecordWrite && writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
 			startupExitTask = (async () => {
 				const exitRecordWrite = recordWrittenSynchronously
 					? { kind: "written" as const }
@@ -1615,6 +1632,12 @@ export default class Sdk extends Command {
 						: pendingShutdownSignal;
 			if (!signal) return;
 			pendingShutdownSignal = signal;
+			if (startupExitTask && startupExitReason === "startup-deadline") {
+				await startupExitTask;
+				await waitForStartupAbortCleanup();
+				process.exit(1);
+				return;
+			}
 			const activeBroker = brokerReadyForSignal();
 			if (activeBroker) {
 				runningBroker = activeBroker;
@@ -1624,6 +1647,7 @@ export default class Sdk extends Command {
 			}
 			startupAbortController.abort();
 			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+			await candidateStartTask?.catch(() => undefined);
 		});
 		const finishPendingStartupSignal = async (): Promise<boolean> => {
 			const signal = pendingShutdownSignal;
@@ -1640,8 +1664,11 @@ export default class Sdk extends Command {
 						? testWatchdogMs
 						: remainingMs;
 				const startupWatchdog = setTimeout(() => {
-					void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(started => {
-						if (started) process.exit(1);
+					startupAbortController.abort();
+					void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
+						if (!started) return;
+						await waitForStartupAbortCleanup();
+						process.exit(1);
 					});
 				}, watchdogMs);
 				try {
@@ -1703,6 +1730,29 @@ export default class Sdk extends Command {
 						testPrePublicationDelayMs <= 10_000
 							? testPrePublicationDelayMs
 							: undefined;
+					const testAfterDiscoveryWriteDelayMs = Number(
+						process.env.GJC_SDK_TEST_BROKER_AFTER_DISCOVERY_WRITE_DELAY_MS ?? 0,
+					);
+					const startupAfterDiscoveryWriteTestHook =
+						Number.isSafeInteger(testAfterDiscoveryWriteDelayMs) &&
+						testAfterDiscoveryWriteDelayMs > 0 &&
+						testAfterDiscoveryWriteDelayMs <= 10_000
+							? async () => {
+									await emitBrokerStartupTestSignal("discovery-written-before-retain");
+									const signal = startupAbortController.signal;
+									if (signal.aborted) return;
+									const wait = Promise.withResolvers<void>();
+									const timer = setTimeout(wait.resolve, testAfterDiscoveryWriteDelayMs);
+									const onAbort = (): void => wait.resolve();
+									signal.addEventListener("abort", onAbort, { once: true });
+									try {
+										await wait.promise;
+									} finally {
+										clearTimeout(timer);
+										signal.removeEventListener("abort", onAbort);
+									}
+								}
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
 						startupAbortSignal: startupAbortController.signal,
@@ -1727,11 +1777,13 @@ export default class Sdk extends Command {
 										await emitBrokerStartupTestSignal("pre-publication-ready");
 									},
 								}),
+						...(startupAfterDiscoveryWriteTestHook === undefined ? {} : { startupAfterDiscoveryWriteTestHook }),
 						...(startupPostPublicationDelayMs === undefined ? {} : { startupPostPublicationDelayMs }),
 						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
-					await candidate.start();
+					candidateStartTask = candidate.start();
+					await candidateStartTask;
 					if (candidate.ownsDiscovery) runningBroker = candidate;
 					return candidate;
 				} finally {
