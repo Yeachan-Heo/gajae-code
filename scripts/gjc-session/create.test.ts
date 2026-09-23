@@ -910,6 +910,13 @@ exec tmux "$@"
 		expect(respawnRequests[0]).toContain("if-shell");
 		expect(respawnRequests[0]).toContain("-F");
 		expect(respawnRequests[0]).toContain("#{pane_id}");
+		for (const field of [
+			`#{==:#{pid},${original[0]}}`,
+			`#{==:#{session_id},${original[1]}}`,
+			`#{==:#{session_name},${original[2]}}`,
+			`#{==:#{pane_id},${original[3]}}`,
+		])
+			expect(respawnRequests[0]).toContain(field);
 		const generation = ((await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).json()) as { generation: string }).generation;
 		expect(await Bun.file(path.join(state, name, "owner-lifecycle", `monitor-identity-${generation}.json`)).exists()).toBe(false);
 	});
@@ -1223,7 +1230,7 @@ test("forwards SIGTERM when terminal observer output has an invalid schema", asy
 		const name = `malformed-observer-${label}-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
 		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: setupBin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
 		const generation = ((await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).json()) as { generation: string }).generation;
-		const adapter = path.join(root, "malformed-observer.py"), ready = path.join(root, "ready"), rawPid = path.join(root, "raw-child.pid"), signalReceived = path.join(root, "signal-received");
+		const adapter = path.join(root, "malformed-observer.py"), ready = path.join(root, "ready"), rawPid = path.join(root, "raw-child.pid"), signalReceived = path.join(root, "signal-received"), observerResponseSuccess = path.join(root, "observer-response-success");
 		const response = value(name, generation);
 		await executable(adapter, `#!/usr/bin/env python3
 import json, os, signal, sys
@@ -1231,6 +1238,7 @@ if "--internal-tmux-owner-isolation" in sys.argv:
     request = json.load(sys.stdin)
     if request.get("op") == "observe_terminal":
         print(${JSON.stringify(response)})
+        open(os.environ["GJC_FIXTURE_OBSERVER_RESPONSE_SUCCESS"], "w", encoding="utf-8").close()
         raise SystemExit(0)
     raise SystemExit(23)
 with open(os.environ["GJC_FIXTURE_RAW_PID"], "w", encoding="utf-8") as handle: handle.write(str(os.getpid()))
@@ -1241,12 +1249,13 @@ def receive(_signum, _frame):
 signal.signal(signal.SIGTERM, receive)
 signal.pause()
 `);
-		const supervisor = Bun.spawn(["python3", path.join(state, "supervisor.py")], { env: { ...process.env, GJC_SESSION_NAME: name, GJC_SESSION_WORKDIR: dir, GJC_SESSION_STATE_DIR: state, GJC_SESSION_OWNER_GENERATION: generation, GJC_TMUX_OWNER_PROTOCOL_TOKEN: "a".repeat(64), GJC_TMUX_OWNER_SERVER_KEY: `gjc-${name}`, GJC_SESSION_GJC_BIN: adapter, GJC_SESSION_POSTMORTEM_SH: postmortemScript, GJC_SESSION_RUNNER_SH: "/bin/true", GJC_FIXTURE_RAW_READY: ready, GJC_FIXTURE_RAW_PID: rawPid, GJC_FIXTURE_SIGNAL_RECEIVED: signalReceived }, stdout: "pipe", stderr: "pipe" });
+		const supervisor = Bun.spawn(["python3", path.join(state, "supervisor.py")], { env: { ...process.env, GJC_SESSION_NAME: name, GJC_SESSION_WORKDIR: dir, GJC_SESSION_STATE_DIR: state, GJC_SESSION_OWNER_GENERATION: generation, GJC_TMUX_OWNER_PROTOCOL_TOKEN: "a".repeat(64), GJC_TMUX_OWNER_SERVER_KEY: `gjc-${name}`, GJC_SESSION_GJC_BIN: adapter, GJC_SESSION_POSTMORTEM_SH: postmortemScript, GJC_SESSION_RUNNER_SH: "/bin/true", GJC_FIXTURE_RAW_READY: ready, GJC_FIXTURE_RAW_PID: rawPid, GJC_FIXTURE_SIGNAL_RECEIVED: signalReceived, GJC_FIXTURE_OBSERVER_RESPONSE_SUCCESS: observerResponseSuccess }, stdout: "pipe", stderr: "pipe" });
 		let supervisorExited = false;
 		try {
 			await waitFor(ready);
 			expect(Bun.spawnSync(["kill", "-TERM", String(supervisor.pid)]).exitCode).toBe(0);
 			await waitFor(signalReceived);
+			expect(await Bun.file(observerResponseSuccess).exists()).toBe(true);
 			expect(await supervisor.exited).toBe(0);
 			supervisorExited = true;
 			expect(await Bun.file(path.join(state, "supervisor-failure.json")).json()).toMatchObject({ kind: "supervisor_failure", session_id: name, owner_generation: generation });
