@@ -5,7 +5,7 @@
 **Reviewed:** 2026-09-23
 **Original task-fixture base:** `dev` at `1431b449495be731d44aa6ee21092aee45f88b82` (pinned by merged PR #5857).
 **Safety-gate follow-up base:** `dev` at `618c0a33cd175a993468b63872c553d7e9921440`.
-**Read-path correction base:** `dev` at `64501600ab6c4e0bfcf2425cc396bb221630da0d` (current base for G010; it includes the #5868 merge commit `84315340c24b013a781b55edb1504d83c4c5f343`).
+**Read-path correction base:** `dev` at `15f6c3d23d5fe8a337fc0007b739a916de0dc457` (current G010 PR base; it includes the #5868 merge commit `84315340c24b013a781b55edb1504d83c4c5f343`).
 
 ## Decision requested before live runs
 
