@@ -83,6 +83,7 @@ type Fixture = {
 	/** Correlation the fixture host acknowledged for the turn currently in flight. */
 	correlation(): { commandId: string; turnId: string };
 	promptDeliveryCount(): number;
+	imageUploadCount(): number;
 	/** Sends one raw frame down the session socket, correlation included or omitted verbatim. */
 	send(frame: Record<string, unknown>): void;
 	sendAssistantText(text: string): void;
@@ -161,6 +162,7 @@ type FixtureOptions = {
 	cancelSettlementGraceMs?: number;
 	preflightCancelAcknowledgement?: boolean;
 	deferCancelAcknowledgement?: boolean;
+	imageEchoGate?: { started: () => void; release: Promise<void> };
 };
 
 async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -173,6 +175,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	const clock = new VirtualClock();
 	const abort = new AbortController();
 	let turnCount = 0;
+	let imageUploadCount = 0;
 	let commandId = "";
 	let turnId = "";
 	let promptSocket: TestSocket | undefined;
@@ -354,6 +357,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.")) imageUploadCount++;
 				if (frame.operation === "turn.prompt") {
 					promptSocket = socket;
 					turnCount += 1;
@@ -434,7 +438,18 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				const chunk = update.update as { sessionUpdate?: string; content?: { type?: string } };
+				if (
+					chunk.sessionUpdate === "user_message_chunk" &&
+					chunk.content?.type === "image" &&
+					options.imageEchoGate
+				) {
+					options.imageEchoGate.started();
+					await options.imageEchoGate.release;
+				}
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -456,6 +471,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		clock,
 		correlation: () => ({ commandId, turnId }),
 		promptDeliveryCount: () => turnCount,
+		imageUploadCount: () => imageUploadCount,
 		send,
 		sendAssistantText,
 		sendAssistantToolCall,
@@ -646,6 +662,49 @@ test("a silent completed todo_write argument stream rejects the ACP client withi
 		).toBe(true);
 	} finally {
 		diagnostic.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("a stalled image echo cannot hold a settled prompt or dispatch after late publication", async () => {
+	const echoStarted = Promise.withResolvers<void>();
+	const echoGate = Promise.withResolvers<void>();
+	const fixture = await createFixture({ imageEchoGate: { started: echoStarted.resolve, release: echoGate.promise } });
+	try {
+		const image = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(image.length).toBeGreaterThan(256 * 1024);
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "image", mimeType: "image/png", data: image.toString("base64") }],
+		} as PromptRequest);
+		let settlements = 0;
+		void pending.then(
+			() => settlements++,
+			() => settlements++,
+		);
+		await bounded(echoStarted.promise, "image echo publication");
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+		expect(fixture.clock.pending).toBe(1);
+
+		fixture.clock.advance(ACP_PROMPT_INACTIVITY_TIMEOUT_MS + 1);
+		await expect(bounded(pending, "stalled image echo watchdog")).rejects.toMatchObject({
+			code: "prompt_abandoned",
+		});
+		expect(settlements).toBe(1);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+		await expect(prompt(fixture, "after abandoned echo")).rejects.toMatchObject({ code: "not_found" });
+
+		echoGate.resolve();
+		await Bun.sleep(20);
+		expect(settlements).toBe(1);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.imageUploadCount()).toBe(0);
+	} finally {
+		echoGate.resolve();
 		fixture.dispose();
 	}
 });
