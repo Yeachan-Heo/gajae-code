@@ -108,7 +108,7 @@ describe("sdk session raw control envelope", () => {
 					4,
 				),
 			);
-			expect(JSON.stringify({ listInputs, routedTargets, warnings })).not.toContain(repo);
+			expect(JSON.stringify({ listInputs, routedTargets, warnings, outputs })).not.toContain(repo);
 		} finally {
 			stderr.mockRestore();
 			request.mockRestore();
