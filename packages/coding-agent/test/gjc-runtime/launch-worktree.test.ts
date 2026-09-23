@@ -835,6 +835,45 @@ describe("launch guard classification", () => {
 		expect(guard?.message).toContain("Safe remediation:");
 	});
 
+	it("keeps fatal check-ignore failures on the operational error path", async () => {
+		const repo = await createRepo("gjc-guard-check-ignore-fatal-");
+		const fatalStderr = "fatal: index file corrupt";
+		const checkIgnoreCalls: string[][] = [];
+		const originalSpawnSync = Bun.spawnSync.bind(Bun);
+		const spawnSyncSpy = spyOn(Bun, "spawnSync").mockImplementation(((
+			command: string[] | { cmd: string[] },
+			options?: unknown,
+		) => {
+			const argv = Array.isArray(command) ? command : command.cmd;
+			if (argv[0] === "git" && argv[1] === "check-ignore") {
+				checkIgnoreCalls.push(argv);
+				return {
+					exitCode: 128,
+					stdout: Buffer.alloc(0),
+					stderr: Buffer.from(fatalStderr),
+				} as never;
+			}
+			return originalSpawnSync(command as never, options as never);
+		}) as never);
+
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree"]);
+		} catch (error) {
+			caught = error;
+		} finally {
+			spawnSyncSpy.mockRestore();
+		}
+
+		expect(checkIgnoreCalls).toHaveLength(1);
+		expect(caught).toBeInstanceOf(Error);
+		expect(asLaunchWorktreeGuardError(caught)).toBeNull();
+		expect((caught as Error).message).toContain("git check-ignore");
+		expect((caught as Error).message).toContain(fatalStderr);
+		expect((caught as Error).message).not.toContain(".gitignore");
+		expect((caught as Error).message).not.toContain("Safe remediation");
+	});
+
 	// Regression: validateBranchName threw raw git stderr with no code prefix, so the guard
 	// existed in name only and fell through to the crash path.
 	it("prefixes the guard code even when git supplies its own branch-name diagnostic", async () => {

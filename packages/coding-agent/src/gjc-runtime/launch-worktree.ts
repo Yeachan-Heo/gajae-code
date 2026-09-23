@@ -234,6 +234,12 @@ function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): vo
 			stderr: "pipe",
 		});
 		if (result.exitCode === 0) return;
+		if (result.exitCode !== 1) {
+			const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
+			throw new Error(
+				`git check-ignore --quiet -- ${candidate} failed with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`,
+			);
+		}
 	}
 	throw launchGuardLines(
 		"worktree_bucket_not_ignored",
