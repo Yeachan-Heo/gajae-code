@@ -53,6 +53,7 @@ describe("stable release policy", () => {
 		expect(finalize).toContain("draft: false");
 		expect(finalize).toContain("mupdf-release-materials/mupdf-source.tar.gz");
 		expect(finalize).toContain("mupdf-release-materials/mupdf-provenance.json");
+		expect(finalize).toContain("mupdf-release-materials/mupdf-built.wasm");
 	});
 
 	test("stable tags and nightly publication lanes are non-cancelling", async () => {

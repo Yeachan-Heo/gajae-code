@@ -517,6 +517,7 @@ describe("native release binary coverage", () => {
 		expect(finalize).toContain("Publish binary checksum manifest");
 		expect(finalize).toContain("mupdf-release-materials/mupdf-source.tar.gz");
 		expect(finalize).toContain("mupdf-release-materials/mupdf-provenance.json");
+		expect(finalize).toContain("mupdf-release-materials/mupdf-built.wasm");
 		expect(finalize.indexOf("Publish binary checksum manifest")).toBeLessThan(finalize.indexOf("Create GitHub Release"));
 		expect(finalize).toContain("gajae-release-packages-v1.json");
 		expect(finalize).toContain("gajae-release-channel-v1.json");
