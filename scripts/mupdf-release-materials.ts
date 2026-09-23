@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -76,7 +76,7 @@ function isSha256(value: unknown): value is string {
 }
 
 export function sha256(value: Uint8Array | string): string {
-	return createHash("sha256").update(value).digest("hex");
+	return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 export function validateMuPdfSourceArchiveDigest(

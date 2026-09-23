@@ -31,7 +31,10 @@ describe("stable release policy", () => {
 		const positions = stages.map(stage => ci.indexOf(`   ${stage}:`));
 		for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
 
-		expect(jobSection(ci, "mupdf_source")).toContain("needs: [release_metadata]");
+		const mupdfSource = jobSection(ci, "mupdf_source");
+		expect(mupdfSource).toContain("needs: [release_metadata]");
+		expect(mupdfSource).toContain('node-version: "24"');
+		expect(mupdfSource).toContain("retention-days: 30");
 		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
 		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata, mupdf_source]");
 		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");

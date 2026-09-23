@@ -413,7 +413,7 @@ jobs:
               name: mupdf-release-materials-${{ needs.release_metadata.outputs.version || format('rehearsal-{0}', github.run_id) }}
               path: ${{ runner.temp }}/mupdf-release-materials
               if-no-files-found: error
-              retention-days: 1
+              retention-days: 30
               overwrite: true
 
    native:
