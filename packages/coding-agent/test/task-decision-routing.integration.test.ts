@@ -33,7 +33,13 @@ const original = getBundledModel("anthropic", "claude-opus-4-6")!;
 const selector = (model: Model) => `${model.provider}/${model.id}`;
 const recommendation: DecisionOutcome = { result: { choice: "fast", probabilities: { fast: 1 }, confidence: 1 } };
 
-async function fixture(provider: DecisionProvider, mode: "shadow" | "routing" = "routing") {
+async function fixture(
+	provider: DecisionProvider,
+	mode: "shadow" | "routing" = "routing",
+	tierMap: Readonly<Partial<Record<"fast" | "balanced" | "strong", readonly string[]>>> = {
+		fast: [`${selector(selected)}:low`],
+	},
+) {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-decision-routing-"));
 	roots.push(root);
 	const observations: TaskDecisionObservationInput[] = [];
@@ -53,7 +59,7 @@ async function fixture(provider: DecisionProvider, mode: "shadow" | "routing" = 
 	const context = buildTaskDecisionContext({
 		role: "executor",
 		assignment: "synthetic bounded task",
-		tierMap: { fast: [`${selector(selected)}:low`] },
+		tierMap,
 		routingSnapshot: [selected, original],
 		provider: { provider, providerName: "kev", mode, decisionModel: "kev-latest", timeoutMs: 5000 },
 	});
@@ -112,6 +118,31 @@ describe("fresh-subagent decision integration", () => {
 			effective_selector: `${selector(selected)}:low`,
 			effective_effort: "low",
 		});
+	});
+
+	test("a chosen tier without an effort suffix keeps the role's requested effort", async () => {
+		const f = await fixture({ decide: async () => recommendation }, "routing", { fast: [selector(selected)] });
+		expect(f.context.tierEfforts).toEqual({});
+		const bootstrap = vi.spyOn(sdk, "createAgentSession").mockRejectedValue(new Error("synthetic bootstrap stop"));
+		await runSubprocess(f.options);
+		expect(bootstrap.mock.calls[0]?.[0]?.model?.id).toBe(selected.id);
+		// The tier decided the model only; "high" was the role's request and survives it.
+		expect(bootstrap.mock.calls[0]?.[0]?.thinkingLevel).toBe(Effort.High);
+		expect(f.observations[0]?.effective_selector).toBe(selector(selected));
+		expect(f.observations[0]?.effective_effort).toBeUndefined();
+	});
+
+	test("a chosen tier whose selector carries an effort suffix overrides the role's requested effort", async () => {
+		const f = await fixture({ decide: async () => recommendation }, "routing", {
+			fast: [`${selector(selected)}:low`],
+		});
+		expect(f.context.tierEfforts).toEqual({ fast: Effort.Low });
+		const bootstrap = vi.spyOn(sdk, "createAgentSession").mockRejectedValue(new Error("synthetic bootstrap stop"));
+		await runSubprocess(f.options);
+		expect(f.options.thinkingLevel).toBe(Effort.High);
+		expect(bootstrap.mock.calls[0]?.[0]?.model?.id).toBe(selected.id);
+		expect(bootstrap.mock.calls[0]?.[0]?.thinkingLevel).toBe(Effort.Low);
+		expect(f.observations[0]?.effective_effort).toBe("low");
 	});
 
 	test("failure preserves original pins and runs once across preflight fallback attempts", async () => {
