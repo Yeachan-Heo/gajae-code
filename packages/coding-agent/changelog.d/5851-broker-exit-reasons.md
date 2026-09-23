@@ -1,3 +1,3 @@
 ### Fixed
 
-- SDK broker graceful exits now log and persist a bounded structured reason, including publication-fence and signal details, so supervisors can diagnose broker restarts (#5851).
+- SDK broker exits now log and persist a bounded structured reason for startup deadlines and pre-readiness signals as well as publication fences, committed restarts, and shutdown requests, so supervisors can diagnose broker restarts (#5851).

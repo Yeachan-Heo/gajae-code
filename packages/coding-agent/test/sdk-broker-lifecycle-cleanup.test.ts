@@ -337,7 +337,7 @@ test("write is best-effort when the sdk directory cannot be created", async () =
 
 		await expect(
 			writeBrokerStartupFailureMarker(agentDir, { reason: "boom", exitCode: 1, signal: null, pid: process.pid }),
-		).resolves.toBeUndefined();
+		).resolves.toBe(false);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
