@@ -1,6 +1,6 @@
 import { describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { markNonDispatchedToolEvent } from "@gajae-code/agent-core";
@@ -645,6 +645,49 @@ test("SDK-only markUncertain persists an active-schema record without quarantini
 			status: "terminal_ok",
 		});
 		expect((await readdir(root)).some(name => name.includes("corrupt"))).toBe(false);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("a deadline-deferred stopped outcome reloads consistently before terminal commit", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-deferred-stop-reload-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		await Bun.write(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId: "deferred-stop-reload" });
+		const reconciliation = createInvocationReconciliation({ store });
+		const correlation = { commandId: "deferred-stop-command", turnId: "deferred-stop-turn" };
+		await reconciliation.noteAccepted("prompt", correlation, "deferred-stop-ref");
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+		await reconciliation.claimPendingOutcome("prompt", correlation, {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+			provenance: "deadline",
+		});
+		expect(
+			await reconciliation.notePendingStoppedOutcome("prompt", correlation, {
+				kind: "stopped",
+				reason: "cancelled",
+				provenance: "client_cancel",
+			}),
+		).toBe(true);
+		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "in_flight" });
+		const staged = store.snapshot().find(record => record.commandId === correlation.commandId) as
+			| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown })
+			| undefined;
+		expect(staged?.pendingOutcome).toMatchObject({ kind: "stopped", reason: "cancelled" });
+		expect(staged?.terminalAt).toBeUndefined();
+
+		const reopened = createInvocationReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId: "deferred-stop-reload" }),
+		});
+		await reopened.hydrate();
+		expect(reopened.lookup("prompt", { clientRef: "deferred-stop-ref" })).toMatchObject({
+			status: "terminal_ok",
+			outcome: { kind: "stopped", reason: "cancelled" },
+		});
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -3758,6 +3801,7 @@ describe("SessionSdkSessionRuntime", () => {
 			await handlers.get("session_start")?.({}, context);
 			await rm(agentDir);
 			await mkdir(agentDir, { recursive: true });
+			await chmod(agentDir, 0o700);
 			broker = new Broker({ agentDir });
 			await broker.start();
 			await handlers.get("turn_start")?.({}, context);
@@ -4044,8 +4088,13 @@ function createInterceptorReconciliationStore(
 		load: async () => backing.records.map(record => ({ ...record })),
 		async transact(mutator) {
 			const records = mutator(backing.records.map(record => ({ ...record })));
-			let transitionType: "agent_failed" | "agent_end" | undefined;
-			for (const record of records as Array<{ status?: string; terminalAt?: number; commandId?: string }>) {
+			let transitionType: string | undefined;
+			for (const record of records as Array<{
+				status?: string;
+				terminalAt?: number;
+				commandId?: string;
+				pendingOutcome?: unknown;
+			}>) {
 				// The intermediate durable state an agent_failed write produces:
 				// the reason is set but the row is not terminal yet. Tests choose how
 				// many consecutive writes fail before the recovery replay succeeds.
@@ -4064,6 +4113,13 @@ function createInterceptorReconciliationStore(
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
 				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
+				if (
+					record.terminalAt === undefined &&
+					record.pendingOutcome !== undefined &&
+					(previous as (SdkOnlyInvocationRecord & { pendingOutcome?: unknown }) | undefined)?.pendingOutcome ===
+						undefined
+				)
+					transitionType ??= "deadline_claim";
 				if (record?.terminalAt !== undefined && previous?.terminalAt === undefined) {
 					transitionType = "agent_end";
 					interceptor({ type: "agent_end" });
@@ -6315,6 +6371,247 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("agent_start during a pending deadline claim preserves the expiring correlation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
+		const claimEntered = Promise.withResolvers<void>();
+		const releaseClaim = Promise.withResolvers<void>();
+		const epoch = 83;
+		let harness: InvocationHarness | undefined;
+		let startPromise: Promise<void> | undefined;
+		let claimWasEntered = false;
+		let handleReads = 0;
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-start-race", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				persistHolds: [
+					{
+						type: "deadline_claim",
+						onEntered: () => {
+							claimWasEntered = true;
+							claimEntered.resolve();
+						},
+						release: releaseClaim.promise,
+					},
+				],
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => {
+						handleReads += 1;
+						return "deadline-start-race-run";
+					},
+					pendingToolExecutions: () => [],
+					abortPromptAndWaitWithTerminal: async (_handle, _options) => {
+						abortCalls += 1;
+						await startPromise;
+						await harness?.emit("agent_end", { stopReason: "cancelled" });
+						return {
+							status: "settled",
+							terminalScope: { abortedAttemptEpoch: epoch, lineageIdHash: "deadline-start-race-lineage" },
+						};
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			const claimDeadline = Date.now() + 2_000;
+			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
+			expect(claimWasEntered).toBe(true);
+			await claimEntered.promise;
+			startPromise = harness.emit("agent_start");
+			const captureDeadline = Date.now() + 2_000;
+			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
+			expect(handleReads).toBeGreaterThan(0);
+			releaseClaim.resolve();
+			await startPromise;
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(abortCalls).toBe(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+		} finally {
+			releaseClaim.resolve();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("agent_start during an expiry claim keeps the queued correlation owned", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-start-race-"));
+		const claimEntered = Promise.withResolvers<void>();
+		const releaseClaim = Promise.withResolvers<void>();
+		const activeTools = new Set(["delayed-tool"]);
+		const epoch = 83;
+		let harness: InvocationHarness | undefined;
+		let startPromise: Promise<void> | undefined;
+		let claimWasEntered = false;
+		let handleReads = 0;
+		let boundaryWaitStarted = false;
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-start-race", cwd, {
+				settings: zeroProgressSettings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: () => {},
+				agentFailedWriteFailures: 0,
+				persistHolds: [
+					{
+						type: "deadline_claim",
+						onEntered: () => {
+							claimWasEntered = true;
+							claimEntered.resolve();
+						},
+						release: releaseClaim.promise,
+					},
+				],
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => {
+						handleReads += 1;
+						return "deadline-start-race-run";
+					},
+					pendingToolExecutions: () => {
+						if (activeTools.size > 0) boundaryWaitStarted = true;
+						return [...activeTools];
+					},
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						return { status: "unfenced" };
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "start while expiring" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			const claimDeadline = Date.now() + 2_000;
+			while (!claimWasEntered && Date.now() < claimDeadline) await Bun.sleep(5);
+			expect(claimWasEntered).toBe(true);
+			startPromise = harness.emit("agent_start");
+			const captureDeadline = Date.now() + 2_000;
+			while (handleReads === 0 && Date.now() < captureDeadline) await Bun.sleep(5);
+			expect(handleReads).toBeGreaterThan(0);
+			releaseClaim.resolve();
+			await startPromise;
+			const boundaryDeadline = Date.now() + 2_000;
+			while (!boundaryWaitStarted && Date.now() < boundaryDeadline) await Bun.sleep(5);
+			expect(boundaryWaitStarted).toBe(true);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
+			activeTools.clear();
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(abortCalls).toBe(0);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+		} finally {
+			releaseClaim.resolve();
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a sibling publication failure does not hide the expiring correlation's end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-sibling-publication-"));
+		const epoch = 89;
+		let promptDeadlineMs = 600_000;
+		let harness: InvocationHarness | undefined;
+		let promotedB: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+		let promotedC: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
+		let targetIds: { commandId?: string; turnId?: string } = {};
+		let siblingIds: { commandId?: string; turnId?: string } = {};
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-sibling-publication", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs"
+							? promptDeadlineMs
+							: key === "sdk.promptMaxRuntimeMs"
+								? 60_000
+								: undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					const callback = (
+						options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined
+					)?.onQueuedPromoted;
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						if (promotedB === undefined) promotedB = callback;
+						else promotedC = callback;
+						return;
+					}
+					await neverSettlingPromise();
+				},
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => "deadline-shared-run",
+					pendingToolExecutions: () => [],
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						await harness?.emit("agent_end", {
+							sdkRunToken: `${targetIds.commandId}:${targetIds.turnId}`,
+							stopReason: "cancelled",
+						});
+						return {
+							status: "settled",
+							terminalScope: { abortedAttemptEpoch: epoch, lineageIdHash: "deadline-shared-lineage" },
+						};
+					},
+				},
+				broadcastInterceptor: frame => {
+					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
+					if (
+						frame.kind === "agent_end" &&
+						payload?.commandId === siblingIds.commandId &&
+						payload?.turnId === siblingIds.turnId
+					)
+						throw Object.assign(new Error("sibling boundary publication failed"), { code: "io_error" });
+				},
+			});
+			const lead = await harness.control("turn.prompt", { text: "shared lead" });
+			expect(lead.ok).toBe(true);
+			await harness.emit("agent_start");
+			const followUpB = await harness.control("turn.follow_up", { text: "deadline target" });
+			const followUpC = await harness.control("turn.follow_up", { text: "shared sibling" });
+			expect(followUpB.ok).toBe(true);
+			expect(followUpC.ok).toBe(true);
+			targetIds = { commandId: followUpB.result?.commandId, turnId: followUpB.result?.turnId };
+			siblingIds = { commandId: followUpC.result?.commandId, turnId: followUpC.result?.turnId };
+			promptDeadlineMs = 100;
+			promotedB?.({ startsOwnRun: true });
+			promptDeadlineMs = 600_000;
+			promotedC?.({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			expect(await settledStatus(harness, "turn.prompt_status", targetIds)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(abortCalls).toBe(1);
+			expect(correlatedFrames(harness, targetIds).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, targetIds).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+			expect(correlatedFrames(harness, siblingIds).filter(frame => frame.kind === "agent_end")).toHaveLength(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
