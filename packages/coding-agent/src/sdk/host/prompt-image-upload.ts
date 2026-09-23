@@ -26,6 +26,7 @@ type Upload = {
 	chunks: Buffer[];
 	length: number;
 	sequence: number;
+	finishing: boolean;
 	finished: boolean;
 	timer: ReturnType<typeof setTimeout>;
 };
@@ -84,6 +85,7 @@ export class PromptImageUploadStore {
 			chunks: [],
 			length: 0,
 			sequence: 0,
+			finishing: false,
 			finished: false,
 			timer,
 		});
@@ -96,7 +98,7 @@ export class PromptImageUploadStore {
 	): { id: string; nextSequence: number; receivedBytes: number } {
 		const input = object(value, ["id", "sequence", "data"]);
 		const upload = this.#owned(connectionId, input.id);
-		if (upload.finished) invalid("Image upload is already finished.");
+		if (upload.finishing || upload.finished) invalid("Image upload is already finishing or finished.");
 		if (!Number.isSafeInteger(input.sequence) || input.sequence !== upload.sequence)
 			invalid("Image chunk sequence is out of order.");
 		if (
@@ -129,36 +131,42 @@ export class PromptImageUploadStore {
 	): Promise<{ id: string; byteLength: number; sha256: string; mimeType: string }> {
 		const input = object(value, ["id"]);
 		const upload = this.#owned(connectionId, input.id);
-		if (upload.finished) invalid("Image upload is already finished.");
+		if (upload.finishing || upload.finished) invalid("Image upload is already finishing or finished.");
 		if (upload.length !== upload.byteLength) invalid("Image upload is incomplete.");
-		const bytes = Buffer.concat(upload.chunks, upload.length);
-		if (crypto.createHash("sha256").update(bytes).digest("hex") !== upload.sha256)
-			invalid("Image SHA-256 digest mismatch.");
-		const metadata = parseImageMetadata(bytes);
-		if (
-			!metadata ||
-			metadata.mimeType !== upload.mimeType ||
-			!metadata.width ||
-			!metadata.height ||
-			metadata.width > MAX_PASTED_IMAGE_DIMENSION ||
-			metadata.height > MAX_PASTED_IMAGE_DIMENSION ||
-			metadata.width * metadata.height > MAX_PASTED_IMAGE_PIXELS
-		)
-			invalid("Image MIME type, structure or dimensions are invalid.");
+		// Reserve the lease synchronously: host controls are dispatched concurrently.
+		upload.finishing = true;
 		try {
-			const decoded = await new Bun.Image(bytes).metadata();
-			if (decoded.width !== metadata.width || decoded.height !== metadata.height)
-				invalid("Image dimensions do not match decoded data.");
-			await new Bun.Image(bytes).resize(1, 1).png().bytes();
-		} catch {
-			invalid("Image cannot be decoded.");
+			const bytes = Buffer.concat(upload.chunks, upload.length);
+			if (crypto.createHash("sha256").update(bytes).digest("hex") !== upload.sha256)
+				invalid("Image SHA-256 digest mismatch.");
+			const metadata = parseImageMetadata(bytes);
+			if (
+				!metadata ||
+				metadata.mimeType !== upload.mimeType ||
+				!metadata.width ||
+				!metadata.height ||
+				metadata.width > MAX_PASTED_IMAGE_DIMENSION ||
+				metadata.height > MAX_PASTED_IMAGE_DIMENSION ||
+				metadata.width * metadata.height > MAX_PASTED_IMAGE_PIXELS
+			)
+				invalid("Image MIME type, structure or dimensions are invalid.");
+			try {
+				const decoded = await new Bun.Image(bytes).metadata();
+				if (decoded.width !== metadata.width || decoded.height !== metadata.height)
+					invalid("Image dimensions do not match decoded data.");
+				await new Bun.Image(bytes).resize(1, 1).png().bytes();
+			} catch {
+				invalid("Image cannot be decoded.");
+			}
+			// The transport can disconnect while decoding. A removed lease cannot be resurrected.
+			if (this.#uploads.get(input.id as string) !== upload)
+				throw new TypedControlError("resource_gone", "Image upload expired.");
+			upload.chunks = [bytes];
+			upload.finished = true;
+			return { id: input.id as string, byteLength: upload.length, sha256: upload.sha256, mimeType: upload.mimeType };
+		} finally {
+			upload.finishing = false;
 		}
-		// The transport can disconnect while decoding. A removed lease cannot be resurrected.
-		if (this.#uploads.get(input.id as string) !== upload)
-			throw new TypedControlError("resource_gone", "Image upload expired.");
-		upload.chunks = [bytes];
-		upload.finished = true;
-		return { id: input.id as string, byteLength: upload.length, sha256: upload.sha256, mimeType: upload.mimeType };
 	}
 
 	discard(connectionId: string | undefined, value: unknown): { discarded: true } {

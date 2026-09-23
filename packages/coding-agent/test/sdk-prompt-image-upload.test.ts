@@ -87,6 +87,37 @@ test("a valid original image larger than 256 KiB survives chunk upload and host 
 	}
 });
 
+test("concurrent finishes validate one lease only once and reject appends during finalization", async () => {
+	const bytes = originalLargePng();
+	const store = new PromptImageUploadStore();
+	try {
+		const { id } = store.begin("sender", descriptor(bytes));
+		for (let offset = 0, sequence = 0; offset < bytes.length; offset += 96 * 1024, sequence++)
+			store.append("sender", {
+				id,
+				sequence,
+				data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+			});
+		const attempts = Array.from({ length: 8 }, () => store.finish("sender", { id }));
+		const settled = Promise.allSettled(attempts);
+		expect(() => store.append("sender", { id, sequence: 4, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "invalid_input" }),
+		);
+		const outcomes = await settled;
+		expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
+		for (const outcome of outcomes)
+			if (outcome.status === "rejected") expect(outcome.reason).toMatchObject({ code: "invalid_input" });
+		const accepted = store.redeem("sender", [{ id }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		store.close();
+	}
+});
+
 test("upload chunks reject out-of-order, duplicate, noncanonical, cross-connection and bad-digest inputs", async () => {
 	const bytes = originalLargePng();
 	const store = new PromptImageUploadStore();
