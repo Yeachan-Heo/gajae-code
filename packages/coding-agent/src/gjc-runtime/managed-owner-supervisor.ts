@@ -465,10 +465,10 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 	let childStartTime = await managedOwnerProcessProvenance(child.pid);
 	while (!childStartTime && !childExited) {
 		await Promise.race([childExitPromise, Bun.sleep(20)]);
-		if (!childExited && sigtermPending) childStartTime = await managedOwnerProcessProvenance(child.pid);
+		if (!childExited) childStartTime = await managedOwnerProcessProvenance(child.pid);
 	}
-	process.removeListener("SIGTERM", relayUnprovenSigterm);
 	if (!childStartTime) {
+		process.removeListener("SIGTERM", relayUnprovenSigterm);
 		const exitCode = await childExitPromise;
 		const stagedJournal = await recordStagedTerminal(
 			stateDir,
@@ -507,6 +507,7 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 	const childProcess =
 		nativeReferenceStartTime === childStartTime ? nativeProcessBindings().Process.fromPid(nativeReferencePid) : null;
 	if (!childProcess) {
+		process.removeListener("SIGTERM", relayUnprovenSigterm);
 		const exitCode = await child.exited;
 		const stagedJournal = await recordStagedTerminal(
 			stateDir,
@@ -567,14 +568,17 @@ export async function runManagedOwnerSupervisor(options: { requireAuthority?: bo
 		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
-	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
+	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`) {
+		process.removeListener("SIGTERM", relayUnprovenSigterm);
 		throw new Error("managed_owner_child_incarnation_mismatch");
+	}
 	const relaySigterm = () => {
 		relayAuthorizedSigterm(() => childProcess.signalRoot(15));
 	};
 	sigtermPending ||= bootstrapSigtermPending;
 	process.removeListener("SIGTERM", captureBootstrapSigterm);
 	process.on("SIGTERM", relaySigterm);
+	process.removeListener("SIGTERM", relayUnprovenSigterm);
 	if (sigtermPending) relaySigterm();
 	const exitCode = await childExitPromise;
 	process.removeListener("SIGTERM", relaySigterm);

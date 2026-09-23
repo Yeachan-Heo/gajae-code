@@ -3004,10 +3004,14 @@ fn open_portable_unix_root(path: &std::path::Path) -> Result<std::fs::File, Stri
 	if !path.is_absolute() {
 		return Err("invalid_path".to_owned());
 	}
-	// Walk from the real filesystem root so every ancestor is checked and opened without
-	// following symlinks. O_NOFOLLOW on the final pathname alone would still permit a
-	// symlinked state or session directory to redirect this authority.
-	let mut fd = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
+	// Walk from the real filesystem root so every ancestor is checked and opened
+	// without following symlinks. O_NOFOLLOW on the final pathname alone would
+	// still permit a symlinked state or session directory to redirect this
+	// authority.
+	// SAFETY: the root path is a static NUL-terminated string; the returned fd is
+	// owned here.
+	let mut fd =
+		unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
 	if fd < 0 {
 		return Err("io_error".to_owned());
 	}
@@ -3016,42 +3020,49 @@ fn open_portable_unix_root(path: &std::path::Path) -> Result<std::fs::File, Stri
 			if matches!(component, Component::RootDir) {
 				continue;
 			}
+			// SAFETY: fd is the descriptor owned by this traversal.
 			unsafe { libc::close(fd) };
 			return Err("invalid_path".to_owned());
 		};
 		let name = CString::new(name.as_bytes()).map_err(|_| {
+			// SAFETY: fd is the descriptor owned by this traversal.
 			unsafe { libc::close(fd) };
 			"invalid_path".to_owned()
 		})?;
+		// SAFETY: zeroed stat is initialized by fstatat before any fields are read.
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: fd is open, name is NUL-terminated, and named is writable.
 		if unsafe { libc::fstatat(fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) } != 0
 			|| named.st_mode & libc::S_IFMT != libc::S_IFDIR
 		{
+			// SAFETY: fd is the descriptor owned by this traversal.
 			unsafe { libc::close(fd) };
 			return Err("untrusted_root".to_owned());
 		}
+		// SAFETY: fd is open and name is NUL-terminated; next is owned on success.
 		let next = unsafe {
-			libc::openat(
-				fd,
-				name.as_ptr(),
-				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-			)
+			libc::openat(fd, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
 		};
+		// SAFETY: fd is no longer needed after opening the next component.
 		unsafe { libc::close(fd) };
 		if next < 0 {
 			return Err("untrusted_root".to_owned());
 		}
+		// SAFETY: zeroed stat is initialized by fstat before any fields are read.
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: next is open and opened is writable.
 		if unsafe { libc::fstat(next, &mut opened) } != 0
 			|| opened.st_mode & libc::S_IFMT != libc::S_IFDIR
 			|| opened.st_dev != named.st_dev
 			|| opened.st_ino != named.st_ino
 		{
+			// SAFETY: next is an owned descriptor not transferred into fd.
 			unsafe { libc::close(next) };
 			return Err("untrusted_root".to_owned());
 		}
 		fd = next;
 	}
+	// SAFETY: fd is owned by this traversal and transferred exactly once into File.
 	Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 

@@ -45,18 +45,27 @@ function startSupervisor(
 	env: Record<string, string> = {},
 	options: {
 		forceMissingChildStartMarker?: string;
+		transientMissingChildStartMarker?: string;
 		forceMissingNativeReferenceMarker?: string;
+		signalDuringNativeReferenceReadMarker?: string;
+		signalDuringNativeReferenceReadReadyMarker?: string;
 		generation?: string;
 		internalEntry?: boolean;
 	} = {},
 ) {
 	const forcedMissingPidRead = options.forceMissingChildStartMarker
-		? `if (pidReads === 1) { appendFileSync(${JSON.stringify(options.forceMissingChildStartMarker)}, "forced-missing-child-start:" + actualPid + "\\n"); return 2_000_000_000; }`
-		: options.forceMissingNativeReferenceMarker
-			? `if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; }`
-			: "";
-	const script = forcedMissingPidRead
-		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${forcedMissingPidRead} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""}); } finally { Bun.spawn = originalSpawn; }`
+		? `if (pidReads >= 1) { if (pidReads === 1) appendFileSync(${JSON.stringify(options.forceMissingChildStartMarker)}, "forced-missing-child-start:" + actualPid + "\\n"); return 2_000_000_000; }`
+		: options.transientMissingChildStartMarker
+			? `if (pidReads === 1) { appendFileSync(${JSON.stringify(options.transientMissingChildStartMarker)}, "forced-missing-child-start:" + actualPid + "\\n"); return 2_000_000_000; }`
+			: options.forceMissingNativeReferenceMarker
+				? `if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; }`
+				: "";
+	const signalDuringNativeReferenceRead = options.signalDuringNativeReferenceReadMarker
+		? `if (pidReads === 2) { ${options.signalDuringNativeReferenceReadReadyMarker ? `const readyDeadline = Date.now() + 5_000; while (!existsSync(${JSON.stringify(options.signalDuringNativeReferenceReadReadyMarker)})) { if (Date.now() >= readyDeadline) throw new Error("managed_owner_test_child_ready_timeout"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1); }` : ""} appendFileSync(${JSON.stringify(options.signalDuringNativeReferenceReadMarker)}, "native-reference-read\\n"); process.nextTick(() => process.kill(process.pid, "SIGTERM")); }`
+		: "";
+	const pidReadHooks = [forcedMissingPidRead, signalDuringNativeReferenceRead].filter(Boolean).join(" ");
+	const script = pidReadHooks
+		? `const { appendFileSync, existsSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${pidReadHooks} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""}); } finally { Bun.spawn = originalSpawn; }`
 		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""});`;
 	return Bun.spawn({
 		cmd: [process.execPath, "-e", script, ...(options.internalEntry ? ["--internal-managed-owner-supervisor"] : [])],
@@ -81,7 +90,10 @@ async function runSupervisor(
 	env: Record<string, string> = {},
 	options: {
 		forceMissingChildStartMarker?: string;
+		transientMissingChildStartMarker?: string;
 		forceMissingNativeReferenceMarker?: string;
+		signalDuringNativeReferenceReadMarker?: string;
+		signalDuringNativeReferenceReadReadyMarker?: string;
 		generation?: string;
 	} = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -459,6 +471,32 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("recovers transient child provenance while the child remains alive", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const markerFile = path.join(stateDir, "forced-missing-child-start.marker");
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "setTimeout(() => process.exit(0), 250)"],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+				{ transientMissingChildStartMarker: markerFile },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+			expect(await fs.readFile(markerFile, "utf8")).toMatch(/^forced-missing-child-start:\d+\n$/);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).verdictFile).json()).toMatchObject({
+				signal: "EXIT",
+				exit_code: 0,
+				result: "cleanup",
+				classification: "non_operator_cleanup",
+			});
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 
 	it("forwards an early SIGTERM while child provenance is transiently unavailable", async () => {
 		if (process.platform !== "linux") return;
@@ -476,11 +514,63 @@ describe("managed owner supervisor", () => {
 				stateDir,
 				[process.execPath, "-e", childScript],
 				{},
-				{ forceMissingChildStartMarker: forcedMissingChildStart },
+				{ transientMissingChildStartMarker: forcedMissingChildStart },
 			);
 			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
 			expect(await fs.readFile(forcedMissingChildStart, "utf8")).toMatch(/^forced-missing-child-start:\d+\n$/);
 			expect(await fs.readFile(forwardedSignal, "utf8")).toBe("forwarded\n");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("forwards and records SIGTERM during asynchronous child provenance confirmation", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const forwardedSignal = path.join(stateDir, "forwarded-sigterm.marker");
+		const provenanceRead = path.join(stateDir, "native-reference-read.marker");
+		const childReady = path.join(stateDir, "child-ready.marker");
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			await createOwnerIntent(stateDir, {
+				generation,
+				session_id: sessionId,
+				server_key: "server-key",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "provenance-reread-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 60_000).toISOString(),
+			});
+			const childScript = `import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => {
+	writeFileSync(${JSON.stringify(forwardedSignal)}, "forwarded\\n");
+	process.exit(0);
+});
+writeFileSync(${JSON.stringify(childReady)}, "ready\\n");
+setInterval(() => {}, 1_000);`;
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", childScript],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+				{
+					signalDuringNativeReferenceReadMarker: provenanceRead,
+					signalDuringNativeReferenceReadReadyMarker: childReady,
+				},
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+			expect(await fs.readFile(provenanceRead, "utf8")).toBe("native-reference-read\n");
+			expect(await fs.readFile(forwardedSignal, "utf8")).toBe("forwarded\n");
+			const verdict = await Bun.file(lifecyclePaths(stateDir, sessionId, generation).verdictFile).json();
+			expect(verdict).toMatchObject({
+				signal: "SIGTERM",
+				result: "owner_term_then_session_cleanup",
+				classification: "expected_operator_shutdown",
+			});
+			expect(verdict.intent_id).toBeString();
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
