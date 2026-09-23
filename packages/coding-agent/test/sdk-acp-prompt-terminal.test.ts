@@ -12,6 +12,7 @@ import { AcpAgent, acpRequestFailure } from "../src/modes/acp/acp-agent";
 import { AcpSdkAdapter } from "../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SdkClientError } from "../src/sdk/client";
+import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -64,6 +65,8 @@ type Fixture = {
 	rebindSession(): Promise<void>;
 	mutationInputs: Record<string, unknown>[];
 	recoveryInputs: Record<string, unknown>[];
+	imageUploadIds: string[];
+	redeemedImages: Buffer[];
 	releaseRecoveryResult(result: unknown): void;
 	releaseRecoveryAcknowledgement(result: Record<string, unknown>, index?: number): void;
 };
@@ -126,6 +129,7 @@ async function createFixture(
 		uncertainPromptAcknowledgement?: boolean;
 		deferRecoveryAcknowledgement?: boolean;
 		retainRecoveryQuery?: boolean;
+		acceptStagedImages?: boolean;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -140,6 +144,9 @@ async function createFixture(
 	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const mutationInputs: Record<string, unknown>[] = [];
 	const recoveryInputs: Record<string, unknown>[] = [];
+	const imageUploadIds: string[] = [];
+	const redeemedImages: Buffer[] = [];
+	const imageUploads = options.acceptStagedImages ? new PromptImageUploadStore() : undefined;
 	let recoveryQuery: { socket: TestSocket; id: unknown } | undefined;
 	const recoveryAcknowledgements: Array<{ socket: TestSocket; id: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
@@ -351,7 +358,54 @@ async function createFixture(
 					return;
 				}
 				if (frame.type !== "control_request") return;
+				if (typeof frame.operation === "string" && frame.operation.startsWith("turn.image.") && imageUploads) {
+					void (async () => {
+						try {
+							const owner = "sdk-acp-prompt-terminal";
+							const result =
+								frame.operation === "turn.image.begin"
+									? imageUploads.begin(owner, frame.input)
+									: frame.operation === "turn.image.append"
+										? imageUploads.append(owner, frame.input)
+										: frame.operation === "turn.image.finish"
+											? await imageUploads.finish(owner, frame.input)
+											: imageUploads.discard(owner, frame.input);
+							if (frame.operation === "turn.image.begin") imageUploadIds.push((result as { id: string }).id);
+							socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+						}
+					})();
+					return;
+				}
 				if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
+					const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> }).stagedImages;
+					if (stagedImages && imageUploads) {
+						try {
+							const reservation = imageUploads.redeem("sdk-acp-prompt-terminal", stagedImages);
+							for (const image of reservation.images) redeemedImages.push(Buffer.from(image.data, "base64"));
+							reservation.release();
+						} catch (error) {
+							const failure = error as Error & { code?: string };
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: false,
+									error: { code: failure.code ?? "internal", message: failure.message },
+								}),
+							);
+							return;
+						}
+					}
 					promptSocket = socket;
 					promptDeliveries++;
 					mutationInputs.push(frame.input as Record<string, unknown>);
@@ -589,6 +643,8 @@ async function createFixture(
 		queryCalls,
 		mutationInputs,
 		recoveryInputs,
+		imageUploadIds,
+		redeemedImages,
 		releaseRecoveryResult: result => {
 			if (!recoveryQuery) throw new Error("Expected retained recovery query");
 			recoveryQuery.socket.send(JSON.stringify({ type: "query_response", id: recoveryQuery.id, ok: true, result }));
@@ -631,6 +687,7 @@ async function createFixture(
 			agentMessageUpdateRelease.resolve();
 			failureDiagnosticRelease.resolve();
 			abort.abort();
+			imageUploads?.close();
 			server.stop(true);
 			tempDir.removeSync();
 		},
@@ -642,6 +699,14 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 		sessionId: fixture.sessionId,
 		messageId: "00000000-0000-4000-8000-000000000001",
 		prompt: [{ type: "text", text }],
+	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+}
+
+function imagePrompt(fixture: Fixture, bytes: Buffer): Promise<{ stopReason: StoppedReason }> {
+	return fixture.agent.prompt({
+		sessionId: fixture.sessionId,
+		messageId: "00000000-0000-4000-8000-000000000001",
+		prompt: [{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }],
 	} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
 }
 
@@ -873,6 +938,43 @@ test("ACP retries a first-turn prompt_failed after the turn started, then recove
 		// The retry lands on a host that has finished coming up and completes normally.
 		fixture.sendStopped("end_turn");
 		expect(await bounded(pending, "first-turn retry recovery")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP restages original large image with fresh refs after confirmed first-turn readiness failure", async () => {
+	const fixture = await createFixture({ acceptStagedImages: true, controlledRetryBackoff: true });
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const pending = imagePrompt(fixture, bytes);
+		await bounded(fixture.promptDelivered, "first image prompt delivery");
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		fixture.sendTerminal({
+			type: "agent_start",
+			sessionId: fixture.sessionId,
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+		});
+		fixture.sendReadinessFailure();
+		await bounded(fixture.retryBackoffScheduled, "confirmed image retry backoff");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.fireRetryBackoff();
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "restaged image prompt delivery");
+		expect(fixture.imageUploadIds).toHaveLength(2);
+		expect(new Set(fixture.imageUploadIds).size).toBe(2);
+		expect(fixture.redeemedImages).toEqual([bytes, bytes]);
+		expect(fixture.mutationInputs.map(input => input.stagedImages)).toEqual(
+			fixture.imageUploadIds.map(id => [{ id }]),
+		);
+		expect(new Set(fixture.mutationInputs.map(input => input.clientRef)).size).toBe(2);
+		expect(fixture.updates.filter(update => update.update.sessionUpdate === "user_message_chunk")).toHaveLength(1);
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "confirmed large-image retry completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		fixture.dispose();
 	}
@@ -3017,7 +3119,7 @@ test("ACP activity idle alone does not settle a prompt", async () => {
 async function createRecoveryFixture(
 	acknowledgement: "held" | "rejected" | "accepted",
 	blockedAgentMessageText?: string,
-	options: { controlledRetryBackoff?: boolean } = {},
+	options: { controlledRetryBackoff?: boolean; acceptStagedImages?: boolean } = {},
 ): Promise<Fixture & { notify(code?: string): void }> {
 	let notify: ((error: SdkClientError) => void) | undefined;
 	const original = AcpSdkAdapter.prototype.onReconnectFailed;
@@ -3036,6 +3138,7 @@ async function createRecoveryFixture(
 			blockedAgentMessageText,
 			cancelSettlementGraceMs: 25,
 			controlledRetryBackoff: options.controlledRetryBackoff,
+			acceptStagedImages: options.acceptStagedImages,
 		});
 		const callback = notify;
 		if (!callback) throw new Error("Expected session reconnect failure subscription");
@@ -3196,6 +3299,34 @@ test("ACP refreshes a stale Router attachment before retained recovery without r
 				update.update.content.text === "retained report",
 		);
 		expect(retainedChunks).toHaveLength(1);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP never replays a large image after uncertain acknowledgement and attachment replacement", async () => {
+	const fixture = await createRecoveryFixture("rejected", undefined, { acceptStagedImages: true });
+	try {
+		const bytes = Buffer.from(
+			await Bun.file(path.join(import.meta.dir, "fixtures/sdk-inline-image-large.png")).arrayBuffer(),
+		);
+		expect(bytes.length).toBeGreaterThan(256 * 1024);
+		const pending = imagePrompt(fixture, bytes);
+		void pending.catch(() => undefined);
+		await bounded(fixture.promptDelivered, "uncertain image delivery");
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		expect(fixture.redeemedImages).toEqual([bytes]);
+		await fixture.rebindSession();
+		fixture.notify("uncertain_after_send");
+		await waitFor(() => fixture.recoveryInputs.length === 1, "uncertain image reconciliation");
+		expect(fixture.recoveryInputs[0]).toEqual({ kind: "prompt", clientRef: fixture.mutationInputs[0]?.clientRef });
+		fixture.releaseRecoveryResult({ ...retainedTerminal(fixture), status: "unknown" });
+		await expect(bounded(pending, "uncertain image refusal")).rejects.toMatchObject({ code: "terminal_uncertain" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		expect(fixture.imageUploadIds).toHaveLength(1);
+		await expect(prompt(fixture, "must not replay image after unknown outcome")).rejects.toMatchObject({
+			code: "not_found",
+		});
 	} finally {
 		fixture.dispose();
 	}
