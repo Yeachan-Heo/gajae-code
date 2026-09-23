@@ -3469,6 +3469,7 @@ export class AgentSession {
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 		this.#codexCredentialModelUnavailableRetried = false;
 	}
 
@@ -3508,6 +3509,7 @@ export class AgentSession {
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#providerRetryMaxAttempts: number | undefined;
+	#managedFallbackProviderAttemptCount = 0;
 	/** One content-free retry is allowed after Codex says the active account lacks the model. */
 	#codexCredentialModelUnavailableRetried = false;
 	#retryAttempt = 0;
@@ -7905,6 +7907,7 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
+					this.#managedFallbackProviderAttemptCount = 0;
 				}
 			}
 
@@ -23045,6 +23048,7 @@ export class AgentSession {
 			fallbackManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
+				this.#managedFallbackProviderAttemptCount++;
 				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
 			},
 			onManagedAttemptAccepted: () => {
@@ -23974,8 +23978,11 @@ export class AgentSession {
 				: false;
 		}
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const providerAttemptsUsed = managedFallback
+			? Math.max(this.#managedFallbackProviderAttemptCount, controller.attemptsUsed || 1)
+			: attemptsUsed;
 		const providerRetryCeilingReached =
-			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
+			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
 		// Credential rotation: a content-free quota/rate-limit failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark it before managed fallback
@@ -24052,7 +24059,13 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (managedFallback) {
+		if (managedFallback && quotaCredentialMark === "rotated") {
+			// A credential retry is a separate dimension from model fallback
+			// attempts. Leave the controller on the current entry and refund its
+			// provisional request charge so every same-kind account is tried first.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (managedFallback) {
 			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
@@ -24102,18 +24115,19 @@ export class AgentSession {
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
 		if (credentialRotated) {
-			// A rotation only becomes a same-model retry if the controller can
-			// actually be rewound. `restorePreviousEntryForRetry()` refuses once an
-			// entry's restore budget is consumed or attempts are exhausted; ignoring
-			// that would force `outcome = "retry"` while `activeIndex` stays on the
-			// next entry and `this.model` stays on the previous one — splitting
-			// attempt attribution, exhaustion, and sticky selection across two models.
-			if (!managedFallback || controller.restorePreviousEntryForRetry()) {
+			// Do not rewind when the controller already chose retry: it still points
+			// at the current model. Rewind only after an actual model advance.
+			if (
+				!managedFallback ||
+				outcome === "retry" ||
+				(outcome === "advance" && controller.restorePreviousEntryForRetry())
+			) {
 				outcome = "retry";
 			}
 		}
 		if (outcome === "advance") {
 			this.#providerRetryMaxAttempts = undefined;
+			this.#managedFallbackProviderAttemptCount = 0;
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
@@ -24591,6 +24605,7 @@ export class AgentSession {
 			if (!this.#isInterruptedRetryTail(lastMsg)) return false;
 			this.#retryAttempt = 0;
 			this.#providerRetryMaxAttempts = undefined;
+			this.#managedFallbackProviderAttemptCount = 0;
 			this.#scheduleAgentContinue({ delayMs: 1 });
 			return true;
 		}
@@ -24610,6 +24625,7 @@ export class AgentSession {
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
 		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 
 		// Re-attempt the turn
 		this.#scheduleAgentContinue({ delayMs: 1 });
