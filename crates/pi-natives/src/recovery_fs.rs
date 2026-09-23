@@ -3397,37 +3397,38 @@ fn reap_managed_recovery_with_limits(
 			..RecoveryReaperMetrics::default()
 		});
 	};
-	let RecoveryReaperCursor {
-		name: cursor_name,
-		file: mut cursor_file,
-		cookie: mut directory_cookie,
-		directory_identity,
-	} = match open_reaper_cursor(recovery) {
-		Ok(cursor) => cursor,
+	let cursor = open_reaper_cursor(recovery);
+	let (mut directory_cookie, mut cursor_state, cursor_open_failed) = match cursor {
+		Ok(cursor) => {
+			let RecoveryReaperCursor { name, file, cookie, directory_identity } = cursor;
+			(cookie, Some((name, file, directory_identity)), false)
+		},
 		Err("cursor_locked") => {
 			return record_reaper_metrics(&mut state, RecoveryReaperMetrics {
 				scan_limited: true,
 				..RecoveryReaperMetrics::default()
 			});
 		},
-		Err(_) => {
-			return record_reaper_metrics(&mut state, RecoveryReaperMetrics {
-				failures: 1,
-				..RecoveryReaperMetrics::default()
-			});
-		},
+		Err(_) => (0, None, true),
 	};
-	let metrics = reap_managed_recovery_at_with_cursor(
+	let mut metrics = reap_managed_recovery_at_with_cursor(
 		recovery,
 		unix_now.as_secs(),
 		&mut directory_cookie,
 		max_scan_entries,
 		max_bytes,
-		|cookie| {
-			write_reaper_cursor(recovery, &cursor_name, &mut cursor_file, directory_identity, cookie)
+		|cookie| match cursor_state.as_mut() {
+			Some((name, file, directory_identity)) => {
+				write_reaper_cursor(recovery, name, file, *directory_identity, cookie)
+			},
+			None => Ok(()),
 		},
 		process_is_dead,
 	);
+	if cursor_open_failed {
+		metrics.failures = metrics.failures.saturating_add(1);
+		metrics.scan_limited = true;
+	}
 	record_reaper_metrics(&mut state, metrics)
 }
 
@@ -3932,7 +3933,7 @@ fn reap_managed_recovery_at_with_cursor(
 	}
 	if persist_cookie(*directory_cookie).is_err() {
 		metrics.failures = metrics.failures.saturating_add(1);
-		return metrics;
+		metrics.scan_limited = true;
 	}
 	let mut bytes_left = max_bytes;
 	for (name, candidate) in candidates {
@@ -5643,6 +5644,68 @@ mod tests {
 		assert_eq!(metrics.preserved_candidates, 1);
 		assert!(metrics.scan_limited);
 		assert!(temporary.0.join(name).exists());
+	}
+
+	#[test]
+	fn reaper_processes_scanned_candidates_when_persisting_cursor_fails() {
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let now = unix_now_secs();
+		let expired = now - RECOVERY_REAPER_REMOVE_TTL_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS;
+		let name = recovery_name(".gjc-managed-remove", 919, 1, expired);
+		write_reaper_file(&temporary.0, &name, b"expired", 0o600);
+
+		let mut cookie = 0;
+		let metrics = reap_managed_recovery_at_with_cursor(
+			&directory,
+			now,
+			&mut cookie,
+			8,
+			1024,
+			|_| Err("fsync_failed"),
+			|_| true,
+		);
+
+		assert_eq!(metrics.reaped_files, 1);
+		assert_eq!(metrics.reaped_bytes, b"expired".len() as u64);
+		assert_eq!(metrics.failures, 1);
+		assert!(metrics.scan_limited);
+		assert!(!temporary.0.join(name).exists());
+	}
+
+	#[test]
+	fn reaper_falls_back_to_a_bounded_scan_when_cursor_open_is_unsafe() {
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let target_name = "cursor-target";
+		let cursor_name =
+			std::str::from_utf8(RECOVERY_REAPER_CURSOR_NAME).expect("cursor name is valid UTF-8");
+		write_reaper_file(&temporary.0, target_name, b"untouched target", 0o600);
+		std::os::unix::fs::symlink(target_name, temporary.0.join(cursor_name))
+			.expect("create unsafe cursor marker");
+		let now = unix_now_secs();
+		let expired = now - RECOVERY_REAPER_REMOVE_TTL_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS;
+		let name = recovery_name(".gjc-managed-remove", 920, 1, expired);
+		write_reaper_file(&temporary.0, &name, b"expired", 0o600);
+		let state = Arc::new(Mutex::new(RecoveryReaperState::default()));
+
+		let metrics = reap_managed_recovery_with_limits(&directory, &state, true, 8, 1024, |_| true);
+
+		assert_eq!(metrics.reaped_files, 1);
+		assert_eq!(metrics.reaped_bytes, b"expired".len() as u64);
+		assert_eq!(metrics.failures, 1);
+		assert!(metrics.scan_limited);
+		assert!(!temporary.0.join(name).exists());
+		assert!(
+			fs::symlink_metadata(temporary.0.join(cursor_name))
+				.expect("cursor marker remains a symlink")
+				.file_type()
+				.is_symlink()
+		);
+		assert_eq!(
+			fs::read(temporary.0.join(target_name)).expect("cursor target remains untouched"),
+			b"untouched target",
+		);
 	}
 
 	#[test]
