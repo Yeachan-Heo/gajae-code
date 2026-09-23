@@ -151,6 +151,8 @@ export interface BrokerSettings {
 	 * value its launcher decided, with no cast/assumed tag in between.
 	 */
 	restartRequestId?: string;
+	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
+	startupPrePublicationDelayMs?: number;
 	/** Test-only delay after publication to exercise signal handoff ordering. */
 	startupPostPublicationDelayMs?: number;
 }
@@ -1490,6 +1492,7 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#startupPrePublicationDelayMs: number;
 	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
@@ -1524,6 +1527,12 @@ export class Broker {
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#startupPrePublicationDelayMs =
+			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
+			(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPrePublicationDelayMs as number)
+				: 0;
 		this.#startupPostPublicationDelayMs =
 			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
 			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
@@ -3830,6 +3839,7 @@ export class Broker {
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
 			await this.#checkpointSessionHeartbeats();
+			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
@@ -3871,7 +3881,12 @@ export class Broker {
 		}
 	}
 	get ownsDiscovery(): boolean {
-		return this.discovery?.ownerId === this.#owner;
+		// A cached discovery record is not ownership proof until its retained publication is healthy.
+		return (
+			this.#publication !== null &&
+			this.#publicationState === "healthy-owned" &&
+			this.discovery?.ownerId === this.#owner
+		);
 	}
 	get completion(): Promise<void> {
 		return this.#completion;
@@ -4181,8 +4196,12 @@ export class Broker {
 			let recordPersisted = recordPersistedSynchronously;
 			if (!recordPersisted) {
 				const recordWrite = Promise.withResolvers<boolean>();
-				const recordWriteTimer = setTimeout(() => recordWrite.resolve(false), BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
-				void writeBrokerExitRecord(this.settings.agentDir, exitRecord).then(
+				const recordWriteController = new AbortController();
+				const recordWriteTimer = setTimeout(() => {
+					recordWriteController.abort();
+					recordWrite.resolve(false);
+				}, BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
+				void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
 					() => recordWrite.resolve(true),
 					() => recordWrite.resolve(false),
 				);

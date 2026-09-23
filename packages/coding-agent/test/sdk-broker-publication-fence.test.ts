@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Broker, setAmbiguityGraceForTest, setPublicationObservationForTest } from "../src/sdk/broker/broker";
-import { readBrokerExitRecord } from "../src/sdk/broker/broker-exit";
+import { readBrokerExitRecord, writeBrokerExitRecord } from "../src/sdk/broker/broker-exit";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so the fence advances
 // in tens of milliseconds instead of the production five-second cadence.
@@ -22,6 +22,31 @@ async function startBroker(): Promise<Broker> {
 	await broker.start();
 	return broker;
 }
+
+test("cached discovery is not owned until its publication is retained", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-fence-unpublished-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({
+		agentDir,
+		heartbeatTtlMs: HEARTBEAT_TTL_MS,
+		startupPrePublicationDelayMs: 500,
+	});
+	brokers.push(broker);
+	const starting = broker.start();
+	try {
+		for (let attempt = 0; broker.discovery === null && attempt < 200; attempt++) await Bun.sleep(5);
+		expect(broker.discovery).not.toBeNull();
+		expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(false);
+		expect(broker.ownsDiscovery).toBe(false);
+
+		await starting;
+		expect(broker.ownsDiscovery).toBe(true);
+	} catch (error) {
+		await starting.catch(() => {});
+		throw error;
+	}
+});
 
 /** Resolves to true when the broker self-terminated inside the window. */
 function completedWithin(broker: Broker, ms: number): Promise<boolean> {
@@ -117,6 +142,33 @@ test("a signal stop retains the signal as its structured exit reason", async () 
 	} finally {
 		info.mockRestore();
 	}
+});
+
+test("an aborted exit-record write cannot publish after its caller gives up", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exit-abort-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const controller = new AbortController();
+	const write = writeBrokerExitRecord(
+		agentDir,
+		{
+			version: 1,
+			mode: "owned-root",
+			reason: "shutdown-request",
+			fenceReason: null,
+			fencedForMs: 0,
+			uptimeMs: 1,
+			pid: process.pid,
+			signal: null,
+			writtenAt: Date.now(),
+		},
+		controller.signal,
+	);
+	controller.abort();
+
+	await expect(write).rejects.toThrow("write was aborted");
+	expect(await readBrokerExitRecord(agentDir)).toBeUndefined();
+	expect(await Bun.file(path.join(agentDir, "sdk", "broker.exit.json")).exists()).toBe(false);
 });
 
 test("transient ambiguity within the deadline does not terminate the broker", async () => {
