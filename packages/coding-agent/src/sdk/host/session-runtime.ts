@@ -4904,6 +4904,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				try {
 					const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 					const unrecorded = type === "agent_end" ? current.unrecordedFailureReasons?.get(reasonKey) : undefined;
+					const deferDeadlineTerminal =
+						type === "agent_end" &&
+						invocation.kind === "prompt" &&
+						current.deadlineManager.isExpiring(invocation.correlation);
 					if (type === "agent_end" && invocation.kind === "prompt")
 						current.deadlineManager.noteTerminalTransition(
 							invocation.correlation,
@@ -4915,6 +4919,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 										...(terminalOutcome?.kind === "stopped" ? { outcome: terminalOutcome } : {}),
 									} satisfies PromptTerminalTransitionEvidence)
 								: undefined,
+							deferDeadlineTerminal,
 						);
 					if (type === "agent_end") {
 						// Compound recovery (exact-head review P1): if this run's
@@ -4949,7 +4954,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 										? { outcome: terminalOutcome }
 										: {}),
 								};
-					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
+					// The deadline manager flushes only after the run and its tools settle;
+					// keep its durable pending marker until that flush completes.
+					if (!deferDeadlineTerminal)
+						await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
 					if ((type as string) === "agent_end") {
 						if (invocation.kind === "prompt" && !current.deadlineManager.isExpiring(invocation.correlation))
 							current.deadlineManager.clear(invocation.correlation);
@@ -5441,26 +5449,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (!owner) return "uncertain";
 				const target = lifecycleCorrelationKey(correlation);
 				const currentBatch = owner.openLifecycleBatches.find(batch => batch.epoch === owner.lifecycleEpoch);
-				const pending = owner.pending.some(entry => lifecycleCorrelationKey(entry.correlation) === target);
-				if (!currentBatch) return pending ? "idle" : "uncertain";
+				if (!currentBatch) return "uncertain";
 				const belongsToCurrentRun = [...currentBatch.invocations, ...currentBatch.attachedInvocations].some(
 					entry => lifecycleCorrelationKey(entry.correlation) === target,
 				);
-				if (!belongsToCurrentRun) {
-					return pending ? "idle" : "uncertain";
-				}
+				if (!belongsToCurrentRun) return "uncertain";
 
 				const seams = options.terminalAbortSeams;
 				const handle = seams?.getActivePromptHandle();
 				const epoch = seams?.getTerminalTurnEpoch();
-				if (!seams || !handle || epoch === undefined) return "uncertain";
-				if (seams.pendingToolExecutions !== undefined) {
-					await waitForToolCallBoundary({
-						pending: () => seams.pendingToolExecutions?.(handle) ?? [],
-						whenIdle: () => new Promise<void>(() => {}),
-						graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
-					});
-				}
+				if (!seams || !handle || epoch === undefined || !seams.pendingToolExecutions) return "uncertain";
+				await waitForToolCallBoundary({
+					pending: () => seams.pendingToolExecutions?.(handle) ?? [],
+					whenIdle: () => new Promise<void>(() => {}),
+					graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+				});
 				if (!isCurrent() || seams.getActivePromptHandle() !== handle || seams.getTerminalTurnEpoch() !== epoch)
 					return "uncertain";
 
@@ -5541,69 +5544,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					signal,
 				});
 			},
-			onExpired: (correlation, deadlineOutcome) => {
+			onExpired: correlation => {
 				const owner = lifecycleOwnerHolder.state;
-				if (deadlineOutcome === undefined) {
-					if (!owner) return;
-					removeLifecycleReferences(owner, correlation);
-					maybeRetireLifecycleOwner(owner);
-					return;
-				}
-				const failure = sanitizePromptFailure(
-					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
-				);
-				// The deadline publishes a failed/end PAIR and owns it atomically, so the
-				// boundary claim is taken once, here, covering both frames. Losing it means
-				// a real agent_end already reached the wire for this correlation: emit
-				// NEITHER frame, but still run the cleanup below, and still let #expire
-				// finish its durable reconciliation. Losing the boundary must not skip
-				// cleanup.
-				//
-				// Retained for the whole publication: this path owns the correlation from
-				// here, so a concurrent boundary must not evict its key mid-flight.
-				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
-				try {
-					if (claimTerminalBoundary(correlation)) {
-						// Each required frame is emitted INDEPENDENTLY (review P2): a throwing
-						// diagnostic must never suppress the boundary, which is the frame this
-						// path exists to deliver. Both failures are reported, never rethrown --
-						// the cleanup below still has to run.
-						try {
-							runtime.emitEvent({
-								type: "agent_failed",
-								sessionId,
-								...correlation,
-								error: failure,
-							});
-						} catch (error) {
-							logger.warn("sdk: deadline correlated diagnostic publication failed", {
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
-								error: sanitizePromptFailure(error),
-							});
-						}
-						try {
-							runtime.emitEvent({
-								type: "agent_end",
-								sessionId,
-								...correlation,
-								outcome: canonicalFailedOutcome(failure, "deadline"),
-							});
-						} catch (error) {
-							logger.error("sdk: deadline correlated boundary publication failed", {
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
-								error: sanitizePromptFailure(error),
-							});
-						}
-					}
-				} finally {
-					releaseTerminalRetention();
-				}
-				if (owner) {
-					removeLifecycleReferences(owner, correlation);
-					maybeRetireLifecycleOwner(owner);
-				}
+				if (!owner) return;
+				removeLifecycleReferences(owner, correlation);
+				maybeRetireLifecycleOwner(owner);
 			},
 		});
 		const pending: Array<{
