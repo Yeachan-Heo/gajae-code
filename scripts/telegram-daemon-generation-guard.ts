@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 51;
+export const GUARD_CONTRACT_VERSION = 52;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -528,13 +528,16 @@ export function validateCiInputs(input: {
 
 /**
  * Prove that a CI run operates on the exact, authoritative event revisions. The
- * event head SHA must match both the checked-out head and the fetched head-branch
- * ref, and the event base SHA must resolve to a real object in the authoritative
- * base repository. Pull requests intentionally prove only their immutable event
- * base object because the live ref can advance while queued; a workflow_dispatch
- * explicitly pins a live base ref and therefore proves that ref still resolves to
- * the requested base SHA. Repository/ref provenance and event ownership are
- * enforced via {@link validateCiInputs}.
+ * event head SHA must match the checked-out head. Pull requests and
+ * workflow_dispatch also require the fetched head-branch ref to match exactly;
+ * push runs accept a newer fetched branch tip only with an explicit ancestry
+ * proof, allowing a queued run to validate its immutable event commit after a
+ * later fast-forward push. The event base SHA must resolve to a real object in the
+ * authoritative base repository. Pull requests intentionally prove only their
+ * immutable event base object because the live ref can advance while queued; a
+ * workflow_dispatch explicitly pins a live base ref and therefore proves that ref
+ * still resolves to the requested base SHA. Repository/ref provenance and event
+ * ownership are enforced via {@link validateCiInputs}.
  */
 export function assertGuardAuthority(input: {
 	eventName: string | undefined;
@@ -545,6 +548,7 @@ export function assertGuardAuthority(input: {
 	repository: string | undefined;
 	checkedOutHead: string | undefined;
 	headRefSha: string | undefined;
+	headRefDescendsFromEventHead: string | undefined;
 	baseObjectSha: string | undefined;
 	baseRefSha: string | undefined;
 }): void {
@@ -558,8 +562,12 @@ export function assertGuardAuthority(input: {
 	const baseObjectSha = validateSha("base object", input.baseObjectSha);
 	if (checkedOutHead !== headSha)
 		throw new Error("telegram-daemon-generation-guard: checked-out head object does not equal event head SHA");
-	if (headRefSha !== headSha)
-		throw new Error("telegram-daemon-generation-guard: head ref does not resolve to event head SHA");
+	if (headRefSha !== headSha) {
+		if (input.eventName !== "push")
+			throw new Error("telegram-daemon-generation-guard: head ref does not resolve to event head SHA");
+		if (input.headRefDescendsFromEventHead !== "true")
+			throw new Error("telegram-daemon-generation-guard: push head ref is not proven to descend from event head SHA");
+	}
 	if (baseObjectSha !== baseSha)
 		throw new Error("telegram-daemon-generation-guard: base object does not equal event base SHA");
 	if (input.eventName === "workflow_dispatch" && validateSha("base ref object", input.baseRefSha) !== baseSha)
@@ -1482,6 +1490,7 @@ if (import.meta.main) {
 				repository: process.env.GUARD_REPOSITORY,
 				checkedOutHead: process.env.GUARD_CHECKED_OUT_HEAD,
 				headRefSha: process.env.GUARD_HEAD_REF_SHA,
+				headRefDescendsFromEventHead: process.env.GUARD_HEAD_REF_DESCENDS_FROM_EVENT_HEAD,
 				baseObjectSha: process.env.GUARD_BASE_OBJECT_SHA,
 				baseRefSha: process.env.GUARD_BASE_REF_SHA,
 			});

@@ -1279,6 +1279,15 @@ class McpManagerCleanupError extends Error {
 	}
 }
 
+class McpStartupCleanupRetryError extends Error {
+	readonly primaryError: unknown;
+	constructor(primaryError: unknown) {
+		super("Owned MCP manager cleanup failed during startup", { cause: primaryError });
+		this.name = "McpStartupCleanupRetryError";
+		this.primaryError = primaryError;
+	}
+}
+
 class McpManagerCleanupDiagnosticError extends Error {
 	readonly code = "MCP_MANAGER_CLEANUP_FAILED";
 	readonly primaryError: unknown;
@@ -1286,6 +1295,17 @@ class McpManagerCleanupDiagnosticError extends Error {
 	constructor(primaryError: unknown, cleanupError: unknown) {
 		super(safePluginMcpDiagnostic(primaryError), { cause: primaryError });
 		this.name = "McpManagerCleanupDiagnosticError";
+		this.primaryError = primaryError;
+		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
+	}
+}
+
+class McpPluginStartupCleanupDiagnosticError extends Error {
+	readonly primaryError: unknown;
+	readonly cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED"; cause: unknown };
+	constructor(primaryError: unknown, cleanupError: unknown) {
+		super("GJC plugin MCP startup and cleanup failed");
+		this.name = "McpPluginStartupCleanupDiagnosticError";
 		this.primaryError = primaryError;
 		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
 	}
@@ -1532,7 +1552,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let asyncJobManagerOwned = false;
 	let asyncJobManagerAdmitted = false;
 	let priorAsyncJobManager: AsyncJobManager | undefined;
-	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
+	type OwnedMcpManagerCleanup = (options?: { retryAfterStartupFailure?: boolean }) => Promise<void>;
+	let cleanupOwnedMcpManager: OwnedMcpManagerCleanup | undefined;
+	const registerOwnedMcpManagerCleanup = (owned: MCPManager): OwnedMcpManagerCleanup => {
+		let cleanupAttempt: Promise<void> | undefined;
+		const cleanup: OwnedMcpManagerCleanup = cleanupOptions => {
+			if (cleanupAttempt) return cleanupAttempt;
+			cleanupAttempt = Promise.resolve()
+				.then(() => owned.disconnectAll())
+				.then(
+					() => {
+						if (cleanupOwnedMcpManager === cleanup) cleanupOwnedMcpManager = undefined;
+					},
+					error => {
+						if (cleanupOptions?.retryAfterStartupFailure) cleanupAttempt = undefined;
+						else if (cleanupOwnedMcpManager === cleanup) cleanupOwnedMcpManager = undefined;
+						throw error;
+					},
+				);
+			return cleanupAttempt;
+		};
+		cleanupOwnedMcpManager = cleanup;
+		return cleanup;
+	};
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
@@ -3115,6 +3157,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let deferredConventionalMcp:
 			| {
 					manager: MCPManager;
+					cleanup: OwnedMcpManagerCleanup;
 					configs: Record<string, MCPServerConfig>;
 					sources: Record<string, SourceMeta>;
 					conventionalConfigs: Record<string, MCPServerConfig>;
@@ -3235,6 +3278,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			conventionalConfigs: Record<string, MCPServerConfig>,
 			pluginNames: ReadonlySet<string>,
 			pluginMcpProvenance: ReadonlyMap<string, GjcPluginMcpServerProvenance>,
+			cleanupOwned: OwnedMcpManagerCleanup,
 		): Promise<MCPLoadResult> => {
 			let result: MCPLoadResult;
 			try {
@@ -3247,14 +3291,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				)
 					throw error;
 				// Avoid leaking partially-started server processes on failure.
+				const retryAfterStartupCleanupFailure = options.enableMCP === false && !options.deferMcpConfigStartup;
 				let cleanupError: unknown;
+				let cleanupFailed = false;
 				try {
-					await owned.disconnectAll();
-					cleanupOwnedMcpManager = undefined;
+					await cleanupOwned({ retryAfterStartupFailure: retryAfterStartupCleanupFailure });
 				} catch (disconnectError) {
+					cleanupFailed = true;
 					cleanupError = disconnectError;
 				}
-				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
+				if (cleanupFailed) {
+					if (retryAfterStartupCleanupFailure) throw new McpStartupCleanupRetryError(error);
+					if (pluginNames.size > 0) {
+						throw new McpPluginStartupCleanupDiagnosticError(error, cleanupError);
+					}
+					throw attachMcpCleanupDiagnostic(error, cleanupError);
+				}
 				throw error;
 			}
 			const conventionalServerNames = new Set(
@@ -3388,8 +3440,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			} else {
 				try {
-					await owned.disconnectAll();
-					cleanupOwnedMcpManager = undefined;
+					await cleanupOwned();
 				} catch (cleanupError) {
 					throw new McpManagerCleanupError(cleanupError);
 				}
@@ -3407,7 +3458,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			owned.setAuthStorage(authStorage);
 			mcpManager = owned;
 			ownsMcpManager = true;
-			cleanupOwnedMcpManager = () => owned.disconnectAll();
+			registerOwnedMcpManagerCleanup(owned);
 			if (options.deferMcpConfigStartup) {
 				deferredExactMcpConfig = { manager: owned, configPath: explicitMcpConfigPath };
 			} else {
@@ -3525,7 +3576,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						},
 					);
 					owned.setAuthStorage(authStorage);
-					cleanupOwnedMcpManager = () => owned.disconnectAll();
+					const cleanupOwned = registerOwnedMcpManagerCleanup(owned);
 					// Interactive launches may paint before MCP connects; the deferred
 					// starter reconnects this manager after first paint and a startup
 					// turn barrier keeps the first prompt from racing tool registration.
@@ -3535,6 +3586,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (options.deferMcpConfigStartup && pluginNames.size === 0) {
 						deferredConventionalMcp = {
 							manager: owned,
+							cleanup: cleanupOwned,
 							configs: mergedConfigs,
 							sources: mergedSourceMetas,
 							conventionalConfigs,
@@ -3552,20 +3604,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							conventionalConfigs,
 							pluginNames,
 							pluginMcpProvenance,
+							cleanupOwned,
 						);
 					}
 				}
 			} catch (error) {
+				if (safeIsInstanceOf(error, McpStartupCleanupRetryError)) {
+					throw (error as McpStartupCleanupRetryError).primaryError;
+				}
+				const pluginStartupCleanupFailure = safeIsInstanceOf(error, McpPluginStartupCleanupDiagnosticError)
+					? (error as McpPluginStartupCleanupDiagnosticError)
+					: undefined;
 				if (
-					safeIsInstanceOf(error, McpManagerCleanupError) ||
-					safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
-					safeReadCleanupDiagnostic(error) !== undefined
+					!pluginStartupCleanupFailure &&
+					(safeIsInstanceOf(error, McpManagerCleanupError) ||
+						safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
+						safeReadCleanupDiagnostic(error) !== undefined)
 				)
 					throw error;
 				gjcProducersComplete = false;
-				const cleanupDiagnostic = safeReadCleanupDiagnostic(error);
+				const cleanupDiagnostic =
+					pluginStartupCleanupFailure?.cleanupDiagnostic ?? safeReadCleanupDiagnostic(error);
 				logger.warn("Failed to wire GJC plugin MCP servers", {
-					error: safeErrorForLog(error),
+					error: pluginStartupCleanupFailure
+						? safePluginMcpDiagnostic(pluginStartupCleanupFailure.primaryError)
+						: safeErrorForLog(error),
 					cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
 				});
 			}
@@ -5547,6 +5610,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								conventional.conventionalConfigs,
 								new Set<string>(),
 								new Map<string, GjcPluginMcpServerProvenance>(),
+								conventional.cleanup,
 							);
 							const resultTools = result.tools as CustomTool[];
 							if (!cancelled && !session.isDisposed) {

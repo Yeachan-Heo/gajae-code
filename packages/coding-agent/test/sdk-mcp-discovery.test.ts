@@ -1054,7 +1054,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		const startupError = new Error("plugin startup failed");
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -1067,6 +1067,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				error: "plugin startup failed",
 				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
 			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();
 		}
@@ -1151,7 +1152,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -1161,7 +1162,11 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				([message]) => message === "Failed to wire GJC plugin MCP servers",
 			);
 			expect(cleanupWarning).toBeDefined();
-			expect(cleanupWarning?.[1]).toMatchObject({ error: "<unprintable error>" });
+			expect(cleanupWarning?.[1]).toMatchObject({
+				error: "<unprintable error>",
+				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
+			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 			const serialized = JSON.stringify(cleanupWarning?.[1]);
 			expect(serialized).toContain("<unprintable error>");
 			expect(serialized).toContain("MCP_MANAGER_CLEANUP_FAILED");
