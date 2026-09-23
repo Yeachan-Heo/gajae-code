@@ -121,25 +121,26 @@ function boundedMarker(
 }
 
 /**
- * Best-effort durable marker write; never throws (diagnostics must not mask the
- * exit itself). `pid` must be the writing broker process's own pid
- * (`process.pid`) so a later reader can bind the marker to the exact spawned
- * child it is attributing the failure to.
+ * Best-effort durable marker write; returns false on failure so callers can
+ * report missing evidence without masking the exit itself. `pid` must be the
+ * writing broker process's own pid (`process.pid`) so a later reader can bind
+ * the marker to the exact spawned child it is attributing the failure to.
  */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
 	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
-): Promise<void> {
+): Promise<boolean> {
 	try {
 		const incarnation = failure.incarnation ?? processIncarnation(failure.pid);
-		if (!incarnation) return;
+		if (!incarnation) return false;
 		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
 		await Bun.write(
 			brokerStartupFailurePath(agentDir),
 			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
 		);
+		return true;
 	} catch {
-		// Best-effort only.
+		return false;
 	}
 }
 
