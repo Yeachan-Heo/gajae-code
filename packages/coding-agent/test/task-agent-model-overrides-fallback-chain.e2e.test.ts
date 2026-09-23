@@ -223,6 +223,7 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 	it("resolves an owned delegated registry from a pre-seeded LiteLLM cache without models-list I/O", async () => {
 		const modelId = "viant-gemini-3-8-flash";
 		const endpoint = "http://localhost:4000/v1";
+		const unrelatedEndpoint = "http://unrelated-provider.test/v1";
 		const modelsPath = path.join(tempDir.path(), "models.yml");
 		const cachedModel: Model<"openai-completions"> = {
 			id: modelId,
@@ -246,6 +247,12 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 						api: "openai-completions",
 						discovery: { type: "openai-models-list" },
 					},
+					"unrelated-discovery": {
+						baseUrl: unrelatedEndpoint,
+						api: "openai-completions",
+						apiKey: "unrelated-discovery-key",
+						discovery: { type: "openai-models-list" },
+					},
 				},
 			}),
 		);
@@ -265,11 +272,16 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 		);
 
 		let modelsListRequests = 0;
+		let unrelatedModelsListRequests = 0;
 		using _hook = hookFetch(input => {
 			const url = String(input);
 			if (url === `${endpoint}/models`) {
 				modelsListRequests++;
 				throw new Error(`unexpected LiteLLM models-list request: ${url}`);
+			}
+			if (url === `${unrelatedEndpoint}/models`) {
+				unrelatedModelsListRequests++;
+				throw new Error(`unexpected unrelated models-list request: ${url}`);
 			}
 			throw new Error(`unexpected unrelated network request: ${url}`);
 		});
@@ -299,6 +311,7 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 		expect(accepted.preflightProbeAccepted).toBe(true);
 		expect(accepted.setupFailure).toBeUndefined();
 		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
 
 		const repeated = await runSubprocessOnce({
 			cwd: tempDir.path(),
@@ -318,6 +331,7 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 		expect(repeated.preflightProbeAccepted).toBe(true);
 		expect(repeated.setupFailure).toBeUndefined();
 		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
 
 		const parent = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!parent) throw new Error("Expected bundled parent model");
@@ -342,6 +356,7 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 		expect(unknown.setupFailure?.summary).toMatch(/missing from the catalog|fail closed/i);
 		expect(unknown.setupFailure?.summary).toMatch(/do not fall back/i);
 		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
 		await parentRegistry.dispose();
 	});
 

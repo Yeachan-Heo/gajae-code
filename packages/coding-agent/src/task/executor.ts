@@ -37,6 +37,7 @@ import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	isExplicitProviderModelOverride,
+	refreshMissingQualifiedModelProviders,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -1786,8 +1787,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					},
 				);
 				await awaitAbortable(
-					ownedModelRegistry.refresh(
-						"online-if-uncached",
+					refreshMissingQualifiedModelProviders(
+						modelPatterns,
+						ownedModelRegistry,
 						options.parentCredentialSessionId ?? options.parentSessionId,
 					),
 				);
