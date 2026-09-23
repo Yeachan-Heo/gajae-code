@@ -44,12 +44,14 @@ export type FileLockAcquireReason = "acquire_timeout" | "orphan_transition";
  * generation); this records the cause that exhaustion must report.
  */
 export interface FileLockStaleRemovalFailure {
-	/** Guarded-removal outcome the acquire path can record, or `"error"` when the removal attempt threw. */
-	outcome: "cleanup_failed" | "error";
+	/** Guarded-removal outcome; refusals are surfaced only after exhaustion revalidates the dead generation. */
+	outcome: "cleanup_failed" | "owner_changed" | "missing" | "error";
 	/** Native/errno code carried by the refusal, when one was present. */
 	code?: string;
 	/** Human-readable cause surfaced to the operator at exhaustion. */
 	message: string;
+	/** Platform-specific manual cleanup command, set only when the same dead owner persists at exhaustion. */
+	manualCleanupCommand?: string;
 }
 
 export class FileLockAcquireError extends Error {
@@ -70,10 +72,12 @@ export class FileLockAcquireError extends Error {
 					removalFailure.code ? ` [${removalFailure.code}]` : ""
 				})`
 			: "";
+		const cleanupDetail = removalFailure?.manualCleanupCommand
+			? `; manual cleanup is appropriate only after independently verifying this exact directory still belongs to the dead owner and no successor has taken it: ${removalFailure.manualCleanupCommand}`
+			: "";
 		super(
 			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${detail}${removalDetail} (${lockPath}); ` +
-				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying; ` +
-				`the lock is a directory, remove it only by deleting the directory (${lockPath}) once no live owner remains`,
+				`a live owner is never displaced — if this is an SDK broker (gjc sdk session list), it must finish or be stopped before retrying${cleanupDetail}`,
 		);
 		this.code = reason;
 		this.name = "FileLockAcquireError";
@@ -1069,6 +1073,10 @@ function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map
 	return currentStartTime !== null && currentStartTime !== owner.start_time;
 }
 
+function ownerGenerationIsDead(owner: FileLockOwnerToken): boolean {
+	return ownerLiveness(owner.pid) === "dead" || ownerIncarnationChanged(owner);
+}
+
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing" | "cleanup_failed";
 
@@ -1550,13 +1558,17 @@ async function staleLockSnapshot(
 
 type StaleLockRemovalAttempt = { removed: true } | { removed: false; failure?: FileLockStaleRemovalFailure };
 
-type RecordedStaleRemovalFailure = { owner: FileLockOwnerToken; failure: FileLockStaleRemovalFailure };
+type RecordedStaleRemovalFailure = {
+	owner: FileLockOwnerToken;
+	identity: GenericFileLockDirIdentity;
+	failure: FileLockStaleRemovalFailure;
+};
 
 /**
- * A recorded refusal describes exactly one dead owner generation. Re-read the pathname at
- * exhaustion and report it only while that same generation still owns the directory, so a
- * refusal recorded for a dead generation is never pinned onto a live successor that took
- * the pathname over before the budget ran out.
+ * A recorded refusal describes exactly one dead owner generation and directory identity.
+ * Re-read the pathname at exhaustion and report it only while both still match, so a refusal
+ * recorded for a dead generation is never pinned onto a successor that took the pathname over
+ * before the budget ran out, even if its legacy owner bytes are identical.
  */
 async function staleRemovalFailureForCurrentGeneration(
 	lockPath: string,
@@ -1564,11 +1576,29 @@ async function staleRemovalFailureForCurrentGeneration(
 ): Promise<FileLockStaleRemovalFailure | undefined> {
 	if (!recorded) return undefined;
 	try {
-		const current = await readLockInfo(lockPath);
-		return current && sameFileLockOwnerToken(current, recorded.owner) ? recorded.failure : undefined;
+		const observation = await readLockInfoObservation(lockPath);
+		if (!observation) return undefined;
+		const current = parseLockInfoBytes(observation.bytes);
+		if (!current || !sameFileLockOwnerToken(current, recorded.owner) || !ownerGenerationIsDead(current))
+			return undefined;
+		const currentIdentity = fileLockDirIdentityFromPathState(observation.state, observation.bytes);
+		if (!sameGenericFileLockDirIdentity(recorded.identity, currentIdentity)) return undefined;
+		return {
+			...recorded.failure,
+			manualCleanupCommand: manualLockCleanupCommand(lockPath),
+		};
 	} catch {
 		return undefined;
 	}
+}
+
+function manualLockCleanupCommand(lockPath: string): string {
+	if (process.platform === "win32") {
+		const quotedPath = lockPath.replace(/'/g, "''");
+		return `Remove-Item -LiteralPath '${quotedPath}' -Recurse -Force`;
+	}
+	const quotedPath = lockPath.replace(/'/g, "'\\''");
+	return `rm -rf -- '${quotedPath}'`;
 }
 
 async function removeStaleLockForAcquire(
@@ -1579,8 +1609,21 @@ async function removeStaleLockForAcquire(
 	try {
 		const outcome = await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity);
 		if (outcome === "removed") return { removed: true };
-		// `owner_changed`/`missing` mean a successor or a concurrent reclaimer already
-		// owns the pathname; that is ordinary contention, not a host removal failure.
+		// Either refusal can mean a successor or an incomplete publication owns the path;
+		// keep it only as a diagnostic candidate and expose it at exhaustion if the same
+		// dead owner still persists. Never fall back to path-only deletion.
+		if (outcome === "owner_changed" || outcome === "missing") {
+			return {
+				removed: false,
+				failure: {
+					outcome,
+					message:
+						outcome === "owner_changed"
+							? "the identity-bound removal guard returned owner_changed; no path-only fallback was attempted"
+							: "the guarded removal could not read the owner record; no path-only fallback was attempted",
+				},
+			};
+		}
 		if (outcome !== "cleanup_failed") return { removed: false };
 		return {
 			removed: false,
@@ -2207,7 +2250,9 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			continue;
 		}
 		staleRemovalFailure =
-			stale.stale && staleRemoval.failure ? { owner: stale.owner, failure: staleRemoval.failure } : undefined;
+			stale.stale && staleRemoval.failure
+				? { owner: stale.owner, identity: stale.identity, failure: staleRemoval.failure }
+				: undefined;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);
 			continue;

@@ -5941,8 +5941,12 @@ export class AgentSession {
 		if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
 	}
 
-	/** Swap named custom/project tools after a cwd rescope. */
-	async replaceNamedCustomTools(previousNames: readonly string[], nextTools: CustomTool[]): Promise<void> {
+	/** Swap named custom tools and, when supplied, their mandatory MCP selection. */
+	async replaceNamedCustomTools(
+		previousNames: readonly string[],
+		nextTools: CustomTool[],
+		options?: { mandatoryMCPToolNames?: readonly string[] },
+	): Promise<void> {
 		const previous = new Set(previousNames);
 		const previousActive = this.getActiveToolNames();
 		for (const name of previous) this.#toolRegistry.delete(name);
@@ -5956,7 +5960,12 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 			added.push(finalTool.name);
 		}
-		this.#invalidateDiscoveryCaches();
+		if (options?.mandatoryMCPToolNames) {
+			this.#mandatoryMCPToolNames = new Set(
+				options.mandatoryMCPToolNames.map(name => name.toLowerCase()).filter(name => this.#toolRegistry.has(name)),
+			);
+		}
+		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		await this.#applyActiveToolsByName([
 			...previousActive.filter(name => !previous.has(name)),
 			...added.filter(name => !previous.has(name) || previousActive.includes(name)),

@@ -13,10 +13,12 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
+import { DeferredMCPTool, loadAllMCPConfigs, type MCPLoadResult, MCPManager, MCPToolCache } from "../src/runtime-mcp";
+import * as mcpClient from "../src/runtime-mcp/client";
+import { AgentStorage } from "../src/session/agent-storage";
 
 const DEMO_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
@@ -126,6 +128,100 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	it("loads persisted cached conventional tools through the session-owned manager", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow-demo",
+			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 1_000 },
+			cwd: projectDir,
+		});
+
+		const configPath = path.join(projectDir, ".gjc", "mcp.json");
+		const configDocument = JSON.parse(await fs.promises.readFile(configPath, "utf8")) as {
+			mcpServers: Record<string, Record<string, unknown>>;
+		};
+		delete configDocument.mcpServers["slow-demo"]?.timeout;
+		await fs.promises.writeFile(configPath, JSON.stringify(configDocument, null, 2));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+
+		const sessionAgentDir = path.join(tempHome, ".gjc", "session-profile");
+		await fs.promises.mkdir(sessionAgentDir, { recursive: true });
+		const options = { ...isolatedSessionOptions(), agentDir: sessionAgentDir };
+		const loaded = await loadAllMCPConfigs(projectDir, {
+			agentDir: sessionAgentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-demo"];
+		if (!config) throw new Error("slow-demo config was not loaded");
+
+		const storage = await AgentStorage.open(getAgentDbPath(sessionAgentDir), { isolated: true });
+		try {
+			await new MCPToolCache(storage).set("slow-demo", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+
+			const { session, mcpManager } = await createAgentSession(options);
+			try {
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				expect(mcpManager).toBeDefined();
+				const cachedTool = mcpManager?.getTools().find(tool => tool.name === "mcp__slow_demo_cached_hello");
+				expect(cachedTool).toBeInstanceOf(DeferredMCPTool);
+				expect(session.getAllToolNames()).toContain("mcp__slow_demo_cached_hello");
+				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
+		}
+	}, 30_000);
+
+	it("uses the session cache when rebuilding conventional MCP authority after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(sourceCwd, { recursive: true });
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { "slow-target": { type: "http", url: "http://127.0.0.1:1" } } }),
+		);
+
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const options = { ...isolatedSessionOptions(), cwd: sourceCwd, sessionManager, toolNames: ["move_session"] };
+		const loaded = await loadAllMCPConfigs(targetCwd, {
+			agentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-target"];
+		if (!config) throw new Error("slow-target config was not loaded");
+		const storage = await AgentStorage.open(getAgentDbPath(agentDir));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+		try {
+			await new MCPToolCache(storage).set("slow-target", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+			const { session } = await createAgentSession(options);
+			try {
+				await session.getToolByName("move_session")!.execute("move-with-cache", { path: "move-target" });
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				const cachedTool = session.getToolByName("mcp__slow_target_cached_hello");
+				expect(cachedTool).toBeDefined();
+				expect(session.getAllToolNames()).toContain("mcp__slow_target_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
 		}
 	}, 30_000);
 
@@ -357,6 +453,40 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("retains the manager that owns cached tools after startup timeout", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { cached: { type: "stdio", command: process.execPath } } }),
+		);
+		const [cachedTool] = DeferredMCPTool.fromTools(
+			"cached",
+			[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			async () => {
+				throw new Error("cached server is disconnected");
+			},
+		);
+		if (!cachedTool) throw new Error("cached MCP tool was not created");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [cachedTool],
+			errors: new Map([["cached", "MCP server connection timed out during startup: cached"]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		});
+		vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(mcpManager).toBeDefined();
+			expect(session.getAllToolNames()).toContain("mcp__cached_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__cached_hello");
+			expect(disconnectAll).not.toHaveBeenCalled();
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("does not warn again for an MCP startup timeout already returned as an error", async () => {
 		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
 		await fs.promises.writeFile(
@@ -381,6 +511,44 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(warnSpy.mock.calls.some(([message]) => String(message).includes("GJC plugin MCP connect failed"))).toBe(
 				false,
 			);
+		} finally {
+			await session.dispose();
+			warnSpy.mockRestore();
+		}
+	}, 30_000);
+
+	it("keeps remote MCP error details out of conventional startup logs", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					upstream: { type: "stdio", command: process.execPath },
+				},
+			}),
+		);
+		const remoteSecret = "remote-secret-502-response";
+		const remoteError = `HTTP 502: upstream response contains ${remoteSecret}`;
+		const startupResult: MCPLoadResult = {
+			tools: [],
+			errors: new Map([["upstream", remoteError]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		};
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue(startupResult);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			const startupWarning = warnSpy.mock.calls.find(([message]) =>
+				String(message).includes("GJC plugin MCP connect failed"),
+			);
+			if (!startupWarning) throw new Error("conventional MCP startup warning was not logged");
+			expect(startupWarning[1]).toMatchObject({ path: "mcp:upstream", error: "transport-error" });
+			expect(JSON.stringify(startupWarning)).not.toContain(remoteSecret);
+			// The session logger does not rewrite the manager result's details.
+			expect(startupResult.errors.get("upstream")).toBe(remoteError);
 		} finally {
 			await session.dispose();
 			warnSpy.mockRestore();
