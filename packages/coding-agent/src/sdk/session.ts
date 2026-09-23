@@ -38,7 +38,6 @@ import {
 	normalizePathForComparison,
 	postmortem,
 	prompt,
-	redactCrashSecrets,
 	Snowflake,
 	safeErrorDescription,
 	setProjectDir,
@@ -121,6 +120,7 @@ import {
 	getGjcPluginToolDeclarations,
 	loadAlwaysOnPluginTools,
 	renderAlwaysOnSystemAppendices,
+	safePluginMcpDiagnostic,
 } from "../extensibility/gjc-plugins/runtime-adapters";
 import {
 	GjcRuntimeFindingAccumulator,
@@ -1272,7 +1272,7 @@ class ExactMcpToolNameCollisionError extends Error {
 class McpManagerCleanupError extends Error {
 	readonly code = "MCP_MANAGER_CLEANUP_FAILED";
 	constructor(cause: unknown) {
-		super(`Owned MCP manager cleanup failed: ${safeErrorDescription(cause)}`, { cause });
+		super(`Owned MCP manager cleanup failed: ${safePluginMcpDiagnostic(cause)}`, { cause });
 		this.name = "McpManagerCleanupError";
 	}
 }
@@ -1282,7 +1282,7 @@ class McpManagerCleanupDiagnosticError extends Error {
 	readonly primaryError: unknown;
 	readonly cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED"; cause: unknown };
 	constructor(primaryError: unknown, cleanupError: unknown) {
-		super(safeErrorDescription(primaryError), { cause: primaryError });
+		super(safePluginMcpDiagnostic(primaryError), { cause: primaryError });
 		this.name = "McpManagerCleanupDiagnosticError";
 		this.primaryError = primaryError;
 		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
@@ -1311,8 +1311,8 @@ function safeCleanupDiagnosticForLog(value: unknown): { code: string; cause: str
 	const code = safeReadProperty(value, "code");
 	const nestedCause = safeReadProperty(value, "cause");
 	return {
-		code: typeof code === "string" ? code : "MCP_MANAGER_CLEANUP_FAILED",
-		cause: safeErrorDescription(nestedCause === undefined ? value : nestedCause),
+		code: typeof code === "string" ? safePluginMcpDiagnostic(code) : "MCP_MANAGER_CLEANUP_FAILED",
+		cause: safePluginMcpDiagnostic(nestedCause === undefined ? value : nestedCause),
 	};
 }
 function safeReadCleanupDiagnostic(value: unknown): unknown {
@@ -1326,11 +1326,6 @@ function safeReadCleanupDiagnostic(value: unknown): unknown {
 
 function safeErrorForLog(value: unknown): unknown {
 	return safeErrorDescription(value);
-}
-
-function safePluginMcpDiagnostic(value: unknown): string {
-	const message = safeErrorDescription(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, "?");
-	return redactCrashSecrets(message).slice(0, 1024);
 }
 
 function sanitizeProviderForLog(provider: string): string {
@@ -3228,15 +3223,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				result = await owned.connectServers(mergedConfigs, mergedSources as never);
 			} catch (error) {
-				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
+				if (
+					safeIsInstanceOf(error, McpManagerCleanupError) ||
+					safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
+					safeReadCleanupDiagnostic(error) !== undefined
+				)
+					throw error;
 				// Avoid leaking partially-started server processes on failure.
 				let cleanupError: unknown;
 				try {
 					await owned.disconnectAll();
+					cleanupOwnedMcpManager = undefined;
 				} catch (disconnectError) {
 					cleanupError = disconnectError;
-				} finally {
-					cleanupOwnedMcpManager = undefined;
 				}
 				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
 				throw error;
@@ -3375,7 +3374,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await owned.disconnectAll();
 					cleanupOwnedMcpManager = undefined;
 				} catch (cleanupError) {
-					cleanupOwnedMcpManager = undefined;
 					throw new McpManagerCleanupError(cleanupError);
 				}
 			}
@@ -3541,7 +3539,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 			} catch (error) {
-				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
+				if (
+					safeIsInstanceOf(error, McpManagerCleanupError) ||
+					safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
+					safeReadCleanupDiagnostic(error) !== undefined
+				)
+					throw error;
 				gjcProducersComplete = false;
 				const cleanupDiagnostic = safeReadCleanupDiagnostic(error);
 				logger.warn("Failed to wire GJC plugin MCP servers", {

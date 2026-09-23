@@ -3,6 +3,7 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { redactCrashSecrets, safeErrorDescription } from "@gajae-code/utils";
 import { bindPluginMcpToPublicNetwork } from "../../runtime-mcp/plugin-network-boundary";
 import type { MCPStdioPreparedLaunch, MCPStdioSpawnLaunch } from "../../runtime-mcp/types";
 import { loadCustomTools } from "../custom-tools/loader";
@@ -41,6 +42,18 @@ export interface GjcPluginToolDeclaration extends NormalizedToolSurfaceV2 {
 export interface GjcPluginMcpServerProvenance {
 	identity: GjcBundleIdentity;
 	surfaceId: string;
+}
+
+// Plugin MCP manifests reject per-server timeout controls; generated transports
+// share one bounded window so startup evidence reaches a terminal result.
+const PLUGIN_MCP_STARTUP_TIMEOUT_MS = 5_000;
+const MAX_PLUGIN_MCP_DIAGNOSTIC_LENGTH = 1_024;
+
+/** Bound and scrub plugin-controlled MCP causes before they enter logs or runtime findings. */
+export function safePluginMcpDiagnostic(value: unknown): string {
+	const message = safeErrorDescription(value).replace(/[\u0000-\u001f\u007f-\u009f]/gu, "");
+	const normalized = message.replace(/\b(Bearer|Basic|Token)(?=[A-Za-z0-9._~+/=-]{8,})/giu, "$1 ");
+	return redactCrashSecrets(normalized).slice(0, MAX_PLUGIN_MCP_DIAGNOSTIC_LENGTH);
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -1136,7 +1149,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 						command,
 						args: initialArgs,
 						cwd: invocation.cwd,
-						timeout: 5_000,
+						timeout: PLUGIN_MCP_STARTUP_TIMEOUT_MS,
 						// Third-party plugin MCP processes must not inherit host secrets;
 						// only a minimal OS allowlist (PATH/HOME/temp/locale) is provided.
 						noInheritEnv: true,
@@ -1224,7 +1237,11 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 					// resolution path expands ${env:...}/shell templates, which would let
 					// a third-party bundle exfiltrate host secrets. Plugin-bundle MCP
 					// servers connect without bundle-declared headers.
-					configs[m.name] = bindPluginMcpToPublicNetwork({ type: cfg.transport, url: url.toString() });
+					configs[m.name] = bindPluginMcpToPublicNetwork({
+						type: cfg.transport,
+						url: url.toString(),
+						timeout: PLUGIN_MCP_STARTUP_TIMEOUT_MS,
+					});
 				}
 				serverProvenance.set(m.name, {
 					identity: bundleIdentity(entry.scope, entry.name),
@@ -1236,7 +1253,7 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 					plugin: entry.name,
 					surfaceId: m.extensionId,
 					code: "security_policy",
-					message: error instanceof Error ? error.message : String(error),
+					message: safePluginMcpDiagnostic(error),
 				});
 			}
 		}

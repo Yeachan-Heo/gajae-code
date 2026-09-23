@@ -330,6 +330,52 @@ describe("GJC Bundles settings integration through the production selector", () 
 		30_000,
 	);
 
+	test.skipIf(process.platform !== "linux")(
+		"retries owned MCP cleanup after a startup failure without dropping manager ownership",
+		async () => {
+			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-runtime-cleanup-retry-"));
+			let restoreConnectServers: (() => void) | undefined;
+			let restoreDisconnectAll: (() => void) | undefined;
+			try {
+				const installed = await installGjcBundle({ cwd }, "project", sixSurfaceBundle);
+				expect(installed.ok).toBe(true);
+				const startupError = new Error("synthetic plugin MCP startup failure");
+				const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+				restoreConnectServers = () => connectServers.mockRestore();
+				let cleanupAttempts = 0;
+				const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockImplementation(async () => {
+					cleanupAttempts++;
+					if (cleanupAttempts === 1) throw new Error("synthetic first cleanup failure");
+				});
+				restoreDisconnectAll = () => disconnectAll.mockRestore();
+
+				await expect(
+					createAgentSession({
+						cwd,
+						agentDir: cwd,
+						sessionManager: SessionManager.inMemory(cwd),
+						settings: Settings.isolated(),
+						model: getBundledModel("openai", "gpt-4o-mini"),
+						disableExtensionDiscovery: true,
+						extensions: [],
+						skills: [],
+						contextFiles: [],
+						promptTemplates: [],
+						slashCommands: [],
+						enableMCP: false,
+						enableLsp: false,
+					}),
+				).rejects.toThrow("synthetic plugin MCP startup failure");
+				expect(cleanupAttempts).toBe(2);
+			} finally {
+				restoreConnectServers?.();
+				restoreDisconnectAll?.();
+				await fs.rm(cwd, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
 	test("a missing provider degrades honestly instead of crashing", () => {
 		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist"), {
 			onCancel: () => {},

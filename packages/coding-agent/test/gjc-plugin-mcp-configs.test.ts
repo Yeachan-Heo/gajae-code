@@ -12,6 +12,7 @@ import {
 	type GjcPluginLoadErrorCode,
 	installGjcBundle,
 } from "../src/extensibility/gjc-plugins";
+import { safePluginMcpDiagnostic } from "../src/extensibility/gjc-plugins/runtime-adapters";
 import { isPluginMcpPublicNetworkBound } from "../src/runtime-mcp/plugin-network-boundary";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -99,6 +100,18 @@ afterEach(async () => {
 });
 
 describe("plugin MCP runtime config conversion", () => {
+	test("bounds and redacts plugin MCP diagnostics", () => {
+		const secret = "plugin-startup-secret-value";
+		const diagnostic = safePluginMcpDiagnostic(`api_key=${secret}\u001b[31m ${"x".repeat(1_200)}`);
+		expect(diagnostic).toContain("api_key=«redacted»");
+		expect(diagnostic).not.toContain(secret);
+		expect(diagnostic).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+		expect(diagnostic.length).toBe(1_024);
+		const splitBearer = safePluginMcpDiagnostic(`Bearer\u0001${secret}`);
+		expect(splitBearer).toContain("«redacted-auth»");
+		expect(splitBearer).not.toContain(secret);
+	});
+
 	test("converts a bundled stdio MCP into a root-confined runtime config", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-"));
 		tempDirs.push(cwd);
@@ -174,7 +187,7 @@ describe("plugin MCP runtime config conversion", () => {
 		const { configs, quarantine, serverProvenance } = await buildPluginMcpConfigs({ cwd });
 
 		expect(quarantine).toHaveLength(0);
-		expect(configs.remote_docs).toMatchObject({ type: "http", url });
+		expect(configs.remote_docs).toMatchObject({ type: "http", url, timeout: 5_000 });
 		expect(serverProvenance.get("remote_docs")).toEqual({
 			identity: { kind: "gjc-bundle", scope: "project", name: "remote-mcp-bundle" },
 			surfaceId: "mcp:remote_docs",
