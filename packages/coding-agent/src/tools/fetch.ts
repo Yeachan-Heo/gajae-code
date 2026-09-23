@@ -11,15 +11,20 @@ import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
 import type { AgentStorage } from "../session/agent-storage";
 import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
-import { renderStatusLine } from "../tui";
 import { CachedOutputBlock } from "../tui/output-block";
+import { renderStatusLine } from "../tui/status-line";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
 import { INSANE_NOTES } from "../web/insane/bridge";
 import { validatePublicHttpUrl } from "../web/insane/url-guard";
-import { specialHandlers } from "../web/scrapers";
-import type { RenderResult } from "../web/scrapers/types";
-import { finalizeOutput, loadPage, looksLikeHtml, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
+import {
+	finalizeOutput,
+	loadPage,
+	looksLikeHtml,
+	MAX_OUTPUT_CHARS,
+	type RenderResult,
+	type SpecialHandler,
+} from "../web/scrapers/types";
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
@@ -30,6 +35,12 @@ import { clampTimeout } from "./tool-timeouts";
 
 type NativeHtmlBindings = { htmlToMarkdown: typeof htmlToMarkdownFn };
 let nativeHtmlBindings: NativeHtmlBindings | undefined;
+let specialHandlersCache: SpecialHandler[] | undefined;
+
+function getSpecialHandlers(): SpecialHandler[] {
+	specialHandlersCache ??= (require("../web/scrapers") as { specialHandlers: SpecialHandler[] }).specialHandlers;
+	return specialHandlersCache;
+}
 
 /**
  * Lazy native access for HTML conversion. The module is cached, never the
@@ -659,7 +670,7 @@ async function handleSpecialUrls(
 	signal: AbortSignal | undefined,
 	storage: AgentStorage | null,
 ): Promise<FetchRenderResult | null> {
-	for (const handler of specialHandlers) {
+	for (const handler of getSpecialHandlers()) {
 		if (signal?.aborted) {
 			throw new ToolAbortError();
 		}
@@ -668,6 +679,11 @@ async function handleSpecialUrls(
 	}
 	return null;
 }
+
+/** Test-only seam for verifying lazy special-handler loading and dispatch. */
+export const fetchSpecialHandlerTestHooks = {
+	dispatch: handleSpecialUrls,
+};
 
 // =============================================================================
 // Main Render Function
