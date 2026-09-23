@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import {
+	type GuardedWriteResult,
 	readExistingStateForMutation,
+	StatePublicationUncertainError,
 	StateWriteConflictError,
 	withWorkflowStateLock,
 	writeGuardedJsonAtomic,
@@ -297,17 +299,25 @@ function trustedStoredAcceptance(attempt: ManagedTaskAttempt): boolean {
 }
 export type ManagedEnrollmentRecord = {
 	controlRoots: string[];
+	establishedRoots: string[];
+	publishingRoots: string[];
 	nativeIdentities: string[];
 	byRoot: Record<string, string[]>;
 };
 function enrollmentIndexDocument(record: ManagedEnrollmentRecord): {
 	version: 1;
 	controlRoots: string[];
+	establishedRoots: string[];
+	publishingRoots: string[];
 	nativeIdentities: string[];
 	byRoot: Record<string, string[]>;
 	state_revision: number;
 } {
 	const controlRoots = [...record.controlRoots].sort();
+	const establishedRoots = [...record.establishedRoots].filter(root => controlRoots.includes(root)).sort();
+	const publishingRoots = [...record.publishingRoots]
+		.filter(root => controlRoots.includes(root) && !establishedRoots.includes(root))
+		.sort();
 	const byRoot: Record<string, string[]> = {};
 	for (const root of controlRoots) byRoot[root] = [...(record.byRoot[root] ?? [])].sort();
 	const nativeIdentities = [
@@ -316,6 +326,8 @@ function enrollmentIndexDocument(record: ManagedEnrollmentRecord): {
 	return {
 		version: 1,
 		controlRoots,
+		establishedRoots,
+		publishingRoots,
 		// Global identities may be accepted without a root mapping; cleanup must retain them.
 		nativeIdentities,
 		byRoot,
@@ -327,6 +339,8 @@ function parseEnrollmentIndex(value: unknown): ManagedEnrollmentRecord {
 		.object({
 			version: z.literal(1),
 			controlRoots: z.array(text),
+			establishedRoots: z.array(text),
+			publishingRoots: z.array(text),
 			nativeIdentities: z.array(digest).default([]),
 			byRoot: z.record(text, z.array(digest)).default({}),
 			state_revision: counter.optional(),
@@ -335,19 +349,39 @@ function parseEnrollmentIndex(value: unknown): ManagedEnrollmentRecord {
 		.parse(value);
 	requireDistinct(parsed.controlRoots, "duplicate enrolled control root");
 	requirePolicy(parsed.controlRoots.every(isCanonicalAbsolute), "enrolled control root is not canonical");
+	requireDistinct(parsed.establishedRoots, "duplicate established control root");
+	requireDistinct(parsed.publishingRoots, "duplicate publishing control root");
+	requirePolicy(
+		parsed.establishedRoots.every(root => parsed.controlRoots.includes(root)),
+		"established control root is not enrolled",
+	);
+	requirePolicy(
+		parsed.publishingRoots.every(
+			root => parsed.controlRoots.includes(root) && !parsed.establishedRoots.includes(root),
+		),
+		"publishing control root is not pending",
+	);
 	const byRoot: Record<string, string[]> = {};
 	for (const root of parsed.controlRoots) {
 		const ids = parsed.byRoot[root] ?? [];
 		requireDistinct(ids, "duplicate enrolled native identity");
 		byRoot[root] = ids;
 	}
+	requireDistinct(Object.values(byRoot).flat(), "native identity belongs to multiple control roots");
 	const nativeIdentities = [...new Set([...parsed.nativeIdentities, ...Object.values(byRoot).flat()])];
 	requireDistinct(nativeIdentities, "duplicate enrolled native identity");
-	return { controlRoots: parsed.controlRoots, nativeIdentities, byRoot };
+	return {
+		controlRoots: parsed.controlRoots,
+		establishedRoots: parsed.establishedRoots,
+		publishingRoots: parsed.publishingRoots,
+		nativeIdentities,
+		byRoot,
+	};
 }
 async function loadEnrollmentIndexUnderLock(target: string): Promise<ManagedEnrollmentRecord> {
 	const read = await readExistingStateForMutation(target);
-	if (read.kind === "absent") return { controlRoots: [], nativeIdentities: [], byRoot: {} };
+	if (read.kind === "absent")
+		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 	requirePolicy(read.kind === "valid", "corrupt managed enrollment index");
 	try {
 		return parseEnrollmentIndex(read.value);
@@ -950,6 +984,12 @@ export interface ManagedDomainTransactionOptions {
 	expectedRevision?: number;
 	/** Only for first enrollment; caller checks its authoritative registration/native journal under this lock. */
 	assertNoManagedEvidence?: () => Promise<void>;
+	/** Publish a fail-closed marker after definition validation but before the first state write. */
+	beforeFirstPublication?: () => Promise<void>;
+	/** Runs under the domain lock after the first state is durable, serialized with stale-index reclamation. */
+	onFirstPublication?: () => Promise<void>;
+	/** Restore pending only when the state writer proves it failed before rename. */
+	onFirstPublicationAborted?: () => Promise<void>;
 	/** Trusted native/internal observation: reload under the lock and CAS against the live revision. */
 	internal?: boolean;
 }
@@ -972,6 +1012,7 @@ export async function transactManagedTaskDomain<T>(
 			await validateBinding(binding);
 			const read = await readExistingStateForMutation(target);
 			requirePolicy(read.kind !== "corrupt", "corrupt authority");
+			const firstPublication = read.kind === "absent";
 			let state: ManagedTaskDomain;
 			if (read.kind === "absent") {
 				requirePolicy(!options.internal, "established authority missing");
@@ -1048,13 +1089,35 @@ export async function transactManagedTaskDomain<T>(
 				}
 			validateManagedTaskDomain(state);
 			await validateManagedTaskDomainAuthority(state, binding);
-			const written = await writeGuardedJsonAtomic(target, state, {
-				...writer,
-				policy: "source",
-				expectedRevision,
-				lockHeld: true,
-			});
+			if (firstPublication) await options.beforeFirstPublication?.();
+			let written: GuardedWriteResult;
+			try {
+				written = await writeGuardedJsonAtomic(target, state, {
+					...writer,
+					policy: "source",
+					expectedRevision,
+					lockHeld: true,
+				});
+			} catch (caught) {
+				if (firstPublication && caught instanceof StatePublicationUncertainError) {
+					const published = await readExistingStateForMutation(target);
+					if (published.kind === "valid") {
+						try {
+							const state = validateManagedTaskDomain(published.value);
+							if (managedIdentity(state.binding) === managedIdentity(binding))
+								await options.onFirstPublication?.();
+						} catch {
+							// Keep the publishing marker when the read-back cannot prove this domain.
+						}
+					}
+					// Missing or corrupt after a rename attempt is deliberately retained as publishing.
+				} else if (firstPublication) {
+					await options.onFirstPublicationAborted?.();
+				}
+				throw caught;
+			}
 			requirePolicy(written.written, "source publication skipped");
+			if (firstPublication) await options.onFirstPublication?.();
 			return { state: validateManagedTaskDomain(written.stamped), result };
 		},
 		writer,
@@ -1575,7 +1638,7 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 		});
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { controlRoots: [], nativeIdentities: [], byRoot: {} };
+			return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 		if (error instanceof Error && error.message === "corrupt managed enrollment index") throw error;
 		throw new Error("corrupt managed enrollment index");
 	}
@@ -1600,6 +1663,8 @@ export async function recordManagedEnrollment(
 			const rootNatives = new Set(byRoot[controlRoot] ?? []);
 			const already = roots.has(controlRoot) && (nativeIdentity === undefined || rootNatives.has(nativeIdentity));
 			if (already) return;
+			if (nativeIdentity !== undefined && record.nativeIdentities.includes(nativeIdentity))
+				throw new Error("managed native identity is already enrolled under another control root");
 			roots.add(controlRoot);
 			if (nativeIdentity) rootNatives.add(nativeIdentity);
 			byRoot[controlRoot] = [...rootNatives];
@@ -1608,6 +1673,8 @@ export async function recordManagedEnrollment(
 				target,
 				enrollmentIndexDocument({
 					controlRoots: [...roots],
+					establishedRoots: record.establishedRoots,
+					publishingRoots: record.publishingRoots,
 					nativeIdentities: record.nativeIdentities,
 					byRoot,
 				}),
@@ -1619,6 +1686,72 @@ export async function recordManagedEnrollment(
 	);
 }
 
+async function updateManagedEnrollmentPublication(
+	agentDir: string,
+	controlRoot: string,
+	publication: "pending" | "publishing" | "established",
+): Promise<void> {
+	requirePolicy(isCanonicalAbsolute(controlRoot), "control root is not canonical");
+	const agent = await fs.realpath(agentDir);
+	const target = managedEnrollmentIndexPath(agent);
+	const writer = { cwd: agent, privateDurable: { directory: path.dirname(target) } };
+	await withWorkflowStateLock(
+		target,
+		async () => {
+			const record = await loadEnrollmentIndexUnderLock(target);
+			const establishedRoots = new Set(record.establishedRoots);
+			const publishingRoots = new Set(record.publishingRoots);
+			if (publication === "established") {
+				establishedRoots.add(controlRoot);
+				publishingRoots.delete(controlRoot);
+			} else if (publication === "publishing") {
+				if (establishedRoots.has(controlRoot)) return;
+				publishingRoots.add(controlRoot);
+			} else {
+				if (establishedRoots.has(controlRoot)) return;
+				publishingRoots.delete(controlRoot);
+			}
+			const controlRoots = [...new Set([...record.controlRoots, controlRoot])];
+			const byRoot = { ...record.byRoot, [controlRoot]: record.byRoot[controlRoot] ?? [] };
+			if (
+				controlRoots.length === record.controlRoots.length &&
+				establishedRoots.size === record.establishedRoots.length &&
+				publishingRoots.size === record.publishingRoots.length
+			)
+				return;
+			const expectedRevision = await persistedEnrollmentRevision(target);
+			const written = await writeGuardedJsonAtomic(
+				target,
+				enrollmentIndexDocument({
+					controlRoots,
+					establishedRoots: [...establishedRoots],
+					publishingRoots: [...publishingRoots],
+					nativeIdentities: record.nativeIdentities,
+					byRoot,
+				}),
+				{ ...writer, policy: "source", expectedRevision, lockHeld: true },
+			);
+			requirePolicy(written.written, "source publication skipped");
+		},
+		writer,
+	);
+}
+
+/** Mark a first domain publication in progress before its state rename. */
+export async function markManagedEnrollmentPublishing(agentDir: string, controlRoot: string): Promise<void> {
+	await updateManagedEnrollmentPublication(agentDir, controlRoot, "publishing");
+}
+
+/** A valid domain snapshot is authoritative even if the marker update was interrupted. */
+export async function markManagedEnrollmentEstablished(agentDir: string, controlRoot: string): Promise<void> {
+	await updateManagedEnrollmentPublication(agentDir, controlRoot, "established");
+}
+
+/** Only a proven pre-rename state-write failure may return publication to pending. */
+export async function markManagedEnrollmentPending(agentDir: string, controlRoot: string): Promise<void> {
+	await updateManagedEnrollmentPublication(agentDir, controlRoot, "pending");
+}
+
 /**
  * Remove a root that was pre-published for a first enrollment but never got a
  * domain state. Native identities make the root non-recoverable, so callers
@@ -1627,31 +1760,47 @@ export async function recordManagedEnrollment(
 async function removeEmptyManagedEnrollment(agentDir: string, controlRoot: string): Promise<boolean> {
 	requirePolicy(isCanonicalAbsolute(controlRoot), "control root is not canonical");
 	const agent = await fs.realpath(agentDir);
-	const target = managedEnrollmentIndexPath(agent);
-	const writer = { cwd: agent, privateDurable: { directory: path.dirname(target) } };
+	const domainTarget = managedTaskDomainPath(controlRoot);
 	return withWorkflowStateLock(
-		target,
+		domainTarget,
 		async () => {
-			const record = await loadEnrollmentIndexUnderLock(target);
-			if (!record.controlRoots.includes(controlRoot)) return true;
-			if ((record.byRoot[controlRoot] ?? []).length > 0) return false;
-			const controlRoots = record.controlRoots.filter(root => root !== controlRoot);
-			const byRoot = { ...record.byRoot };
-			delete byRoot[controlRoot];
-			const expectedRevision = await persistedEnrollmentRevision(target);
-			const written = await writeGuardedJsonAtomic(
+			const domain = await readExistingStateForMutation(domainTarget);
+			if (domain.kind !== "absent") return false;
+			const target = managedEnrollmentIndexPath(agent);
+			const writer = { cwd: agent, privateDurable: { directory: path.dirname(target) } };
+			return withWorkflowStateLock(
 				target,
-				enrollmentIndexDocument({
-					controlRoots,
-					nativeIdentities: record.nativeIdentities,
-					byRoot,
-				}),
-				{ ...writer, policy: "source", expectedRevision, lockHeld: true },
+				async () => {
+					const record = await loadEnrollmentIndexUnderLock(target);
+					if (!record.controlRoots.includes(controlRoot)) return true;
+					if (
+						record.establishedRoots.includes(controlRoot) ||
+						record.publishingRoots.includes(controlRoot) ||
+						(record.byRoot[controlRoot] ?? []).length > 0
+					)
+						return false;
+					const controlRoots = record.controlRoots.filter(root => root !== controlRoot);
+					const byRoot = { ...record.byRoot };
+					delete byRoot[controlRoot];
+					const expectedRevision = await persistedEnrollmentRevision(target);
+					const written = await writeGuardedJsonAtomic(
+						target,
+						enrollmentIndexDocument({
+							controlRoots,
+							establishedRoots: record.establishedRoots,
+							publishingRoots: record.publishingRoots,
+							nativeIdentities: record.nativeIdentities,
+							byRoot,
+						}),
+						{ ...writer, policy: "source", expectedRevision, lockHeld: true },
+					);
+					requirePolicy(written.written, "source publication skipped");
+					return true;
+				},
+				writer,
 			);
-			requirePolicy(written.written, "source publication skipped");
-			return true;
 		},
-		writer,
+		{ cwd: controlRoot, privateDurable: { directory: path.dirname(domainTarget) } },
 	);
 }
 
@@ -1731,6 +1880,7 @@ export async function restoreManagedAttemptRefs(agentDir: string): Promise<Resto
 				failedRoots.push(controlRoot);
 				continue;
 			}
+			await markManagedEnrollmentEstablished(agentDir, controlRoot);
 			for (const graph of state.graphs)
 				for (const attempt of graph.attempts)
 					if (!attempt.retired) refs.push(managedAttemptRefFromState(state, attempt, graph.id));

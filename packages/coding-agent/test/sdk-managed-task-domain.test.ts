@@ -147,10 +147,12 @@ describe("strict private shared domain transactions", () => {
 	it("post-rename failure is uncertain and leaves the complete reservation, never a fresh retry", async () => {
 		const { root, binding, node } = await fixture();
 		await enroll(binding, [node("a")]);
+		const target = managedTaskDomainPath(root);
 		const rename = fs.rename;
 		const fault = spyOn(fs, "rename").mockImplementation(async (from, to) => {
 			await rename(from, to);
-			if (String(to) === managedTaskDomainPath(root)) throw new Error("simulated publication acknowledgement loss");
+			const anchoredTarget = path.join(await fs.realpath(path.dirname(String(to))), path.basename(String(to)));
+			if (anchoredTarget === target) throw new Error("simulated publication acknowledgement loss");
 		});
 		try {
 			await expect(

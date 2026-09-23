@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -138,6 +138,173 @@ describe("managed verification (M4b)", () => {
 		expect(domain.graphs[0]!.attempts[0]!.accepted).toBeNull();
 		expect(domain.graphs[0]!.attempts[0]!.validation).toBe("unknown");
 		expect(domain.graphs[0]!.attempts[0]!.retired).toBe(false);
+	});
+	it("reconciles a post-rename uncertain start to unknown without launching or retrying the validator", async () => {
+		const { root, binding } = await fixture();
+		await fs.writeFile(path.join(root, "result.txt"), "produced");
+		await enrollClosed(binding, node(root, "true"));
+		let runs = 0;
+		const runner = {
+			runValidation: async (spec: { name: string; command: string }) => {
+				runs += 1;
+				return { exactCommand: spec.command, cwd: root, exitStatus: 0, pass: true };
+			},
+			resolveCommit: async () => null,
+			commitOnBranch: async () => false,
+			prOrIssue: async () => ({ prUrl: null, issueArtifact: null }),
+		};
+		const rename = fs.rename;
+		let injected = false;
+		const fault = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			await rename(from, to);
+			const anchoredTarget = path.join(await fs.realpath(path.dirname(String(to))), path.basename(String(to)));
+			if (!injected && anchoredTarget === managedTaskDomainPath(root)) {
+				injected = true;
+				throw new Error("simulated start publication acknowledgement loss");
+			}
+		});
+		let first: Awaited<ReturnType<typeof verifyManagedTaskAttempt>>;
+		try {
+			first = await verifyManagedTaskAttempt({ binding, graphId: "g", nodeId: "a", owner: "owner", runner });
+		} finally {
+			fault.mockRestore();
+		}
+		expect(injected).toBe(true);
+		expect(first).toMatchObject({ status: "unknown", started: false });
+		const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+			graphs: Array<{
+				attempts: Array<{
+					validation: string;
+					verificationExecution: { executionId: string } | null;
+				}>;
+			}>;
+		};
+		expect(domain.graphs[0]!.attempts[0]!.validation).toBe("unknown");
+		expect(domain.graphs[0]!.attempts[0]!.verificationExecution).not.toBeNull();
+		const again = await verifyManagedTaskAttempt({ binding, graphId: "g", nodeId: "a", owner: "owner", runner });
+		expect(again).toMatchObject({ status: "unknown", started: false });
+		expect(runs).toBe(0);
+	});
+	it("returns unknown when a plain runner exception is durably recorded as unknown", async () => {
+		const { root, binding } = await fixture();
+		await fs.writeFile(path.join(root, "result.txt"), "produced");
+		await enrollClosed(binding, node(root, "true"));
+		let runs = 0;
+		const runner = {
+			runValidation: async () => {
+				runs += 1;
+				throw new Error("runner crashed");
+			},
+			resolveCommit: async () => null,
+			commitOnBranch: async () => false,
+			prOrIssue: async () => ({ prUrl: null, issueArtifact: null }),
+		};
+		const result = await verifyManagedTaskAttempt({ binding, graphId: "g", nodeId: "a", owner: "owner", runner });
+		expect(result).toMatchObject({ status: "unknown", started: true });
+		const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+			graphs: Array<{
+				attempts: Array<{ accepted: unknown; validation: string; retired: boolean }>;
+			}>;
+		};
+		expect(domain.graphs[0]!.attempts[0]!.accepted).toBeNull();
+		expect(domain.graphs[0]!.attempts[0]!.validation).toBe("unknown");
+		expect(domain.graphs[0]!.attempts[0]!.retired).toBe(false);
+		const again = await verifyManagedTaskAttempt({ binding, graphId: "g", nodeId: "a", owner: "owner", runner });
+		expect(again).toMatchObject({ status: "unknown", started: false });
+		expect(runs).toBe(1);
+	});
+	it("returns the durably accepted result after post-rename acceptance uncertainty", async () => {
+		const { root, binding } = await fixture();
+		await fs.writeFile(path.join(root, "result.txt"), "produced");
+		await enrollClosed(binding, node(root, "true"));
+		const rename = fs.rename;
+		let injected = false;
+		const fault = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			await rename(from, to);
+			const anchoredTarget = path.join(await fs.realpath(path.dirname(String(to))), path.basename(String(to)));
+			if (!injected && anchoredTarget === managedTaskDomainPath(root)) {
+				const persisted = JSON.parse(await fs.readFile(String(to), "utf8"));
+				const attempt = persisted.graphs[0].attempts[0];
+				if (attempt.validation === "finished" && attempt.accepted !== null) {
+					injected = true;
+					throw new Error("simulated acceptance acknowledgement loss");
+				}
+			}
+		});
+		let result: Awaited<ReturnType<typeof verifyManagedTaskAttempt>>;
+		try {
+			result = await verifyManagedTaskAttempt({
+				binding,
+				graphId: "g",
+				nodeId: "a",
+				owner: "owner",
+				runner: {
+					runValidation: async spec => ({
+						exactCommand: spec.command,
+						cwd: root,
+						exitStatus: 0,
+						pass: true,
+					}),
+					resolveCommit: async () => null,
+					commitOnBranch: async () => false,
+					prOrIssue: async () => ({ prUrl: null, issueArtifact: null }),
+				},
+			});
+		} finally {
+			fault.mockRestore();
+		}
+		expect(injected).toBe(true);
+		expect(result).toMatchObject({ status: "accepted", started: true });
+		const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8"));
+		expect(domain.graphs[0].attempts[0].validation).toBe("finished");
+		expect(domain.graphs[0].attempts[0].accepted).not.toBeNull();
+	});
+	it("returns the durably failed result after post-rename failure uncertainty", async () => {
+		const { root, binding } = await fixture();
+		await fs.writeFile(path.join(root, "result.txt"), "produced");
+		await enrollClosed(binding, node(root, "false"));
+		const rename = fs.rename;
+		let injected = false;
+		const fault = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			await rename(from, to);
+			const anchoredTarget = path.join(await fs.realpath(path.dirname(String(to))), path.basename(String(to)));
+			if (!injected && anchoredTarget === managedTaskDomainPath(root)) {
+				const persisted = JSON.parse(await fs.readFile(String(to), "utf8"));
+				const attempt = persisted.graphs[0].attempts[0];
+				if (attempt.validation === "finished" && attempt.fence === "failed") {
+					injected = true;
+					throw new Error("simulated failure acknowledgement loss");
+				}
+			}
+		});
+		let result: Awaited<ReturnType<typeof verifyManagedTaskAttempt>>;
+		try {
+			result = await verifyManagedTaskAttempt({
+				binding,
+				graphId: "g",
+				nodeId: "a",
+				owner: "owner",
+				runner: {
+					runValidation: async spec => ({
+						exactCommand: spec.command,
+						cwd: root,
+						exitStatus: 1,
+						pass: false,
+					}),
+					resolveCommit: async () => null,
+					commitOnBranch: async () => false,
+					prOrIssue: async () => ({ prUrl: null, issueArtifact: null }),
+				},
+			});
+		} finally {
+			fault.mockRestore();
+		}
+		expect(injected).toBe(true);
+		expect(result).toMatchObject({ status: "failed", started: true });
+		const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8"));
+		expect(domain.graphs[0].attempts[0].validation).toBe("finished");
+		expect(domain.graphs[0].attempts[0].fence).toBe("failed");
+		expect(domain.graphs[0].attempts[0].accepted).toBeNull();
 	});
 
 	it("rejects a failed validation and retires the quiescent attempt", async () => {

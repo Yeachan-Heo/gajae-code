@@ -312,15 +312,15 @@ describe("managed native recovery (M3)", () => {
 					nodeIds: ["a"],
 				}),
 			).toMatchObject({ ok: false });
-			expect(
-				await request(ws, "cancel-a", "task.dag", {
-					...auth,
-					action: "cancel",
-					graphId: "a",
-					expectedRevision: liveRevision,
-					nodeIds: ["a"],
-				}),
-			).toMatchObject({ ok: true });
+			const cancellation = await request(ws, "cancel-a", "task.dag", {
+				...auth,
+				action: "cancel",
+				graphId: "a",
+				expectedRevision: liveRevision,
+				nodeIds: ["a"],
+			});
+			expect(cancellation).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(closes.count).toBe(1);
 			const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
 				graphs: Array<{ attempts: Array<{ worker: string; retired: boolean; fence: string }> }>;
 			};

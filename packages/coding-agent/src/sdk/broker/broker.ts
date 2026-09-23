@@ -42,6 +42,7 @@ import {
 	deriveIdempotencyIdentity,
 	deriveLegacyIdentity,
 	deriveLegacyTargetIdentity,
+	deriveScopedIdempotencyIdentity,
 	getBrokerIdentityKey,
 } from "./identity";
 import {
@@ -65,6 +66,7 @@ import {
 	createManagedDomainBinding,
 	currentManagedRevision,
 	defineManagedTaskGraph,
+	inspectManagedAttemptByNativeIdentity,
 	loadManagedDomainBinding,
 	loadManagedEnrollmentRecord,
 	lookupManagedAttemptByNativeIdentity,
@@ -76,6 +78,9 @@ import {
 	managedIdentity,
 	managedNativeVector,
 	managedTaskDomainPath,
+	markManagedEnrollmentEstablished,
+	markManagedEnrollmentPending,
+	markManagedEnrollmentPublishing,
 	observeOrAdmitManagedTask,
 	recordManagedEnrollment,
 	recordManagedNativeObservation,
@@ -552,6 +557,23 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+const MANAGED_CLOSE_WAIT_MS = 10_000;
+
+function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	const settled = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => settled.resolve(false), timeoutMs);
+	void promise.then(
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+		() => {
+			clearTimeout(timer);
+			settled.resolve(true);
+		},
+	);
+	return settled.promise;
+}
 
 /** The five legs every usable pin must carry; a partial pin is missing authority. */
 type CompleteSpawnPinAuthority = SpawnAuthorityV1 & {
@@ -1424,6 +1446,7 @@ const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublica
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
 const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
 const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
+const managedCloseWaitOverridesForTest = new WeakMap<Broker, number>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -1554,7 +1577,7 @@ export class Broker {
 				admission.masterCapability = "";
 			}
 			if (!verified.allowed) return finish(error("spawn_failed", "master capability verification was denied"));
-			const managedDenied = await this.#denyOrdinaryManagedSpawn(lifecycleIdentity);
+			const managedDenied = await this.#denyOrdinaryManagedSpawn(lifecycleIdentity, idempotencyKey!);
 			if (managedDenied) return finish(managedDenied);
 			return finish(
 				await this.#driveVerifiedSpawn(lifecycleIdentity, admission, inFlight, owner => {
@@ -1570,7 +1593,7 @@ export class Broker {
 			if (becameOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
 		}
 	}
-	async #denyOrdinaryManagedSpawn(lifecycleIdentity: string): Promise<BrokerResponse | undefined> {
+	async #denyOrdinaryManagedSpawn(lifecycleIdentity: string, callerKey: string): Promise<BrokerResponse | undefined> {
 		if (this.#managedAttempts.has(lifecycleIdentity))
 			return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
 		if (this.#managedEnrollmentFailed) return error("spawn_failed", "managed enrollment membership is unprovable");
@@ -1585,12 +1608,21 @@ export class Broker {
 		for (const root of enrolled.controlRoots) {
 			if (this.#managedFailedRoots.has(root)) continue;
 			try {
+				const scopedIdentity = await deriveScopedIdempotencyIdentity(
+					this.settings.agentDir,
+					"session.spawn",
+					callerKey,
+					root,
+				);
+				if (this.#managedAttempts.has(scopedIdentity) || enrolled.nativeIdentities.includes(scopedIdentity))
+					return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
 				const read = await readExistingStateForMutation(managedTaskDomainPath(root));
 				if (read.kind !== "valid") continue;
-				const attempt = lookupManagedAttemptByNativeIdentity(
-					validateManagedTaskDomain(read.value),
-					lifecycleIdentity,
-				);
+				const state = validateManagedTaskDomain(read.value);
+				const attempt =
+					lookupManagedAttemptByNativeIdentity(state, lifecycleIdentity) ??
+					lookupManagedAttemptByNativeIdentity(state, scopedIdentity) ??
+					state.graphs.flatMap(graph => graph.attempts).find(item => item.native.key === callerKey);
 				if (attempt) return error("spawn_failed", "managed native identity cannot re-enter ordinary session.spawn");
 			} catch {}
 		}
@@ -1679,6 +1711,8 @@ export class Broker {
 			}
 		}
 		if (!decision) return error("spawn_failed", "session.spawn admission could not be durably established");
+		if (decision.kind === "managed_key_conflict")
+			return error("idempotency_conflict", "idempotency key is reserved by a managed task.dag attempt");
 		if (decision.kind === "idempotency_conflict")
 			return error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim");
 		if (decision.kind === "in_progress")
@@ -1818,9 +1852,9 @@ export class Broker {
 				worktrees: auth.worktrees,
 				...(auth.aliases ? { aliases: auth.aliases } : {}),
 			});
-			let rootWasEnrolled = false;
+			let rootWasEstablished = false;
 			try {
-				rootWasEnrolled = (await loadManagedEnrollmentRecord(this.settings.agentDir)).controlRoots.includes(
+				rootWasEstablished = (await loadManagedEnrollmentRecord(this.settings.agentDir)).establishedRoots.includes(
 					binding.controlRoot,
 				);
 			} catch {
@@ -1843,8 +1877,23 @@ export class Broker {
 									} catch {
 										throw new Error("native managed evidence exists");
 									}
-									if (rootWasEnrolled || (enrolled.byRoot[binding.controlRoot] ?? []).length > 0)
+									if (
+										rootWasEstablished ||
+										enrolled.establishedRoots.includes(binding.controlRoot) ||
+										enrolled.publishingRoots.includes(binding.controlRoot) ||
+										(enrolled.byRoot[binding.controlRoot] ?? []).length > 0
+									)
 										throw new Error("native managed evidence exists");
+									await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot);
+								},
+								beforeFirstPublication: async () => {
+									await markManagedEnrollmentPublishing(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublication: async () => {
+									await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
+								},
+								onFirstPublicationAborted: async () => {
+									await markManagedEnrollmentPending(this.settings.agentDir, binding.controlRoot);
 								},
 							}
 						: {}),
@@ -1856,6 +1905,7 @@ export class Broker {
 						nodes: input.nodes,
 					}),
 			);
+			await markManagedEnrollmentEstablished(this.settings.agentDir, binding.controlRoot);
 			return {
 				ok: true,
 				result: {
@@ -1892,11 +1942,18 @@ export class Broker {
 				worktrees: auth.worktrees,
 				...(auth.aliases ? { aliases: auth.aliases } : {}),
 			});
-			const nativeIdentity = await deriveIdempotencyIdentity(
+			const scopedIdentity = await deriveScopedIdempotencyIdentity(
 				this.settings.agentDir,
 				"session.spawn",
 				idempotencyKey,
+				binding.controlRoot,
 			);
+			const ordinaryAliases = await Promise.all([
+				deriveIdempotencyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+				deriveLegacyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey),
+			]);
+			const authority = this.#spawnAuthority;
+			if (!authority) return error("unavailable", "spawn authority is unavailable");
 			const requestHash = managedIdentity({
 				graphId: input.graphId,
 				nodeId: input.nodeId,
@@ -1913,13 +1970,36 @@ export class Broker {
 					const workspace = path.resolve(node.definition.workspace);
 					if (typeof input.cwd === "string" && input.cwd.length > 0 && path.resolve(input.cwd) !== workspace)
 						throw new Error("cwd must match admitted workspace");
-					return observeOrAdmitManagedTask(state, {
+					const prior = state.graphs
+						.flatMap(item => item.attempts)
+						.find(
+							attempt =>
+								!attempt.retired &&
+								attempt.native.key === idempotencyKey &&
+								attempt.native.requestHash === requestHash &&
+								attempt.nodeId === input.nodeId &&
+								attempt.id === `attempt-${idempotencyKey}`,
+						);
+					const admitted = await observeOrAdmitManagedTask(state, {
 						graphId: graph.id,
 						owner: auth.ownerSessionId,
 						nodeId: input.nodeId as string,
 						attemptId: `attempt-${idempotencyKey}`,
-						native: { key: idempotencyKey, identity: nativeIdentity, requestHash },
+						native: {
+							key: idempotencyKey,
+							identity: prior?.native.identity ?? scopedIdentity,
+							requestHash,
+						},
 					});
+					if (
+						!(await authority.reserveManagedKeyAliases(
+							ordinaryAliases,
+							admitted.nativeIdentity,
+							binding.controlRoot,
+						))
+					)
+						throw new Error("idempotency key conflicts with an existing ordinary session.spawn claim");
+					return admitted;
 				},
 			);
 			const attemptRef = reserved.result;
@@ -1955,6 +2035,7 @@ export class Broker {
 			this.#spawnInFlight.set(attemptRef.nativeIdentity, inFlight);
 			this.#spawnTasks.set(inFlight, spawnAdmission.task);
 			let becameOwner = false;
+			let completionResult: BrokerResponse = error("spawn_failed", "managed advance did not complete");
 			try {
 				const driven = await this.#driveVerifiedSpawn(
 					attemptRef.nativeIdentity,
@@ -1964,7 +2045,7 @@ export class Broker {
 						becameOwner = owner;
 					},
 				);
-				completion.resolve(driven);
+				completionResult = driven;
 				if (!driven.ok) return driven;
 				const liveRevision = await currentManagedRevision(binding);
 				return {
@@ -1977,6 +2058,7 @@ export class Broker {
 					},
 				};
 			} finally {
+				completion.resolve(completionResult);
 				this.#spawnTasks.delete(inFlight);
 				this.#spawnInFlight.delete(attemptRef.nativeIdentity);
 				if (becameOwner) await this.#spawnAuthority?.releaseOwner(attemptRef.nativeIdentity);
@@ -2038,7 +2120,8 @@ export class Broker {
 					return reviseManagedTaskGraph(state, graph, input.nodes);
 				},
 			);
-			await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after graph revision");
 			return {
 				ok: true,
 				result: {
@@ -2077,7 +2160,8 @@ export class Broker {
 					return cancelManagedTasks(graph, ids);
 				},
 			);
-			await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result);
+			if (!(await this.#closeManagedAttempts(binding.controlRoot, input.graphId as string, result.result)))
+				return error("terminal_uncertain", "managed child close remains unresolved after cancellation");
 			return {
 				ok: true,
 				result: {
@@ -2333,6 +2417,56 @@ export class Broker {
 						substrateProof: launched.proof,
 					})
 				).claim;
+				inFlight.phase = current.state;
+				if (admission.managedAttempt && admission.managedBinding) {
+					let attempt: ManagedTaskAttempt | undefined;
+					try {
+						attempt = await inspectManagedAttemptByNativeIdentity(
+							admission.managedBinding,
+							admission.managedAttempt.nativeIdentity,
+						);
+					} catch {
+						// A failed fence read cannot prove the launch is still authorized.
+					}
+					if (attempt?.fence !== "current" || attempt?.retired) {
+						const release = await this.#releaseUnownedSubstrate(provider, launched.proof);
+						let gone = release === "gone";
+						if (release === "closed") {
+							try {
+								gone = (await provider.verify(launched.proof)) === "gone";
+							} catch {
+								gone = false;
+							}
+						}
+						if (gone) {
+							current = (
+								await store.persistTransition(lifecycleIdentity, {
+									claimId: current.claimId,
+									from: "substrate_starting",
+									to: "closed",
+								})
+							).claim;
+							inFlight.phase = current.state;
+							launchedProof = undefined;
+							return error("spawn_failed", "managed attempt was fenced while its child was launching");
+						}
+						current = (
+							await store.persistTransition(lifecycleIdentity, {
+								claimId: current.claimId,
+								from: "substrate_starting",
+								to: "uncertain",
+								failure: {
+									substrateKind: launched.proof.substrateKind,
+									code: "managed_child_close_unresolved",
+									message: "managed child close could not be proven after its attempt was fenced",
+								},
+							})
+						).claim;
+						inFlight.phase = current.state;
+						launchedProof = undefined;
+						return error("terminal_uncertain", "managed child close is unresolved after its attempt was fenced");
+					}
+				}
 				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
 				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
@@ -2862,7 +2996,41 @@ export class Broker {
 		if (!store || this.#managedEnrollmentFailed) return;
 		for (const ref of this.#managedAttempts.values()) {
 			if (this.#managedFailedRoots.has(ref.controlRoot)) continue;
+			const binding = await loadManagedDomainBinding(ref.controlRoot);
+			if (!binding) throw new Error("managed attempt domain is unavailable during startup reconciliation");
+			const attempt = await inspectManagedAttemptByNativeIdentity(binding, ref.nativeIdentity);
+			if (!attempt) throw new Error("managed attempt authority is missing during startup reconciliation");
 			const claim = store.claim(ref.nativeIdentity);
+			if (attempt.fence !== "current" || attempt.retired) {
+				if (!claim) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "prepared") {
+					await store.persistTransition(ref.nativeIdentity, {
+						claimId: claim.claimId,
+						from: "prepared",
+						to: "closed",
+					});
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "closed" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				if (claim.state === "pre_send_rejected" && !store.authority(ref.nativeIdentity) && !claim.substrateProof) {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+					continue;
+				}
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome !== "closed") {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					throw new Error("fenced managed child could not be exactly closed during startup reconciliation");
+				}
+				await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				continue;
+			}
 			if (!claim) {
 				await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
 				continue;
@@ -2873,13 +3041,18 @@ export class Broker {
 			}
 			if (claim.state === "closed") {
 				const authority = store.authority(ref.nativeIdentity);
-				if (authority?.closeState === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				if (authority?.closeState === "closed" || (!authority && claim.substrateProof))
+					await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
 				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
 				continue;
 			}
 			if (claim.state === "pre_send_rejected") {
 				const authority = store.authority(ref.nativeIdentity);
-				if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				if (!authority && claim.substrateProof) {
+					const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+					await this.#observeManagedNative(ref.nativeIdentity, outcome === "closed" ? "closed" : "unknown");
+				} else if (!authority) await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
 				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
 				continue;
 			}
@@ -2888,15 +3061,52 @@ export class Broker {
 		}
 	}
 
-	async #closeManagedAttempts(controlRoot: string, graphId: string, nodeIds: string[]): Promise<void> {
+	async #closeManagedAttempts(controlRoot: string, graphId: string, nodeIds: string[]): Promise<boolean> {
 		const affected = [...this.#managedAttempts.values()].filter(
 			ref => ref.controlRoot === controlRoot && ref.graphId === graphId && nodeIds.includes(ref.nodeId),
 		);
+		let allClosed = true;
 		for (const ref of affected) {
+			const inFlight = this.#spawnInFlight.get(ref.nativeIdentity);
+			const waitMs = managedCloseWaitOverridesForTest.get(this) ?? MANAGED_CLOSE_WAIT_MS;
+			if (inFlight && !(await settlesWithin(inFlight.completion, waitMs))) {
+				this.#scheduleManagedCloseAfterFlight(ref, inFlight);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+				continue;
+			}
+			const claim = this.#spawnAuthority?.claim(ref.nativeIdentity);
+			const authority = this.#spawnAuthority?.authority(ref.nativeIdentity);
+			if (!claim || (claim.state === "pre_send_rejected" && !authority && !claim.substrateProof)) {
+				try {
+					await this.#observeManagedNative(ref.nativeIdentity, "no-effect");
+				} catch {
+					await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+					allClosed = false;
+				}
+				continue;
+			}
 			const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
 			if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
-			else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+			else {
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+				allClosed = false;
+			}
 		}
+		return allClosed;
+	}
+
+	#scheduleManagedCloseAfterFlight(ref: ManagedAttemptRef, inFlight: SpawnInFlight): void {
+		void inFlight.completion
+			.then(async () => {
+				const outcome = await this.#closeSpawnAuthority(ref.nativeIdentity);
+				if (outcome === "closed") await this.#observeManagedNative(ref.nativeIdentity, "closed");
+				else await this.#observeManagedNative(ref.nativeIdentity, "unknown");
+			})
+			.catch(async caught => {
+				logger.warn(`sdk broker: deferred managed child close failed for ${ref.nativeIdentity}: ${String(caught)}`);
+				await this.#observeManagedNative(ref.nativeIdentity, "unknown").catch(() => undefined);
+			});
 	}
 
 	async #awaitSpawnHostRegistration(input: {
@@ -3110,8 +3320,47 @@ export class Broker {
 		try {
 			const claim = store.claim(lifecycleIdentity);
 			let authority = store.authority(lifecycleIdentity);
-			if (!claim || !authority) return "retained";
-			if (claim.state === "closed" && authority.closeState === "closed") return "closed";
+			if (!claim) return "retained";
+			if (claim.state === "closed" && (!authority || authority.closeState === "closed")) return "closed";
+			if (!authority) {
+				if (!claim.substrateProof || !claim.childId) return "retained";
+				const provider = this.#spawnSubstrateProvider();
+				const proof = claim.substrateProof;
+				let verdict: "verified" | "mismatch" | "gone";
+				try {
+					verdict = await provider.verify(proof);
+				} catch {
+					verdict = "mismatch";
+				}
+				let gone = verdict === "gone";
+				if (verdict === "verified") {
+					try {
+						gone = (await provider.close(proof)).ok && (await provider.verify(proof)) === "gone";
+					} catch {
+						gone = false;
+					}
+				}
+				if (!gone) {
+					if (claim.state !== "uncertain")
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: claim.claimId,
+							from: claim.state,
+							to: "uncertain",
+							failure: {
+								substrateKind: proof.substrateKind,
+								code: "child_close_unresolved",
+								message: "session.spawn child close could not be proven",
+							},
+						});
+					return verdict === "mismatch" ? "uncertain" : "retained";
+				}
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: claim.claimId,
+					from: claim.state,
+					to: "closed",
+				});
+				return "closed";
+			}
 			if (authority.closeState === "closed") return "closed";
 			const provider = this.#spawnSubstrateProvider();
 			const proof = spawnProofFromAuthority(authority);
@@ -4695,6 +4944,12 @@ export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | un
 export function setLivenessGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) livenessGraceOverridesForTest.delete(broker);
 	else livenessGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only hook for shortening the bounded wait before a deferred managed close is queued. */
+export function setManagedCloseWaitForTest(broker: Broker, waitMs: number | undefined): void {
+	if (waitMs === undefined) managedCloseWaitOverridesForTest.delete(broker);
+	else managedCloseWaitOverridesForTest.set(broker, Math.max(0, waitMs));
 }
 
 /**

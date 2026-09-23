@@ -125,8 +125,8 @@ describe("SpawnAuthorityStore", () => {
 		const second = store.claimOrJoin("identity", bindingMac);
 		gate.resolve();
 		const [owner, joiner] = await Promise.all([first, second]);
-		expect(owner.kind).toBe("owner");
-		expect(joiner.kind).toBe("in_progress");
+		if (owner.kind !== "owner") throw new Error("expected owner claim");
+		if (joiner.kind !== "in_progress") throw new Error("expected in-progress joiner");
 		expect(owner.claim.claimId).toBe(joiner.claim.claimId);
 		expect(owner.claim).toMatchObject({ state: "prepared", preSendLease: { status: "owned" } });
 		expect((await Bun.file(store.file).text()).split("\n").filter(Boolean)).toHaveLength(1);
@@ -139,8 +139,8 @@ describe("SpawnAuthorityStore", () => {
 		const initial = await store.claimOrJoin("identity", bindingMac);
 		await store.releaseOwner("identity");
 		const conflict = await store.claimOrJoin("identity", "c".repeat(64));
-		expect(initial.kind).toBe("owner");
-		expect(conflict.kind).toBe("idempotency_conflict");
+		if (initial.kind !== "owner") throw new Error("expected initial owner claim");
+		if (conflict.kind !== "idempotency_conflict") throw new Error("expected idempotency conflict");
 		expect(conflict.claim).toEqual(initial.claim);
 		expect((await Bun.file(store.file).text()).split("\n").filter(Boolean)).toHaveLength(1);
 	});

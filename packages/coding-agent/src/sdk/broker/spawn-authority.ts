@@ -170,12 +170,22 @@ export type SpawnClaimDecision =
 	| { kind: "replay"; claim: SpawnClaimV2 }
 	| { kind: "terminal"; claim: SpawnClaimV2 }
 	| { kind: "terminal_uncertain"; claim: SpawnClaimV2 }
-	| { kind: "idempotency_conflict"; claim: SpawnClaimV2 };
+	| { kind: "idempotency_conflict"; claim: SpawnClaimV2 }
+	| { kind: "managed_key_conflict" };
 
 type StoredClaim = {
 	version: 1;
 	claim: SpawnClaimV2;
 	authority?: SpawnAuthorityV1;
+	integrity: string;
+};
+
+type ManagedKeyReservation = {
+	version: 1;
+	kind: "managed_key_reservation";
+	aliasIdentities: string[];
+	managedIdentity: string;
+	controlRoot: string;
 	integrity: string;
 };
 
@@ -560,6 +570,8 @@ export class SpawnAuthorityStore {
 	readonly #options: SpawnAuthorityStoreOptions;
 	readonly #latest = new Map<string, SpawnClaimV2>();
 	readonly #authorities = new Map<string, SpawnAuthorityV1>();
+	readonly #managedKeyAliases = new Map<string, Map<string, string>>();
+	readonly #managedIdentityBindings = new Map<string, { aliasIdentities: string[]; controlRoot: string }>();
 	readonly #active = new Set<string>();
 	#tail: Promise<void> = Promise.resolve();
 
@@ -592,6 +604,8 @@ export class SpawnAuthorityStore {
 			await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
 			this.#latest.clear();
 			this.#authorities.clear();
+			this.#managedKeyAliases.clear();
+			this.#managedIdentityBindings.clear();
 			let source = "";
 			try {
 				source = await Bun.file(this.#file).text();
@@ -606,6 +620,12 @@ export class SpawnAuthorityStore {
 				} catch {
 					throw new Error("Spawn authority journal contains malformed durable evidence.");
 				}
+				if (this.#isManagedKeyReservation(row)) {
+					const reservation = row as ManagedKeyReservation;
+					if (!this.#rememberManagedKeyReservation(reservation))
+						throw new Error("Spawn authority journal managed key history is invalid.");
+					continue;
+				}
 				if (!this.#isStoredClaim(row))
 					throw new Error("Spawn authority journal contains invalid durable evidence.");
 				const stored = row as StoredClaim;
@@ -616,6 +636,52 @@ export class SpawnAuthorityStore {
 				if (stored.authority) this.#authorities.set(stored.claim.lifecycleIdentity, stored.authority);
 				else this.#authorities.delete(stored.claim.lifecycleIdentity);
 			}
+			for (const alias of this.#managedKeyAliases.keys())
+				if (this.#latest.has(alias)) throw new Error("Spawn authority journal aliases an ordinary claim.");
+		});
+	}
+
+	/**
+	 * Durably reserves an ordinary session.spawn idempotency identity for one
+	 * managed native identity. Multiple managed roots may share the alias, but an
+	 * ordinary claim and a managed reservation can never both win.
+	 */
+	async reserveManagedKeyAliases(
+		aliasIdentities: readonly string[],
+		managedIdentity: string,
+		controlRoot: string,
+	): Promise<boolean> {
+		const aliases = [...new Set(aliasIdentities)].sort();
+		if (
+			aliases.length === 0 ||
+			aliases.some(identity => !/^[0-9a-f]{64}$/i.test(identity)) ||
+			!/^[0-9a-f]{64}$/i.test(managedIdentity) ||
+			!path.isAbsolute(controlRoot) ||
+			path.normalize(controlRoot) !== controlRoot
+		)
+			throw new Error("Invalid managed spawn key reservation.");
+		return await this.#serial(async () => {
+			if (aliases.some(alias => this.#latest.has(alias))) return false;
+			const prior = this.#managedIdentityBindings.get(managedIdentity);
+			if (prior)
+				return prior.controlRoot === controlRoot && canonicalJson(prior.aliasIdentities) === canonicalJson(aliases);
+			for (const alias of aliases) {
+				const roots = this.#managedKeyAliases.get(alias);
+				const existingRoot = roots?.get(managedIdentity);
+				if (existingRoot !== undefined && existingRoot !== controlRoot) return false;
+			}
+			const reservation: ManagedKeyReservation = {
+				version: 1,
+				kind: "managed_key_reservation",
+				aliasIdentities: aliases,
+				managedIdentity,
+				controlRoot,
+				integrity: "",
+			};
+			reservation.integrity = this.#managedKeyReservationIntegrity(reservation);
+			await this.#appendRow(reservation);
+			this.#rememberManagedKeyReservation(reservation);
+			return true;
 		});
 	}
 
@@ -632,6 +698,7 @@ export class SpawnAuthorityStore {
 		)
 			throw new Error("Invalid opaque spawn claim key.");
 		return await this.#serial(async () => {
+			if (this.#managedKeyAliases.has(lifecycleIdentity)) return { kind: "managed_key_conflict" };
 			const current = this.#latest.get(lifecycleIdentity);
 			if (!current) {
 				if (bindingMac === undefined) throw new Error("A canonical spawn binding is required for a new claim.");
@@ -964,6 +1031,68 @@ export class SpawnAuthorityStore {
 			.digest("hex");
 	}
 
+	#managedKeyReservationIntegrity(reservation: ManagedKeyReservation): string {
+		const { integrity: _integrity, ...facts } = reservation;
+		return createHmac("sha256", this.#identityKey).update(canonicalJson(facts)).digest("hex");
+	}
+
+	#isManagedKeyReservation(value: unknown): value is ManagedKeyReservation {
+		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+		const row = value as Partial<ManagedKeyReservation>;
+		return (
+			Object.keys(row).every(
+				key =>
+					key === "version" ||
+					key === "kind" ||
+					key === "aliasIdentities" ||
+					key === "managedIdentity" ||
+					key === "controlRoot" ||
+					key === "integrity",
+			) &&
+			row.version === 1 &&
+			row.kind === "managed_key_reservation" &&
+			Array.isArray(row.aliasIdentities) &&
+			row.aliasIdentities.length > 0 &&
+			row.aliasIdentities.every(identity => typeof identity === "string" && /^[0-9a-f]{64}$/i.test(identity)) &&
+			new Set(row.aliasIdentities).size === row.aliasIdentities.length &&
+			canonicalJson(row.aliasIdentities) === canonicalJson([...row.aliasIdentities].sort()) &&
+			typeof row.managedIdentity === "string" &&
+			/^[0-9a-f]{64}$/i.test(row.managedIdentity) &&
+			typeof row.controlRoot === "string" &&
+			path.isAbsolute(row.controlRoot) &&
+			path.normalize(row.controlRoot) === row.controlRoot &&
+			typeof row.integrity === "string" &&
+			/^[0-9a-f]{64}$/i.test(row.integrity) &&
+			timingSafeEqual(
+				Buffer.from(row.integrity, "hex"),
+				Buffer.from(this.#managedKeyReservationIntegrity(row as ManagedKeyReservation), "hex"),
+			)
+		);
+	}
+
+	#rememberManagedKeyReservation(reservation: ManagedKeyReservation): boolean {
+		const prior = this.#managedIdentityBindings.get(reservation.managedIdentity);
+		if (
+			prior &&
+			(prior.controlRoot !== reservation.controlRoot ||
+				canonicalJson(prior.aliasIdentities) !== canonicalJson(reservation.aliasIdentities))
+		)
+			return false;
+		if (prior) return false;
+		this.#managedIdentityBindings.set(reservation.managedIdentity, {
+			aliasIdentities: [...reservation.aliasIdentities],
+			controlRoot: reservation.controlRoot,
+		});
+		for (const alias of reservation.aliasIdentities) {
+			const roots = this.#managedKeyAliases.get(alias) ?? new Map<string, string>();
+			const existingRoot = roots.get(reservation.managedIdentity);
+			if (existingRoot !== undefined && existingRoot !== reservation.controlRoot) return false;
+			roots.set(reservation.managedIdentity, reservation.controlRoot);
+			this.#managedKeyAliases.set(alias, roots);
+		}
+		return true;
+	}
+
 	#isStoredClaim(value: unknown): value is StoredClaim {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 		const row = value as Partial<StoredClaim>;
@@ -989,6 +1118,13 @@ export class SpawnAuthorityStore {
 			throw new Error("Refusing to persist invalid spawn authority evidence.");
 		const write: SpawnAuthorityDurableWrite = { claim, ...(authority === undefined ? {} : { authority }) };
 		const row: StoredClaim = { version: 1, ...write, integrity: this.#integrity(claim, authority) };
+		await this.#appendRow(row, write);
+		this.#latest.set(claim.lifecycleIdentity, claim);
+		if (authority) this.#authorities.set(claim.lifecycleIdentity, authority);
+		else this.#authorities.delete(claim.lifecycleIdentity);
+	}
+
+	async #appendRow(row: unknown, write?: SpawnAuthorityDurableWrite): Promise<void> {
 		// The row is appended before the durability barrier, so a barrier failure
 		// can leave a physically written line that in-memory state never accepted.
 		// A retry would then append a second row for the same claim and reopen
@@ -1009,13 +1145,13 @@ export class SpawnAuthorityStore {
 		try {
 			try {
 				await handle.writeFile(`${canonicalJson(row)}\n`);
-				await this.#options.beforeSyncForTest?.(write);
+				if (write) await this.#options.beforeSyncForTest?.(write);
 				await handle.sync();
 				// The parent-directory barrier belongs INSIDE the rolled-back region:
 				// a throw here would otherwise leave a durable row that in-memory
 				// state never accepted, and the retry would append a duplicate that
 				// makes the journal unreopenable.
-				await this.#options.beforeDirectorySyncForTest?.(write);
+				if (write) await this.#options.beforeDirectorySyncForTest?.(write);
 				const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
 				try {
 					await directory.sync();
@@ -1039,10 +1175,7 @@ export class SpawnAuthorityStore {
 		} finally {
 			await handle.close();
 		}
-		this.#latest.set(claim.lifecycleIdentity, claim);
-		if (authority) this.#authorities.set(claim.lifecycleIdentity, authority);
-		else this.#authorities.delete(claim.lifecycleIdentity);
-		await this.#options.afterSyncForTest?.(write);
+		if (write) await this.#options.afterSyncForTest?.(write);
 	}
 
 	async #serial<T>(operation: () => Promise<T>): Promise<T> {

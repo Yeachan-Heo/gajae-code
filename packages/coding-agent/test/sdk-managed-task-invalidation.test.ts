@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	admitManagedTask,
-	assertManagedManifestCurrent,
 	cancelManagedTasks,
 	canRetireManagedAttempt,
 	createManagedDomainBinding,
@@ -151,6 +150,24 @@ describe("managed invalidation (M5)", () => {
 		const output = path.join(workspace, "result.txt");
 		const report = path.join(workspace, "report.json");
 		await fs.writeFile(output, "produced");
+		await fs.writeFile(report, "cache-original");
+		const successor = async (id: string): Promise<ManagedTaskDefinition> => {
+			const base = await writerNode(root, id, ["a"]);
+			const successorOutput = path.join(base.workspace, "result.txt");
+			return {
+				...base,
+				workspace: root,
+				resources: [
+					{ kind: "path", path: output, mode: "read", recursive: false, namespace: false },
+					{ kind: "path", path: successorOutput, mode: "write", recursive: false, namespace: false },
+					{ kind: "path", path: base.workspace, mode: "write", recursive: false, namespace: true },
+				],
+				artifacts: [
+					{ path: output, role: "input", presence: "required" },
+					{ path: successorOutput, role: "output", presence: "required" },
+				],
+			};
+		};
 		await enroll(binding, [
 			await writerNode(root, "a", [], {
 				resources: [
@@ -163,6 +180,8 @@ describe("managed invalidation (M5)", () => {
 					{ path: report, role: "validation-output", presence: "optional" },
 				],
 			}),
+			await successor("b"),
+			await successor("c"),
 		]);
 		await transactManagedTaskDomain({ binding, expectedRevision: 1 }, async state => {
 			await admitManagedTask(state, {
@@ -177,14 +196,28 @@ describe("managed invalidation (M5)", () => {
 		expect((await verifyManagedTaskAttempt({ binding, graphId: "g", nodeId: "a", owner: "owner" })).status).toBe(
 			"accepted",
 		);
-		const domain = JSON.parse(
-			await fs.readFile(path.join(root, ".gjc", "managed-task-domain", "state.json"), "utf8"),
+		await fs.writeFile(report, "cache-updated");
+		await transactManagedTaskDomain({ binding, expectedRevision: await currentManagedRevision(binding) }, state =>
+			admitManagedTask(state, {
+				graphId: "g",
+				owner: "owner",
+				nodeId: "b",
+				attemptId: "attempt-b",
+				native: native("b"),
+			}),
 		);
-		const produced = domain.graphs[0].attempts[0].produced;
-		await fs.writeFile(report, "cache");
-		await assertManagedManifestCurrent(binding, produced);
 		await fs.writeFile(output, "drift");
-		await expect(assertManagedManifestCurrent(binding, produced)).rejects.toThrow("drift");
+		await expect(
+			transactManagedTaskDomain({ binding, expectedRevision: await currentManagedRevision(binding) }, state =>
+				admitManagedTask(state, {
+					graphId: "g",
+					owner: "owner",
+					nodeId: "c",
+					attemptId: "attempt-c",
+					native: native("c"),
+				}),
+			),
+		).rejects.toThrow("content drift");
 	});
 
 	it("fences in-flight verify so a late runner cannot mint stale PASS", async () => {

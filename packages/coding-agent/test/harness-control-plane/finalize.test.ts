@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -398,7 +399,7 @@ describe("defaultFinalizeChecks.runValidation (async runner)", () => {
 		try {
 			const run = await checks.runValidation({
 				name: "drain",
-				command: "python3 -c \"import sys; sys.stdout.write('o'*200000); sys.stderr.write('e'*200000)\"",
+				command: "python3 -c \"import sys; sys.stdout.write('o'*200000); sys.stderr.write('e'*200000)\"; sleep 0.1",
 			});
 			expect(run.exactCommand).toContain("python3");
 			expect(run.cwd).toBe(root);
@@ -407,6 +408,92 @@ describe("defaultFinalizeChecks.runValidation (async runner)", () => {
 			expect(ticks).toBeGreaterThan(0);
 		} finally {
 			clearInterval(timer);
+		}
+	});
+
+	it("terminates a validator's child process group when its owner cancels it", async () => {
+		const checks = defaultFinalizeChecks(root);
+		const pidFile = path.join(root, "validation-child.pid");
+		const controller = new AbortController();
+		const run = checks.runValidation(
+			{ name: "cancel-tree", command: `sleep 30 & echo $! > '${pidFile}'; wait` },
+			controller.signal,
+		);
+		let childPid: number | undefined;
+		for (let attempt = 0; attempt < 100 && childPid === undefined; attempt++) {
+			try {
+				const parsed = Number((await readFile(pidFile, "utf8")).trim());
+				if (Number.isSafeInteger(parsed) && parsed > 0) childPid = parsed;
+			} catch {}
+			if (childPid === undefined) await Bun.sleep(10);
+		}
+		expect(childPid).toBeDefined();
+		controller.abort(new Error("owner stopped"));
+		await expect(run).rejects.toBeInstanceOf(ValidationObservationUncertainError);
+
+		const childAlive = (): boolean => {
+			if (process.platform === "linux") {
+				try {
+					const stat = readFileSync(`/proc/${childPid}/stat`, "utf8");
+					const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+					return state !== "Z" && state !== "X";
+				} catch (error) {
+					return (error as NodeJS.ErrnoException).code !== "ENOENT";
+				}
+			}
+			try {
+				process.kill(childPid as number, 0);
+				return true;
+			} catch (error) {
+				return (error as NodeJS.ErrnoException).code !== "ESRCH";
+			}
+		};
+		for (let attempt = 0; attempt < 100 && childAlive(); attempt++) await Bun.sleep(10);
+		expect(childAlive()).toBe(false);
+	});
+
+	it("does not report validator group cleanup while Linux process identity is unverified", async () => {
+		if (process.platform !== "linux") return;
+		const checks = defaultFinalizeChecks(root, () => ({ kind: "unverifiable", reason: "permission_denied" }));
+		const pidFile = path.join(root, "unverified-validation-child.pid");
+		const controller = new AbortController();
+		let childPid: number | undefined;
+		const run = checks.runValidation(
+			{ name: "unverified-cancel", command: `sleep 0.5 & echo $! > '${pidFile}'; wait` },
+			controller.signal,
+		);
+		let settled = false;
+		void run.catch(() => {
+			settled = true;
+		});
+		try {
+			for (let attempt = 0; attempt < 100 && childPid === undefined; attempt++) {
+				try {
+					const parsed = Number((await readFile(pidFile, "utf8")).trim());
+					if (Number.isSafeInteger(parsed) && parsed > 0) childPid = parsed;
+				} catch {}
+				if (childPid === undefined) await Bun.sleep(10);
+			}
+			expect(childPid).toBeDefined();
+			controller.abort(new Error("owner stopped"));
+			await Bun.sleep(100);
+			expect(settled).toBe(false);
+			if (childPid === undefined) throw new Error("validator child did not start");
+			const childStat = await readFile(`/proc/${childPid}/stat`, "utf8");
+			const state = childStat.slice(childStat.lastIndexOf(")") + 2).split(" ")[0];
+			expect(state).not.toBe("Z");
+			expect(state).not.toBe("X");
+			await expect(run).rejects.toBeInstanceOf(ValidationObservationUncertainError);
+			expect(settled).toBe(true);
+			await expect(readFile(`/proc/${childPid}/stat`, "utf8")).rejects.toThrow();
+		} finally {
+			controller.abort(new Error("test cleanup"));
+			if (childPid !== undefined) {
+				try {
+					process.kill(childPid, "SIGKILL");
+				} catch {}
+			}
+			await run.catch(() => undefined);
 		}
 	});
 });

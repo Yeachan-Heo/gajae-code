@@ -2,9 +2,27 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
-import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
-import { managedIdentity, managedTaskDomainPath, recordManagedEnrollment } from "../src/sdk/broker/managed-task-dag";
+import { Broker, setManagedCloseWaitForTest } from "../src/sdk/broker/broker";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveScopedIdempotencyIdentity,
+	getBrokerIdentityKey,
+} from "../src/sdk/broker/identity";
+import {
+	cancelManagedTasks,
+	createManagedDomainBinding,
+	defineManagedTaskGraph,
+	loadManagedEnrollmentRecord,
+	managedEnrollmentIndexPath,
+	managedIdentity,
+	managedTaskDomainPath,
+	markManagedEnrollmentEstablished,
+	markManagedEnrollmentPublishing,
+	recordManagedEnrollment,
+	restoreManagedAttemptRefs,
+	transactManagedTaskDomain,
+} from "../src/sdk/broker/managed-task-dag";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
 
@@ -81,6 +99,36 @@ function substrate(launches: { count: number }) {
 		},
 		verify: async () => "verified" as const,
 		close: async () => ({ ok: true }),
+	};
+}
+
+function trackedSubstrate() {
+	const launched: number[] = [];
+	const closed = new Set<number>();
+	return {
+		launched,
+		closed,
+		provider: {
+			launch: async () => {
+				const pid = 5000 + launched.length;
+				launched.push(pid);
+				return {
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "managed-tracked-fixture",
+						pid,
+						processIncarnation: `inc-${pid}`,
+					},
+				};
+			},
+			verify: async (proof: { pid?: number }) =>
+				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
+			close: async (proof: { pid?: number }) => {
+				if (proof.pid !== undefined) closed.add(proof.pid);
+				return { ok: true };
+			},
+		},
 	};
 }
 
@@ -182,6 +230,195 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 		}
 	});
 
+	it("retries an uncommitted first define and preserves established empty-root evidence", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-enroll-retry-"));
+		roots.push(root);
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: substrate({ count: 0 }),
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			const failed = await request(ws, "define-invalid", "task.dag", {
+				...auth,
+				action: "define",
+				graphId: "retry",
+				expectedRevision: 0,
+				nodes: "invalid",
+			});
+			expect(failed).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			await expect(fs.stat(managedTaskDomainPath(root))).rejects.toThrow();
+
+			const retry = request(ws, "define-retry", "task.dag", {
+				...auth,
+				action: "define",
+				graphId: "retry",
+				expectedRevision: 0,
+				nodes: [node("n", root, "retry")],
+			});
+			await Promise.all([restoreManagedAttemptRefs(broker.settings.agentDir), retry]);
+			expect(await retry).toMatchObject({ ok: true, result: { graphId: "retry" } });
+			const enrollment = await loadManagedEnrollmentRecord(broker.settings.agentDir);
+			expect(enrollment.establishedRoots).toContain(root);
+			expect(enrollment.nativeIdentities).toEqual([]);
+
+			await fs.rm(managedTaskDomainPath(root), { force: true });
+			expect(
+				await request(ws, "define-after-delete", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "later",
+					expectedRevision: 0,
+					nodes: [node("later", root, "later")],
+				}),
+			).toMatchObject({ ok: false, error: { message: "native managed evidence exists" } });
+		} finally {
+			ws.close();
+			await broker.stop();
+		}
+	});
+	it("reclaims only a never-committed root while retaining an indexed native root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-enrollment-cleanup-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const pendingRoot = path.join(root, "pending");
+		const nativeRoot = path.join(root, "native");
+		await Promise.all([
+			fs.mkdir(agentDir, { mode: 0o700 }),
+			fs.mkdir(pendingRoot, { mode: 0o700 }),
+			fs.mkdir(nativeRoot, { mode: 0o700 }),
+		]);
+		await recordManagedEnrollment(agentDir, pendingRoot);
+		await recordManagedEnrollment(agentDir, nativeRoot, "a".repeat(64));
+		const restored = await restoreManagedAttemptRefs(agentDir);
+		expect(restored.failedRoots).toContain(nativeRoot);
+		const enrollment = await loadManagedEnrollmentRecord(agentDir);
+		expect(enrollment.controlRoots).toEqual([nativeRoot]);
+		expect(enrollment.nativeIdentities).toEqual(["a".repeat(64)]);
+	});
+	it("fails closed on an unmarked persisted enrollment index but initializes an absent index", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-enrollment-unmarked-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const pendingRoot = path.join(root, "pending");
+		await Promise.all([fs.mkdir(agentDir, { mode: 0o700 }), fs.mkdir(pendingRoot, { mode: 0o700 })]);
+
+		expect(await loadManagedEnrollmentRecord(agentDir)).toEqual({
+			controlRoots: [],
+			establishedRoots: [],
+			publishingRoots: [],
+			nativeIdentities: [],
+			byRoot: {},
+		});
+
+		const enrollmentPath = managedEnrollmentIndexPath(agentDir);
+		await fs.mkdir(path.dirname(enrollmentPath), { recursive: true });
+		await Bun.write(
+			enrollmentPath,
+			JSON.stringify({
+				version: 1,
+				controlRoots: [pendingRoot],
+				nativeIdentities: [],
+				byRoot: { [pendingRoot]: [] },
+				state_revision: 0,
+			}),
+		);
+		await expect(restoreManagedAttemptRefs(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		await expect(fs.stat(managedTaskDomainPath(pendingRoot))).rejects.toThrow();
+		expect(await Bun.file(enrollmentPath).exists()).toBe(true);
+	});
+	it("retains a publication-in-progress enrollment when state publication is interrupted", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-enrollment-interrupted-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const controlRoot = path.join(root, "control");
+		await Promise.all([fs.mkdir(agentDir, { mode: 0o700 }), fs.mkdir(controlRoot, { mode: 0o700 })]);
+		await recordManagedEnrollment(agentDir, controlRoot);
+
+		// Simulate a crash after the pre-write publication marker and before rename.
+		await markManagedEnrollmentPublishing(agentDir, controlRoot);
+		const restored = await restoreManagedAttemptRefs(agentDir);
+		expect(restored.failedRoots).toContain(controlRoot);
+		const enrollment = await loadManagedEnrollmentRecord(agentDir);
+		expect(enrollment.controlRoots).toContain(controlRoot);
+		expect(enrollment.publishingRoots).toContain(controlRoot);
+		await expect(fs.stat(managedTaskDomainPath(controlRoot))).rejects.toThrow();
+
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: substrate({ count: 0 }),
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, controlRoot);
+			const denied = await request(ws, "define-publishing", "task.dag", {
+				controlRoot,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [controlRoot],
+				action: "define",
+				graphId: "must-not-retry",
+				expectedRevision: 0,
+				nodes: [node("n", controlRoot, "must-not-retry")],
+			});
+			expect(denied).toMatchObject({ ok: false, error: { message: "native managed evidence exists" } });
+			expect((await loadManagedEnrollmentRecord(agentDir)).publishingRoots).toContain(controlRoot);
+			await expect(fs.stat(managedTaskDomainPath(controlRoot))).rejects.toThrow();
+		} finally {
+			ws.close();
+			await broker.stop();
+		}
+
+		const recoveredRoot = path.join(root, "published-control");
+		await fs.mkdir(recoveredRoot, { mode: 0o700 });
+		const binding = await createManagedDomainBinding({
+			controlRoot: recoveredRoot,
+			agentDir,
+			enrollmentId: "enrollment",
+			worktrees: [recoveredRoot],
+		});
+		await recordManagedEnrollment(agentDir, recoveredRoot);
+		await transactManagedTaskDomain(
+			{
+				binding,
+				expectedRevision: 0,
+				assertNoManagedEvidence: async () => undefined,
+				beforeFirstPublication: async () => markManagedEnrollmentPublishing(agentDir, recoveredRoot),
+				// Omit the success marker update to model a crash after state rename.
+			},
+			async state =>
+				defineManagedTaskGraph(state, {
+					id: "recovered",
+					owner: ownerId,
+					nodes: [node("n", recoveredRoot, "recovered")],
+				}),
+		);
+		expect((await loadManagedEnrollmentRecord(agentDir)).publishingRoots).toContain(recoveredRoot);
+		const afterRecovery = await restoreManagedAttemptRefs(agentDir);
+		expect(afterRecovery.failedRoots).not.toContain(recoveredRoot);
+		const recoveredEnrollment = await loadManagedEnrollmentRecord(agentDir);
+		expect(recoveredEnrollment.establishedRoots).toContain(recoveredRoot);
+		expect(recoveredEnrollment.publishingRoots).not.toContain(recoveredRoot);
+	});
 	it("authenticated wire admits disjoint writers twice and denies a competing writer", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-admit-"));
 		roots.push(root);
@@ -261,7 +498,12 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			);
 			expect(conflict).toMatchObject({ ok: false });
 			expect(launches.count).toBe(2);
-			const nativeA = await deriveIdempotencyIdentity(broker.settings.agentDir, "session.spawn", "key-a");
+			const nativeA = await deriveScopedIdempotencyIdentity(
+				broker.settings.agentDir,
+				"session.spawn",
+				"key-a",
+				root,
+			);
 			const ordinary = await request(
 				ws,
 				"ordinary",
@@ -296,7 +538,11 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 		const rootA = path.join(root, "root-a");
 		const rootB = path.join(root, "root-b");
 		const enrolledRoot = path.join(root, "enrolled-root");
-		await Promise.all([fs.mkdir(rootA), fs.mkdir(rootB), fs.mkdir(enrolledRoot)]);
+		await Promise.all([
+			fs.mkdir(rootA, { mode: 0o700 }),
+			fs.mkdir(rootB, { mode: 0o700 }),
+			fs.mkdir(enrolledRoot, { mode: 0o700 }),
+		]);
 		const launches = { count: 0 };
 		const broker = new Broker({
 			agentDir: path.join(root, "agent"),
@@ -310,6 +556,7 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 		try {
 			await attest(broker, rootA);
 			await recordManagedEnrollment(broker.settings.agentDir, enrolledRoot);
+			await markManagedEnrollmentEstablished(broker.settings.agentDir, enrolledRoot);
 			const auth = (controlRoot: string) => ({
 				controlRoot,
 				enrollmentId: "enrollment",
@@ -570,6 +817,7 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-lock-"));
 		roots.push(root);
 		const launches = { count: 0 };
+		const closed = new Set<number>();
 		const persistTransition = SpawnAuthorityStore.prototype.persistTransition;
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -578,7 +826,15 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			agentDir: path.join(root, "agent"),
 			packageGeneration: "test",
 			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: substrate(launches),
+			spawnSubstrateProvider: {
+				...substrate(launches),
+				verify: async (proof: { pid?: number }) =>
+					proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
+				close: async (proof: { pid?: number }) => {
+					if (proof.pid !== undefined) closed.add(proof.pid);
+					return { ok: true };
+				},
+			},
 			spawnPromptLayer: promptLayer,
 		});
 		const discovery = await broker.start();
@@ -735,6 +991,590 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			expect(launches.count).toBe(0);
 		} finally {
 			ws.close();
+			await broker.stop();
+		}
+	});
+	it("scopes a reused idempotency key to each managed control root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-root-scope-"));
+		roots.push(root);
+		const rootA = path.join(root, "root-a");
+		const rootB = path.join(root, "root-b");
+		await Promise.all([fs.mkdir(rootA, { mode: 0o700 }), fs.mkdir(rootB, { mode: 0o700 })]);
+		const tracked = trackedSubstrate();
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: tracked.provider,
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, rootA);
+			const auth = (controlRoot: string) => ({
+				controlRoot,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [controlRoot],
+			});
+			for (const [controlRoot, graphId, id] of [
+				[rootA, "a", "define-a"],
+				[rootB, "b", "define-b"],
+			] as const) {
+				expect(
+					await request(ws, id, "task.dag", {
+						...auth(controlRoot),
+						action: "define",
+						graphId,
+						expectedRevision: 0,
+						nodes: [node("n", controlRoot, `resource-${graphId}`)],
+					}),
+				).toMatchObject({ ok: true });
+			}
+			const advanceA = await request(
+				ws,
+				"advance-a",
+				"task.dag",
+				{ ...auth(rootA), action: "advance", graphId: "a", nodeId: "n", expectedRevision: 1 },
+				"shared-key",
+			);
+			expect(advanceA).toMatchObject({ ok: true, result: { attemptId: "attempt-shared-key" } });
+
+			await attest(broker, rootB);
+			const advanceB = await request(
+				ws,
+				"advance-b",
+				"task.dag",
+				{ ...auth(rootB), action: "advance", graphId: "b", nodeId: "n", expectedRevision: 1 },
+				"shared-key",
+			);
+			expect(advanceB).toMatchObject({ ok: true, result: { attemptId: "attempt-shared-key" } });
+			expect(tracked.launched).toHaveLength(2);
+
+			const identityA = await deriveScopedIdempotencyIdentity(
+				broker.settings.agentDir,
+				"session.spawn",
+				"shared-key",
+				rootA,
+			);
+			const identityB = await deriveScopedIdempotencyIdentity(
+				broker.settings.agentDir,
+				"session.spawn",
+				"shared-key",
+				rootB,
+			);
+			expect(identityA).not.toBe(identityB);
+			const enrollment = await loadManagedEnrollmentRecord(broker.settings.agentDir);
+			expect(enrollment.byRoot[rootA]).toContain(identityA);
+			expect(enrollment.byRoot[rootB]).toContain(identityB);
+
+			ws.close();
+			await broker.stop();
+			const restartedBroker = new Broker({
+				agentDir: broker.settings.agentDir,
+				packageGeneration: "test",
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: tracked.provider,
+				spawnPromptLayer: promptLayer,
+			});
+			const restartedDiscovery = await restartedBroker.start();
+			const restartedWs = await connect(`${restartedDiscovery.url}/?token=${restartedDiscovery.token}`);
+			try {
+				await attest(restartedBroker, rootA);
+				await attest(restartedBroker, rootB);
+				const replayedAuthority = new SpawnAuthorityStore(
+					restartedBroker.settings.agentDir,
+					await getBrokerIdentityKey(restartedBroker.settings.agentDir),
+				);
+				await replayedAuthority.open();
+				for (const ordinaryIdentity of await Promise.all([
+					deriveIdempotencyIdentity(restartedBroker.settings.agentDir, "session.spawn", "shared-key"),
+					deriveLegacyIdentity(restartedBroker.settings.agentDir, "session.spawn", "shared-key"),
+				])) {
+					expect(await replayedAuthority.claimOrJoin(ordinaryIdentity, "a".repeat(64), "b".repeat(64))).toEqual({
+						kind: "managed_key_conflict",
+					});
+				}
+				const ordinary = await request(
+					restartedWs,
+					"ordinary-after-restart",
+					"session.spawn",
+					{
+						cwd: rootA,
+						task: "Task n",
+						ownerSessionId: ownerId,
+						attestationEpoch: epoch,
+						masterCapability: grant,
+					},
+					"shared-key",
+				);
+				expect(ordinary).toMatchObject({
+					ok: false,
+					error: {
+						code: "spawn_failed",
+						message: "managed native identity cannot re-enter ordinary session.spawn",
+					},
+				});
+				expect(tracked.launched).toHaveLength(2);
+
+				const revisionA = (
+					(
+						await request(restartedWs, "status-a-before-cancel", "task.dag", {
+							...auth(rootA),
+							action: "status",
+						})
+					).result as { stateRevision: number }
+				).stateRevision;
+				expect(
+					await request(restartedWs, "cancel-a-after-restart", "task.dag", {
+						...auth(rootA),
+						action: "cancel",
+						graphId: "a",
+						expectedRevision: revisionA,
+						nodeIds: ["n"],
+					}),
+				).toMatchObject({ ok: true });
+				expect([...tracked.closed]).toEqual([tracked.launched[0]]);
+				expect(await tracked.provider.verify({ pid: tracked.launched[1] })).toBe("verified");
+
+				const revisionB = (
+					(
+						await request(restartedWs, "status-b-before-cancel", "task.dag", {
+							...auth(rootB),
+							action: "status",
+						})
+					).result as { stateRevision: number }
+				).stateRevision;
+				expect(
+					await request(restartedWs, "cancel-b-after-restart", "task.dag", {
+						...auth(rootB),
+						action: "cancel",
+						graphId: "b",
+						expectedRevision: revisionB,
+						nodeIds: ["n"],
+					}),
+				).toMatchObject({ ok: true });
+				expect([...tracked.closed].sort()).toEqual([...tracked.launched].sort());
+			} finally {
+				restartedWs.close();
+				await restartedBroker.stop();
+			}
+		} finally {
+			ws.close();
+			await broker.stop();
+		}
+	});
+	it("an ordinary spawn claim wins the shared key before managed reservation without stranding an attempt", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-ordinary-first-"));
+		roots.push(root);
+		const launches = { count: 0 };
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: substrate(launches),
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-before-ordinary", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "g",
+					expectedRevision: 0,
+					nodes: [node("n", root, "ordinary-first")],
+				}),
+			).toMatchObject({ ok: true });
+
+			const ordinaryInput = {
+				cwd: root,
+				task: "ordinary first",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+			};
+			expect(await request(ws, "ordinary-first", "session.spawn", ordinaryInput, "shared-key")).toMatchObject({
+				ok: true,
+			});
+			expect(launches.count).toBe(1);
+
+			expect(
+				await request(
+					ws,
+					"managed-after-ordinary",
+					"task.dag",
+					{ ...auth, action: "advance", graphId: "g", nodeId: "n", expectedRevision: 1 },
+					"shared-key",
+				),
+			).toMatchObject({
+				ok: false,
+				error: {
+					code: "spawn_failed",
+					message: "idempotency key conflicts with an existing ordinary session.spawn claim",
+				},
+			});
+			const domain = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: unknown[] }>;
+			};
+			expect(domain.graphs[0]!.attempts).toHaveLength(0);
+
+			expect(await request(ws, "ordinary-replay", "session.spawn", ordinaryInput, "shared-key")).toMatchObject({
+				ok: true,
+				result: { code: "spawn_replayed" },
+			});
+			expect(launches.count).toBe(1);
+		} finally {
+			ws.close();
+			await broker.stop();
+		}
+	});
+	it("a managed reservation wins after ordinary preflight and blocks its later claim", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-managed-race-"));
+		roots.push(root);
+		const launches = { count: 0 };
+		const modelResolveEntered = Promise.withResolvers<void>();
+		const releaseModelResolve = Promise.withResolvers<void>();
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			resolveModelPin: async raw => {
+				modelResolveEntered.resolve();
+				await releaseModelResolve.promise;
+				return { ok: true, model: String(raw) };
+			},
+			spawnSubstrateProvider: substrate(launches),
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsManaged = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-race", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "race",
+					expectedRevision: 0,
+					nodes: [node("n", root, "race")],
+				}),
+			).toMatchObject({ ok: true });
+
+			const ordinary = request(
+				ws,
+				"ordinary-racing",
+				"session.spawn",
+				{
+					cwd: root,
+					task: "ordinary race",
+					modelId: "test-model",
+					ownerSessionId: ownerId,
+					attestationEpoch: epoch,
+					masterCapability: grant,
+				},
+				"shared-key",
+			);
+			// Ordinary spawn has passed managed preflight but has not attempted its durable claim.
+			await modelResolveEntered.promise;
+			const managed = await request(
+				wsManaged,
+				"managed-racing",
+				"task.dag",
+				{ ...auth, action: "advance", graphId: "race", nodeId: "n", expectedRevision: 1 },
+				"shared-key",
+			);
+			expect(managed).toMatchObject({ ok: true });
+			expect(launches.count).toBe(1);
+			releaseModelResolve.resolve();
+			expect(await ordinary).toMatchObject({
+				ok: false,
+				error: {
+					code: "idempotency_conflict",
+					message: "idempotency key is reserved by a managed task.dag attempt",
+				},
+			});
+			expect(launches.count).toBe(1);
+
+			const ordinaryIdentities = await Promise.all([
+				deriveIdempotencyIdentity(broker.settings.agentDir, "session.spawn", "shared-key"),
+				deriveLegacyIdentity(broker.settings.agentDir, "session.spawn", "shared-key"),
+			]);
+			const journal = (await Bun.file(path.join(broker.settings.agentDir, "sdk", "spawn-authority.jsonl")).text())
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as { claim?: { lifecycleIdentity?: string } });
+			expect(journal.some(row => ordinaryIdentities.includes(row.claim?.lifecycleIdentity ?? ""))).toBe(false);
+			const managedIdentity = await deriveScopedIdempotencyIdentity(
+				broker.settings.agentDir,
+				"session.spawn",
+				"shared-key",
+				root,
+			);
+			expect(journal.some(row => row.claim?.lifecycleIdentity === managedIdentity)).toBe(true);
+		} finally {
+			releaseModelResolve.resolve();
+			ws.close();
+			wsManaged.close();
+			await broker.stop();
+		}
+	});
+	it("cancel waits for delayed launch and closes its exact child before succeeding", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-launch-cancel-"));
+		roots.push(root);
+		const launchEntered = Promise.withResolvers<void>();
+		const launchRelease = Promise.withResolvers<void>();
+		const closedSignal = Promise.withResolvers<void>();
+		const closed = new Set<number>();
+		let closeCalls = 0;
+		const launchedPid = 6123;
+		const provider = {
+			launch: async () => {
+				launchEntered.resolve();
+				await launchRelease.promise;
+				return {
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "managed-delayed-fixture",
+						pid: launchedPid,
+						processIncarnation: `inc-${launchedPid}`,
+					},
+				};
+			},
+			verify: async (proof: { pid?: number }) =>
+				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
+			close: async (proof: { pid?: number }) => {
+				closeCalls += 1;
+				if (closeCalls === 1) return { ok: false };
+				if (proof.pid !== undefined) closed.add(proof.pid);
+				closedSignal.resolve();
+				return { ok: true };
+			},
+		};
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider,
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsCancel = await connect(`${discovery.url}/?token=${discovery.token}`);
+		setManagedCloseWaitForTest(broker, 20);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-delayed", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "delayed",
+					expectedRevision: 0,
+					nodes: [node("n", root, "delayed")],
+				}),
+			).toMatchObject({ ok: true });
+			const advance = request(
+				ws,
+				"advance-delayed",
+				"task.dag",
+				{ ...auth, action: "advance", graphId: "delayed", nodeId: "n", expectedRevision: 1 },
+				"delayed-key",
+			);
+			await launchEntered.promise;
+			const currentRevision = (
+				(await request(wsCancel, "status-before-cancel", "task.dag", { ...auth, action: "status" })).result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			const cancel = request(wsCancel, "cancel-delayed", "task.dag", {
+				...auth,
+				action: "cancel",
+				graphId: "delayed",
+				expectedRevision: currentRevision,
+				nodeIds: ["n"],
+			});
+			let cancelSettled = false;
+			void cancel.then(() => {
+				cancelSettled = true;
+			});
+			await Bun.sleep(50);
+			expect(cancelSettled).toBe(true);
+			expect(await cancel).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			const duringLaunch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: Array<{ fence: string }> }>;
+			};
+			expect(duringLaunch.graphs[0]!.attempts[0]!.fence).toBe("canceled");
+			expect(closed.size).toBe(0);
+			launchRelease.resolve();
+			expect(await advance).toMatchObject({ ok: false });
+			await Promise.race([closedSignal.promise, Bun.sleep(1_000)]);
+			expect([...closed]).toEqual([launchedPid]);
+			expect(closeCalls).toBeGreaterThanOrEqual(2);
+		} finally {
+			launchRelease.resolve();
+			setManagedCloseWaitForTest(broker, undefined);
+			ws.close();
+			wsCancel.close();
+			await broker.stop();
+		}
+	});
+	it("startup closes a proof-backed child for an already fenced managed attempt before discovery", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-fenced-restart-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const launchEntered = Promise.withResolvers<void>();
+		const launchRelease = Promise.withResolvers<void>();
+		const closed = new Set<number>();
+		const pid = 7345;
+		let dispatches = 0;
+		let allowClose = false;
+		let restartedBroker: Broker | undefined;
+		let discoveryVisibleDuringRecoveryClose: boolean | undefined;
+		const provider = {
+			launch: async () => {
+				launchEntered.resolve();
+				await launchRelease.promise;
+				return {
+					ok: true as const,
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "managed-fenced-restart-fixture",
+						pid,
+						processIncarnation: `inc-${pid}`,
+					},
+				};
+			},
+			verify: async (proof: { pid?: number }) =>
+				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
+			close: async (proof: { pid?: number }) => {
+				if (!allowClose) return { ok: false };
+				discoveryVisibleDuringRecoveryClose = restartedBroker?.discovery !== null;
+				if (proof.pid !== undefined) closed.add(proof.pid);
+				return { ok: true };
+			},
+		};
+		const spawnPromptLayer = {
+			...promptLayer,
+			dispatch: async () => {
+				dispatches += 1;
+				return {
+					kind: "accepted" as const,
+					commandId: "cmd-fenced",
+					turnId: "turn-fenced",
+					acceptedAt: Date.now(),
+				};
+			},
+		};
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider,
+			spawnPromptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsStatus = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-fenced", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "fenced",
+					expectedRevision: 0,
+					nodes: [node("n", root, "fenced-restart")],
+				}),
+			).toMatchObject({ ok: true });
+			const advance = request(
+				ws,
+				"advance-fenced",
+				"task.dag",
+				{ ...auth, action: "advance", graphId: "fenced", nodeId: "n", expectedRevision: 1 },
+				"fenced-key",
+			);
+			await launchEntered.promise;
+			const binding = await createManagedDomainBinding({
+				controlRoot: root,
+				agentDir,
+				enrollmentId: "enrollment",
+				worktrees: [root],
+			});
+			const revision = (
+				(await request(wsStatus, "status-fence-in-flight", "task.dag", { ...auth, action: "status" })).result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			await transactManagedTaskDomain({ binding, expectedRevision: revision }, async state => {
+				const graph = state.graphs.find(item => item.id === "fenced");
+				if (!graph) throw new Error("test graph missing");
+				return cancelManagedTasks(graph, ["n"]);
+			});
+			launchRelease.resolve();
+			expect(await advance).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(dispatches).toBe(0);
+			await broker.stop();
+
+			allowClose = true;
+			restartedBroker = new Broker({
+				agentDir,
+				packageGeneration: "test",
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: provider,
+				spawnPromptLayer,
+			});
+			const restartedDiscovery = await restartedBroker.start();
+			try {
+				expect(restartedDiscovery.ownerId).toBeTruthy();
+				expect(discoveryVisibleDuringRecoveryClose).toBe(false);
+				expect([...closed]).toEqual([pid]);
+				expect(dispatches).toBe(0);
+			} finally {
+				await restartedBroker.stop();
+			}
+		} finally {
+			launchRelease.resolve();
+			ws.close();
+			wsStatus.close();
 			await broker.stop();
 		}
 	});

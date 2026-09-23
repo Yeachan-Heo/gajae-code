@@ -20,7 +20,11 @@ export interface EndpointRequest {
 	input: Record<string, unknown>;
 }
 
-export type EndpointHandler = (req: EndpointRequest) => Promise<unknown>;
+export interface EndpointHandlerRequest extends EndpointRequest {
+	signal: AbortSignal;
+}
+
+export type EndpointHandler = (req: EndpointHandlerRequest) => Promise<unknown>;
 
 function frame(value: unknown): string {
 	return `${JSON.stringify(value)}\n`;
@@ -54,6 +58,14 @@ export class ControlServer {
 		socket.setEncoding("utf8");
 		let buffer = "";
 		let handled = false;
+		let responseSent = false;
+		const controller = new AbortController();
+		socket.once("close", () => {
+			if (!responseSent) controller.abort(new Error("endpoint_client_disconnected"));
+		});
+		socket.on("error", () => {
+			if (!responseSent) controller.abort(new Error("endpoint_client_disconnected"));
+		});
 		socket.on("data", (chunk: string) => {
 			if (handled) return;
 			buffer += chunk;
@@ -61,20 +73,26 @@ export class ControlServer {
 			if (idx < 0) return;
 			handled = true;
 			const line = buffer.slice(0, idx).trim();
-			void this.#dispatch(line)
+			void this.#dispatch(line, controller.signal)
 				.then(response => {
-					socket.end(frame(response));
+					if (!socket.destroyed && !controller.signal.aborted) {
+						responseSent = true;
+						socket.end(frame(response));
+					}
 				})
 				.catch((error: unknown) => {
-					socket.end(frame({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+					if (!socket.destroyed && !controller.signal.aborted) {
+						responseSent = true;
+						socket.end(frame({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+					}
 				});
 		});
 	}
 
-	async #dispatch(line: string): Promise<unknown> {
+	async #dispatch(line: string, signal: AbortSignal): Promise<unknown> {
 		const req = JSON.parse(line) as EndpointRequest;
 		if (!req || typeof req.verb !== "string") throw new Error("bad_request");
-		return this.handler({ verb: req.verb, input: req.input ?? {} });
+		return this.handler({ verb: req.verb, input: req.input ?? {}, signal });
 	}
 
 	async close(): Promise<void> {

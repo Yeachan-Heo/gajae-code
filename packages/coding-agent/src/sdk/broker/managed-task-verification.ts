@@ -279,6 +279,69 @@ async function startOrObserve(
 	return result.result;
 }
 
+async function reconcileUncertainStart(
+	binding: ManagedDomainBinding,
+	input: { graphId: string; nodeId: string; owner: string },
+): Promise<ManagedTaskAttempt> {
+	const result = await transactManagedTaskDomain({ binding, internal: true }, async state => {
+		const { attempt } = findAttempt(state.graphs, input.graphId, input.nodeId, input.owner);
+		if (attempt.validation === "running") attempt.validation = "unknown";
+		return structuredClone(attempt);
+	});
+	return result.result;
+}
+
+function durableAttemptStatus(attempt: ManagedTaskAttempt, started: boolean): ManagedVerificationStatus {
+	const execution = attempt.verificationExecution;
+	requirePolicy(execution, "verification execution missing");
+	if (attempt.validation === "unknown") return { status: "unknown", executionId: execution.executionId, started };
+	if (attempt.validation === "running")
+		return { status: "running", executionId: execution.executionId, started: false };
+	if (attempt.accepted)
+		return {
+			status: "accepted",
+			executionId: execution.executionId,
+			started,
+			acceptedId: attempt.accepted.id,
+			acceptedHash: attempt.accepted.hash,
+		};
+	if (attempt.validation === "finished" && !attempt.accepted) {
+		const failedObservation = execution.observations.some(
+			observation => !observation.pass || observation.exitStatus !== 0,
+		);
+		return {
+			status: "failed",
+			executionId: execution.executionId,
+			started,
+			reason: failedObservation ? "validation command failed" : "verification failed",
+		};
+	}
+	return {
+		status: "finished",
+		executionId: execution.executionId,
+		started: false,
+		accepted: false,
+	};
+}
+
+async function reconcileAttemptStatus(
+	binding: ManagedDomainBinding,
+	input: { graphId: string; attemptId: string; executionId: string; started: boolean },
+): Promise<ManagedVerificationStatus> {
+	const result = await transactManagedTaskDomain({ binding, internal: true }, async state => {
+		const attempt = state.graphs
+			.find(graph => graph.id === input.graphId)
+			?.attempts.find(item => item.id === input.attemptId);
+		requirePolicy(attempt, "attempt missing");
+		if (attempt.validation === "running") attempt.validation = "unknown";
+		return structuredClone(attempt);
+	});
+	const attempt = result.result;
+	if (!attempt.verificationExecution)
+		return unknownStatus(input.executionId, new Error("verification execution missing"), input.started);
+	return durableAttemptStatus(attempt, input.started);
+}
+
 async function appendObservation(
 	binding: ManagedDomainBinding,
 	input: { graphId: string; attemptId: string; observation: ManagedVerificationObservation },
@@ -445,37 +508,40 @@ export async function verifyManagedTaskAttempt(input: {
 			owner: input.owner,
 		});
 	} catch (error) {
-		if (isCorruptAuthority(error)) return unknownStatus("unreadable", error, false);
-		if (isStaleAcceptedEvidence(error))
-			return {
-				status: "failed",
-				executionId: "accepted",
-				started: false,
-				reason: "managed-task: verification refused",
-			};
-		throw error;
+		if (error instanceof StatePublicationUncertainError) {
+			try {
+				const attempt = await reconcileUncertainStart(input.binding, {
+					graphId: input.graphId,
+					nodeId: input.nodeId,
+					owner: input.owner,
+				});
+				if (attempt.validation !== "not-started") return durableAttemptStatus(attempt, false);
+				started = await startOrObserve(input.binding, {
+					graphId: input.graphId,
+					nodeId: input.nodeId,
+					owner: input.owner,
+				});
+			} catch (reconcileError) {
+				if (isPublicationUncertainty(reconcileError) || isCorruptAuthority(reconcileError))
+					return unknownStatus("unreadable", reconcileError, false);
+				throw reconcileError;
+			}
+		} else {
+			if (isCorruptAuthority(error)) return unknownStatus("unreadable", error, false);
+			if (isStaleAcceptedEvidence(error))
+				return {
+					status: "failed",
+					executionId: "accepted",
+					started: false,
+					reason: "managed-task: verification refused",
+				};
+			throw error;
+		}
 	}
 	const execution = started.attempt.verificationExecution;
 	requirePolicy(execution, "verification execution missing");
 	if (!started.started) {
-		if (started.attempt.validation === "unknown")
-			return { status: "unknown", executionId: execution.executionId, started: false };
-		if (started.attempt.validation === "running")
-			return { status: "running", executionId: execution.executionId, started: false };
-		if (started.attempt.accepted)
-			return {
-				status: "accepted",
-				executionId: execution.executionId,
-				started: false,
-				acceptedId: started.attempt.accepted.id,
-				acceptedHash: started.attempt.accepted.hash,
-			};
-		return {
-			status: "finished",
-			executionId: execution.executionId,
-			started: false,
-			accepted: false,
-		};
+		return durableAttemptStatus(started.attempt, false);
 	}
 	const workspace = execution.workspace;
 	const runner = input.runner ?? defaultFinalizeChecks(workspace);
@@ -512,6 +578,18 @@ export async function verifyManagedTaskAttempt(input: {
 			};
 		} catch (error) {
 			if (isPublicationUncertainty(error) || isCorruptAuthority(error)) {
+				if (error instanceof StatePublicationUncertainError) {
+					try {
+						return await reconcileAttemptStatus(input.binding, {
+							graphId: input.graphId,
+							attemptId: started.attempt.id,
+							executionId: execution.executionId,
+							started: true,
+						});
+					} catch (reconcileError) {
+						return unknownStatus(execution.executionId, reconcileError);
+					}
+				}
 				try {
 					await markManagedVerificationUnknown(input.binding, input.graphId, started.attempt.id);
 				} catch (markError) {
@@ -540,6 +618,18 @@ export async function verifyManagedTaskAttempt(input: {
 			return unknownStatus(execution.executionId, error);
 		}
 	} catch (error) {
+		if (error instanceof StatePublicationUncertainError) {
+			try {
+				return await reconcileAttemptStatus(input.binding, {
+					graphId: input.graphId,
+					attemptId: started.attempt.id,
+					executionId: execution.executionId,
+					started: true,
+				});
+			} catch (reconcileError) {
+				return unknownStatus(execution.executionId, reconcileError);
+			}
+		}
 		try {
 			await markManagedVerificationUnknown(input.binding, input.graphId, started.attempt.id);
 		} catch (markError) {
@@ -547,13 +637,6 @@ export async function verifyManagedTaskAttempt(input: {
 				return unknownStatus(execution.executionId, isCorruptAuthority(markError) ? markError : error);
 			throw markError;
 		}
-		if (isPublicationUncertainty(error) || isCorruptAuthority(error))
-			return unknownStatus(execution.executionId, error);
-		return {
-			status: "failed",
-			executionId: execution.executionId,
-			started: true,
-			reason: publicFailureReason(error),
-		};
+		return unknownStatus(execution.executionId, error);
 	}
 }

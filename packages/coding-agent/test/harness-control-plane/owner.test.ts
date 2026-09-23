@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import * as net from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { ControlServer, callEndpoint } from "../../src/harness-control-plane/control-endpoint";
+import { defaultFinalizeChecks, ValidationObservationUncertainError } from "../../src/harness-control-plane/finalize";
 import { RuntimeOwner, resolveOwner, resolveOwnerLive } from "../../src/harness-control-plane/owner";
 import { acquireLease, heartbeat, readLease, releaseLease } from "../../src/harness-control-plane/session-lease";
 import type {
@@ -313,6 +315,325 @@ describe("RuntimeOwner (in-process integration)", () => {
 			after = await resolveOwner(root, SID);
 		}
 		expect(after.live).toBe(false);
+	});
+
+	it("does not resurrect retired state when validation becomes uncertain afterward", async () => {
+		const transport = new FakeTransport();
+		const validationStarted = Promise.withResolvers<void>();
+		const validationAborted = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec, signal) {
+					validationStarted.resolve();
+					await new Promise<void>(resolve => {
+						const onAbort = (): void => {
+							validationAborted.resolve();
+							resolve();
+						};
+						if (signal?.aborted) onAbort();
+						else signal?.addEventListener("abort", onAbort, { once: true });
+					});
+					throw new ValidationObservationUncertainError(spec.command, root);
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					return { prUrl: null, issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "blocked validator" }],
+		});
+		const info = await owner.start();
+		const validation = callEndpoint(info.socketPath, { verb: "validate", input: {} });
+		await validationStarted.promise;
+		const retiring = callEndpoint(info.socketPath, { verb: "retire", input: {} });
+		await validationAborted.promise;
+		const result = (await validation) as Record<string, unknown>;
+		const retired = (await retiring) as Record<string, unknown>;
+		expect(result.ok).toBe(false);
+		expect((retired.state as Record<string, unknown>).lifecycle).toBe("retired");
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("retired");
+		expect(await readReceiptIndex(root, SID, "validation")).toHaveLength(0);
+		await owner.stop();
+		owner = null;
+	});
+
+	it("does not replace an already completed lifecycle with uncertain validation", async () => {
+		const transport = new FakeTransport();
+		const validationStarted = Promise.withResolvers<void>();
+		const releaseValidation = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec) {
+					validationStarted.resolve();
+					await releaseValidation.promise;
+					throw new ValidationObservationUncertainError(spec.command, root);
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					return { prUrl: null, issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "blocked validator" }],
+		});
+		const info = await owner.start();
+		await writeSessionState(root, { ...seedState(root), lifecycle: "completed" });
+		const validation = callEndpoint(info.socketPath, { verb: "validate", input: {} });
+		await validationStarted.promise;
+		releaseValidation.resolve();
+		const result = (await validation) as Record<string, unknown>;
+		expect(result.ok).toBe(false);
+		expect((result.state as Record<string, unknown>).lifecycle).toBe("completed");
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("completed");
+		expect(await readReceiptIndex(root, SID, "validation")).toHaveLength(0);
+	});
+
+	it("cancels validation when its endpoint client disconnects", async () => {
+		const transport = new FakeTransport();
+		const validationStarted = Promise.withResolvers<void>();
+		const validationAborted = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec, signal) {
+					validationStarted.resolve();
+					await new Promise<void>(resolve => {
+						const onAbort = (): void => {
+							validationAborted.resolve();
+							resolve();
+						};
+						if (signal?.aborted) onAbort();
+						else signal?.addEventListener("abort", onAbort, { once: true });
+					});
+					throw new ValidationObservationUncertainError(spec.command, root);
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					return { prUrl: null, issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "blocked validator" }],
+		});
+		const info = await owner.start();
+		const client = net.createConnection(info.socketPath);
+		await new Promise<void>((resolve, reject) => {
+			client.once("connect", resolve);
+			client.once("error", reject);
+		});
+		client.write(`${JSON.stringify({ verb: "validate", input: {} })}\n`);
+		await validationStarted.promise;
+		client.destroy();
+		await validationAborted.promise;
+		await owner.stop();
+
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("started");
+		expect(await readReceiptIndex(root, SID, "validation")).toHaveLength(0);
+		expect((await readEvents(root, SID, 0)).map(event => event.kind)).not.toContain("validation_uncertain");
+		owner = null;
+	});
+
+	it("joins blocked validation before releasing the owner lease", async () => {
+		const transport = new FakeTransport();
+		const validationStarted = Promise.withResolvers<void>();
+		const validationAborted = Promise.withResolvers<void>();
+		const releaseValidation = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec, signal) {
+					validationStarted.resolve();
+					await new Promise<void>(resolve => {
+						const onAbort = (): void => {
+							validationAborted.resolve();
+							resolve();
+						};
+						if (signal?.aborted) onAbort();
+						else signal?.addEventListener("abort", onAbort, { once: true });
+					});
+					await releaseValidation.promise;
+					throw new ValidationObservationUncertainError(spec.command, root);
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					return { prUrl: null, issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "blocked validator" }],
+		});
+		const info = await owner.start();
+		const validation = callEndpoint(info.socketPath, { verb: "validate", input: {} });
+		await validationStarted.promise;
+		const stopping = owner.stop();
+		await validationAborted.promise;
+		const leaseLiveWhileValidatorBlocked = (await resolveOwner(root, SID)).live;
+		releaseValidation.resolve();
+		await Promise.all([stopping, validation]);
+
+		expect(leaseLiveWhileValidatorBlocked).toBe(true);
+		expect((await resolveOwner(root, SID)).live).toBe(false);
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("started");
+		expect(await readReceiptIndex(root, SID, "validation")).toHaveLength(0);
+		owner = null;
+	});
+
+	it("keeps the lease until an unverified validator group is actually gone", async () => {
+		if (process.platform !== "linux") return;
+		const childPidPath = path.join(root, "unverified-owner-child.pid");
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport: new FakeTransport(),
+			finalizeChecks: defaultFinalizeChecks(root, () => ({ kind: "unverifiable", reason: "permission_denied" })),
+			validationCommands: [{ name: "child-group", command: `sleep 0.5 & echo $! > '${childPidPath}'; wait` }],
+		});
+		let childPid: number | undefined;
+		try {
+			const info = await owner.start();
+			const validation = callEndpoint(info.socketPath, { verb: "validate", input: {} });
+			for (let attempt = 0; attempt < 100 && childPid === undefined; attempt++) {
+				try {
+					const parsed = Number((await readFile(childPidPath, "utf8")).trim());
+					if (Number.isSafeInteger(parsed) && parsed > 0) childPid = parsed;
+				} catch {}
+				if (childPid === undefined) await Bun.sleep(10);
+			}
+			expect(childPid).toBeDefined();
+			const stopping = owner.stop();
+			await Bun.sleep(100);
+			expect((await resolveOwner(root, SID)).live).toBe(true);
+			if (childPid === undefined) throw new Error("validator child did not start");
+			const childStat = await readFile(`/proc/${childPid}/stat`, "utf8");
+			const state = childStat.slice(childStat.lastIndexOf(")") + 2).split(" ")[0];
+			expect(state).not.toBe("Z");
+			expect(state).not.toBe("X");
+			await Promise.all([validation, stopping]);
+			expect((await resolveOwner(root, SID)).live).toBe(false);
+		} finally {
+			if (childPid !== undefined) {
+				try {
+					process.kill(childPid, "SIGKILL");
+				} catch {}
+			}
+			if (owner) {
+				await owner.stop().catch(() => undefined);
+				owner = null;
+			}
+		}
+	});
+
+	it("finalize reloads terminal state after its async checks before writing lifecycle", async () => {
+		const transport = new FakeTransport();
+		const checkStarted = Promise.withResolvers<void>();
+		const releaseCheck = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec) {
+					return { exactCommand: spec.command, cwd: root, exitStatus: 0, pass: true };
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					checkStarted.resolve();
+					await releaseCheck.promise;
+					return { prUrl: "https://example.invalid/pr/1", issueArtifact: null };
+				},
+			},
+			validationCommands: [{ name: "test", command: "test" }],
+		});
+		const info = await owner.start();
+		const finalizing = callEndpoint(info.socketPath, { verb: "finalize", input: {} });
+		await checkStarted.promise;
+		const retiring = callEndpoint(info.socketPath, { verb: "retire", input: {} });
+		await Bun.sleep(50);
+		releaseCheck.resolve();
+		const result = (await finalizing) as Record<string, unknown>;
+		const retired = (await retiring) as Record<string, unknown>;
+		expect(result.ok).toBe(false);
+		expect((retired.state as Record<string, unknown>).lifecycle).toBe("retired");
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("retired");
+		expect(await readReceiptIndex(root, SID, "completion")).toHaveLength(0);
+		await owner.stop();
+		owner = null;
+	});
+
+	it("operate terminal events and result writes preserve a concurrent retire", async () => {
+		const transport = new FakeTransport();
+		const checkStarted = Promise.withResolvers<void>();
+		const releaseCheck = Promise.withResolvers<void>();
+		owner = new RuntimeOwner({
+			root,
+			sessionId: SID,
+			transport,
+			finalizeChecks: {
+				async runValidation(spec) {
+					return { exactCommand: spec.command, cwd: root, exitStatus: 0, pass: true };
+				},
+				async resolveCommit() {
+					return "abc123";
+				},
+				async commitOnBranch() {
+					return true;
+				},
+				async prOrIssue() {
+					checkStarted.resolve();
+					await releaseCheck.promise;
+					return { prUrl: "https://example.invalid/pr/1", issueArtifact: null };
+				},
+			},
+		});
+		const info = await owner.start();
+		await writeSessionState(root, { ...seedState(root), lifecycle: "finalizing" });
+		const operating = callEndpoint(info.socketPath, {
+			verb: "operate",
+			input: { goal: "finish", maxIterations: 1 },
+		});
+		await checkStarted.promise;
+		const retiring = callEndpoint(info.socketPath, { verb: "retire", input: {} });
+		await Bun.sleep(50);
+		releaseCheck.resolve();
+		const result = (await operating) as Record<string, unknown>;
+		const retired = (await retiring) as Record<string, unknown>;
+		expect(result.ok).toBe(false);
+		expect((retired.state as Record<string, unknown>).lifecycle).toBe("retired");
+		expect((await readSessionState(root, SID))?.lifecycle).toBe("retired");
+		await owner.stop();
+		owner = null;
 	});
 	it("records transport stop failure and retains the owner lease (fail closed)", async () => {
 		const transport = new FakeTransport();
