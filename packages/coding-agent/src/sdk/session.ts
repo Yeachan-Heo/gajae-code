@@ -2430,6 +2430,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (previousManager) await previousManager.disconnectAll().catch(() => {});
 				pluginMcpToolNames.length = 0;
 				conventionalMcpToolNames.length = 0;
+				ownedConventionalMcpServerNames.clear();
+				cachedConventionalMcpServerNames.clear();
+				ownedConventionalMcpToolNames = [];
+				publishOwnedConventionalMcpTools = false;
+				ownedPluginServersConnected = false;
 				let nextManager: MCPManager | undefined;
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
@@ -2453,11 +2458,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							]),
 						),
 					};
+					const conventionalCacheServerNames = new Set(
+						Object.keys(loaded.configs).filter(name => !pluginNames.has(name)),
+					);
+					for (const name of conventionalCacheServerNames) ownedConventionalMcpServerNames.add(name);
+					publishOwnedConventionalMcpTools = conventionalCacheServerNames.size > 0;
 					if (Object.keys(mergedConfigs).length > 0) {
-						nextManager = new MCPManager(to, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+						nextManager = new MCPManager(
+							to,
+							conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
+							{
+								sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
+								toolCacheServerNames: conventionalCacheServerNames,
+							},
+						);
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
+						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
+						ownedPluginServersConnected = connectedPluginNames.size > 0;
+						pluginMcpManagerServers.set(nextManager, connectedPluginNames);
+						conventionalMcpManagerServers.set(nextManager, new Set(Object.keys(loaded.configs)));
+						for (const tool of result.tools) {
+							const serverName = tool.mcpServerName;
+							if (
+								tool instanceof DeferredMCPTool &&
+								serverName &&
+								conventionalCacheServerNames.has(serverName)
+							) {
+								cachedConventionalMcpServerNames.add(serverName);
+							}
+							if (serverName && conventionalCacheServerNames.has(serverName)) {
+								ownedConventionalMcpToolNames.push(tool.name);
+							}
+						}
+						ownedConventionalMcpToolNames = [...new Set(ownedConventionalMcpToolNames)];
 						nextCustomTools.push(...(result.tools as CustomTool[]));
 						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
 						for (const tool of result.tools) {
@@ -2483,6 +2518,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
 				nextCustomTools,
 			);
+			wireOwnedConventionalToolSync();
 		};
 
 		/**

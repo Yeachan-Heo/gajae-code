@@ -183,6 +183,48 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("uses the session cache when rebuilding conventional MCP authority after a cwd move", async () => {
+		const sourceCwd = path.join(projectDir, "move-source");
+		const targetCwd = path.join(sourceCwd, "move-target");
+		await fs.promises.mkdir(sourceCwd, { recursive: true });
+		await fs.promises.mkdir(path.join(targetCwd, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(targetCwd, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { "slow-target": { type: "http", url: "http://127.0.0.1:1" } } }),
+		);
+
+		const sessionManager = SessionManager.create(sourceCwd, SessionManager.managedDestination(sourceCwd, projectDir));
+		const options = { ...isolatedSessionOptions(), cwd: sourceCwd, sessionManager, toolNames: ["move_session"] };
+		const loaded = await loadAllMCPConfigs(targetCwd, {
+			agentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-target"];
+		if (!config) throw new Error("slow-target config was not loaded");
+		const storage = await AgentStorage.open(getAgentDbPath(agentDir));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+		try {
+			await new MCPToolCache(storage).set("slow-target", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+			const { session } = await createAgentSession(options);
+			try {
+				await session.getToolByName("move_session")!.execute("move-with-cache", { path: "move-target" });
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				const cachedTool = session.getToolByName("mcp__slow_target_cached_hello");
+				expect(cachedTool).toBeDefined();
+				expect(session.getAllToolNames()).toContain("mcp__slow_target_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
+		}
+	}, 30_000);
+
 	it("retains a declared-timeout MCP manager and publishes tools after background connection", async () => {
 		await runMCPCommand({
 			action: "add",
