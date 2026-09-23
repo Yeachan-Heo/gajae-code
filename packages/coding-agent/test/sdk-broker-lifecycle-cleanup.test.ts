@@ -159,10 +159,8 @@ test("overflowing compact lock cleanup reason stores and reconstructs the full v
 });
 
 test("inline compact lock cleanup guidance classifies the exact startup lock after it disappears", async () => {
-	const tempDir = await makeAgentDir();
-	const agentDir = path.join(tempDir, "a".repeat(180));
+	const agentDir = await makeAgentDir();
 	try {
-		await fs.mkdir(agentDir, { recursive: true });
 		const startupLockPath = path.join(agentDir, "sdk", "broker.startup");
 		const lockPath = `${startupLockPath}.lock`;
 		const manualCleanupCommand =
@@ -173,7 +171,7 @@ test("inline compact lock cleanup guidance classifies the exact startup lock aft
 			startupLockPath,
 			lockPath,
 			3,
-			"dead owner",
+			"dead owner details ".repeat(40),
 			"acquire_timeout",
 			undefined,
 			{
@@ -211,7 +209,7 @@ test("inline compact lock cleanup guidance classifies the exact startup lock aft
 		).toBe(false);
 		expect(brokerStartupFailureCleanupTargetsLock(undefined, lockPath)).toBe(false);
 	} finally {
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 });
 
