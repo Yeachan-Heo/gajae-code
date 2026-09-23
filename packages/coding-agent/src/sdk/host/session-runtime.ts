@@ -2925,6 +2925,7 @@ function createControlSurface(
 	) => void,
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
+	imageUploads: PromptImageUploadStore,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -6891,6 +6892,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
 					if (kind === "prompt") retireAcceptedQueueCancellation(acceptedQueueCancellations, correlation);
+					if (kind === "prompt") releaseAcceptedImage(correlation);
 					return true;
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
@@ -6946,6 +6948,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
+			imageUploads,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
