@@ -1,11 +1,13 @@
 /** Internal JSON-line facade for the tmux owner-isolation contract. */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { admitManagedOwnerPredecessorBeforeLaunch } from "./managed-owner-admission";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { normalizeExactTmuxTarget } from "./tmux-common";
 import {
 	type BootstrapRequest,
+	type AdmitPredecessorRequest,
 	bootstrapTmuxOwnerIsolation,
 	classifyCgroup,
 	isTmuxControlArgvBoundToSocket,
@@ -443,6 +445,10 @@ export async function runTmuxOwnerIsolationCli(stdin: string): Promise<string> {
 			}),
 		);
 	}
+	if (request.op === "admit_predecessor")
+		return serializeOwnerIsolationResponse(
+			await admitManagedOwnerPredecessorBeforeLaunch(request as AdmitPredecessorRequest),
+		);
 	if (request.op === "publish_generation") {
 		if (!(await isTrustedLifecycleMutationCaller(request as PublishGenerationRequest)))
 			return cliFailure("invalid_json_line");

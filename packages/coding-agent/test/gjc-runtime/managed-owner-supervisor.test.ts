@@ -8,17 +8,19 @@ import {
 	managedOwnerSupervisorIdentityMatches,
 	publishManagedOwnerSupervisorAuthoritySync,
 } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
-import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	__setManagedOwnerEvidenceAfterFirstReadForTests,
 	__setManagedOwnerEvidenceAfterRootPinnedForTests,
 	captureOwnerGenerationBaseline,
+	closeExactTmuxOwner,
 	createOwnerIntent,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
+	type OwnerIntent,
+	type OwnerVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -29,14 +31,6 @@ const supervisorModule = path.join(
 	"src",
 	"gjc-runtime",
 	"managed-owner-supervisor.ts",
-);
-const admissionModule = path.join(
-	repoRoot,
-	"packages",
-	"coding-agent",
-	"src",
-	"gjc-runtime",
-	"managed-owner-admission.ts",
 );
 
 function startSupervisor(
@@ -122,7 +116,160 @@ function fastSigabrtCommand(): string[] {
 	return [process.execPath, "-e", "process.kill(process.pid, 'SIGABRT')"];
 }
 
+function expectedCloseVerdict(input: {
+	sessionId: string;
+	generation: string;
+	serverKey: string;
+	intentId: string;
+}): OwnerVerdict {
+	return {
+		schema_version: 1,
+		generation: input.generation,
+		session_id: input.sessionId,
+		server_key: input.serverKey,
+		observed_at: new Date().toISOString(),
+		signal: "SIGTERM",
+		exit_code: null,
+		result: "owner_term_then_session_cleanup",
+		observer: "raw_monitor",
+		classification: "expected_operator_shutdown",
+		reason: "terminal_observation",
+		intent_id: input.intentId,
+		dedupe_key: `owner-loss:${input.sessionId}:${input.generation}`,
+	};
+}
+
+async function exactOwnerCloseAttempt(
+	stateDir: string,
+	options: {
+		verdictSessionId?: string;
+		verdictGeneration?: string;
+		verdictServerKey?: string;
+		verdictIntentId?: string;
+		consumedDispatchId?: string;
+		verdictHasUnknownField?: boolean;
+	} = {},
+): Promise<{ promise: Promise<OwnerVerdict>; cleanupCount: () => number }> {
+	const sessionId = "session-close-test";
+	const generation = "generation-close-test";
+	const serverKey = "server-close-test";
+	const dispatchId = "dispatch-close-test";
+	await replaceOwnerGeneration(stateDir, sessionId, generation);
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	let sentIntent: OwnerIntent | undefined;
+	let cleanups = 0;
+	const promise = closeExactTmuxOwner(
+		{
+			stateDir,
+			sessionId,
+			generation,
+			serverKey,
+			pid: process.pid,
+			startTime: "owner-start",
+			dispatchId,
+			createdAt: new Date(Date.now() - 1_000).toISOString(),
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+		},
+		{
+			readStartTime: async () => "owner-start",
+			sendSigterm: async (_pid, intent) => {
+				sentIntent = intent;
+			},
+			waitForVerdict: async () => {
+				if (!sentIntent) throw new Error("test_intent_not_dispatched");
+				await fs.rename(paths.intentFile, `${paths.intentFile}.consumed`);
+				await fs.writeFile(
+					`${paths.intentFile}.consumed`,
+					`${JSON.stringify({
+						...sentIntent,
+						dispatch_id: options.consumedDispatchId ?? dispatchId,
+					})}\n`,
+				);
+				await fs.rename(`${paths.intentFile}.dispatching`, `${paths.intentFile}.dispatching.superseded-test`);
+				const verdict = expectedCloseVerdict({
+					sessionId: options.verdictSessionId ?? sessionId,
+					generation: options.verdictGeneration ?? generation,
+					serverKey: options.verdictServerKey ?? serverKey,
+					intentId: options.verdictIntentId ?? sentIntent.intent_id,
+				});
+				if (options.verdictHasUnknownField) return { ...verdict, dispatch_id: dispatchId } as OwnerVerdict;
+				return verdict;
+			},
+			cleanupSession: async () => {
+				cleanups += 1;
+			},
+		},
+	);
+	return { promise, cleanupCount: () => cleanups };
+}
+
 describe("managed owner supervisor", () => {
+	it("cleans up only for a complete verdict bound to the exact close request", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-close-"));
+		try {
+			const attempt = await exactOwnerCloseAttempt(stateDir);
+			await expect(attempt.promise).resolves.toMatchObject({
+				classification: "expected_operator_shutdown",
+				intent_id: expect.any(String),
+			});
+			expect(attempt.cleanupCount()).toBe(1);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"session",
+		"generation",
+		"server",
+	] as const)("refuses compatibility cleanup for a verdict with a foreign %s", async mismatch => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-close-"));
+		try {
+			const attempt = await exactOwnerCloseAttempt(stateDir, {
+				...(mismatch === "session" ? { verdictSessionId: "other-session" } : {}),
+				...(mismatch === "generation" ? { verdictGeneration: "other-generation" } : {}),
+				...(mismatch === "server" ? { verdictServerKey: "other-server" } : {}),
+			});
+			await expect(attempt.promise).rejects.toThrow("owner_term_verdict_timeout");
+			expect(attempt.cleanupCount()).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses cleanup for a verdict with a different intent", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-close-"));
+		try {
+			const attempt = await exactOwnerCloseAttempt(stateDir, { verdictIntentId: "other-intent" });
+			await expect(attempt.promise).rejects.toThrow("owner_term_verdict_timeout");
+			expect(attempt.cleanupCount()).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses cleanup for a verdict outside the complete schema", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-close-"));
+		try {
+			const attempt = await exactOwnerCloseAttempt(stateDir, { verdictHasUnknownField: true });
+			await expect(attempt.promise).rejects.toThrow("owner_term_verdict_timeout");
+			expect(attempt.cleanupCount()).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses cleanup when the verdict intent is not bound to the close dispatch", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-close-"));
+		try {
+			const attempt = await exactOwnerCloseAttempt(stateDir, { consumedDispatchId: "other-dispatch" });
+			await expect(attempt.promise).rejects.toThrow("owner_term_verdict_timeout");
+			expect(attempt.cleanupCount()).toBe(0);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts the exact Windows pane parent without weakening direct-supervisor platforms", () => {
 		expect(
 			managedOwnerSupervisorIdentityMatches({
@@ -971,53 +1118,6 @@ setInterval(() => {}, 1_000);`;
 		} finally {
 			await fs.chmod(lifecycleRoot, 0o700).catch(() => undefined);
 			await fs.rm(stateDir, { recursive: true, force: true });
-		}
-	});
-	it("routes a replacement supervisor child through predecessor recovery before normal CLI", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
-		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));
-		try {
-			const predecessor = await runSupervisor(stateDir, fastSigabrtCommand());
-			expect(predecessor.exitCode).toBe(134);
-			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
-			const bindingFile = (await fs.readdir(root)).find(
-				file => file.startsWith("child-") && file.endsWith(".binding.json"),
-			);
-			expect(bindingFile).toBeDefined();
-			const predecessorToken = bindingFile!.slice("child-".length, -".binding.json".length);
-			const ultragoal = sessionUltragoalDir(cwd, "session-2681");
-			await fs.mkdir(ultragoal, { recursive: true });
-			await fs.writeFile(path.join(ultragoal, "goals.json"), '{"goals":[]}');
-			await fs.writeFile(path.join(ultragoal, "ledger.jsonl"), '{"event":"started"}\n');
-			const transcript = path.join(cwd, "predecessor.jsonl");
-			await fs.writeFile(
-				transcript,
-				'{"id":"yield-1","parentId":null,"type":"yield","result":{"status":"success"}}\n{"id":"result-1","parentId":"yield-1","type":"toolResult","toolCallId":"yield-1","content":[]}\n',
-			);
-			const childScript = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; process.chdir(${JSON.stringify(cwd)}); const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind }));`;
-			const replacement = await runSupervisor(stateDir, [process.execPath, "-e", childScript], {
-				GJC_TMUX_OWNER_GENERATION: "replacement-generation-2681",
-				GJC_MANAGED_OWNER_RUN_ID: "replacement-run-2681",
-				GJC_MANAGED_OWNER_INCARNATION: "replacement-incarnation-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
-				GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "generation-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "run-2681",
-				GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "incarnation-2681",
-				GJC_MANAGED_OWNER_TRANSCRIPT_PATH: transcript,
-			});
-			expect(replacement.exitCode).toBe(75);
-			expect(replacement.stdout).toContain('"kind":"handoff"');
-			const handoffFile = (await fs.readdir(root)).find(
-				file => file.startsWith("admission-handoff-") && file.endsWith(".json"),
-			);
-			expect(handoffFile).toBeDefined();
-			expect(JSON.parse(await fs.readFile(path.join(root, handoffFile!), "utf8"))).toMatchObject({
-				state: "fail_closed_handoff",
-				reason: "safe_session_resume_seam_unavailable",
-			});
-		} finally {
-			await fs.rm(stateDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	});
 });

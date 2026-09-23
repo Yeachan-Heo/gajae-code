@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { sessionStateDir, sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -14,6 +14,14 @@ const admissionModule = path.join(
 	"src",
 	"gjc-runtime",
 	"managed-owner-admission.ts",
+);
+const ownerIsolationCliModule = path.join(
+	repoRoot,
+	"packages",
+	"coding-agent",
+	"src",
+	"gjc-runtime",
+	"tmux-owner-isolation-cli.ts",
 );
 const managedOwnerEnvironmentKeys = [
 	"GJC_TMUX_OWNER_STATE_DIR",
@@ -81,30 +89,37 @@ async function recover(
 	cwd: string,
 	token: string,
 	transcriptPath: string,
-): Promise<{ kind: string; exitCode: number }> {
-	const script = `import { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); const terminal = admission.kind === "recovery" ? await completeManagedOwnerRecovery(admission.context) : admission; console.log(JSON.stringify({ kind: terminal.kind, exitCode: process.exitCode ?? 0 }));`;
+): Promise<{ response: Record<string, unknown>; exitCode: number }> {
+	const request = {
+		schema_version: 1,
+		op: "admit_predecessor",
+		state_dir: stateDir,
+		cwd,
+		session_id: "session-2681",
+		owner_generation: "replacement-generation-2681",
+		owner_run_id: "replacement-run-2681",
+		owner_incarnation: "replacement-incarnation-2681",
+		predecessor_generation: "generation-2681",
+		predecessor_run_id: "run-2681",
+		predecessor_incarnation: "incarnation-2681",
+		predecessor_token: token,
+		transcript_path: transcriptPath,
+	};
+	const script = `import { runTmuxOwnerIsolationCli } from ${JSON.stringify(ownerIsolationCliModule)}; const input = await new Response(Bun.stdin.stream()).text(); const response = await runTmuxOwnerIsolationCli(input); console.log(JSON.stringify({ response: JSON.parse(response), exitCode: process.exitCode ?? 0 }));`;
 	const child = Bun.spawn({
 		cmd: [process.execPath, "-e", script],
 		cwd,
+		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 		env: {
 			...process.env,
-			GJC_TMUX_OWNER_STATE_DIR: stateDir,
-			GJC_COORDINATOR_SESSION_ID: "session-2681",
-			GJC_TMUX_OWNER_GENERATION: "replacement-generation-2681",
-			GJC_MANAGED_OWNER_RUN_ID: "replacement-run-2681",
-			GJC_MANAGED_OWNER_INCARNATION: "replacement-incarnation-2681",
-			GJC_MANAGED_OWNER_CHILD_TOKEN: "replacement-child-token",
-			GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: token,
-			GJC_MANAGED_OWNER_PREDECESSOR_GENERATION: "generation-2681",
-			GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID: "run-2681",
-			GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION: "incarnation-2681",
-			GJC_MANAGED_OWNER_TRANSCRIPT_PATH: transcriptPath,
 		},
 	});
-	const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	return { ...(JSON.parse(stdout) as { kind: string; exitCode: number }), exitCode };
+	child.stdin.write(`${JSON.stringify(request)}\n`);
+	child.stdin.end();
+	const [stdout] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+	return JSON.parse(stdout) as { response: Record<string, unknown>; exitCode: number };
 }
 
 async function writeSigabrtReceipt(root: string, token: string): Promise<void> {
@@ -273,17 +288,33 @@ describe("managed owner admission", () => {
 			const dirty = path.join(cwd, "dirty.ts");
 			await fs.writeFile(dirty, "export const dirty = true;\n");
 			const result = await recover(stateDir, cwd, "predecessor", transcript);
-			expect(result).toEqual({ kind: "handoff", exitCode: 75 });
+			expect(result.exitCode).toBe(75);
+			expect(result.response).toMatchObject({
+				ok: false,
+				code: "predecessor_rejected",
+				reason: "safe_session_resume_seam_unavailable",
+			});
 			expect(await fs.readFile(dirty, "utf8")).toBe("export const dirty = true;\n");
 			expect(await fs.readFile(goals, "utf8")).toBe(beforeGoals);
 			expect(await fs.readFile(ledger, "utf8")).toBe(beforeLedger);
-			const handoffs = (await fs.readdir(root)).filter(file => file.startsWith("admission-handoff-"));
+			const replacementRoot = lifecyclePaths(stateDir, "session-2681", "replacement-generation-2681").root;
+			const handoffs = (await fs.readdir(replacementRoot)).filter(file => file.startsWith("admission-handoff-"));
 			expect(handoffs).toHaveLength(1);
-			expect(JSON.parse(await fs.readFile(path.join(root, handoffs[0]!), "utf8"))).toMatchObject({
+			expect(JSON.parse(await fs.readFile(path.join(replacementRoot, handoffs[0]!), "utf8"))).toMatchObject({
 				state: "fail_closed_handoff",
 				reason: "safe_session_resume_seam_unavailable",
 				terminal_reconciliation: "unavailable_without_owning_store_cas",
 				b0_preserved: true,
+			});
+			const recoveryDecision = JSON.parse(
+				await fs.readFile(
+					path.join(sessionStateDir(cwd, "session-2681"), "ultragoal-owner-loss-recovery.json"),
+					"utf8",
+				),
+			) as Record<string, unknown>;
+			expect(recoveryDecision).toMatchObject({
+				disposition: "handoff",
+				reason: "safe_session_resume_seam_unavailable",
 			});
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });

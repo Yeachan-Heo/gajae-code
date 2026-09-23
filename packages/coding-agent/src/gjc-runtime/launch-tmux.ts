@@ -8,13 +8,6 @@ import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 import {
-	MANAGED_OWNER_PREDECESSOR_GENERATION_ENV,
-	MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV,
-	MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV,
-	MANAGED_OWNER_PREDECESSOR_TOKEN_ENV,
-	MANAGED_OWNER_TRANSCRIPT_PATH_ENV,
-} from "./managed-owner-admission";
-import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
 	MANAGED_OWNER_SUPERVISED_ENV,
@@ -62,12 +55,14 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
+	type AdmitPredecessorRequest,
 	type ManagedOwnerPredecessorEvidence,
 	type OwnerGenerationBaseline,
 	type OwnerIsolationProbeSync,
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
+	tmuxOwnerIsolationBootstrapArgv,
 	type TmuxServerProof,
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
@@ -123,6 +118,13 @@ export interface TmuxLaunchContext {
 	platform?: NodeJS.Platform;
 	tty?: TtyState;
 	spawnSync?: TmuxSpawnSync;
+	/** Test seam for observing the stdin-only trusted predecessor admission handoff. */
+	ownerPredecessorAdmissionRunner?: (input: {
+		command: string[];
+		cwd: string;
+		env: NodeJS.ProcessEnv;
+		stdinLine: string;
+	}) => TmuxSpawnResult;
 	/**
 	 * Provider authority boundaries. Production resolves, persists, and asserts
 	 * the durable psmux authority; tests may inject deterministic equivalents.
@@ -1224,7 +1226,6 @@ function rebuildManagedOwnerChildCommand(
 	const runId = plan.ownerRunId;
 	const incarnation = plan.ownerIncarnation;
 	if (!generation || !runId || !incarnation) throw new Error("gjc_tmux_owner_lifecycle_identity_missing");
-	const replacement = plan.ownerPredecessor;
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1248,16 +1249,6 @@ function rebuildManagedOwnerChildCommand(
 				[GJC_TMUX_COMMAND_ENV]: plan.tmuxCommand,
 				[MANAGED_OWNER_RUN_ID_ENV]: runId,
 				[MANAGED_OWNER_INCARNATION_ENV]: incarnation,
-				...(replacement
-					? {
-							[MANAGED_OWNER_PREDECESSOR_TOKEN_ENV]: replacement.predecessorToken,
-							[MANAGED_OWNER_PREDECESSOR_GENERATION_ENV]: replacement.generation,
-							[MANAGED_OWNER_PREDECESSOR_RUN_ID_ENV]: replacement.runId,
-							[MANAGED_OWNER_PREDECESSOR_INCARNATION_ENV]: replacement.incarnation,
-							[MANAGED_OWNER_TRANSCRIPT_PATH_ENV]:
-								context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
-						}
-					: {}),
 			},
 			bootstrapSecret: plan.coordinatorSidecarBootstrap
 				? {
@@ -1296,6 +1287,89 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	plan.ownerIncarnation = incarnation;
 	plan.ownerPredecessor = replacement;
 	rebuildManagedOwnerChildCommand(plan, context, stateDir, sessionId);
+}
+
+function admitManagedOwnerPredecessorBeforeLaunch(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+	const predecessor = plan.ownerPredecessor;
+	if (!predecessor) return;
+	if (
+		!plan.sessionId ||
+		!plan.ownerGeneration ||
+		!plan.ownerRunId ||
+		!plan.ownerIncarnation ||
+		plan.sessionId !== predecessor.sessionId
+	)
+		throw new Error("managed_owner_predecessor_identity_unavailable");
+	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const request: AdmitPredecessorRequest = {
+		schema_version: 1,
+		op: "admit_predecessor",
+		state_dir: stateDir,
+		cwd: plan.cwd,
+		session_id: predecessor.sessionId,
+		owner_generation: plan.ownerGeneration,
+		owner_run_id: plan.ownerRunId,
+		owner_incarnation: plan.ownerIncarnation,
+		predecessor_generation: predecessor.generation,
+		predecessor_run_id: predecessor.runId,
+		predecessor_incarnation: predecessor.incarnation,
+		predecessor_token: predecessor.predecessorToken,
+		transcript_path: context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
+	};
+	const stdinLine = JSON.stringify(request);
+	const helperEnvironment = { ...process.env, ...(context.env ?? {}) };
+	delete helperEnvironment[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	delete helperEnvironment.GJC_MANAGED_OWNER_CHILD_TOKEN;
+	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN;
+	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_GENERATION;
+	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID;
+	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION;
+	if (request.transcript_path) helperEnvironment.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = request.transcript_path;
+	else delete helperEnvironment.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
+	const command = tmuxOwnerIsolationBootstrapArgv();
+	const result = context.ownerPredecessorAdmissionRunner?.({
+		command,
+		cwd: plan.cwd,
+		env: helperEnvironment,
+		stdinLine,
+	});
+	const subprocess =
+		result ??
+		(() => {
+			const child = Bun.spawnSync({
+				cmd: command,
+				cwd: plan.cwd,
+				env: helperEnvironment,
+				stdin: Buffer.from(`${stdinLine}\n`),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return {
+				exitCode: child.exitCode,
+				stdout: Buffer.from(child.stdout).toString("utf8"),
+				stderr: Buffer.from(child.stderr).toString("utf8"),
+			};
+		})();
+	if (subprocess.exitCode !== 0) throw new Error("managed_owner_predecessor_admission_failed");
+	const responseText = subprocess.stdout ?? "";
+	if (Buffer.byteLength(responseText) > 16 * 1024 || !responseText.endsWith("\n"))
+		throw new Error("managed_owner_predecessor_admission_failed");
+	try {
+		const response: unknown = JSON.parse(responseText.slice(0, -1));
+		if (
+			!response ||
+			typeof response !== "object" ||
+			Array.isArray(response) ||
+			Object.keys(response).sort().join(",") !== "code,disposition,ok,schema_version" ||
+			(response as Record<string, unknown>).schema_version !== 1 ||
+			(response as Record<string, unknown>).ok !== true ||
+			(response as Record<string, unknown>).code !== "predecessor_admitted" ||
+			(response as Record<string, unknown>).disposition !== "resume"
+		)
+			throw new Error("managed_owner_predecessor_admission_failed");
+	} catch {
+		throw new Error("managed_owner_predecessor_admission_failed");
+	}
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
@@ -1629,6 +1703,11 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
 	const spawnEnv = { ...env };
 	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	delete spawnEnv.GJC_MANAGED_OWNER_CHILD_TOKEN;
+	delete spawnEnv.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN;
+	delete spawnEnv.GJC_MANAGED_OWNER_PREDECESSOR_GENERATION;
+	delete spawnEnv.GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID;
+	delete spawnEnv.GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION;
 	const signingEnv = coordinatorSidecarSigningEnv(env);
 	Object.assign(spawnEnv, signingEnv);
 	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
@@ -1804,6 +1883,13 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	} catch (error) {
 		cleanupCoordinatorSidecarBootstrap(plan);
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
+		return true;
+	}
+	try {
+		admitManagedOwnerPredecessorBeforeLaunch(plan, context);
+	} catch (error) {
+		cleanupCoordinatorSidecarBootstrap(plan);
+		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner predecessor admission failed: ${String(error)}`);
 		return true;
 	}
 	if (!plan.sessionId || !plan.sessionStateFile || !plan.ownerGeneration || !plan.tmuxCommand) {

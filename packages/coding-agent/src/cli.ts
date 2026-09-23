@@ -127,15 +127,9 @@ export async function runCli(argv: string[]): Promise<void> {
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {
-		const { admitManagedOwnerBeforeCli, completeManagedOwnerRecovery } = await import(
-			"./gjc-runtime/managed-owner-admission"
-		);
+		const { admitManagedOwnerBeforeCli } = await import("./gjc-runtime/managed-owner-admission");
 		const admission = await admitManagedOwnerBeforeCli();
 		if (admission.kind === "blocked") return;
-		if (admission.kind === "recovery") {
-			await completeManagedOwnerRecovery(admission.context);
-			return;
-		}
 	}
 	if (argv[0] === "sdk" && argv[1] === "stderr-drain-internal") {
 		// Private lifecycle stderr drainer: must stay ahead of the public sdk family

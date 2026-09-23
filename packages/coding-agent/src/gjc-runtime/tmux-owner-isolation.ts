@@ -1294,6 +1294,28 @@ export interface ObserveTerminalRequest {
 	/** Optional exact intent identity for relays that can carry it. */
 	operator_intent_id?: string;
 }
+
+/** One-shot parent-to-child admission request; the predecessor bearer is stdin-only. */
+export interface AdmitPredecessorRequest {
+	schema_version: 1;
+	op: "admit_predecessor";
+	state_dir: string;
+	cwd: string;
+	session_id: string;
+	owner_generation: string;
+	owner_run_id: string;
+	owner_incarnation: string;
+	predecessor_generation: string;
+	predecessor_run_id: string;
+	predecessor_incarnation: string;
+	predecessor_token: string;
+	transcript_path: string;
+}
+
+export type AdmitPredecessorResponse =
+	| { schema_version: 1; ok: true; code: "predecessor_admitted"; disposition: "resume" }
+	| { schema_version: 1; ok: false; code: "predecessor_rejected"; reason: string };
+
 export interface LifecyclePaths {
 	root: string;
 	generation: string;
@@ -2893,6 +2915,40 @@ export interface ExactOwnerCloseDependencies {
 	cleanupSession(): Promise<void>;
 }
 
+/** @internal */
+export async function hasExactOwnerIntentBinding(input: {
+	stateDir: string;
+	sessionId: string;
+	generation: string;
+	serverKey: string;
+	dispatchId: string;
+	intentId: string;
+}): Promise<boolean> {
+	const paths = lifecyclePaths(input.stateDir, input.sessionId, input.generation);
+	const candidates = [
+		paths.intentFile,
+		`${paths.intentFile}.dispatching`,
+		`${paths.intentFile}.consumed`,
+		`${paths.intentFile}.dispatched`,
+	];
+	let found = false;
+	for (const file of candidates) {
+		const value = await readNoFollowJson(file);
+		if (value === null) continue;
+		if (!isValidOwnerIntent(value)) throw new Error("owner_term_verdict_evidence_invalid");
+		if (value.intent_id !== input.intentId) return false;
+		found = true;
+		if (
+			value.session_id !== input.sessionId ||
+			value.generation !== input.generation ||
+			value.server_key !== input.serverKey ||
+			value.dispatch_id !== input.dispatchId
+		)
+			return false;
+	}
+	return found;
+}
+
 async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, generation: string): Promise<boolean> {
 	const record = await readJson<unknown>(lifecyclePaths(stateDir, sessionId, generation).generationFile);
 	return isValidGenerationRecord(record, sessionId, generation);
@@ -2971,18 +3027,39 @@ export async function closeExactTmuxOwner(
 		await releaseVerdictLock(generationLockToken);
 	}
 	const verdict = await deps.waitForVerdict();
-	if (!verdict || verdict.intent_id !== intent.intent_id || verdict.classification !== "expected_operator_shutdown") {
+	const validVerdict =
+		verdict !== null &&
+		isValidOwnerVerdict(verdict) &&
+		verdict.session_id === request.sessionId &&
+		verdict.generation === request.generation &&
+		verdict.server_key === request.serverKey &&
+		verdict.intent_id === intent.intent_id &&
+		verdict.classification === "expected_operator_shutdown" &&
+		intent.dispatch_id === request.dispatchId
+			? verdict
+			: null;
+	if (
+		!validVerdict ||
+		!(await hasExactOwnerIntentBinding({
+			stateDir: request.stateDir,
+			sessionId: request.sessionId,
+			generation: request.generation,
+			serverKey: request.serverKey,
+			dispatchId: request.dispatchId,
+			intentId: intent.intent_id,
+		}))
+	) {
 		await archiveDispatchingIntent(paths, intent.intent_id);
 		await renameIntentIfCurrent(paths, intent.intent_id, dispatched ? ".dispatched" : ".expired");
 		throw new Error("owner_term_verdict_timeout");
 	}
 	await deps.cleanupSession();
-	return verdict;
+	return validVerdict;
 }
 
 export function parseOwnerIsolationRequest(
 	line: string,
-): PlanRequest | BootstrapRequest | PublishGenerationRequest | ObserveTerminalRequest | null {
+): PlanRequest | BootstrapRequest | PublishGenerationRequest | ObserveTerminalRequest | AdmitPredecessorRequest | null {
 	if (Buffer.byteLength(line) > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES || line.includes("\n")) return null;
 	try {
 		const parsed: unknown = JSON.parse(line);
@@ -2991,7 +3068,8 @@ export function parseOwnerIsolationRequest(
 			isPlanRequest(parsed) ||
 			isBootstrapRequest(parsed) ||
 			isPublishGenerationRequest(parsed) ||
-			isObserveTerminalRequest(parsed)
+			isObserveTerminalRequest(parsed) ||
+			isAdmitPredecessorRequest(parsed)
 		)
 			return parsed;
 		return null;
@@ -3000,7 +3078,7 @@ export function parseOwnerIsolationRequest(
 	}
 }
 export function serializeOwnerIsolationResponse(
-	response: PlanResponse | BootstrapResult | PublishGenerationResult | OwnerVerdict,
+	response: PlanResponse | BootstrapResult | PublishGenerationResult | OwnerVerdict | AdmitPredecessorResponse,
 ): string {
 	const serialized = JSON.stringify(response);
 	if (Buffer.byteLength(serialized) < TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) return serialized;
@@ -3011,6 +3089,52 @@ export function serializeOwnerIsolationResponse(
 		diagnostic: "response_too_large",
 	} satisfies PlanFailure);
 }
+
+function isAdmitPredecessorRequest(request: unknown): request is AdmitPredecessorRequest {
+	if (
+		!isRecord(request) ||
+		!hasOnlyKeys(request, [
+			"schema_version",
+			"op",
+			"state_dir",
+			"cwd",
+			"session_id",
+			"owner_generation",
+			"owner_run_id",
+			"owner_incarnation",
+			"predecessor_generation",
+			"predecessor_run_id",
+			"predecessor_incarnation",
+			"predecessor_token",
+			"transcript_path",
+		]) ||
+		request.schema_version !== 1 ||
+		request.op !== "admit_predecessor" ||
+		typeof request.state_dir !== "string" ||
+		!path.isAbsolute(request.state_dir) ||
+		/[\u0000-\u001f\u007f]/u.test(request.state_dir) ||
+		typeof request.cwd !== "string" ||
+		!path.isAbsolute(request.cwd) ||
+		/[\u0000-\u001f\u007f]/u.test(request.cwd) ||
+		typeof request.transcript_path !== "string" ||
+		(request.transcript_path !== "" && !path.isAbsolute(request.transcript_path)) ||
+		/[\u0000-\u001f\u007f]/u.test(request.transcript_path)
+	)
+		return false;
+	return (
+		[
+			[request.session_id, "owner session id"],
+			[request.owner_generation, "owner generation"],
+			[request.owner_run_id, "managed owner run id"],
+			[request.owner_incarnation, "managed owner incarnation"],
+			[request.predecessor_generation, "predecessor generation"],
+			[request.predecessor_run_id, "predecessor run id"],
+			[request.predecessor_incarnation, "predecessor incarnation"],
+			[request.predecessor_token, "predecessor token"],
+		] as const
+	).every(([value, label]) => typeof value === "string" && isSafePathComponent(value, label));
+}
+
 function isPlanRequest(request: unknown): request is PlanRequest {
 	return (
 		isRecord(request) &&
@@ -3247,7 +3371,12 @@ function isPlatform(value: unknown): value is NodeJS.Platform {
  * hermetic callers; the protocol itself must not trust those fields.
  */
 export function isTrustedOwnerIsolationProtocolRequest(
-	request: PlanRequest | BootstrapRequest | PublishGenerationRequest | ObserveTerminalRequest,
+	request:
+		| PlanRequest
+		| BootstrapRequest
+		| PublishGenerationRequest
+		| ObserveTerminalRequest
+		| AdmitPredecessorRequest,
 ): boolean {
 	if (request.op === "plan") {
 		if (request.platform !== process.platform) return false;
@@ -3276,6 +3405,7 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
+	if (request.op === "admit_predecessor") return true;
 	return true;
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {

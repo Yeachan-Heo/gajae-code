@@ -21,7 +21,11 @@ import {
 	__setBinaryResolverForTests,
 	__setExecutableIdentityResolverForTests,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
-import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	sessionRuntimeDir,
+	sessionStateDir,
+	sessionUltragoalDir,
+} from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
@@ -49,6 +53,45 @@ function args(overrides: Partial<Args> = {}): Args {
 		fileArgs: [],
 		unknownFlags: new Map(),
 		...overrides,
+	};
+}
+
+function runPredecessorAdmissionHelper(input: { cwd: string; env: NodeJS.ProcessEnv; stdinLine: string }): {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+} {
+	const cliModule = new URL("../../src/gjc-runtime/tmux-owner-isolation-cli.ts", import.meta.url).href;
+	const source = `import { runTmuxOwnerIsolationCli } from ${JSON.stringify(cliModule)}; const input = await new Response(Bun.stdin.stream()).text(); const response = await runTmuxOwnerIsolationCli(input); process.stdout.write(response + "\\n"); if (JSON.parse(response).ok !== true) process.exitCode = 1;`;
+	const child = Bun.spawnSync({
+		cmd: [process.execPath, "-e", source],
+		cwd: input.cwd,
+		env: input.env,
+		stdin: Buffer.from(`${input.stdinLine}\n`),
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	return {
+		exitCode: child.exitCode,
+		stdout: Buffer.from(child.stdout).toString("utf8"),
+		stderr: Buffer.from(child.stderr).toString("utf8"),
+	};
+}
+
+function runManagedOwnerAdmission(env: NodeJS.ProcessEnv): { exitCode: number; stdout: string; stderr: string } {
+	const admissionModule = new URL("../../src/gjc-runtime/managed-owner-admission.ts", import.meta.url).href;
+	const source = `import { admitManagedOwnerBeforeCli } from ${JSON.stringify(admissionModule)}; const admission = await admitManagedOwnerBeforeCli(); console.log(JSON.stringify({ kind: admission.kind, exitCode: process.exitCode ?? 0 }));`;
+	const child = Bun.spawnSync({
+		cmd: [process.execPath, "-e", source],
+		cwd: process.cwd(),
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	return {
+		exitCode: child.exitCode,
+		stdout: Buffer.from(child.stdout).toString("utf8"),
+		stderr: Buffer.from(child.stderr).toString("utf8"),
 	};
 }
 
@@ -3829,7 +3872,7 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("propagates only an exact durable SIGABRT predecessor token into a replacement launch", () => {
+	it("admits an exact predecessor over stdin without exposing its bearer to a direct pane", () => {
 		if (process.platform !== "linux") return;
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-replacement-"));
 		try {
@@ -3846,6 +3889,14 @@ describe("tmux owner isolation launch gate", () => {
 			const predecessorToken = "exact-predecessor";
 			const ownerRoot = lifecyclePaths(root, sessionId, generation).root;
 			fs.mkdirSync(ownerRoot, { recursive: true });
+			const transcriptPath = path.join(root, "predecessor.jsonl");
+			fs.mkdirSync(sessionUltragoalDir(root, sessionId), { recursive: true });
+			fs.writeFileSync(path.join(sessionUltragoalDir(root, sessionId), "goals.json"), '{"goals":[]}');
+			fs.writeFileSync(path.join(sessionUltragoalDir(root, sessionId), "ledger.jsonl"), '{"event":"started"}\n');
+			fs.writeFileSync(
+				transcriptPath,
+				'{"id":"one","parentId":null,"type":"message"}\n{"id":"two","parentId":"one","type":"yield","result":{"status":"success"}}\n{"id":"three","parentId":"two","type":"toolResult","toolCallId":"two","content":[]}\n',
+			);
 			fs.writeFileSync(
 				lifecyclePaths(root, sessionId, generation).generationFile,
 				`${JSON.stringify({ schema_version: 1, generation, session_id: sessionId, published_at: "2026-07-19T00:00:00.000Z" })}\n`,
@@ -3861,6 +3912,15 @@ describe("tmux owner isolation launch gate", () => {
 				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
 			);
 			const calls: string[][] = [];
+			const diagnostics: string[] = [];
+			const events: string[] = [];
+			const admissionResults: string[] = [];
+			const admissionInputs: Array<{
+				command: string[];
+				cwd: string;
+				env: NodeJS.ProcessEnv;
+				stdinLine: string;
+			}> = [];
 			const handled = launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
@@ -3868,29 +3928,126 @@ describe("tmux owner isolation launch gate", () => {
 				env: {
 					GJC_COORDINATOR_SESSION_ID: sessionId,
 					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
-					GJC_TMUX_OWNER_STATE_DIR: root,
-					GJC_TMUX_OWNER_GENERATION: generation,
-					GJC_MANAGED_OWNER_RUN_ID: runId,
-					GJC_MANAGED_OWNER_INCARNATION: incarnation,
-					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: predecessorToken,
+					GJC_SESSION_FILE: transcriptPath,
+					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: "caller-supplied-decoy",
 				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
-				platform: "linux",
+				platform: "darwin",
 				tty: interactiveTty,
 				tmuxAvailable: true,
 				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+				ownerPredecessorAdmissionRunner: input => {
+					events.push("admission");
+					admissionInputs.push(input);
+					const result = runPredecessorAdmissionHelper(input);
+					admissionResults.push(result.stdout);
+					return result;
+				},
 				spawnSync: (_command, spawnArgs) => {
+					if (spawnArgs[0] === "new-session") events.push("new-session");
 					calls.push(spawnArgs);
 					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
 				},
 			});
 			expect(handled).toBe(true);
-			const innerCommand = calls.find(call => call[0] === "new-session")?.at(-1);
-			expect(innerCommand).toContain(`GJC_MANAGED_OWNER_PREDECESSOR_TOKEN='${predecessorToken}'`);
-			expect(innerCommand).toMatch(/GJC_TMUX_OWNER_GENERATION='[0-9a-f-]{36}'/i);
-			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
-			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
+			expect(events.indexOf("admission")).toBeGreaterThanOrEqual(0);
+			expect(events).not.toContain("new-session");
+			expect(calls.some(call => call[0] === "new-session")).toBe(false);
+			expect(calls.some(call => call[0] === "attach-session")).toBe(false);
+			expect(diagnostics.join("\n")).toContain("tmux owner predecessor admission failed");
+			expect(admissionInputs).toHaveLength(1);
+			const admissionInput = admissionInputs[0]!;
+			expect(admissionInput.command.join(" ")).toContain("--internal-tmux-owner-isolation");
+			expect(admissionInput.command.join(" ")).not.toContain(predecessorToken);
+			expect(admissionInput.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN).toBeUndefined();
+			expect(admissionInput.stdinLine).toContain(predecessorToken);
+			expect(JSON.parse(admissionResults[0]!)).toMatchObject({
+				ok: false,
+				code: "predecessor_rejected",
+				reason: "safe_session_resume_seam_unavailable",
+			});
+			expect(JSON.parse(admissionInput.stdinLine)).toMatchObject({
+				op: "admit_predecessor",
+				session_id: sessionId,
+				owner_generation: expect.any(String),
+				owner_run_id: expect.any(String),
+				owner_incarnation: expect.any(String),
+				predecessor_generation: generation,
+				predecessor_run_id: runId,
+				predecessor_incarnation: incarnation,
+				predecessor_token: predecessorToken,
+			});
+			const admissionRequest = JSON.parse(admissionInput.stdinLine) as Record<string, string>;
+			const ownerGeneration = admissionRequest.owner_generation!;
+			const ownerRunId = admissionRequest.owner_run_id!;
+			const ownerIncarnation = admissionRequest.owner_incarnation!;
+			expect(JSON.parse(admissionInput.stdinLine)).toMatchObject({
+				owner_generation: ownerGeneration,
+				owner_run_id: ownerRunId,
+				owner_incarnation: ownerIncarnation,
+			});
+
+			const newOwnerRoot = lifecyclePaths(root, sessionId, ownerGeneration).root;
+			const admissionHandoffs = fs
+				.readdirSync(newOwnerRoot)
+				.filter(file => file.startsWith("admission-handoff-"))
+				.map(file => JSON.parse(fs.readFileSync(path.join(newOwnerRoot, file), "utf8")) as Record<string, unknown>);
+			expect(admissionHandoffs).toHaveLength(1);
+			expect(admissionHandoffs[0]).toMatchObject({
+				state: "fail_closed_handoff",
+				reason: "safe_session_resume_seam_unavailable",
+				generation,
+				session_id: sessionId,
+				predecessor_child_token: predecessorToken,
+				predecessor_run_id: runId,
+				terminal_reconciliation: "unavailable_without_owning_store_cas",
+				b0_preserved: true,
+			});
+			expect(admissionHandoffs[0]?.reason).not.toBe("recovery_transcript_changed");
+			const recoveryDecision = JSON.parse(
+				fs.readFileSync(path.join(sessionStateDir(root, sessionId), "ultragoal-owner-loss-recovery.json"), "utf8"),
+			) as Record<string, unknown>;
+			expect(recoveryDecision).toMatchObject({
+				disposition: "handoff",
+				reason: "safe_session_resume_seam_unavailable",
+			});
+			expect(recoveryDecision.reason).not.toBe("recovery_transcript_changed");
+
+			const childToken = "linux-supervisor-child";
+			const directAdmissionEnv = {
+				...process.env,
+				GJC_TMUX_OWNER_STATE_DIR: root,
+				GJC_COORDINATOR_SESSION_ID: sessionId,
+				GJC_TMUX_OWNER_GENERATION: ownerGeneration,
+				GJC_MANAGED_OWNER_RUN_ID: ownerRunId,
+				GJC_MANAGED_OWNER_INCARNATION: ownerIncarnation,
+			};
+			const childCommand = ["gjc", "--resume"];
+			const childCommandSha256 = createHash("sha256").update(JSON.stringify(childCommand)).digest("hex");
+			fs.writeFileSync(
+				path.join(newOwnerRoot, `child-${childToken}.binding.json`),
+				`${JSON.stringify({ schema_version: 2, generation: ownerGeneration, session_id: sessionId, run_id: ownerRunId, endpoint_incarnation: ownerIncarnation, child_token: childToken, command: childCommand, command_sha256: childCommandSha256, supervisor_pid: 1, supervisor_start_time: "1", created_at: "2026-09-23T00:00:00.000Z" })}\n`,
+			);
+			const linuxAdmission = runManagedOwnerAdmission({
+				...directAdmissionEnv,
+				GJC_MANAGED_OWNER_CHILD_TOKEN: childToken,
+			});
+			expect(linuxAdmission.exitCode).toBe(0);
+			expect(JSON.parse(linuxAdmission.stdout)).toMatchObject({ kind: "supervised", exitCode: 0 });
+
+			const receiptPath = path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`);
+			const foreignReceipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
+			foreignReceipt.run_id = "foreign-run";
+			fs.writeFileSync(receiptPath, `${JSON.stringify(foreignReceipt)}\n`);
+			const rejected = runPredecessorAdmissionHelper(admissionInput);
+			expect(rejected.exitCode).not.toBe(0);
+			expect(JSON.parse(rejected.stdout)).toMatchObject({
+				ok: false,
+				code: "predecessor_rejected",
+				reason: "exact_sigabrt_receipt_untrusted",
+			});
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

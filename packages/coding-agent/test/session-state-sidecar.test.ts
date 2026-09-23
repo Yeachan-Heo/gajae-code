@@ -2811,6 +2811,119 @@ describe("coordinator runtime state sidecar", () => {
 		);
 		expect(await readPayload(stateFile)).toMatchObject({ cwd: workspace, workdir: workspace });
 	});
+	it("persists only an owner verdict bound to the runtime session and close dispatch", async () => {
+		let serial = 0;
+		const prepare = async () => {
+			serial += 1;
+			const root = await tempRoot();
+			const stateFile = path.join(root, "state.json");
+			const sessionId = `owner-verdict-context-${serial}`;
+			const generation = `owner-verdict-generation-${serial}`;
+			const serverKey = `owner-server-${serial}`;
+			const dispatchId = `owner-dispatch-${serial}`;
+			const now = Date.now();
+			await replaceOwnerGeneration(root, sessionId, generation);
+			const ownerIntent = await createOwnerIntent(root, {
+				generation,
+				session_id: sessionId,
+				server_key: serverKey,
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: dispatchId,
+				created_at: new Date(now - 1_000).toISOString(),
+				expires_at: new Date(now + 60_000).toISOString(),
+			});
+			const prior = JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			});
+			await Bun.write(stateFile, prior);
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: root,
+				socket_key: serverKey,
+				observer: "raw_monitor",
+				observed_at: new Date(now).toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "exit",
+				reason: "test",
+				operator_dispatch_id: dispatchId,
+				operator_intent_id: ownerIntent.intent_id,
+			});
+			return {
+				root,
+				stateFile,
+				sessionId,
+				generation,
+				serverKey,
+				dispatchId,
+				ownerIntent,
+				verdict,
+				prior,
+				context: {
+					generation,
+					stateDir: root,
+					socketKey: serverKey,
+					operatorDispatchId: dispatchId,
+					operatorIntentId: ownerIntent.intent_id,
+				},
+			};
+		};
+
+		const matching = await prepare();
+		await persistCoordinatorRuntimeStateFromOwnerVerdict(matching.stateFile, matching.context, matching.verdict);
+		expect(await readPayload(matching.stateFile)).toMatchObject({
+			session_id: matching.sessionId,
+			owner_terminal: {
+				generation: matching.generation,
+				socket_key: matching.serverKey,
+				intent_id: matching.ownerIntent.intent_id,
+			},
+		});
+
+		for (const mismatch of ["session", "generation", "server", "dispatch"] as const) {
+			const sample = await prepare();
+			const verdict =
+				mismatch === "session"
+					? {
+							...sample.verdict,
+							session_id: "foreign-session",
+							dedupe_key: `owner-loss:foreign-session:${sample.generation}`,
+						}
+					: mismatch === "generation"
+						? {
+								...sample.verdict,
+								generation: "foreign-generation",
+								dedupe_key: `owner-loss:${sample.sessionId}:foreign-generation`,
+							}
+						: mismatch === "server"
+							? { ...sample.verdict, server_key: "foreign-server" }
+							: sample.verdict;
+			const context =
+				mismatch === "dispatch" ? { ...sample.context, operatorDispatchId: "foreign-dispatch" } : sample.context;
+			await expect(
+				persistCoordinatorRuntimeStateFromOwnerVerdict(sample.stateFile, context, verdict),
+			).rejects.toThrow("owner_verdict_context_mismatch");
+			expect(await Bun.file(sample.stateFile).text()).toBe(sample.prior);
+		}
+
+		const unbound = await prepare();
+		await expect(
+			persistCoordinatorRuntimeStateFromOwnerVerdict(
+				unbound.stateFile,
+				{ generation: unbound.generation, stateDir: unbound.root, socketKey: unbound.serverKey },
+				unbound.verdict,
+			),
+		).rejects.toThrow("owner_verdict_context_mismatch");
+		expect(await Bun.file(unbound.stateFile).text()).toBe(unbound.prior);
+	});
 	it("fails closed with public-safe recovery for invalid metadata and unavailable owner ownership", async () => {
 		const root = await tempRoot();
 		const sessionId = "owner-fail-closed";

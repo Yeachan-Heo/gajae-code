@@ -24,6 +24,7 @@ import { sessionRoot, sessionRuntimeDir, sessionRuntimeStatePath } from "./sessi
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
 	captureOwnerGenerationBaseline,
+	hasExactOwnerIntentBinding,
 	isValidOwnerIntent,
 	isValidOwnerVerdict,
 	lifecyclePaths,
@@ -3554,6 +3555,15 @@ export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
 	fallbackCwd?: string,
 ): Promise<void> {
 	const previous = readPreviousPayload(stateFile);
+	if (
+		!isValidOwnerVerdict(verdict) ||
+		previous.session_id !== verdict.session_id ||
+		ownerTerminal.generation !== verdict.generation ||
+		ownerTerminal.socketKey !== verdict.server_key ||
+		(ownerTerminal.operatorIntentId != null && ownerTerminal.operatorIntentId !== verdict.intent_id) ||
+		!(await ownerIntentMatchesVerdictContext(ownerTerminal, verdict))
+	)
+		throw new Error("owner_verdict_context_mismatch");
 	const cwd =
 		typeof previous.cwd === "string" && previous.cwd.trim()
 			? previous.cwd
@@ -3571,6 +3581,29 @@ export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
 		},
 		{ stateFile, ownerTerminalVerdict: verdict },
 	);
+}
+
+async function ownerIntentMatchesVerdictContext(
+	ownerTerminal: OwnerTerminalContext,
+	verdict: OwnerVerdict,
+): Promise<boolean> {
+	const dispatchId = ownerTerminal.operatorDispatchId;
+	if (dispatchId == null)
+		return verdict.classification !== "expected_operator_shutdown" && verdict.intent_id === undefined;
+	const intentId = ownerTerminal.operatorIntentId;
+	if (!intentId || verdict.intent_id !== intentId) return false;
+	try {
+		return await hasExactOwnerIntentBinding({
+			stateDir: ownerTerminal.stateDir,
+			sessionId: verdict.session_id,
+			generation: ownerTerminal.generation,
+			serverKey: verdict.server_key,
+			dispatchId,
+			intentId,
+		});
+	} catch {
+		return false;
+	}
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(
