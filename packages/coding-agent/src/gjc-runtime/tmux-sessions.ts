@@ -505,7 +505,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 
 function listSessionLines(env: NodeJS.ProcessEnv = process.env): ListedTmuxSessions {
 	return runListSessions(
-		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t#{${GJC_TMUX_PROJECT_OPTION}}\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t#{${GJC_TMUX_SESSION_STATE_FILE_OPTION}}\t#{${GJC_TMUX_OWNER_GENERATION_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}}\t#{session_id}`,
+		`#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{${GJC_TMUX_PROFILE_OPTION}}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{${GJC_TMUX_BRANCH_OPTION}}\t#{${GJC_TMUX_BRANCH_SLUG_OPTION}}\t\t#{${GJC_TMUX_SESSION_ID_OPTION}}\t\t#{${GJC_TMUX_OWNER_GENERATION_OPTION}}\t#{${GJC_TMUX_VERSION_OPTION}}\t#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}}\t#{session_id}`,
 
 		env,
 	);
@@ -1432,7 +1432,7 @@ function readExactOptionForGc(
 			["show-options", "-qv", "-t", normalizeExactTmuxTarget(sessionName, env, "option"), option],
 			env,
 			provisionalAuthority,
-		).trim();
+		).replace(/\r?\n$/u, "");
 		if (!raw) return undefined;
 		// tmux returns just the value; psmux returns `key value` (or `key "value with space"` for
 		// @gjc-branch etc.). On psmux, parse the last token and strip any

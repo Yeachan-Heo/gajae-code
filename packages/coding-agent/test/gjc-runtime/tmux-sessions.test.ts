@@ -147,16 +147,41 @@ describe("GJC tmux session management", () => {
 	});
 
 	it("lists only GJC-managed tmux sessions", () => {
-		spyOn(Bun, "spawnSync").mockReturnValue(
-			spawnResult(
-				0,
-				[
-					"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a\t\t\t\t\t\t$1",
-					"unrelated	2	1	1770000060		root	3	23456		",
-					"gajae_code	1	1	1770000120		root	1	34567		",
-				].join("\n"),
-			),
-		);
+		const spawnSyncSpy = spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy;
+		spawnSyncSpy.mockImplementation(command => {
+			const commandArgv = spawnArgv(command);
+			if (commandArgv.includes("list-sessions")) {
+				return spawnResult(
+					0,
+					[
+						[
+							"gajae_code_abc",
+							"1",
+							"0",
+							"1770000000",
+							"1",
+							"root",
+							"2",
+							"12345",
+							"feature/demo",
+							"feature-demo",
+							"",
+							"",
+							"",
+							"",
+							"",
+							"",
+							"$1",
+						].join("\t"),
+						"unrelated\t2\t1\t1770000060\t\troot\t3\t23456\t\t",
+						"gajae_code\t1\t1\t1770000120\t\troot\t1\t34567\t\t",
+					].join("\n"),
+				);
+			}
+			if (commandArgv.includes("show-options"))
+				return spawnResult(0, commandArgv.at(-1) === "@gjc-project" ? "/repo-a\n" : "\n");
+			return spawnResult(0, "");
+		});
 
 		clearPsmuxDetectionCache();
 		const sessions = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" });
@@ -175,10 +200,63 @@ describe("GJC tmux session management", () => {
 				"tmux-test",
 				"list-sessions",
 				"-F",
-				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t#{@gjc-project}\t#{@gjc-session-id}\t#{@gjc-session-state-file}\t#{@gjc-owner-generation}\t#{@gjc-version}\t#{@gjc-psmux-incarnation}\t#{session_id}",
+				"#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@gjc-profile}\t#{session_key_table}\t#{session_panes}\t#{pane_pid}\t#{@gjc-branch}\t#{@gjc-branch-slug}\t\t#{@gjc-session-id}\t\t#{@gjc-owner-generation}\t#{@gjc-version}\t#{@gjc-psmux-incarnation}\t#{session_id}",
 			],
 			expect.any(Object),
 		);
+	});
+
+	it("preserves literal tabs in exact path-valued session options", () => {
+		const project = "/repo/\tproject\t";
+		const sessionStateFile = "/tmp/runtime/\tstate.json\t";
+		const calls: string[][] = [];
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation(command => {
+			const commandArgv = spawnArgv(command);
+			calls.push(commandArgv);
+			if (commandArgv.includes("list-sessions")) {
+				return spawnResult(
+					0,
+					[
+						"gajae_code_tabs",
+						"1",
+						"0",
+						"1770000000",
+						"1",
+						"root",
+						"1",
+						"",
+						"feature/tabs",
+						"feature-tabs",
+						"",
+						"session-tabs",
+						"",
+						"generation-tabs",
+						"",
+						"",
+						"$7",
+					].join("\t"),
+				);
+			}
+			if (commandArgv.includes("show-options")) {
+				const value =
+					commandArgv.at(-1) === "@gjc-project"
+						? project
+						: commandArgv.at(-1) === "@gjc-session-state-file"
+							? sessionStateFile
+							: "";
+				return spawnResult(0, `${value}\n`);
+			}
+			return spawnResult(0, "");
+		});
+		clearPsmuxDetectionCache();
+
+		const [session] = listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" });
+
+		expect(session?.project).toBe(project);
+		expect(session?.sessionStateFile).toBe(sessionStateFile);
+		const listCommand = calls.find(command => command.includes("list-sessions"));
+		expect(listCommand?.at(-1)).not.toContain("@gjc-project");
+		expect(listCommand?.at(-1)).not.toContain("@gjc-session-state-file");
 	});
 
 	it("skips unsafe foreign names without losing valid tagged sessions", () => {
@@ -248,7 +326,7 @@ describe("GJC tmux session management", () => {
 	it("retries on the default socket when the inherited $TMUX socket is unreachable", () => {
 		const inheritedSocket = "/tmp/host-emulated/agent-team";
 		const sessionRow =
-			"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t/repo-a\t\t\t\t\t\t$1";
+			"gajae_code_abc\t1\t0\t1770000000\t1\troot\t2\t12345\tfeature/demo\tfeature-demo\t\t\t\t\t\t\t$1";
 		const observedTmux: (string | undefined)[] = [];
 		spyOn(Bun, "spawnSync").mockImplementation(((command: unknown, options: unknown) => {
 			if (!spawnArgv(command).includes("list-sessions")) return spawnResult(0, "");
@@ -413,12 +491,24 @@ describe("GJC tmux session management", () => {
 			if (commandArgv.includes("list-sessions")) {
 				return spawnResult(
 					0,
-					"gajae_code_work\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t/repo\tsession-1\t/tmp/runtime-state.json\tgeneration-one\t\t$1\n",
+					"gajae_code_work\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t\tsession-1\t\tgeneration-one\t\t$1\n",
 				);
 			}
 			if (commandArgv.includes("display-message")) return spawnResult(0, "$2\n");
 			if (commandArgv.includes("show-options")) {
-				return spawnResult(0, commandArgv.at(-1) === "@gjc-owner-generation" ? "generation-one\n" : "1\n");
+				const option = commandArgv.at(-1);
+				return spawnResult(
+					0,
+					option === "@gjc-owner-generation"
+						? "generation-one\n"
+						: option === "@gjc-project"
+							? "/repo\n"
+							: option === "@gjc-session-id"
+								? "session-1\n"
+								: option === "@gjc-session-state-file"
+									? "/tmp/runtime-state.json\n"
+									: "1\n",
+				);
 			}
 			return spawnResult(0, "");
 		});
@@ -451,7 +541,7 @@ describe("GJC tmux session management", () => {
 				if (command.includes("list-sessions"))
 					return spawnResult(
 						0,
-						"gajae_code_work\t1\t0\t1770000000\t1\troot\t0\t\t\t\tsession\t/state/marker\tgeneration\tgajae_code_work\n",
+						"gajae_code_work\t1\t0\t1770000000\t1\troot\t0\t\t\t\tsession\t\tgeneration\t\t\tgajae_code_work\n",
 					);
 				if (command.includes("list-panes")) return spawnResult(0, "321\n");
 				if (command.includes("show-options")) {
@@ -651,7 +741,7 @@ describe("GJC tmux session management", () => {
 			if (commandArgv.includes("list-sessions"))
 				return spawnResult(
 					0,
-					"managed\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t/repo\tsession-1\t/tmp/runtime-state.json\tgeneration,#{pid}\t\t$1\n",
+					"managed\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t\tsession-1\t\tgeneration,#{pid}\t\t$1\n",
 				);
 			if (commandArgv.includes("show-options"))
 				return spawnResult(0, commandArgv.at(-1) === "@gjc-owner-generation" ? "generation,#{pid}\n" : "1\n");
@@ -2162,10 +2252,7 @@ describe("GJC tmux session management", () => {
 			const command = spawnArgv(rawSpawn);
 			if (command.includes("display-message")) return spawnResult(0, "");
 			if (command.includes("list-sessions"))
-				return spawnResult(
-					0,
-					"managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\t\tsession\t/state/marker\tgeneration\t\n",
-				);
+				return spawnResult(0, "managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\tsession\t\tgeneration\t\t\t\n");
 			if (command.includes("list-panes")) return spawnResult(0, "321\n");
 			if (command.includes("show-options")) {
 				const option = command.at(-1);
