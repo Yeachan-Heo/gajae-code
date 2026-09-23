@@ -24,16 +24,23 @@ describe("sdk session raw control envelope", () => {
 			return true;
 		});
 		try {
-			const error = await runSdkSessionCli({ action: "inspect", repo, json: true }, () => {}).catch(error => error);
-			expect(error).toBeInstanceOf(PublicCommandFailure);
-			expect(error).toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
-			const rendered = await renderPublicCommandFailure(error, {
-				command: ["sdk", "session", "inspect"],
-				json: true,
-			});
-			expect(rendered.exitCode).toBe(2);
-			expect(rendered.stderr).toBe("");
-			expect(rendered.stdout).not.toContain(repo);
+			for (const { args, command } of [
+				{ args: { action: "inspect", repo, json: true }, command: ["sdk", "session", "inspect"] },
+				{ args: { action: "send", repo, json: true }, command: ["sdk", "session", "send"] },
+				{ args: { action: "status", repo, json: true }, command: ["sdk", "session", "status"] },
+				{
+					args: { action: "raw", rawAction: "query", query: "session.checkpoint", repo, json: true },
+					command: ["sdk", "session", "raw", "query"],
+				},
+			]) {
+				const error = await runSdkSessionCli(args, () => {}).catch(error => error);
+				expect(error).toBeInstanceOf(PublicCommandFailure);
+				expect(error).toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+				const rendered = await renderPublicCommandFailure(error, { command, json: true });
+				expect(rendered.exitCode).toBe(2);
+				expect(rendered.stderr).toBe("");
+				expect(rendered.stdout).not.toContain(repo);
+			}
 			expect(stderr.join("")).toBe("");
 		} finally {
 			stderrSpy.mockRestore();
