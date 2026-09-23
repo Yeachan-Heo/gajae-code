@@ -73,7 +73,7 @@ export function assertNotFutureWorkflowState(
 	const version = state.version;
 	if (hasExplicitVersion && (typeof version !== "number" || !Number.isInteger(version) || version < 1)) {
 		throw new Error(
-			`${surface} for ${canonicalSkillOrThrow(skill)} has an invalid explicit version; refusing legacy migration`,
+			`${surface} for ${canonicalSkillOrThrow(skill)} has an invalid explicit version: state.version must be a number and positive integer; refusing legacy migration`,
 		);
 	}
 	if (typeof version === "number" && Number.isFinite(version) && version > WORKFLOW_STATE_VERSION) {
