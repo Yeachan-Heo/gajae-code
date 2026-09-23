@@ -26,6 +26,60 @@ const markitRoot = path.join(packageRoot, "vendor/markit-ai");
 const markitEntry = path.join(markitRoot, "dist/index.js");
 const mupdfEntry = Bun.resolveSync("mupdf", path.dirname(markitEntry));
 
+async function packWorkspaceCohort(directory: string, packer: string, names: string[]): Promise<Map<string, string>> {
+	const specs = new Map<string, string>();
+	// @gajae-code/agent-core lives in packages/agent, not packages/agent-core.
+	const nameToDir: Record<string, string> = { "agent-core": "agent" };
+	const workspace = path.join(directory, "workspace/packages");
+	await fs.mkdir(workspace, { recursive: true });
+	for (const name of names) {
+		const nameSuffix = name.replace("@gajae-code/", "");
+		const packageDirectory = nameToDir[nameSuffix] ?? nameSuffix;
+		const publisher = path.join(workspace, packageDirectory);
+		// Per-package subdirectory: npm names scoped packages "scope-name-version.tgz",
+		// which doesn't match the bare package directory prefix used by a shared dir search.
+		const packageTarballs = path.join(directory, "cohort-tarballs", packageDirectory);
+		await fs.mkdir(packageTarballs, { recursive: true });
+		await fs.cp(path.join(repoRoot, "packages", packageDirectory), publisher, {
+			recursive: true,
+			filter: source => path.basename(source) !== "node_modules" && !source.endsWith(".tgz"),
+		});
+		await normalizePackageModes(publisher);
+		const manifest = await Bun.file(path.join(publisher, "package.json")).json();
+		for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+			for (const [dep, version] of Object.entries(manifest[field] ?? {})) {
+				// Prefer the already-packed local tarball for cohort siblings; resolve
+				// everything else (catalog:, version ranges, etc.) via the standard helper.
+				manifest[field][dep] = specs.get(dep) ?? (await resolvePublishDependency(dep, version as string));
+			}
+		}
+		// For @gajae-code/natives: embedded-addon.js is null in the workspace (embed:native
+		// is a release step, not run by setup:worktree). Add the built .node binary to
+		// the pack's files so the loader finds it in native/ via legacyReleaseCandidates
+		// when isCompiledBinary=false and isWorkspaceLoad=false. Platform packages are
+		// in overrides to redirect transitive optional dep resolution; they carry no
+		// binary in local packs, but with the binary in natives/ they are not needed.
+		if (name === "@gajae-code/natives") {
+			const nativeBinaries = (await fs.readdir(path.join(publisher, "native")))
+				.filter(f => f.endsWith(".node"))
+				.map(f => `native/${f}`);
+			manifest.files = [...(manifest.files ?? []), ...nativeBinaries];
+		}
+		await Bun.write(path.join(publisher, "package.json"), JSON.stringify(manifest));
+		const command =
+			packer === "npm"
+				? ["npm", "pack", "--pack-destination", packageTarballs]
+				: [process.execPath, "pm", "pack", "--destination", packageTarballs];
+		await runPackageCommand(command, publisher);
+		const archives = (await fs.readdir(packageTarballs)).filter(file => file.endsWith(".tgz"));
+		expect(archives).toHaveLength(1);
+		const archive = path.join(packageTarballs, archives[0]!);
+		specs.set(name, `file:${archive}`);
+		await fs.rm(publisher, { recursive: true });
+	}
+	return specs;
+}
+
 // A generated, valid one-page PDF keeps this regression independent of network
 // access, the W3C endpoint, and an installed PDF authoring program.
 function dummyPdf(): string {
@@ -642,38 +696,37 @@ describe("published vendored Markit", () => {
 				expect(Object.values(packedFiles).some(value => value.startsWith("symlink:"))).toBe(false);
 				expect(await fs.readdir(packed)).not.toContain("node_modules");
 				await fs.rm(publisher, { recursive: true });
-				// Install the current utils cohort, not the already-published version that
-				// predates imports in this coding-agent source (such as error-classification).
+				// Topological order: leaves first so each package's @gajae-code/* deps
+				// are already in specs as file: paths when its manifest is rewritten.
+				const cohortNames = [
+					"@gajae-code/natives-darwin-arm64",
+					"@gajae-code/natives-darwin-x64",
+					"@gajae-code/natives-linux-arm64",
+					"@gajae-code/natives-linux-x64",
+					"@gajae-code/natives-win32-x64",
+					"@gajae-code/natives",
+					"@gajae-code/utils",
+					"@gajae-code/ai",
+					"@gajae-code/tui",
+					"@gajae-code/stats",
+					"@gajae-code/agent-core",
+				];
+				const cohort = await packWorkspaceCohort(directory, packer, cohortNames);
 				const utilsRoot = path.join(repoRoot, "packages/utils");
-				const utilsPublisher = path.join(directory, "workspace/packages/utils");
-				const utilsTarballs = path.join(directory, "utils-tarballs");
-				await fs.mkdir(utilsTarballs);
-				await fs.cp(utilsRoot, utilsPublisher, {
-					recursive: true,
-					filter: source => path.basename(source) !== "node_modules" && !source.endsWith(".tgz"),
-				});
-				await normalizePackageModes(utilsPublisher);
-				const utilsManifest = await Bun.file(path.join(utilsPublisher, "package.json")).json();
-				for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
-					for (const [name, version] of Object.entries(utilsManifest[field] ?? {})) {
-						utilsManifest[field][name] = await resolvePublishDependency(name, version as string);
-					}
-				}
+				const utilsManifest = await Bun.file(path.join(utilsRoot, "package.json")).json();
 				expect(utilsManifest.version).toBe(manifest.dependencies[utilsManifest.name]);
-				await Bun.write(path.join(utilsPublisher, "package.json"), JSON.stringify(utilsManifest));
-				await runPackageCommand(
-					packer === "npm"
-						? ["npm", "pack", "--pack-destination", utilsTarballs]
-						: [process.execPath, "pm", "pack", "--destination", utilsTarballs],
-					utilsPublisher,
-				);
-				const utilsArchives = (await fs.readdir(utilsTarballs)).filter(name => name.endsWith(".tgz"));
-				expect(utilsArchives).toHaveLength(1);
-				const utilsArchive = path.join(utilsTarballs, utilsArchives[0]!);
-				await fs.rm(utilsPublisher, { recursive: true });
-				// A top-level tarball alone does not replace Bun's transitive registry
-				// package with the same version. Bind every utils edge to these bytes.
-				const utilsSpec = `file:${utilsArchive}`;
+				// Platform-specific native packages carry os/cpu constraints; npm enforces
+				// these on direct dependencies and fails on the wrong platform. Overrides
+				// alone redirect @gajae-code/natives' optional dep resolution to local
+				// tarballs without triggering the constraint check.
+				const platformPackageNames = new Set([
+					"@gajae-code/natives-darwin-arm64",
+					"@gajae-code/natives-darwin-x64",
+					"@gajae-code/natives-linux-arm64",
+					"@gajae-code/natives-linux-x64",
+					"@gajae-code/natives-win32-x64",
+				]);
+				const cohortDirectDeps = Object.fromEntries([...cohort].filter(([n]) => !platformPackageNames.has(n)));
 				await Bun.write(
 					path.join(consumer, "package.json"),
 					JSON.stringify({
@@ -681,9 +734,9 @@ describe("published vendored Markit", () => {
 						type: "module",
 						dependencies: {
 							[manifest.name]: `file:${archive}`,
-							[utilsManifest.name]: utilsSpec,
+							...cohortDirectDeps,
 						},
-						overrides: { [utilsManifest.name]: utilsSpec },
+						overrides: Object.fromEntries(cohort),
 					}),
 				);
 				await runPackageCommand(
@@ -775,6 +828,6 @@ console.log(JSON.stringify({ buffer: { ok: true, content: "published read text/i
 			} finally {
 				await fs.rm(directory, { recursive: true, force: true });
 			}
-		}, 300_000);
+		}, 600_000);
 	}
 });
