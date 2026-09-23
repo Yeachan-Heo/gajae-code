@@ -113,6 +113,7 @@ struct RecoveryReaperMarker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagedRecoveryKind {
 	Replace,
+	CompletedReplace,
 	Remove,
 }
 
@@ -2710,11 +2711,14 @@ fn parse_canonical_u64(bytes: &[u8]) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn parse_managed_recovery_name(name: &[u8]) -> Option<ManagedRecoveryName> {
-	let (kind, remainder) = if let Some(remainder) = name.strip_prefix(b".gjc-managed-replace-") {
-		(ManagedRecoveryKind::Replace, remainder)
-	} else {
-		(ManagedRecoveryKind::Remove, name.strip_prefix(b".gjc-managed-remove-")?)
-	};
+	let (kind, remainder) =
+		if let Some(remainder) = name.strip_prefix(b".gjc-managed-replace-complete-") {
+			(ManagedRecoveryKind::CompletedReplace, remainder)
+		} else if let Some(remainder) = name.strip_prefix(b".gjc-managed-replace-") {
+			(ManagedRecoveryKind::Replace, remainder)
+		} else {
+			(ManagedRecoveryKind::Remove, name.strip_prefix(b".gjc-managed-remove-")?)
+		};
 	let mut fields = remainder.split(|byte| *byte == b'-');
 	let pid = parse_canonical_u64(fields.next()?)?;
 	let _counter = parse_canonical_u64(fields.next()?)?;
@@ -2816,6 +2820,7 @@ fn reaper_owner_file_stat(stat: &libc::stat) -> bool {
 const fn managed_recovery_family(kind: ManagedRecoveryKind) -> &'static str {
 	match kind {
 		ManagedRecoveryKind::Replace => ".gjc-managed-replace",
+		ManagedRecoveryKind::CompletedReplace => ".gjc-managed-replace-complete",
 		ManagedRecoveryKind::Remove => ".gjc-managed-remove",
 	}
 }
@@ -3033,9 +3038,10 @@ fn reap_managed_recovery_candidate(
 	remaining_bytes: u64,
 	process_is_dead: &mut impl FnMut(libc::pid_t) -> bool,
 ) -> ReaperCandidateResult {
-	// A detached removal is terminal evidence and expires after its full TTL
-	// even if its publisher is a long-lived agent. Replacement staging may
-	// still be in-flight, so retain that family while its publisher is alive.
+	// Replacement staging may still be in-flight, so retain it while its
+	// publisher is alive. Successful replacements are atomically moved to the
+	// completed family before returning; completed predecessors and detached
+	// removals expire after their TTL even if their publisher remains alive.
 	if candidate.kind == ManagedRecoveryKind::Replace && !process_is_dead(candidate.pid) {
 		return ReaperCandidateResult::Preserved;
 	}
@@ -3081,7 +3087,9 @@ fn reap_managed_recovery_candidate(
 		},
 	};
 	let retention_secs = match candidate.kind {
-		ManagedRecoveryKind::Replace => RECOVERY_REAPER_REPLACE_GRACE_SECS,
+		ManagedRecoveryKind::Replace | ManagedRecoveryKind::CompletedReplace => {
+			RECOVERY_REAPER_REPLACE_GRACE_SECS
+		},
 		ManagedRecoveryKind::Remove => RECOVERY_REAPER_REMOVE_TTL_SECS,
 	};
 	let minimum_age = retention_secs.saturating_add(RECOVERY_REAPER_CLOCK_GRACE_SECS);
@@ -3762,8 +3770,38 @@ fn replace_managed(
 	{
 		return Err("identity_mismatch");
 	}
-	// Publication is committed. The verified displaced object remains recoverable
-	// evidence; deleting it would reopen an unprovable name race.
+	// The exchange committed, so publish a terminal family name for the displaced
+	// predecessor. Keeping the in-flight name would exempt this completed evidence
+	// from TTL cleanup for as long as this publisher process remained alive.
+	let completed_candidate = managed_recovery_name(
+		".gjc-managed-replace-complete",
+		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed),
+	)?;
+	let completed_candidate_name = CString::new(completed_candidate).map_err(|_| "io_error")?;
+	if rename_file_no_replace(
+		&candidate_parent,
+		&candidate_name,
+		&candidate_parent,
+		&completed_candidate_name,
+		move || drop(displaced),
+	)
+	.is_err()
+	{
+		return Err("rollback_unavailable");
+	}
+	candidate_parent
+		.sync_all()
+		.map_err(|_| "rollback_unavailable")?;
+	let terminal_completed =
+		statat(&candidate_parent, &completed_candidate_name).map_err(|_| "identity_mismatch")?;
+	if !stat_matches_regular_identity_after_rename(&terminal_completed, &displaced_identity)
+		|| !reaper_owner_file_stat(&terminal_completed)
+	{
+		return Err("identity_mismatch");
+	}
+	// Publication is committed and the displaced object remains recoverable under
+	// a terminal name. The reaper retains it for the configured TTL, then removes
+	// it only after its descriptor-relative identity checks succeed.
 	Ok(RecoveryFsResult::success(replacement_identity))
 }
 
@@ -4518,6 +4556,14 @@ mod tests {
 			})
 		);
 		assert_eq!(
+			parse_managed_recovery_name(b".gjc-managed-replace-complete-17-1-42"),
+			Some(ManagedRecoveryName {
+				pid:             17,
+				kind:            ManagedRecoveryKind::CompletedReplace,
+				created_at_secs: Some(42),
+			})
+		);
+		assert_eq!(
 			parse_managed_recovery_name(b".gjc-managed-remove-18-9-43"),
 			Some(ManagedRecoveryName {
 				pid:             18,
@@ -4572,6 +4618,7 @@ mod tests {
 			(107, ".gjc-managed-replace", "replace-grace-edge", replace_age - 1, false),
 			(108, ".gjc-managed-replace", "replace-expired", replace_age, false),
 			(109, ".gjc-managed-remove", "live-remove-expired", remove_age, true),
+			(110, ".gjc-managed-replace-complete", "live-complete-expired", replace_age, true),
 		];
 		for &(pid, family, suffix, age, _) in &entries {
 			let name = recovery_name(family, pid, 0, now - age);
@@ -4579,16 +4626,24 @@ mod tests {
 		}
 
 		let mut cookie = 0;
-		let metrics = reap_managed_recovery_at(&directory, now, &mut cookie, |pid| pid != 101);
-		assert_eq!(metrics.reaped_files, 3);
+		let metrics =
+			reap_managed_recovery_at(&directory, now, &mut cookie, |pid| pid != 101 && pid != 110);
+		assert_eq!(metrics.reaped_files, 4);
 		assert_eq!(
 			metrics.reaped_bytes,
-			(b"remove-expired".len() + b"replace-expired".len() + b"live-remove-expired".len()) as u64
+			(b"remove-expired".len()
+				+ b"replace-expired".len()
+				+ b"live-remove-expired".len()
+				+ b"live-complete-expired".len()) as u64
 		);
 		assert_eq!(metrics.preserved_candidates, 6);
 		for &(pid, family, suffix, age, _) in &entries {
 			let path = temporary.0.join(recovery_name(family, pid, 0, now - age));
-			assert_eq!(path.exists(), pid != 105 && pid != 108 && pid != 109, "{suffix} retention");
+			assert_eq!(
+				path.exists(),
+				pid != 105 && pid != 108 && pid != 109 && pid != 110,
+				"{suffix} retention"
+			);
 		}
 	}
 
@@ -5624,9 +5679,9 @@ mod tests {
 					entry
 						.file_name()
 						.to_string_lossy()
-						.starts_with(".gjc-managed-replace-")
+						.starts_with(".gjc-managed-replace-complete-")
 				})
-				.expect("displaced object retained under the candidate name");
+				.expect("displaced object retained under the completed family name");
 			assert_eq!(
 				fs::read(displaced.path()).expect("displaced contents"),
 				original,
@@ -5651,6 +5706,24 @@ mod tests {
 						.starts_with(".gjc-managed-exchange-")),
 				"no temporary exchange name may survive"
 			);
+			let completed_name = displaced.file_name().to_string_lossy().into_owned();
+			let completed = parse_managed_recovery_name(completed_name.as_bytes())
+				.expect("completed replacement name parses");
+			assert_eq!(completed.kind, ManagedRecoveryKind::CompletedReplace);
+			let expiration = completed
+				.created_at_secs
+				.expect("completed replacement timestamp")
+				+ RECOVERY_REAPER_REPLACE_GRACE_SECS
+				+ RECOVERY_REAPER_CLOCK_GRACE_SECS;
+			let recovery =
+				open_existing_directory(&root, ".gjc-recovery").expect("open recovery directory");
+			let mut cookie = 0;
+			let metrics = reap_managed_recovery_at(&recovery, expiration, &mut cookie, |_| false);
+			assert_eq!(
+				metrics.reaped_files, 1,
+				"live publisher does not exempt completed predecessor"
+			);
+			assert!(!displaced.path().exists(), "expired completed predecessor is reaped");
 		}
 	}
 
