@@ -4,7 +4,7 @@
  * Runs each subagent on the main thread and forwards AgentEvents for progress tracking.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type {
 	AgentEvent,
@@ -62,6 +62,14 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+import {
+	beginTaskDecision,
+	hashTaskDecisionValue,
+	type TaskDecisionOutcomeStatus,
+	type TaskDecisionRecorder,
+} from "./decision-collection";
+import type { DecisionOutcome } from "./decision-model";
+import { applyTaskDecision, decisionObservation, type TaskDecisionRoutingContext } from "./decision-routing";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
 import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
@@ -306,6 +314,9 @@ export interface ExecutorOptions {
 	 */
 	parentArtifactManager?: ArtifactManager;
 	managedPersistence?: ManagedTaskPersistence;
+	/** Best-effort local decision recorder shared by routed attempts. */
+	collectionRecorder?: TaskDecisionRecorder;
+	decisionContext?: TaskDecisionRoutingContext;
 	/**
 	 * The parent session's ENDPOINT-owned AsyncJobManager (resolved by the
 	 * TaskTool via its opaque async endpoint accessor, then the process-global
@@ -1162,6 +1173,27 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 	let probeAccepted = false;
 	let preflightOperation: Extract<AutoroutingPreflightFailure, { kind: "local" }>["op"] = "preflight_validation";
 	const seenAssistantMessageIdentities = new Set<string>();
+	let lastCollectedModel: string | undefined;
+	const recordActualModel = (actualModel: string, providerReportedModel?: string): void => {
+		if (options.preflightProbe || !options.collectionRecorder) return;
+		const effectiveEffort = activeSession?.thinkingLevel;
+		const identity = JSON.stringify([actualModel, providerReportedModel, effectiveEffort]);
+		if (identity === lastCollectedModel) return;
+		lastCollectedModel = identity;
+		try {
+			void options.collectionRecorder
+				.recordModel({
+					requestedModel: modelSubstitutionWarning?.requested ?? modelPatterns[0] ?? resolvedModelString,
+					actualModel,
+					providerReportedModel,
+					provider: providerNameFromModel(providerReportedModel ?? actualModel),
+					effectiveEffort,
+				})
+				.catch(() => undefined);
+		} catch {
+			// A collection failure must not abort model execution.
+		}
+	};
 
 	// Accumulate usage incrementally from message_end events (no memory for streaming events)
 	const accumulatedUsage = {
@@ -1583,6 +1615,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					if (assistantModel) {
 						lastAssistantModelString = assistantModel;
 						activeProviderModelString = assistantModel;
+						recordActualModel(assistantModel, assistantModel);
 						if (resolvedModelString && assistantModel !== resolvedModelString && !modelSubstitutionWarning) {
 							modelSubstitutionWarning = {
 								requested: resolvedModelString,
@@ -2322,6 +2355,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				}
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
+					recordActualModel(event.to);
 					progress.fastMode = isFastForModel(session.model);
 					// Keep the fallback metadata on the SAME manager the initial
 					// update used: another session may have become the
@@ -2421,6 +2455,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				onPreflightAccepted: markLlmRequestStarted,
 				onPreflightAcceptCommit: markLlmRequestStarted,
 			};
+			if (session.model) recordActualModel(`${session.model.provider}/${session.model.id}`);
 			if (runMode === "message") {
 				await awaitAbortable(session.prompt(options.resumeMessage ?? "", promptOptions));
 				await awaitAbortable(session.waitForIdle());
@@ -2876,7 +2911,7 @@ function preflightTerminalResult(
 }
 
 /** Run routed initial tasks through the bounded probe/durable candidate ledger. */
-export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+async function runSubprocessInternal(options: ExecutorOptions): Promise<SingleResult> {
 	if (
 		!options.autoroutingPreflight ||
 		(options.runMode ?? "initial") !== "initial" ||
@@ -2984,4 +3019,163 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 	}
 	return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted", prior);
+}
+
+function collectionSessionHash(options: ExecutorOptions): string {
+	return hashTaskDecisionValue(options.parentSessionId ?? options.subagentId ?? options.id);
+}
+
+function collectionStatus(result: SingleResult): TaskDecisionOutcomeStatus {
+	if (result.paused) return "paused";
+	if (result.aborted) return "cancelled";
+	if (result.routing?.notExecuted) return "preflight_exhausted";
+	return result.exitCode === 0 ? "completed" : "error";
+}
+
+export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	const decisionContext =
+		(options.runMode ?? "initial") === "initial" && !options.preflightProbe && !options.preflightDurable
+			? options.decisionContext
+			: undefined;
+	let recorder = options.collectionRecorder;
+	if (!recorder) {
+		try {
+			const requestedSelectors = normalizeModelPatterns(options.modelOverride ?? options.agent.model);
+			const assignment =
+				options.runMode === "message" ? (options.resumeMessage ?? "") : (options.assignment ?? options.task);
+			recorder = await beginTaskDecision(
+				{
+					role: options.agent.name,
+					taskId: options.id,
+					sessionIdHash: collectionSessionHash(options),
+					runMode: options.runMode ?? "initial",
+					requestedTier: options.routing?.tier,
+					requestedSelectors,
+					requestedEffort: options.thinkingLevel,
+					repoCwdHash: hashTaskDecisionValue(options.cwd),
+					assignmentHash: hashTaskDecisionValue(assignment),
+					contextHash: options.context === undefined ? undefined : hashTaskDecisionValue(options.context),
+					assignmentCount: assignment.length,
+					contextCount: options.context?.length,
+					assignment,
+					context: options.context,
+				},
+				{
+					decisionEnabled:
+						decisionContext !== undefined || options.settings?.get("task.decision.enabled") === true,
+				},
+			);
+		} catch {
+			recorder = undefined;
+		}
+	}
+	const decisionStartedAt = performance.now();
+	const observationId = decisionContext ? randomUUID() : undefined;
+	let decisionLatencyMs = 0;
+	const decisionPromise: Promise<DecisionOutcome> | undefined = decisionContext
+		? Promise.resolve()
+				.then<DecisionOutcome>(() => {
+					if (decisionContext.setupError) return { error: { code: decisionContext.setupError } };
+					if (decisionContext.candidateTiers.length === 0) return { error: { code: "no_candidate" } };
+					if (!decisionContext.provider) return { error: { code: "invalid_configuration" } };
+					return decisionContext.provider.decide(
+						{
+							role: decisionContext.role,
+							assignment: decisionContext.assignment,
+							candidates: decisionContext.candidates,
+						},
+						{ signal: options.signal },
+					);
+				})
+				.catch<DecisionOutcome>(() => ({ error: { code: "transport_error" } }))
+				.then<DecisionOutcome>(outcome => {
+					decisionLatencyMs = Math.max(0, performance.now() - decisionStartedAt);
+					return outcome.result && decisionLatencyMs >= decisionContext.timeoutMs
+						? { error: { code: "timeout" } }
+						: outcome;
+				})
+		: undefined;
+	const recordDecision = async (decision: DecisionOutcome) => {
+		if (!decisionContext || !recorder || !observationId) return;
+		try {
+			const applied = decisionContext.mode === "routing" ? applyTaskDecision(decisionContext, decision) : undefined;
+			await recorder.recordDecision(
+				decisionObservation(
+					decisionContext,
+					decision,
+					decisionLatencyMs,
+					observationId,
+					applied?.selector,
+					applied?.effort,
+				),
+			);
+		} catch {
+			// Decision collection is strictly best effort.
+		}
+	};
+	const observationPromise = decisionPromise?.then(recordDecision);
+	let executionOptions = options;
+	if (decisionContext?.mode === "routing" && decisionPromise) {
+		const outcome = await decisionPromise;
+		const applied = applyTaskDecision(decisionContext, outcome);
+		if (applied.selector) {
+			executionOptions = {
+				...options,
+				modelOverride: [applied.selector],
+				thinkingLevel: applied.effort,
+				autoroutingCandidates: [applied.selector],
+				autoroutingPreflight: Boolean(options.autoroutingPreflight),
+				routing: {
+					...(options.routing ?? {
+						tier: applied.tier!,
+						requestedSelector:
+							normalizeModelPatterns(options.modelOverride ?? options.agent.model)[0] ?? "manual-model-chain",
+						substitutions: [],
+					}),
+					tier: applied.tier!,
+					effectiveModel: applied.selector,
+					note: `${options.routing?.note ?? ""}; decision:${applied.tier}`,
+				},
+			};
+		}
+	}
+	try {
+		const result = await runSubprocessInternal({ ...executionOptions, collectionRecorder: recorder });
+		if (decisionContext?.mode === "routing") await observationPromise;
+		if (recorder) {
+			try {
+				await recorder.finish({
+					status: collectionStatus(result),
+					exitCode: result.exitCode,
+					durationMs: result.durationMs,
+					tokenUsage: result.usage
+						? {
+								input: result.usage.input,
+								output: result.usage.output,
+								cacheRead: result.usage.cacheRead,
+								cacheWrite: result.usage.cacheWrite,
+								total: result.usage.totalTokens,
+							}
+						: undefined,
+					routingTerminalCode: result.routing?.terminal,
+					abortReason: result.abortReason,
+					costUsd: result.usageCostBreakdownComplete ? result.usage?.cost.total : undefined,
+					usageCostComplete: result.usageCostBreakdownComplete,
+				});
+			} catch {
+				// Collection is strictly best effort and must never alter execution results.
+			}
+		}
+		return result;
+	} catch (error) {
+		if (decisionContext?.mode === "routing") await observationPromise;
+		if (recorder) {
+			try {
+				await recorder.finish({ status: options.signal?.aborted ? "cancelled" : "error" });
+			} catch {
+				// Preserve the original execution exception, including synchronous recorder failures.
+			}
+		}
+		throw error;
+	}
 }

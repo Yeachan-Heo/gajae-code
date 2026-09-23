@@ -104,6 +104,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	"alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
 	openai: () => $credentialEnv("OPENAI_API_KEY"),
 	google: "GEMINI_API_KEY",
+	typesafe: "TYPESAFE_API_KEY",
 	groq: "GROQ_API_KEY",
 	cerebras: "CEREBRAS_API_KEY",
 	xai: "XAI_API_KEY",

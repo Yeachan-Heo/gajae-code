@@ -16,6 +16,7 @@ const COMPONENTS: SetupComponent[] = [
 	"provider",
 	"python",
 	"stt",
+	"kev",
 ];
 
 export default class Setup extends Command {
@@ -26,6 +27,11 @@ export default class Setup extends Command {
 			description: "Component to install (defaults when omitted)",
 			required: false,
 			options: COMPONENTS,
+		}),
+		action: Args.string({
+			description: "Kev action (install, start, stop, status)",
+			required: false,
+			options: ["install", "start", "stop", "status"],
 		}),
 	};
 
@@ -59,6 +65,7 @@ export default class Setup extends Command {
 				"Full command the controller execs: one token = executable substitute for gjc (mcp-serve coordinator still appended); multiple tokens = complete server command rendered verbatim, nothing appended; quote-aware, never shell-evaluated",
 		}),
 		target: Flags.string({ description: "Hermes config file target for config-only install" }),
+		port: Flags.integer({ description: "Kev loopback service port (1-65535)" }),
 		"profile-dir": Flags.string({ description: "Hermes profile directory for full setup install" }),
 		timeout: Flags.string({
 			description:
@@ -119,6 +126,8 @@ export default class Setup extends Command {
 				profileDir: flags["profile-dir"],
 				timeout: flags.timeout,
 				connectTimeout: flags["connect-timeout"],
+				port: flags.port,
+				action: args.action as SetupCommandArgs["flags"]["action"],
 				remove: flags.remove,
 				mpreset: flags.mpreset,
 				yes: flags.yes,

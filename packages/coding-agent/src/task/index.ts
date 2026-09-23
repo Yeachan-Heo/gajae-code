@@ -27,7 +27,11 @@ import {
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
-import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
+import {
+	AUTOROUTING_SELECTOR_MAX_LENGTH,
+	type AutoroutingReasonCode,
+	normalizeTierMap,
+} from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -70,6 +74,7 @@ import { registerOwnedIfLineaged } from "../session/terminal-abort";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { loadBundledAgents } from "./agents";
+import { buildTaskDecisionContext, createTaskDecisionProvider } from "./decision-routing";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import {
 	buildBoundedRoutingSkips,
@@ -2035,6 +2040,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
 			const effectiveAutorouting = this.session.settings.getEffectiveAutorouting();
+			const decisionProvider = createTaskDecisionProvider({
+				settings: this.session.settings,
+				authStorage: this.session.authStorage,
+				credentialSessionId: this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+			});
 			const registry = this.session.modelRegistry as
 				| {
 						getAvailable?: () => Model[];
@@ -2283,6 +2293,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 									preflightErrors: new Map(),
 								}
 						: { candidates: undefined, skips: undefined, preflightErrors: new Map() };
+				const decisionContext =
+					decisionProvider && (effectiveRunMode ?? "initial") === "initial"
+						? buildTaskDecisionContext({
+								role: agentName,
+								assignment: task.assignment.trim(),
+								tierMap: effectiveAutorouting.active
+									? effectiveAutorouting.map
+									: normalizeTierMap(this.session.settings.get("task.autorouting.tiers")),
+								routingSnapshot,
+								provider: decisionProvider,
+							})
+						: undefined;
 				const routingForRun = routeEvidence(
 					routingOutcome,
 					effectiveRunMode === "resume" || effectiveRunMode === "message",
@@ -2363,6 +2385,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
+						decisionContext,
 					});
 					return {
 						...result,
@@ -2449,6 +2472,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentTelemetry: this.session.getTelemetry?.(),
 						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
+						decisionContext,
 					});
 					let capturedResult = {
 						...result,
