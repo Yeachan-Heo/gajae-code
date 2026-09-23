@@ -173,3 +173,63 @@ test("redemption is atomic, ordered and connection-owned; discard, disconnect an
 		store.close();
 	}
 });
+
+test("pending uploads enforce the 64 MiB session budget and recover capacity on discard and disconnect", () => {
+	const store = new PromptImageUploadStore();
+	const capacity = 64 * 1024 * 1024;
+	const imageLength = capacity / 4;
+	const chunk = Buffer.alloc(96 * 1024).toString("base64");
+	const tail = Buffer.alloc(64 * 1024).toString("base64");
+	const ids: string[] = [];
+	try {
+		for (let image = 0; image < 4; image++) {
+			const { id } = store.begin("sender", {
+				mimeType: "image/png",
+				byteLength: imageLength,
+				sha256: "0".repeat(64),
+			});
+			ids.push(id);
+			for (let sequence = 0; sequence < 170; sequence++) store.append("sender", { id, sequence, data: chunk });
+			store.append("sender", { id, sequence: 170, data: tail });
+		}
+		const next = store.begin("sender", { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) });
+		expect(() => store.append("sender", { id: next.id, sequence: 0, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "busy" }),
+		);
+		expect(store.discard("sender", { id: ids[0] })).toEqual({ discarded: true });
+		expect(store.append("sender", { id: next.id, sequence: 0, data: "AA==" })).toMatchObject({ receivedBytes: 1 });
+		store.disconnect("sender");
+		const resumed = store.begin("sender", { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) });
+		expect(store.append("sender", { id: resumed.id, sequence: 0, data: "AA==" })).toMatchObject({ receivedBytes: 1 });
+	} finally {
+		store.close();
+	}
+});
+
+test("accepted images enforce the 64 MiB session budget until their terminal release", async () => {
+	const original = originalLargePng();
+	// A safe-to-copy ancillary chunk enlarges the source without changing decoded pixels.
+	const image = Buffer.concat([
+		original.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(17 * 1024 * 1024)),
+		original.subarray(-12),
+	]);
+	const store = new PromptImageUploadStore();
+	const releases: Array<() => void> = [];
+	try {
+		for (let index = 0; index < 3; index++) {
+			const id = await stage(store, "sender", image);
+			releases.push(store.redeem("sender", [{ id }]).release);
+		}
+		const pending = await stage(store, "sender", image);
+		expect(() => store.redeem("sender", [{ id: pending }])).toThrow(expect.objectContaining({ code: "busy" }));
+		releases[0]!();
+		const recovered = store.redeem("sender", [{ id: pending }]);
+		expect(Buffer.from(recovered.images[0]!.data, "base64").equals(image)).toBe(true);
+		releases.push(recovered.release);
+		releases[0]!();
+	} finally {
+		for (const release of releases) release();
+		store.close();
+	}
+}, 60_000);

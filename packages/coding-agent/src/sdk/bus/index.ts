@@ -3052,7 +3052,11 @@ function sdkControlSurface(
 					...(effectiveDeliverAs ? { deliverAs: effectiveDeliverAs } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
-					...admission.hooks,
+					onQueuedPromoted: promotion => {
+						admission.hooks.onQueuedPromoted(promotion);
+						if (promotion.removed) releaseAcceptedImage(correlation);
+					},
+					onDispatchDisposition: admission.hooks.onDispatchDisposition,
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
