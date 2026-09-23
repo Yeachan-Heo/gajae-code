@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
+import { readBrokerExitRecord } from "../src/sdk/broker/broker-exit";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { brokerShutdownSendAction } from "../src/sdk/broker/transport";
 import { SdkClient } from "../src/sdk/client/client";
@@ -365,6 +366,7 @@ describe("SDK broker WebSocket transport", () => {
 
 		await broker.completion;
 		expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(false);
+		expect(await readBrokerExitRecord(agentDir)).toMatchObject({ mode: "owned-root", reason: "shutdown-request" });
 	});
 	it("rejects oversized frames without disrupting other authenticated clients", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-transport-"));

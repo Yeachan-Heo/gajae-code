@@ -354,6 +354,12 @@ describe("broker clean-exit lock contention diagnostics", () => {
 		expect(contention[0]).toContain("yielding to the live broker owner");
 		expect(contention[0]).toContain("ownerId=foreign-owner");
 		expect(contention[0]).toContain("exits without owning discovery");
+		expect(info.mock.calls.find(call => String(call[0]).includes("lock contention"))?.[1]).toMatchObject({
+			reason: "startup-race-lost",
+			ownerId: "foreign-owner",
+			pid: process.pid,
+			exitCode: 0,
+		});
 	});
 
 	it("warns with the holding pid before refusing a lock held by a live owner", async () => {
