@@ -262,7 +262,7 @@ async function prepareReleaseMaterials(outputDirectory: string): Promise<{ direc
 		await run(["tar", "-xzf", archivePath, "-C", temporaryDirectory], temporaryDirectory, process.env);
 		const sourceLayout = sourceDirectory(temporaryDirectory, entries);
 		await checkUpstreamPackage(sourceLayout.packageRoot, installed.packageRoot);
-		const environment = { ...process.env, EMSDK: emsdkRoot };
+		const environment: NodeJS.ProcessEnv = { ...process.env, EMSDK: emsdkRoot };
 		for (const name of ["BUILD", "DEFINES", "FEATURES", "SUFFIX"]) delete environment[name];
 		const emccVersion = await activateEmsdk(emsdkRoot, sourceLayout.packageRoot);
 		const nodeVersion = capture(["bash", "-c", 'source "$EMSDK/emsdk_env.sh" >/dev/null && node --version'], sourceLayout.packageRoot, environment);

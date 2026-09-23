@@ -210,8 +210,21 @@ describe("MuPDF standalone packaging", () => {
 		expect(await Bun.file(mapping).text()).toContain("= undefined;");
 		expect(await Bun.file(mapping).text()).not.toContain("node_modules");
 	});
+	it("embeds the explicitly selected release WASM path", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-built-wasm-"));
+		const wasmPath = path.join(directory, "mupdf-built.wasm");
+		const mapping = path.join(packageRoot, "src/utils/mupdf-embedded.ts");
+		try {
+			await Bun.write(wasmPath, "source-built wasm fixture");
+			await generateMuPdfAsset({ wasmPath });
+			expect(await Bun.file(mapping).text()).toContain(JSON.stringify(wasmPath));
+		} finally {
+			await resetMuPdfAsset();
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
 
-	it("fails closed until corresponding-source release materials are complete", async () => {
+	it("rejects placeholder corresponding-source materials and missing notices", async () => {
 		await expect(verifyMuPdfReleaseMaterials("")).rejects.toThrow(MUPDF_RELEASE_MATERIALS_ENV);
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mupdf-materials-"));
 		try {
@@ -226,7 +239,9 @@ describe("MuPDF standalone packaging", () => {
 					notices: "mupdf-notices.txt",
 				}),
 			);
-			expect(await verifyMuPdfReleaseMaterials(directory)).toBe(directory);
+			await expect(verifyMuPdfReleaseMaterials(directory)).rejects.toThrow(
+				"Source-built MuPDF WASM bytes do not exactly match",
+			);
 			await fs.rm(path.join(directory, "mupdf-notices.txt"));
 			await expect(verifyMuPdfReleaseMaterials(directory)).rejects.toThrow("mupdf-notices.txt");
 		} finally {
