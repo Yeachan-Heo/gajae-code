@@ -2385,7 +2385,6 @@ export async function runSdkSessionCli(
 				"Expected one of: list, inspect, send, status, tail, close, retire, raw (control|query|global).",
 				2,
 			);
-		warnIfRepoIgnoredForExactSession(args);
 		const agentDir = path.resolve(args.agentDir ?? getAgentDir());
 		if (action === "list") {
 			writeOutput(stripSecretFields(await runList(agentDir, args)));
@@ -2398,10 +2397,12 @@ export async function runSdkSessionCli(
 		}
 		if (action === "inspect") {
 			writeOutput(stripSecretFields(await runInspect(agentDir, requireValue(args.sessionId, "<sessionId>"))));
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "send") {
 			writeOutput(stripSecretFields(await runSend(agentDir, requireValue(args.sessionId, "<sessionId>"), args)));
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "status") {
@@ -2415,6 +2416,7 @@ export async function runSdkSessionCli(
 					),
 				),
 			);
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "tail") {
@@ -2521,6 +2523,7 @@ export async function runSdkSessionCli(
 					: await runRawQuery(agentDir, sessionId, operation, input, args),
 			),
 		);
+		warnIfRepoIgnoredForExactSession(args);
 	} catch (error) {
 		throw normalizeSessionFailure(error, args);
 	}
