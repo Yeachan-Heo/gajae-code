@@ -136,6 +136,44 @@ test("test logger honors an explicitly owned sink under its HOME", async () => {
 	}
 }, 30_000);
 
+test("test cleanup preserves an explicitly pinned temp-looking log sink", async () => {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-prefix-home-"));
+	const owned = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-test-logs-"));
+	try {
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			GJC_LOG_DIR: owned,
+			GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: path.join(home, ".gjc", "parent-logs"),
+			GJC_PROBE_WRITE: "1",
+		};
+		const proc = Bun.spawn([process.execPath, "--preload", PRELOAD, PROBE], {
+			cwd: REPO_ROOT,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, `log probe failed:\n${stdout}\n${stderr}`).toBe(0);
+		const result = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+			effectiveLogsDir: string | null;
+			markerDir: string | null;
+		};
+		expect(result.effectiveLogsDir).toBe(owned);
+		expect(result.markerDir).toBe(owned);
+		expect(await countMarkersInDir(owned)).toBeGreaterThan(0);
+	} finally {
+		await Promise.all([
+			fs.rm(home, { recursive: true, force: true }),
+			fs.rm(owned, { recursive: true, force: true }),
+		]);
+	}
+}, 30_000);
+
 test("a test process does not write watchdog errors into the operator log sink", async () => {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-guard-"));
 
