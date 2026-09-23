@@ -2553,8 +2553,9 @@ async function assertNonCrystalApprovalCurrent(
 	sessionId: string,
 	stage: ExecutionApprovalStage,
 	status: "pending" | "consumed",
+	knownRecord?: NonCrystalExecutionApprovalRecord,
 ) {
-	const record = await readNonCrystalApproval(cwd, sessionId, stage);
+	const record = knownRecord ?? (await readNonCrystalApproval(cwd, sessionId, stage));
 	if (!record || record.status !== status || (status === "pending" && Date.parse(record.expires_at) <= Date.now()))
 		throw new StateCommandError(2, "ordinary execution approval is missing, expired or consumed");
 	const publication = await nonCrystalApprovalPublication(cwd, sessionId, stage);
@@ -2591,7 +2592,12 @@ async function consumeNonCrystalApprovalUnlocked(
 	return withWorkflowStateLock(
 		nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage),
 		async () => {
-			const record = await assertNonCrystalApprovalCurrent(cwd, sessionId, stage, "pending");
+			const candidate = await readNonCrystalApproval(cwd, sessionId, stage);
+			if (!candidate) throw new StateCommandError(2, "ordinary execution approval is missing, expired or consumed");
+			const status = candidate.status === "consumed" ? "consumed" : "pending";
+			const record = await assertNonCrystalApprovalCurrent(cwd, sessionId, stage, status, candidate);
+			if (record.status === "consumed")
+				return { status: 0, stdout: `${JSON.stringify({ skill: stage, execution_approval: "approved" })}\n` };
 			await writeNonCrystalApproval(cwd, { ...record, status: "consumed" });
 			return { status: 0, stdout: `${JSON.stringify({ skill: stage, execution_approval: "approved" })}\n` };
 		},
