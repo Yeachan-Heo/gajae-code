@@ -215,6 +215,90 @@ The same presets are available inside the TUI:
 
 Presets only write `models.yml` entries that reference documented environment variable names (`MINIMAX_CODE_API_KEY`, `MINIMAX_CODE_CN_API_KEY`, `ZAI_API_KEY`, `ALIBABA_TOKEN_PLAN_API_KEY`, `CLINE_API_KEY`, `CMD_API_KEY`, or `IONET_API_KEY`); they do not store or validate real credentials. The GLM preset aliases (`glm`, `zai`, `z-ai`) write an OpenAI-compatible custom provider named `glm-proxy` and do not replace the first-class `zai` provider. The Alibaba Token Plan preset (aliases: `alibaba`, `token-plan`) writes an OpenAI-compatible custom provider named `alibaba-token-plan` with per-model API routing. The ClinePass preset (aliases: `clinepass`, `cline`) does not hardcode models: Cline's inference API has no working `/models` route, so GJC follows Cline's own catalog-generation source and fetches the live `cline-pass` provider catalog from `https://models.dev/api.json`. The Command Code GOAT preset (aliases: `commandcode`, `command-code`, `goat`) fetches its live `/provider/v1/models` catalog, keeps every current or future model—including Claude-named IDs—on the provider's documented OpenAI-compatible `/chat/completions` transport, and requires a fixed harmless inference entitlement probe before login persistence. The IO Intelligence preset (aliases: `io-net`, `io-intelligence`) writes an OpenAI-compatible custom provider named `ionet` for [IO Intelligence](https://io.net) by io.net; model ids are `org/name` pairs discovered live from the endpoint's `/models` route, so no models are hardcoded. Create the corresponding API key in the provider dashboard before inference.
 
+## Local task decision collection
+
+For future routing evaluation, opt in before starting GJC:
+
+```sh
+GJC_TASK_COLLECTION=metadata bun run dev
+```
+
+Collection alone is local only and disabled by default. It does not call Kev, change model/effort selection, inject hints, train models, or upload data. Enabling the separate decision feature below automatically permits metadata collection only when `GJC_TASK_COLLECTION` is unset. Explicit `off` or unsupported values and `GJC_DISABLE_TELEMETRY=1` prevent persistence. Use a trusted shell/user environment; a repository `.env` cannot opt you in.
+
+Each logical subagent execution records a begin event, observed model selections, and a terminal outcome linked by `decision_id`. Autorouting probes are not counted as executed model calls. Requested selectors/effort remain separate from resolved models/effort and provider-reported model identity. Resume/message invocations are separate decisions with task/session grouping. A process crash can leave a begin event without an outcome: absence is unknown, not failure.
+
+The SQLite store is `<agent-dir>/task-decisions/task-decisions.db` (normally `~/.gjc/agent/task-decisions/task-decisions.db`). Each independently initialized store has a random installation ID; event IDs are globally unique, and per-decision sequence numbers avoid relying on clocks across machines. Run collection separately on each Mac. Do not synchronize the live SQLite database or copy it between Macs as a setup template.
+
+Export from a source checkout:
+
+```sh
+umask 077
+bun scripts/export-task-decisions.ts > task-decisions-mac-a.jsonl
+```
+
+Export is read-only and omits collected assignment/context text by default. Export each Mac separately and deduplicate repeated exports by `event_id` when combining them. There is no automatic cross-machine synchronization.
+
+### Content and training limitations
+
+`metadata` omits assignment/context text, subagent output, stderr, tool arguments/results, and raw repository paths. Hashes and model/task identifiers are still potentially identifying; this is not an anonymization guarantee. Exact assignment hashes support duplicate grouping, while repository-path hashes are local-path identities, not portable repository IDs.
+
+For future text-based training, `GJC_TASK_COLLECTION=content` explicitly permits bounded assignment/context text. This text can contain source code, paths, and secrets; collection is **not automatic secret redaction**. Review the data before sharing. Export it only with a second explicit opt-in:
+
+```sh
+umask 077
+bun scripts/export-task-decisions.ts --include-content > task-decisions-with-content.jsonl
+```
+
+Truncation is recorded. Metadata-only records cannot reconstruct the original task, and content mode is not a complete conversation or repository snapshot.
+
+Execution completion is not a correctness label. These observations do not certify test success, independent review approval, or which untried tier would have succeeded. Raw test/review evidence and baseline source snapshots are not collected. Keep related retries and duplicate tasks together when later splitting datasets; derive labels separately from verified comparisons rather than treating the selected tier as the answer. Storage failures are logged without changing task execution; collection is best effort, not an audit guarantee.
+
+## Kev and Jev subagent decisions
+
+This optional feature selects a **subagent tier**, resolved through the existing configured tier map and a frozen live model snapshot. It does not replace the main model. Kev and Jev use the typed System One API, not OpenAI chat or Ollama; `local-provider smoke` is not their health check.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `task.decision.enabled` | `false` | No extra decision requests/events while off; ordinary opted-in collection still works. |
+| `task.decision.provider` | `kev` | Local `kev` or explicitly selected paid `jev`; no automatic provider fallback. |
+| `task.decision.mode` | `shadow` | Observe without delaying child launch; `routing` applies valid recommendations. |
+| `task.decision.timeoutMs` | `5000` | One absolute deadline, including credential lookup, response reading, and validation; integer 1–60000 ms. |
+| `task.decision.kevEndpoint` | `http://127.0.0.1:8009/v1/systemone` | Loopback-only decision endpoint. |
+| `task.decision.kevModel` | `kev-latest` | Server request model alias; installation defaults to `jaredpalmer/kev-4b`. |
+
+Configure eligible tiers using the existing `task.autorouting.tiers` map. This tier map is also the decision feature's independent candidate map: disabling legacy autorouting does not populate or remove it, and an empty map gives the decision provider no valid candidate. A fresh initial child makes at most one decision request; unavailable candidates, invalid output, errors, and timeouts preserve its original routing. No request is repeated by preflight probes, fallback attempts, resume, or message delivery. In **routing mode, a valid recommendation overrides even explicit child model/effort pins**. Main and already-running sessions remain unchanged.
+
+Only the assignment (at most **4096 UTF-8 bytes**, including a truncation marker), role, and frozen tier candidates are sent. Shared context, files, tools, and environment values are not added. Responses are incrementally bounded to **64 KiB decoded bytes**. Local content collection retains its separate existing **4096 UTF-16 code-unit** limit.
+
+### Independent setup on each Mac
+
+Run these commands separately on each supported Apple Silicon Mac:
+
+```sh
+gjc setup kev install --model jaredpalmer/kev-4b
+gjc setup kev start --port 8009
+gjc setup kev status --json
+gjc config set task.decision.provider kev
+gjc config set task.decision.mode shadow
+gjc config set task.decision.enabled true
+```
+
+Installation uses an isolated Kev environment and requires the upstream-supported Python/MLX toolchain. Install records the exact upstream checkout revision and downloaded local Hugging Face snapshot used by the server; it is not a floating model alias at run time. To change `--model`, stop the owned server first, then run `gjc setup kev install --model <hub-org>/<hub-model>` explicitly; start refuses a model that was not installed. Installation does not start the server; sessions never automatically start or stop it. `start` may report `starting` until the loopback health check is ready, while `status` reports `running` only after ownership, listening, and `/v1/models` health all pass. Stop explicitly with `gjc setup kev stop`. GJC only signals a process whose ownership and incarnation it can prove, never a process merely occupying the port.
+
+The default root is `~/.gjc/agent/kev`. Pass `--root /absolute/path` to `install`, `start`, `status`, or `stop` to use another user-owned root; a successful install remembers that root for later commands that omit `--root`. A remembered root is local state, not a shared or remote deployment. The setup-managed Kev server and default decision endpoint are loopback-only (`127.0.0.1`); do not expose them as a three-Mac service or point them at another Mac. Any configured `task.decision.kevEndpoint` is enforced as loopback HTTP on `127.0.0.1` or `localhost`, without credentials, query, or fragment.
+
+For source-checkout verification, replace `gjc` with `bun packages/coding-agent/src/cli.ts`; this does not require changing global links. Perform this procedure separately on each of the three Macs; do not treat one Mac's success as remote deployment or evidence for the others. On each Mac, check status, launch a synthetic fresh child, and export its local records with the command in [local task decision collection](#local-task-decision-collection). Confirm a decision event and actual model/outcome records. Shadow results may arrive after the outcome: they append once without revising it. Give each Mac's export a distinct filename; do not clone or synchronize the live database. These are deployment instructions, not evidence that another Mac has been deployed.
+
+Switch to `task.decision.mode routing` only when recommendation authority is intended. Setting `task.decision.enabled false` stops new decision requests but leaves ordinary explicitly enabled collection intact.
+
+### Jev credentials and persistence controls
+
+Jev uses `https://api.typesafe.ai/v1/systemone` with `jev-latest`. Supply `TYPESAFE_API_KEY` through a trusted launching-shell or user-owned environment, then select `task.decision.provider jev`. Do not place keys in command-line literals or a project's `.env`. The adapter obtains the key through `AuthStorage`'s `typesafe` identity; this is not a new chat provider or login flow. Jev requests can incur charges.
+
+Feature activation permits metadata persistence only when the trusted collection variable is unset. Explicit `metadata` or `content` retains its meaning; `off`, invalid/unsupported explicit values, or the telemetry kill switch prevent persistence, **not separately authorized inference**. Content is never automatically enabled. No keys, raw HTTP response bodies, or disabled counters are persisted. Provider errors do not trigger retries or a paid fallback.
+
+Neither a recommendation nor execution completion is a verified training label. Training, centralized transfer, and paid Jev verification are separate activities; mock contract tests must not be presented as live Jev validation.
+
 ## Signed remote preset registry
 
 GJC ships its embedded model metadata and profiles as an immutable bootstrap fallback, then overlays a separately published signed registry before applying local configuration:

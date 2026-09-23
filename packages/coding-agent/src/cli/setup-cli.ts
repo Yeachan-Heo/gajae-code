@@ -30,6 +30,7 @@ import {
 	runHermesSetup,
 } from "../setup/hermes-setup";
 import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
+import { type KevSetupAction, runKevSetup } from "../setup/kev-setup";
 import {
 	type PaseoSetupFlags,
 	type PaseoSetupOutcome,
@@ -55,7 +56,8 @@ export type SetupComponent =
 	| "paseo"
 	| "provider"
 	| "python"
-	| "stt";
+	| "stt"
+	| "kev";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -95,6 +97,8 @@ export interface SetupCommandArgs {
 		yes?: boolean;
 		dryRun?: boolean;
 		keychain?: boolean;
+		port?: number;
+		action?: KevSetupAction;
 	};
 }
 
@@ -109,6 +113,7 @@ const VALID_COMPONENTS: SetupComponent[] = [
 	"provider",
 	"python",
 	"stt",
+	"kev",
 ];
 
 /**
@@ -138,6 +143,17 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"timeout",
 	"connectTimeout",
 ];
+const KEV_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = ["port", "action"];
+
+function rejectKevFlagsOutsideKev(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
+	if (component === "kev") return;
+	const offending = KEV_ONLY_FLAGS.filter(flag => flags[flag] !== undefined);
+	if (offending.length === 0) return;
+	const flagList = offending.map(flag => `--${flag}`);
+	process.stderr.write(`${chalk.red(`${flagList.join(", ")} require the explicit \`kev\` component.`)}\n`);
+	process.stderr.write(`${chalk.dim(`Run: ${APP_NAME} setup kev install ${flagList.join(" ")}`)}\n`);
+	process.exit(1);
+}
 
 function rejectHermesFlagsOutsideHermes(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
 	if (component === "hermes") return;
@@ -173,7 +189,8 @@ function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 }
 
 function rejectProviderFlagsOutsideProvider(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
-	if (component === "provider" || !hasProviderSetupFlags(flags)) {
+	const providerFlags = component === "kev" ? { ...flags, model: undefined } : flags;
+	if (component === "provider" || !hasProviderSetupFlags(providerFlags)) {
 		return;
 	}
 	console.error(chalk.red("Provider setup flags require the explicit `provider` component."));
@@ -219,6 +236,9 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.keychain = true;
 		} else if (arg === "--root") {
 			flags.root = [...(flags.root ?? []), args[++i] ?? ""];
+		} else if (arg === "--port") {
+			const value = args[++i];
+			flags.port = value === undefined ? undefined : Number(value);
 		} else if (arg === "--repo") {
 			flags.repo = args[++i];
 		} else if (arg === "--profile") {
@@ -277,6 +297,12 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 		} else if (!componentSeen && VALID_COMPONENTS.includes(arg as SetupComponent)) {
 			component = arg as SetupComponent;
 			componentSeen = true;
+		} else if (
+			component === "kev" &&
+			flags.action === undefined &&
+			["install", "start", "stop", "status"].includes(arg)
+		) {
+			flags.action = arg as KevSetupAction;
 		} else {
 			console.error(chalk.red(`Unknown setup argument: ${arg}`));
 			console.error(`Valid components: ${VALID_COMPONENTS.join(", ")}`);
@@ -287,6 +313,7 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 	rejectProviderFlagsOutsideProvider(component, flags);
 	rejectPaseoFlagsOutsidePaseo(component, flags);
 	rejectHermesFlagsOutsideHermes(component, flags);
+	rejectKevFlagsOutsideKev(component, flags);
 
 	return {
 		component,
@@ -346,6 +373,7 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	rejectProviderFlagsOutsideProvider(cmd.component, cmd.flags);
 	rejectPaseoFlagsOutsidePaseo(cmd.component, cmd.flags);
 	rejectHermesFlagsOutsideHermes(cmd.component, cmd.flags);
+	rejectKevFlagsOutsideKev(cmd.component, cmd.flags);
 	switch (cmd.component) {
 		case "claude":
 			handleHostPluginSetup("claude", cmd.flags);
@@ -376,6 +404,31 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			break;
 		case "credentials":
 			await handleCredentialsSetup(cmd.flags);
+			break;
+		case "kev":
+			try {
+				if ((cmd.flags.model?.length ?? 0) > 1 || (cmd.flags.root?.length ?? 0) > 1) {
+					throw new Error("Kev accepts one --model and one --root");
+				}
+				const result = await runKevSetup(cmd.flags.action ?? "status", {
+					model: cmd.flags.model?.[0],
+					root: cmd.flags.root?.[0],
+					port: cmd.flags.port,
+					json: cmd.flags.json,
+				});
+				if (!cmd.flags.json) {
+					process.stdout.write(
+						`Kev ${result.state}: ${JSON.stringify(result.root)}${result.port ? ` (port ${result.port})` : ""}\n`,
+					);
+				}
+				if (!result.ok) process.exitCode = 1;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (cmd.flags.json) process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+				else
+					process.stderr.write(`${chalk.red(`${theme.status.error} Kev setup failed`)}\n${chalk.dim(message)}\n`);
+				process.exitCode = 1;
+			}
 			break;
 	}
 }
@@ -928,6 +981,7 @@ ${chalk.bold("Components:")}
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
   credentials Optional: import existing Claude Code / Codex CLI credentials
+  kev       Install and manage the explicit local Kev decision service
 
 
 ${chalk.bold("Provider example:")}
@@ -1001,5 +1055,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup paseo            Register GJC as a Paseo ACP provider
   ${APP_NAME} setup paseo --check    Diagnose the Paseo registration
   ${APP_NAME} setup paseo --remove   Roll back the Paseo registration
+  ${APP_NAME} setup kev install --model jaredpalmer/kev-4b
+  ${APP_NAME} setup kev start --port 8009
+  ${APP_NAME} setup kev status --json
 `);
 }

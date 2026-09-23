@@ -1273,6 +1273,44 @@
 						}
 					},
 					"additionalProperties": false
+				},
+				"decision": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"default": false
+						},
+						"provider": {
+							"type": "string",
+							"enum": [
+								"kev",
+								"jev"
+							],
+							"default": "kev"
+						},
+						"mode": {
+							"type": "string",
+							"enum": [
+								"shadow",
+								"routing"
+							],
+							"default": "shadow"
+						},
+						"timeoutMs": {
+							"type": "number",
+							"default": 5000
+						},
+						"kevEndpoint": {
+							"type": "string",
+							"default": "http://127.0.0.1:8009/v1/systemone"
+						},
+						"kevModel": {
+							"type": "string",
+							"default": "kev-latest"
+						}
+					},
+					"additionalProperties": false
 				}
 			},
 			"additionalProperties": false
