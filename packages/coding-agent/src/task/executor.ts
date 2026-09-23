@@ -1418,6 +1418,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 		forwardSubagentEvent(event);
 
 		const now = Date.now();
+		progress.lastActivityMs = now;
 		let flushProgress = false;
 		// A retry is recovered at the first assistant provider event, before the
 		// session emits auto_retry_end after message completion.
