@@ -11,6 +11,7 @@ import {
 	captureManagedManifest,
 	createManagedDomainBinding,
 	defineManagedTaskGraph,
+	loadManagedEnrollmentRecord,
 	type ManagedResource,
 	type ManagedTaskDefinition,
 	type ManagedTaskDomain,
@@ -58,6 +59,21 @@ function native(key: string) {
 function resource(p: string, mode: "read" | "write", recursive = false): ManagedResource {
 	return { kind: "path", path: p, mode, recursive, namespace: false };
 }
+
+describe("managed enrollment index reads", () => {
+	it("reads an absent index without Linux-only private publication", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-enrollment-empty-"));
+		roots.push(agentDir);
+
+		await expect(loadManagedEnrollmentRecord(agentDir)).resolves.toEqual({
+			controlRoots: [],
+			establishedRoots: [],
+			publishingRoots: [],
+			nativeIdentities: [],
+			byRoot: {},
+		});
+	});
+});
 
 describe("managed DAG policy (no native effects or verification authority)", () => {
 	it("rejects duplicate, missing, cyclic, extra-key, and empty-validation graphs", async () => {
