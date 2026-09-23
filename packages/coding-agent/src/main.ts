@@ -476,7 +476,7 @@ type StartupModelProfileArgs = {
 };
 
 function staleDefaultProfileMessage(error: UnknownModelProfileError): string {
-	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml if present, or run gjc config reset modelProfile.default for the global setting.`;
+	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml or .gjc/settings.json if set there, or run gjc config reset modelProfile.default for the global setting.`;
 }
 
 async function applyStartupModelProfilesWithPolicy(

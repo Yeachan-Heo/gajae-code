@@ -834,6 +834,7 @@ test("input-free interactive startup reports a stale persisted default without c
 	expect(result.recoverableErrors[0]).toContain('unknown model profile "deleted-profile"');
 	expect(result.recoverableErrors[0]).toContain("gjc config reset modelProfile.default");
 	expect(result.recoverableErrors[0]).toContain(".gjc/config.yml");
+	expect(result.recoverableErrors[0]).toContain(".gjc/settings.json");
 	expect(settings.get("modelProfile.default")).toBe("deleted-profile");
 	expect(session.setModelTemporaryCalls).toEqual([]);
 	expect(session.model).toBeUndefined();
