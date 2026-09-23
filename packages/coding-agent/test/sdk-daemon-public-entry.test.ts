@@ -26,6 +26,7 @@ describe("inert public command entry scanner", () => {
 		const agentDir = "/tmp/gjc-agent";
 		for (const argv of [
 			["session", "--agent-dir", agentDir, "list", "--scope", "all"],
+			["session", "--agent-dir", agentDir, "inspect", "session-id"],
 			["session", "list", "--scope", "all", "--agent-dir", agentDir],
 			["session", "inspect", "session-id", "--agent-dir", agentDir],
 		]) {
@@ -42,11 +43,24 @@ describe("inert public command entry scanner", () => {
 			["session", "send", "session-id", "--text", "hello", "--repo", repo],
 			["session", "status", "session-id", "operation-ref", "--repo", repo],
 			["session", "raw", "query", "session-id", "--query", "session.inspect", "--repo", repo],
+			["session", "raw", "query", "session-id", "--query", "session.inspect", `--repo=${repo}`],
 		]) {
 			const result = scanPublicCommand("sdk", argv);
 			expect(result.kind).toBe("operation");
 			expect(result.flags.repo).toBe(repo);
 		}
+		const rawControl = scanPublicCommand("sdk", [
+			"session",
+			"raw",
+			"control",
+			"session-id",
+			"--op",
+			"thinking.cycle",
+			"--repo",
+			repo,
+		]);
+		expect(rawControl.kind).toBe("usage");
+		expect(rawControl.issues.some(issue => issue.code === "unknown-flag")).toBe(true);
 	});
 
 	it("does not infer help or JSON from operands, equals values or tokens after --", () => {
