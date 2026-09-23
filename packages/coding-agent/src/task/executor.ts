@@ -3033,7 +3033,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					context: options.context,
 				},
 				{
-					mode: options.settings?.get("task.decision.collection") ?? "off",
+					mode: options.settings?.get("task.decision.collection") === "off" ? undefined : options.settings?.get("task.decision.collection"),
 				},
 			);
 		} catch {

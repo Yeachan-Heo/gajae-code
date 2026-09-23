@@ -212,10 +212,10 @@ const decisionPayloadSchema = decisionObservationSchema.extend({ late: z.boolean
 function resolveMode(options?: TaskDecisionStoreOptions): TaskCollectionMode | undefined {
 	const disabled = $credentialEnv("GJC_DISABLE_TELEMETRY");
 	if (/^(?:1|true|yes|on)$/iu.test(disabled ?? "")) return undefined;
-	if (options?.mode === "off") return undefined;
 	const configured = $credentialEnv("GJC_TASK_COLLECTION");
 	if (configured === "metadata" || configured === "content") return configured;
 	if (configured !== undefined) return undefined;
+	if (options?.mode === "off") return undefined;
 	if (options?.mode === "metadata" || options?.mode === "content") return options.mode;
 	return undefined;
 }
