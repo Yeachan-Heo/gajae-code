@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { WorkflowStateEnvelopeSchema } from "@gajae-code/coding-agent/gjc-runtime/state-schema";
-import { migrateWorkflowState, normalizeLegacyState } from "../../src/gjc-runtime/state-migrations";
+import {
+	migrateAndPersistLegacyState,
+	migrateWorkflowState,
+	normalizeLegacyState,
+} from "../../src/gjc-runtime/state-migrations";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 describe("state migrations", () => {
@@ -44,6 +51,79 @@ describe("state migrations", () => {
 		expect(result.state.current_phase).toBe("planner");
 		expect(result.state.phase).toBe("planner");
 		expect(result.state.extra).toBe("preserved");
+	});
+
+	it("rejects malformed explicit versions without persisting or revoking authority", async () => {
+		const invalidVersions: unknown[] = [
+			"1",
+			"2",
+			1.5,
+			0,
+			-1,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Number.NEGATIVE_INFINITY,
+			"NaN",
+			null,
+			undefined,
+			true,
+			{},
+		];
+		for (const version of invalidVersions) {
+			const state = {
+				version,
+				active: true,
+				current_phase: "handoff",
+				spec_path: "/tmp/approved.md",
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "approved",
+					execution_approval_receipt: { method: "explicit-state-action" },
+				},
+			};
+
+			expect(() => migrateWorkflowState(state, "deep-interview")).toThrow("invalid explicit version");
+			expect(() => normalizeLegacyState(state, "deep-interview")).toThrow("invalid explicit version");
+			expect(state.spec_path).toBe("/tmp/approved.md");
+			expect(state.state.crystal).toEqual({ lifecycle: "ready" });
+			expect(state.state.execution_approval).toBe("approved");
+		}
+
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-migration-invalid-version-"));
+		const statePath = path.join(cwd, ".gjc", "state", "deep-interview.json");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		const persistedState = {
+			version: "1",
+			active: true,
+			current_phase: "handoff",
+			spec_path: "/tmp/approved.md",
+			state: {
+				crystal: { lifecycle: "ready" },
+				execution_approval: "approved",
+				execution_approval_receipt: { method: "explicit-state-action" },
+			},
+		};
+		const before = `${JSON.stringify(persistedState)}\n`;
+		try {
+			await fs.writeFile(statePath, before);
+			await expect(
+				migrateAndPersistLegacyState({
+					cwd,
+					skill: "deep-interview",
+					statePath: path.relative(cwd, statePath),
+					sessionId: "test-session",
+				}),
+			).rejects.toThrow("invalid explicit version");
+			expect(await fs.readFile(statePath, "utf-8")).toBe(before);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("continues to reject genuine future numeric versions", () => {
+		expect(() => migrateWorkflowState({ version: WORKFLOW_STATE_VERSION + 1 }, "ralplan")).toThrow(
+			"unsupported future version",
+		);
 	});
 
 	it("is idempotent for v2 state", () => {

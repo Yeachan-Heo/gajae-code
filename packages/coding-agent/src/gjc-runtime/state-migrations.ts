@@ -69,7 +69,13 @@ export function assertNotFutureWorkflowState(
 	skill: string,
 	surface = "workflow state",
 ): void {
+	const hasExplicitVersion = Object.hasOwn(state, "version");
 	const version = state.version;
+	if (hasExplicitVersion && (typeof version !== "number" || !Number.isInteger(version) || version < 1)) {
+		throw new Error(
+			`${surface} for ${canonicalSkillOrThrow(skill)} has an invalid explicit version; refusing legacy migration`,
+		);
+	}
 	if (typeof version === "number" && Number.isFinite(version) && version > WORKFLOW_STATE_VERSION) {
 		throw new Error(
 			`${surface} for ${canonicalSkillOrThrow(skill)} has unsupported future version ${version}; refusing downgrade`,
@@ -146,7 +152,7 @@ const MIGRATIONS: Record<number, WorkflowStateMigration> = {
 export function migrateWorkflowState(raw: Record<string, unknown>, skill: string): MigrateWorkflowStateResult {
 	const canonicalSkill = canonicalSkillOrThrow(skill);
 	assertNotFutureWorkflowState(raw, canonicalSkill, "workflow state");
-	const fromVersion = typeof raw.version === "number" ? raw.version : 1;
+	const fromVersion = Object.hasOwn(raw, "version") ? (raw.version as number) : 1;
 	if (fromVersion >= WORKFLOW_STATE_VERSION) {
 		return { state: raw, fromVersion, toVersion: fromVersion, changed: false };
 	}
@@ -181,7 +187,7 @@ export function normalizeLegacyState(raw: Record<string, unknown>, skill: string
 	assertNotFutureWorkflowState(raw, canonicalSkill, "workflow state");
 	const state = cloneRecord(raw);
 	state.skill = canonicalSkill;
-	if (typeof state.version !== "number") state.version = 1;
+	if (!Object.hasOwn(raw, "version")) state.version = 1;
 	if (typeof state.active !== "boolean") state.active = true;
 	if (typeof state.updated_at !== "string") state.updated_at = new Date().toISOString();
 	state.receipt = receiptWithRequiredFields(state.receipt, canonicalSkill);
