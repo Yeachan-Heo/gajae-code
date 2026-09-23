@@ -259,11 +259,15 @@ Execution completion is not a correctness label. These observations do not certi
 
 This optional feature selects a **subagent tier**, resolved through the existing configured tier map and a frozen live model snapshot. It does not replace the main model. Kev and Jev use the typed System One API, not OpenAI chat or Ollama; `local-provider smoke` is not their health check.
 
+**Scope of this implementation.** The only decision made is the tier `choice`, in `shadow` or `routing` mode. There is no `noul` delegation decision, no advisory `hint` mode, and `enforce` is rejected by the settings schema and by the provider factory. Anything describing those as available is describing work that is not here.
+
+**Data transfer.** With `provider=kev` the request never leaves this machine — see the Unix-socket note below. With **`provider=jev` the role string and the raw assignment text (up to 4096 UTF-8 bytes) are transmitted to Typesafe's remote endpoint, `https://api.typesafe.ai/v1/systemone`.** That is an outbound transfer of task content to a third party, it is billable, and it happens on every fresh initial child while the provider is selected. It requires explicit opt-in: `task.decision.enabled true` *and* `task.decision.provider jev` *and* a `typesafe` credential. There is no automatic fallback from `kev` to `jev`, so selecting the local provider cannot silently become a remote one.
+
 | Setting | Default | Behavior |
 | --- | --- | --- |
 | `task.decision.enabled` | `false` | No extra decision requests/events while off; ordinary opted-in collection still works. |
-| `task.decision.provider` | `kev` | Local `kev` or explicitly selected paid `jev`; no automatic provider fallback. |
-| `task.decision.mode` | `shadow` | Observe without delaying child launch; `routing` applies valid recommendations. |
+| `task.decision.provider` | `kev` | Local `kev`, or explicitly selected paid `jev` which **sends role and raw assignment text to Typesafe**; no automatic provider fallback. |
+| `task.decision.mode` | `shadow` | Observe without delaying child launch; `routing` applies valid recommendations. Only these two exist: `enforce` is refused, and there is no `hint` or `noul` mode. |
 | `task.decision.collection` | `off` | Explicit persistence consent: `metadata` or `content`; decision enablement alone does not collect. |
 | `task.decision.timeoutMs` | `5000` | One absolute deadline, including credential lookup, response reading, and validation; integer 1–60000 ms. |
 | `task.decision.kevModel` | `kev-latest` | Server request model alias; installation defaults to `jaredpalmer/kev-4b`. |
@@ -299,7 +303,7 @@ Switch to `task.decision.mode routing` only when recommendation authority is int
 
 ### Jev credentials and persistence controls
 
-Jev uses `https://api.typesafe.ai/v1/systemone` with `jev-latest`. Supply `TYPESAFE_API_KEY` through a trusted launching-shell or user-owned environment, then select `task.decision.provider jev`. Do not place keys in command-line literals or a project's `.env`. The adapter obtains the key through `AuthStorage`'s `typesafe` identity; this is not a new chat provider or login flow. Jev requests can incur charges.
+Jev uses `https://api.typesafe.ai/v1/systemone` with `jev-latest`. **Selecting it transmits the subagent's role and its raw assignment text off this machine to Typesafe on every fresh initial child.** That text is whatever the parent wrote as the task assignment, so treat it as you would any other outbound disclosure of repository-derived prose; if the assignment must not leave the machine, use `provider=kev` or leave the feature off. Supply `TYPESAFE_API_KEY` through a trusted launching-shell or user-owned environment, then select `task.decision.provider jev`. Do not place keys in command-line literals or a project's `.env`. The adapter obtains the key through `AuthStorage`'s `typesafe` identity; this is not a new chat provider or login flow. Jev requests can incur charges.
 
 Feature activation permits metadata persistence only when the trusted collection variable is unset. Explicit `metadata` or `content` retains its meaning; `off`, invalid/unsupported explicit values, or the telemetry kill switch prevent persistence, **not separately authorized inference**. Content is never automatically enabled. No keys, raw HTTP response bodies, or disabled counters are persisted. Provider errors do not trigger retries or a paid fallback.
 
