@@ -23884,9 +23884,11 @@ export class AgentSession {
 			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
 		// Credential rotation: a content-free quota/rate-limit failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
-		// extension lifecycle participation. Mark the failed credential and
-		// retry with the next stored credential of the same provider.
+		// extension lifecycle participation. Mark it before managed fallback
+		// policy decides whether to retry or advance, unless an explicit provider
+		// retry ceiling forbids another attempt.
 		let credentialRotated = false;
+		let quotaCredentialMark: "rotated" | "exhausted" | "unchanged" | undefined;
 		if (canRotateCodexCredential && trigger.class === "credential") {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
@@ -23901,14 +23903,13 @@ export class AgentSession {
 			}
 		}
 		if (
-			!managedFallback &&
-			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit")
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			!providerRetryCeilingReached
 		) {
-			const mark = await this.#markFailedCredential(trigger);
-			credentialRotated = mark === "rotated";
-			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
+			quotaCredentialMark = await this.#markFailedCredential(trigger);
+			credentialRotated = quotaCredentialMark === "rotated";
+			if (quotaCredentialMark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 
 		// A content-free credential rotation is inherently replay-safe: no partial
@@ -23962,6 +23963,22 @@ export class AgentSession {
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
+			if (quotaCredentialMark === "exhausted" && outcome === "retry" && this.model) {
+				const failedProvider = this.model.provider;
+				const authStorage = this.#modelRegistry.authStorage;
+				const credentialKind = authStorage.getSessionCredentialType(failedProvider, this.credentialSessionId);
+				const activeCredentialCount =
+					credentialKind === undefined
+						? 0
+						: authStorage
+								.listCredentialInventory(failedProvider)
+								.filter(credential => !credential.disabled && credential.credentialKind === credentialKind)
+								.length;
+				// An exhausted typed pool should not spend the remaining model retry
+				// budget on the account that just failed. With only one active row of
+				// this credential kind, retain the existing configured retry behavior.
+				if (activeCredentialCount > 1) outcome = controller.advance() ? "advance" : "exhausted";
+			}
 			// The one content-free account retry was already spent: never spend
 			// another same-model attempt on a third account, advance instead.
 			if (
@@ -23990,16 +24007,6 @@ export class AgentSession {
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
-		if (
-			managedFallback &&
-			!providerRetryCeilingReached &&
-			outcome === "advance" &&
-			(trigger.class === "quota" || trigger.class === "rate_limit")
-		) {
-			const mark = await this.#markFailedCredential(trigger);
-			credentialRotated = mark === "rotated";
-			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
-		}
 		if (credentialRotated) {
 			// A rotation only becomes a same-model retry if the controller can
 			// actually be rewound. `restorePreviousEntryForRetry()` refuses once an
@@ -24019,7 +24026,7 @@ export class AgentSession {
 				let errorMessage = this.#fallbackExhaustionError(controller);
 				if (trigger.class === "quota" || trigger.class === "rate_limit") {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
-						const mark = await this.#markFailedCredential(trigger);
+						const mark = quotaCredentialMark ?? (await this.#markFailedCredential(trigger));
 						if (mark === "exhausted") {
 							this.#stampQuotaRetryableAt(message);
 							errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
@@ -24062,10 +24069,11 @@ export class AgentSession {
 				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
 			if (retryCancelled()) return;
-			let quotaPoolExhausted = false;
+			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
 				!credentialRotated &&
+				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&
 				!(this.#isCodexCredentialModelUnavailable(message) && this.#codexCredentialModelUnavailableRetried)
 			) {

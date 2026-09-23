@@ -17,6 +17,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import * as z from "zod/v4";
 
 const provider = "openai-codex";
+const selector = (model: Model) => `${model.provider}/${model.id}`;
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
@@ -265,4 +266,206 @@ describe("credential marking before re-resolution", () => {
 			}
 		});
 	}
+});
+
+async function runManagedFallbackQuotaScenario(options: {
+	accounts: readonly string[];
+	quotaKeys: readonly string[];
+	maxAttempts?: number;
+	trigger?: "quota" | "rate_limit";
+	preblockedAccounts?: readonly string[];
+	runtimeApiKey?: string;
+}): Promise<{ models: string[]; keys: string[]; markCount: number }> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
+	let session: AgentSession | undefined;
+	const usageProvider: UsageProvider = {
+		id: provider,
+		async fetchUsage(params): Promise<UsageReport | null> {
+			const accountId = params.credential.accountId ?? "unknown";
+			return {
+				provider,
+				fetchedAt: Date.now(),
+				limits: [
+					{
+						id: "requests",
+						label: "Requests",
+						scope: { provider, accountId },
+						amount: { unit: "requests", used: 10, limit: 100 },
+						status: "ok",
+					},
+				],
+			};
+		},
+	};
+	const storage = await AuthStorage.create(path.join(root, "auth.db"), {
+		usageProviderResolver: currentProvider => (currentProvider === provider ? usageProvider : undefined),
+		rankingStrategyResolver: currentProvider => (currentProvider === provider ? strategy : undefined),
+	});
+	const model = getBundledModel(provider, "gpt-5.1-codex");
+	const fallback = getBundledModel("openai", "gpt-4o-mini");
+	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+	try {
+		await storage.set(provider, [
+			...options.accounts.map(accountId => ({
+				type: "oauth" as const,
+				access: `TOKEN-${accountId}`,
+				refresh: `refresh-${accountId}`,
+				expires: Date.now() + 3_600_000,
+				accountId,
+			})),
+		]);
+		for (const accountId of options.preblockedAccounts ?? []) {
+			const preblockedSessionId = `preblocked-${accountId}`;
+			await storage.getApiKey(provider, preblockedSessionId, {
+				credentialSelector: { kind: "account", value: accountId },
+			});
+			const blockedRowId = storage.getSessionCredentialRowId(provider, preblockedSessionId);
+			if (blockedRowId === undefined) throw new Error(`Missing ${accountId} OAuth row to preblock`);
+			const hasRemaining = await storage.markUsageLimitReached(provider, preblockedSessionId, {
+				rowId: blockedRowId,
+				retryAfterMs: 120_000,
+			});
+			if (!hasRemaining) throw new Error(`Could not preblock ${accountId} OAuth row`);
+		}
+		storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
+		if (options.runtimeApiKey !== undefined) storage.setRuntimeApiKey(provider, options.runtimeApiKey);
+		storage.setRuntimeApiKey("openai", "fallback-test-key");
+		const registry = new ModelRegistry(storage, path.join(root, "models.yml"));
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": options.maxAttempts ?? 3,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", selector(model));
+		const calls: Array<{ model: string; key: string }> = [];
+		const quotaKeys = new Set(options.quotaKeys);
+		const success = createMockModel({ responses: [{ content: ["accepted"] }] });
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["Synthetic test"], tools: [], messages: [] },
+			convertToLlm: identityConverter,
+			getApiKey: async requestedProvider => {
+				if (!session) throw new Error("Session not initialized");
+				return registry.getApiKeyForProvider(requestedProvider, session.credentialSessionId);
+			},
+			streamFn: (requestedModel, context, streamOptions) => {
+				const key = String(streamOptions?.apiKey);
+				calls.push({ model: selector(requestedModel), key });
+				if (requestedModel.provider === provider && quotaKeys.has(key)) {
+					return usageLimitStream(requestedModel, options.trigger ?? "quota");
+				}
+				return success.stream(requestedModel, context, streamOptions);
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: registry,
+		});
+		session.setConfiguredModelChain("default", [selector(model), selector(fallback)], "test");
+		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
+		await session.prompt("recover from a Codex quota error");
+		await session.waitForIdle();
+		return {
+			models: calls.map(call => call.model),
+			keys: calls.map(call => call.key),
+			markCount: markUsageLimitReached.mock.calls.length,
+		};
+	} finally {
+		await session?.dispose();
+		storage.close();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}
+
+describe("managed fallback quota credential rotation", () => {
+	test("retries the same Codex model with the next credential before fallback", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({ accounts: ["a", "b"], quotaKeys: ["TOKEN-a"] });
+		expect(result).toEqual({
+			models: [selector(model), selector(model)],
+			keys: ["TOKEN-a", "TOKEN-b"],
+			markCount: 1,
+		});
+	});
+
+	test("advances to the next model only after every Codex credential is quota-limited", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
+			markCount: 2,
+		});
+	});
+
+	test("advances when every other stored Codex credential was already quota-limited", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a"],
+			preblockedAccounts: ["b"],
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "fallback-test-key"],
+			markCount: 1,
+		});
+	});
+
+	test("preserves the existing retry budget when the provider has no alternate credential", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a"],
+			quotaKeys: ["TOKEN-a"],
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-a", "TOKEN-a", "fallback-test-key"],
+			markCount: 3,
+		});
+	});
+
+	test("advances after both Codex accounts are rate-limited", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			trigger: "rate_limit",
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
+			markCount: 2,
+		});
+	});
+
+	test("does not mutate credentials pinned by a runtime API key", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["pinned-codex-key"],
+			runtimeApiKey: "pinned-codex-key",
+			maxAttempts: 1,
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(fallback)],
+			keys: ["pinned-codex-key", "fallback-test-key"],
+			markCount: 0,
+		});
+	});
 });
