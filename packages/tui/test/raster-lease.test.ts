@@ -399,6 +399,47 @@ describe("TUI raster lease public boundary", () => {
 		expect((await pending).status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).toBe("FLUSH_PREFIX");
 	});
+	it("unblocks raster ingress when terminal flush ignores lifecycle abort", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("flush-never-settles"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		const flushStarted = Promise.withResolvers<void>();
+		const releaseFlush = Promise.withResolvers<void>();
+		terminal.flush = async () => {
+			flushStarted.resolve();
+			await releaseFlush.promise;
+		};
+		let callbackCalled = false;
+		terminal.clearWriteLog();
+		const pending = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("FLUSH_SAVE"),
+				afterPrefix: async () => {
+					callbackCalled = true;
+					return true;
+				},
+				records: [bytes("STALE_FLUSH_BODY")],
+				abortSuffix: bytes("FLUSH_RESTORE"),
+			},
+		});
+		await flushStarted.promise;
+
+		tui.stop();
+
+		const settled = await Promise.race([pending.then(() => true), Bun.sleep(100).then(() => false)]);
+		expect(settled).toBe(true);
+		expect((await pending).status).toBe("failed");
+		expect(callbackCalled).toBe(false);
+		expect(terminal.getWriteLog().join("")).not.toContain("STALE_FLUSH_BODY");
+
+		tui.start();
+		expect((await tui.queueTerminalOutput("AFTER_FLUSH_RESTART")).status).toBe("written");
+		expect(terminal.getWriteLog().join("")).toContain("AFTER_FLUSH_RESTART");
+		releaseFlush.resolve();
+		tui.stop();
+	});
 	it("closes multipart ownership when terminal loss occurs during afterPrefix", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("terminal-loss-after-prefix"));
