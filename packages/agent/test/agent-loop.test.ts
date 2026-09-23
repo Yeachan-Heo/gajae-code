@@ -1825,6 +1825,54 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(cleanupCalls).toBe(1);
 	});
 
+	it("bounds abort while afterToolCall already owns dispatched cleanup", async () => {
+		const toolSchema = z.object({});
+		const controller = new AbortController();
+		const cleanupStarted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		let cleanupCalls = 0;
+		const tool: AgentTool<typeof toolSchema, unknown> = {
+			name: "completed",
+			label: "Completed",
+			description: "Completes before its cleanup hook settles",
+			parameters: toolSchema,
+			execute: async () => ({ content: [{ type: "text", text: "done" }] }),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "tool-1", name: "completed", arguments: {} }] }],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				afterToolCall: async () => {
+					cleanupCalls++;
+					cleanupStarted.resolve();
+					await releaseCleanup.promise;
+				},
+			},
+			controller.signal,
+			mock.stream,
+		);
+		const drained = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		await cleanupStarted.promise;
+		controller.abort();
+		const abortSettled = await Promise.race([drained.then(() => true), Bun.sleep(1_500).then(() => false)]);
+		releaseCleanup.resolve();
+		await drained;
+
+		expect(abortSettled).toBe(true);
+		expect(cleanupCalls).toBe(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(1);
+	});
+
 	it("settles dispatched cancellation cleanup before agent_end", async () => {
 		const toolSchema = z.object({});
 		const controller = new AbortController();
