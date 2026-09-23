@@ -1468,6 +1468,9 @@ export class MCPManager {
 				// window, or already spent it, is torn down and reported. Exact-config
 				// (`toolsOnly`) startup still fails fast: it builds a catalog once, so a
 				// missing server is an error.
+				// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
+				// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
+				// registered if it eventually connects.
 				const startupElapsedMs = Date.now() - startupStartedAt;
 				for (const task of pendingTasks) {
 					if (task.tracked.status !== "pending") continue;
@@ -1505,9 +1508,6 @@ export class MCPManager {
 						this.#logLeaseReleaseFailure(task.name, undefined, error);
 					});
 				}
-				// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
-				// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
-				// registered if it eventually connects.
 			}
 
 			for (const task of connectionTasks) {
