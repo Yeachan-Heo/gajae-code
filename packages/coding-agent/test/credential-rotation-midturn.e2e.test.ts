@@ -276,6 +276,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	preblockedAccounts?: readonly string[];
 	runtimeApiKey?: string;
 	predecessorModel?: Model;
+	removeFailedCredentialDuringMark?: boolean;
 }): Promise<{ models: string[]; keys: string[]; markCount: number; activeIndex?: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
 	let session: AgentSession | undefined;
@@ -368,7 +369,25 @@ async function runManagedFallbackQuotaScenario(options: {
 			? [selector(options.predecessorModel), selector(model), selector(fallback)]
 			: [selector(model), selector(fallback)];
 		session.setConfiguredModelChain("default", entries, "test");
+		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
 		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
+		if (options.removeFailedCredentialDuringMark) {
+			let removedFailedCredential = false;
+			markUsageLimitReached.mockImplementation(async (markProvider, markSessionId, markOptions) => {
+				const pendingMark = markBeforeRemoval(markProvider, markSessionId, markOptions);
+				if (!removedFailedCredential && markOptions?.rowId !== undefined) {
+					const removalTarget = storage
+						.listCredentialRemovalTargets(markProvider)
+						.find(target => target.id === markOptions.rowId);
+					if (!removalTarget) throw new Error("Missing removal target for failed credential row");
+					const removal = storage.removeAuthCredentialsHard(markProvider, [removalTarget]);
+					if (removal.kind !== "removed") throw new Error("Could not remove failed credential row");
+					storage.removeRuntimePreferredCredentialSelector(markProvider);
+					removedFailedCredential = true;
+				}
+				return pendingMark;
+			});
+		}
 		await session.prompt("recover from a Codex quota error");
 		await session.waitForIdle();
 		return {
@@ -427,6 +446,20 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "fallback-test-key"],
 			markCount: 1,
 		});
+	});
+
+	test("does not treat a row that vanishes during marking as an exhausted pool", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b", "c"],
+			quotaKeys: ["TOKEN-a"],
+			removeFailedCredentialDuringMark: true,
+		});
+		expect(result.models).toEqual([selector(model), selector(model)]);
+		expect(result.keys[0]).toBe("TOKEN-a");
+		expect(["TOKEN-b", "TOKEN-c"]).toContain(result.keys[1]);
+		expect(result.markCount).toBe(1);
 	});
 
 	test("preserves the existing retry budget when the provider has no alternate credential", async () => {
