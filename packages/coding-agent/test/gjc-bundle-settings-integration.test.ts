@@ -13,7 +13,7 @@ import { SettingsSelectorComponent } from "../src/modes/components/settings-sele
 import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
 import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 import { createAgentSession } from "../src/sdk/session";
-import type { AgentSession } from "../src/session/agent-session";
+import { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 
 const sixSurfaceBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
@@ -237,6 +237,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 			let restoreConnectionStatus: (() => void) | undefined;
 			let restoreDisconnectServer: (() => void) | undefined;
 			let restorePluginErrorLog: (() => void) | undefined;
+			let restoreMcpToolReplacementSpy: (() => void) | undefined;
 			try {
 				const installed = await installGjcBundle({ cwd }, "project", sixSurfaceBundle);
 				expect(installed.ok).toBe(true);
@@ -279,6 +280,8 @@ describe("GJC Bundles settings integration through the production selector", () 
 				restoreDisconnectServer = () => disconnectServer.mockRestore();
 				const pluginErrorLog = vi.spyOn(logger, "error").mockImplementation(() => {});
 				restorePluginErrorLog = () => pluginErrorLog.mockRestore();
+				const replaceNamedCustomTools = vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools");
+				restoreMcpToolReplacementSpy = () => replaceNamedCustomTools.mockRestore();
 
 				const created = await createAgentSession({
 					cwd,
@@ -308,6 +311,14 @@ describe("GJC Bundles settings integration through the production selector", () 
 				const manager = created.mcpManager;
 				if (!manager) throw new Error("Expected the owned MCP manager to be retained");
 				expect(manager.getToolCatalogSnapshot().publication).toBe("unpublished");
+				const startupToolNames = new Set([failedTool.name, successfulTool.name]);
+				expect(
+					replaceNamedCustomTools.mock.calls.filter(
+						([previousNames, nextTools]) =>
+							previousNames.some(name => startupToolNames.has(name)) ||
+							nextTools.some(tool => startupToolNames.has(tool.name)),
+					),
+				).toHaveLength(0);
 				const runtimeSnapshot = created.gjcRuntimeSnapshot;
 				if (!runtimeSnapshot) throw new Error("Expected a GJC runtime snapshot provider");
 				const runtime = runtimeSnapshot.current();
@@ -326,6 +337,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 				restoreConnectionStatus?.();
 				restoreDisconnectServer?.();
 				restorePluginErrorLog?.();
+				restoreMcpToolReplacementSpy?.();
 				await fs.rm(cwd, { recursive: true, force: true });
 			}
 		},
