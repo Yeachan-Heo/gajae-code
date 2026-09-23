@@ -158,6 +158,63 @@ test("overflowing compact lock cleanup reason stores and reconstructs the full v
 	}
 });
 
+test("inline compact lock cleanup guidance classifies the exact startup lock after it disappears", async () => {
+	const tempDir = await makeAgentDir();
+	const agentDir = path.join(tempDir, "a".repeat(180));
+	try {
+		await fs.mkdir(agentDir, { recursive: true });
+		const startupLockPath = path.join(agentDir, "sdk", "broker.startup");
+		const lockPath = `${startupLockPath}.lock`;
+		const manualCleanupCommand =
+			process.platform === "win32"
+				? `Remove-Item -LiteralPath '${lockPath.replace(/'/g, "''")}' -Recurse -Force`
+				: `rm -rf -- '${lockPath.replace(/'/g, "'\\''")}'`;
+		const lockError = new FileLockAcquireError(
+			startupLockPath,
+			lockPath,
+			3,
+			"dead owner",
+			"acquire_timeout",
+			undefined,
+			{
+				outcome: "cleanup_failed",
+				message: "permission denied",
+				manualCleanupCommand,
+			},
+		);
+		expect(lockError.message.length).toBeGreaterThan(512);
+		await fs.mkdir(lockPath, { recursive: true });
+
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: lockError.message,
+			exitCode: 1,
+			signal: null,
+			pid: process.pid,
+		});
+		const marker = await readBrokerStartupFailureMarker(agentDir);
+		expect(marker).toBeDefined();
+		expect(marker?.reason.length).toBeLessThanOrEqual(512);
+		expect(marker?.reason.endsWith(manualCleanupCommand)).toBe(true);
+		expect(marker?.cleanupCommand).toBeUndefined();
+		await fs.rm(lockPath, { recursive: true });
+		await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+		// This is the same classification used before ensureBroker's filesystem
+		// fallback; it must survive the lock directory disappearing after the child exits.
+		expect(brokerStartupFailureCleanupTargetsLock(marker, lockPath)).toBe(true);
+		expect(brokerStartupFailureCleanupTargetsLock(marker, `${lockPath}.other`)).toBe(false);
+		expect(
+			brokerStartupFailureCleanupTargetsLock(
+				{ ...marker!, reason: `${marker!.reason}; echo unsafe-tail` },
+				lockPath,
+			),
+		).toBe(false);
+		expect(brokerStartupFailureCleanupTargetsLock(undefined, lockPath)).toBe(false);
+	} finally {
+		await fs.rm(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("read returns undefined when no marker exists", async () => {
 	const agentDir = await makeAgentDir();
 	try {

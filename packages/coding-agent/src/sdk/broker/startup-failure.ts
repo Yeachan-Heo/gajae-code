@@ -85,16 +85,20 @@ export function brokerStartupFailurePath(agentDir: string): string {
 	return path.join(agentDir, "sdk", BROKER_STARTUP_FAILURE_FILE);
 }
 
-/** Whether a validated overflow command targets the exact lock path. */
+/** Whether validated compact cleanup guidance targets the exact lock path. */
 export function brokerStartupFailureCleanupTargetsLock(
 	marker: BrokerStartupFailureMarker | undefined,
 	lockPath: string,
 ): boolean {
-	return (
-		marker?.reason === COMPACT_FILE_LOCK_CLEANUP_GUIDANCE &&
-		marker.cleanupCommand !== undefined &&
-		decodeFileLockCleanupCommand(marker.cleanupCommand) === lockPath
-	);
+	if (!marker) return false;
+	if (marker.cleanupCommand !== undefined) {
+		return (
+			marker.reason === COMPACT_FILE_LOCK_CLEANUP_GUIDANCE &&
+			decodeFileLockCleanupCommand(marker.cleanupCommand) === lockPath
+		);
+	}
+	if (!marker.reason.startsWith(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE)) return false;
+	return decodeFileLockCleanupCommand(marker.reason.slice(COMPACT_FILE_LOCK_CLEANUP_GUIDANCE.length)) === lockPath;
 }
 
 function boundedMarker(
