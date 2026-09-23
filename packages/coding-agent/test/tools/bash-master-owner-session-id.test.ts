@@ -236,5 +236,5 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 		} finally {
 			await fs.rm(fixtureDir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 });

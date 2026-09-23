@@ -652,7 +652,7 @@
     "crates/pi-natives/src/path_identity.rs": "c2355fd62b4a7b59186788a12720dd29a9eb5dea6be8ff595f5e50a35114d396",
     "crates/pi-natives/src/ps.rs": "d7b38b5155bbabeebbe9593075670194bdd936b8e164611869d33edab1a322b9",
     "crates/pi-shell/src/process.rs": "17c1bb72ce27c6b80e44ce8bb7d54f9e47df651f774cc072dda4735bf8320618",
-    "crates/pi-shell/src/shell.rs": "502819bf16cfe7ab92ff55adead41fe203ad2ddfac2e604609777694aa03e7a5",
+    "crates/pi-shell/src/shell.rs": "b1f6652a3fc05a8b4e64562627f930b1aff8a68d8cfc706f96e0e1281671c882",
     "crates/brush-core-vendored/src/commands.rs": "8458ea77edd13c8e6ff6bf5ab8d306ca9ee811d6d8a6038ef56ae64f902698c3",
     "packages/natives/native/index.d.ts": "94a43e36f3b70753e18c4eea868d36cb7042f6b0acfae77f314108e1d3cda83c",
     "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "67afa98673d077baf64fee9bf7c8d59937bdd9891a0a061f4d37d1420710db23"
