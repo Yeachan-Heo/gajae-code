@@ -1205,7 +1205,10 @@ export interface TrackedSendUserMessageOptions extends SendUserMessageOptions {
 	trackSubmission: true;
 }
 
-type SendUserMessageDispatchOptions = SendUserMessageOptions & { trackSubmission?: boolean };
+type SendUserMessageDispatchOptions = SendUserMessageOptions & {
+	trackSubmission?: boolean;
+	expectedSdkRunToken?: string;
+};
 
 type InternalPromptOptions = PromptOptions & { sdkRunToken?: string };
 type InternalCustomMessageOptions = Pick<
@@ -14595,6 +14598,7 @@ export class AgentSession {
 			onQueuedAfterAdmission?: (message: AgentMessage, cancelQueued: () => boolean) => void;
 			external?: boolean;
 			sdkRunToken?: string;
+			expectedSdkRunToken?: string;
 			forceOneAtATime?: boolean;
 			allowDuringSessionTransition?: boolean;
 			allowCancelAndSubmit?: boolean;
@@ -14611,11 +14615,18 @@ export class AgentSession {
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
 		// Enqueue-time admission: the Agent only accepts a steer into a live,
 		// non-aborted run. Anything else (idle, unwinding after agent_end, another
-		// prompt still in preflight, aborting) has no run to steer, so it is routed
-		// as a sequential follow-up owned by the next turn instead of being parked
-		// in a queue nobody owns.
+		// prompt still in preflight, aborting) has no run to steer. Ordinary steers
+		// become a sequential follow-up owned by the next turn; SDK turn-bound
+		// steers fail closed rather than being delivered to a successor run.
+		if (
+			options?.expectedSdkRunToken !== undefined &&
+			this.#activeSdkRunToken !== options.expectedSdkRunToken
+		)
+			throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
+			if (options?.expectedSdkRunToken !== undefined)
+				throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
 			const queuedFollowUp = await this.#queueFollowUpAfterReservation(message, displayText, {
 				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
@@ -15768,6 +15779,7 @@ export class AgentSession {
 					onPromoted: onQueuedPromoted,
 					external: true,
 					sdkRunToken: internalOptions?.sdkRunToken,
+					expectedSdkRunToken: internalOptions?.expectedSdkRunToken,
 					forceOneAtATime: options?.queuePolicy === "sequential",
 					onQueuedAfterAdmission: onTrackedQueued,
 					allowDuringSessionTransition: this.#hasCommittedSuccessorTrackedAdmission(options),

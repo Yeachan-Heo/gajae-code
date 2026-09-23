@@ -10420,14 +10420,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Feedback requires the selected active turn; no new turn was created.",
 										},
 									};
+								const runtimeCommandId = turn.delivery.runtime_command_id;
+								const runtimeTurnId = turn.delivery.runtime_turn_id;
+								if (
+									typeof runtimeCommandId !== "string" ||
+									runtimeCommandId.length === 0 ||
+									typeof runtimeTurnId !== "string" ||
+									runtimeTurnId.length === 0
+								)
+									return {
+										ok: false,
+										error: {
+											code: "turn_not_active",
+											message:
+												"Feedback requires the selected active turn's runtime identity; no new turn was created.",
+										},
+									};
 								const session = asRecord(await readJsonFile(sessionFile(sessionId)));
 								if (!session) throw new Error("resource_gone");
 								await assertPersistedSessionAuthority(transaction.canonical.session);
 								const clientRef = `coordinator-feedback:${createHash("sha256")
 									.update(JSON.stringify([sessionId, turnId, idempotencyKey]))
 									.digest("hex")}`;
+								const expectedSdkRunToken = `${runtimeCommandId}:${runtimeTurnId}`;
 								const response = asRecord(
-									await controlSession(session, "turn.steer", { text: prompt, clientRef }, idempotencyKey),
+									await controlSession(
+										session,
+										"turn.steer",
+										{ text: prompt, clientRef, expectedSdkRunToken },
+										idempotencyKey,
+									),
 								);
 								const result = asRecord(response?.result);
 								return {
@@ -10442,10 +10464,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								};
 							}),
 						true,
-						response =>
-							["ambiguous", "uncertain_after_send", "connection_closed", "timeout"].includes(
-								String(asRecord(response.error)?.code),
-							),
+						response => {
+							const result = asRecord(response.result);
+							const resultError = asRecord(result?.error);
+							return (
+								["ambiguous", "uncertain_after_send", "connection_closed", "timeout"].includes(
+									String(asRecord(response.error)?.code),
+								) ||
+								result?.status === "uncertain" ||
+								resultError?.code === "delivery_uncertain"
+							);
+						},
 					);
 				}
 				return await withToolIdempotency(

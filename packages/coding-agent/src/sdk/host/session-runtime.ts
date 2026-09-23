@@ -2517,6 +2517,7 @@ function createControlSurface(
 	};
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
+		expectedSdkRunToken?: string;
 	};
 	type InternalSdkApi = Omit<ExtensionAPI, "sendUserMessage"> & {
 		sendUserMessage: (
@@ -3846,23 +3847,30 @@ function createControlSurface(
 				),
 			);
 		},
-		steer: async (text, clientRef) => {
+		steer: async (text, clientRef, expectedSdkRunToken) => {
 			const invalid = validateRequiredPromptText("turn.steer", { text });
 			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
 			const retainedClientRef = normalizeClientRef(clientRef);
+			const sendSteer = () =>
+				sendSdkUserMessage(text, {
+					deliverAs: "steer",
+					...(expectedSdkRunToken === undefined ? {} : { expectedSdkRunToken }),
+				});
 			if (retainedClientRef === undefined) {
 				const correlation = newCorrelation();
-				await sendSdkUserMessage(text, { deliverAs: "steer" });
+				await sendSteer();
 				return { accepted: true, ...correlation };
 			}
 			const durable = steerReconciliation;
 			const reservation = await durable.reserveSteer(retainedClientRef, text);
 			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
 			try {
-				await sendSdkUserMessage(text, { deliverAs: "steer" });
+				await sendSteer();
 				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
 			} catch (error) {
-				return { accepted: false, ...(await durable.settleSteer(retainedClientRef, "rejected", error)) };
+				const settled = await durable.settleSteer(retainedClientRef, "rejected", error);
+				if (expectedSdkRunToken !== undefined) throw error;
+				return { accepted: false, ...settled };
 			}
 		},
 		followUp: async text => {
