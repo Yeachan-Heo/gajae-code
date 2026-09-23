@@ -53,7 +53,7 @@ async function collectIsolated(
 		await Bun.write(
 			script,
 			`import { beginTaskDecision, exportTaskDecisionEvents } from ${JSON.stringify(collectorModule)};
-const options = { rootDir: ${JSON.stringify(path.join(root, "store"))}, decisionEnabled: ${enabled} };
+		const options = { rootDir: ${JSON.stringify(path.join(root, "store"))}, decisionEnabled: ${enabled}, mode: ${JSON.stringify(projectCollection ?? "off")} };
 const recorder = await beginTaskDecision({ role: "executor", taskId: "synthetic", sessionIdHash: "session",
  runMode: "initial", repoCwdHash: "repo", assignmentHash: "assignment", assignment: "synthetic private text" }, options);
 await recorder?.finish({status:"completed"});
@@ -86,8 +86,8 @@ process.stdout.write(JSON.stringify({ mode: events[0]?.mode ?? null, hasContent:
 }
 
 describe("decision collection consent precedence", () => {
-	it("automatically collects only metadata for an enabled feature with trusted env unset", async () => {
-		expect(await collectIsolated(true, {})).toEqual({ mode: "metadata", hasContent: false, count: 2 });
+	it("does not collect when only the decision feature is enabled", async () => {
+		expect(await collectIsolated(true, {})).toEqual({ mode: null, hasContent: false, count: 0 });
 	});
 
 	it("preserves ordinary opt-in collection when the decision feature is off", async () => {
@@ -117,10 +117,6 @@ describe("decision collection consent precedence", () => {
 			hasContent: true,
 			count: 2,
 		});
-		expect(await collectIsolated(true, {}, "content")).toEqual({
-			mode: "metadata",
-			hasContent: false,
-			count: 2,
-		});
+		expect(await collectIsolated(true, {}, "content")).toEqual({ mode: "content", hasContent: true, count: 2 });
 	});
 });
