@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -38,21 +38,35 @@ async function pathExists(target: string): Promise<boolean> {
 }
 
 const nativeKill = process.kill.bind(process);
+type SignalCall = [number, string | number | undefined];
 
 /**
  * Record every signal attempt and deliver none. These tests assert that the stop
  * path signals nothing, so a regression must be caught rather than delivered to
  * whatever process currently holds a fixture pid. Liveness probes still pass
  * through so the lock owner check keeps working.
+ *
+ * The binding is replaced directly because `spyOn(process, "kill")` does not
+ * intercept it under Bun — a spy here would silently assert nothing.
  */
-function spyOnSignals() {
-	return spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) =>
-		signal === 0 ? nativeKill(pid, signal) : true) as unknown as typeof process.kill);
+function captureSignals(): { calls: SignalCall[]; restore: () => void } {
+	const calls: SignalCall[] = [];
+	const original = process.kill;
+	process.kill = ((pid: number, signal?: string | number) => {
+		calls.push([pid, signal]);
+		return signal === 0 ? nativeKill(pid, signal) : true;
+	}) as typeof process.kill;
+	return {
+		calls,
+		restore: () => {
+			process.kill = original;
+		},
+	};
 }
 
 /** Signals other than the liveness probe used by the lock owner check. */
-function realSignals(spy: ReturnType<typeof spyOnSignals>): unknown[][] {
-	return spy.mock.calls.filter(call => call[1] !== 0);
+function realSignals(capture: { calls: SignalCall[] }): SignalCall[] {
+	return capture.calls.filter(([, signal]) => signal !== 0);
 }
 
 async function fixture() {
@@ -176,12 +190,12 @@ describe("Kev lifecycle", () => {
 		expect((await fs.stat(path.join(f.root, "supervisor.py"))).mode & 0o777).toBe(0o600);
 		await runKevSetup("start", {}, f.deps);
 		expect(f.spawned).toHaveLength(1);
-		const kills = spyOnSignals();
+		const kills = captureSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 			await runKevSetup("stop", {}, f.deps);
 		} finally {
-			kills.mockRestore();
+			kills.restore();
 		}
 		expect(realSignals(kills)).toEqual([]);
 		expect(stopRequests(f.control)).toEqual([
@@ -194,7 +208,17 @@ describe("Kev lifecycle", () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
-		const supervisorPid = f.supervisor.pid!;
+		// The recorded pid is a real, unrelated process this test owns. Any signal the
+		// stop path sends to it is therefore observable as that process dying, with no
+		// reliance on intercepting a call.
+		const bystander = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+		spawnedPids.push(bystander.pid);
+		const supervisorPid = bystander.pid;
+		const file = path.join(f.root, "server.json");
+		const owned = { ...((await Bun.file(file).json()) as Record<string, unknown>), pid: supervisorPid };
+		await privateJson(file, owned);
+		f.supervisor.pid = supervisorPid;
+		f.processes.set(supervisorPid, f.processes.get(42)!);
 		const reused: KevProcessIdentity = {
 			command: "/usr/bin/unrelated-user-work --important",
 			incarnation: "Sat Oct 3 09:00:00 2026",
@@ -217,13 +241,14 @@ describe("Kev lifecycle", () => {
 			if ((JSON.parse(message.trim()) as { op?: string }).op === "stop") reusedNow = true;
 			return answer(socketPath, message);
 		};
-		const kills = spyOnSignals();
-		try {
-			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
-		} finally {
-			kills.mockRestore();
-		}
-		expect(realSignals(kills)).toEqual([]);
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
+		// The process now holding the recorded pid is untouched.
+		expect(
+			await Promise.race([
+				bystander.exited.then(() => "signaled" as const),
+				Bun.sleep(400).then(() => "alive" as const),
+			]),
+		).toBe("alive");
 		// The stop carried only an operation and the recorded token — no pid field
 		// exists on this path for a reused pid to leak into.
 		expect(stopRequests(f.control)).toEqual([
@@ -241,11 +266,11 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.supervisor.acceptsToken = false;
-		const kills = spyOnSignals();
+		const kills = captureSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopping" });
 		} finally {
-			kills.mockRestore();
+			kills.restore();
 		}
 		expect(realSignals(kills)).toEqual([]);
 		expect(f.supervisor.running).toBe(true);
@@ -342,11 +367,11 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.deps.control = async () => undefined;
-		const kills = spyOnSignals();
+		const kills = captureSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopping" });
 		} finally {
-			kills.mockRestore();
+			kills.restore();
 		}
 		expect(realSignals(kills)).toEqual([]);
 		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(true);
@@ -357,11 +382,11 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.processes.delete(f.supervisor.pid!);
-		const kills = spyOnSignals();
+		const kills = captureSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 		} finally {
-			kills.mockRestore();
+			kills.restore();
 		}
 		expect(realSignals(kills)).toEqual([]);
 		expect(stopRequests(f.control)).toEqual([]);
