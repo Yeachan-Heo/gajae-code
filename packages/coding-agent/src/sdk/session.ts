@@ -3182,7 +3182,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (!isMCPStartupTimeoutError(err)) {
 					logger.warn("GJC plugin MCP connect failed", {
 						path: `mcp:${server}`,
-						error: safeErrorForLog(err),
+						// MCPLoadResult stores failures as strings, so their original
+						// type is unavailable here; use the manager classifier's safe fallback.
+						error: "transport-error",
 					});
 				}
 			}

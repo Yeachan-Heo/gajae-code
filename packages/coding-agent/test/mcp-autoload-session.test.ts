@@ -421,6 +421,44 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("keeps remote MCP error details out of conventional startup logs", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					upstream: { type: "stdio", command: process.execPath },
+				},
+			}),
+		);
+		const remoteSecret = "remote-secret-502-response";
+		const remoteError = `HTTP 502: upstream response contains ${remoteSecret}`;
+		const startupResult: MCPLoadResult = {
+			tools: [],
+			errors: new Map([["upstream", remoteError]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		};
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue(startupResult);
+		vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			const startupWarning = warnSpy.mock.calls.find(([message]) =>
+				String(message).includes("GJC plugin MCP connect failed"),
+			);
+			if (!startupWarning) throw new Error("conventional MCP startup warning was not logged");
+			expect(startupWarning[1]).toMatchObject({ path: "mcp:upstream", error: "transport-error" });
+			expect(JSON.stringify(startupWarning)).not.toContain(remoteSecret);
+			// The session logger does not rewrite the manager result's details.
+			expect(startupResult.errors.get("upstream")).toBe(remoteError);
+		} finally {
+			await session.dispose();
+			warnSpy.mockRestore();
+		}
+	}, 30_000);
+
 	it("opts out with enableMcpAutoload: false (CLI --no-mcp) without loading conventional registrations", async () => {
 		await runMCPCommand({
 			action: "add",
