@@ -703,6 +703,16 @@ def observe(signum):
         if returncode != 0:
             raise ValueError("terminal observer adapter failed")
         verdict = json.loads(stdout)
+        if not isinstance(verdict, dict):
+            raise ValueError("terminal observer returned a non-object verdict")
+        required_verdict_fields = {
+            "schema_version", "generation", "session_id", "server_key", "observed_at",
+            "signal", "exit_code", "result", "observer", "classification", "reason", "dedupe_key",
+        }
+        if verdict.get("classification") == "expected_operator_shutdown":
+            required_verdict_fields.add("intent_id")
+        if set(verdict) != required_verdict_fields:
+            raise ValueError("terminal observer returned an invalid verdict shape")
         state_dir = os.environ["GJC_SESSION_STATE_DIR"]
         session = os.environ["GJC_SESSION_NAME"]
         generation = os.environ["GJC_SESSION_OWNER_GENERATION"]
@@ -711,8 +721,13 @@ def observe(signum):
         canonical_path = os.path.join(lifecycle_dir, f"verdict-{generation}.json")
         with open(canonical_path, encoding="utf-8") as handle:
             canonical = json.load(handle)
+        if not isinstance(canonical, dict):
+            raise ValueError("invalid canonical verdict")
         with open(generation_path, encoding="utf-8") as handle:
-            current_generation = json.load(handle).get("generation")
+            current = json.load(handle)
+        if not isinstance(current, dict):
+            raise ValueError("invalid current generation")
+        current_generation = current.get("generation")
         if not (
             current_generation == generation
             and verdict == canonical
@@ -766,9 +781,15 @@ def observe(signum):
 def forward(signum, _frame):
     if child is None:
         if generation_published:
-            observe(signum)
+            try:
+                observe(signum)
+            except Exception:
+                pass
         raise SystemExit(128 + signum)
-    observe(signum)
+    try:
+        observe(signum)
+    except Exception:
+        pass
     try:
         child.send_signal(signum)
     except ProcessLookupError:
@@ -1231,9 +1252,10 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != 1 ]]; then
   "$TMUX_BIN" -L "$SOCKET_KEY" new-session -d -s "$MONITOR_SESSION" -c "$WORKDIR" -n owner-monitor "sleep 30" || { echo "owner monitor creation failed" >&2; exit 1; }
   ROLLBACK_MONITOR_CREATED=1
   record_rollback_identity monitor_session "$MONITOR_SESSION" ROLLBACK_MONITOR_NATIVE_ID ROLLBACK_MONITOR_SERVER_PID ROLLBACK_MONITOR_SERVER_START_TIME ROLLBACK_MONITOR_SESSION_NAME || { echo "owner monitor rollback identity receipt failed" >&2; exit 1; }
-  MONITOR_TAG_CONDITION="#{&&:#{==:#{pid},${ROLLBACK_MONITOR_SERVER_PID}},#{&&:#{==:#{session_id},${ROLLBACK_MONITOR_NATIVE_ID}},#{==:#{session_name},${ROLLBACK_MONITOR_SESSION_NAME}}}}"
   MONITOR_PANE_ID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$ROLLBACK_MONITOR_NATIVE_ID:" -F '#{pane_id}')" || { echo "monitor pane identity unavailable" >&2; exit 1; }
   [[ -n "$MONITOR_PANE_ID" ]] || { echo "monitor pane identity unavailable" >&2; exit 1; }
+  MONITOR_TAG_CONDITION="#{&&:#{==:#{pid},${ROLLBACK_MONITOR_SERVER_PID}},#{&&:#{==:#{session_id},${ROLLBACK_MONITOR_NATIVE_ID}},#{==:#{session_name},${ROLLBACK_MONITOR_SESSION_NAME}}}}"
+  MONITOR_RESPAWN_CONDITION="#{&&:#{==:#{pid},${ROLLBACK_MONITOR_SERVER_PID}},#{&&:#{==:#{session_id},${ROLLBACK_MONITOR_NATIVE_ID}},#{&&:#{==:#{session_name},${ROLLBACK_MONITOR_SESSION_NAME}},#{==:#{pane_id},${MONITOR_PANE_ID}}}}}}"
   MONITOR_IDENTITY_FILE="$LIFECYCLE_DIR/monitor-identity-$OWNER_GENERATION.json"
   rm -f "$MONITOR_IDENTITY_FILE"
   MONITOR_LAUNCH=(env "GJC_TMUX_COMMAND=$TMUX_BIN" "GJC_SESSION_MONITOR_IDENTITY_FILE=$MONITOR_IDENTITY_FILE" "GJC_SESSION_OWNER_PID=$OWNER_PID" "GJC_SESSION_OWNER_START_TIME=$OWNER_START_TIME" "GJC_TMUX_COMMAND=$TMUX_BIN" "GJC_SESSION_OWNER_PID=$OWNER_PID" "GJC_SESSION_OWNER_START_TIME=$OWNER_START_TIME" "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_OWNER_NATIVE_SESSION_ID=$ROLLBACK_OWNER_NATIVE_ID" "GJC_SESSION_OWNER_PANE_ID=$OWNER_PANE_ID" "GJC_SESSION_OWNER_SERVER_PID=$ROLLBACK_OWNER_SERVER_PID" "GJC_SESSION_OWNER_SERVER_START_TIME=$ROLLBACK_OWNER_SERVER_START_TIME" "GJC_SESSION_MONITOR_NATIVE_SESSION_ID=$ROLLBACK_MONITOR_NATIVE_ID" "GJC_SESSION_MONITOR_PANE_ID=$MONITOR_PANE_ID" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_SOCKET_KEY=$SOCKET_KEY" "GJC_SESSION_TMUX_BIN=$TMUX_BIN" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_SESSION_VERDICT_JSON=$STATE_DIR/verdict.json" "GJC_SESSION_VERDICT_CANONICAL_JSON=$LIFECYCLE_DIR/verdict-$OWNER_GENERATION.json" "GJC_SESSION_VANISHED_JSON=$STATE_DIR/vanished.json" "GJC_SESSION_VANISHED_CANONICAL_JSON=$LIFECYCLE_DIR/vanished-$OWNER_GENERATION.json" "GJC_SESSION_INCIDENT_JSON=$STATE_DIR/incident.json" "GJC_SESSION_INCIDENT_CANONICAL_JSON=$LIFECYCLE_DIR/incident-$OWNER_GENERATION.json" "GJC_SESSION_MONITOR_INTERVAL=${GJC_SESSION_MONITOR_INTERVAL:-5}" bash "$STATE_DIR/monitor.sh")  MONITOR_TAG_CONDITION="#{&&:#{==:#{pid},${ROLLBACK_MONITOR_SERVER_PID}},#{&&:#{==:#{session_id},${ROLLBACK_MONITOR_NATIVE_ID}},#{==:#{session_name},${ROLLBACK_MONITOR_SESSION_NAME}}}}"
@@ -1248,7 +1270,10 @@ if [[ "${GJC_SESSION_MONITOR_DISABLE:-0}" != 1 ]]; then
     tag_response="$("$TMUX_BIN" -L "$SOCKET_KEY" if-shell -t "$ROLLBACK_MONITOR_NATIVE_ID" -F "$MONITOR_TAG_CONDITION" "$tag_command" "display-message -p __gjc_monitor_tag_refused__" 2>/dev/null)" || { echo "failed to tag isolated tmux monitor session: $option" >&2; exit 1; }
     [[ -z "$tag_response" ]] || { echo "refusing to tag replacement tmux monitor session: $option" >&2; exit 1; }
   done
-  "$TMUX_BIN" -L "$SOCKET_KEY" respawn-pane -k -t "$MONITOR_PANE_ID" "$(shell_join "${MONITOR_LAUNCH[@]}")" || { echo "owner monitor launch failed" >&2; exit 1; }
+  monitor_launch_command="$(shell_join "${MONITOR_LAUNCH[@]}")"
+  monitor_respawn_command="$(shell_join respawn-pane -k -t "$MONITOR_PANE_ID" "$monitor_launch_command")"
+  respawn_response="$("$TMUX_BIN" -L "$SOCKET_KEY" if-shell -t "$MONITOR_PANE_ID" -F "$MONITOR_RESPAWN_CONDITION" "$monitor_respawn_command" "display-message -p __gjc_monitor_respawn_refused__")" || { echo "owner monitor launch failed" >&2; exit 1; }
+  [[ -z "$respawn_response" ]] || { echo "refusing to launch monitor in replacement tmux pane" >&2; exit 1; }
   MONITOR_PID="$("$TMUX_BIN" -L "$SOCKET_KEY" display-message -p -t "$MONITOR_PANE_ID" -F '#{pane_pid}')" || { echo "monitor process identity unavailable" >&2; exit 1; }
   python3 - "$MONITOR_IDENTITY_FILE" "$MONITOR_PID" <<'PY' || { echo "monitor process identity unavailable" >&2; exit 1; }
 import json, os, sys

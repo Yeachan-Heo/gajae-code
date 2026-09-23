@@ -850,6 +850,63 @@ gjc_session_write_vanished_json() { : >"$1"; }
 		expect(await Bun.file(clockCount).text()).toBe("5");
 	});
 
+	test("does not respawn the monitor after the tmux server changes following identity tagging", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-monitor-respawn-race-")); roots.push(root);
+		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);
+		const name = `monitor-respawn-race-${Date.now()}`; const socket = `gjc-${name}`; const monitorSession = `${name}-owner-monitor`; const replacementSession = `replacement-${Date.now()}`; sessions.push({ name, socket });
+		const receipt = path.join(root, "replacement-identities"); const trace = path.join(root, "replacement-trace"); const tmux = path.join(root, "tmux-race-wrapper");
+		await executable(tmux, `#!/usr/bin/env bash
+printf 'call=%s\n' "$*" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+if [[ "$*" == *"@gjc-owner-server-key"* ]] && tmux -L "$GJC_FIXTURE_SOCKET" has-session -t "=$GJC_FIXTURE_MONITOR_SESSION" >/dev/null 2>&1; then
+  printf 'matched-tag\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  tmux "$@" >"$GJC_FIXTURE_REPLACEMENT_TRACE.out" 2>"$GJC_FIXTURE_REPLACEMENT_TRACE.err"
+  tag_status=$?
+  printf 'tag-status=%s\n' "$tag_status" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  cat "$GJC_FIXTURE_REPLACEMENT_TRACE.err" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  cat "$GJC_FIXTURE_REPLACEMENT_TRACE.out"
+  [[ "$tag_status" -eq 0 ]] || exit "$tag_status"
+  before="$(tmux -L "$GJC_FIXTURE_SOCKET" display-message -p -t "=$GJC_FIXTURE_MONITOR_SESSION:" -F '#{pid}|#{session_id}|#{session_name}|#{pane_id}|#{pane_pid}')" || { printf 'before-identity-failed\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"; exit 90; }
+  printf 'before=%s\n' "$before" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  IFS='|' read -r old_server old_session old_name pane_id old_pane_pid <<<"$before"
+  pane_index="$(printf '%s\n' "$pane_id" | cut -d '%' -f 2)"
+  [[ "$pane_index" =~ ^[0-9]+$ ]] || exit 91
+  tmux -L "$GJC_FIXTURE_SOCKET" kill-server || { printf 'kill-server-failed\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"; exit 92; }
+  printf 'server-killed\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  for ((attempt=0; attempt<100; attempt++)); do
+    if ! kill -0 "$old_server" 2>/dev/null; then break; fi
+    sleep 0.01
+  done
+  if kill -0 "$old_server" 2>/dev/null; then printf 'old-server-did-not-exit\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"; exit 92; fi
+  for ((index=0; index<=pane_index; index++)); do
+    if [[ "$index" -eq "$pane_index" ]]; then replacement="$GJC_FIXTURE_REPLACEMENT_SESSION"; else replacement="$GJC_FIXTURE_REPLACEMENT_SESSION-filler-$index"; fi
+    tmux -L "$GJC_FIXTURE_SOCKET" new-session -d -s "$replacement" "sleep 30" >>"$GJC_FIXTURE_REPLACEMENT_TRACE" 2>&1 || { printf 'replacement-session-failed:%s\n' "$replacement" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"; exit 93; }
+  done
+  after="$(tmux -L "$GJC_FIXTURE_SOCKET" display-message -p -t "=$GJC_FIXTURE_REPLACEMENT_SESSION:" -F '#{pid}|#{session_id}|#{session_name}|#{pane_id}|#{pane_pid}')" || { printf 'after-identity-failed\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"; exit 94; }
+  printf 'after=%s\n' "$after" >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  printf '%s\n%s\n' "$before" "$after" >"$GJC_FIXTURE_REPLACEMENT_RECEIPT"
+  printf 'receipt-created\n' >>"$GJC_FIXTURE_REPLACEMENT_TRACE"
+  exit 0
+fi
+exec tmux "$@"
+`);
+		const created = Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state, GJC_SESSION_TMUX_BIN: tmux, GJC_SESSION_MONITOR_DISABLE: "0", GJC_SESSION_MONITOR_INTERVAL: "1", GJC_FIXTURE_SOCKET: socket, GJC_FIXTURE_MONITOR_SESSION: monitorSession, GJC_FIXTURE_REPLACEMENT_SESSION: replacementSession, GJC_FIXTURE_REPLACEMENT_RECEIPT: receipt, GJC_FIXTURE_REPLACEMENT_TRACE: trace }), stdout: "pipe", stderr: "pipe" });
+		expect(created.exitCode, created.stderr.toString()).not.toBe(0);
+		expect(await Bun.file(receipt).exists(), `${created.stderr.toString()}\n${await Bun.file(trace).text()}`).toBe(true);
+		expect(created.stderr.toString()).toContain("refusing to launch monitor in replacement tmux pane");
+		const rows = (await Bun.file(receipt).text()).trim().split("\n");
+		expect(rows).toHaveLength(2);
+		const original = rows[0]!.split("|"); const replacement = rows[1]!.split("|");
+		expect(original[0]).not.toBe(replacement[0]);
+		expect(original[2]).toBe(monitorSession);
+		expect(replacement[2]).toBe(replacementSession);
+		expect(replacement[3]).toBe(original[3]);
+		const current = Bun.spawnSync(["tmux", "-L", socket, "display-message", "-p", "-t", `=${replacementSession}:`, "-F", "#{pid}|#{session_id}|#{session_name}|#{pane_id}|#{pane_pid}"], { stdout: "pipe", stderr: "pipe" });
+		expect(current.exitCode).toBe(0);
+		expect(current.stdout.toString().trim()).toBe(rows[1]);
+		const generation = ((await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).json()) as { generation: string }).generation;
+		expect(await Bun.file(path.join(state, name, "owner-lifecycle", `monitor-identity-${generation}.json`)).exists()).toBe(false);
+	});
+
 	test("monitor writes immutable verdict and incident markers after owner loss without claiming recovery", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-monitor-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);
@@ -1108,6 +1165,49 @@ signal.pause()
 	expect(Bun.spawnSync(["kill", "-TERM", String(supervisor.pid)]).exitCode).toBe(0);
 	expect(await supervisor.exited).toBe(0);
 	expect(await Bun.file(path.join(state, "supervisor-failure.json")).json()).toMatchObject({ kind: "supervisor_failure", session_id: name, owner_generation: generation });
+});
+
+test("forwards SIGTERM when a successful terminal observer returns non-object JSON", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-supervisor-malformed-observer-")); roots.push(root);
+	const dir = await worktree(root); const state = path.join(root, "state"); const setupBin = await fixture(root); const name = `malformed-observer-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+	expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: setupBin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
+	const generation = ((await Bun.file(path.join(state, name, "owner-lifecycle", "generation.json")).json()) as { generation: string }).generation;
+	const adapter = path.join(root, "malformed-observer.py"), ready = path.join(root, "ready"), rawPid = path.join(root, "raw-child.pid"), signalReceived = path.join(root, "signal-received");
+	await executable(adapter, `#!/usr/bin/env python3
+import json, os, signal, sys
+if "--internal-tmux-owner-isolation" in sys.argv:
+    request = json.load(sys.stdin)
+    if request.get("op") == "observe_terminal":
+        print("null")
+        raise SystemExit(0)
+    raise SystemExit(23)
+with open(os.environ["GJC_FIXTURE_RAW_PID"], "w", encoding="utf-8") as handle: handle.write(str(os.getpid()))
+open(os.environ["GJC_FIXTURE_RAW_READY"], "w", encoding="utf-8").close()
+def receive(_signum, _frame):
+    open(os.environ["GJC_FIXTURE_SIGNAL_RECEIVED"], "w", encoding="utf-8").close()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, receive)
+signal.pause()
+`);
+	const supervisor = Bun.spawn(["python3", path.join(state, "supervisor.py")], { env: { ...process.env, GJC_SESSION_NAME: name, GJC_SESSION_WORKDIR: dir, GJC_SESSION_STATE_DIR: state, GJC_SESSION_OWNER_GENERATION: generation, GJC_TMUX_OWNER_PROTOCOL_TOKEN: "a".repeat(64), GJC_TMUX_OWNER_SERVER_KEY: `gjc-${name}`, GJC_SESSION_GJC_BIN: adapter, GJC_SESSION_POSTMORTEM_SH: postmortemScript, GJC_SESSION_RUNNER_SH: "/bin/true", GJC_FIXTURE_RAW_READY: ready, GJC_FIXTURE_RAW_PID: rawPid, GJC_FIXTURE_SIGNAL_RECEIVED: signalReceived }, stdout: "pipe", stderr: "pipe" });
+	let supervisorExited = false;
+	try {
+		await waitFor(ready);
+		expect(Bun.spawnSync(["kill", "-TERM", String(supervisor.pid)]).exitCode).toBe(0);
+		await waitFor(signalReceived);
+		expect(await supervisor.exited).toBe(0);
+		supervisorExited = true;
+		expect(await Bun.file(path.join(state, "supervisor-failure.json")).json()).toMatchObject({ kind: "supervisor_failure", session_id: name, owner_generation: generation });
+	} finally {
+		if (!supervisorExited) {
+			Bun.spawnSync(["kill", "-KILL", String(supervisor.pid)], { stdout: "pipe", stderr: "pipe" });
+			await supervisor.exited;
+		}
+		if (!(await Bun.file(signalReceived).exists()) && await Bun.file(rawPid).exists()) {
+			const childPid = (await Bun.file(rawPid).text()).trim();
+			if (childPid) Bun.spawnSync(["kill", "-KILL", childPid], { stdout: "pipe", stderr: "pipe" });
+		}
+	}
 });
 
 test("records finalizer failure without replacing the owner exit status", async () => {
