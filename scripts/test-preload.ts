@@ -1,9 +1,10 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
-import { installRuntimeDeletionGuard, safeRmSync } from "./safe-cleanup";
+import { installRuntimeDeletionGuard, registerOwnedDeletionRoot, safeRmSync } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,17 +42,44 @@ try {
 
 const testTempRoot = path.resolve(os.tmpdir());
 const isolatedTempDirs: Array<{ dir: string; prefix: string }> = [];
+
+function createIsolatedTempDir(prefix: string): string {
+	const dir = path.join(testTempRoot, `${prefix}${crypto.randomUUID()}`);
+	const forgetOwnedRoot = registerOwnedDeletionRoot(dir);
+	try {
+		fs.mkdirSync(dir, { mode: 0o700 });
+	} catch (error) {
+		forgetOwnedRoot();
+		throw error;
+	}
+	// Retain the exact-path grant for this process so safeRmSync can remove
+	// os.tmpdir() descendants even when the OS temp root is beneath HOME, and
+	// later lifecycle callbacks remain authorized after an earlier removal.
+	isolatedTempDirs.push({ dir, prefix });
+	return dir;
+}
+
 export function cleanupIsolatedTempDirs(): void {
 	let cleanupError: unknown;
-	for (const { dir, prefix } of isolatedTempDirs) {
+	for (const isolatedTempDir of isolatedTempDirs) {
+		const { dir, prefix } = isolatedTempDir;
 		const resolvedDir = path.resolve(dir);
 		if (path.dirname(resolvedDir) !== testTempRoot || !path.basename(resolvedDir).startsWith(prefix)) {
 			cleanupError ??= new Error(`Refusing to remove test temp directory outside os.tmpdir(): ${dir}`);
 			continue;
 		}
 		try {
+			fs.lstatSync(resolvedDir);
+		} catch (error) {
+			if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+				continue;
+			}
+			cleanupError ??= error;
+			continue;
+		}
+		try {
 			// safeRmSync confines recursive deletion to the safe-cleanup world;
-			// force makes an already-removed directory an idempotent no-op.
+			// the registered exact-path root also covers os.tmpdir() under HOME.
 			safeRmSync(resolvedDir, { recursive: true, force: true });
 		} catch (error) {
 			cleanupError ??= error;
@@ -143,8 +171,7 @@ const isolation = decideAgentDirIsolation({
 });
 if (isolation.action === "isolate") {
 	try {
-		const agentDir = fs.mkdtempSync(path.join(testTempRoot, "gjc-test-agent-"));
-		isolatedTempDirs.push({ dir: agentDir, prefix: "gjc-test-agent-" });
+		const agentDir = createIsolatedTempDir("gjc-test-agent-");
 		process.env.GJC_CODING_AGENT_DIR = agentDir;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 	} catch (error) {
@@ -207,8 +234,7 @@ if (logIsolation.action === "fail") {
 }
 if (logIsolation.action === "isolate") {
 	try {
-		const logDir = fs.mkdtempSync(path.join(testTempRoot, "gjc-test-logs-"));
-		isolatedTempDirs.push({ dir: logDir, prefix: "gjc-test-logs-" });
+		const logDir = createIsolatedTempDir("gjc-test-logs-");
 		process.env.GJC_LOG_DIR = logDir;
 	} catch (error) {
 		throw new Error(

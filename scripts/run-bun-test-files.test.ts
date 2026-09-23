@@ -123,7 +123,7 @@ describe("fresh-process test harness contracts", () => {
 			"test",
 			"--timeout=30000",
 			"--preload",
-			"./scripts/test-preload.ts",
+			"./scripts/test-preload-after-all.ts",
 			"./packages/coding-agent/test/path with spaces.test.ts",
 		]);
 		expect(spec.cwd).toBe("/repo root");
@@ -175,7 +175,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-contamination-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		await Bun.write(
 			path.join(root, "tests", "01-leak.test.ts"),
@@ -234,7 +234,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-parallel-timing-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		await Bun.write(
 			path.join(root, "tests", "first.test.ts"),
@@ -265,7 +265,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-timeout-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
@@ -298,7 +298,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-clean-exit-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
@@ -329,7 +329,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-signal-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
