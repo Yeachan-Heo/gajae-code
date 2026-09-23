@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Track the current Claude Code release in the spoofed version constant (`2.1.278` → `2.1.280`). Anthropic gates newer models behind a minimum client version, so a stale `claude-cli/<version>` fingerprint is rejected with an HTTP 400 on a model the account can otherwise reach — which is what blocked Claude Opus 5.5.
+
 ## [0.17.3] - 2026-09-22
 
 ### Added
