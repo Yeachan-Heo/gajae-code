@@ -8,7 +8,7 @@ Investigate how the TypeScript edit benchmark constructs an in-process GJC agent
 Dependency contract:
 1. Search the repository without a `paths` filter for `createAgentSession`.
 2. Read the relevant source path returned by that search.
-3. Search for a distinctive session option or API identifier copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `modelPattern` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the discovered source path, a concrete session option, and the tool-selection behavior.
 Required answer terms: `in-process-client.ts`, `modelPattern`, `authStorage`, `toolNames`
@@ -19,7 +19,7 @@ Investigate the OpenAI Codex Responses provider's freeform custom-tool capabilit
 Dependency contract:
 1. Search the repository without a `paths` filter for `supportsFreeformApplyPatchCodex`.
 2. Read the provider source path returned by that search.
-3. Search for a distinctive capability or grammar field copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `applyPatchToolType` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the provider source path, the capability name, and the grammar serialization field.
 Required answer terms: `openai-codex-responses.ts`, `applyPatchToolType`, `customFormat`, `syntax`
@@ -30,7 +30,7 @@ Investigate the built-in read tool's input schema and truncation behavior. Start
 Dependency contract:
 1. Search the repository without a `paths` filter for `const readSchema`.
 2. Read a source path returned by that search.
-3. Search for a distinctive schema field or truncation identifier copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `truncation` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the source path, the path argument, and the truncation detail.
 Required answer terms: `read.ts`, `readSchema`, `path`, `truncation`
@@ -41,7 +41,7 @@ Investigate the built-in search tool's result metadata. Start with a repository-
 Dependency contract:
 1. Search the repository without a `paths` filter for `interface SearchToolDetails`.
 2. Read a source path returned by that search.
-3. Search for a distinctive result-property identifier copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `fileMatches` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the source path, a file-list property, and a match-related property.
 Required answer terms: `search.ts`, `files`, `fileMatches`, `matchCount`
@@ -52,7 +52,7 @@ Investigate how AgentSession computes session statistics. Start with a repositor
 Dependency contract:
 1. Search the repository without a `paths` filter for `getSessionStats(): SessionStats`.
 2. Read a session source path returned by that search.
-3. Search for a distinctive usage accumulator copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `cacheRead` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the source path and usage-accounting fields.
 Required answer terms: `agent-session.ts`, `assistantMessages`, `cacheRead`, `cacheWrite`
@@ -63,7 +63,7 @@ Investigate where the core agent loop emits model-turn start events. Start with 
 Dependency contract:
 1. Search the repository without a `paths` filter for `turn_start`.
 2. Read a core agent-loop source path returned by that search.
-3. Search for a distinctive event-stream identifier copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `turn_end` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the source path and at least two relevant turn-boundary facts.
 Required answer terms: `agent-loop.ts`, `turn_start`, `turn_end`, `runLoop`
@@ -74,7 +74,7 @@ Investigate the AI tool type's `customWireName` contract. Start with a repositor
 Dependency contract:
 1. Search the repository without a `paths` filter for `customWireName`.
 2. Read the AI tool type source path returned by that search.
-3. Search for a distinctive tool-format or dispatch identifier copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `customFormat` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the source path, the wire-name purpose, and the related format/dispatch contract.
 Required answer terms: `packages/ai/src/types.ts`, `customWireName`, `customFormat`, `activeToolForCallName`
@@ -85,7 +85,7 @@ Investigate the root package's benchmark script conventions. Start with a reposi
 Dependency contract:
 1. Search the repository without a `paths` filter for `bench:orchestration-tokens`.
 2. Read the root package manifest path returned by that search.
-3. Search for a distinctive benchmark script name copied from the read result, without a fixed path filter.
+3. Search for the copied identifier `bench:composer-stability-v3` from the immediately preceding read, without a fixed path filter.
 Final answer:
 Return the shared JSON answer/evidence format. Evidence should establish the manifest path and at least two existing benchmark command names.
 Required answer terms: `package.json`, `bench:orchestration-tokens`, `bench:edit`, `bench:composer-stability-v3`

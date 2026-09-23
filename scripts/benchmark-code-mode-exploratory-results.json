@@ -1078,7 +1078,7 @@
                 "Arm B step s1 path/query did not use data from the preceding result.",
                 "Arm B exec: Reference s2 result does not contain the requested literal.",
                 "Arm B exec: Reference path path does not resolve.",
-                "Arm B exec: Script plan must contain 3–8 ordered steps.",
+                "Arm B exec: Script plan must contain 3\u20138 ordered steps.",
                 "Arm B exec: Reference path details.files.20 must resolve to a string or an array of strings."
               ]
             },
@@ -1159,7 +1159,7 @@
                 "kind": "exec",
                 "input": "{\"steps\":[{\"id\":\"s1\",\"tool\":\"search\",\"input\":{\"pattern\":\"createAgentSession\",\"timeout\":5}},{\"id\":\"s2\",\"tool\":\"read\",\"input\":{\"path\":{\"$ref\":\"s1\",\"select\":\"details.files.20\"}}}]}",
                 "errors": [
-                  "Script plan must contain 3–8 ordered steps."
+                  "Script plan must contain 3\u20138 ordered steps."
                 ],
                 "steps": []
               },
@@ -2192,7 +2192,7 @@
                 "Arm B step a1 path/query did not use data from the preceding result.",
                 "Arm B exec: Reference s2 result does not contain the requested literal.",
                 "Arm B exec: Reference path result does not resolve.",
-                "Arm B exec: Script plan must contain 3–8 ordered steps."
+                "Arm B exec: Script plan must contain 3\u20138 ordered steps."
               ]
             },
             "errors": [
@@ -2262,7 +2262,7 @@
                 "kind": "exec",
                 "input": "{\"steps\":[{\"id\":\"b1\",\"tool\":\"search\",\"input\":{\"pattern\":\"createAgentSession\"}},{\"id\":\"b2\",\"tool\":\"search\",\"input\":{\"pattern\":{\"$ref\":\"b1\",\"select\":\"content.0.text\",\"contains\":\"createAgentSession\"},\"skip\":10,\"timeout\":10}}]}",
                 "errors": [
-                  "Script plan must contain 3–8 ordered steps."
+                  "Script plan must contain 3\u20138 ordered steps."
                 ],
                 "steps": []
               },
@@ -2570,7 +2570,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -2717,7 +2717,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3023,7 +3023,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3052,7 +3052,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3169,7 +3169,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3196,7 +3196,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   },
                   {
                     "id": "s3",
@@ -3497,7 +3497,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3526,7 +3526,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -3555,7 +3555,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               }
@@ -3645,7 +3645,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-160 omitted …]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
+                    "resultExcerpt": "[\u2026 source lines 1-160 omitted \u2026]\nconst CODEX_NON_RETRYABLE_EVENT_CODES = new Set([ .. ]);\nconst CODEX_NON_RETRYABLE_EVENT_MESSAGE =\n\t/invalid[_ -]function[_ -]parameters|invalid schema for function|invalid[_ -]tool[_ -]schema|schema must ha"
                   }
                 ]
               },
@@ -4989,7 +4989,7 @@
               "modelFacingToolCalls": 4,
               "readSearchHandlerCalls": 4
             },
-            "finalAnswer": "{\"answer\":\"In packages/coding-agent/src/tools/search.ts, SearchToolDetails returns file metadata as `files` (a string list of returned file paths) and `fileMatches` (per-file `{ path, count }` entries), plus match metadata including numeric `matchCount`; docs indicate these counts are for the returned page.\",\"evidence\":[\"## search.ts\",\"export interface SearchToolDetails {\",\"matchCount?: number;\",\"files?: string[];\",\"fileMatches?: Array<{ path: string; count: number }>;\",\"`matchCount`, `fileCount`, `files`, `fileMatches` — counts for the returned page, not necessarily total corpus counts.\"]}",
+            "finalAnswer": "{\"answer\":\"In packages/coding-agent/src/tools/search.ts, SearchToolDetails returns file metadata as `files` (a string list of returned file paths) and `fileMatches` (per-file `{ path, count }` entries), plus match metadata including numeric `matchCount`; docs indicate these counts are for the returned page.\",\"evidence\":[\"## search.ts\",\"export interface SearchToolDetails {\",\"matchCount?: number;\",\"files?: string[];\",\"fileMatches?: Array<{ path: string; count: number }>;\",\"`matchCount`, `fileCount`, `files`, `fileMatches` \u2014 counts for the returned page, not necessarily total corpus counts.\"]}",
             "calls": [
               {
                 "toolName": "search",
@@ -5304,7 +5304,7 @@
                       "timeout": 5
                     },
                     "isError": false,
-                    "resultExcerpt": "# packages/coding-agent/src/tools/\n## search.ts\n 81| * agent paginates further pages via `skip`. */\n*82|export const DEFAULT_FILE_LIMIT = 20;\n 83|/** Per-file match cap for multi-file searches — keeps a single hot file\n 84| * from crowding "
+                    "resultExcerpt": "# packages/coding-agent/src/tools/\n## search.ts\n 81| * agent paginates further pages via `skip`. */\n*82|export const DEFAULT_FILE_LIMIT = 20;\n 83|/** Per-file match cap for multi-file searches \u2014 keeps a single hot file\n 84| * from crowding "
                   }
                 ]
               }
@@ -6630,7 +6630,7 @@
               "reasons": [
                 "Arm B must complete exactly one exec call containing the whole plan.",
                 "Arm B exec: Reference path matches.0.path does not resolve.",
-                "Arm B exec: Script plan must contain 3–8 ordered steps.",
+                "Arm B exec: Script plan must contain 3\u20138 ordered steps.",
                 "Arm B exec: Reference path path does not resolve.",
                 "Arm B exec: Reference path matches.0.path does not resolve."
               ]
@@ -6674,7 +6674,7 @@
                 "kind": "exec",
                 "input": "{\"steps\":[{\"id\":\"r1\",\"tool\":\"read\",\"input\":{\"path\":\"packages/coding-agent/src/session/agent-session.ts:26490-26640\"}},{\"id\":\"r2\",\"tool\":\"search\",\"input\":{\"pattern\":{\"$ref\":\"r1\",\"select\":\"content.0.text\",\"contains\":\"assistantMessages\"},\"paths\":[{\"$ref\":\"r1\",\"select\":\"path\"}]}}]}",
                 "errors": [
-                  "Script plan must contain 3–8 ordered steps."
+                  "Script plan must contain 3\u20138 ordered steps."
                 ],
                 "steps": []
               },
@@ -7463,7 +7463,7 @@
                       "timeout": 5
                     },
                     "isError": false,
-                    "resultExcerpt": "# REPORT.md\n 89|\n*90|For every `message_update` carrying a toolcall event, the session runs the streaming-edit machinery twice per event: once from the assistant-message interceptor (agent-session.ts:1361-1369 → #preCacheStreamingEditFile +"
+                    "resultExcerpt": "# REPORT.md\n 89|\n*90|For every `message_update` carrying a toolcall event, the session runs the streaming-edit machinery twice per event: once from the assistant-message interceptor (agent-session.ts:1361-1369 \u2192 #preCacheStreamingEditFile +"
                   }
                 ]
               }
@@ -8486,7 +8486,7 @@
                       "truncation": "last"
                     },
                     "isError": false,
-                    "resultExcerpt": "[… source lines 1-262 omitted …]\n * literals: the log is shape-only, so no caller-supplied or provider-derived\n * string may ever reach it.\n */\nconst MANAGED_LOCAL_FAILURE_STAGES = [\n...\n] as const;\ntype ManagedLocalFailureStage = (typeof M"
+                    "resultExcerpt": "[\u2026 source lines 1-262 omitted \u2026]\n * literals: the log is shape-only, so no caller-supplied or provider-derived\n * string may ever reach it.\n */\nconst MANAGED_LOCAL_FAILURE_STAGES = [\n...\n] as const;\ntype ManagedLocalFailureStage = (typeof M"
                   }
                 ]
               }
@@ -9101,7 +9101,7 @@
                       "timeout": 5
                     },
                     "isError": false,
-                    "resultExcerpt": " 667|\t */\n*668|\tcustomWireName?: string;\n 669|\t/**\n 670|\t * Set when the provider detected the argument JSON was not safely executable —\n 671|\t * the model hit its output-token limit (or the response was otherwise cut short)\n...\n 1032|\t * w"
+                    "resultExcerpt": " 667|\t */\n*668|\tcustomWireName?: string;\n 669|\t/**\n 670|\t * Set when the provider detected the argument JSON was not safely executable \u2014\n 671|\t * the model hit its output-token limit (or the response was otherwise cut short)\n...\n 1032|\t * w"
                   },
                   {
                     "id": "s3",
@@ -9357,7 +9357,7 @@
                 "Arm B step s1 path/query did not use data from the preceding result.",
                 "Arm B exec: Reference path matches.0.path does not resolve.",
                 "Arm B exec: Reference path result does not resolve.",
-                "Arm B exec: Script plan must contain 3–8 ordered steps.",
+                "Arm B exec: Script plan must contain 3\u20138 ordered steps.",
                 "Arm B exec: Reference s2 result does not contain the requested literal.",
                 "Arm B exec: Reference path resolvedPath does not resolve."
               ]
@@ -9422,7 +9422,7 @@
                 "kind": "exec",
                 "input": "{\"steps\":[{\"id\":\"s1\",\"tool\":\"search\",\"input\":{\"pattern\":\"customWireName\",\"timeout\":10}},{\"id\":\"s2\",\"tool\":\"read\",\"input\":{\"path\":{\"$ref\":\"s1\",\"select\":\"details.files.0\"}}}]}",
                 "errors": [
-                  "Script plan must contain 3–8 ordered steps."
+                  "Script plan must contain 3\u20138 ordered steps."
                 ],
                 "steps": []
               },
@@ -9940,7 +9940,7 @@
                 "Arm B exec: Reference s2 result does not contain the requested literal.",
                 "Arm B exec: Reference path result does not resolve.",
                 "Arm B exec: Reference path result does not resolve.",
-                "Arm B exec: Script plan must contain 3–8 ordered steps."
+                "Arm B exec: Script plan must contain 3\u20138 ordered steps."
               ]
             },
             "errors": [
@@ -10030,7 +10030,7 @@
                 "kind": "exec",
                 "input": "{\"steps\":[{\"id\":\"s1\",\"tool\":\"search\",\"input\":{\"pattern\":\"customWireName\"}},{\"id\":\"s2\",\"tool\":\"read\",\"input\":{\"path\":{\"$ref\":\"s1\",\"select\":\"details.files.10\"}}}]}",
                 "errors": [
-                  "Script plan must contain 3–8 ordered steps."
+                  "Script plan must contain 3\u20138 ordered steps."
                 ],
                 "steps": []
               }
@@ -11453,5 +11453,7 @@
     }
   ],
   "executionStatus": "complete",
-  "decisionEligible": true
+  "decisionEligible": false,
+  "validityStatus": "exploratory-invalid",
+  "validityReason": "The report and task manifest were in the repository-wide search corpus; incremental pair writes could affect later task searches."
 }

@@ -16,6 +16,8 @@ import {
 	validateFinalAnswer,
 	validateScriptPlan,
 	validateScriptToolArguments,
+	validateTaskCallSequence,
+	type BenchmarkTask,
 } from "./benchmark-code-mode";
 import benchmarkCodeModeTasks from "./benchmark-code-mode-tasks.md" with { type: "text" };
 
@@ -30,6 +32,26 @@ function dependentPlan(): unknown {
 				input: {
 					pattern: { $ref: "open", select: "content.0.text", contains: "DistinctiveName" },
 					paths: ["src"],
+				},
+			},
+		],
+	};
+}
+
+function planForTask(task: BenchmarkTask): unknown {
+	return {
+		steps: [
+			{ id: "find", tool: "search", input: { pattern: task.initialSearchQuery } },
+			{ id: "open", tool: "read", input: { path: { $ref: "find", select: "details.files.0" } } },
+			{
+				id: "follow",
+				tool: "search",
+				input: {
+					pattern: {
+						$ref: "open",
+						select: "content.0.text",
+						contains: task.requiredFollowupSearchTerm,
+					},
 				},
 			},
 		],
@@ -153,16 +175,54 @@ describe("pre-registered task contracts", () => {
 			expect(task.dependencyRequirements).toHaveLength(3);
 			expect(task.dependencyRequirements[0]).toMatch(/without a `paths` filter/i);
 			expect(task.dependencyRequirements[1]).toMatch(/path returned by that search/i);
-			expect(task.dependencyRequirements[2]).toMatch(/copied from the read result/i);
+			expect(task.dependencyRequirements[2]).toMatch(/copied identifier.*immediately preceding read/i);
 			expect(task.requiredAnswerTerms.length).toBeGreaterThanOrEqual(2);
+			expect(task.initialSearchQuery.length).toBeGreaterThan(2);
+			expect(task.requiredFollowupSearchTerm.length).toBeGreaterThan(2);
 			expect(task.prompt).not.toMatch(/scoped to `packages\//i);
 		}
+	});
+
+	test("requires the registered repository-wide first search but allows any fully dependent third call", () => {
+		const task = parseBenchmarkTasks(benchmarkCodeModeTasks)[0]!;
+		expect(parseScriptPlan(JSON.stringify(planForTask(task)), task).steps).toHaveLength(3);
+		const scoped = planForTask(task) as { steps: Array<Record<string, unknown>> };
+		scoped.steps[0]!.input = { pattern: task.initialSearchQuery, paths: ["packages"] };
+		expect(() => parseScriptPlan(JSON.stringify(scoped), task)).toThrow(/initial search must not constrain paths/);
+		const unrelated = planForTask(task) as { steps: Array<Record<string, unknown>> };
+		unrelated.steps[0]!.input = { pattern: "unrelated source" };
+		expect(() => parseScriptPlan(JSON.stringify(unrelated), task)).toThrow(/initial search must include/);
+		const dependentRead = planForTask(task) as { steps: Array<Record<string, unknown>> };
+		dependentRead.steps[2]!.tool = "read";
+		dependentRead.steps[2]!.input = {
+			path: { $ref: "open", select: "content.0.text", contains: "packages/example.ts" },
+		};
+		expect(parseScriptPlan(JSON.stringify(dependentRead), task).steps[2]?.tool).toBe("read");
+	});
+
+	test("requires three dependent calls and the registered repository-wide first query for Arm A", () => {
+		const task = parseBenchmarkTasks(benchmarkCodeModeTasks)[0]!;
+		const valid = [
+			{ toolName: "search", args: { pattern: task.initialSearchQuery, paths: null }, resultText: "Found packages/example.ts" },
+			{ toolName: "read", args: { path: "packages/example.ts" }, resultText: `The source declares ${task.requiredFollowupSearchTerm}.` },
+			{ toolName: "search", args: { pattern: task.requiredFollowupSearchTerm, paths: null }, resultText: "Confirmed." },
+		];
+		expect(validateTaskCallSequence(task, valid)).toEqual([]);
+		expect(validateTaskCallSequence(task, [{ ...valid[0]!, args: { pattern: task.initialSearchQuery, paths: ["."] } }, ...valid.slice(1)])).toContain(
+			`Task ${task.id} initial search constrained paths.`,
+		);
+		expect(validateTaskCallSequence(task, valid.slice(0, 2))).toContain(
+			`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`,
+		);
+		expect(validateTaskCallSequence(task, [{ ...valid[0]!, args: { pattern: "unrelated" } }, ...valid.slice(1)])).toContain(
+			`Task ${task.id} initial search did not contain ${task.initialSearchQuery}.`,
+		);
 	});
 
 	test("rejects a task set whose cardinality or dependencies are changed", () => {
 		expect(() => parseBenchmarkTasks("# no benchmark tasks")).toThrow(/exactly 8 tasks/);
 		const missingDependency = benchmarkCodeModeTasks.replace(
-			"3. Search for a distinctive session option or API identifier copied from the read result, without a fixed path filter.",
+			"3. Search for the copied identifier `modelPattern` from the immediately preceding read, without a fixed path filter.",
 			"3. Search with a fixed query.",
 		);
 		expect(() => {

@@ -30,10 +30,22 @@ export const MAX_STEP_TEXT_CHARS = 4_000;
 export const MAX_REPORT_RESULT_CHARS = 32_000;
 export const MAX_ATTEMPTS = 2;
 export const DEFAULT_TIMEOUT_MS = 300_000;
+export const CLEANUP_TIMEOUT_MS = 10_000;
 export const SCHEDULE_SEED = 5792;
 export const BOOTSTRAP_REPETITIONS = 10_000;
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
+const SEARCH_CORPUS_SENTINELS = [
+	"scripts/benchmark-code-mode.ts",
+	"scripts/benchmark-code-mode.test.ts",
+	"scripts/benchmark-code-mode-prompts.md",
+	"scripts/benchmark-code-mode-tasks.md",
+	"scripts/benchmark-code-mode-exec-description.md",
+	"scripts/benchmark-code-mode-results.json",
+	"scripts/benchmark-code-mode-runs.json.gz",
+	"scripts/benchmark-code-mode-exploratory-results.json",
+	"scripts/benchmark-code-mode-exploratory-runs.json.gz",
+] as const;
 const SYSTEM_PROMPT = benchmarkCodeModePrompts.trim();
 const RUN_RETRY_REASON = "The preceding attempt did not reach a validated final answer.";
 
@@ -42,6 +54,8 @@ export interface BenchmarkTask {
 	title: string;
 	prompt: string;
 	dependencyRequirements: string[];
+	initialSearchQuery: string;
+	requiredFollowupSearchTerm: string;
 	requiredAnswerTerms: string[];
 }
 
@@ -186,8 +200,12 @@ function findStepMarkers(value: unknown, result: ScriptReference[] = []): Script
 	return collectReferences(value, result);
 }
 
+function normalizeSearchPattern(value: string): string {
+	return value.replace(/\\[bB]/g, "").replace(/\\([\\^$.*+?()[\]{}|])/g, "$1");
+}
+
 /** Validate the constrained JSON plan before any repository tool is executed. */
-export function validateScriptPlan(value: unknown): ScriptPlan {
+export function validateScriptPlan(value: unknown, task?: BenchmarkTask): ScriptPlan {
 	if (!isRecord(value)) throw new Error("Script plan must be a JSON object.");
 	expectExactKeys(value, ["steps"], "Script plan");
 	if (!Array.isArray(value.steps) || value.steps.length < MIN_PLAN_STEPS || value.steps.length > MAX_PLAN_STEPS) {
@@ -224,11 +242,24 @@ export function validateScriptPlan(value: unknown): ScriptPlan {
 		seen.add(step.id);
 		steps.push(step);
 	}
-	return { steps };
+	const plan = { steps };
+	if (task) validateTaskPlan(plan, task);
+	return plan;
+}
+
+function validateTaskPlan(plan: ScriptPlan, task: BenchmarkTask): void {
+	const initial = plan.steps[0]!;
+	if (initial.tool !== "search" || typeof initial.input.pattern !== "string") {
+		throw new Error(`Task ${task.id} must start with a repository-wide search.`);
+	}
+	if (!normalizeSearchPattern(initial.input.pattern).includes(task.initialSearchQuery)) {
+		throw new Error(`Task ${task.id} initial search must include ${task.initialSearchQuery}.`);
+	}
+	if (initial.input.paths != null) throw new Error(`Task ${task.id} initial search must not constrain paths.`);
 }
 
 /** Parse JSON only; no JavaScript or other language is ever evaluated. */
-export function parseScriptPlan(input: string): ScriptPlan {
+export function parseScriptPlan(input: string, task?: BenchmarkTask): ScriptPlan {
 	const inputBytes = new TextEncoder().encode(input).byteLength;
 	if (inputBytes === 0 || inputBytes > MAX_PLAN_BYTES) {
 		throw new Error(`Script plan text must be between 1 and ${MAX_PLAN_BYTES} bytes.`);
@@ -239,7 +270,7 @@ export function parseScriptPlan(input: string): ScriptPlan {
 	} catch (error) {
 		throw new Error(`Script plan is not valid JSON: ${safeError(error)}`);
 	}
-	return validateScriptPlan(decoded);
+	return validateScriptPlan(decoded, task);
 }
 
 function getSelectedValue(root: unknown, select: string): unknown {
@@ -318,7 +349,7 @@ export function parseBenchmarkTasks(markdown: string): BenchmarkTask[] {
 		if (
 			!/^1\.\s+Search\b.*without a `paths` filter/i.test(dependencyRequirements[0]!) ||
 			!/^2\.\s+Read\b.*path returned by that search/i.test(dependencyRequirements[1]!) ||
-			!/^3\.\s+Search\b.*copied from the read result/i.test(dependencyRequirements[2]!) ||
+			!/^3\.\s+Search\b.*copied identifier `[^`]+` from the immediately preceding read/i.test(dependencyRequirements[2]!) ||
 			sections[3]!.trim().length === 0
 		) {
 			throw new Error(
@@ -332,8 +363,16 @@ export function parseBenchmarkTasks(markdown: string): BenchmarkTask[] {
 		if (requiredAnswerTerms.length < 2 || requiredAnswerTerms.some(term => term.length === 0)) {
 			throw new Error(`Task ${marker[1]} must pre-register at least two required answer terms.`);
 		}
+		const initialSearchQuery = /Start with a repository-wide search for `([^`]+)`/i.exec(sections[1]!)?.[1];
+		const requiredFollowupSearchTerm = /^3\.\s+Search\b.*copied identifier `([^`]+)`/i.exec(dependencyRequirements[2]!)?.[1];
+		if (!initialSearchQuery || !requiredFollowupSearchTerm) {
+			throw new Error(`Task ${marker[1]} must freeze an initial query and a distinctive follow-up search term.`);
+		}
 		const prompt = [
 			sections[1]!.trim(),
+			"",
+			"## Required dependent-call contract",
+			dependencyRequirements.join("\n"),
 			"",
 			sections[3]!.trim(),
 			"",
@@ -341,7 +380,15 @@ export function parseBenchmarkTasks(markdown: string): BenchmarkTask[] {
 			"",
 			"Return only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
 		].join("\n");
-		return { id: marker[1]!, title: marker[2]!.trim(), prompt, dependencyRequirements, requiredAnswerTerms };
+		return {
+			id: marker[1]!,
+			title: marker[2]!.trim(),
+			prompt,
+			dependencyRequirements,
+			initialSearchQuery,
+			requiredFollowupSearchTerm,
+			requiredAnswerTerms,
+		};
 	});
 	if (new Set(tasks.map(task => task.id)).size !== TASK_COUNT)
 		throw new Error("Pre-registered task IDs must be unique.");
@@ -457,11 +504,28 @@ export function usesPreviousResult(toolName: string, args: unknown, previousResu
 				return true;
 			}
 		}
-		const normalized = value.replace(/\\[bB]/g, "").replace(/\\([\\^$.*+?()[\]{}|])/g, "$1");
+		const normalized = normalizeSearchPattern(value);
 		if (normalized !== value && normalized.length >= 6 && previousResult.includes(normalized)) return true;
 		const distinctiveTerms = normalized.match(/[A-Za-z0-9_$.-]{6,}/g) ?? [];
 		return distinctiveTerms.some(term => previousResult.includes(term));
 	});
+}
+
+export function validateTaskCallSequence(
+	task: Pick<BenchmarkTask, "id" | "initialSearchQuery" | "requiredFollowupSearchTerm">,
+	entries: readonly Pick<AToolTraceEntry, "toolName" | "args" | "resultText">[],
+): string[] {
+	const reasons: string[] = [];
+	const initial = entries[0];
+	if (!initial || initial.toolName !== "search" || !isRecord(initial.args) || typeof initial.args.pattern !== "string") {
+		return [`Task ${task.id} must start with its registered repository-wide search.`];
+	}
+	if (entries.length < MIN_PLAN_STEPS) reasons.push(`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`);
+	if (!normalizeSearchPattern(initial.args.pattern).includes(task.initialSearchQuery)) {
+		reasons.push(`Task ${task.id} initial search did not contain ${task.initialSearchQuery}.`);
+	}
+	if (initial.args.paths != null) reasons.push(`Task ${task.id} initial search constrained paths.`);
+	return reasons;
 }
 
 interface AToolTraceEntry {
@@ -498,10 +562,11 @@ interface TraceValidation {
 	toolResultText: string;
 }
 
-function validateATrace(entries: readonly AToolTraceEntry[]): TraceValidation {
+function validateATrace(entries: readonly AToolTraceEntry[], task: BenchmarkTask): TraceValidation {
 	const reasons: string[] = [];
 	const ordered = [...entries].sort((left, right) => left.startOrder - right.startOrder);
 	if (ordered.length < MIN_PLAN_STEPS) reasons.push(`Expected at least ${MIN_PLAN_STEPS} read/search calls.`);
+	reasons.push(...validateTaskCallSequence(task, ordered));
 	for (let index = 0; index < ordered.length; index++) {
 		const current = ordered[index]!;
 		if (current.toolName !== "read" && current.toolName !== "search")
@@ -530,12 +595,29 @@ function validateATrace(entries: readonly AToolTraceEntry[]): TraceValidation {
 	};
 }
 
-function validateBTrace(entries: readonly BExecTraceEntry[]): TraceValidation {
+function validateBTrace(entries: readonly BExecTraceEntry[], task: BenchmarkTask): TraceValidation {
 	const reasons: string[] = [];
 	if (entries.length !== 1) reasons.push("Arm B must complete exactly one exec call containing the whole plan.");
 	const steps = entries.flatMap(entry => entry.steps);
 	if (steps.length < MIN_PLAN_STEPS)
 		reasons.push(`Expected at least ${MIN_PLAN_STEPS} executed read/search steps in the plan.`);
+	const first = steps[0];
+	const second = steps[1];
+	const third = steps[2];
+	if (!first || first.tool !== "search" || typeof first.resolvedInput.pattern !== "string") {
+		reasons.push(`Task ${task.id} Arm B must start with its registered repository-wide search.`);
+	} else {
+		if (!normalizeSearchPattern(first.resolvedInput.pattern).includes(task.initialSearchQuery)) {
+			reasons.push(`Task ${task.id} Arm B initial search omitted ${task.initialSearchQuery}.`);
+		}
+		if (first.resolvedInput.paths != null) reasons.push(`Task ${task.id} Arm B initial search constrained paths.`);
+	}
+	if (!second || second.tool !== "read") reasons.push(`Task ${task.id} Arm B second step must be a read.`);
+	if (!third || third.tool !== "search" || typeof third.resolvedInput.pattern !== "string") {
+		reasons.push(`Task ${task.id} Arm B third step must be the registered follow-up search.`);
+	} else if (!normalizeSearchPattern(third.resolvedInput.pattern).includes(task.requiredFollowupSearchTerm)) {
+		reasons.push(`Task ${task.id} Arm B follow-up search omitted ${task.requiredFollowupSearchTerm}.`);
+	}
 	for (let index = 0; index < steps.length; index++) {
 		const current = steps[index]!;
 		if (current.isError || !current.result || !current.resultText)
@@ -619,6 +701,7 @@ function safeError(error: unknown): string {
 function createExecTool(
 	readTool: AnyAgentTool,
 	searchTool: AnyAgentTool,
+	task: BenchmarkTask,
 ): { tool: ExecAgentTool; calls: BExecTraceEntry[] } {
 	const calls: BExecTraceEntry[] = [];
 	const handlers = { read: readTool, search: searchTool };
@@ -655,7 +738,7 @@ function createExecTool(
 			const call: BExecTraceEntry = { callId: toolCallId, input: params.input, steps: [], errors: [] };
 			calls.push(call);
 			try {
-				call.plan = parseScriptPlan(params.input);
+				call.plan = parseScriptPlan(params.input, task);
 				const previousResults = new Map<string, ScriptResultRecord>();
 				for (const step of call.plan.steps) {
 					const input = resolveScriptReferences(step.input, previousResults);
@@ -722,6 +805,42 @@ async function disposeSessionResult(result: CreateAgentSessionResult | undefined
 	await (result.mcpManager as { dispose?: () => Promise<void> } | undefined)?.dispose?.();
 }
 
+function withTimeout<T>(
+	operation: Promise<T>,
+	timeoutMs: number,
+	message: string,
+	onTimeout?: () => void,
+	onLateResolve?: (value: T) => void | Promise<void>,
+): Promise<T> {
+	const completion = Promise.withResolvers<T>();
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		onTimeout?.();
+		completion.reject(new Error(message));
+	}, Math.max(1, timeoutMs));
+	operation.then(
+		value => {
+			if (timedOut) {
+				void Promise.resolve(onLateResolve?.(value)).catch(() => {});
+				return;
+			}
+			completion.resolve(value);
+		},
+		error => completion.reject(error),
+	);
+	return completion.promise.finally(() => clearTimeout(timer));
+}
+
+async function disposeSessionResultBounded(result: CreateAgentSessionResult | undefined): Promise<void> {
+	if (!result) return;
+	await withTimeout(
+		disposeSessionResult(result),
+		CLEANUP_TIMEOUT_MS,
+		`Session cleanup exceeded ${CLEANUP_TIMEOUT_MS} ms.`,
+	);
+}
+
 function modelKey(model: Model | undefined): string | undefined {
 	return model ? `${model.provider}/${model.id}` : undefined;
 }
@@ -732,8 +851,13 @@ function getRequiredTool(session: AgentSession, name: string): AnyAgentTool {
 	return tool;
 }
 
-function getAttemptTraceValidation(arm: Arm, aTrace: AToolTraceEntry[], bTrace: BExecTraceEntry[]): TraceValidation {
-	return arm === "A" ? validateATrace(aTrace) : validateBTrace(bTrace);
+function getAttemptTraceValidation(
+	arm: Arm,
+	aTrace: AToolTraceEntry[],
+	bTrace: BExecTraceEntry[],
+	task: BenchmarkTask,
+): TraceValidation {
+	return arm === "A" ? validateATrace(aTrace, task) : validateBTrace(bTrace, task);
 }
 
 interface AttemptMetrics {
@@ -767,6 +891,7 @@ async function runAttempt(params: {
 	arm: Arm;
 	task: BenchmarkTask;
 	model: string;
+	workspaceRoot: string;
 	timeoutMs: number;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
@@ -777,10 +902,12 @@ async function runAttempt(params: {
 	retryReason?: string;
 }): Promise<AttemptRecord> {
 	const startedAt = new Date().toISOString();
+	const deadlineStartedAt = Date.now();
+	const remainingMs = (): number => Math.max(1, params.timeoutMs - (Date.now() - deadlineStartedAt));
 	const errors: string[] = [];
 	const aTrace: AToolTraceEntry[] = [];
 	const pending = new Map<string, AToolTraceEntry>();
-	const exec = params.arm === "B" ? createExecTool(params.readTool, params.searchTool) : undefined;
+	const exec = params.arm === "B" ? createExecTool(params.readTool, params.searchTool, params.task) : undefined;
 	let result: CreateAgentSessionResult | undefined;
 	let unsubscribe = (): void => {};
 	let modelRequestCount = 0;
@@ -795,14 +922,23 @@ async function runAttempt(params: {
 	};
 	let timedOut = false;
 	try {
-		result = await createAgentSession(
+		const creatingSession = createAgentSession(
 			sessionOptions({
-				cwd: REPO_ROOT,
+				cwd: params.workspaceRoot,
 				model: params.model,
 				authStorage: params.authStorage,
 				modelRegistry: params.modelRegistry,
 				toolNames: [],
 			}),
+		);
+		result = await withTimeout(
+			creatingSession,
+			remainingMs(),
+			`Run exceeded timeout of ${params.timeoutMs} ms during session setup.`,
+			() => {
+				timedOut = true;
+			},
+			lateResult => disposeSessionResultBounded(lateResult),
 		);
 		const session = result.session;
 		if (modelKey(session.model) !== params.model) {
@@ -857,7 +993,7 @@ async function runAttempt(params: {
 				if (isRecord(event.message) && event.message.role === "assistant") assistantTurnCount++;
 				const text = extractAssistantText(event.message);
 				if (!text || !isRecord(event.message) || event.message.stopReason !== "stop") return;
-				const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? []);
+				const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? [], params.task);
 				const candidate = validateFinalAnswer(text, traceValidation, params.task.requiredAnswerTerms);
 				if (candidate.valid && assistantTurnsToGreen === null) {
 					assistantTurnsToGreen = assistantTurnCount;
@@ -871,23 +1007,19 @@ async function runAttempt(params: {
 			await session.prompt(userPrompt, { expandPromptTemplates: false });
 			await session.waitForIdle();
 		})();
-		let timeoutHandle: NodeJS.Timeout | undefined;
-		const timeoutPromise = new Promise<never>((_resolve, reject) => {
-			timeoutHandle = setTimeout(() => {
+		await withTimeout(
+			operation,
+			remainingMs(),
+			`Run exceeded timeout of ${params.timeoutMs} ms during the model/tool loop.`,
+			() => {
 				timedOut = true;
 				session.abort();
-				reject(new Error(`Run exceeded timeout of ${params.timeoutMs} ms.`));
-			}, params.timeoutMs);
-		});
-		try {
-			await Promise.race([operation, timeoutPromise]);
-		} finally {
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-		}
+			},
+		);
 		unsubscribe();
 		if (assistantTurnsToGreen === null) {
 			finalAnswer = session.getLastAssistantText() ?? null;
-			const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? []);
+			const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? [], params.task);
 			validation = validateFinalAnswer(finalAnswer ?? "", traceValidation, params.task.requiredAnswerTerms);
 		}
 		modelFacingToolCalls = session.getSessionStats().toolCalls;
@@ -901,7 +1033,7 @@ async function runAttempt(params: {
 			try {
 				const session = result.session;
 				finalAnswer = session.getLastAssistantText() ?? null;
-				const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? []);
+				const traceValidation = getAttemptTraceValidation(params.arm, aTrace, exec?.calls ?? [], params.task);
 				validation = validateFinalAnswer(finalAnswer ?? "", traceValidation, params.task.requiredAnswerTerms);
 				const stats = session.getSessionStats();
 				modelFacingToolCalls = stats.toolCalls;
@@ -916,13 +1048,13 @@ async function runAttempt(params: {
 	} finally {
 		unsubscribe();
 		try {
-			await disposeSessionResult(result);
+			await disposeSessionResultBounded(result);
 		} catch (error) {
 			errors.push(`Session disposal failed: ${safeError(error)}`);
 		}
 	}
 	const bTrace = exec?.calls ?? [];
-	const traceValidation = getAttemptTraceValidation(params.arm, aTrace, bTrace);
+	const traceValidation = getAttemptTraceValidation(params.arm, aTrace, bTrace, params.task);
 	if (assistantTurnsToGreen === null) {
 		validation = validateFinalAnswer(finalAnswer ?? "", traceValidation, params.task.requiredAnswerTerms);
 		if (validation.valid) assistantTurnsToGreen = assistantTurnCount;
@@ -1006,6 +1138,7 @@ async function runScheduledArm(params: {
 	task: BenchmarkTask;
 	arm: Arm;
 	model: string;
+	workspaceRoot: string;
 	timeoutMs: number;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
@@ -1019,6 +1152,7 @@ async function runScheduledArm(params: {
 			arm: params.arm,
 			task: params.task,
 			model: params.model,
+			workspaceRoot: params.workspaceRoot,
 			timeoutMs: params.timeoutMs,
 			authStorage: params.authStorage,
 			modelRegistry: params.modelRegistry,
@@ -1315,6 +1449,7 @@ function summarizeRunCountsByArm(pairs: readonly ScheduledPair[]): Record<
 interface CliOptions {
 	model: string;
 	outputPath: string;
+	taskRepoPath: string;
 	timeoutMs: number;
 	resume: boolean;
 }
@@ -1322,6 +1457,7 @@ interface CliOptions {
 function parseCliOptions(args: string[]): CliOptions {
 	let model = DEFAULT_MODEL;
 	let outputPath: string | undefined;
+	let taskRepoPath: string | undefined;
 	let timeoutMs = DEFAULT_TIMEOUT_MS;
 	let resume = false;
 	for (let index = 0; index < args.length; index++) {
@@ -1334,6 +1470,10 @@ function parseCliOptions(args: string[]): CliOptions {
 			const value = args[++index];
 			if (!value || value.startsWith("--")) throw new Error("--output requires an explicit output path.");
 			outputPath = value;
+		} else if (argument === "--task-repo") {
+			const value = args[++index];
+			if (!value || value.startsWith("--")) throw new Error("--task-repo requires an isolated clean repository snapshot path.");
+			taskRepoPath = value;
 		} else if (argument === "--timeout-ms") {
 			const value = Number(args[++index]);
 			if (!Number.isInteger(value) || value < 1_000 || value > 3_600_000)
@@ -1343,7 +1483,7 @@ function parseCliOptions(args: string[]): CliOptions {
 			resume = true;
 		} else if (argument === "--help" || argument === "-h") {
 			process.stdout.write(
-				"Usage: bun scripts/benchmark-code-mode.ts --output <new-file.json> [--model provider/model] [--timeout-ms 300000] [--resume]\n",
+				"Usage: bun scripts/benchmark-code-mode.ts --task-repo <clean-origin-dev-worktree> --output <external-file.json> [--model provider/model] [--timeout-ms 300000] [--resume]\n",
 			);
 			process.exit(0);
 		} else {
@@ -1351,9 +1491,16 @@ function parseCliOptions(args: string[]): CliOptions {
 		}
 	}
 	if (!outputPath) throw new Error("An explicit --output path is required; existing files are never overwritten.");
+	if (!taskRepoPath) throw new Error("An isolated --task-repo snapshot is required for every benchmark run.");
 	if (!model.includes("/") || model.startsWith("/") || model.endsWith("/"))
 		throw new Error("--model must be an exact provider/model selector.");
-	return { model, outputPath: path.resolve(process.cwd(), outputPath), timeoutMs, resume };
+	return {
+		model,
+		outputPath: path.resolve(process.cwd(), outputPath),
+		taskRepoPath: path.resolve(process.cwd(), taskRepoPath),
+		timeoutMs,
+		resume,
+	};
 }
 
 async function resolvePinnedModel(modelSelector: string, modelRegistry: ModelRegistry): Promise<Model> {
@@ -1396,7 +1543,77 @@ async function initializeInfrastructure(modelSelector: string): Promise<{
 	}
 }
 
-async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) => Promise<void>): Promise<unknown> {
+interface TaskWorkspace {
+	root: string;
+	commit: string;
+}
+
+async function gitText(cwd: string, ...args: string[]): Promise<string> {
+	const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${safeError(stderr)}`);
+	return stdout.trim();
+}
+
+function isPathInside(parent: string, child: string): boolean {
+	const relative = path.relative(parent, child);
+	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+async function resolveFuturePath(candidate: string): Promise<string> {
+	let parent = path.dirname(candidate);
+	const suffix = [path.basename(candidate)];
+	while (true) {
+		try {
+			return path.join(await fs.realpath(parent), ...suffix);
+		} catch (error) {
+			if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+			const next = path.dirname(parent);
+			if (next === parent) throw error;
+			suffix.unshift(path.basename(parent));
+			parent = next;
+		}
+	}
+}
+
+async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace> {
+	const root = await fs.realpath(options.taskRepoPath);
+	if (root === REPO_ROOT) throw new Error("--task-repo must be a separate clean snapshot, never the harness checkout.");
+	if (isPathInside(root, options.outputPath)) throw new Error("--output must be outside the task repository search corpus.");
+	if (isPathInside(root, await resolveFuturePath(options.outputPath))) {
+		throw new Error("--output must not resolve through a symlink into the task repository search corpus.");
+	}
+	const [gitRoot, taskHead, originDev, status] = await Promise.all([
+		gitText(root, "rev-parse", "--show-toplevel"),
+		gitText(root, "rev-parse", "HEAD"),
+		gitText(REPO_ROOT, "rev-parse", "origin/dev"),
+		gitText(root, "status", "--porcelain", "--untracked-files=all"),
+	]);
+	if ((await fs.realpath(gitRoot)) !== root) throw new Error("--task-repo must be the root of a Git checkout or worktree.");
+	if (taskHead !== originDev) throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
+	if (status.length > 0) throw new Error("--task-repo must have a clean working tree before benchmark tasks begin.");
+	for (const sentinel of SEARCH_CORPUS_SENTINELS) {
+		let exists = false;
+		try {
+			await fs.access(path.join(root, sentinel));
+			exists = true;
+		} catch (error) {
+			if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+		}
+		if (exists) throw new Error(`Task corpus contains benchmark artifact ${sentinel}; refusing a contaminated run.`);
+	}
+	return { root, commit: taskHead };
+}
+
+async function runBenchmark(
+	options: CliOptions,
+	taskWorkspace: TaskWorkspace,
+	onProgress?: (report: unknown) => Promise<void>,
+): Promise<unknown> {
 	let startedAt = new Date().toISOString();
 	const infrastructure = await initializeInfrastructure(options.model);
 	const { authStorage, modelRegistry, model } = infrastructure;
@@ -1417,18 +1634,35 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 		if (!isRecord(prior.model) || prior.model.resolved !== resolvedModel) {
 			throw new Error(`Resume report model does not match the pinned model ${resolvedModel}.`);
 		}
-		const taskManifest = TASKS.map(({ id, title, prompt, dependencyRequirements, requiredAnswerTerms }) => ({
+		if (!isRecord(prior.workspaceSnapshot) || prior.workspaceSnapshot.commit !== taskWorkspace.commit) {
+			throw new Error(`Resume report task corpus does not match the clean origin/dev snapshot ${taskWorkspace.commit}.`);
+		}
+		const taskManifest = TASKS.map(({
 			id,
 			title,
 			prompt,
 			dependencyRequirements,
+			initialSearchQuery,
+			requiredFollowupSearchTerm,
+			requiredAnswerTerms,
+		}) => ({
+			id,
+			title,
+			prompt,
+			dependencyRequirements,
+			initialSearchQuery,
+			requiredFollowupSearchTerm,
 			requiredAnswerTerms,
 		}));
 		if (JSON.stringify(prior.tasks) !== JSON.stringify(taskManifest)) {
 			throw new Error("Resume report task prompts or answer requirements do not match the frozen task manifest.");
 		}
-		if (!isRecord(prior.contract) || prior.contract.runTimeoutMs !== options.timeoutMs) {
-			throw new Error("Resume report run timeout does not match the frozen run timeout.");
+		if (
+			!isRecord(prior.contract) ||
+			prior.contract.runTimeoutMs !== options.timeoutMs ||
+			prior.contract.setupCleanupTimeoutMs !== CLEANUP_TIMEOUT_MS
+		) {
+			throw new Error("Resume report timeout configuration does not match the frozen run limits.");
 		}
 		if (
 			JSON.stringify(prior.schedule) !==
@@ -1483,6 +1717,7 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 			executionStatus,
 			startedAt,
 			updatedAt: new Date().toISOString(),
+			workspaceSnapshot: { commit: taskWorkspace.commit, isolation: "clean origin/dev worktree; output outside search corpus" },
 			completedPairs: pairs.filter(pair => pair.A !== undefined && pair.B !== undefined).length,
 			model: { requested: options.model, resolved: resolvedModel, armA: resolvedModel, armB: resolvedModel },
 			contract: {
@@ -1491,14 +1726,19 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 				fixedScheduleSeed: SCHEDULE_SEED,
 				maxAttemptsPerScheduledRun: MAX_ATTEMPTS,
 				runTimeoutMs: options.timeoutMs,
+				handlerSetupTimeoutMs: options.timeoutMs,
+				setupCleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
+				runTimeoutScope: "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
 				decisionRule:
 					"Pass iff median paired request reduction >= 1, median paired percent reduction >= 25%, task-clustered bootstrap 95% CI lower bound > 0, Arm B green rate >= 80%, and B green rate is no more than 10 percentage points below A.",
 			},
-			tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, requiredAnswerTerms }) => ({
+			tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, initialSearchQuery, requiredFollowupSearchTerm, requiredAnswerTerms }) => ({
 				id,
 				title,
 				prompt,
 				dependencyRequirements,
+				initialSearchQuery,
+				requiredFollowupSearchTerm,
 				requiredAnswerTerms,
 			})),
 			schedule: pairs.map(pair => ({
@@ -1527,14 +1767,21 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 			let readTool: AnyAgentTool | undefined;
 			let searchTool: AnyAgentTool | undefined;
 			try {
-				handlerSessionResult = await createAgentSession(
+				const handlerSessionCreation = createAgentSession(
 					sessionOptions({
-						cwd: REPO_ROOT,
+						cwd: taskWorkspace.root,
 						model: options.model,
 						authStorage,
 						modelRegistry,
 						toolNames: ["read", "search"],
 					}),
+				);
+				handlerSessionResult = await withTimeout(
+					handlerSessionCreation,
+					options.timeoutMs,
+					`Read/search handler session setup exceeded ${options.timeoutMs} ms.`,
+					undefined,
+					lateResult => disposeSessionResultBounded(lateResult),
 				);
 				if (modelKey(handlerSessionResult.session.model) !== resolvedModel) {
 					throw new Error(
@@ -1546,7 +1793,7 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 			} catch (error) {
 				let setupError = error;
 				try {
-					await disposeSessionResult(handlerSessionResult);
+					await disposeSessionResultBounded(handlerSessionResult);
 				} catch (disposeError) {
 					setupError = new AggregateError([error, disposeError], "Handler-session setup and disposal failed.");
 				}
@@ -1572,6 +1819,7 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 						task,
 						arm,
 						model: options.model,
+						workspaceRoot: taskWorkspace.root,
 						timeoutMs: options.timeoutMs,
 						authStorage,
 						modelRegistry,
@@ -1581,7 +1829,13 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 					pair[arm] = assignRepetition(run, pair.repetition);
 				}
 			} finally {
-				await disposeSessionResult(handlerSessionResult);
+				try {
+					await disposeSessionResultBounded(handlerSessionResult);
+				} catch (error) {
+					for (const arm of pair.armOrder) {
+						pair[arm]?.errors.push(`Read/search handler session disposal failed: ${safeError(error)}`);
+					}
+				}
 			}
 			await persistProgress("running");
 		}
@@ -1616,6 +1870,7 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 		benchmark: "issue-5792-code-mode-measurement",
 		startedAt,
 		finishedAt: new Date().toISOString(),
+		workspaceSnapshot: { commit: taskWorkspace.commit, isolation: "clean origin/dev worktree; output outside search corpus" },
 		workingTree: ".",
 		model: { requested: options.model, resolved: resolvedModel, armA: resolvedModel, armB: resolvedModel },
 		contract: {
@@ -1625,6 +1880,9 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 			fixedScheduleSeed: SCHEDULE_SEED,
 			maxAttemptsPerScheduledRun: MAX_ATTEMPTS,
 			runTimeoutMs: options.timeoutMs,
+			handlerSetupTimeoutMs: options.timeoutMs,
+			setupCleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
+			runTimeoutScope: "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
 			roundTripDefinition: "AgentSession turn_start events (one model request/response cycle per round trip).",
 			assistantTurnDefinition:
 				"Assistant-role turn_end events; turns-to-green stops at the first final answer that passes task-specific answer-term, JSON/evidence, and dependent-trace validation.",
@@ -1643,11 +1901,13 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 			},
 		},
 		systemPrompt: SYSTEM_PROMPT,
-		tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, requiredAnswerTerms }) => ({
+		tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, initialSearchQuery, requiredFollowupSearchTerm, requiredAnswerTerms }) => ({
 			id,
 			title,
 			prompt,
 			dependencyRequirements,
+			initialSearchQuery,
+			requiredFollowupSearchTerm,
 			requiredAnswerTerms,
 		})),
 		schedule: pairs.map(pair => ({
@@ -1675,6 +1935,7 @@ async function runBenchmark(options: CliOptions, onProgress?: (report: unknown) 
 
 async function main(): Promise<void> {
 	const options = parseCliOptions(process.argv.slice(2));
+	const taskWorkspace = await resolveTaskWorkspace(options);
 	await fs.mkdir(path.dirname(options.outputPath), { recursive: true });
 	if (!options.resume) {
 		await fs.writeFile(
@@ -1683,7 +1944,7 @@ async function main(): Promise<void> {
 			{ flag: "wx" },
 		);
 	}
-	const report = await runBenchmark(options, value =>
+	const report = await runBenchmark(options, taskWorkspace, value =>
 		fs.writeFile(options.outputPath, `${JSON.stringify(value, null, 2)}\n`),
 	);
 	const decision = (report as { decision: DecisionSummary & { medianPairedPercentReductionPercent: number | null } })
