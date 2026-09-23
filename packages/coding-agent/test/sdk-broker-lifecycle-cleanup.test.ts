@@ -2,9 +2,10 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileLockAcquireError } from "../src/config/file-lock";
-import { ensureBroker } from "../src/sdk/broker/ensure";
+import { brokerStartupFailureReasonForTest, ensureBroker } from "../src/sdk/broker/ensure";
 import {
 	BrokerStartupError,
+	brokerStartupFailureCleanupTargetsLock,
 	brokerStartupFailurePath,
 	clearBrokerStartupFailureMarker,
 	readBrokerStartupFailureMarker,
@@ -91,7 +92,7 @@ test("startup error reconstructed from a marker keeps a validated long-path lock
 		const callerError = new BrokerStartupError({
 			exitCode: marker?.exitCode ?? null,
 			signal: marker?.signal ?? null,
-			reason: marker?.reason ?? "",
+			reason: brokerStartupFailureReasonForTest(marker),
 		});
 		expect(callerError.reason).toContain(manualCleanupCommand);
 		expect(callerError.message).toContain(manualCleanupCommand);
@@ -105,6 +106,53 @@ test("startup error reconstructed from a marker keeps a validated long-path lock
 		});
 		const unsafeMarker = await readBrokerStartupFailureMarker(agentDir);
 		expect(unsafeMarker?.reason).toBe(unsafeReason.slice(0, 512));
+		expect(unsafeMarker?.cleanupCommand).toBeUndefined();
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("overflowing compact lock cleanup reason stores and reconstructs the full validated command", async () => {
+	const agentDir = await makeAgentDir();
+	try {
+		const nestedComponents = Array.from({ length: 4 }, (_, index) => `part-${index}-${"l".repeat(180)}`);
+		expect(nestedComponents.every(component => component.length <= 255)).toBe(true);
+		const filePath = path.join(agentDir, "sdk", ...nestedComponents, "sessions.index");
+		const lockPath = `${filePath}.lock`;
+		const manualCleanupCommand =
+			process.platform === "win32"
+				? `Remove-Item -LiteralPath '${lockPath.replace(/'/g, "''")}' -Recurse -Force`
+				: `rm -rf -- '${lockPath.replace(/'/g, "'\\''")}'`;
+		const lockError = new FileLockAcquireError(filePath, lockPath, 3, "dead owner", "acquire_timeout", undefined, {
+			outcome: "cleanup_failed",
+			message: "permission denied",
+			manualCleanupCommand,
+		});
+
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: lockError.message,
+			exitCode: 1,
+			signal: null,
+			pid: process.pid,
+		});
+		const marker = await readBrokerStartupFailureMarker(agentDir);
+		expect(marker).toBeDefined();
+		expect(marker?.version).toBe(2);
+		expect(marker?.reason.length).toBeLessThanOrEqual(512);
+		expect((marker?.reason.length ?? 0) + manualCleanupCommand.length).toBeGreaterThan(512);
+		expect(marker?.cleanupCommand).toBe(manualCleanupCommand);
+		expect(brokerStartupFailureCleanupTargetsLock(marker, lockPath)).toBe(true);
+
+		const reconstructedReason = brokerStartupFailureReasonForTest(marker);
+		const callerError = new BrokerStartupError({
+			exitCode: marker?.exitCode ?? null,
+			signal: marker?.signal ?? null,
+			reason: reconstructedReason,
+		});
+		expect(callerError.reason).toBe(`${marker?.reason}${manualCleanupCommand}`);
+		expect(callerError.reason).toContain("no successor has taken it");
+		expect(callerError.reason).toContain(manualCleanupCommand);
+		expect(callerError.message).toContain(manualCleanupCommand);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -135,6 +183,36 @@ test("read returns undefined for a marker with an unsupported version", async ()
 		await Bun.write(
 			brokerStartupFailurePath(agentDir),
 			JSON.stringify({ version: 2, reason: "old shape", exitCode: 1, signal: null, writtenAt: 123, pid: 1 }),
+		);
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("read rejects truncated or over-bound cleanup command fields", async () => {
+	const agentDir = await makeAgentDir();
+	try {
+		const markerPath = brokerStartupFailurePath(agentDir);
+		const marker = {
+			version: 2,
+			reason:
+				"Manual cleanup is appropriate only after independently verifying this exact directory still belongs to the dead owner and no successor has taken it: ",
+			exitCode: 1,
+			signal: null,
+			writtenAt: Date.now(),
+			pid: process.pid,
+			incarnation: "test-incarnation",
+		};
+		const prefix = process.platform === "win32" ? "Remove-Item -LiteralPath '" : "rm -rf -- '";
+		const suffix = process.platform === "win32" ? "' -Recurse -Force" : "'";
+
+		await Bun.write(markerPath, JSON.stringify({ ...marker, cleanupCommand: `${prefix}truncated` }));
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ ...marker, cleanupCommand: `${prefix}${"x".repeat(66_001)}${suffix}` }),
 		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
