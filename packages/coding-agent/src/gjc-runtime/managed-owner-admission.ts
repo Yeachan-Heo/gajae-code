@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { openPortableRecoveryFsRoot } from "@gajae-code/natives";
 import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
-import { lifecyclePaths, type AdmitPredecessorRequest, type AdmitPredecessorResponse } from "./tmux-owner-isolation";
+import { type AdmitPredecessorRequest, type AdmitPredecessorResponse, lifecyclePaths } from "./tmux-owner-isolation";
 import {
 	persistUltragoalRecoveryDecision,
 	planUltragoalOwnerLossRecovery,

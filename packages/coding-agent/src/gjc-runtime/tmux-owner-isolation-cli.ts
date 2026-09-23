@@ -1,13 +1,13 @@
 /** Internal JSON-line facade for the tmux owner-isolation contract. */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { admitManagedOwnerPredecessorBeforeLaunch } from "./managed-owner-admission";
 import { readLinuxProcStartTime } from "./linux-proc";
+import { admitManagedOwnerPredecessorBeforeLaunch } from "./managed-owner-admission";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { normalizeExactTmuxTarget } from "./tmux-common";
 import {
-	type BootstrapRequest,
 	type AdmitPredecessorRequest,
+	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
 	classifyCgroup,
 	isTmuxControlArgvBoundToSocket,

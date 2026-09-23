@@ -16,11 +16,11 @@ import {
 	createOwnerIntent,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
+	type OwnerIntent,
+	type OwnerVerdict,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
-	type OwnerIntent,
-	type OwnerVerdict,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");

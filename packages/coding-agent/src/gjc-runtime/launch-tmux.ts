@@ -50,20 +50,20 @@ import {
 	resolveGjcTmuxProviderContext,
 } from "./tmux-common";
 import {
+	type AdmitPredecessorRequest,
 	captureOwnerGenerationBaselineSync,
 	classifyCgroup,
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
-	type AdmitPredecessorRequest,
 	type ManagedOwnerPredecessorEvidence,
 	type OwnerGenerationBaseline,
 	type OwnerIsolationProbeSync,
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
-	tmuxOwnerIsolationBootstrapArgv,
 	type TmuxServerProof,
+	tmuxOwnerIsolationBootstrapArgv,
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
