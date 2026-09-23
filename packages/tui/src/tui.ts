@@ -2128,7 +2128,9 @@ export class TUI extends Container {
 				this.#inFlightMultipartAbort = abortBarrier;
 				let flushed: boolean | undefined;
 				try {
-					flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+					const flush = (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+					flushed =
+						flush === undefined ? undefined : await this.#raceRasterLifecycle(flush, lifecycleSignal, false);
 				} catch {
 					abortBarrier();
 					return failed();
@@ -2147,16 +2149,15 @@ export class TUI extends Container {
 					abortBarrier();
 					return failed();
 				}
-				const abortResult = Promise.withResolvers<false>();
-				const onLifecycleAbort = () => abortResult.resolve(false);
-				lifecycleSignal.addEventListener("abort", onLifecycleAbort, { once: true });
 				try {
-					afterPrefixSucceeded = await Promise.race([op.afterPrefix(lifecycleSignal), abortResult.promise]);
+					afterPrefixSucceeded = await this.#raceRasterLifecycle(
+						op.afterPrefix(lifecycleSignal),
+						lifecycleSignal,
+						false,
+					);
 				} catch {
 					abortBarrier();
 					return failed();
-				} finally {
-					lifecycleSignal.removeEventListener("abort", onLifecycleAbort);
 				}
 				if (afterPrefixSucceeded !== true) {
 					abortBarrier();
@@ -2354,6 +2355,15 @@ export class TUI extends Container {
 		const abort = this.#inFlightMultipartAbort;
 		this.#inFlightMultipartAbort = undefined;
 		abort?.();
+	}
+	#raceRasterLifecycle<T>(operation: Promise<T>, lifecycleSignal: AbortSignal, cancelled: T): Promise<T> {
+		if (lifecycleSignal.aborted) return Promise.resolve(cancelled);
+		const abortResult = Promise.withResolvers<T>();
+		const onAbort = () => abortResult.resolve(cancelled);
+		lifecycleSignal.addEventListener("abort", onAbort, { once: true });
+		return Promise.race([operation, abortResult.promise]).finally(() => {
+			lifecycleSignal.removeEventListener("abort", onAbort);
+		});
 	}
 	#validRect(r: CellRect): boolean {
 		return (
