@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
@@ -170,6 +170,45 @@ test("redemption is atomic, ordered and connection-owned; discard, disconnect an
 		store.close();
 		await expect(store.finish("sender", { id: closed.id })).rejects.toMatchObject({ code: "resource_gone" });
 	} finally {
+		store.close();
+	}
+});
+
+test("expired leases free capacity and a discard during decoding cannot resurrect an upload", async () => {
+	const bytes = originalLargePng();
+	const store = new PromptImageUploadStore();
+	try {
+		vi.useFakeTimers();
+		const expired = store.begin("sender", descriptor(bytes));
+		store.append("sender", { id: expired.id, sequence: 0, data: bytes.subarray(0, 96 * 1024).toString("base64") });
+		vi.advanceTimersByTime(2 * 60_000);
+		expect(() => store.append("sender", { id: expired.id, sequence: 1, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		vi.useRealTimers();
+
+		const pending = store.begin("sender", descriptor(bytes));
+		for (let offset = 0, sequence = 0; offset < bytes.length; offset += 96 * 1024, sequence++)
+			store.append("sender", {
+				id: pending.id,
+				sequence,
+				data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+			});
+		const finishing = store.finish("sender", { id: pending.id });
+		expect(store.discard("sender", { id: pending.id })).toEqual({ discarded: true });
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		expect(() => store.redeem("sender", [{ id: pending.id }])).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		const next = await stage(store, "sender", bytes);
+		const accepted = store.redeem("sender", [{ id: next }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		vi.useRealTimers();
 		store.close();
 	}
 });
