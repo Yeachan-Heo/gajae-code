@@ -15,6 +15,7 @@ import { AuthStorage, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../../scripts/safe-cleanup";
@@ -283,9 +284,31 @@ describe("red-team: conventional MCP autoload", () => {
 			});
 			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
 			const sealConnectionSet = vi.spyOn(MCPManager.prototype, "sealConnectionSet");
+			const syncSealCheck = Promise.withResolvers<void>();
+			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+			let cachedToolPublished = false;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+			) {
+				await replaceNamedCustomTools.call(this, previousNames, nextTools);
+				if (nextTools.includes(cachedTool)) cachedToolPublished = true;
+			});
+			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
+			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
+				const status = getConnectionStatus.call(this, name);
+				if (cachedToolPublished && name === "slow-demo" && status === "disconnected") {
+					syncSealCheck.resolve();
+				}
+				return status;
+			});
 
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 			try {
+				// The owned-manager tool sync is fire-and-forget. Wait until its
+				// post-publication seal decision checks the cached server status.
+				await syncSealCheck.promise;
 				expect(connectServers).toHaveBeenCalledTimes(1);
 				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
 				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("slow-demo");

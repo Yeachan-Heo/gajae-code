@@ -145,7 +145,7 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { isMCPStartupTimeoutError, loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import { DeferredMCPTool, isMCPStartupTimeoutError, loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -5183,17 +5183,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							...ownedConventionalMcpToolNames,
 						);
 						await session.replaceNamedCustomTools(previousNames, nextTools);
-						// Mixed plugin + conventional sessions deferred the seal while
-						// a conventional server was still connecting; restore the
-						// fixed-connection plugin contract once every conventional
-						// server has reached a terminal state.
+						const hasDisconnectedCachedTool = nextTools.some(
+							tool =>
+								tool instanceof DeferredMCPTool &&
+								mcpManager?.getConnectionStatus(tool.mcpServerName) === "disconnected",
+						);
+						// Mixed plugin + conventional sessions defer the seal while a
+						// conventional server is connecting. A cached DeferredMCPTool also
+						// keeps its reconnect path live after cleanup reports disconnected;
+						// derive that hold from this snapshot so removing/replacing the tool
+						// restores the fixed-connection plugin contract.
 						if (
 							ownedPluginServersConnected &&
 							mcpManager !== undefined &&
 							!mcpManager.isConnectionSetSealed() &&
 							![...ownedConventionalMcpServerNames].some(
 								name => mcpManager?.getConnectionStatus(name) === "connecting",
-							)
+							) &&
+							!hasDisconnectedCachedTool
 						) {
 							mcpManager.sealConnectionSet();
 						}
