@@ -441,7 +441,11 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 	let child: KevChild;
 	try {
 		const stat = await log.stat();
-		if (!stat.isFile() || (process.getuid && stat.uid !== process.getuid())) throw new Error("Unsafe Kev log file");
+		// A second link to this inode is someone else's handle on the same bytes.
+		// O_NOFOLLOW stops symlinks but not hard links, and the chmod/truncate below
+		// would otherwise reach through to a file the user never meant to expose.
+		if (!stat.isFile() || stat.nlink !== 1 || (process.getuid && stat.uid !== process.getuid()))
+			throw new Error("Unsafe Kev log file");
 		await log.chmod(0o600);
 		await log.truncate(0);
 		child = (deps.spawn ?? spawnDefault)(argv, {

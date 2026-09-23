@@ -328,6 +328,20 @@ describe("Kev lifecycle", () => {
 		expect(f.spawned).toEqual([]);
 	});
 
+	test("does not truncate a hard-linked foreign log", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		const foreign = path.join(f.base, "foreign-hardlink.txt");
+		await Bun.write(foreign, "preserve me");
+		await fs.chmod(foreign, 0o644);
+		// O_NOFOLLOW refuses symlinks but not a second link to the same inode.
+		await fs.link(foreign, path.join(f.root, "server.log"));
+		await expect(runKevSetup("start", {}, f.deps)).rejects.toThrow("Unsafe Kev log file");
+		expect(await Bun.file(foreign).text()).toBe("preserve me");
+		expect((await fs.stat(foreign)).mode & 0o777).toBe(0o644);
+		expect(f.spawned).toEqual([]);
+	});
+
 	test("refuses revision drift before starting a process", async () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);
