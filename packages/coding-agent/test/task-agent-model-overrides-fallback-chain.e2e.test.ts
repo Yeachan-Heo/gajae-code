@@ -360,6 +360,77 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 		await parentRegistry.dispose();
 	});
 
+	it("refreshes only the requested provider after a delegated cache miss", async () => {
+		const modelId = "freshly-discovered-lite-llm-model";
+		const endpoint = "http://localhost:4000/v1";
+		const unrelatedEndpoint = "http://unrelated-provider.test/v1";
+		const modelsPath = path.join(tempDir.path(), "models.yml");
+		authStorage.setRuntimeApiKey("litellm", "miss-litellm-key");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					litellm: {
+						baseUrl: endpoint,
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+					},
+					"unrelated-discovery": {
+						baseUrl: unrelatedEndpoint,
+						api: "openai-completions",
+						apiKey: "unrelated-discovery-key",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+
+		let targetModelsListRequests = 0;
+		let unrelatedModelsListRequests = 0;
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url === `${endpoint}/models`) {
+				targetModelsListRequests++;
+				return Response.json({ data: [{ id: modelId }] });
+			}
+			if (url === `${unrelatedEndpoint}/models`) {
+				unrelatedModelsListRequests++;
+				throw new Error(`unexpected unrelated models-list request: ${url}`);
+			}
+			throw new Error(`unexpected unrelated network request: ${url}`);
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const parentRegistry = new ModelRegistry(
+			authStorage,
+			path.join(tempDir.path(), "stale-parent-models.yml"),
+			settings,
+			{ automaticRefresh: false },
+		);
+		try {
+			const accepted = await runSubprocessOnce({
+				cwd: tempDir.path(),
+				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "discover requested delegated provider after a cache miss",
+				index: 0,
+				id: "owned-litellm-cache-miss",
+				modelOverride: `litellm/${modelId}`,
+				preflightProbe: true,
+				settings,
+				authStorage,
+				modelRegistry: parentRegistry,
+				agentDir: tempDir.path(),
+				enableLsp: false,
+			});
+
+			expect(accepted.preflightProbeAccepted).toBe(true);
+			expect(accepted.setupFailure).toBeUndefined();
+			expect(targetModelsListRequests).toBe(1);
+			expect(unrelatedModelsListRequests).toBe(0);
+		} finally {
+			await parentRegistry.dispose();
+		}
+	});
+
 	it("fails closed on a missing explicit provider/model without parent substitution", async () => {
 		const parent = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!parent) throw new Error("Expected bundled parent model");
