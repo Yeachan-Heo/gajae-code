@@ -17,13 +17,21 @@ import { existsSync } from "node:fs";
 import type { AgentWireOwnerObservation } from "../modes/shared/agent-wire/event-contract";
 import { observeAgentWireFrame } from "../modes/shared/agent-wire/event-observation";
 import { classifyRecovery } from "./classifier";
-import { ControlServer, type EndpointHandler, type EndpointRequest } from "./control-endpoint";
-import { defaultFinalizeChecks, type FinalizeChecks, runFinalize, type ValidationCommandSpec } from "./finalize";
+import { ControlServer, type EndpointHandler, type EndpointHandlerRequest } from "./control-endpoint";
+import {
+	defaultFinalizeChecks,
+	type FinalizeChecks,
+	runFinalize,
+	type ValidationCommandSpec,
+	ValidationObservationUncertainError,
+	type ValidationRun,
+} from "./finalize";
 import { type OperateResult, operate } from "./operate";
 import { preserveDirtyWorktree } from "./preserve";
 import { RECEIPT_SPOOL_DIR_ENV, withReceiptSpoolDir } from "./receipt-spool";
 import {
 	buildReceipt,
+	type ReceiptEnvelope,
 	type ReceiptSubject,
 	requiresVanishBeforeAction,
 	type ValidationEvidence,
@@ -50,6 +58,7 @@ import { buildStateView, nextAllowedActions, submitUnavailableReason } from "./s
 import {
 	appendEvent,
 	controlSocketPath,
+	type ReceiptIndexEntry,
 	readEvents,
 	readSessionState,
 	sessionPaths,
@@ -165,6 +174,15 @@ export class RuntimeOwner {
 	#framePumpFailure: unknown = null;
 	#coalesced = new Map<string, true>();
 	#stopPromise: Promise<void> | null = null;
+	#retiring = false;
+	#retirePromise: Promise<PrimitiveResponse> | null = null;
+	#lifecycleMutation: Promise<void> = Promise.resolve();
+	#activeRetirementSensitiveWork = new Set<Promise<void>>();
+	#activeValidationWork = new Set<{
+		controller: AbortController;
+		done: Promise<void>;
+	}>();
+	#validationStopFailure: unknown = null;
 	#lastStopFailures: unknown[] = [];
 	#reportedStopFailures = new Set<string>();
 	#transportClosed = false;
@@ -270,10 +288,14 @@ export class RuntimeOwner {
 		const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
 		if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
 		const reconciled = reconcileLiveOwnerState(state);
-		if (reconciled.reconciled) {
-			await writeSessionState(this.#opts.root, reconciled.state);
-			return reconciled.state;
-		}
+		if (reconciled.reconciled)
+			return this.#withLifecycleMutation(async () => {
+				const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
+				if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+				const current = reconcileLiveOwnerState(latest);
+				if (current.reconciled) await this.#framePersistence.writeSessionState(this.#opts.root, current.state);
+				return current.state;
+			});
 		return state;
 	}
 
@@ -425,24 +447,158 @@ export class RuntimeOwner {
 		return fn();
 	}
 
-	async #handle(req: EndpointRequest): Promise<unknown> {
+	async #withLifecycleMutation<T>(fn: () => Promise<T>): Promise<T> {
+		const previous = this.#lifecycleMutation;
+		let unlock!: () => void;
+		this.#lifecycleMutation = new Promise<void>(resolve => {
+			unlock = resolve;
+		});
+		await previous;
+		try {
+			return await fn();
+		} finally {
+			unlock();
+		}
+	}
+
+	#withRetirementSensitiveWork<T>(work: () => Promise<T>): Promise<T> {
+		const operation = work();
+		let done!: Promise<void>;
+		done = operation
+			.then(
+				() => undefined,
+				() => undefined,
+			)
+			.then(() => {
+				this.#activeRetirementSensitiveWork.delete(done);
+			});
+		this.#activeRetirementSensitiveWork.add(done);
+		return operation;
+	}
+
+	async #joinRetirementSensitiveWork(): Promise<void> {
+		await Promise.all([...this.#activeRetirementSensitiveWork]);
+	}
+
+	#withOwnedValidationWork<T>(requestSignal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		const controller = new AbortController();
+		const done = Promise.withResolvers<void>();
+		const active = { controller, done: done.promise };
+		const abortFromRequest = (): void => controller.abort(requestSignal.reason);
+		if (requestSignal.aborted) abortFromRequest();
+		else requestSignal.addEventListener("abort", abortFromRequest, { once: true });
+		if (this.#stopPromise) controller.abort(new Error("owner_stopping"));
+		this.#activeValidationWork.add(active);
+		return (async () => {
+			try {
+				return await work(controller.signal);
+			} catch (error) {
+				if (controller.signal.aborted && !(error instanceof ValidationObservationUncertainError)) {
+					this.#validationStopFailure = error;
+				}
+				throw error;
+			} finally {
+				requestSignal.removeEventListener("abort", abortFromRequest);
+				this.#activeValidationWork.delete(active);
+				done.resolve();
+			}
+		})();
+	}
+
+	async #stopActiveValidationWork(): Promise<void> {
+		const active = [...this.#activeValidationWork];
+		for (const work of active) work.controller.abort(new Error("owner_stopping"));
+		await Promise.all(active.map(work => work.done));
+		if (this.#validationStopFailure !== null) {
+			throw new AggregateError([this.#validationStopFailure], "Runtime owner validation cleanup failed.");
+		}
+	}
+
+	async #persistValidationLifecycle(
+		signal: AbortSignal,
+		lifecycle: SessionState["lifecycle"],
+		blockers?: string[],
+	): Promise<{ state: SessionState; persisted: boolean }> {
+		return this.#withLifecycleMutation(async () => {
+			const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			if (signal.aborted || state.lifecycle === "retired") {
+				return { state, persisted: false };
+			}
+			if (state.lifecycle === "completed") return { state, persisted: lifecycle === "completed" };
+			state.lifecycle = lifecycle;
+			if (blockers) state.blockers = blockers;
+			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+			await writeSessionState(this.#opts.root, state);
+			return { state, persisted: true };
+		});
+	}
+
+	async #persistOwnedReceipt(
+		signal: AbortSignal,
+		family: "validation" | "completion" | "review-failure" | "review-verdict",
+		receipt: ReceiptEnvelope<unknown>,
+	): Promise<ReceiptIndexEntry | null> {
+		return this.#withLifecycleMutation(async () => {
+			const state = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!state) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			if (
+				signal.aborted ||
+				this.#retiring ||
+				this.#stopPromise ||
+				state.lifecycle === "retired" ||
+				state.lifecycle === "completed"
+			) {
+				return null;
+			}
+			return writeReceiptImmutable(this.#opts.root, this.#opts.sessionId, family, receipt.receiptId, receipt);
+		});
+	}
+
+	#finalizeChecksForOwner(checks: FinalizeChecks, signal: AbortSignal): FinalizeChecks {
+		return {
+			runValidation: (spec, validationSignal) => checks.runValidation(spec, validationSignal ?? signal),
+			resolveCommit: () => checks.resolveCommit(),
+			commitOnBranch: (commit, branch) => checks.commitOnBranch(commit, branch),
+			prOrIssue: () => checks.prOrIssue(),
+			writeReceipt: (family, receipt) => this.#persistOwnedReceipt(signal, family, receipt),
+		};
+	}
+
+	async #handle(req: EndpointHandlerRequest): Promise<unknown> {
+		if (this.#stopPromise && !this.#retiring && req.verb === "retire") {
+			return { ok: false, error: "owner_stopping" };
+		}
+		if (
+			(this.#stopPromise || this.#retiring) &&
+			(req.verb === "submit" ||
+				req.verb === "recover" ||
+				req.verb === "observe" ||
+				req.verb === "validate" ||
+				req.verb === "finalize" ||
+				req.verb === "operate")
+		) {
+			return { ok: false, error: this.#retiring ? "owner_retiring" : "owner_stopping" };
+		}
 		switch (req.verb) {
 			case "ping":
 				return { ok: true, ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch };
 			case "submit":
-				return this.#submit(req.input);
+				return this.#withRetirementSensitiveWork(() => this.#submit(req.input));
 			case "observe":
-				return this.#observe();
+				return this.#withRetirementSensitiveWork(() => this.#observe());
 			case "retire":
 				return this.#retire();
 			case "finalize":
-				return this.#withReceiptSpoolFromInput(req.input, () => this.#finalize(req.input));
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#finalize(req.input, req.signal));
 			case "recover":
-				return this.#withReceiptSpoolFromInput(req.input, () => this.#recover());
+				return this.#withRetirementSensitiveWork(() =>
+					this.#withReceiptSpoolFromInput(req.input, () => this.#recover()),
+				);
 			case "validate":
-				return this.#withReceiptSpoolFromInput(req.input, () => this.#validate());
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#validate(req.signal));
 			case "operate":
-				return this.#withReceiptSpoolFromInput(req.input, () => this.#operate(req.input));
+				return this.#withReceiptSpoolFromInput(req.input, () => this.#operate(req.input, req.signal));
 			default:
 				return { ok: false, error: `owner_unsupported_verb:${req.verb}` };
 		}
@@ -512,52 +668,79 @@ export class RuntimeOwner {
 		};
 	}
 
-	async #validate(): Promise<PrimitiveResponse> {
-		const state = await this.#loadState();
-		if (state.handle.mode === "review") {
-			// Review-only sessions do not run implementation validation and never attach PR metadata.
-			state.lifecycle = "validating";
-			state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-			await writeSessionState(this.#opts.root, state);
-			await this.#emit("info", "validated", { count: 0, reviewOnly: true });
-			return this.#response(state, { validation: [], reviewOnly: true });
-		}
-		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace);
-		const commit = await checks.resolveCommit();
-		const subject: ReceiptSubject = {
-			workspace: state.handle.workspace,
-			branch: state.handle.branch,
-			head: commit,
-			commit,
-		};
-		const validation: { name: string; valid: boolean; exitStatus: number }[] = [];
-		for (const spec of this.#validationCommands ?? []) {
-			const run = await checks.runValidation(spec);
-			const evidence: ValidationEvidence = {
-				command: spec.name,
-				exactCommand: run.exactCommand,
-				cwd: run.cwd,
-				exitStatus: run.exitStatus,
-				pass: run.pass,
-				commitUnderTest: commit,
+	async #validate(requestSignal: AbortSignal): Promise<PrimitiveResponse> {
+		return this.#withOwnedValidationWork(requestSignal, async signal => {
+			const state = await this.#loadState();
+			const canceledResponse = async (evidence: Record<string, unknown>): Promise<PrimitiveResponse> => {
+				const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
+				if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+				return this.#response(latest, evidence, false);
 			};
-			const receipt = buildReceipt<ValidationEvidence>({
-				receiptId: `val-${Date.now()}-${randomBytes(4).toString("hex")}`,
-				sessionId: this.#opts.sessionId,
-				family: "validation",
-				source: "owner",
-				subject,
-				evidence,
-				valid: run.pass,
-			});
-			await writeReceiptImmutable(this.#opts.root, this.#opts.sessionId, "validation", receipt.receiptId, receipt);
-			validation.push({ name: spec.name, valid: validateReceipt(receipt).valid, exitStatus: run.exitStatus });
-		}
-		state.lifecycle = "validating";
-		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-		await writeSessionState(this.#opts.root, state);
-		await this.#emit("info", "validated", { count: validation.length });
-		return this.#response(state, { validation });
+			if (signal.aborted) return canceledResponse({ canceled: true, validation: [] });
+			if (state.handle.mode === "review") {
+				// Review-only sessions do not run implementation validation and never attach PR metadata.
+				const updated = await this.#persistValidationLifecycle(signal, "validating");
+				if (updated.persisted) await this.#emit("info", "validated", { count: 0, reviewOnly: true });
+				return this.#response(updated.state, { validation: [], reviewOnly: true }, updated.persisted);
+			}
+			const checks = this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace);
+			const commit = await checks.resolveCommit();
+			if (signal.aborted) return canceledResponse({ canceled: true, validation: [] });
+			const subject: ReceiptSubject = {
+				workspace: state.handle.workspace,
+				branch: state.handle.branch,
+				head: commit,
+				commit,
+			};
+			const validation: { name: string; valid: boolean; exitStatus: number }[] = [];
+			for (const spec of this.#validationCommands ?? []) {
+				if (signal.aborted) return canceledResponse({ canceled: true, validation });
+				let run: ValidationRun;
+				try {
+					run = await checks.runValidation(spec, signal);
+				} catch (caught) {
+					if (caught instanceof ValidationObservationUncertainError) {
+						if (signal.aborted) return canceledResponse({ canceled: true, validation });
+						const updated = await this.#persistValidationLifecycle(signal, "blocked", [
+							`validation-unknown:${spec.name}`,
+						]);
+						if (updated.persisted) {
+							await this.#emit("critical", "validation_uncertain", {
+								name: spec.name,
+								exactCommand: caught.exactCommand,
+								cwd: caught.cwd,
+							});
+						}
+						return this.#response(updated.state, { uncertain: true, name: spec.name, validation }, false);
+					}
+					throw caught;
+				}
+				if (signal.aborted) return canceledResponse({ canceled: true, validation });
+				const evidence: ValidationEvidence = {
+					command: spec.name,
+					exactCommand: run.exactCommand,
+					cwd: run.cwd,
+					exitStatus: run.exitStatus,
+					pass: run.pass,
+					commitUnderTest: commit,
+				};
+				const receipt = buildReceipt<ValidationEvidence>({
+					receiptId: `val-${Date.now()}-${randomBytes(4).toString("hex")}`,
+					sessionId: this.#opts.sessionId,
+					family: "validation",
+					source: "owner",
+					subject,
+					evidence,
+					valid: run.pass,
+				});
+				const entry = await this.#persistOwnedReceipt(signal, "validation", receipt);
+				if (!entry) return canceledResponse({ canceled: true, validation });
+				validation.push({ name: spec.name, valid: validateReceipt(receipt).valid, exitStatus: run.exitStatus });
+			}
+			const updated = await this.#persistValidationLifecycle(signal, "validating");
+			if (updated.persisted) await this.#emit("info", "validated", { count: validation.length });
+			return this.#response(updated.state, { validation }, updated.persisted);
+		});
 	}
 
 	async #recover(): Promise<PrimitiveResponse> {
@@ -610,26 +793,31 @@ export class RuntimeOwner {
 		return this.#response(state, { decision, observation: recoveryObservation, vanishReceiptId });
 	}
 
-	async #operate(input: Record<string, unknown>): Promise<PrimitiveResponse> {
+	async #operate(input: Record<string, unknown>, requestSignal: AbortSignal): Promise<PrimitiveResponse> {
+		return this.#withOwnedValidationWork(requestSignal, signal => this.#operateOwned(input, signal));
+	}
+
+	async #operateOwned(input: Record<string, unknown>, signal: AbortSignal): Promise<PrimitiveResponse> {
 		const goal = typeof input.goal === "string" ? input.goal : "";
-		let state = await this.#loadState();
+		const state = await this.#loadState();
 		if (!goal) return this.#response(state, { error: "empty-goal" }, false);
+		const baseChecks = this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace);
+		const finalizeChecks = this.#finalizeChecksForOwner(baseChecks, signal);
 		const emitOperateEvent = async (
 			severity: Severity,
 			kind: string,
 			evidence: Record<string, unknown>,
 		): Promise<void> => {
+			if (signal.aborted) return;
 			if (kind === "operate_blocked" || kind === "operate_finalized") {
-				const terminalState = await this.#loadState();
-				terminalState.lifecycle =
-					kind === "operate_finalized" && evidence.completed === true ? "completed" : "blocked";
-				terminalState.blockers = Array.isArray(evidence.blockers)
+				const lifecycle = kind === "operate_finalized" && evidence.completed === true ? "completed" : "blocked";
+				const blockers = Array.isArray(evidence.blockers)
 					? evidence.blockers.filter((blocker): blocker is string => typeof blocker === "string")
-					: terminalState.lifecycle === "completed"
+					: lifecycle === "completed"
 						? []
-						: terminalState.blockers;
-				terminalState.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-				await writeSessionState(this.#opts.root, terminalState);
+						: undefined;
+				const persisted = await this.#persistValidationLifecycle(signal, lifecycle, blockers);
+				if (!persisted.persisted) return;
 			}
 			await this.#emit(severity, kind, evidence);
 		};
@@ -640,24 +828,30 @@ export class RuntimeOwner {
 			branch: state.handle.branch ?? "",
 			transport: this.#opts.transport,
 			observe: () => this.#observeGit(),
-			finalizeChecks: this.#finalizeChecks ?? defaultFinalizeChecks(state.handle.workspace),
+			finalizeChecks,
 			validationCommands: this.#validationCommands,
 			maxIterations: typeof input.maxIterations === "number" ? input.maxIterations : 5,
 			emit: emitOperateEvent,
 		});
-		// Persist the loop's terminal lifecycle/blockers so the response state is not stale.
-		state = await this.#loadState();
-		state.lifecycle = result.lifecycle;
-		state.blockers = result.blockers;
-		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-		await writeSessionState(this.#opts.root, state);
-		return this.#response(state, { operate: result }, result.completed);
+		if (signal.aborted) {
+			const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			return this.#response(latest, { canceled: true, operate: result }, false);
+		}
+		// Persist the loop's lifecycle/blockers from a fresh state under the same lock
+		// as retire so an older operation snapshot cannot resurrect terminal state.
+		const persisted = await this.#persistValidationLifecycle(signal, result.lifecycle, result.blockers);
+		return this.#response(persisted.state, { operate: result }, result.completed && persisted.persisted);
 	}
 
-	async #finalize(input: Record<string, unknown>): Promise<PrimitiveResponse> {
+	async #finalize(input: Record<string, unknown>, requestSignal: AbortSignal): Promise<PrimitiveResponse> {
+		return this.#withOwnedValidationWork(requestSignal, signal => this.#finalizeOwned(input, signal));
+	}
+
+	async #finalizeOwned(input: Record<string, unknown>, signal: AbortSignal): Promise<PrimitiveResponse> {
 		const state = await this.#loadState();
 		const workspace = state.handle.workspace;
-		const checks = this.#finalizeChecks ?? defaultFinalizeChecks(workspace);
+		const checks = this.#finalizeChecksForOwner(this.#finalizeChecks ?? defaultFinalizeChecks(workspace), signal);
 		const reviewOnly = state.handle.mode === "review";
 		const inputVerdict = reviewOnly ? (typeof input.verdict === "string" ? input.verdict : null) : undefined;
 		// Review-only finalize with no explicit verdict pulls the final assistant text from the live
@@ -665,6 +859,11 @@ export class RuntimeOwner {
 		let assistantText: string | null = null;
 		if (reviewOnly && inputVerdict == null && this.#opts.transport.getLastAssistantText) {
 			assistantText = await this.#opts.transport.getLastAssistantText().catch(() => null);
+		}
+		if (signal.aborted) {
+			const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			return this.#response(latest, { canceled: true }, false);
 		}
 		const fin = await runFinalize({
 			root: this.#opts.root,
@@ -680,18 +879,28 @@ export class RuntimeOwner {
 			requirePr: input.requirePr !== false,
 			validationCommands: this.#validationCommands,
 			checks,
+			signal,
 			clock: this.#opts.clock,
 		});
-		state.lifecycle = fin.completed ? "completed" : "blocked";
-		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-		if (!fin.completed) state.blockers = fin.blockers;
-		await writeSessionState(this.#opts.root, state);
+		if (signal.aborted) {
+			const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			return this.#response(latest, { canceled: true, finalize: fin }, false);
+		}
+		const persisted = await this.#persistValidationLifecycle(
+			signal,
+			fin.completed ? "completed" : "blocked",
+			fin.completed ? undefined : fin.blockers,
+		);
+		if (!persisted.persisted) {
+			return this.#response(persisted.state, { canceled: signal.aborted, finalize: fin }, false);
+		}
 		await this.#emit(fin.completed ? "info" : "critical", "finalized", {
 			completed: fin.completed,
 			blockers: fin.blockers,
 			...(reviewOnly ? { verdict: fin.verdict ?? null, reviewOnly: true } : {}),
 		});
-		return this.#response(state, { finalize: fin }, fin.completed);
+		return this.#response(persisted.state, { finalize: fin }, fin.completed);
 	}
 
 	async #submit(input: Record<string, unknown>): Promise<PrimitiveResponse> {
@@ -775,13 +984,31 @@ export class RuntimeOwner {
 		return this.#response(state, { observation, ownerRouted: true }, true, submitGateReason);
 	}
 
-	async #retire(): Promise<PrimitiveResponse> {
-		const state = await this.#loadState();
-		state.lifecycle = "retired";
-		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
-		await writeSessionState(this.#opts.root, state);
+	#retire(): Promise<PrimitiveResponse> {
+		if (this.#retirePromise) return this.#retirePromise;
+		this.#retiring = true;
+		this.#retirePromise = this.#retireOnce();
+		void this.#retirePromise.then(
+			() => queueMicrotask(() => void this.stop().catch(() => {})),
+			() => {},
+		);
+		return this.#retirePromise;
+	}
+
+	async #retireOnce(): Promise<PrimitiveResponse> {
+		// Fence new mutating work first, then abort validation and join every request
+		// that could still commit state or a receipt before recording retirement.
+		await this.#stopActiveValidationWork();
+		await this.#joinRetirementSensitiveWork();
+		const state = await this.#withLifecycleMutation(async () => {
+			const current = await readSessionState(this.#opts.root, this.#opts.sessionId);
+			if (!current) throw new Error(`session_not_found:${this.#opts.sessionId}`);
+			current.lifecycle = "retired";
+			current.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
+			await writeSessionState(this.#opts.root, current);
+			return current;
+		});
 		await this.#emit("info", "owner_retired", {});
-		queueMicrotask(() => void this.stop().catch(() => {}));
 		return this.#response(state, { retired: true });
 	}
 
@@ -865,6 +1092,13 @@ export class RuntimeOwner {
 			const reportFailure = await this.#reportStopFailure(kind, error);
 			if (reportFailure !== null) failures.push(reportFailure);
 		};
+		// A retirement already in progress must finish its state commit before stop
+		// tears down the endpoint or relinquishes the lease.
+		if (this.#retirePromise) await this.#retirePromise;
+		// Validation owns independent subprocess groups. Cancel and join those exact
+		// requests before transport/endpoint teardown can surrender the owner lease.
+		await this.#stopActiveValidationWork();
+		await this.#joinRetirementSensitiveWork();
 		const unsubscribe = this.#unsubscribeFrames;
 		if (unsubscribe) {
 			try {

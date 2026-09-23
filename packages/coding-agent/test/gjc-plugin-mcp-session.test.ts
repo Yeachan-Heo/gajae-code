@@ -1,15 +1,17 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { buildPluginMcpConfigs } from "../src/extensibility/gjc-plugins/runtime-adapters";
 import { MCPManager } from "../src/runtime-mcp";
+import * as mcpClient from "../src/runtime-mcp/client";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const mcpBundle = path.join(fixturesRoot, "valid-mcp-bundle");
@@ -23,6 +25,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 	fs.rmSync(agentDir, { recursive: true, force: true });
@@ -335,6 +338,23 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		const connected = await callerManager.connectServers(configs, sources as never);
 		expect(connected.errors.size).toBe(0);
 		expect(callerManager.getTools().map(tool => tool.name)).toContain("mcp__domain_docs_lookup");
+		const lateToolName = "mcp__domain_docs_late_lookup";
+		const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+		let childSession: AgentSession | undefined;
+		let awaitLateCatalogSync = false;
+		const lateCatalogSynced = Promise.withResolvers<void>();
+		vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+			this: AgentSession,
+			previousNames,
+			nextTools,
+			options,
+		) {
+			await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
+			if (this === childSession && awaitLateCatalogSync && nextTools.some(tool => tool.name === lateToolName)) {
+				awaitLateCatalogSync = false;
+				lateCatalogSynced.resolve();
+			}
+		});
 
 		const child = await createAgentSession({
 			cwd,
@@ -353,6 +373,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			parentTaskPrefix: "0-Forged",
 			mcpManager: callerManager,
 		});
+		childSession = child.session;
 		try {
 			expect(child.session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
 			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
@@ -362,6 +383,26 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			await child.session.setActiveToolsByName([]);
 			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
 			expect(child.mcpManager).toBe(callerManager);
+
+			const listTools = vi
+				.spyOn(mcpClient, "listTools")
+				.mockResolvedValue([{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }]);
+			awaitLateCatalogSync = true;
+			await callerManager.refreshServerTools("domain_docs");
+			await lateCatalogSynced.promise;
+			const deadline = Date.now() + 5_000;
+			while (!child.session.getAllToolNames().includes(lateToolName)) {
+				if (Date.now() >= deadline) throw new Error("late caller-owned MCP tool did not reach child");
+				await Bun.sleep(1);
+			}
+			expect(listTools).toHaveBeenCalledTimes(1);
+			expect(child.session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
+			expect(child.session.getSelectedMCPToolNames()).not.toContain(lateToolName);
+			await child.session.setActiveToolsByName([lateToolName]);
+			expect(child.session.getActiveToolNames()).toContain(lateToolName);
+			await child.session.setActiveToolsByName([]);
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
 		} finally {
 			await child.session.dispose();
 		}

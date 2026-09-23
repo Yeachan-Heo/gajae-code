@@ -109,6 +109,117 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
+	test("notifies independent tool subscribers for catalog changes and stops after unsubscribe", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const secondConnection = makeConnection("second", async () => {});
+		const definitions: MCPToolDefinition[][] = [
+			[{ name: "first", inputSchema: { type: "object" } }],
+			[{ name: "renamed", inputSchema: { type: "object" } }],
+			[],
+			[{ name: "after_unsubscribe", inputSchema: { type: "object" } }],
+			[{ name: "published", inputSchema: { type: "object" } }],
+		];
+		const changes: string[][] = [];
+		const remainingChanges: string[][] = [];
+		const snapshotMutationResults: Array<{ frozen: boolean; mutationRejected: boolean; catalog: string[] }> = [];
+		let ownerChanges = 0;
+		let throwOwnerCallback = false;
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation(async name => (name === "second" ? secondConnection : connection));
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => definitions.shift() ?? []);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		manager.setOnToolsChanged(() => {
+			ownerChanges++;
+			if (throwOwnerCallback) throw new Error("owner callback failed");
+		});
+		const unsubscribe = manager.subscribeToToolsChanged(tools => {
+			changes.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeRemaining = manager.subscribeToToolsChanged(tools => {
+			remainingChanges.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeReadOnly = manager.subscribeToToolsChanged(tools => {
+			let mutationRejected = false;
+			try {
+				(tools as unknown as unknown[]).pop();
+			} catch {
+				mutationRejected = true;
+			}
+			snapshotMutationResults.push({
+				frozen: Object.isFrozen(tools),
+				mutationRejected,
+				catalog: manager.getTools().map(tool => tool.name),
+			});
+		});
+		try {
+			const result = await manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {});
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__late_first"]);
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"]]);
+			await manager.refreshServerTools("late");
+			await manager.refreshServerTools("late");
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"], ["mcp__late_renamed"], []]);
+
+			unsubscribe();
+			throwOwnerCallback = true;
+			await manager.refreshServerTools("late");
+			throwOwnerCallback = false;
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__late_after_unsubscribe"]);
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_first"], ["mcp__late_renamed"], []]);
+			expect(remainingChanges).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(snapshotMutationResults).toHaveLength(5);
+			expect(snapshotMutationResults.every(result => result.frozen && result.mutationRejected)).toBe(true);
+			expect(snapshotMutationResults.map(result => result.catalog)).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(warning.mock.calls.map(([message]) => message)).toContain("MCP tool catalog owner callback failed");
+
+			const bulkResult = await manager.connectServers({ second: { type: "http", url: "http://127.0.0.1:2" } }, {});
+			expect(bulkResult.tools.map(tool => tool.name)).toEqual(["mcp__second_published"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__second_published"]);
+			expect(remainingChanges).toEqual([
+				["mcp__late_first"],
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+				["mcp__late_after_unsubscribe", "mcp__second_published"],
+				["mcp__second_published"],
+			]);
+			expect(snapshotMutationResults.map(result => result.catalog)).toEqual(remainingChanges);
+			expect(ownerChanges).toBe(7);
+			expect(connect).toHaveBeenCalledTimes(2);
+
+			await manager.disconnectAll();
+			expect(manager.getTools()).toEqual([]);
+			expect(remainingChanges).toHaveLength(8);
+			expect(remainingChanges.at(-1)).toEqual([]);
+			expect(snapshotMutationResults).toHaveLength(8);
+			expect(snapshotMutationResults.at(-1)).toEqual({
+				frozen: true,
+				mutationRejected: true,
+				catalog: [],
+			});
+			expect(ownerChanges).toBe(8);
+		} finally {
+			unsubscribe();
+			unsubscribeRemaining();
+			unsubscribeReadOnly();
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
 	test("retains a post-return background tool-load failure in the result errors", async () => {
 		const manager = new MCPManager(process.cwd());
 		const connection = makeConnection("late", async () => {});

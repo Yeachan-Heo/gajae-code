@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
@@ -114,6 +115,12 @@ export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedSta
 
 export interface StateWriterOptions {
 	cwd?: string;
+	/**
+	 * Linux-only private durable source publication. The supplied directory is
+	 * the exact private subtree containing the target; existing paths are never
+	 * chmodded or repaired.
+	 */
+	privateDurable?: { directory: string };
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
@@ -147,6 +154,16 @@ export class StateWriteConflictError extends Error {
 
 export interface DeleteIfOwnedOptions extends StateWriterOptions {
 	predicate?: (current: unknown) => boolean | Promise<boolean>;
+}
+
+export class StatePublicationUncertainError extends Error {
+	constructor(
+		public readonly path: string,
+		public readonly cause: unknown,
+	) {
+		super(`state publication requires authoritative reload: ${path}`);
+		this.name = "StatePublicationUncertainError";
+	}
 }
 
 export interface DeleteResult {
@@ -528,13 +545,293 @@ async function atomicWrite(filePath: string, content: string): Promise<string> {
 	return filePath;
 }
 
+function currentUid(): number {
+	const uid = process.getuid?.();
+	if (uid === undefined) throw new Error("private durable publication requires a POSIX uid");
+	return uid;
+}
+
+interface PrivatePublicationDirectory {
+	handle: FileHandle;
+	parent?: PrivatePublicationDirectory;
+	name?: string;
+	dev: number;
+	ino: number;
+	privateSubtree: boolean;
+}
+
+interface PrivatePublicationContext {
+	root: string;
+	directories: PrivatePublicationDirectory[];
+	targetParent: PrivatePublicationDirectory;
+	anchoredTarget: string;
+}
+
+function assertSafePublicationDirectory(stat: Stats, directory: string, privateSubtree: boolean): void {
+	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe publication directory");
+	if ((stat.mode & 0o022) !== 0 || stat.uid !== currentUid()) {
+		const mode = (stat.mode & 0o777).toString(8);
+		throw new Error(
+			`publication parent is not exclusively owned (uid=${stat.uid}, mode=${mode}, directory=${path.basename(directory)})`,
+		);
+	}
+	if (privateSubtree && (stat.mode & 0o777) !== 0o700)
+		throw new Error("private publication directory is not owned mode 0700");
+}
+
+function procPath(handle: FileHandle): string {
+	return `/proc/self/fd/${handle.fd}`;
+}
+
+function directoryPath(directory: PrivatePublicationDirectory): string {
+	return procPath(directory.handle);
+}
+
+const LINUX_O_PATH = 0o10000000;
+
+async function readPrivateExistingStateForMutation(filePath: string): Promise<StrictMutationReadResult> {
+	let handle: FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.uid !== currentUid())
+			throw new Error("unsafe private publication file");
+		const parsed = JSON.parse(await handle.readFile("utf-8"));
+		if (isPlainObject(parsed)) return { kind: "valid", value: parsed };
+		return { kind: "corrupt", error: "state file must contain a JSON object" };
+	} catch (error) {
+		if (isErrno(error, "ENOENT")) return { kind: "absent" };
+		return { kind: "corrupt", error: error instanceof Error ? error.message : String(error) };
+	} finally {
+		await handle?.close();
+	}
+}
+
+async function assertPrivatePublicationDirectories(context: PrivatePublicationContext): Promise<void> {
+	for (const expected of context.directories) {
+		const current = await expected.handle.stat();
+		const directory =
+			expected.parent && expected.name ? path.join(directoryPath(expected.parent), expected.name) : context.root;
+		assertSafePublicationDirectory(current, directory, expected.privateSubtree);
+		if (current.dev !== expected.dev || current.ino !== expected.ino)
+			throw new Error("private publication directory changed during publication");
+		if (expected.parent && expected.name) {
+			const linked = await fs.lstat(path.join(directoryPath(expected.parent), expected.name));
+			if (
+				!linked.isDirectory() ||
+				linked.isSymbolicLink() ||
+				linked.dev !== expected.dev ||
+				linked.ino !== expected.ino
+			)
+				throw new Error("private publication directory changed during publication");
+		}
+	}
+	const namedRoot = await fs.lstat(context.root);
+	const root = context.directories[0];
+	if (
+		!root ||
+		!namedRoot.isDirectory() ||
+		namedRoot.isSymbolicLink() ||
+		namedRoot.dev !== root.dev ||
+		namedRoot.ino !== root.ino
+	)
+		throw new Error("private publication root changed during publication");
+}
+
+async function closePrivatePublicationContext(context: PrivatePublicationContext): Promise<void> {
+	await Promise.all(
+		context.directories
+			.splice(0)
+			.reverse()
+			.map(directory => directory.handle.close()),
+	);
+}
+
+async function preparePrivateDirectory(
+	filePath: string,
+	options: StateWriterOptions,
+): Promise<PrivatePublicationContext> {
+	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
+	const boundary = resolveGjcTarget(options.privateDurable!.directory, cwdForOptions(options));
+	if (boundary !== path.dirname(filePath)) throw new Error("private publication directory must be the target parent");
+	const root = cwdForOptions(options);
+	if ((await fs.realpath(root)) !== root) throw new Error("private publication requires canonical cwd");
+	const directories: PrivatePublicationDirectory[] = [];
+	const openFlags = fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+	try {
+		const rootHandle = await fs.open(root, openFlags);
+		let rootStat: Stats;
+		try {
+			rootStat = await rootHandle.stat();
+		} catch (error) {
+			await rootHandle.close();
+			throw error;
+		}
+		directories.push({
+			handle: rootHandle,
+			dev: rootStat.dev,
+			ino: rootStat.ino,
+			privateSubtree: false,
+		});
+		assertSafePublicationDirectory(rootStat, root, false);
+		const namedRoot = await fs.lstat(root);
+		if (namedRoot.isSymbolicLink() || namedRoot.dev !== rootStat.dev || namedRoot.ino !== rootStat.ino)
+			throw new Error("private publication root changed during publication");
+
+		let parent = directories[0];
+		if (!parent) throw new Error("private publication root was not opened");
+		let directory = root;
+		for (const segment of path.relative(root, path.dirname(filePath)).split(path.sep)) {
+			const childPath = path.join(directoryPath(parent), segment);
+			directory = path.join(directory, segment);
+			let created = false;
+			try {
+				await fs.mkdir(childPath, { mode: 0o700 });
+				created = true;
+			} catch (error) {
+				if (!isErrno(error, "EEXIST")) throw error;
+			}
+			let createdIdentity: { dev: number; ino: number } | undefined;
+			if (created) {
+				const pathHandle = await fs.open(
+					childPath,
+					LINUX_O_PATH | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+				);
+				try {
+					const beforeChmod = await pathHandle.stat();
+					if (!beforeChmod.isDirectory() || beforeChmod.uid !== currentUid() || (beforeChmod.mode & 0o022) !== 0)
+						throw new Error("unsafe newly created private publication directory");
+					await fs.chmod(procPath(pathHandle), 0o700);
+					const afterChmod = await pathHandle.stat();
+					if ((afterChmod.mode & 0o777) !== 0o700)
+						throw new Error("private publication directory is not owned mode 0700");
+					createdIdentity = { dev: afterChmod.dev, ino: afterChmod.ino };
+				} finally {
+					await pathHandle.close();
+				}
+			}
+			const childHandle = await fs.open(childPath, openFlags);
+			let childStat: Stats;
+			try {
+				childStat = await childHandle.stat();
+			} catch (error) {
+				await childHandle.close();
+				throw error;
+			}
+			if (createdIdentity && (childStat.dev !== createdIdentity.dev || childStat.ino !== createdIdentity.ino)) {
+				await childHandle.close();
+				throw new Error("private publication directory changed during creation");
+			}
+			const privateSubtree = directory === boundary || directory.startsWith(`${boundary}${path.sep}`);
+			const child: PrivatePublicationDirectory = {
+				handle: childHandle,
+				parent,
+				name: segment,
+				dev: childStat.dev,
+				ino: childStat.ino,
+				privateSubtree,
+			};
+			directories.push(child);
+			assertSafePublicationDirectory(childStat, directory, privateSubtree);
+			if (created || directory === boundary) {
+				// The newly linked entry is durable only after both the child and its
+				// parent have been synced. Newly created directories are chmodded first
+				// so umask cannot weaken their required mode.
+				await childHandle.sync();
+				await parent.handle.sync();
+			}
+			parent = child;
+		}
+		const targetParent = directories[directories.length - 1];
+		if (!targetParent) throw new Error("private publication target parent was not opened");
+		const context: PrivatePublicationContext = {
+			root,
+			directories,
+			targetParent,
+			anchoredTarget: path.join(directoryPath(targetParent), path.basename(filePath)),
+		};
+		await assertPrivatePublicationDirectories(context);
+		try {
+			const stat = await fs.lstat(context.anchoredTarget);
+			if (
+				!stat.isFile() ||
+				stat.isSymbolicLink() ||
+				stat.nlink !== 1 ||
+				(stat.mode & 0o777) !== 0o600 ||
+				stat.uid !== currentUid()
+			)
+				throw new Error("unsafe private publication file");
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		return context;
+	} catch (error) {
+		await Promise.all(directories.reverse().map(directory => directory.handle.close().catch(() => undefined)));
+		throw error;
+	}
+}
+
+async function privateAtomicWrite(
+	filePath: string,
+	content: string,
+	options: StateWriterOptions,
+	context: PrivatePublicationContext,
+): Promise<void> {
+	await assertPrivatePublicationDirectories(context);
+	const temporary = tempPathFor(filePath);
+	const anchoredTemporary = path.join(directoryPath(context.targetParent), path.basename(temporary));
+	let renameAttempted = false;
+	try {
+		const handle = await fs.open(anchoredTemporary, "wx", 0o600);
+		try {
+			await handle.chmod(0o600);
+			const created = await handle.stat();
+			if (!created.isFile() || created.uid !== currentUid() || (created.mode & 0o777) !== 0o600)
+				throw new Error("unsafe private publication temporary file");
+			await handle.writeFile(content, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await assertPrivatePublicationDirectories(context);
+		renameAttempted = true;
+		await fs.rename(anchoredTemporary, context.anchoredTarget);
+		await context.targetParent.handle.sync();
+		await assertPrivatePublicationDirectories(context);
+		await maybeAudit(filePath, options);
+	} catch (error) {
+		// A rename call or anything after it can have committed the replacement
+		// before returning an error. The caller must reload instead of retrying
+		// with a new authority record.
+		if (renameAttempted) throw new StatePublicationUncertainError(filePath, error);
+		await fs.rm(anchoredTemporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
 async function writeGuardedResolvedJsonAtomic(
 	filePath: string,
 	value: unknown,
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
+	let privateContext: PrivatePublicationContext | undefined;
+	if (options.privateDurable) {
+		if (options.policy !== "source" || options.expectedRevision === undefined)
+			throw new Error("private durable publication requires source CAS");
+		privateContext = await preparePrivateDirectory(filePath, options);
+	}
 	const write = async (): Promise<GuardedWriteResult> => {
-		const current = await readJsonIfPresentTolerant(filePath);
+		if (privateContext) await assertPrivatePublicationDirectories(privateContext);
+		const strict = privateContext
+			? await readPrivateExistingStateForMutation(privateContext.anchoredTarget)
+			: undefined;
+		if (strict?.kind === "corrupt") throw new Error(strict.error);
+		if (strict?.kind === "absent" && options.expectedRevision !== 0) throw new Error("established state missing");
+		const current = strict
+			? strict.kind === "valid"
+				? strict.value
+				: undefined
+			: await readJsonIfPresentTolerant(filePath);
 		const currentRevision = persistedStateRevision(current);
 
 		if (options.policy === "source") {
@@ -542,8 +839,13 @@ async function writeGuardedResolvedJsonAtomic(
 				throw new StateWriteConflictError(filePath, options.expectedRevision, currentRevision);
 			}
 			const next = stampStateRevision(withWorkflowReceipt(value, buildReceipt(options)), currentRevision + 1);
-			await atomicWrite(filePath, jsonText(next));
-			await maybeAudit(filePath, options);
+			if (options.privateDurable) {
+				if (!privateContext) throw new Error("private publication directories were not prepared");
+				await privateAtomicWrite(filePath, jsonText(next), options, privateContext);
+			} else {
+				await atomicWrite(filePath, jsonText(next));
+				await maybeAudit(filePath, options);
+			}
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		}
 
@@ -567,7 +869,11 @@ async function writeGuardedResolvedJsonAtomic(
 	// that already holds this target's lock (via `withWorkflowStateLock`) must say
 	// so rather than deadlocking against itself — the same `lockHeld` contract the
 	// envelope writers already use.
-	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
+	try {
+		return options.lockHeld ? await write() : await lockResolvedWorkflowTarget(filePath, write, options.lock);
+	} finally {
+		if (privateContext) await closePrivatePublicationContext(privateContext);
+	}
 }
 
 export async function writeGuardedJsonAtomic(
@@ -798,7 +1104,12 @@ export async function withWorkflowStateLock<T>(
 	options?: StateWriterOptions,
 ): Promise<T> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	return lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+	const privateContext = options?.privateDurable ? await preparePrivateDirectory(filePath, options) : undefined;
+	try {
+		return await lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+	} finally {
+		if (privateContext) await closePrivatePublicationContext(privateContext);
+	}
 }
 
 async function lockResolvedWorkflowTarget<T>(
