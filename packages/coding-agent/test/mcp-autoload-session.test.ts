@@ -16,7 +16,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
+import { DeferredMCPTool, type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
 
 const DEMO_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
@@ -352,6 +352,40 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			const agentPrompt = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			await session.prompt("prompt after failed deferred conventional startup");
 			expect(agentPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("retains the manager that owns cached tools after startup timeout", async () => {
+		await fs.promises.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.promises.writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { cached: { type: "stdio", command: process.execPath } } }),
+		);
+		const [cachedTool] = DeferredMCPTool.fromTools(
+			"cached",
+			[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			async () => {
+				throw new Error("cached server is disconnected");
+			},
+		);
+		if (!cachedTool) throw new Error("cached MCP tool was not created");
+		vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+			tools: [cachedTool],
+			errors: new Map([["cached", "MCP server connection timed out during startup: cached"]]),
+			connectedServers: [],
+			exaApiKeys: [],
+		});
+		vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
+		const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll").mockResolvedValue();
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(mcpManager).toBeDefined();
+			expect(session.getAllToolNames()).toContain("mcp__cached_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__cached_hello");
+			expect(disconnectAll).not.toHaveBeenCalled();
 		} finally {
 			await session.dispose();
 		}

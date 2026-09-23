@@ -3194,7 +3194,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
 				name => owned.getConnectionStatus(name) !== "disconnected",
 			);
-			const retainOwnedManager = result.connectedServers.length > 0 || unsettledConventionalNames.length > 0;
+			// Cached deferred tools still reconnect through this manager even after startup cleanup marks their server disconnected.
+			const retainOwnedManager =
+				result.connectedServers.length > 0 || unsettledConventionalNames.length > 0 || result.tools.length > 0;
 			if (retainOwnedManager) {
 				mcpManager = owned;
 				ownsMcpManager = true;
