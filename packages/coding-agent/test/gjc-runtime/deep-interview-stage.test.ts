@@ -6,6 +6,7 @@ import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runt
 import { deepInterviewDraftPath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-stage";
 import { ENVELOPE_RESERVED_STATE_KEYS } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
 import { modeStatePath, sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { stampWorkflowEnvelopeChecksum } from "../../src/gjc-runtime/state-writer";
 
 const TEST_SESSION_ID = "stage-test-session";
 const tempRoots: string[] = [];
@@ -698,9 +699,6 @@ describe("deep-interview staged transitions", () => {
 					"write",
 					"--input",
 					JSON.stringify({
-						current_phase: "handoff",
-						spec_path: "/tmp/legacy-spec.md",
-						spec_sha256: "a".repeat(64),
 						state: { note_a: "kept", established_facts: [{ id: "f1", statement: "fact", round: 1 }] },
 					}),
 					"--json",
@@ -992,6 +990,101 @@ describe("deep-interview staged transitions", () => {
 		expect(state.execution_approval).toBeUndefined();
 		expect(state.execution_approval_receipt).toBeUndefined();
 		expect(state.note).toBe("payload with fabricated contract");
+	});
+
+	it("ignores staged requirement-marker attempts and preserves recorder-owned intent", async () => {
+		const root = await tempDir();
+		const orphanAttempt = await run(root, [
+			"stage",
+			"--for",
+			"initialize-context",
+			"--input",
+			JSON.stringify({
+				state: {
+					initial_idea: "staged intent boundary",
+					intent_contract_required: true,
+					note: "not locked",
+				},
+			}),
+			"--json",
+		]);
+		expect(orphanAttempt.status).toBe(0);
+		expect(parse(orphanAttempt.stdout).ignored_runtime_owned_keys).toContain("state.intent_contract_required");
+		expect((await run(root, ["apply", "--json"])).status).toBe(0);
+		let state = (await readState(root)).state as Record<string, unknown>;
+		expect(state.intent_contract_required).toBeUndefined();
+		expect(state.intent_contract).toBeUndefined();
+
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" }],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		state = (await readState(root)).state as Record<string, unknown>;
+		const contract = state.intent_contract;
+		expect(state.intent_contract_required).toBe(true);
+		expect(contract).toBeDefined();
+
+		const clearAttempt = await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { intent_contract_required: false, note: "recorder contract remains" } }),
+			"--json",
+		]);
+		expect(clearAttempt.status).toBe(0);
+		expect(parse(clearAttempt.stdout).ignored_runtime_owned_keys).toContain("state.intent_contract_required");
+		expect((await run(root, ["apply", "--json"])).status).toBe(0);
+		state = (await readState(root)).state as Record<string, unknown>;
+		expect(state.intent_contract).toEqual(contract);
+		expect(state.intent_contract_required).toBe(true);
+		expect(state.note).toBe("recorder contract remains");
+	});
+
+	it("fails closed when persisted state requires a missing intent contract", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const orphaned = await readState(root);
+		const orphanedState = orphaned.state as Record<string, unknown>;
+		orphanedState.intent_contract_required = true;
+		orphanedState.rounds = [{ round: 0, lifecycle: "answered" }];
+		await fs.writeFile(
+			statePath,
+			`${JSON.stringify(stampWorkflowEnvelopeChecksum(orphaned, statePath), null, 2)}\n`,
+			"utf8",
+		);
+
+		const attempted = await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "must not overwrite required policy" } }),
+			"--json",
+		]);
+		expect(attempted.status).toBe(2);
+		expect(parse(attempted.stderr).code).toBe("DI_STAGE_STATE_CORRUPT");
+		expect(attempted.stderr).toContain("persisted intent contract is required but missing");
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).intent_contract_required).toBe(true);
+		expect((after.state as Record<string, unknown>).rounds).toEqual([{ round: 0, lifecycle: "answered" }]);
+		expect((after.state as Record<string, unknown>).note).toBeUndefined();
 	});
 
 	it("reports nested envelope-reserved keys instead of dropping them silently", async () => {

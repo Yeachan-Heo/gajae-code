@@ -188,6 +188,8 @@ function assertDeepInterviewEvidenceUnchanged(
 	const existingInner = isPlainObject(existingEnvelope.state) ? existingEnvelope.state : {};
 	const mergedInner = isPlainObject(mergedEnvelope.state) ? mergedEnvelope.state : {};
 
+	assertPersistedDeepInterviewIntentContract(existingEnvelope);
+	assertPersistedDeepInterviewIntentContract(mergedEnvelope);
 	assertDeepInterviewExecutionApprovalUnchanged(existingEnvelope, mergedEnvelope, surface);
 
 	if (existingEnvelope.active === false && mergedEnvelope.active !== false)
@@ -235,11 +237,74 @@ function assertDeepInterviewEvidenceUnchanged(
 			if (mergedEnvelope[field] !== existingEnvelope[field])
 				throw new StateCommandError(2, `crystallized ${field} is immutable through ${surface}`);
 		if (isPlainObject(existingInner.crystal) && existingInner.crystal.lifecycle === "ready") {
-			for (const field of ["rounds", "established_facts", "intent_review", "current_ambiguity"] as const)
+			for (const field of [
+				"rounds",
+				"established_facts",
+				"intent_review",
+				"current_ambiguity",
+				"topology",
+				"auto_answered_rounds",
+			] as const)
 				if (JSON.stringify(mergedInner[field]) !== JSON.stringify(existingInner[field]))
 					throw new StateCommandError(2, `ready Crystal evidence is immutable through ${surface}`);
 		}
 	}
+}
+
+/**
+ * `intent_contract_required` is recorder-owned policy evidence. Caller payloads
+ * cannot set or clear it; an already-persisted required marker is valid without
+ * its contract only during the seeded pre-Round-0 phase. Later locked evidence
+ * requires the persisted marker to have a canonical contract.
+ */
+function assertPersistedDeepInterviewIntentContract(envelope: Record<string, unknown>): void {
+	const inner = isPlainObject(envelope.state) ? envelope.state : {};
+	const hasRoundZeroEvidence =
+		Array.isArray(inner.rounds) && inner.rounds.some(round => isPlainObject(round) && round.round === 0);
+	const claimsLockedContract =
+		hasRoundZeroEvidence ||
+		inner.intent_review !== undefined ||
+		inner.crystal !== undefined ||
+		inner.execution_approval !== undefined ||
+		inner.execution_approval_receipt !== undefined ||
+		typeof envelope.spec_path === "string" ||
+		envelope.current_phase === "handoff" ||
+		envelope.current_phase === "complete";
+	if (inner.intent_contract_required === true && inner.intent_contract === undefined && claimsLockedContract)
+		throw new StateCommandError(
+			2,
+			"persisted intent contract is required but missing despite Round 0 or locked workflow evidence",
+		);
+	if (inner.intent_contract === undefined) return;
+	try {
+		assertDeepInterviewIntentManifest(inner.intent_contract);
+	} catch {
+		throw new StateCommandError(2, "persisted intent contract is invalid; refusing to discard locked policy");
+	}
+}
+
+/** Ignore caller attempts to set or clear the recorder-owned requirement marker. */
+function withoutCallerIntentContractRequired(payload: Record<string, unknown>): Record<string, unknown> {
+	const sanitized = { ...payload };
+	delete sanitized.intent_contract_required;
+	if (isPlainObject(sanitized.state)) {
+		const state = { ...sanitized.state };
+		delete state.intent_contract_required;
+		sanitized.state = state;
+	}
+	return sanitized;
+}
+
+/** Preserve any persisted marker value, including an explicit false value, across replacement merges. */
+function preservePersistedIntentContractRequired(
+	existingEnvelope: Record<string, unknown>,
+	mergedEnvelope: Record<string, unknown>,
+): void {
+	const existingInner = isPlainObject(existingEnvelope.state) ? existingEnvelope.state : {};
+	if (!Object.hasOwn(existingInner, "intent_contract_required")) return;
+	const mergedInner = isPlainObject(mergedEnvelope.state) ? { ...mergedEnvelope.state } : {};
+	mergedInner.intent_contract_required = existingInner.intent_contract_required;
+	mergedEnvelope.state = mergedInner;
 }
 
 function assertHandoffLineageUnchanged(
@@ -1310,6 +1375,7 @@ async function reconcileWorkflowSkillStateUnlocked(
 	const existingPayload = existingRead.kind === "valid" ? migrateWorkflowState(existingRead.value, mode).state : {};
 	const nowIsoStr = nowIso();
 	const mutationId = `${mode}:reconcile:${nowIsoStr}`;
+	const reconciliationPayload = mode === "deep-interview" ? withoutCallerIntentContractRequired(payload) : payload;
 
 	const trimmedPhase = options.phase.trim();
 	const manifestStates = new Set(getSkillManifest(mode).states.map(state => state.id));
@@ -1337,22 +1403,27 @@ async function reconcileWorkflowSkillStateUnlocked(
 		mode === "deep-interview"
 			? // Enforce the deterministic ambiguity floor on every reconcile so a
 				// self-reported score can never undercut persisted contradiction evidence.
-				(applyAmbiguityFloorToEnvelope(mergeDeepInterviewEnvelope(existingPayload, payload)).envelope as Record<
-					string,
-					unknown
-				>)
-			: mergeWithNullDelete(existingPayload, payload);
+				(applyAmbiguityFloorToEnvelope(mergeDeepInterviewEnvelope(existingPayload, reconciliationPayload))
+					.envelope as Record<string, unknown>)
+			: mergeWithNullDelete(existingPayload, reconciliationPayload);
+	if (mode === "deep-interview") preservePersistedIntentContractRequired(existingPayload, merged);
 	assertNoFutureWorkflowEnvelope(merged, mode, `runtime reconciliation of ${mode}`);
 	assertHandoffLineageUnchanged(existingPayload, merged, "runtime reconciliation");
 	if (mode === "deep-interview") {
 		assertDeepInterviewEnvelopeInputLimits(merged);
-		assertDeepInterviewEvidenceUnchanged(existingPayload, merged, "runtime reconciliation");
+		assertDeepInterviewEvidenceUnchanged(
+			existingPayload,
+			{ ...merged, current_phase: trimmedPhase },
+			"runtime reconciliation",
+		);
 	}
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
 	merged.active = active;
-	if (mode === "deep-interview")
+	if (mode === "deep-interview") {
+		assertPersistedDeepInterviewIntentContract(merged);
 		assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "runtime reconciliation");
+	}
 	merged.version = WORKFLOW_STATE_VERSION;
 	merged.updated_at = nowIsoStr;
 	merged.receipt = receipt;
@@ -1520,6 +1591,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			throw new StateCommandError(2, error instanceof Error ? error.message : String(error));
 		}
 	}
+	const writePayload = mode === "deep-interview" ? withoutCallerIntentContractRequired(payload) : payload;
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	const forced = hasFlag(args, "--force");
 	return await withWorkflowStateLock(
@@ -1548,12 +1620,12 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				nowIso: nowIsoStr,
 				mutationId,
 			});
-			const innerState = (payload.state as Record<string, unknown> | undefined) ?? {};
+			const innerState = (writePayload.state as Record<string, unknown> | undefined) ?? {};
 			const incomingPhase =
-				typeof payload.current_phase === "string" && payload.current_phase.trim()
-					? payload.current_phase.trim()
-					: typeof payload.phase === "string" && payload.phase.trim()
-						? payload.phase.trim()
+				typeof writePayload.current_phase === "string" && writePayload.current_phase.trim()
+					? writePayload.current_phase.trim()
+					: typeof writePayload.phase === "string" && writePayload.phase.trim()
+						? writePayload.phase.trim()
 						: typeof innerState.current_phase === "string" && (innerState.current_phase as string).trim()
 							? (innerState.current_phase as string).trim()
 							: undefined;
@@ -1564,7 +1636,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				// The deterministic ambiguity floor is applied after the merge so a reported
 				// score written through the CLI can never undercut persisted contradiction evidence.
 				merged = applyAmbiguityFloorToEnvelope(
-					mergeDeepInterviewEnvelope(existingPayload, payload, { replace: hasFlag(args, "--replace") }),
+					mergeDeepInterviewEnvelope(existingPayload, writePayload, { replace: hasFlag(args, "--replace") }),
 				).envelope;
 				try {
 					assertDeepInterviewEnvelopeInputLimits(merged);
@@ -1572,16 +1644,17 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 					throw new StateCommandError(2, error instanceof Error ? error.message : String(error));
 				}
 			} else if (hasFlag(args, "--replace")) {
-				merged = { ...payload };
+				merged = { ...writePayload };
 			} else {
-				merged = mergeWithNullDelete(existingPayload, payload);
+				merged = mergeWithNullDelete(existingPayload, writePayload);
 				// Flatten payload.state.* into the top-level envelope so downstream consumers
 				// see a single canonical structure with the receipt at top level.
-				if (payload.state && typeof payload.state === "object" && !Array.isArray(payload.state)) {
-					merged = mergeWithNullDelete(merged, payload.state as Record<string, unknown>);
+				if (writePayload.state && typeof writePayload.state === "object" && !Array.isArray(writePayload.state)) {
+					merged = mergeWithNullDelete(merged, writePayload.state as Record<string, unknown>);
 					delete merged.state;
 				}
 			}
+			if (mode === "deep-interview") preservePersistedIntentContractRequired(existingPayload, merged);
 			assertNoFutureWorkflowEnvelope(merged, mode, `generic state write for ${mode}`);
 			const preDefaultValidation = validateWorkflowStateEnvelope(mode, merged);
 			if (!preDefaultValidation.valid) {
@@ -1612,6 +1685,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
 				if (isPlainObject(mergedInner.crystal) && mergedInner.crystal.lifecycle !== "ready")
 					merged.current_phase = "interviewing";
+				assertPersistedDeepInterviewIntentContract(merged);
 				assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "generic state write");
 			}
 			merged.version = WORKFLOW_STATE_VERSION;
