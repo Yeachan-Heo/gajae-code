@@ -657,7 +657,7 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		});
 
 		manager.recoverPending(correlation, 0);
-		await Bun.sleep(20);
+		await Bun.sleep(1_100);
 
 		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
 		expect(state.status).toBe("failed");
@@ -676,11 +676,64 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		});
 
 		manager.recoverPending(correlation, 0, 50);
-		await Bun.sleep(20);
+		await Bun.sleep(1_100);
 
 		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
 		expect(state.status).toBe("failed");
 		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
+	test("progress at the hard maximum does not extend an already-due deadline", async () => {
+		let now = 0;
+		const claimStarted = Promise.withResolvers<void>();
+		const claimGate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.claimStarted = () => claimStarted.resolve();
+		state.claimRelease = claimGate.promise;
+		let expired = 0;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60,
+			now: () => now,
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-hard-max-progress", turnId: "turn-hard-max-progress" };
+		manager.onAccepted(correlation);
+		now = 60;
+		await claimStarted.promise;
+		for (let tick = 0; tick < 5; tick += 1) manager.onProgress(correlation, now + tick);
+		claimGate.resolve();
+		const terminalDeadline = Date.now() + 2_000;
+		while (expired === 0 && Date.now() < terminalDeadline) await Bun.sleep(5);
+		expect(expired).toBe(1);
+		expect(state.finalizeCalls).toBe(1);
+		manager.clearAll();
+	});
+
+	test("uncertain recovery after the hard maximum backs off without duplicate writes", async () => {
+		let now = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 20,
+			now: () => now,
+			onDeadlineTerminalization: async () => "uncertain" as const,
+		});
+		const correlation = { commandId: "cmd-hard-max-uncertain", turnId: "turn-hard-max-uncertain" };
+		manager.onAccepted(correlation);
+		now = 20;
+		const recoveryDeadline = Date.now() + 2_000;
+		while (state.uncertainCalls === 0 && Date.now() < recoveryDeadline) await Bun.sleep(5);
+		expect(state.uncertainCalls).toBe(1);
+		expect(manager.hasRecoveryPending(correlation)).toBe(true);
+		await Bun.sleep(150);
+		expect(state.uncertainCalls).toBe(1);
+		expect(manager.has(correlation)).toBe(true);
 		manager.clearAll();
 	});
 });
