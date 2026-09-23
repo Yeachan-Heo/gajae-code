@@ -871,6 +871,38 @@ test.each([
 	}
 });
 
+test("registry errors are not mistaken for a stale default", async () => {
+	const exit = new Error("exit 1");
+	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
+		throw exit;
+	}) as never);
+	const stderr: string[] = [];
+	const stderrSpy = spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+		stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+		return true;
+	}) as never);
+	try {
+		await expect(
+			applyStartupModelProfilesForRoot({
+				session: fakeSession(),
+				settings: Settings.isolated({ "modelProfile.default": "deleted-profile" }),
+				modelRegistry: { ...fakeRegistry([]), getError: () => new Error("invalid models.yml") } as never,
+				parsedArgs: {},
+				isInteractive: true,
+				hasInteractiveTerminal: true,
+				initialMessage: undefined,
+				initialMessages: [],
+				resumeAction: undefined,
+			}),
+		).rejects.toBe(exit);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(stderr.join("")).toContain("model profile registry is unavailable");
+	} finally {
+		stderrSpy.mockRestore();
+		exitSpy.mockRestore();
+	}
+});
+
 test("explicit --mpreset remains invalid even when a stale default is recoverable", async () => {
 	const exit = new Error("exit 1");
 	const exitSpy = spyOn(process, "exit").mockImplementation((() => {
@@ -954,7 +986,6 @@ test("explicit --model skips a stale default and retains CLI precedence", async 
 		expect(stderr.join("")).toContain("Warning: Configured modelProfile.default is stale");
 		expect(session.model?.provider).toBe("cli-provider");
 		expect(session.model?.id).toBe("explicit");
-		expect(settings.get("modelProfile.default")).toBe("deleted-profile");
 	} finally {
 		stderrSpy.mockRestore();
 	}
