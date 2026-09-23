@@ -1518,6 +1518,7 @@ export default class Sdk extends Command {
 		let runningBroker: Broker | undefined;
 		let stopSweep: (() => void) | undefined;
 		let startupExitRequested = false;
+		let startupExitReason: "startup-deadline" | "startup-signal" | undefined;
 		let startupExitLogged = false;
 		let pendingShutdownSignal: "SIGTERM" | "SIGINT" | undefined;
 		let startupExitTask: Promise<boolean> | undefined;
@@ -1542,11 +1543,11 @@ export default class Sdk extends Command {
 			writtenAt: Date.now(),
 		});
 		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
-			if (!startupExitWrite) {
-				startupExitWrite = writeBrokerStartupExitRecordSynchronously(agentDir, record)
-					? Promise.resolve({ kind: "written" as const })
-					: writeBrokerStartupExitRecordBounded(agentDir, record, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
-			}
+			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
+				agentDir,
+				record,
+				BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
+			);
 			return startupExitWrite;
 		};
 		const brokerReadyForSignal = (): Broker | undefined =>
@@ -1568,17 +1569,22 @@ export default class Sdk extends Command {
 			signal: "SIGTERM" | "SIGINT" | null,
 			timeoutMs?: number,
 		): Promise<boolean> => {
-			if (startupExitTask) return startupExitTask;
+			// The first startup exit cause owns both the persisted reason and the process exit code.
+			if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
 			if (startupExitRequested) return Promise.resolve(false);
 			startupExitRequested = true;
+			startupExitReason = reason;
 			const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs);
 			const message =
 				reason === "startup-deadline"
 					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
 					: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
+			const recordWrittenSynchronously = writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
 			startupExitTask = (async () => {
-				const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
+				const exitRecordWrite = recordWrittenSynchronously
+					? { kind: "written" as const }
+					: await beginStartupExitRecordWrite(exitRecord);
 				const exitRecordWritten = exitRecordWrite.kind === "written";
 				if (!exitRecordWritten)
 					logger.error("sdk broker: startup exit record write timed out", {
@@ -1625,26 +1631,7 @@ export default class Sdk extends Command {
 				stopSweep?.();
 				void activeBroker.stop({ kind: "signal", signal });
 			} else {
-				const exitRecord = makeStartupExitRecord("startup-signal", exitCode, signal);
-				writeStartupExitLog(exitRecord, `SDK broker startup interrupted by ${signal} before readiness.`);
-				const written = writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
-				startupExitRequested = true;
-				startupExitTask = written
-					? Promise.resolve(true)
-					: beginStartupExitRecordWrite(exitRecord).then(result => {
-							const persisted = result.kind === "written";
-							if (!persisted)
-								logger.error("sdk broker: startup exit record write failed", {
-									reason: "startup-exit-record-write-failed-or-timed-out",
-									exitRecordWriteStatus: result.kind,
-									...(result.kind === "failed" && result.code
-										? { exitRecordWriteErrorCode: result.code }
-										: {}),
-									pid: process.pid,
-									exitCode,
-								});
-							return persisted;
-						});
+				void exitDuringStartup("startup-signal", exitCode, signal);
 			}
 			void postmortem.quit(exitCode);
 		};

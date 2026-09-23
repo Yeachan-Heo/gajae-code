@@ -145,25 +145,34 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 	);
 }
 
-async function writeAtomicExitRecord(destination: string, record: object): Promise<void> {
+async function writeAtomicExitRecord(destination: string, record: object, signal?: AbortSignal): Promise<void> {
 	const serialized = JSON.stringify(record);
 	if (typeof serialized !== "string") throw new Error("SDK broker exit record could not be serialized.");
 	if (Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
 		throw new Error("SDK broker exit record exceeds its size bound.");
+	const throwIfAborted = (): void => {
+		if (signal?.aborted) throw new Error("SDK broker exit record write was aborted.");
+	};
 
 	const directory = path.dirname(destination);
 	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+	throwIfAborted();
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	let published = false;
 	try {
+		throwIfAborted();
 		const handle = await fs.open(temporary, "wx", 0o600);
 		try {
+			throwIfAborted();
 			await handle.writeFile(serialized, "utf8");
+			throwIfAborted();
 			await handle.sync();
 		} finally {
 			await handle.close();
 		}
-		await fs.rename(temporary, destination);
+		throwIfAborted();
+		// A synchronous commit point prevents a timed-out async writer from renaming late.
+		syncFs.renameSync(temporary, destination);
 		published = true;
 	} finally {
 		if (!published) await fs.rm(temporary, { force: true }).catch(() => {});
@@ -214,8 +223,12 @@ function writeAtomicExitRecordSynchronously(destination: string, serialized: str
 }
 
 /** Atomically persist the latest bounded graceful-exit reason for supervisors. */
-export async function writeBrokerExitRecord(agentDir: string, record: BrokerExitRecord): Promise<void> {
-	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record);
+export async function writeBrokerExitRecord(
+	agentDir: string,
+	record: BrokerExitRecord,
+	signal?: AbortSignal,
+): Promise<void> {
+	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record, signal);
 }
 
 /** Persist an exit synchronously when a process signal can preempt async writes. */
@@ -245,8 +258,12 @@ export async function writeBrokerStartupExitRecordBounded(
 	timeoutMs = 1_000,
 ): Promise<BrokerStartupExitWriteStatus> {
 	const settled = Promise.withResolvers<BrokerStartupExitWriteStatus>();
-	const timer = setTimeout(() => settled.resolve({ kind: "timed_out" }), timeoutMs);
-	void writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record).then(
+	const abortController = new AbortController();
+	const timer = setTimeout(() => {
+		abortController.abort();
+		settled.resolve({ kind: "timed_out" });
+	}, timeoutMs);
+	void writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record, abortController.signal).then(
 		() => settled.resolve({ kind: "written" }),
 		error => {
 			const code =
