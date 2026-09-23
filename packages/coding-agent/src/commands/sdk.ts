@@ -1502,11 +1502,29 @@ export default class Sdk extends Command {
 						? testWatchdogMs
 						: remainingMs;
 				const startupWatchdog = setTimeout(() => {
-					process.stderr.write(`SDK broker startup exceeded its ${watchdogMs}ms fence deadline.\n`);
+					process.stderr.write(
+						`${JSON.stringify({
+							level: "error",
+							message: `SDK broker startup exceeded its ${watchdogMs}ms fence deadline.`,
+							reason: "startup-deadline",
+							timeoutMs: watchdogMs,
+							pid: process.pid,
+							exitCode: 1,
+						})}\n`,
+					);
 					process.exit(1);
 				}, watchdogMs);
 				try {
-					if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
+					const existing = await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+					if (existing) {
+						logger.info("sdk broker: startup reused an existing owner", {
+							reason: "existing-owner-reused",
+							ownerId: existing.ownerId,
+							pid: existing.pid,
+							exitCode: 0,
+						});
+						return undefined;
+					}
 					if (process.env.GJC_SDK_TEST_BROKER_STARTUP_STALL === "1") {
 						const stalled = Promise.withResolvers<void>();
 						await stalled.promise;
@@ -1559,7 +1577,7 @@ export default class Sdk extends Command {
 		} catch (error) {
 			if (broker) {
 				try {
-					await broker.stop();
+					await broker.stop({ kind: "startup-failure" });
 				} catch {
 					// Preserve the startup/fence failure that made this bootstrap unusable.
 				}
@@ -1576,6 +1594,11 @@ export default class Sdk extends Command {
 					pid: process.pid,
 					incarnation,
 				});
+			logger.error("sdk broker: startup failed", {
+				reason: "startup-failure",
+				pid: process.pid,
+				exitCode: 1,
+			});
 			throw error;
 		}
 		if (!broker) return;
@@ -1598,12 +1621,12 @@ export default class Sdk extends Command {
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
 		const stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
-		const stop = () => {
+		const stop = (signal: "SIGTERM" | "SIGINT") => {
 			stopSweep();
-			void runningBroker.stop();
+			void runningBroker.stop({ kind: "signal", signal });
 		};
-		process.once("SIGTERM", stop);
-		process.once("SIGINT", stop);
+		process.once("SIGTERM", () => stop("SIGTERM"));
+		process.once("SIGINT", () => stop("SIGINT"));
 		try {
 			await completeBrokerProcess(runningBroker);
 		} finally {

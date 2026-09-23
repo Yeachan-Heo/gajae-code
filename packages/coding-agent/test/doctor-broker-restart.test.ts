@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { readBrokerExitRecord } from "../src/sdk/broker/broker-exit";
 import { launchAuthorizedBrokerSuccessor } from "../src/sdk/broker/daemon-entry";
 import { brokerRestartIntentPath, publishBrokerDiscovery, readBrokerRestartIntent } from "../src/sdk/broker/discovery";
 import { restartBrokerForDoctor } from "../src/sdk/broker/doctor-restart";
@@ -166,6 +167,32 @@ describe("doctor broker restart protocol", () => {
 		await broker.stop();
 	});
 
+	it("restart lease expiry releases its reservation without exiting the owner", async () => {
+		const { dir, broker, discovery } = await fixture();
+		const prepared = await broker.prepareRestart({
+			...discovery,
+			generation: discovery.packageGeneration,
+			requestId: "lease-expiry",
+			deadlineAt: Date.now() + 100,
+		});
+		expect(prepared.ok).toBe(true);
+		expect(await readBrokerRestartIntent(dir)).not.toBeNull();
+
+		await Bun.sleep(150);
+		expect(await readBrokerRestartIntent(dir)).toBeNull();
+		expect((await broker.handleRequest("session.list", {})).ok).toBe(true);
+		expect(
+			await Promise.race([
+				broker.completion.then(
+					() => true,
+					() => true,
+				),
+				Bun.sleep(20).then(() => false),
+			]),
+		).toBe(false);
+		await broker.stop();
+	});
+
 	it("successor clears a predecessor's durable intent only by exact existing file identity", async () => {
 		const { dir, broker, discovery } = await fixture();
 		const prepared = await broker.prepareRestart({
@@ -225,6 +252,7 @@ describe("doctor broker restart protocol", () => {
 		});
 		expect(committed.ok).toBe(true);
 		await broker.completion;
+		expect(await readBrokerExitRecord(dir)).toMatchObject({ mode: "owned-root", reason: "restart-committed" });
 		expect((await readBrokerRestartIntent(dir))?.phase).toBe("committed");
 
 		// A successor Broker whose settings carry a DIFFERENT restartRequestId must
