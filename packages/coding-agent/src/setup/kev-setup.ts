@@ -1,10 +1,19 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { z } from "zod";
 import { acquireFileLock, FileLockAcquireError } from "../config/file-lock";
+import {
+	CONTROL_FILE,
+	controlRequest,
+	controlSocketPathIsBindable,
+	KEV_SUPERVISOR_SOURCE,
+	type KevControlReply,
+	kevControl,
+	SUPERVISOR_FILE,
+} from "./kev-supervisor";
 
 export type KevSetupAction = "install" | "start" | "stop" | "status";
 export const DEFAULT_KEV_MODEL = "jaredpalmer/kev-4b";
@@ -24,9 +33,15 @@ const installSchema = z
 		snapshot: z.string().min(1),
 	})
 	.strict();
+/**
+ * Version 2 records a supervisor, not a bare `kev.serve` process: `pid`/`argv`
+ * describe the supervisor and `socket`/`token` are the only authority to stop it.
+ * Version-1 records are simply not ours — the feature is unreleased, so they are
+ * refused as foreign rather than migrated into a control channel they never had.
+ */
 const serviceSchema = z
 	.object({
-		version: z.literal(1),
+		version: z.literal(2),
 		pid: z.number().int().min(2),
 		ownerId: z.string().uuid(),
 		incarnation: z.string().min(1),
@@ -35,6 +50,8 @@ const serviceSchema = z
 		root: z.string().min(1),
 		model: hubModel,
 		port: z.number().int().min(1).max(65535),
+		socket: z.string().min(1),
+		token: z.string().regex(/^[a-f0-9]{64}$/u),
 	})
 	.strict();
 type Installation = z.infer<typeof installSchema>;
@@ -55,6 +72,8 @@ export interface KevCommandOptions {
 export interface KevSpawnOptions extends KevCommandOptions {
 	logPath: string;
 	logFd: number;
+	/** Control token handed to the supervisor on stdin, never through argv or env. */
+	token: string;
 }
 export interface KevChild {
 	pid: number;
@@ -69,7 +88,8 @@ export interface KevSetupDeps {
 	portAvailable?: (port: number) => boolean;
 	listens?: (pid: number, port: number) => boolean;
 	health?: (port: number) => Promise<boolean>;
-	kill?: (pid: number, signal: NodeJS.Signals) => void;
+	/** The only channel that may stop an owned server; there is deliberately no `kill` dependency. */
+	control?: (socketPath: string, message: string) => Promise<KevControlReply | undefined>;
 	sleep?: (ms: number) => Promise<void>;
 	readyTimeoutMs?: number;
 }
@@ -123,11 +143,11 @@ async function readPrivate<T>(file: string, schema: z.ZodType<T>): Promise<T | u
 	}
 	return schema.parse(await Bun.file(file).json());
 }
-async function writePrivate(file: string, value: unknown): Promise<void> {
+async function writePrivateText(file: string, contents: string): Promise<void> {
 	const temp = `${file}.${randomUUID()}.tmp`;
 	const handle = await fs.open(temp, "wx", 0o600);
 	try {
-		await Bun.write(Bun.file(handle.fd), `${JSON.stringify(value, null, 2)}\n`);
+		await Bun.write(Bun.file(handle.fd), contents);
 		await handle.sync();
 		await handle.close();
 		await fs.rename(temp, file);
@@ -135,6 +155,9 @@ async function writePrivate(file: string, value: unknown): Promise<void> {
 		await handle.close().catch(() => undefined);
 		await fs.rm(temp, { force: true });
 	}
+}
+async function writePrivate(file: string, value: unknown): Promise<void> {
+	await writePrivateText(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 function digest(argv: readonly string[]): string {
 	return createHash("sha256").update(JSON.stringify(argv)).digest("hex");
@@ -181,11 +204,24 @@ function inspectDefault(pid: number): KevProcessIdentity | undefined {
 function executable(root: string): string {
 	return path.join(root, "repo", ".venv", "bin", "python");
 }
+function controlSocket(root: string): string {
+	return path.join(root, CONTROL_FILE);
+}
+/**
+ * The recorded process is the supervisor; `kev.serve` follows `--` as the
+ * command the supervisor owns. Ownership proof therefore covers both the
+ * supervised server arguments and the exact control socket it answers on.
+ */
 function serviceArgv(root: string, run: string, port: number, ownerId: string): string[] {
 	return [
 		executable(root),
 		"-X",
 		`gjc_kev_owner=${ownerId}`,
+		path.join(root, SUPERVISOR_FILE),
+		"--socket",
+		controlSocket(root),
+		"--",
+		executable(root),
 		"-m",
 		"kev.serve",
 		"--run",
@@ -264,7 +300,15 @@ async function status(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	if (!observed) return { ok: true, state: "stale", root, model: record.model, port: record.port, pid: record.pid };
 	if (!owns(record, install, observed))
 		return { ok: false, state: "foreign", root, error: "Kev process ownership or incarnation does not match" };
-	const ready = (deps.listens ?? listens)(record.pid, record.port) && (await (deps.health ?? healthy)(record.port));
+	// The supervisor does not hold the port; its child does. Ask the authenticated
+	// control channel which pid that is, so `listens` still proves the listener is
+	// ours rather than any process that happens to answer on the loopback port.
+	const reported = await (deps.control ?? kevControl)(record.socket, controlRequest("status", record.token));
+	const servicePid = reported?.ok && reported.state === "running" ? reported.pid : undefined;
+	const ready =
+		servicePid !== undefined &&
+		(deps.listens ?? listens)(servicePid, record.port) &&
+		(await (deps.health ?? healthy)(record.port));
 	return {
 		ok: true,
 		state: ready ? "running" : "starting",
@@ -347,10 +391,14 @@ function spawnDefault(argv: string[], options: KevSpawnOptions): KevChild {
 		cwd: options.cwd,
 		env: options.env,
 		detached: true,
-		stdin: "ignore",
+		stdin: "pipe",
 		stdout: options.logFd,
 		stderr: options.logFd,
 	});
+	// The token travels on stdin only: argv and the environment are readable by
+	// any local process, and the log file would persist it on disk.
+	child.stdin.write(`${options.token}\n`);
+	child.stdin.end();
 	return {
 		pid: child.pid,
 		unref: () => child.unref(),
@@ -380,6 +428,12 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 	}
 	if (!(deps.portAvailable ?? portAvailable)(port))
 		throw new Error("Kev loopback port is occupied; no process was signaled");
+	const socket = controlSocket(root);
+	if (!controlSocketPathIsBindable(socket))
+		throw new Error("Kev control socket path is too long for a Unix socket; choose a shorter --root");
+	await fs.rm(socket, { force: true });
+	await writePrivateText(path.join(root, SUPERVISOR_FILE), KEV_SUPERVISOR_SOURCE);
+	const token = randomBytes(32).toString("hex");
 	const logPath = path.join(root, "server.log");
 	const log = await fs.open(logPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
 	const ownerId = randomUUID();
@@ -395,6 +449,7 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 			env: environment(root),
 			logPath,
 			logFd: log.fd,
+			token,
 		});
 	} finally {
 		await log.close();
@@ -410,7 +465,7 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 		if (!identity || identity.command !== argv.join(" "))
 			throw new Error("Unable to establish the spawned Kev process identity; inspect server.log");
 		const record: ServiceRecord = {
-			version: 1,
+			version: 2,
 			pid: child.pid,
 			ownerId,
 			incarnation: identity.incarnation,
@@ -419,6 +474,8 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 			root,
 			model: install.model,
 			port,
+			socket,
+			token,
 		};
 		await writePrivate(path.join(root, SERVICE_FILE), record);
 		published = true;
@@ -449,16 +506,31 @@ async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	if (!install || !record || !owns(record, install, (deps.inspect ?? inspectDefault)(record.pid))) {
 		return { ok: false, state: "foreign", root, error: "Kev ownership changed before stop" };
 	}
-	(deps.kill ?? process.kill)(record.pid, "SIGTERM");
-	for (let attempt = 0; attempt < 50; attempt++) {
-		const observed = (deps.inspect ?? inspectDefault)(record.pid);
-		if (!observed || !owns(record, install, observed)) {
-			await fs.rm(path.join(root, SERVICE_FILE), { force: true });
-			return { ok: true, state: "stopped", root };
-		}
-		await (deps.sleep ?? Bun.sleep)(100);
+	// Nothing below resolves `record.pid` into a signal. Ownership is proven to the
+	// supervisor by a token over its own socket, and the supervisor signals a child
+	// handle it holds — so a pid recycled between this check and the stop is never
+	// the thing that gets signaled, because no pid is ever signaled here.
+	const reply = await (deps.control ?? kevControl)(record.socket, controlRequest("stop", record.token));
+	if (reply?.ok) {
+		await fs.rm(path.join(root, SERVICE_FILE), { force: true });
+		return { ok: true, state: "stopped", root };
 	}
-	return { ...current, state: "stopping", error: "Owned Kev process has not exited yet; ownership retained" };
+	// The control channel gave no confirmation. A supervisor that is gone leaves
+	// only a stale record to retire; one that is still alive keeps its ownership
+	// record so a later stop can retry against the same authenticated channel.
+	const observed = (deps.inspect ?? inspectDefault)(record.pid);
+	if (!observed || !owns(record, install, observed)) {
+		await fs.rm(path.join(root, SERVICE_FILE), { force: true });
+		return { ok: true, state: "stopped", root };
+	}
+	return {
+		...current,
+		state: "stopping",
+		error:
+			reply === undefined
+				? "Kev supervisor did not answer its control socket; ownership retained and nothing was signaled"
+				: `Kev supervisor refused the stop (${reply.error ?? "unknown"}); ownership retained and nothing was signaled`,
+	};
 }
 
 export async function runKevSetup(
