@@ -197,6 +197,29 @@ async function handoff(cwd: string, sessionId: string, stage: ExecutionApprovalS
 	);
 }
 
+function consumeOrdinary(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
+	return runNativeStateCommand(["approve-execution", "--mode", stage, "--session-id", sessionId, "--json"], cwd);
+}
+
+async function failHandoffAfterCallee(
+	cwd: string,
+	sessionId: string,
+	stage: ExecutionApprovalStage,
+	handoffAt: string,
+) {
+	const previousFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE;
+	const originalToISOString = Date.prototype.toISOString;
+	Date.prototype.toISOString = () => handoffAt;
+	process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE = `${stage}:handoff:ultragoal:${handoffAt}`;
+	try {
+		return await handoff(cwd, sessionId, stage);
+	} finally {
+		Date.prototype.toISOString = originalToISOString;
+		if (previousFailpoint === undefined) delete process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE;
+		else process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLEE = previousFailpoint;
+	}
+}
+
 async function approval(cwd: string, sessionId: string, stage: ExecutionApprovalStage) {
 	return JSON.parse(await fs.readFile(nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage), "utf8"));
 }
@@ -244,11 +267,49 @@ describe("non-Crystal user-gated execution approval", () => {
 				if (stage === "deep-interview") {
 					const result = await consume(cwd, sessionId);
 					expect(result.status, result.stderr).toBe(0);
-					expect((await consume(cwd, sessionId)).status).toBe(2);
+					expect((await consume(cwd, sessionId)).status).toBe(0);
 				}
 				const result = await handoff(cwd, sessionId, stage);
 				expect(result.status, result.stderr).toBe(0);
 				expect(JSON.parse(await fs.readFile(modeStatePath(cwd, sessionId, "ultragoal"), "utf8")).active).toBe(true);
+			});
+		});
+
+		it(`${stage}: consumed approval retries after failed handoff only while publication is current`, async () => {
+			await withSession(async (cwd, manager, sessionId) => {
+				await publish(cwd, sessionId, stage);
+				await ask(cwd, manager, stage, "retry-after-handoff-failure", false);
+				const consumed = await consumeOrdinary(cwd, sessionId, stage);
+				expect(consumed.status, consumed.stderr).toBe(0);
+
+				const failed = await failHandoffAfterCallee(cwd, sessionId, stage, "2026-09-23T06:15:00.000Z");
+				expect(failed.status).toBe(1);
+				expect(failed.stderr).toContain("injected handoff failure after callee write");
+				const originalRecord = await approval(cwd, sessionId, stage);
+				expect(originalRecord.status).toBe("consumed");
+
+				const retried = await consumeOrdinary(cwd, sessionId, stage);
+				expect(retried.status, retried.stderr).toBe(0);
+				expect(await approval(cwd, sessionId, stage)).toEqual(originalRecord);
+				const recovered = await handoff(cwd, sessionId, stage);
+				expect(recovered.status, recovered.stderr).toBe(0);
+			});
+
+			await withSession(async (cwd, manager, sessionId) => {
+				await publish(cwd, sessionId, stage);
+				await ask(cwd, manager, stage, "stale-retry-after-handoff-failure", false);
+				const consumed = await consumeOrdinary(cwd, sessionId, stage);
+				expect(consumed.status, consumed.stderr).toBe(0);
+
+				const failed = await failHandoffAfterCallee(cwd, sessionId, stage, "2026-09-23T06:16:00.000Z");
+				expect(failed.status).toBe(1);
+				expect(failed.stderr).toContain("injected handoff failure after callee write");
+				await publish(cwd, sessionId, stage, 2);
+
+				const staleRetry = await consumeOrdinary(cwd, sessionId, stage);
+				expect(staleRetry.status).toBe(2);
+				expect(staleRetry.stderr).toContain("publication is stale");
+				expect((await approval(cwd, sessionId, stage)).status).toBe("consumed");
 			});
 		});
 
