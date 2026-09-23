@@ -45,6 +45,81 @@ describe("sdk session raw control envelope", () => {
 		}
 	});
 
+	test("ignores repo while routing successful exact-session calls by session ID", async () => {
+		const repo = "/private/workspace/path";
+		const sessionId = "session-5862-target";
+		const listInputs: Record<string, unknown>[] = [];
+		const routedTargets: Array<{ sessionId: string; operation: string }> = [];
+		const warnings: string[] = [];
+		const ensure = spyOn(brokerEnsure, "ensureBroker").mockResolvedValue({} as never);
+		const start = spyOn(SessionRouter.prototype, "start").mockResolvedValue(undefined);
+		const stop = spyOn(SessionRouter.prototype, "stop").mockResolvedValue(undefined);
+		const attachment = spyOn(SessionRouter.prototype, "attachment").mockReturnValue({ generation: 1 } as never);
+		const list = spyOn(SessionRouter.prototype, "listBrokerSessions").mockImplementation(async input => {
+			listInputs.push(input);
+			return {
+				ok: true,
+				result: {
+					sessions: [
+						{
+							sessionId,
+							locator: { cwd: "/workspace/target", worktreeRoot: null, stateRoot: "/workspace/target/state" },
+							endpointGeneration: 1,
+							pid: 123,
+							live: true,
+							deleted: false,
+							indexSeq: 1,
+						},
+					],
+				},
+			};
+		});
+		const request = spyOn(SessionRouter.prototype, "request").mockImplementation(async (routedSessionId, frame) => {
+			routedTargets.push({ sessionId: routedSessionId, operation: String(frame.operation ?? frame.query) });
+			return {
+				ok: true,
+				result: frame.type === "control_request" ? { accepted: true } : { status: "complete" },
+			};
+		});
+		const stderr = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			warnings.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			const outputs: unknown[] = [];
+			for (const args of [
+				{ action: "inspect", sessionId, repo },
+				{ action: "send", sessionId, text: "hello", repo },
+				{ action: "status", sessionId, opRef: "op-5862", repo },
+				{ action: "raw", rawAction: "query", sessionId, query: "session.checkpoint", repo },
+			]) {
+				await runSdkSessionCli({ ...args, agentDir: "/tmp/gjc-5862-agent" }, value => outputs.push(value));
+			}
+			expect(outputs).toHaveLength(4);
+			expect(outputs.every(output => (output as { ok?: unknown }).ok === true)).toBe(true);
+			expect(listInputs).toEqual([{ resolveSessionId: sessionId }]);
+			expect(routedTargets).toEqual([
+				{ sessionId, operation: "turn.prompt" },
+				{ sessionId, operation: "turn.result" },
+				{ sessionId, operation: "session.checkpoint" },
+			]);
+			expect(warnings.join("")).toBe(
+				"Warning: --repo is ignored for exact-session commands; the session ID selects the broker target.\n".repeat(
+					4,
+				),
+			);
+			expect(JSON.stringify({ listInputs, routedTargets, warnings })).not.toContain(repo);
+		} finally {
+			stderr.mockRestore();
+			request.mockRestore();
+			list.mockRestore();
+			attachment.mockRestore();
+			stop.mockRestore();
+			start.mockRestore();
+			ensure.mockRestore();
+		}
+	});
+
 	test("invalid JSON throws before output and the boundary never echoes its body", async () => {
 		const output: unknown[] = [];
 		const secret = "secret-body-not-for-output";
