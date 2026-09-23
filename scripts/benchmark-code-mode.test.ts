@@ -203,18 +203,33 @@ describe("pre-registered task contracts", () => {
 	test("requires three dependent calls and the registered repository-wide first query for Arm A", () => {
 		const task = parseBenchmarkTasks(benchmarkCodeModeTasks)[0]!;
 		const valid = [
-			{ toolName: "search", args: { pattern: task.initialSearchQuery, paths: null }, resultText: "Found packages/example.ts" },
-			{ toolName: "read", args: { path: "packages/example.ts" }, resultText: `The source declares ${task.requiredFollowupSearchTerm}.` },
-			{ toolName: "search", args: { pattern: task.requiredFollowupSearchTerm, paths: null }, resultText: "Confirmed." },
+			{
+				toolName: "search",
+				args: { pattern: task.initialSearchQuery, paths: null },
+				resultText: "Found packages/example.ts",
+			},
+			{
+				toolName: "read",
+				args: { path: "packages/example.ts" },
+				resultText: `The source declares ${task.requiredFollowupSearchTerm}.`,
+			},
+			{
+				toolName: "search",
+				args: { pattern: task.requiredFollowupSearchTerm, paths: null },
+				resultText: "Confirmed.",
+			},
 		];
 		expect(validateTaskCallSequence(task, valid)).toEqual([]);
-		expect(validateTaskCallSequence(task, [{ ...valid[0]!, args: { pattern: task.initialSearchQuery, paths: ["."] } }, ...valid.slice(1)])).toContain(
-			`Task ${task.id} initial search constrained paths.`,
-		);
+		const scopedSearch = [
+			{ ...valid[0]!, args: { pattern: task.initialSearchQuery, paths: ["."] } },
+			...valid.slice(1),
+		];
+		expect(validateTaskCallSequence(task, scopedSearch)).toContain(`Task ${task.id} initial search constrained paths.`);
 		expect(validateTaskCallSequence(task, valid.slice(0, 2))).toContain(
 			`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`,
 		);
-		expect(validateTaskCallSequence(task, [{ ...valid[0]!, args: { pattern: "unrelated" } }, ...valid.slice(1)])).toContain(
+		const unrelatedSearch = [{ ...valid[0]!, args: { pattern: "unrelated" } }, ...valid.slice(1)];
+		expect(validateTaskCallSequence(task, unrelatedSearch)).toContain(
 			`Task ${task.id} initial search did not contain ${task.initialSearchQuery}.`,
 		);
 	});
