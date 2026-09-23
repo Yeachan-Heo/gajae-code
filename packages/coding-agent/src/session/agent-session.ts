@@ -23757,14 +23757,15 @@ export class AgentSession {
 	 *    would hide an authorization defect and cycle through healthy rows.
 	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
 	 *    and OAuth account-model rejections mark before resolving and require two known,
-	 *    different stored row IDs before reporting rotation. This is mark-time
-	 *    identity, not dispatch-bound attribution across shared sessions.
+	 *    different stored row IDs before reporting rotation. If a same-kind peer remains
+	 *    but the pre-mark row identity is unknown, return `alternate` so managed fallback
+	 *    can retry the model without claiming a proven row rotation.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
-	}): Promise<"rotated" | "exhausted" | "unchanged"> {
+	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
 		if (
 			!this.model ||
 			(trigger.class !== "auth" &&
@@ -23814,11 +23815,16 @@ export class AgentSession {
 							!credential.disabled &&
 							credential.credentialKind === beforeType,
 					);
-				return failedRowStillActive ? "exhausted" : "unchanged";
+				if (failedRowStillActive) return "exhausted";
+				await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+				const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				const afterType = authStorage.getSessionCredentialType(provider, credentialSessionId);
+				return after !== undefined && after !== before && afterType === beforeType ? "rotated" : "unchanged";
 			}
 			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			if (before !== undefined && after !== undefined && before !== after) return "rotated";
+			if (before === undefined) return "alternate";
 			return "unchanged";
 		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
@@ -24010,7 +24016,7 @@ export class AgentSession {
 		// policy decides whether to retry or advance, unless an explicit provider
 		// retry ceiling forbids another attempt.
 		let credentialRotated = false;
-		let quotaCredentialMark: "rotated" | "exhausted" | "unchanged" | undefined;
+		let quotaCredentialMark: "rotated" | "alternate" | "exhausted" | "unchanged" | undefined;
 		if (canRotateCodexCredential && trigger.class === "credential") {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
@@ -24030,7 +24036,8 @@ export class AgentSession {
 			!providerRetryCeilingReached
 		) {
 			quotaCredentialMark = await this.#markFailedCredential(trigger);
-			credentialRotated = quotaCredentialMark === "rotated";
+			credentialRotated =
+				quotaCredentialMark === "rotated" || (managedFallback && quotaCredentialMark === "alternate");
 			if (quotaCredentialMark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 
@@ -24080,7 +24087,7 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (managedFallback && quotaCredentialMark === "rotated") {
+		if (managedFallback && (quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate")) {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
