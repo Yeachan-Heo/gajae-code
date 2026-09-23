@@ -1825,6 +1825,63 @@ describe("agentLoopContinue with AgentMessage", () => {
 		expect(cleanupCalls).toBe(1);
 	});
 
+	it("bounds transform-triggered abort cleanup before dispatch", async () => {
+		const toolSchema = z.object({});
+		const controller = new AbortController();
+		const cleanupStarted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		let executed = false;
+		let cleanupCalls = 0;
+		const tool: AgentTool<typeof toolSchema, unknown> = {
+			name: "prepared",
+			label: "Prepared",
+			description: "Aborted by argument transformation before dispatch",
+			parameters: toolSchema,
+			execute: async () => {
+				executed = true;
+				return { content: [{ type: "text", text: "unexpected execution" }] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [{ content: [{ type: "toolCall", id: "tool-1", name: "prepared", arguments: {} }] }],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("run")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				transformToolCallArguments: args => {
+					controller.abort();
+					return args;
+				},
+				afterToolCall: async ({ result }) => {
+					expect(result).toMatchObject({ details: { cancellation: "before_dispatch" } });
+					cleanupCalls++;
+					cleanupStarted.resolve();
+					await releaseCleanup.promise;
+				},
+			},
+			controller.signal,
+			mock.stream,
+		);
+		const drained = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+		await cleanupStarted.promise;
+		const abortSettled = await Promise.race([drained.then(() => true), Bun.sleep(1_500).then(() => false)]);
+		releaseCleanup.resolve();
+		await drained;
+
+		expect(abortSettled).toBe(true);
+		expect(executed).toBe(false);
+		expect(cleanupCalls).toBe(1);
+		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "tool_execution_end")).toHaveLength(1);
+	});
+
 	it("bounds abort while afterToolCall already owns dispatched cleanup", async () => {
 		const toolSchema = z.object({});
 		const controller = new AbortController();

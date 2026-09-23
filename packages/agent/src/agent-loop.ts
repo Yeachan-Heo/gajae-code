@@ -5362,7 +5362,10 @@ async function executeToolCalls(
 	};
 
 	const settlePreDispatchCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
-		if (record.cleanupClaimed) return record.cleanupSettled.promise;
+		if (record.cleanupClaimed) {
+			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
+			return;
+		}
 		record.cleanupClaimed = true;
 		try {
 			if (afterToolCall) {
@@ -5604,28 +5607,7 @@ async function executeToolCalls(
 			// that must flow through the normal tool-result path without invoking the
 			// post-execution hook before execution ever started.
 			if (afterToolCall && preDispatchCancellationResult && !record.started && !record.cleanupClaimed) {
-				record.cleanupClaimed = true;
-				try {
-					await afterToolCall(
-						{
-							assistantMessage,
-							toolCall,
-							args: record.args,
-							result: preDispatchCancellationResult ?? {
-								content: [{ type: "text", text: "Tool call failed before dispatch." }],
-								isError: true,
-								details: { cancellation: "pre_dispatch_failure" },
-							},
-							isError: true,
-							context: currentContext,
-						},
-						toolSignal,
-					);
-				} catch {
-					// Pre-dispatch failure is authoritative; cleanup hooks are best-effort.
-				} finally {
-					record.cleanupSettled.resolve();
-				}
+				await settlePreDispatchCancellationCleanup(record);
 			}
 
 			if (afterToolCall && record.started && (signal?.aborted || toolSignal.aborted)) {
@@ -5777,7 +5759,9 @@ async function executeToolCalls(
 				}
 				await Promise.all(
 					records.map(record =>
-						record.started ? settleDispatchedCancellationCleanup(record) : record.cleanupSettled.promise,
+						record.started
+							? settleDispatchedCancellationCleanup(record)
+							: settlePreDispatchCancellationCleanup(record),
 					),
 				);
 			}

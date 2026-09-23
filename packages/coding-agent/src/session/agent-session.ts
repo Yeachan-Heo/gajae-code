@@ -5823,10 +5823,14 @@ export class AgentSession {
 			getIdleFlushSignal: () => this.#postPromptTasksAbortController.signal,
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		const configuredAfterTurnEndPublished = this.agent.afterTurnEndPublished;
 		this.agent.afterTurnEndPublished = async () => {
 			const admission = this.#canonicalMessageAdmissionTail;
 			if (!admission.released) await admission.promise;
 			if (admission.error !== undefined) throw admission.error;
+			// The canonical append is visible before a caller's observer runs. Do not
+			// suppress that observer or swallow its rejection: both hooks gate the next turn.
+			await configuredAfterTurnEndPublished?.call(this.agent);
 		};
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped

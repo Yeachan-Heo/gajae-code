@@ -56,6 +56,7 @@ describe("queued promotion run identity (#4668)", () => {
 		settings = Settings.isolated({ "compaction.enabled": false }),
 		sessionManager = SessionManager.inMemory(),
 		extensionRunner?: unknown,
+		afterTurnEndPublished?: () => void | Promise<void>,
 	): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
@@ -64,6 +65,7 @@ describe("queued promotion run identity (#4668)", () => {
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
 			streamFn: mock.stream,
+			...(afterTurnEndPublished ? { afterTurnEndPublished } : {}),
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return new AgentSession({
@@ -74,6 +76,33 @@ describe("queued promotion run identity (#4668)", () => {
 			modelRegistry,
 		});
 	}
+
+	it("preserves configured turn-end observers after canonical session persistence", async () => {
+		const sessionManager = SessionManager.inMemory();
+		let observerCalls = 0;
+		let assistantWasCanonical = false;
+		const tool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			execute: async (_toolCallId, params) => ({
+				content: [{ type: "text", text: params.value }],
+			}),
+		};
+		session = buildSession([{ content: ["turn answer"] }], tool, undefined, sessionManager, undefined, async () => {
+			observerCalls++;
+			assistantWasCanonical = sessionManager
+				.getBranch()
+				.some(entry => entry.type === "message" && entry.message.role === "assistant");
+		});
+
+		await session.prompt("first task");
+		await session.waitForIdle();
+
+		expect(observerCalls).toBe(1);
+		expect(assistantWasCanonical).toBe(true);
+	});
 
 	function buildAbortableTrackedTransitionFixture(
 		sessionManager = SessionManager.inMemory(),
