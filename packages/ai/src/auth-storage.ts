@@ -117,6 +117,20 @@ export type OAuthCredential = {
 
 export type AuthCredential = ApiKeyCredential | OAuthCredential;
 
+export type UsageLimitMarkResult =
+	| {
+			state: "marked";
+			failedRowId: number;
+			credentialKind: "oauth" | "api_key";
+			remainingCredentialIds: readonly number[];
+	  }
+	| {
+			state: "not-marked";
+			failedRowId?: number;
+			credentialKind?: "oauth" | "api_key";
+			remainingCredentialIds: readonly number[];
+	  };
+
 export interface MCPOAuthRefreshClient {
 	clientId?: string;
 	clientSecret?: string;
@@ -2177,6 +2191,26 @@ export class AuthStorage {
 		const session = this.#getSessionCredential(storageProvider, sessionId);
 		if (!session) return undefined;
 		return this.#getStoredCredentials(storageProvider)[session.index]?.id;
+	}
+
+	/** Whether an enabled stored row is currently available outside quota backoff. */
+	isCredentialAvailable(provider: string, rowId: number): boolean {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const entries = this.#getStoredCredentials(storageProvider);
+		const index = entries.findIndex(entry => entry.id === rowId);
+		if (index === -1) return false;
+
+		const inventory = this.#store.listCredentialInventory?.(storageProvider);
+		if (inventory) {
+			const row = inventory.find(candidate => candidate.id === rowId);
+			if (!row || row.disabled) return false;
+		}
+
+		const entry = entries[index];
+		return (
+			entry !== undefined &&
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+		);
 	}
 
 	/**
@@ -4844,16 +4878,19 @@ export class AuthStorage {
 	/**
 	 * Marks the explicit stored row, or the session row captured at entry, as usage-limited.
 	 * Re-finds that same row after the usage lookup; a vanished row marks nothing.
-	 * Returns whether another credential of the same type remains unblocked.
+	 * Returns whether the row was marked and the IDs of remaining unblocked peers
+	 * with the same credential type.
 	 */
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
 		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
-	): Promise<boolean> {
+	): Promise<UsageLimitMarkResult> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
-		if (ownerOverride && !ownerOverride.envSourced) return false;
+		if (ownerOverride && !ownerOverride.envSourced) {
+			return { state: "not-marked", remainingCredentialIds: [] };
+		}
 		const entries = this.#getStoredCredentials(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		const initial =
@@ -4862,7 +4899,9 @@ export class AuthStorage {
 				: sessionCredential
 					? entries[sessionCredential.index]
 					: undefined;
-		if (!initial) return false;
+		if (!initial) return { state: "not-marked", remainingCredentialIds: [] };
+		const failedRowId = initial.id;
+		const credentialKind = initial.credential.type;
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
@@ -4876,20 +4915,38 @@ export class AuthStorage {
 
 		// Never consult the possibly reassigned sticky pointer after the await.
 		const current = this.#getStoredCredentials(provider);
-		const targetIndex = current.findIndex(entry => entry.id === initial.id);
+		const targetIndex = current.findIndex(entry => entry.id === failedRowId);
 		const target = current[targetIndex];
-		if (!target) return false;
-		const providerKey = this.#getProviderTypeKey(provider, target.credential.type);
+		const inventory = this.#store.listCredentialInventory?.(provider);
+		const enabledIds = inventory ? new Set(inventory.filter(row => !row.disabled).map(row => row.id)) : undefined;
+		const remainingCredentialIds = (): number[] => {
+			return this.#getStoredCredentials(provider)
+				.map((entry, index) => ({ entry, index }))
+				.filter(
+					candidate =>
+						candidate.entry.credential.type === credentialKind &&
+						candidate.entry.id !== failedRowId &&
+						(!enabledIds || enabledIds.has(candidate.entry.id)) &&
+						!this.#isCredentialBlocked(this.#getProviderTypeKey(provider, credentialKind), candidate.index),
+				)
+				.map(candidate => candidate.entry.id);
+		};
+		if (!target || target.credential.type !== credentialKind || (enabledIds && !enabledIds.has(failedRowId))) {
+			return {
+				state: "not-marked",
+				failedRowId,
+				credentialKind,
+				remainingCredentialIds: remainingCredentialIds(),
+			};
+		}
+		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
 		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
-
-		const remainingCredentials = this.#getCredentialsForProvider(provider)
-			.map((credential, index) => ({ credential, index }))
-			.filter(
-				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === target.credential.type && entry.index !== targetIndex,
-			);
-
-		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
+		return {
+			state: "marked",
+			failedRowId,
+			credentialKind,
+			remainingCredentialIds: remainingCredentialIds(),
+		};
 	}
 
 	/**
