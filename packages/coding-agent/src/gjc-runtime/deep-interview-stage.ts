@@ -176,17 +176,18 @@ const RUNTIME_OWNED_ENVELOPE_KEYS = [
 	"receipt",
 	"updated_at",
 	"last_applied_draft_id",
+	"intent_contract_required",
 ] as const;
 
 /**
- * Nested `state.*` keys owned by the Round-0 ask recorder. A staged/write
- * payload can never set them: a fabricated contract (missing digest/
- * confirmation binding) would poison state so every later merge fails
- * `invalid intent contract`, bricking the interview until a destructive
- * `clear --force`. The recorder is the only writer that can lock intent.
+ * Nested `state.*` keys owned by the deep-interview runtime and Round-0
+ * recorder. A staged/write payload can never set them: a fabricated contract
+ * (missing digest/confirmation binding) or orphan requirement marker could
+ * poison policy state. Only sanctioned runtime/recorder paths may lock intent.
  */
 const RUNTIME_OWNED_STATE_KEYS = [
 	"intent_contract",
+	"intent_contract_required",
 	"intent_review",
 	"execution_approval",
 	"execution_approval_receipt",
@@ -238,12 +239,30 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 
 /**
  * A persisted locked contract is policy evidence, not disposable merge input.
- * If it is malformed, preserve it for recovery/audit and fail closed rather
- * than silently converting a tampered policy into an unlocked interview.
+ * The seeded pre-Round-0 requirement marker is valid while rounds are empty;
+ * after Round-0 or later locked evidence exists, a missing contract is corrupt.
+ * Preserve malformed policy for recovery/audit instead of unlocking the interview.
  */
 function assertPersistedIntentContract(base: Record<string, unknown>): void {
 	if (!isPlainObject(base.state)) return;
 	const state = base.state as Record<string, unknown>;
+	const hasRoundZeroEvidence =
+		Array.isArray(state.rounds) && state.rounds.some(round => isPlainObject(round) && round.round === 0);
+	const claimsLockedContract =
+		hasRoundZeroEvidence ||
+		state.intent_review !== undefined ||
+		state.crystal !== undefined ||
+		state.execution_approval !== undefined ||
+		state.execution_approval_receipt !== undefined ||
+		typeof base.spec_path === "string" ||
+		base.current_phase === "handoff" ||
+		base.current_phase === "complete";
+	if (state.intent_contract_required === true && state.intent_contract === undefined && claimsLockedContract)
+		throw new DeepInterviewStageError(
+			"DI_STAGE_STATE_CORRUPT",
+			"persisted intent contract is required but missing despite Round 0 or locked workflow evidence",
+			"repair the persisted intent contract or clear the deep-interview state explicitly before retrying",
+		);
 	if (state.intent_contract === undefined) return;
 	try {
 		assertDeepInterviewIntentManifest(state.intent_contract);
@@ -457,6 +476,8 @@ function computeMergedEnvelope(
 	// one-fact patch cannot erase confirmed/disputed history (#3387 finding 2).
 	const mergedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
 	const priorState = isPlainObject(current.state) ? (current.state as Record<string, unknown>) : undefined;
+	if (mergedState && priorState && Object.hasOwn(priorState, "intent_contract_required"))
+		mergedState.intent_contract_required = priorState.intent_contract_required;
 	if (priorState?.crystal === undefined && mergedState?.crystal !== undefined)
 		throw new DeepInterviewStageError(
 			"DI_STAGE_MERGE_REJECTED",
@@ -497,6 +518,7 @@ function computeMergedEnvelope(
 		);
 	}
 	merged = deriveRuntimeAmbiguity(merged, current);
+	assertPersistedIntentContract(merged);
 	if (isPlainObject(priorState?.crystal) && priorState.crystal.lifecycle === "ready") {
 		for (const field of [
 			"rounds",
