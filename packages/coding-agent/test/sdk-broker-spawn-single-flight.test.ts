@@ -646,8 +646,7 @@ it("keeps the deadline reason when SIGTERM arrives during its async record fallb
 				...process.env,
 				GJC_SDK_TEST_BROKER_STARTUP_STALL: "1",
 				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "250",
-				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_FORCE_ASYNC: "1",
-				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS: "1500",
+				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS: "500",
 				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
 			},
 		});
@@ -675,6 +674,42 @@ it("keeps the deadline reason when SIGTERM arrives during its async record fallb
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 15_000);
+
+it("exits on the startup deadline when async evidence exceeds its write bound", async () => {
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_STARTUP_STALL: "1",
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "250",
+				GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS: "2000",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "startup-exit-record-fallback-waiting"));
+			const fallbackObservedAt = Date.now();
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(1);
+			expect(Date.now() - fallbackObservedAt).toBeLessThan(1_500);
+			expect(stderr).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+			expect(await readBrokerStartupExitRecord(dir)).toBeUndefined();
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 10_000);
 
 it("records SIGTERM and SIGINT received before broker readiness", async () => {
 	if (process.platform === "win32") return;
