@@ -17,7 +17,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../../src/cli/mcp-cli";
 import type { CustomTool } from "../../src/extensibility/custom-tools/types";
@@ -416,15 +416,21 @@ describe("red-team: conventional MCP autoload", () => {
 				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
 				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
 			);
+			const [initialPluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "initial", inputSchema: { type: "object", properties: {} } }],
+			);
 			const [renamedPluginTool] = MCPTool.fromTools(
 				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
 				[{ name: "renamed_lookup", inputSchema: { type: "object", properties: {} } }],
 			);
-			if (!pluginTool || !renamedPluginTool) throw new Error("plugin MCP test tools were not created");
+			if (!pluginTool || !initialPluginTool || !renamedPluginTool) {
+				throw new Error("plugin MCP test tools were not created");
+			}
 
-			let publishedTools: MCPTool[] = [];
+			let publishedTools: MCPTool[] = [initialPluginTool];
 			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
-				tools: [],
+				tools: [initialPluginTool],
 				errors: new Map(),
 				connectedServers: ["domain_docs"],
 				exaApiKeys: [],
@@ -440,17 +446,43 @@ describe("red-team: conventional MCP autoload", () => {
 				setOnToolsChanged.call(this, handler);
 				publishToolsChanged = handler;
 			});
+			const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
+			let ownerSession: AgentSession | undefined;
+			let failNextCatalogReplacement = false;
+			const failedCatalogReplacement = Promise.withResolvers<void>();
+			const failureLogged = Promise.withResolvers<void>();
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+				options,
+			) {
+				if (
+					this === ownerSession &&
+					failNextCatalogReplacement &&
+					nextTools.some(tool => tool.name === pluginTool.name)
+				) {
+					failNextCatalogReplacement = false;
+					failedCatalogReplacement.resolve();
+					throw new Error("injected owner tool registry failure");
+				}
+				await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
+			});
+			vi.spyOn(logger, "warn").mockImplementation(message => {
+				if (message === "Failed to publish owned MCP tools") failureLogged.resolve();
+			});
 
 			const { session, mcpManager } = await createAgentSession({
 				...isolatedSessionOptions(),
 				settings: Settings.isolated({ "tools.discoveryMode": "all" }),
 			});
+			ownerSession = session;
 			try {
 				if (!mcpManager) throw new Error("plugin-only MCP manager was not retained");
 				expect(connectServers).toHaveBeenCalledTimes(1);
 				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
 				expect(Object.keys(connectServers.mock.calls[0]?.[0] ?? {})).toEqual(["domain_docs"]);
-				expect(session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
+				expect(session.getAllToolNames()).toContain(initialPluginTool.name);
 
 				const publishCatalog = async (tools: MCPTool[], present: string[], absent: string[]): Promise<void> => {
 					publishedTools = tools;
@@ -470,10 +502,20 @@ describe("red-team: conventional MCP autoload", () => {
 					}
 				};
 
-				await publishCatalog([pluginTool], [pluginTool.name], []);
-				expect(session.getActiveToolNames()).toContain(pluginTool.name);
-				expect(session.getSelectedMCPToolNames()).not.toContain(pluginTool.name);
-				await publishCatalog([renamedPluginTool], [renamedPluginTool.name], [pluginTool.name]);
+				failNextCatalogReplacement = true;
+				publishedTools = [pluginTool];
+				if (!publishToolsChanged) throw new Error("plugin-only owner callback was not registered");
+				publishToolsChanged(publishedTools);
+				await failedCatalogReplacement.promise;
+				await failureLogged.promise;
+				expect(session.getAllToolNames()).toContain(initialPluginTool.name);
+				expect(session.getAllToolNames()).not.toContain(pluginTool.name);
+
+				await publishCatalog(
+					[renamedPluginTool],
+					[renamedPluginTool.name],
+					[initialPluginTool.name, pluginTool.name],
+				);
 				expect(session.getActiveToolNames()).toContain(renamedPluginTool.name);
 				expect(session.getSelectedMCPToolNames()).not.toContain(renamedPluginTool.name);
 				await publishCatalog([], [], [renamedPluginTool.name]);

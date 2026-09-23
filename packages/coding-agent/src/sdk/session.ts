@@ -2410,7 +2410,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const cachedConventionalMcpServerNames = new Set<string>();
 		let ownedMcpManagerToolNames: string[] = [];
 		let publishOwnedMcpTools = false;
-		let ownedPluginServersConnected = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
 			manager.setOnPromptsChanged(serverName => {
@@ -2469,7 +2468,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cachedConventionalMcpServerNames.clear();
 				ownedMcpManagerToolNames = [];
 				publishOwnedMcpTools = false;
-				ownedPluginServersConnected = false;
 				let nextManager: MCPManager | undefined;
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
@@ -2511,7 +2509,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						wireMcpManagerCallbacks(nextManager);
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
-						ownedPluginServersConnected = connectedPluginNames.size > 0;
 						pluginMcpManagerServers.set(nextManager, new Set(pluginNames));
 						conventionalMcpManagerServers.set(nextManager, conventionalCacheServerNames);
 						for (const tool of result.tools) {
@@ -3394,7 +3391,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 				publishOwnedMcpTools = true;
-				ownedPluginServersConnected = connectedPluginNames.size > 0;
 				// Keep plugin config authority fixed even while a conventional cached
 				// fallback needs reconnects; a full reload would disconnect and lose the
 				// plugin-bundle configs because native discovery does not reload them.
@@ -5383,11 +5379,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						}
 						pluginMcpManagerServers.set(manager, pluginServerNames);
 						conventionalMcpManagerServers.set(manager, conventionalServerNames);
-						ownedConventionalMcpServerNames.clear();
-						for (const name of conventionalServerNames) ownedConventionalMcpServerNames.add(name);
-						for (const serverName of cachedConventionalMcpServerNames) {
+						const nextCachedConventionalMcpServerNames = new Set(cachedConventionalMcpServerNames);
+						for (const serverName of nextCachedConventionalMcpServerNames) {
 							if (!tools.some(tool => tool.mcpServerName === serverName)) {
-								cachedConventionalMcpServerNames.delete(serverName);
+								nextCachedConventionalMcpServerNames.delete(serverName);
 							}
 						}
 						for (const tool of tools) {
@@ -5396,7 +5391,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								tool.mcpServerName &&
 								conventionalServerNames.has(tool.mcpServerName)
 							) {
-								cachedConventionalMcpServerNames.add(tool.mcpServerName);
+								nextCachedConventionalMcpServerNames.add(tool.mcpServerName);
 							}
 						}
 						const nextTools = tools.filter(tool =>
@@ -5405,7 +5400,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								: false,
 						);
 						const previousNames = ownedMcpManagerToolNames;
-						ownedMcpManagerToolNames = nextTools.map(tool => tool.name);
+						const nextToolNames = nextTools.map(tool => tool.name);
 						const previousSet = new Set(previousNames);
 						const nextPluginToolNames = nextTools
 							.filter(tool => tool.mcpServerName && pluginServerNames.has(tool.mcpServerName))
@@ -5413,34 +5408,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const nextConventionalToolNames = nextTools
 							.filter(tool => tool.mcpServerName && conventionalServerNames.has(tool.mcpServerName))
 							.map(tool => tool.name);
-						pluginMcpToolNames.splice(
-							0,
-							pluginMcpToolNames.length,
+						const nextMandatoryMcpToolNames = [
 							...pluginMcpToolNames.filter(name => !previousSet.has(name)),
 							...nextPluginToolNames,
-						);
-						conventionalMcpToolNames.splice(
-							0,
-							conventionalMcpToolNames.length,
+						];
+						const nextConventionalMcpToolNames = [
 							...conventionalMcpToolNames.filter(name => !previousSet.has(name)),
 							...nextConventionalToolNames,
-						);
-						cwdCapturingToolNames.splice(
-							0,
-							cwdCapturingToolNames.length,
+						];
+						const nextCwdCapturingToolNames = [
 							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-							...ownedMcpManagerToolNames,
-						);
-						ownedPluginServersConnected = [...pluginServerNames].some(
+							...nextToolNames,
+						];
+						const nextOwnedPluginServersConnected = [...pluginServerNames].some(
 							name => manager.getConnectionStatus(name) === "connected",
 						);
-						await session.replaceNamedCustomTools(previousNames, nextTools, {
-							mandatoryMCPToolNames: pluginMcpToolNames,
-						});
+						const nextOwnedConventionalMcpServerNames = new Set(conventionalServerNames);
 						const hasPublishedCachedTool = nextTools.some(
 							tool =>
-								tool.mcpServerName !== undefined && cachedConventionalMcpServerNames.has(tool.mcpServerName),
+								tool.mcpServerName !== undefined &&
+								nextCachedConventionalMcpServerNames.has(tool.mcpServerName),
 						);
+						try {
+							await session.replaceNamedCustomTools(previousNames, nextTools, {
+								mandatoryMCPToolNames: nextMandatoryMcpToolNames,
+							});
+						} catch (error) {
+							ownedMcpManagerToolNames = [...new Set([...previousNames, ...nextToolNames])];
+							throw error;
+						}
+						ownedMcpManagerToolNames = nextToolNames;
+						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...nextMandatoryMcpToolNames);
+						conventionalMcpToolNames.splice(0, conventionalMcpToolNames.length, ...nextConventionalMcpToolNames);
+						cwdCapturingToolNames.splice(0, cwdCapturingToolNames.length, ...nextCwdCapturingToolNames);
+						ownedConventionalMcpServerNames.clear();
+						for (const name of nextOwnedConventionalMcpServerNames) ownedConventionalMcpServerNames.add(name);
+						cachedConventionalMcpServerNames.clear();
+						for (const name of nextCachedConventionalMcpServerNames) cachedConventionalMcpServerNames.add(name);
 						// Mixed plugin + conventional sessions defer the seal while a
 						// conventional server is connecting. Cached fallback servers retain
 						// their reconnect path while any of their tools remain published,
@@ -5448,9 +5452,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// Derive that hold from this snapshot so removing/replacing the tools
 						// restores the fixed-connection plugin contract.
 						if (
-							ownedPluginServersConnected &&
+							nextOwnedPluginServersConnected &&
 							!manager.isConnectionSetSealed() &&
-							![...ownedConventionalMcpServerNames].some(
+							![...nextOwnedConventionalMcpServerNames].some(
 								name => manager.getConnectionStatus(name) === "connecting",
 							) &&
 							!hasPublishedCachedTool
@@ -5487,11 +5491,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					.then(async () => {
 						if (session.isDisposed) return;
 						const previousNames = inheritedMcpManagerToolNames;
+						const nextNames = snapshot.map(tool => tool.name);
 						const classifiedTools = classifyInheritedMcpToolNames(manager, snapshot);
-						await session.replaceNamedCustomTools(previousNames, snapshot, {
-							mandatoryMCPToolNames: classifiedTools.pluginMcpToolNames,
-						});
-						inheritedMcpManagerToolNames = snapshot.map(tool => tool.name);
+						try {
+							await session.replaceNamedCustomTools(previousNames, snapshot, {
+								mandatoryMCPToolNames: classifiedTools.pluginMcpToolNames,
+								activateNewTools: false,
+							});
+						} catch (error) {
+							inheritedMcpManagerToolNames = [...new Set([...previousNames, ...nextNames])];
+							throw error;
+						}
+						inheritedMcpManagerToolNames = nextNames;
 						pluginMcpToolNames.splice(0, pluginMcpToolNames.length, ...classifiedTools.pluginMcpToolNames);
 						conventionalMcpToolNames.splice(
 							0,

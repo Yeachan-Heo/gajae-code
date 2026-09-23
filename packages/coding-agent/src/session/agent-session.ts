@@ -5941,11 +5941,11 @@ export class AgentSession {
 		if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
 	}
 
-	/** Swap named custom tools and, when supplied, their mandatory MCP selection. */
+	/** Swap named custom tools and their optional mandatory MCP selection. */
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
-		nextTools: CustomTool[],
-		options?: { mandatoryMCPToolNames?: readonly string[] },
+		nextTools: readonly CustomTool[],
+		options?: { mandatoryMCPToolNames?: readonly string[]; activateNewTools?: boolean },
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
@@ -5970,7 +5970,9 @@ export class AgentSession {
 		await this.#applyActiveToolsByName(
 			[
 				...previousActive.filter(name => !previous.has(name)),
-				...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+				...added.filter(
+					name => previousActive.includes(name) || (options?.activateNewTools !== false && !previous.has(name)),
+				),
 			],
 			{ previousSelectedMCPToolNames },
 		);
