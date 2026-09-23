@@ -3392,6 +3392,12 @@ describe("deep-interview crystallize contract", () => {
 			"Confirmed",
 			"Absolutely",
 			"Sounds good",
+			"Yes exactly",
+			"Yes, exactly!",
+			"Yes please",
+			"Yes please...",
+			"Absolutely yes",
+			"Absolutely, yes!!!",
 			"true",
 			"false",
 			"Yes!!",
@@ -3405,6 +3411,18 @@ describe("deep-interview crystallize contract", () => {
 			expect(() => crystallizeDeepInterview(singleGoalEvidence(acknowledgement, acknowledgement))).toThrow(
 				"verbatim user anchor",
 			);
+		}
+	});
+
+	it("ignores acknowledgement follow-ups without rejecting substantive requirement text", () => {
+		const followUp = userDirectiveEvidence(
+			["Build a report.", "Yes, exactly!"],
+			[{ message_index: 0, quote: "Build a report." }],
+		);
+		expect(crystallizeDeepInterview(followUp).lifecycle).toBe("ready");
+
+		for (const requirement of ["Yes, please export reports.", "Absolutely yes, encrypt backups."]) {
+			expect(crystallizeDeepInterview(singleGoalEvidence(requirement)).lifecycle).toBe("ready");
 		}
 	});
 
