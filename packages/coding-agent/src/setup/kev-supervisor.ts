@@ -22,7 +22,8 @@ export const WATCH_FD_ENV = "GJC_KEV_WATCH_FD";
 export const CONTROL_SOCKET_PATH_MAX = 103;
 /** Longer than the supervisor's terminate grace so a legitimate slow shutdown is still observed. */
 const CONTROL_TIMEOUT_MS = 20_000;
-const CONTROL_REPLY_MAX = 4096;
+/** Inference replies are the largest thing this channel carries; matches the provider's body cap. */
+const CONTROL_REPLY_MAX = 64 * 1024;
 
 export const controlReplySchema = z
 	.object({
@@ -31,6 +32,10 @@ export const controlReplySchema = z
 		pid: z.number().int().min(2).optional(),
 		exit: z.number().int().nullable().optional(),
 		state: z.enum(["running", "exited"]).optional(),
+		/** HTTP status the supervisor's own child returned for an `infer` request. */
+		status: z.number().int().min(100).max(599).optional(),
+		/** Verbatim response body from that child, bounded by the supervisor. */
+		body: z.string().optional(),
 	})
 	.strict();
 export type KevControlReply = z.infer<typeof controlReplySchema>;
@@ -38,6 +43,17 @@ export type KevControlReply = z.infer<typeof controlReplySchema>;
 /** A control request carries the operation and the start-time token, never a pid. */
 export function controlRequest(op: "stop" | "status", token: string): string {
 	return `${JSON.stringify({ op, token })}\n`;
+}
+
+/**
+ * Ask the supervisor to run one inference against the server it owns.
+ *
+ * The body never leaves this machine's socket: the supervisor forwards it to its
+ * own child on loopback, so task text cannot reach whatever else might be
+ * listening on that port.
+ */
+export function controlInferRequest(token: string, body: string): string {
+	return `${JSON.stringify({ op: "infer", token, body })}\n`;
 }
 
 export function controlSocketPathIsBindable(socketPath: string): boolean {
@@ -49,7 +65,11 @@ export function controlSocketPathIsBindable(socketPath: string): boolean {
  * Every failure resolves `undefined`: an unreachable or silent supervisor must
  * leave the caller with no outcome to act on, never a fallback signal.
  */
-export function kevControl(socketPath: string, message: string): Promise<KevControlReply | undefined> {
+export function kevControl(
+	socketPath: string,
+	message: string,
+	timeoutMs = CONTROL_TIMEOUT_MS,
+): Promise<KevControlReply | undefined> {
 	return new Promise(resolve => {
 		let settled = false;
 		let buffer = "";
@@ -60,7 +80,7 @@ export function kevControl(socketPath: string, message: string): Promise<KevCont
 			socket.destroy();
 			resolve(reply);
 		};
-		socket.setTimeout(CONTROL_TIMEOUT_MS, () => finish(undefined));
+		socket.setTimeout(timeoutMs, () => finish(undefined));
 		socket.on("connect", () => socket.write(message));
 		socket.on("data", chunk => {
 			buffer += chunk.toString("utf8");
@@ -170,6 +190,7 @@ depends on resolving a bare, recyclable pid.
 
 import errno
 import hmac
+import http.client
 import json
 import os
 import signal
@@ -179,9 +200,14 @@ import sys
 import time
 
 GRACE_SECONDS = 10.0
-MAX_REQUEST = 4096
+MAX_REQUEST = 256 * 1024
+MAX_RESPONSE = 64 * 1024
 SUN_PATH_MAX = 103
 TOKEN_LENGTH = 64
+INFER_TIMEOUT_SECONDS = 60.0
+# Fixed: callers choose neither host, port nor path, so this channel can only ever
+# reach the server this supervisor started.
+SERVICE_PATH = "/v1/systemone"
 
 
 def fail(message):
@@ -236,7 +262,36 @@ def terminate(child):
         return None
 
 
-def serve(connection, child, token):
+def infer(port, body):
+    # The destination is this supervisor's own child on loopback. Nothing in the
+    # request chooses it, so an unrelated listener that grabbed the port cannot
+    # be handed task text by a caller.
+    if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_REQUEST:
+        return {"ok": False, "error": "invalid_request"}
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=INFER_TIMEOUT_SECONDS)
+    try:
+        payload = body.encode("utf-8")
+        connection.request(
+            "POST",
+            SERVICE_PATH,
+            body=payload,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+        )
+        response = connection.getresponse()
+        received = response.read(MAX_RESPONSE + 1)
+        if len(received) > MAX_RESPONSE:
+            return {"ok": False, "error": "response_too_large"}
+        return {"ok": True, "status": response.status, "body": received.decode("utf-8", "replace")}
+    except Exception:
+        return {"ok": False, "error": "transport"}
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def serve(connection, child, token, port):
     connection.settimeout(5.0)
     data = b""
     try:
@@ -254,13 +309,20 @@ def serve(connection, child, token):
     except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
         reply(connection, {"ok": False, "error": "malformed"})
         return False
-    # Refuse before touching the child: an unauthenticated request signals nothing.
+    # Refuse before touching the child: an unauthenticated request signals nothing
+    # and reaches no server.
     if not isinstance(presented, str) or not hmac.compare_digest(presented, token):
         reply(connection, {"ok": False, "error": "refused"})
         return False
     if op == "status":
         alive = child.poll() is None
         reply(connection, {"ok": True, "pid": child.pid, "state": "running" if alive else "exited"})
+        return False
+    if op == "infer":
+        if child.poll() is not None:
+            reply(connection, {"ok": False, "error": "exited"})
+            return False
+        reply(connection, infer(port, request.get("body")))
         return False
     if op != "stop":
         reply(connection, {"ok": False, "error": "unsupported"})
@@ -271,10 +333,13 @@ def serve(connection, child, token):
 
 
 def main(argv):
-    if len(argv) < 4 or argv[0] != "--socket" or argv[2] != "--":
-        fail("usage: supervisor.py --socket <path> -- <command> [args...]")
+    if len(argv) < 6 or argv[0] != "--socket" or argv[2] != "--port" or argv[4] != "--":
+        fail("usage: supervisor.py --socket <path> --port <port> -- <command> [args...]")
     socket_path = argv[1]
-    command = argv[3:]
+    if not argv[3].isdigit():
+        fail("supervised port must be a number")
+    port = int(argv[3])
+    command = argv[5:]
     if not command:
         fail("no supervised command")
     if len(socket_path.encode("utf-8")) > SUN_PATH_MAX:
@@ -340,7 +405,7 @@ def main(argv):
                 continue
             raise
         try:
-            if serve(connection, child, token):
+            if serve(connection, child, token, port):
                 cleanup(listener, socket_path, watch_write)
                 return 0
         finally:

@@ -369,12 +369,20 @@ describe("decision context construction", () => {
 		expect(createTaskDecisionProvider({ settings: Settings.isolated() })).toBeUndefined();
 		const settings = Settings.isolated({
 			"task.decision.enabled": true,
-			"task.decision.kevEndpoint": "https://outside.invalid",
+			"task.decision.kevModel": "x".repeat(300),
 		});
 		expect(createTaskDecisionProvider({ settings })).toMatchObject({
 			setupError: "invalid_configuration",
 			providerName: "kev",
 		});
+	});
+
+	test("the local provider exposes no configurable endpoint", () => {
+		const settings = Settings.isolated({ "task.decision.enabled": true });
+		const selection = createTaskDecisionProvider({ settings });
+		expect(selection?.provider).toBeDefined();
+		// A loopback URL is not a proof of identity, so none is accepted.
+		expect(JSON.stringify(Object.keys(selection?.provider ?? {}))).not.toContain("endpoint");
 	});
 
 	test("enforce mode is rejected and never creates a provider", () => {

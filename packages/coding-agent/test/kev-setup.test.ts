@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { acquireFileLock } from "../src/config/file-lock";
 import { type KevProcessIdentity, type KevSetupDeps, runKevSetup } from "../src/setup/kev-setup";
 import {
+	controlInferRequest,
 	controlRequest,
 	controlSocketPathIsBindable,
 	KEV_SERVICE_SHIM_SOURCE,
@@ -581,6 +582,8 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 				supervisorScript,
 				"--socket",
 				socketPath,
+				"--port",
+				String(port),
 				"--",
 				python!,
 				shim,
@@ -612,6 +615,57 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		expect(await until(() => loopbackPortIsFree(port!))).toBe(true);
 	}, 60_000);
 
+	test("forwards an authenticated inference to its own child and refuses an unauthenticated one", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-infer-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const script = path.join(base, "supervisor.py");
+		await Bun.write(script, KEV_SUPERVISOR_SOURCE);
+		await fs.chmod(script, 0o600);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+		expect(port).toBeDefined();
+
+		const token = "d".repeat(64);
+		const echoServer = [
+			"import http.server, json",
+			"class Handler(http.server.BaseHTTPRequestHandler):",
+			"    def do_POST(self):",
+			"        body = self.rfile.read(int(self.headers['Content-Length']))",
+			"        payload = json.dumps({'path': self.path, 'echo': json.loads(body)}).encode()",
+			"        self.send_response(200)",
+			"        self.send_header('Content-Type', 'application/json')",
+			"        self.send_header('Content-Length', str(len(payload)))",
+			"        self.end_headers()",
+			"        self.wfile.write(payload)",
+			"    def log_message(self, *args):",
+			"        pass",
+			`http.server.HTTPServer(('127.0.0.1', ${port}), Handler).serve_forever()`,
+		].join("\n");
+		const supervisor = Bun.spawn(
+			[python!, script, "--socket", socketPath, "--port", String(port), "--", python!, "-c", echoServer],
+			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
+		);
+		spawnedPids.push(supervisor.pid);
+		supervisor.stdin.write(`${token}\n`);
+		supervisor.stdin.end();
+		expect(await until(() => pathExists(socketPath))).toBe(true);
+		const started = await kevControl(socketPath, controlRequest("status", token));
+		spawnedPids.push(started!.pid!);
+		expect(await until(() => !loopbackPortIsFree(port!))).toBe(true);
+
+		const refused = await kevControl(socketPath, controlInferRequest("e".repeat(64), JSON.stringify({ probe: 1 })));
+		expect(refused).toEqual({ ok: false, error: "refused" });
+
+		const answered = await kevControl(socketPath, controlInferRequest(token, JSON.stringify({ probe: "payload" })));
+		expect(answered).toMatchObject({ ok: true, status: 200 });
+		// The supervisor chose the destination, not the caller.
+		expect(JSON.parse(answered!.body!)).toEqual({ path: "/v1/systemone", echo: { probe: "payload" } });
+
+		expect((await kevControl(socketPath, controlRequest("stop", token)))?.ok).toBe(true);
+		expect(await supervisor.exited).toBe(0);
+	}, 60_000);
+
 	test("refuses a wrong token, then stops its child for the right one", async () => {
 		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-sup-"));
 		roots.push(base);
@@ -624,7 +678,18 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 
 		const token = "a".repeat(64);
 		const supervisor = Bun.spawn(
-			[python!, script, "--socket", socketPath, "--", python!, "-c", "import time; time.sleep(60)"],
+			[
+				python!,
+				script,
+				"--socket",
+				socketPath,
+				"--port",
+				String(PORT_BASE),
+				"--",
+				python!,
+				"-c",
+				"import time; time.sleep(60)",
+			],
 			{ stdin: "pipe", stdout: "pipe", stderr: "pipe" },
 		);
 		spawnedPids.push(supervisor.pid);

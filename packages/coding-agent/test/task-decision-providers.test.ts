@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { DecisionErrorCode, DecisionProbabilities, DecisionRequest } from "../src/task/decision-model";
 import { JevDecisionProvider, KevDecisionProvider } from "../src/task/decision-providers";
+import type { KevControlReply } from "../src/setup/kev-supervisor";
 
 const request: DecisionRequest = {
 	role: "executor",
@@ -16,26 +20,107 @@ const answer = (
 });
 const json = (value: unknown) => new Response(JSON.stringify(value));
 
+const SOCKET = "/tmp/gjc-kev-fixture.sock";
+const TOKEN = "t".repeat(64);
+type ControlCall = { socket: string; request: Record<string, unknown> };
+
+/** A Kev provider whose owned channel is stubbed, so no socket or port is touched. */
+function kevThroughControl(
+	respond: (body: string) => KevControlReply | undefined,
+	options: { model?: string; timeoutMs?: number; calls?: ControlCall[] } = {},
+) {
+	return new KevDecisionProvider({
+		model: options.model,
+		timeoutMs: options.timeoutMs,
+		resolveChannel: async () => ({ socket: SOCKET, token: TOKEN, port: 8009 }),
+		control: async (socket, message) => {
+			const parsed = JSON.parse(message.trim()) as Record<string, unknown>;
+			options.calls?.push({ socket, request: parsed });
+			return respond(String(parsed.body));
+		},
+	});
+}
+
+const okReply = (value: unknown): KevControlReply => ({ ok: true, status: 200, body: JSON.stringify(value) });
+
+/** Shared-checkout isolation: these tests bind only inside this window. */
+function reservedLoopbackPort(): number {
+	const base = Number(process.env.PORT_BASE ?? 42040);
+	for (let port = base; port < base + 20; port++) {
+		try {
+			const probe = Bun.listen({
+				hostname: "127.0.0.1",
+				port,
+				socket: {
+					data() {},
+					open(socket) {
+						socket.end();
+					},
+				},
+			});
+			probe.stop(true);
+			return port;
+		} catch {
+			// Taken by another task in this shared checkout; try the next one.
+		}
+	}
+	throw new Error("no free loopback port in the reserved window");
+}
+
 describe("task decision providers", () => {
-	test("Kev sends only a bounded typed packet with the requested model and subset", async () => {
-		let body: unknown;
-		const provider = new KevDecisionProvider({
+	test("Kev sends only a bounded typed packet through its owned control channel", async () => {
+		const calls: ControlCall[] = [];
+		const provider = kevThroughControl(() => okReply(answer("balanced", { fast: 0.25, balanced: 0.75 })), {
 			model: "kev-custom",
-			fetchFn: async (_url, init) => {
-				body = JSON.parse(String(init.body));
-				expect(init.redirect).toBe("error");
-				return json(answer("balanced", { fast: 0.25, balanced: 0.75 }));
-			},
+			calls,
 		});
 		const outcome = await provider.decide({ ...request, candidates: { fast: "small", balanced: "normal" } });
 		expect(outcome.result?.choice).toBe("balanced");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.socket).toBe(SOCKET);
+		expect(calls[0]?.request.op).toBe("infer");
+		expect(calls[0]?.request.token).toBe(TOKEN);
+		const body = JSON.parse(String(calls[0]?.request.body)) as Record<string, unknown>;
 		expect(body).toMatchObject({
 			model: "kev-custom",
 			state: { role: "executor", assignment: request.assignment },
 			questions: { route: { criteria: { fast: "small", balanced: "normal" } } },
 		});
-		expect(Object.keys(body as object).sort()).toEqual(["model", "questions", "state"]);
+		expect(Object.keys(body).sort()).toEqual(["model", "questions", "state"]);
 		expect(outcome.result?.reportedModel).toBe("server-model");
+	});
+
+	test("a local decision sends nothing to an unrelated listener holding the loopback port", async () => {
+		const received: string[] = [];
+		const port = reservedLoopbackPort();
+		const intruder = Bun.serve({
+			hostname: "127.0.0.1",
+			port,
+			fetch(incoming) {
+				received.push(new URL(incoming.url).pathname);
+				return new Response("{}", { headers: { "content-type": "application/json" } });
+			},
+		});
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-unowned-"));
+		try {
+			// Real resolution against a root with no owned service: there is no
+			// destination at all, so the task text is never put on the wire.
+			const outcome = await new KevDecisionProvider({ root, timeoutMs: 1000 }).decide(request);
+			expect(outcome.result).toBeUndefined();
+			expect(outcome.error?.code).toBe("unavailable");
+			expect(received).toEqual([]);
+		} finally {
+			intruder.stop(true);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("a supervisor that refuses or has lost its child yields no tier", async () => {
+		for (const reply of [{ ok: false, error: "refused" }, { ok: false, error: "exited" }, undefined] as const) {
+			const outcome = await kevThroughControl(() => reply).decide(request);
+			expect(outcome.result).toBeUndefined();
+			expect(["unavailable", "transport_error"]).toContain(outcome.error?.code ?? "");
+		}
 	});
 
 	test("Jev fixes its endpoint and model and resolves only typesafe credentials with a deadline signal", async () => {
@@ -50,8 +135,6 @@ describe("task decision providers", () => {
 				},
 			},
 			credentialSessionId: "credential-session",
-			endpoint: "http://untrusted.invalid",
-			model: "untrusted-model",
 			fetchFn: async (url, init) => {
 				destination = url;
 				expect(init.redirect).toBe("error");
@@ -80,9 +163,9 @@ describe("task decision providers", () => {
 	});
 
 	test("rejects the retired decision answer key", async () => {
-		const provider = new KevDecisionProvider({
-			fetchFn: async () => json({ answers: { decision: answer("fast", { fast: 1 }).answers.route } }),
-		});
+		const provider = kevThroughControl(() =>
+			okReply({ answers: { decision: answer("fast", { fast: 1 }).answers.route } }),
+		);
 		expect((await provider.decide({ ...request, candidates: { fast: "small" } })).error?.code).toBe(
 			"invalid_response",
 		);
@@ -126,14 +209,14 @@ describe("task decision providers", () => {
 			[answer("fast", { fast: 2, balanced: 0, strong: -1 }), "invalid_probability"],
 		];
 		for (const [payload, code] of cases) {
-			const provider = new KevDecisionProvider({ fetchFn: async () => json(payload) });
-			expect((await provider.decide(request)).error?.code).toBe(code);
+			expect((await kevThroughControl(() => okReply(payload)).decide(request)).error?.code).toBe(code);
 		}
 	});
 
 	test("stalled and oversized decoded streams are canceled", async () => {
 		let canceled = 0;
-		const stalled = new KevDecisionProvider({
+		const stalled = new JevDecisionProvider({
+			authStorage: { getApiKey: async () => "key" },
 			timeoutMs: 10,
 			fetchFn: async () =>
 				new Response(
@@ -147,7 +230,8 @@ describe("task decision providers", () => {
 		});
 		expect((await stalled.decide(request)).error?.code).toBe("timeout");
 		expect(canceled).toBe(1);
-		const oversized = new KevDecisionProvider({
+		const oversized = new JevDecisionProvider({
+			authStorage: { getApiKey: async () => "key" },
 			fetchFn: async () =>
 				new Response(
 					new ReadableStream<Uint8Array>({
@@ -168,7 +252,11 @@ describe("task decision providers", () => {
 	test("late fetch responses are canceled even when the fetch implementation ignores abort", async () => {
 		const pending = Promise.withResolvers<Response>();
 		let canceled = false;
-		const provider = new KevDecisionProvider({ timeoutMs: 10, fetchFn: () => pending.promise });
+		const provider = new JevDecisionProvider({
+			authStorage: { getApiKey: async () => "key" },
+			timeoutMs: 10,
+			fetchFn: () => pending.promise,
+		});
 		expect((await provider.decide(request)).error?.code).toBe("timeout");
 		pending.resolve(
 			new Response(
@@ -183,21 +271,20 @@ describe("task decision providers", () => {
 		expect(canceled).toBe(true);
 	});
 
-	test("HTTP authentication failures expose codes rather than response secrets", async () => {
+	test("authentication failures expose codes rather than response secrets", async () => {
 		for (const status of [401, 403] as const) {
-			const provider = new KevDecisionProvider({ fetchFn: async () => new Response("secret-response", { status }) });
-			expect(await provider.decide(request)).toEqual({ error: { code: `auth_${status}` } });
+			const remote = new JevDecisionProvider({
+				authStorage: { getApiKey: async () => "key" },
+				fetchFn: async () => new Response("secret-response", { status }),
+			});
+			expect(await remote.decide(request)).toEqual({ error: { code: `auth_${status}` } });
+			const local = kevThroughControl(() => ({ ok: true, status, body: "secret-response" }));
+			expect(await local.decide(request)).toEqual({ error: { code: `auth_${status}` } });
 		}
 	});
 
-	test("rejects unsafe local URL forms before sending any request", () => {
-		for (const endpoint of [
-			"https://example.com/v1/systemone",
-			"http://user:pass@127.0.0.1:8009/v1/systemone",
-			"http://127.0.0.1:8009/v1/systemone?x=1",
-			"http://127.0.0.1:8009/v1/systemone#fragment",
-		]) {
-			expect(() => new KevDecisionProvider({ endpoint })).toThrow();
-		}
+	test("an oversized inference reply is refused by the supervisor, not decoded here", async () => {
+		const provider = kevThroughControl(() => ({ ok: false, error: "response_too_large" }));
+		expect((await provider.decide(request)).error?.code).toBe("response_too_large");
 	});
 });

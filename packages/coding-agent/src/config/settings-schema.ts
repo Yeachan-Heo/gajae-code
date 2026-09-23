@@ -3809,11 +3809,6 @@ export const SETTINGS_SCHEMA = {
 		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 60_000,
 	},
 
-	"task.decision.kevEndpoint": {
-		type: "string",
-		default: "http://127.0.0.1:8009/v1/systemone",
-	},
-
 	"task.decision.kevModel": {
 		type: "string",
 		default: "kev-latest",

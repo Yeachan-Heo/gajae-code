@@ -250,6 +250,8 @@ function serviceArgv(root: string, run: string, port: number, ownerId: string): 
 		path.join(root, SUPERVISOR_FILE),
 		"--socket",
 		controlSocket(root),
+		"--port",
+		String(port),
 		"--",
 		...serviceCommand(root, run, port),
 	];
@@ -630,6 +632,49 @@ async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	}
 	await fs.rm(path.join(root, SERVICE_FILE), { force: true });
 	return { ok: true, state: "stopped", root };
+}
+
+/** The authenticated channel to an owned, running Kev service. */
+export interface KevServiceChannel {
+	readonly socket: string;
+	readonly token: string;
+	readonly port: number;
+}
+
+function resolveRootSync(stateDir: string, pointerRoot: string | undefined, explicit?: string): string {
+	return path.resolve(explicit ?? pointerRoot ?? path.join(stateDir, "kev"));
+}
+
+/**
+ * Resolve the control channel of a Kev service this installation can prove it owns.
+ *
+ * Callers that want to reach the local server must go through this: it returns a
+ * socket and token, never a URL, so inference cannot be aimed at whatever else
+ * happens to be listening on the loopback port. `undefined` means no ownership
+ * could be proven, and the caller must send nothing at all.
+ */
+export async function resolveKevServiceChannel(
+	options: { root?: string } = {},
+	deps: KevSetupDeps = {},
+): Promise<KevServiceChannel | undefined> {
+	try {
+		const stateDir = path.resolve(deps.stateDir ?? getAgentDir());
+		const pointer = options.root
+			? undefined
+			: await readPrivate(path.join(stateDir, "kev-root.json"), pointerSchema);
+		const root = resolveRootSync(stateDir, pointer?.root, options.root);
+		if (!(await checkDirectory(root))) return undefined;
+		const service = await readService(root);
+		if (!service.record) return undefined;
+		const install = await installed(root);
+		if (!install) return undefined;
+		const observed = (deps.inspect ?? inspectDefault)(service.record.pid);
+		if (!observed || !owns(service.record, install, observed)) return undefined;
+		return { socket: controlSocket(root), token: service.record.token, port: service.record.port };
+	} catch {
+		// Unreadable or unsafe local state proves nothing, so it grants nothing.
+		return undefined;
+	}
 }
 
 export async function runKevSetup(

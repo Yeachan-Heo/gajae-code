@@ -78,10 +78,9 @@ export function createTaskDecisionProvider(options: {
 				}),
 			};
 		}
-		const endpoint = options.settings.get("task.decision.kevEndpoint");
-		if (endpoint !== undefined && typeof endpoint !== "string")
-			return { ...base, setupError: "invalid_configuration" };
-		return { ...base, provider: new KevDecisionProvider({ endpoint, model, timeoutMs }) };
+		// No endpoint is configurable: the local provider reaches the owned service
+		// through its authenticated control socket or not at all.
+		return { ...base, provider: new KevDecisionProvider({ model, timeoutMs }) };
 	} catch {
 		return { ...base, setupError: "invalid_configuration" };
 	}

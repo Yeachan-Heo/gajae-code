@@ -1,5 +1,7 @@
 import type { AuthStorage } from "@gajae-code/ai/core";
 import decisionPrompt from "../prompts/task-decision.md" with { type: "text" };
+import { type KevServiceChannel, resolveKevServiceChannel } from "../setup/kev-setup";
+import { controlInferRequest, type KevControlReply, kevControl } from "../setup/kev-supervisor";
 import {
 	DECISION_TIERS,
 	type DecisionErrorCode,
@@ -22,11 +24,19 @@ type ProviderOptions = DecisionProviderConfig & {
 	readonly model: string;
 };
 export type DecisionProviderOptions = ProviderOptions;
-export type KevDecisionProviderOptions = Partial<Omit<ProviderOptions, "endpoint" | "model" | "authStorage">> & {
-	readonly endpoint?: string;
+type KevControlFn = (socketPath: string, message: string, timeoutMs: number) => Promise<KevControlReply | undefined>;
+export type KevDecisionProviderOptions = {
 	readonly model?: string;
+	readonly timeoutMs?: number;
+	/** Kev installation root; defaults to the remembered one. */
+	readonly root?: string;
+	readonly resolveChannel?: (root?: string) => Promise<KevServiceChannel | undefined>;
+	readonly control?: KevControlFn;
 };
-export type JevDecisionProviderOptions = Omit<KevDecisionProviderOptions, "authStorage"> & {
+export type JevDecisionProviderOptions = {
+	readonly timeoutMs?: number;
+	readonly credentialSessionId?: string;
+	readonly fetchFn?: DecisionFetch;
 	readonly authStorage: DecisionAuthStorage;
 };
 
@@ -120,6 +130,33 @@ function makeBody(request: DecisionRequest, model: string): Record<string, unkno
 	};
 }
 
+function httpFailure(status: number): DecisionOutcome {
+	if (status === 401) return failure("auth_401");
+	if (status === 403) return failure("auth_403");
+	return failure("http_error");
+}
+
+/** Shared System One envelope handling; identical whichever transport carried it. */
+function interpretEnvelope(text: string, request: DecisionRequest): DecisionOutcome {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return failure("invalid_json");
+	}
+	const envelope = parsed as { model?: unknown; answers?: { route?: unknown } } | null;
+	if (!envelope?.answers || !Object.hasOwn(envelope.answers, "route")) return failure("invalid_response");
+	const checked = validateDecisionResultDetailed(envelope.answers.route, request.candidates);
+	if (checked.error) return failure(checked.error);
+	if (!checked.result) return failure("invalid_response");
+	return {
+		result:
+			typeof envelope.model === "string"
+				? { ...checked.result, reportedModel: envelope.model.slice(0, 256) }
+				: checked.result,
+	};
+}
+
 async function decide(
 	input: DecisionRequest,
 	options: ProviderOptions,
@@ -158,28 +195,13 @@ async function decide(
 			return failure(parentSignal?.aborted ? "aborted" : "timeout");
 		if (!response.ok) {
 			void response.body?.cancel().catch(() => undefined);
-			return failure(response.status === 401 ? "auth_401" : response.status === 403 ? "auth_403" : "http_error");
+			return httpFailure(response.status);
 		}
 		const text = await readBody(response, current);
 		if (performance.now() >= current.deadline) return failure("timeout");
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			return failure("invalid_json");
-		}
+		const interpreted = interpretEnvelope(text, request);
 		if (performance.now() >= current.deadline) return failure("timeout");
-		const envelope = parsed as { model?: unknown; answers?: { route?: unknown } };
-		if (!envelope?.answers || !Object.hasOwn(envelope.answers, "route")) return failure("invalid_response");
-		const checked = validateDecisionResultDetailed(envelope.answers.route, request.candidates);
-		if (checked.error) return failure(checked.error);
-		if (!checked.result || performance.now() >= current.deadline) return failure("timeout");
-		return {
-			result:
-				typeof envelope.model === "string"
-					? { ...checked.result, reportedModel: envelope.model.slice(0, 256) }
-					: checked.result,
-		};
+		return interpreted;
 	} catch (cause) {
 		if (cause instanceof Error && cause.message === "response_too_large") return failure("response_too_large");
 		if (cause instanceof Error && (cause.message === "timeout" || current.signal.aborted))
@@ -192,29 +214,58 @@ async function decide(
 	}
 }
 
+/**
+ * The local decision provider.
+ *
+ * It never posts task text to a loopback URL. A port number proves nothing about
+ * who is listening on it, so inference is carried over the owned supervisor's
+ * authenticated Unix socket, and the supervisor forwards it to the one process
+ * it started. With no provable owned service there is no destination, and
+ * nothing is sent.
+ */
 export class KevDecisionProvider implements DecisionProvider {
-	readonly #options: ProviderOptions;
+	readonly #model: string;
+	readonly #timeoutMs: number;
+	readonly #root?: string;
+	readonly #resolveChannel: (root?: string) => Promise<KevServiceChannel | undefined>;
+	readonly #control: KevControlFn;
 	constructor(options: KevDecisionProviderOptions = {}) {
-		const endpoint = options.endpoint ?? "http://127.0.0.1:8009/v1/systemone";
-		const url = new URL(endpoint);
-		if (
-			url.protocol !== "http:" ||
-			url.username ||
-			url.password ||
-			url.search ||
-			url.hash ||
-			(url.hostname !== "127.0.0.1" && url.hostname !== "localhost")
-		)
-			throw new Error("Kev endpoint must be loopback HTTP without credentials/query/fragment");
-		this.#options = {
-			endpoint,
-			model: options.model ?? "kev-latest",
-			timeoutMs: boundedTimeout(options.timeoutMs),
-			fetchFn: options.fetchFn,
-		};
+		this.#model = options.model ?? "kev-latest";
+		this.#timeoutMs = boundedTimeout(options.timeoutMs);
+		this.#root = options.root;
+		this.#resolveChannel = options.resolveChannel ?? (root => resolveKevServiceChannel({ root }));
+		this.#control = options.control ?? kevControl;
 	}
-	decide(request: DecisionRequest, options?: { signal?: AbortSignal }): Promise<DecisionOutcome> {
-		return decide(request, this.#options, async () => undefined, options?.signal);
+	async decide(request: DecisionRequest, options?: { signal?: AbortSignal }): Promise<DecisionOutcome> {
+		const current = createLease(this.#timeoutMs, options?.signal);
+		try {
+			if (options?.signal?.aborted) return failure("aborted");
+			const normalized = normalizeDecisionRequest(request);
+			if (DECISION_TIERS.every(tier => normalized.candidates[tier] === undefined))
+				return failure("invalid_candidate");
+			const channel = await raceDeadline(this.#resolveChannel(this.#root), current);
+			if (!channel) return failure("unavailable");
+			if (current.signal.aborted || performance.now() >= current.deadline)
+				return failure(options?.signal?.aborted ? "aborted" : "timeout");
+			const body = JSON.stringify(makeBody(normalized, this.#model));
+			const reply = await raceDeadline(
+				this.#control(channel.socket, controlInferRequest(channel.token, body), this.#timeoutMs),
+				current,
+			);
+			if (performance.now() >= current.deadline) return failure("timeout");
+			if (!reply) return failure("transport_error");
+			if (!reply.ok) return failure(reply.error === "response_too_large" ? "response_too_large" : "unavailable");
+			if (reply.status === undefined || reply.body === undefined) return failure("invalid_response");
+			if (reply.status < 200 || reply.status >= 300) return httpFailure(reply.status);
+			return interpretEnvelope(reply.body, normalized);
+		} catch (cause) {
+			if (cause instanceof Error && cause.message === "aborted") return failure("aborted");
+			if (cause instanceof Error && (cause.message === "timeout" || current.signal.aborted))
+				return failure(options?.signal?.aborted ? "aborted" : "timeout");
+			return failure("transport_error");
+		} finally {
+			current.dispose();
+		}
 	}
 }
 export class JevDecisionProvider implements DecisionProvider {

@@ -1,5 +1,7 @@
-// Opt-in live verification: build dist/gjc and start owned Kev on 127.0.0.1:8009 first.
-// Run from repository root. Chat completions are loopback mocks; only Kev inference is real.
+// Opt-in live verification: build dist/gjc, then `gjc setup kev install` and
+// `gjc setup kev start` so an owned Kev service exists. Run from repository root.
+// Chat completions are loopback mocks; only Kev inference is real, and it travels
+// over the owned supervisor's authenticated Unix socket rather than an HTTP port.
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -13,29 +15,17 @@ for (const mode of ["routing", "shadow"] as const) {
 	const cwd = path.join(root, "work");
 	await fs.mkdir(cwd, { recursive: true });
 	const chatModels: string[] = [];
-	const kevPackets: unknown[] = [];
-	const kevReplies: unknown[] = [];
 	let parentTurns = 0;
 	let failure: unknown;
+	// Kev inference is no longer reachable over HTTP, so it cannot be tapped here.
+	// It goes through the owned supervisor's authenticated Unix socket, and the
+	// persisted decision events below are the evidence that it happened.
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
 		async fetch(req) {
 			try {
 				const url = new URL(req.url);
-				if (url.pathname === "/v1/systemone") {
-					const body = await req.text();
-					kevPackets.push(JSON.parse(body));
-					const res = await fetch("http://127.0.0.1:8009/v1/systemone", {
-						method: "POST",
-						headers: { "content-type": "application/json" },
-						body,
-						signal: AbortSignal.timeout(10000),
-					});
-					const text = await res.text();
-					kevReplies.push(JSON.parse(text));
-					return new Response(text, { status: res.status, headers: { "content-type": "application/json" } });
-				}
 				if (url.pathname !== "/v1/chat/completions") return new Response("unexpected path", { status: 404 });
 				const body = (await req.json()) as { model: string; messages: unknown[] };
 				chatModels.push(body.model);
@@ -91,7 +81,6 @@ for (const mode of ["routing", "shadow"] as const) {
 						};
 						finish = "tool_calls";
 					} else {
-						for (let n = 0; n < 100 && kevReplies.length === 0; n++) await Bun.sleep(100);
 						await Bun.sleep(500);
 						delta = { content: "COMPILED_KEV_OK" };
 					}
@@ -142,7 +131,6 @@ for (const mode of ["routing", "shadow"] as const) {
 						provider: "kev",
 						mode,
 						timeoutMs: 5000,
-						kevEndpoint: `${baseUrl}/systemone`,
 						kevModel: "kev-latest",
 					},
 				},
@@ -207,17 +195,15 @@ for (const mode of ["routing", "shadow"] as const) {
 			exitCode,
 			failure,
 			chatModels,
-			kevPackets,
-			kevReplies,
 			rows,
 			stdoutTail: stdout.slice(-12000),
 			stderr,
 		};
 		reports.push(report);
 		await Bun.write("artifacts/kev-compiled-verification.json", JSON.stringify(reports, null, 2));
-		if (exitCode !== 0 || failure || kevPackets.length !== 1 || kevReplies.length !== 1)
+		if (exitCode !== 0 || failure)
 			throw new Error(
-				`Compiled ${mode} failed: exit=${exitCode}, Kev calls=${kevPackets.length}, error=${failure}; inspect artifacts/kev-compiled-verification.json`,
+				`Compiled ${mode} failed: exit=${exitCode}, error=${failure}; inspect artifacts/kev-compiled-verification.json`,
 			);
 		if (!chatModels.includes(mode === "routing" ? "fast" : "pinned"))
 			throw new Error(`Wrong compiled child model: ${chatModels.join(",")}`);
@@ -243,7 +229,6 @@ for (const mode of ["routing", "shadow"] as const) {
 			`${JSON.stringify({
 				mode,
 				exitCode,
-				kevCalls: kevPackets.length,
 				chatModels,
 				eventRows: rows.length,
 				paidCalls: 0,

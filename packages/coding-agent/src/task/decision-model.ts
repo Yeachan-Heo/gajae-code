@@ -30,6 +30,7 @@ export type DecisionErrorCode =
 	| "invalid_candidate"
 	| "invalid_probability"
 	| "invalid_response"
+	| "unavailable"
 	| "transport_error";
 export interface DecisionError {
 	readonly code: DecisionErrorCode;
