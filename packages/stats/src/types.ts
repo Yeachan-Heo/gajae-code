@@ -1,4 +1,5 @@
 import type { AssistantMessage, ServiceTier, StopReason, Usage } from "@gajae-code/ai";
+import type { AgentRole } from "./shared-types";
 
 export * from "./shared-types";
 
@@ -14,6 +15,8 @@ export interface MessageStats {
 	entryId: string;
 	/** Folder/project path (extracted from session filename) */
 	folder: string;
+	/** Agent role inferred from the persisted session identity. */
+	agent: AgentRole;
 	/** Model ID */
 	model: string;
 	/** Provider name */

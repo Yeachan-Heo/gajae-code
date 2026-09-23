@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getSessionsDir, getStatsDbPath, setAgentDir, TempDir } from "@gajae-code/utils";
-import { syncAllSessions } from "../src/aggregator";
+import { getDashboardStats, syncAllSessions } from "../src/aggregator";
 import { closeDb, getOverallStats, getRecentRequests } from "../src/db";
 import { getSessionEntry, parseSessionFile } from "../src/parser";
 
@@ -332,5 +332,61 @@ describe("priority service-tier premium-request backfill", () => {
 		expect(second.stats).toHaveLength(1);
 		expect(second.stats[0]?.entryId).toBe("d1");
 		expect(second.stats[0]?.usage.premiumRequests).toBe(1);
+	});
+});
+
+describe("agent role attribution", () => {
+	it("groups root and role-agent requests while keeping legacy child roles unknown", async () => {
+		const rootFile = await writeSession("--tmp--proj", "root.jsonl", {
+			lines: [assistantEntry({ id: "root", provider: "openai" })],
+		});
+		const executorIdentity = {
+			type: "configured_model_chain",
+			id: "executor-chain",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			role: "default",
+			entries: ["openai/gpt-5.4"],
+			origin: "subagent",
+			identity: "executor",
+			explicitHead: true,
+		};
+		const executorFile = await writeSession("--tmp--proj/root-session", "executor.jsonl", {
+			lines: [executorIdentity, assistantEntry({ id: "executor-1", provider: "openai" })],
+		});
+		const firstExecutorParse = await parseSessionFile(executorFile);
+		expect(firstExecutorParse.stats[0]?.agent).toBe("executor");
+
+		await fs.appendFile(
+			executorFile,
+			`${JSON.stringify(assistantEntry({ id: "executor-2", provider: "openai" }))}\n`,
+		);
+		const incrementalExecutorParse = await parseSessionFile(executorFile, firstExecutorParse.newOffset);
+		expect(incrementalExecutorParse.stats[0]?.agent).toBe("executor");
+
+		const legacyChildFile = await writeSession("--tmp--proj/root-session", "legacy-child.jsonl", {
+			lines: [assistantEntry({ id: "legacy-child", provider: "openai" })],
+		});
+		const customChildFile = await writeSession("--tmp--proj/root-session", "custom-child.jsonl", {
+			lines: [
+				{ ...executorIdentity, id: "custom-chain", identity: "custom-reviewer" },
+				assistantEntry({ id: "custom-child", provider: "openai" }),
+			],
+		});
+
+		expect((await parseSessionFile(rootFile)).stats[0]?.agent).toBe("default");
+		expect((await parseSessionFile(legacyChildFile)).stats[0]?.agent).toBe("unknown");
+		expect((await parseSessionFile(customChildFile)).stats[0]?.agent).toBe("other");
+
+		await syncAllSessions();
+		const dashboard = await getDashboardStats("all");
+		const byAgent = new Map(dashboard.byAgent.map(row => [row.agent, row]));
+		expect(dashboard.overall.totalRequests).toBe(5);
+		expect(byAgent.get("default")?.totalRequests).toBe(1);
+		expect(byAgent.get("executor")?.totalRequests).toBe(2);
+		expect(byAgent.get("executor")?.totalInputTokens).toBe(20);
+		expect(byAgent.get("other")?.totalRequests).toBe(1);
+		expect(byAgent.get("unknown")?.totalRequests).toBe(1);
+		expect(dashboard.byAgent.reduce((sum, row) => sum + row.totalRequests, 0)).toBe(dashboard.overall.totalRequests);
 	});
 });

@@ -6,7 +6,7 @@
  */
 
 /**
- * Aggregated stats for a model or folder.
+ * Aggregated stats for a model, folder, or agent role.
  */
 export interface AggregatedStats {
 	/** Total number of requests */
@@ -55,6 +55,14 @@ export interface ModelStats extends AggregatedStats {
  */
 export interface FolderStats extends AggregatedStats {
 	folder: string;
+}
+
+/** Agent role attributed from the session transcript. */
+export type AgentRole = "default" | "executor" | "planner" | "architect" | "critic" | "other" | "unknown";
+
+/** Stats grouped by the agent role that produced the assistant request. */
+export interface AgentStats extends AggregatedStats {
+	agent: AgentRole;
 }
 
 /**
@@ -133,6 +141,7 @@ export interface DashboardStats {
 	overall: AggregatedStats;
 	byModel: ModelStats[];
 	byFolder: FolderStats[];
+	byAgent: AgentStats[];
 	timeSeries: TimeSeriesPoint[];
 	modelSeries: ModelTimeSeriesPoint[];
 	modelPerformanceSeries: ModelPerformancePoint[];
