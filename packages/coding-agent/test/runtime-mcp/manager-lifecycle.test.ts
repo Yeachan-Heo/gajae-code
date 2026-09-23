@@ -109,6 +109,53 @@ describe("MCP manager lifecycle cleanup", () => {
 		expect(manager.getConnectedServers()).toEqual([]);
 		await expect(manager.waitForConnection("bad")).rejects.toThrow("MCP server not connected: bad");
 	});
+	test("notifies independent tool subscribers for catalog changes and stops after unsubscribe", async () => {
+		const manager = new MCPManager(process.cwd());
+		const connection = makeConnection("late", async () => {});
+		const definitions: MCPToolDefinition[][] = [
+			[{ name: "first", inputSchema: { type: "object" } }],
+			[{ name: "renamed", inputSchema: { type: "object" } }],
+			[],
+			[{ name: "after_unsubscribe", inputSchema: { type: "object" } }],
+		];
+		const changes: string[][] = [];
+		const remainingChanges: string[][] = [];
+		let ownerChanges = 0;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
+		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => definitions.shift() ?? []);
+		manager.setOnToolsChanged(() => ownerChanges++);
+		const unsubscribe = manager.subscribeToToolsChanged(tools => {
+			changes.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeRemaining = manager.subscribeToToolsChanged(tools => {
+			remainingChanges.push(tools.map(tool => tool.name));
+		});
+		try {
+			const result = await manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {});
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__late_first"]);
+			await manager.refreshServerTools("late");
+			await manager.refreshServerTools("late");
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_renamed"], []]);
+
+			unsubscribe();
+			await manager.refreshServerTools("late");
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__late_after_unsubscribe"]);
+			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_renamed"], []]);
+			expect(remainingChanges).toEqual([
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(ownerChanges).toBe(4);
+			expect(connect).toHaveBeenCalledTimes(1);
+		} finally {
+			unsubscribe();
+			unsubscribeRemaining();
+			await manager.disconnectAll();
+			vi.restoreAllMocks();
+		}
+	});
 	test("retains a post-return background tool-load failure in the result errors", async () => {
 		const manager = new MCPManager(process.cwd());
 		const connection = makeConnection("late", async () => {});

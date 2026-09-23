@@ -433,6 +433,7 @@ export class MCPManager {
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
+	readonly #toolChangeListeners = new Set<(tools: CustomTool<TSchema, MCPToolDetails>[]) => void>();
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
 	#notificationsEnabled = false;
@@ -1022,6 +1023,24 @@ export class MCPManager {
 		this.#onToolsChanged = handler;
 	}
 
+	/** Subscribe to tool catalog changes without replacing the manager owner's callback. */
+	subscribeToToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void): () => void {
+		if (this.#toolsOnly) return () => {};
+		this.#toolChangeListeners.add(handler);
+		return () => this.#toolChangeListeners.delete(handler);
+	}
+
+	#notifyToolsChanged(): void {
+		this.#onToolsChanged?.(this.#tools);
+		for (const listener of this.#toolChangeListeners) {
+			try {
+				listener(this.#tools);
+			} catch (error) {
+				logger.warn("MCP tool catalog listener failed", { error: classifyMCPStartupFailure(error) });
+			}
+		}
+	}
+
 	/**
 	 * Set a callback to fire when any server's resources change.
 	 */
@@ -1410,7 +1429,7 @@ export class MCPManager {
 						this.#exactToolOptions(name, config.sharing === "shared"),
 					);
 					this.#replaceServerTools(name, customTools);
-					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
+					if (!this.#toolsOnly) this.#notifyToolsChanged();
 					if (!this.#toolsOnly && this.#shouldCacheServerTools(name))
 						void this.toolCache?.set(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
@@ -2497,7 +2516,7 @@ export class MCPManager {
 			);
 			if (hadTools) {
 				this.#publishToolCatalog(remainingTools);
-				this.#onToolsChanged?.(this.#tools);
+				this.#notifyToolsChanged();
 			} else {
 				this.#tools = remainingTools;
 			}
@@ -2900,7 +2919,7 @@ export class MCPManager {
 			);
 			if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
-			this.#onToolsChanged?.(this.#tools);
+			this.#notifyToolsChanged();
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
 		} catch (error) {
@@ -2972,7 +2991,7 @@ export class MCPManager {
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
-		this.#onToolsChanged?.(this.#tools);
+		this.#notifyToolsChanged();
 	}
 
 	/**

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcBundle } from "../src/extensibility/gjc-plugins";
 import { buildPluginMcpConfigs } from "../src/extensibility/gjc-plugins/runtime-adapters";
 import { MCPManager } from "../src/runtime-mcp";
+import * as mcpClient from "../src/runtime-mcp/client";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const mcpBundle = path.join(fixturesRoot, "valid-mcp-bundle");
@@ -23,6 +24,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	setAgentDir(originalAgentDir);
 	for (const d of tempDirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 	fs.rmSync(agentDir, { recursive: true, force: true });
@@ -362,6 +364,23 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			await child.session.setActiveToolsByName([]);
 			expect(child.session.getActiveToolNames()).not.toContain("mcp__domain_docs_lookup");
 			expect(child.mcpManager).toBe(callerManager);
+
+			const listTools = vi
+				.spyOn(mcpClient, "listTools")
+				.mockResolvedValue([{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }]);
+			await callerManager.refreshServerTools("domain_docs");
+			const lateToolName = "mcp__domain_docs_late_lookup";
+			const deadline = Date.now() + 5_000;
+			while (!child.session.getAllToolNames().includes(lateToolName)) {
+				if (Date.now() >= deadline) throw new Error("late caller-owned MCP tool did not reach child");
+				await Bun.sleep(1);
+			}
+			expect(listTools).toHaveBeenCalledTimes(1);
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
+			await child.session.setActiveToolsByName([lateToolName]);
+			expect(child.session.getActiveToolNames()).toContain(lateToolName);
+			await child.session.setActiveToolsByName([]);
+			expect(child.session.getActiveToolNames()).not.toContain(lateToolName);
 		} finally {
 			await child.session.dispose();
 		}
