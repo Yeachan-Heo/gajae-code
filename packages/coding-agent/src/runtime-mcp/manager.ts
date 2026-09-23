@@ -433,7 +433,7 @@ export class MCPManager {
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
-	readonly #toolChangeListeners = new Set<(tools: CustomTool<TSchema, MCPToolDetails>[]) => void>();
+	readonly #toolChangeListeners = new Set<(tools: readonly CustomTool<TSchema, MCPToolDetails>[]) => void>();
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
 	#notificationsEnabled = false;
@@ -1024,17 +1024,26 @@ export class MCPManager {
 	}
 
 	/** Subscribe to tool catalog changes without replacing the manager owner's callback. */
-	subscribeToToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void): () => void {
+	subscribeToToolsChanged(handler: (tools: readonly CustomTool<TSchema, MCPToolDetails>[]) => void): () => void {
 		if (this.#toolsOnly) return () => {};
 		this.#toolChangeListeners.add(handler);
-		return () => this.#toolChangeListeners.delete(handler);
+		return () => {
+			this.#toolChangeListeners.delete(handler);
+		};
 	}
 
 	#notifyToolsChanged(): void {
-		this.#onToolsChanged?.(this.#tools);
-		for (const listener of this.#toolChangeListeners) {
+		const listeners = [...this.#toolChangeListeners];
+		const snapshot = listeners.length > 0 ? Object.freeze([...this.#tools]) : undefined;
+		try {
+			this.#onToolsChanged?.(this.#tools);
+		} catch (error) {
+			logger.warn("MCP tool catalog owner callback failed", { error: classifyMCPStartupFailure(error) });
+		}
+		if (!snapshot) return;
+		for (const listener of listeners) {
 			try {
-				listener(this.#tools);
+				listener(snapshot);
 			} catch (error) {
 				logger.warn("MCP tool catalog listener failed", { error: classifyMCPStartupFailure(error) });
 			}
@@ -2627,7 +2636,9 @@ export class MCPManager {
 			this.#pendingExactSuspensions.clear();
 			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
+			const hadTools = this.#tools.length > 0;
 			this.#publishToolCatalog([]);
+			if (hadTools) this.#notifyToolsChanged();
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures,

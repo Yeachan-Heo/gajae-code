@@ -5480,7 +5480,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const manager = inheritedMcpManager;
 			if (!manager) return;
 			let inheritedMcpToolsSync: Promise<void> = Promise.resolve();
-			const syncInheritedTools = (tools: CustomTool[]): Promise<void> => {
+			const syncInheritedTools = (tools: readonly CustomTool[]): Promise<void> => {
 				const snapshot = [...tools];
 				inheritedMcpToolsSync = inheritedMcpToolsSync
 					.then(async () => {
@@ -5504,13 +5504,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return inheritedMcpToolsSync;
 			};
 			const unsubscribe = manager.subscribeToToolsChanged(tools => {
-				void syncInheritedTools(tools as CustomTool[]);
+				void syncInheritedTools(tools);
 			});
 			session.registerToolSessionCleanup(async () => {
 				unsubscribe();
 				await inheritedMcpToolsSync;
 			});
-			await syncInheritedTools(manager.getTools() as CustomTool[]);
+			await syncInheritedTools(manager.getTools());
 		};
 		// Exact-config managers do not receive reactive callbacks; their tools are
 		// registered once in the session-owned catalog. A pending conventional

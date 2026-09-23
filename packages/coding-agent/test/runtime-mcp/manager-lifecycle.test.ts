@@ -120,15 +120,34 @@ describe("MCP manager lifecycle cleanup", () => {
 		];
 		const changes: string[][] = [];
 		const remainingChanges: string[][] = [];
+		const snapshotMutationResults: Array<{ frozen: boolean; mutationRejected: boolean; catalog: string[] }> = [];
 		let ownerChanges = 0;
+		let throwOwnerCallback = false;
 		const connect = vi.spyOn(mcpClient, "connectToServer").mockResolvedValue(connection);
 		vi.spyOn(mcpClient, "listTools").mockImplementation(async () => definitions.shift() ?? []);
-		manager.setOnToolsChanged(() => ownerChanges++);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		manager.setOnToolsChanged(() => {
+			ownerChanges++;
+			if (throwOwnerCallback) throw new Error("owner callback failed");
+		});
 		const unsubscribe = manager.subscribeToToolsChanged(tools => {
 			changes.push(tools.map(tool => tool.name));
 		});
 		const unsubscribeRemaining = manager.subscribeToToolsChanged(tools => {
 			remainingChanges.push(tools.map(tool => tool.name));
+		});
+		const unsubscribeReadOnly = manager.subscribeToToolsChanged(tools => {
+			let mutationRejected = false;
+			try {
+				(tools as unknown as unknown[]).pop();
+			} catch {
+				mutationRejected = true;
+			}
+			snapshotMutationResults.push({
+				frozen: Object.isFrozen(tools),
+				mutationRejected,
+				catalog: manager.getTools().map(tool => tool.name),
+			});
 		});
 		try {
 			const result = await manager.connectServers({ late: { type: "http", url: "http://127.0.0.1:1" } }, {});
@@ -138,7 +157,9 @@ describe("MCP manager lifecycle cleanup", () => {
 			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_renamed"], []]);
 
 			unsubscribe();
+			throwOwnerCallback = true;
 			await manager.refreshServerTools("late");
+			throwOwnerCallback = false;
 			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__late_after_unsubscribe"]);
 			expect(changes).toEqual([["mcp__late_first"], ["mcp__late_renamed"], []]);
 			expect(remainingChanges).toEqual([
@@ -147,11 +168,32 @@ describe("MCP manager lifecycle cleanup", () => {
 				[],
 				["mcp__late_after_unsubscribe"],
 			]);
-			expect(ownerChanges).toBe(4);
+			expect(snapshotMutationResults).toHaveLength(4);
+			expect(snapshotMutationResults.every(result => result.frozen && result.mutationRejected)).toBe(true);
+			expect(snapshotMutationResults.map(result => result.catalog)).toEqual([
+				["mcp__late_first"],
+				["mcp__late_renamed"],
+				[],
+				["mcp__late_after_unsubscribe"],
+			]);
+			expect(warning.mock.calls.map(([message]) => message)).toContain("MCP tool catalog owner callback failed");
 			expect(connect).toHaveBeenCalledTimes(1);
+
+			await manager.disconnectAll();
+			expect(manager.getTools()).toEqual([]);
+			expect(remainingChanges).toHaveLength(5);
+			expect(remainingChanges.at(-1)).toEqual([]);
+			expect(snapshotMutationResults).toHaveLength(5);
+			expect(snapshotMutationResults.at(-1)).toEqual({
+				frozen: true,
+				mutationRejected: true,
+				catalog: [],
+			});
+			expect(ownerChanges).toBe(5);
 		} finally {
 			unsubscribe();
 			unsubscribeRemaining();
+			unsubscribeReadOnly();
 			await manager.disconnectAll();
 			vi.restoreAllMocks();
 		}
