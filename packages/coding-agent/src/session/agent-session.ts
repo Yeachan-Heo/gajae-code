@@ -18228,6 +18228,7 @@ export class AgentSession {
 			reason?: TemporaryModelReason;
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
+			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
@@ -18245,6 +18246,7 @@ export class AgentSession {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+		options?.onMutationStarted?.();
 
 		const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
 		const autoCreateScope = isTemporaryOperation && !suppliedScope;
@@ -18296,13 +18298,18 @@ export class AgentSession {
 		model: Model | undefined,
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
-		if (model) {
-			await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
-			return;
-		}
 		const previousEditMode = this.#resolveActiveEditMode();
 		this.#clearActiveRetryFallback();
-		this.#setModelWithProviderSessionReset(undefined);
+		if (model) {
+			// Restoring a captured live model is compensation, not a new selection:
+			// the old credential may have disappeared after the forward mutation.
+			this.#setModelAuthoritatively(model, "rollback");
+			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
+			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		} else {
+			this.#setModelWithProviderSessionReset(undefined);
+			this.#syncAppendOnlyContext(undefined);
+		}
 		this.setThinkingLevel(thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}

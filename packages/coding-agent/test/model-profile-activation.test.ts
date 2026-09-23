@@ -185,7 +185,12 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>) {
 			this.seedDefaultFallbackResolutionCalls.push({ activeIndex, skips });
 		},
-		async setModelTemporary(next: Model, thinkingLevel?: ThinkingLevel) {
+		async setModelTemporary(
+			next: Model,
+			thinkingLevel?: ThinkingLevel,
+			options?: { onMutationStarted?: () => void },
+		) {
+			options?.onMutationStarted?.();
 			this.setModelTemporaryCalls.push({ model: next, thinkingLevel });
 			this.model = next;
 			this.thinkingLevel = thinkingLevel;
@@ -1265,6 +1270,37 @@ describe("model profile activation", () => {
 		).rejects.toThrow('Model profile "hard-required" requires credentials for: provider-a.');
 	});
 
+	test("preflight retains its original cause when sticky-variant restoration also fails", async () => {
+		const rollbackFailure = new Error("secret-sticky-variant");
+		const registry = {
+			...fakeRegistry({ missingProviders: ["provider-a"] }),
+			getSessionCanonicalVariant: () => "provider-c/default",
+			clearCanonicalVariant: () => true,
+			restoreSessionCanonicalVariant: () => {
+				throw rollbackFailure;
+			},
+		};
+		let failure: unknown;
+		try {
+			await prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "profile-a",
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages[0]?.cause).toBeInstanceOf(ModelProfileCredentialError);
+		expect(stages[1]?.cause).toBe(rollbackFailure);
+		expect(aggregate.message).toContain("profile preflight (required credentials unavailable)");
+		expect(aggregate.message).toContain("restore canonical model variant (operation failed)");
+		expect(aggregate.message).not.toContain("secret-sticky-variant");
+	});
+
 	test("accepts the kNoAuth sentinel for required keyless providers", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "keyless-required",
@@ -1305,6 +1341,41 @@ describe("model profile activation", () => {
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 	});
 
+	test("rollback restores the previous live model even when its credentials are unavailable", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-credential-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async (candidate: Model) => (candidate.provider === "provider-c" ? undefined : kNoAuth),
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("forward flush failed"));
+
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("rollback restores a model-less session without creating resume lineage", async () => {
 		const session = fakeSession();
 		session.model = undefined;
@@ -1322,6 +1393,169 @@ describe("model profile activation", () => {
 		);
 		expect(session.model).toBeUndefined();
 		expect(session.resumeDefaultSelectors).toEqual([]);
+	});
+
+	test("does not disturb the old session when target authentication fails before mutation", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-pre-mutation-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const previousModel = model("provider-c", "default");
+			const registry = {
+				...fakeRegistry(),
+				getApiKey: async () => undefined,
+			};
+			const session = new AgentSession({
+				agent: new Agent({ initialState: { model: previousModel, systemPrompt: [], tools: [], messages: [] } }),
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const append = vi.spyOn(manager, "appendModelChange");
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: "profile-a",
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"No API key for provider-a/default",
+			);
+			expect(session.model).toBe(previousModel);
+			expect(append).not.toHaveBeenCalled();
+			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("model-less rollback disables forward append-only context", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-append-only-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			const agent = new Agent({ initialState: { model: undefined, systemPrompt: [], tools: [], messages: [] } });
+			const targetModel = model("anthropic", "claude-test");
+			const profile: ModelProfileDefinition = {
+				name: "append-only-profile",
+				requiredProviders: ["anthropic"],
+				modelMapping: { default: "anthropic/claude-test" },
+				source: "user",
+			};
+			const base = fakeRegistry({ profiles: [profile] });
+			const registry = {
+				...base,
+				getAll: () => [...base.getAll(), targetModel],
+				getApiKey: async () => kNoAuth,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager: manager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry: registry as unknown as ModelRegistry,
+			});
+			const settings = Settings.isolated();
+			const prepared = await prepareModelProfileActivation({
+				session,
+				modelRegistry: registry,
+				settings,
+				profileName: profile.name,
+			});
+			vi.spyOn(settings, "flushOrThrow").mockImplementationOnce(async () => {
+				expect(agent.appendOnlyContext).toBeDefined();
+				throw new Error("forward flush failed");
+			});
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+				"forward flush failed",
+			);
+			expect(session.model).toBeUndefined();
+			expect(agent.appendOnlyContext).toBeUndefined();
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("reports a second settings flush failure without claiming durable recovery", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const firstFailure = new Error("forward secret-settings-value");
+		const secondFailure = new Error("rollback secret-settings-value");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(firstFailure)
+			.mockRejectedValueOnce(secondFailure);
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		expect((aggregate.errors as Error[]).map(stage => stage.cause)).toEqual([firstFailure, secondFailure]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("secret-settings-value");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.model?.id).toBe("initial");
+	});
+
+	test("labels independent rollback failures without exposing error contents", async () => {
+		const session = fakeSession();
+		session.setConfiguredModelChain("default", ["provider-c/default"]);
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		const original = new Error("forward flush token-secret-123");
+		const modelRollback = new Error("rollback model token-secret-123");
+		const rollbackFlush = new Error("rollback flush token-secret-123");
+		const flush = vi
+			.spyOn(settings, "flushOrThrow")
+			.mockRejectedValueOnce(original)
+			.mockRejectedValueOnce(rollbackFlush);
+		session.restoreModelSelectionForRollback = async () => {
+			throw modelRollback;
+		};
+
+		let failure: unknown;
+		try {
+			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(AggregateError);
+		const aggregate = failure as AggregateError;
+		const stages = aggregate.errors as Error[];
+		expect(stages.map(stage => stage.cause)).toEqual([original, modelRollback, rollbackFlush]);
+		expect(stages.map(stage => stage.message)).toEqual([
+			"forward settings flush (settings write failed)",
+			"restore live model (operation failed)",
+			"restore settings flush (settings write failed)",
+		]);
+		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
+		expect(aggregate.message).toContain("restore live model (operation failed)");
+		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
+		expect(aggregate.message).toContain("Prior state may be unverified");
+		expect(aggregate.message).not.toContain("token-secret-123");
+		expect(flush).toHaveBeenCalledTimes(2);
+		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
+		// The failed live-model restore leaves a different runtime model despite the restored settings.
+		expect(session.model?.id).toBe("default");
 	});
 
 	test("rolls back partial synchronous persistent writes before durable flush", async () => {

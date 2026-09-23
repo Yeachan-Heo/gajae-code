@@ -1528,15 +1528,58 @@ export async function prepareModelProfileActivation(
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
 	} catch (error) {
-		restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+		try {
+			restoreCanonicalVariant(options.modelRegistry, options.session.sessionId, previousCanonicalVariant);
+		} catch (rollbackError) {
+			throw incompleteModelProfileRollbackError("preparation", "profile preflight", error, [
+				{ stage: "restore canonical model variant", error: rollbackError },
+			]);
+		}
 		throw error;
 	}
+}
+
+function modelProfileFailureReason(error: unknown, stage: string): string {
+	try {
+		if (error instanceof ModelProfileCredentialError) return "required credentials unavailable";
+		if (error instanceof Error && error.message.startsWith("No API key for ")) return "credentials unavailable";
+	} catch {
+		// An exotic error getter must not replace the activation failure.
+	}
+	return stage.includes("settings") || stage.startsWith("persist ") || stage.endsWith(" setting")
+		? "settings write failed"
+		: "operation failed";
+}
+
+class ModelProfileActivationStageError extends Error {
+	readonly stage: string;
+
+	constructor(stage: string, error: unknown) {
+		super(`${stage} (${modelProfileFailureReason(error, stage)})`, { cause: error });
+		this.name = "ModelProfileActivationStageError";
+		this.stage = stage;
+	}
+}
+
+function incompleteModelProfileRollbackError(
+	phase: "preparation" | "activation",
+	stage: string,
+	error: unknown,
+	rollbackErrors: readonly { stage: string; error: unknown }[],
+): AggregateError {
+	const primary = new ModelProfileActivationStageError(stage, error);
+	const incomplete = rollbackErrors.map(failure => new ModelProfileActivationStageError(failure.stage, failure.error));
+	return new AggregateError(
+		[primary, ...incomplete],
+		`Model profile ${phase} failed at ${primary.message}; rollback incomplete: ${incomplete.map(failure => failure.message).join("; ")}. Prior state may be unverified.`,
+	);
 }
 
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
+	let activationStage = "default chain";
 	let modelMutationStarted = false;
 	let overridesChanged = false;
 	let modelRolesChanged = false;
@@ -1567,15 +1610,21 @@ export async function applyPreparedModelProfileActivation(
 			}
 		}
 		if (prepared.defaultModel) {
-			modelMutationStarted = true;
+			activationStage = "model selection";
 			await prepared.session.setModelTemporary(
 				prepared.defaultModel,
 				options.thinkingLevelOverride ?? prepared.defaultThinkingLevel,
-				{ cause: "profile-activation" },
+				{
+					cause: "profile-activation",
+					onMutationStarted: () => {
+						modelMutationStarted = true;
+					},
+				},
 			);
 		}
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.
+		activationStage = "model role overrides";
 		prepared.settings.override("modelRoles", {
 			...prepared.baseModelRoles,
 			...prepared.modelRoles,
@@ -1584,6 +1633,7 @@ export async function applyPreparedModelProfileActivation(
 		// Always reinstall the agent role layer from the durable base plus the
 		// new profile's roles: a default-only or role-free successor must drop
 		// the previous profile's role-agent mappings rather than inheriting them.
+		activationStage = "agent role overrides";
 		prepared.settings.override("task.agentModelOverrides", {
 			...prepared.baseAgentModelOverrides,
 			...prepared.agentModelOverrides,
@@ -1591,65 +1641,74 @@ export async function applyPreparedModelProfileActivation(
 		overridesChanged = true;
 		if (options.persistDefault) {
 			persistentMutationStarted = true;
+			activationStage = "persist model roles";
 			prepared.settings.set("modelRoles", {});
+			activationStage = "persist agent roles";
 			prepared.settings.set("task.agentModelOverrides", {});
 			if (prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit) {
+				activationStage = "persist thinking level";
 				prepared.settings.set("defaultThinkingLevel", prepared.defaultThinkingLevel);
 			}
+			activationStage = "persist default profile";
 			prepared.settings.set("modelProfile.default", prepared.profileName);
+			activationStage = "forward settings flush";
 			await prepared.settings.flushOrThrow();
 		}
+		activationStage = "active profile marker";
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
+			activationStage = "canonical model variant";
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
+			activationStage = "resume default model";
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
 		}
+		activationStage = "installed role tracking";
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
 		);
 	} catch (error) {
-		const rollbackErrors: unknown[] = [];
-		const restore = (action: () => void): void => {
+		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
+		const restore = (stage: string, action: () => void): void => {
 			try {
 				action();
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage, error: rollbackError });
 			}
 		};
 		if (persistentMutationStarted) {
-			restore(() =>
+			restore("restore default profile setting", () =>
 				prepared.previousPersistedDefaultProfile === undefined
 					? prepared.settings.unset("modelProfile.default")
 					: prepared.settings.set("modelProfile.default", prepared.previousPersistedDefaultProfile),
 			);
-			restore(() =>
+			restore("restore model role setting", () =>
 				prepared.previousPersistedModelRoles === undefined
 					? prepared.settings.unset("modelRoles")
 					: prepared.settings.set("modelRoles", prepared.previousPersistedModelRoles),
 			);
-			restore(() =>
+			restore("restore agent role setting", () =>
 				prepared.previousPersistedAgentModelOverrides === undefined
 					? prepared.settings.unset("task.agentModelOverrides")
 					: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
 			);
-			restore(() =>
+			restore("restore thinking level setting", () =>
 				prepared.previousPersistedDefaultThinkingLevel === undefined
 					? prepared.settings.unset("defaultThinkingLevel")
 					: prepared.settings.set("defaultThinkingLevel", prepared.previousPersistedDefaultThinkingLevel),
 			);
 		}
 		if (modelRolesChanged) {
-			restore(() =>
+			restore("restore model role overrides", () =>
 				prepared.previousModelRolesOverride === undefined
 					? prepared.settings.clearOverride("modelRoles")
 					: prepared.settings.override("modelRoles", prepared.previousModelRolesOverride),
 			);
 		}
 		if (overridesChanged) {
-			restore(() =>
+			restore("restore agent role overrides", () =>
 				prepared.previousAgentModelOverridesOverride === undefined
 					? prepared.settings.clearOverride("task.agentModelOverrides")
 					: prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverridesOverride),
@@ -1670,15 +1729,17 @@ export async function applyPreparedModelProfileActivation(
 					throw new Error("Model-less profile activation rollback is unavailable");
 				}
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage: "restore live model", error: rollbackError });
 			}
 		}
 		if (resumeDefaultChanged) {
-			restore(() => prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel));
+			restore("restore resume default", () =>
+				prepared.session.recordResumeDefaultModel?.(prepared.previousSessionDefaultModel),
+			);
 		}
 		if (defaultChainChanged) {
 			const previousChain = prepared.previousDefaultChainState;
-			restore(() =>
+			restore("restore default chain", () =>
 				prepared.session.setConfiguredModelChain(
 					"default",
 					previousChain?.entries ??
@@ -1691,26 +1752,25 @@ export async function applyPreparedModelProfileActivation(
 			);
 		}
 		if (prepared.previousDefaultFallbackRuntimeState) {
-			restore(() =>
+			restore("restore fallback runtime", () =>
 				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
 			);
 		}
-		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
-		restore(() =>
+		restore("restore active profile", () =>
+			prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile),
+		);
+		restore("restore canonical model variant", () =>
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
 		);
 		if (persistentMutationStarted) {
 			try {
 				await prepared.settings.flushOrThrow();
 			} catch (rollbackError) {
-				rollbackErrors.push(rollbackError);
+				rollbackErrors.push({ stage: "restore settings flush", error: rollbackError });
 			}
 		}
 		if (rollbackErrors.length > 0) {
-			throw new AggregateError(
-				[error, ...rollbackErrors],
-				"Model profile activation failed and rollback was incomplete",
-			);
+			throw incompleteModelProfileRollbackError("activation", activationStage, error, rollbackErrors);
 		}
 		throw error;
 	}
