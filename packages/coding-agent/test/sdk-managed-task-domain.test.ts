@@ -355,4 +355,24 @@ describe("strict private shared domain transactions", () => {
 		expect((await restoreManagedAttemptRefs(root)).failedRoots).toEqual([root]);
 		expect((await loadManagedEnrollmentRecord(root)).nativeIdentities).toEqual([native]);
 	});
+	it("preserves globally accepted native evidence when reclaiming an unmapped empty root", async () => {
+		const { root } = await fixture();
+		const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-stale-"));
+		roots.push(staleRoot);
+		await recordManagedEnrollment(root, staleRoot);
+
+		const native = managedIdentity("unscoped native evidence");
+		const target = managedEnrollmentIndexPath(root);
+		const index = JSON.parse(await fs.readFile(target, "utf8"));
+		index.nativeIdentities = [native];
+		index.byRoot = {};
+		await fs.writeFile(target, JSON.stringify(index));
+		expect((await loadManagedEnrollmentRecord(root)).nativeIdentities).toEqual([native]);
+
+		expect(await restoreManagedAttemptRefs(root)).toEqual({ refs: [], failedRoots: [] });
+		const record = await loadManagedEnrollmentRecord(root);
+		expect(record.controlRoots).toEqual([]);
+		expect(record.byRoot).toEqual({});
+		expect(record.nativeIdentities).toEqual([native]);
+	});
 });

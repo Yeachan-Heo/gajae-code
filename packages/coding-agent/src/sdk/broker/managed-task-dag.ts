@@ -310,10 +310,14 @@ function enrollmentIndexDocument(record: ManagedEnrollmentRecord): {
 	const controlRoots = [...record.controlRoots].sort();
 	const byRoot: Record<string, string[]> = {};
 	for (const root of controlRoots) byRoot[root] = [...(record.byRoot[root] ?? [])].sort();
+	const nativeIdentities = [
+		...new Set([...record.nativeIdentities, ...controlRoots.flatMap(root => byRoot[root] ?? [])]),
+	].sort();
 	return {
 		version: 1,
 		controlRoots,
-		nativeIdentities: [...new Set(controlRoots.flatMap(root => byRoot[root] ?? []))].sort(),
+		// Global identities may be accepted without a root mapping; cleanup must retain them.
+		nativeIdentities,
 		byRoot,
 		state_revision: 0,
 	};
@@ -1604,7 +1608,7 @@ export async function recordManagedEnrollment(
 				target,
 				enrollmentIndexDocument({
 					controlRoots: [...roots],
-					nativeIdentities: [...new Set(Object.values(byRoot).flat())],
+					nativeIdentities: record.nativeIdentities,
 					byRoot,
 				}),
 				{ ...writer, policy: "source", expectedRevision, lockHeld: true },
@@ -1639,7 +1643,7 @@ async function removeEmptyManagedEnrollment(agentDir: string, controlRoot: strin
 				target,
 				enrollmentIndexDocument({
 					controlRoots,
-					nativeIdentities: [...new Set(Object.values(byRoot).flat())],
+					nativeIdentities: record.nativeIdentities,
 					byRoot,
 				}),
 				{ ...writer, policy: "source", expectedRevision, lockHeld: true },
