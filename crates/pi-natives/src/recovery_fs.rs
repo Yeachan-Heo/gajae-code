@@ -13,7 +13,7 @@ use std::{
 	io::{Read, Seek, SeekFrom, Write},
 	os::{
 		fd::{AsRawFd, FromRawFd},
-		unix::ffi::OsStrExt,
+		unix::{ffi::OsStrExt, fs::MetadataExt},
 	},
 	path::{Component, Path},
 	sync::{
@@ -49,9 +49,10 @@ const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const RECOVERY_REAPER_SWEEP_INTERVAL: Duration = Duration::from_mins(1);
 #[cfg(target_os = "linux")]
-// A fresh CLI process starts with no in-memory directory cookie. Cover the
-// measured ~26k-entry backlog (including first-seen markers) on each cold open
-// so a permanently preserved prefix cannot hide later expired candidates.
+const RECOVERY_REAPER_CURSOR_NAME: &[u8] = b".gjc-reaper-cursor";
+#[cfg(target_os = "linux")]
+// Keep each sweep bounded while persisting the directory cookie so a fresh CLI
+// process continues past a permanently preserved prefix.
 const RECOVERY_REAPER_MAX_SCAN_ENTRIES: usize = 65_536;
 #[cfg(target_os = "linux")]
 const RECOVERY_REAPER_MAX_FILES: u64 = 64;
@@ -67,10 +68,9 @@ const RECOVERY_REAPER_CLOCK_GRACE_SECS: u64 = 5 * 60;
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 struct RecoveryReaperState {
-	last_attempt:     Option<Instant>,
-	directory_cookie: libc::c_long,
-	last_metrics:     RecoveryReaperMetrics,
-	totals:           RecoveryReaperTotals,
+	last_attempt: Option<Instant>,
+	last_metrics: RecoveryReaperMetrics,
+	totals:       RecoveryReaperTotals,
 }
 
 #[cfg(target_os = "linux")]
@@ -107,6 +107,7 @@ struct ManagedRecoveryName {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManagedPublisherIdentity {
+	pid_namespace:    u64,
 	boot_id:          [u8; 16],
 	start_time_ticks: u64,
 }
@@ -140,6 +141,7 @@ static MANAGED_REPLACEMENT_ID: AtomicU64 = AtomicU64::new(0);
 enum RetainedPublishFault {
 	Rename(i32),
 	Unlink(i32),
+	ReplacementCandidateUnlink(i32),
 	Sync(Option<i32>),
 	PostRenameSnapshot(&'static str),
 }
@@ -179,6 +181,20 @@ fn take_post_link_unlink_fault() -> Option<i32> {
 		let mut configured = configured.borrow_mut();
 		match configured.front().copied() {
 			Some(RetainedPublishFault::Unlink(code)) => {
+				configured.pop_front();
+				Some(code)
+			},
+			_ => None,
+		}
+	})
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_replacement_candidate_unlink_fault() -> Option<i32> {
+	RETAINED_PUBLISH_FAULTS.with(|configured| {
+		let mut configured = configured.borrow_mut();
+		match configured.front().copied() {
+			Some(RetainedPublishFault::ReplacementCandidateUnlink(code)) => {
 				configured.pop_front();
 				Some(code)
 			},
@@ -626,8 +642,8 @@ fn rename_file_no_replace(
 #[cfg(target_os = "linux")]
 /// Refreshes a fully-written replacement candidate's retention timestamp just
 /// before exchange. This preparatory move is not a retained publication and
-/// deliberately bypasses publication fault injection and parent-sync reporting;
-/// the subsequent exchange path establishes its own durability boundary.
+/// bypasses normal publication fault injection and parent-sync reporting. A
+/// dedicated test fault covers the link fallback's source-unlink rollback.
 fn rename_replacement_candidate_no_replace(
 	source_parent: &File,
 	source_name: &CString,
@@ -635,24 +651,35 @@ fn rename_replacement_candidate_no_replace(
 	destination_name: &CString,
 	release_source_authority: impl FnOnce(),
 ) -> Result<(), &'static str> {
-	// SAFETY: retained parents and validated names make the no-replace syscall
-	// operands valid; RENAME_NOREPLACE prevents replacing any existing candidate.
-	if unsafe {
-		libc::syscall(
-			libc::SYS_renameat2,
-			source_parent.as_raw_fd(),
-			source_name.as_ptr(),
-			destination_parent.as_raw_fd(),
-			destination_name.as_ptr(),
-			libc::RENAME_NOREPLACE,
-		)
-	} == 0
-	{
-		return Ok(());
+	#[cfg(test)]
+	let injected_unlink_error = take_replacement_candidate_unlink_fault();
+	#[cfg(not(test))]
+	let injected_unlink_error = None;
+	if injected_unlink_error.is_none() {
+		// SAFETY: retained parents and validated names make the no-replace syscall
+		// operands valid; RENAME_NOREPLACE prevents replacing any existing candidate.
+		let renamed = unsafe {
+			libc::syscall(
+				libc::SYS_renameat2,
+				source_parent.as_raw_fd(),
+				source_name.as_ptr(),
+				destination_parent.as_raw_fd(),
+				destination_name.as_ptr(),
+				libc::RENAME_NOREPLACE,
+			)
+		};
+		if renamed == 0 {
+			return Ok(());
+		}
+		if !rename_flags_unsupported(std::io::Error::last_os_error().raw_os_error()) {
+			return Err("io_error");
+		}
 	}
-	if !rename_flags_unsupported(std::io::Error::last_os_error().raw_os_error()) {
-		return Err("io_error");
+	let source_before = statat(source_parent, source_name)?;
+	if !reaper_owner_file_stat(&source_before) {
+		return Err("identity_mismatch");
 	}
+	let expected_inode = (source_before.st_dev, source_before.st_ino);
 	// SAFETY: retained parents and validated names make the linkat operands valid;
 	// linkat fails rather than replacing an existing destination name.
 	if unsafe {
@@ -668,11 +695,147 @@ fn rename_replacement_candidate_no_replace(
 		return Err("io_error");
 	}
 	release_source_authority();
-	// SAFETY: only the staging hard link created by the linkat above is removed.
-	if unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) } != 0 {
+	let source_after_link = statat(source_parent, source_name);
+	let destination_after_link = statat(destination_parent, destination_name);
+	if !source_after_link
+		.as_ref()
+		.is_ok_and(|stat| replacement_candidate_link_stat_matches(stat, expected_inode))
+		|| !destination_after_link
+			.as_ref()
+			.is_ok_and(|stat| replacement_candidate_link_stat_matches(stat, expected_inode))
+	{
+		if rollback_replacement_candidate_link(
+			source_parent,
+			source_name,
+			destination_parent,
+			destination_name,
+			expected_inode,
+		) {
+			return Err("identity_mismatch");
+		}
 		return Err("rollback_unavailable");
 	}
+	let unlink_error = if let Some(code) = injected_unlink_error {
+		Some(std::io::Error::from_raw_os_error(code))
+	} else {
+		// SAFETY: the retained source parent and validated source name identify the
+		// source link whose inode and destination link were just verified.
+		let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
+		(unlinked != 0).then(std::io::Error::last_os_error)
+	};
+	if let Some(_unlink_error) = unlink_error {
+		if !rollback_replacement_candidate_link(
+			source_parent,
+			source_name,
+			destination_parent,
+			destination_name,
+			expected_inode,
+		) {
+			return Err("rollback_unavailable");
+		}
+		return Err("io_error");
+	}
 	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn replacement_candidate_link_stat_matches(stat: &libc::stat, expected_inode: (u64, u64)) -> bool {
+	// SAFETY: geteuid has no preconditions and only reads the effective user ID.
+	let effective_uid = unsafe { libc::geteuid() };
+	(stat.st_mode & libc::S_IFMT) == libc::S_IFREG
+		&& stat.st_dev == expected_inode.0
+		&& stat.st_ino == expected_inode.1
+		&& stat.st_uid == effective_uid
+		&& stat.st_mode & 0o7777 == 0o600
+		&& stat.st_nlink == 2
+}
+
+#[cfg(target_os = "linux")]
+fn open_replacement_candidate_link(parent: &File, name: &CString) -> Result<File, &'static str> {
+	// SAFETY: the retained parent and validated name constrain the open to one
+	// child; O_NOFOLLOW and O_NONBLOCK reject link and FIFO substitutions.
+	let fd = unsafe {
+		libc::openat(
+			parent.as_raw_fd(),
+			name.as_ptr(),
+			libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+		)
+	};
+	if fd < 0 {
+		return Err("identity_mismatch");
+	}
+	// SAFETY: successful openat returned a uniquely owned descriptor.
+	Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn rollback_replacement_candidate_link(
+	source_parent: &File,
+	source_name: &CString,
+	destination_parent: &File,
+	destination_name: &CString,
+	expected_inode: (u64, u64),
+) -> bool {
+	let Ok(source_file) = open_replacement_candidate_link(source_parent, source_name) else {
+		return false;
+	};
+	let Ok(destination_file) = open_replacement_candidate_link(destination_parent, destination_name)
+	else {
+		return false;
+	};
+	if crate::path_identity::platform::verify_created_owner_only_file(&source_file).is_err()
+		|| crate::path_identity::platform::verify_created_owner_only_file(&destination_file).is_err()
+	{
+		return false;
+	}
+	let Ok(source_metadata) = source_file.metadata() else {
+		return false;
+	};
+	let Ok(destination_metadata) = destination_file.metadata() else {
+		return false;
+	};
+	if source_metadata.dev() != expected_inode.0
+		|| source_metadata.ino() != expected_inode.1
+		|| destination_metadata.dev() != expected_inode.0
+		|| destination_metadata.ino() != expected_inode.1
+		|| source_metadata.nlink() != 2
+		|| destination_metadata.nlink() != 2
+	{
+		return false;
+	}
+	let Ok(source_named) = statat(source_parent, source_name) else {
+		return false;
+	};
+	let Ok(destination_named) = statat(destination_parent, destination_name) else {
+		return false;
+	};
+	if !replacement_candidate_link_stat_matches(&source_named, expected_inode)
+		|| !replacement_candidate_link_stat_matches(&destination_named, expected_inode)
+	{
+		return false;
+	}
+	// NFS may silly-rename an unlinked file while its descriptor is open.
+	drop(source_file);
+	drop(destination_file);
+	let Ok(source_named) = statat(source_parent, source_name) else {
+		return false;
+	};
+	let Ok(destination_named) = statat(destination_parent, destination_name) else {
+		return false;
+	};
+	if !replacement_candidate_link_stat_matches(&source_named, expected_inode)
+		|| !replacement_candidate_link_stat_matches(&destination_named, expected_inode)
+	{
+		return false;
+	}
+	// SAFETY: the destination was exclusively created by this function's linkat;
+	// source and destination were revalidated as the expected two links above.
+	let unlinked =
+		unsafe { libc::unlinkat(destination_parent.as_raw_fd(), destination_name.as_ptr(), 0) };
+	if unlinked != 0 {
+		return false;
+	}
+	destination_parent.sync_all().is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -2713,13 +2876,14 @@ fn managed_recovery_name(family: &str, counter: u64) -> Result<String, &'static 
 	let pid = libc::pid_t::try_from(std::process::id()).map_err(|_| "io_error")?;
 	let process = linux_process_identity(pid);
 	if family == ".gjc-managed-replace" && process.is_none() {
-		// Never publish an in-flight candidate that cannot be tied to this process
-		// generation; a later PID reuse would make its live-publisher guard unsafe.
+		// Never publish an in-flight candidate without observable namespace and
+		// generation identity; PID interpretation is namespace-relative.
 		return Err("io_error");
 	}
 	if let Some(publisher) = process {
 		return Ok(format!(
-			"{family}-{pid}-{:032x}-{}-{counter}-{created_at_secs}",
+			"{family}-{pid}-{}-{:032x}-{}-{counter}-{created_at_secs}",
+			publisher.pid_namespace,
 			u128::from_be_bytes(publisher.boot_id),
 			publisher.start_time_ticks,
 		));
@@ -2804,10 +2968,43 @@ fn linux_process_identity(pid: libc::pid_t) -> Option<ManagedPublisherIdentity> 
 	if pid <= 0 {
 		return None;
 	}
+	// `/proc/self` binds observation to this task even if the procfs mount uses
+	// a PID view that does not interpret its namespace-local numeric PID.
+	// SAFETY: getpid has no preconditions and only reads the current PID.
+	let is_current_process = pid == unsafe { libc::getpid() };
 	let boot = linux_boot_info()?;
-	let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+	let pid_namespace = if is_current_process {
+		linux_current_pid_namespace_identity()?
+	} else {
+		linux_pid_namespace_identity(pid)?
+	};
+	let stat_path = if is_current_process {
+		"/proc/self/stat".to_owned()
+	} else {
+		format!("/proc/{pid}/stat")
+	};
+	let stat = std::fs::read(stat_path).ok()?;
 	let start_time_ticks = parse_linux_process_start_ticks(&stat)?;
-	Some(ManagedPublisherIdentity { boot_id: boot.boot_id, start_time_ticks })
+	Some(ManagedPublisherIdentity { pid_namespace, boot_id: boot.boot_id, start_time_ticks })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_namespace_identity(pid: libc::pid_t) -> Option<u64> {
+	if pid <= 0 {
+		return None;
+	}
+	std::fs::metadata(format!("/proc/{pid}/ns/pid"))
+		.ok()
+		.map(|metadata| metadata.ino())
+		.filter(|inode| *inode != 0)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_current_pid_namespace_identity() -> Option<u64> {
+	std::fs::metadata("/proc/self/ns/pid")
+		.ok()
+		.map(|metadata| metadata.ino())
+		.filter(|inode| *inode != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -2816,9 +3013,13 @@ fn process_generation_is_definitely_different(
 	current: ManagedPublisherIdentity,
 ) -> bool {
 	match publisher {
-		Some(publisher) => publisher != current,
-		// Old names have no generation token. Their timestamp is wall-clock based,
-		// so it cannot safely prove PID reuse after a realtime clock adjustment.
+		Some(publisher) if publisher.pid_namespace == current.pid_namespace => {
+			publisher.boot_id != current.boot_id
+				|| publisher.start_time_ticks != current.start_time_ticks
+		},
+		Some(_) => false,
+		// Old names lack namespace-bound generation identity. Their timestamp is
+		// wall-clock based, so it cannot safely prove PID reuse after clock changes.
 		None => false,
 	}
 }
@@ -2836,21 +3037,38 @@ fn parse_managed_recovery_name(name: &[u8]) -> Option<ManagedRecoveryName> {
 	let mut fields = remainder.split(|byte| *byte == b'-');
 	let pid = parse_canonical_u64(fields.next()?)?;
 	let next = fields.next()?;
-	let (publisher, _counter, created_at_secs) = if next.len() == 32
-		&& next.iter().all(|byte| byte.is_ascii_hexdigit())
-	{
-		let boot_id = parse_boot_id_hex(next)?;
-		let start_time_ticks = parse_canonical_u64(fields.next()?)?;
-		let counter = parse_canonical_u64(fields.next()?)?;
+	let tagged = |field: &[u8]| field.len() == 32 && field.iter().all(u8::is_ascii_hexdigit);
+	let (publisher, created_at_secs) = if tagged(next) {
+		// Prior tagged names lack PID-namespace identity. Validate their complete
+		// shape, but treat the publisher namespace as unobservable.
+		let _boot_id = parse_boot_id_hex(next)?;
+		let _start_time_ticks = parse_canonical_u64(fields.next()?)?;
+		let _counter = parse_canonical_u64(fields.next()?)?;
 		let created_at_secs = parse_canonical_u64(fields.next()?)?;
-		(Some(ManagedPublisherIdentity { boot_id, start_time_ticks }), counter, Some(created_at_secs))
+		(None, Some(created_at_secs))
 	} else {
-		let counter = parse_canonical_u64(next)?;
-		let created_at_secs = match fields.next() {
-			Some(timestamp) => Some(parse_canonical_u64(timestamp)?),
-			None => None,
-		};
-		(None, counter, created_at_secs)
+		let first_number = parse_canonical_u64(next)?;
+		let following = fields.next();
+		if following.is_some_and(tagged) {
+			let pid_namespace = first_number;
+			if pid_namespace == 0 {
+				return None;
+			}
+			let boot_id = parse_boot_id_hex(following?)?;
+			let start_time_ticks = parse_canonical_u64(fields.next()?)?;
+			let _counter = parse_canonical_u64(fields.next()?)?;
+			let created_at_secs = parse_canonical_u64(fields.next()?)?;
+			(
+				Some(ManagedPublisherIdentity { pid_namespace, boot_id, start_time_ticks }),
+				Some(created_at_secs),
+			)
+		} else {
+			let created_at_secs = match following {
+				Some(timestamp) => Some(parse_canonical_u64(timestamp)?),
+				None => None,
+			};
+			(None, created_at_secs)
+		}
 	};
 	if fields.next().is_some() || created_at_secs == Some(0) {
 		return None;
@@ -2861,10 +3079,36 @@ fn parse_managed_recovery_name(name: &[u8]) -> Option<ManagedRecoveryName> {
 
 #[cfg(target_os = "linux")]
 fn process_is_definitely_dead_for_candidate(candidate: ManagedRecoveryName) -> bool {
-	if let Some(current) = linux_process_identity(candidate.pid) {
-		return process_generation_is_definitely_different(candidate.publisher, current);
+	process_is_definitely_dead_for_candidate_with_observations(
+		candidate,
+		linux_current_pid_namespace_identity(),
+		linux_process_identity,
+		process_is_definitely_dead,
+	)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_definitely_dead_for_candidate_with_observations(
+	candidate: ManagedRecoveryName,
+	reaper_pid_namespace: Option<u64>,
+	mut observe_process: impl FnMut(libc::pid_t) -> Option<ManagedPublisherIdentity>,
+	mut process_is_dead: impl FnMut(libc::pid_t) -> bool,
+) -> bool {
+	let Some(publisher) = candidate.publisher else {
+		// Old tagged and untagged names do not prove which PID namespace their
+		// numeric PID belonged to, so neither procfs nor kill(0) can prove death.
+		return false;
+	};
+	if reaper_pid_namespace != Some(publisher.pid_namespace) {
+		return false;
 	}
-	process_is_definitely_dead(candidate.pid)
+	if let Some(current) = observe_process(candidate.pid) {
+		return current.pid_namespace == publisher.pid_namespace
+			&& process_generation_is_definitely_different(Some(publisher), current);
+	}
+	// ESRCH is meaningful only after proving the stored PID namespace is the
+	// reaper's namespace; otherwise the same number can identify another process.
+	process_is_dead(candidate.pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2881,6 +3125,179 @@ fn process_is_definitely_dead(pid: libc::pid_t) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn reaper_directory_identity(recovery: &File) -> Result<(u64, u64), &'static str> {
+	let identity = identity(recovery)?;
+	let device = identity
+		.dev
+		.parse::<u64>()
+		.map_err(|_| "identity_mismatch")?;
+	let inode = identity
+		.ino
+		.parse::<u64>()
+		.map_err(|_| "identity_mismatch")?;
+	Ok((device, inode))
+}
+
+#[cfg(target_os = "linux")]
+fn reaper_cursor_name_matches(
+	recovery: &File,
+	name: &CString,
+	file: &File,
+) -> Result<(), &'static str> {
+	crate::path_identity::platform::verify_created_owner_only_file(file)?;
+	let identity = regular_identity(file)?;
+	let named = statat(recovery, name)?;
+	if !reaper_owner_file_stat(&named) || !stat_matches_regular_identity(&named, &identity) {
+		return Err("identity_mismatch");
+	}
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reaper_cursor_contents(directory_identity: (u64, u64), cookie: libc::c_long) -> String {
+	let payload = format!("{}-{}-{cookie}", directory_identity.0, directory_identity.1);
+	let checksum = hex_digest(Sha256::digest(payload.as_bytes()).into());
+	format!("{payload}-{checksum}\n")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_reaper_cursor(value: &[u8], directory_identity: (u64, u64)) -> Option<libc::c_long> {
+	let line = value.strip_suffix(b"\n")?;
+	let checksum_separator = line.iter().rposition(|byte| *byte == b'-')?;
+	let (payload, checksum) = line.split_at(checksum_separator);
+	let checksum = checksum.strip_prefix(b"-")?;
+	let expected_checksum = hex_digest(Sha256::digest(payload).into());
+	if checksum != expected_checksum.as_bytes() {
+		return None;
+	}
+	let mut fields = payload.split(|byte| *byte == b'-');
+	let device = parse_canonical_u64(fields.next()?)?;
+	let inode = parse_canonical_u64(fields.next()?)?;
+	let cookie = parse_canonical_u64(fields.next()?)?;
+	if fields.next().is_some() || (device, inode) != directory_identity {
+		return None;
+	}
+	libc::c_long::try_from(cookie).ok()
+}
+
+#[cfg(target_os = "linux")]
+struct RecoveryReaperCursor {
+	name:               CString,
+	file:               File,
+	cookie:             libc::c_long,
+	directory_identity: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+fn open_reaper_cursor(recovery: &File) -> Result<RecoveryReaperCursor, &'static str> {
+	let name = CString::new(RECOVERY_REAPER_CURSOR_NAME).map_err(|_| "io_error")?;
+	// Claim the fixed state entry without following or replacing an existing name.
+	// If another reaper won creation, open that entry separately and validate it.
+	// SAFETY: recovery is a retained directory descriptor and name is a live,
+	// NUL-terminated child component for this call.
+	let created = unsafe {
+		libc::openat(
+			recovery.as_raw_fd(),
+			name.as_ptr(),
+			libc::O_RDWR
+				| libc::O_CREAT
+				| libc::O_EXCL
+				| libc::O_CLOEXEC
+				| libc::O_NOFOLLOW
+				| libc::O_NONBLOCK,
+			0o600,
+		)
+	};
+	let (fd, newly_created) = if created >= 0 {
+		(created, true)
+	} else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+		// SAFETY: recovery is a retained directory descriptor and name remains a
+		// live, NUL-terminated child component for this call.
+		let fd = unsafe {
+			libc::openat(
+				recovery.as_raw_fd(),
+				name.as_ptr(),
+				libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			return Err("io_error");
+		}
+		(fd, false)
+	} else {
+		return Err("io_error");
+	};
+	// SAFETY: openat returned a uniquely owned descriptor.
+	let mut file = unsafe { File::from_raw_fd(fd) };
+	if newly_created {
+		crate::path_identity::platform::secure_created_owner_only_file(&file)?;
+	} else {
+		crate::path_identity::platform::verify_created_owner_only_file(&file)?;
+	}
+	loop {
+		// Nonblocking flock keeps a bounded maintenance pass from waiting on a
+		// different reaper that is holding the persistent cursor.
+		// SAFETY: file owns a live descriptor; flock only coordinates reaper
+		// instances and releases automatically when the last descriptor closes.
+		if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+			break;
+		}
+		let errno = std::io::Error::last_os_error().raw_os_error();
+		if errno == Some(libc::EWOULDBLOCK) || errno == Some(libc::EAGAIN) {
+			return Err("cursor_locked");
+		}
+		if errno != Some(libc::EINTR) {
+			return Err("io_error");
+		}
+	}
+	reaper_cursor_name_matches(recovery, &name, &file)?;
+	if newly_created {
+		file.sync_all().map_err(|_| "fsync_failed")?;
+		recovery.sync_all().map_err(|_| "fsync_failed")?;
+	}
+	let directory_identity = reaper_directory_identity(recovery)?;
+	let identity_before_read = regular_identity(&file)?;
+	file.seek(SeekFrom::Start(0)).map_err(|_| "io_error")?;
+	let mut value = Vec::with_capacity(64);
+	let mut limited = (&file).take(129);
+	limited.read_to_end(&mut value).map_err(|_| "io_error")?;
+	let cursor = if value.len() <= 128 {
+		parse_reaper_cursor(&value, directory_identity).unwrap_or(0)
+	} else {
+		0
+	};
+	if regular_identity(&file)? != identity_before_read {
+		return Err("identity_mismatch");
+	}
+	reaper_cursor_name_matches(recovery, &name, &file)?;
+	Ok(RecoveryReaperCursor { name, file, cookie: cursor, directory_identity })
+}
+
+#[cfg(target_os = "linux")]
+fn write_reaper_cursor(
+	recovery: &File,
+	name: &CString,
+	file: &mut File,
+	directory_identity: (u64, u64),
+	cookie: libc::c_long,
+) -> Result<(), &'static str> {
+	if reaper_directory_identity(recovery)? != directory_identity || cookie < 0 {
+		return Err("identity_mismatch");
+	}
+	reaper_cursor_name_matches(recovery, name, file)?;
+	let contents = reaper_cursor_contents(directory_identity, cookie);
+	file.seek(SeekFrom::Start(0)).map_err(|_| "io_error")?;
+	file.set_len(0).map_err(|_| "io_error")?;
+	file
+		.write_all(contents.as_bytes())
+		.map_err(|_| "io_error")?;
+	file.sync_all().map_err(|_| "fsync_failed")?;
+	reaper_cursor_name_matches(recovery, name, file)?;
+	recovery.sync_all().map_err(|_| "fsync_failed")?;
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn reap_managed_recovery_if_due(
 	recovery: &File,
 	state: &Arc<Mutex<RecoveryReaperState>>,
@@ -2893,6 +3310,25 @@ fn reap_managed_recovery(
 	recovery: &File,
 	state: &Arc<Mutex<RecoveryReaperState>>,
 	force: bool,
+) -> RecoveryReaperMetrics {
+	reap_managed_recovery_with_limits(
+		recovery,
+		state,
+		force,
+		RECOVERY_REAPER_MAX_SCAN_ENTRIES,
+		RECOVERY_REAPER_MAX_BYTES,
+		process_is_definitely_dead_for_candidate,
+	)
+}
+
+#[cfg(target_os = "linux")]
+fn reap_managed_recovery_with_limits(
+	recovery: &File,
+	state: &Arc<Mutex<RecoveryReaperState>>,
+	force: bool,
+	max_scan_entries: usize,
+	max_bytes: u64,
+	process_is_dead: impl FnMut(ManagedRecoveryName) -> bool,
 ) -> RecoveryReaperMetrics {
 	let mut state = state.lock();
 	let now = Instant::now();
@@ -2909,11 +3345,36 @@ fn reap_managed_recovery(
 			..RecoveryReaperMetrics::default()
 		});
 	};
-	let metrics = reap_managed_recovery_at(
+	let RecoveryReaperCursor {
+		name: cursor_name,
+		file: mut cursor_file,
+		cookie: mut directory_cookie,
+		directory_identity,
+	} = match open_reaper_cursor(recovery) {
+		Ok(cursor) => cursor,
+		Err("cursor_locked") => {
+			return record_reaper_metrics(&mut state, RecoveryReaperMetrics {
+				scan_limited: true,
+				..RecoveryReaperMetrics::default()
+			});
+		},
+		Err(_) => {
+			return record_reaper_metrics(&mut state, RecoveryReaperMetrics {
+				failures: 1,
+				..RecoveryReaperMetrics::default()
+			});
+		},
+	};
+	let metrics = reap_managed_recovery_at_with_cursor(
 		recovery,
 		unix_now.as_secs(),
-		&mut state.directory_cookie,
-		process_is_definitely_dead_for_candidate,
+		&mut directory_cookie,
+		max_scan_entries,
+		max_bytes,
+		|cookie| {
+			write_reaper_cursor(recovery, &cursor_name, &mut cursor_file, directory_identity, cookie)
+		},
+		process_is_dead,
 	);
 	record_reaper_metrics(&mut state, metrics)
 }
@@ -3159,6 +3620,7 @@ fn remove_reaper_marker(
 #[cfg(target_os = "linux")]
 enum ReaperCandidateResult {
 	Deleted(u64),
+	BudgetLimited,
 	Preserved,
 	Failed,
 }
@@ -3211,7 +3673,8 @@ fn reap_managed_recovery_candidate(
 	}
 	let size = match opened_identity.size.parse::<u64>() {
 		Ok(size) if size <= remaining_bytes => size,
-		_ => return ReaperCandidateResult::Preserved,
+		Ok(_) => return ReaperCandidateResult::BudgetLimited,
+		Err(_) => return ReaperCandidateResult::Preserved,
 	};
 	let (first_seen_secs, legacy_marker) = match candidate.created_at_secs {
 		Some(created_at_secs) => (created_at_secs, None),
@@ -3313,11 +3776,32 @@ fn reap_managed_recovery_candidate(
 	ReaperCandidateResult::Deleted(size)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn reap_managed_recovery_at(
 	recovery: &File,
 	now_secs: u64,
 	directory_cookie: &mut libc::c_long,
+	process_is_dead: impl FnMut(ManagedRecoveryName) -> bool,
+) -> RecoveryReaperMetrics {
+	reap_managed_recovery_at_with_cursor(
+		recovery,
+		now_secs,
+		directory_cookie,
+		RECOVERY_REAPER_MAX_SCAN_ENTRIES,
+		RECOVERY_REAPER_MAX_BYTES,
+		|_| Ok(()),
+		process_is_dead,
+	)
+}
+
+#[cfg(target_os = "linux")]
+fn reap_managed_recovery_at_with_cursor(
+	recovery: &File,
+	now_secs: u64,
+	directory_cookie: &mut libc::c_long,
+	max_scan_entries: usize,
+	max_bytes: u64,
+	mut persist_cookie: impl FnMut(libc::c_long) -> Result<(), &'static str>,
 	mut process_is_dead: impl FnMut(ManagedRecoveryName) -> bool,
 ) -> RecoveryReaperMetrics {
 	let mut metrics = RecoveryReaperMetrics::default();
@@ -3349,7 +3833,6 @@ fn reap_managed_recovery_at(
 	// directory's previous readdir call.
 	unsafe { libc::seekdir(directory, *directory_cookie) };
 	let mut candidates = Vec::new();
-	let mut reached_end = false;
 	loop {
 		// SAFETY: errno is thread-local and cleared immediately before readdir for
 		// end/error distinction.
@@ -3360,12 +3843,10 @@ fn reap_managed_recovery_at(
 			// SAFETY: errno is thread-local and read immediately after readdir returned
 			// null.
 			let errno = unsafe { *libc::__errno_location() };
-			if errno == 0 {
-				*directory_cookie = 0;
-				reached_end = true;
-			} else {
+			if errno != 0 {
 				metrics.failures = metrics.failures.saturating_add(1);
 			}
+			*directory_cookie = 0;
 			break;
 		}
 		// SAFETY: readdir returned a live dirent and d_off is the cookie after this
@@ -3374,7 +3855,7 @@ fn reap_managed_recovery_at(
 		*directory_cookie = entry.d_off as libc::c_long;
 		// SAFETY: d_name is NUL-terminated in the live dirent.
 		let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
-		if name == b"." || name == b".." {
+		if name == b"." || name == b".." || name == RECOVERY_REAPER_CURSOR_NAME {
 			continue;
 		}
 		metrics.scanned_entries = metrics.scanned_entries.saturating_add(1);
@@ -3383,7 +3864,7 @@ fn reap_managed_recovery_at(
 		{
 			candidates.push((name, candidate));
 		}
-		if metrics.scanned_entries >= RECOVERY_REAPER_MAX_SCAN_ENTRIES as u64 {
+		if metrics.scanned_entries >= max_scan_entries as u64 {
 			metrics.scan_limited = true;
 			break;
 		}
@@ -3391,11 +3872,17 @@ fn reap_managed_recovery_at(
 	// SAFETY: directory is owned by this function and closed exactly once here.
 	if unsafe { libc::closedir(directory) } != 0 {
 		metrics.failures = metrics.failures.saturating_add(1);
-	}
-	if reached_end {
 		*directory_cookie = 0;
+		if persist_cookie(0).is_err() {
+			metrics.failures = metrics.failures.saturating_add(1);
+		}
+		return metrics;
 	}
-	let mut bytes_left = RECOVERY_REAPER_MAX_BYTES;
+	if persist_cookie(*directory_cookie).is_err() {
+		metrics.failures = metrics.failures.saturating_add(1);
+		return metrics;
+	}
+	let mut bytes_left = max_bytes;
 	for (name, candidate) in candidates {
 		if metrics.reaped_files >= RECOVERY_REAPER_MAX_FILES {
 			metrics.scan_limited = true;
@@ -3416,6 +3903,10 @@ fn reap_managed_recovery_at(
 			},
 			ReaperCandidateResult::Preserved => {
 				metrics.preserved_candidates = metrics.preserved_candidates.saturating_add(1);
+			},
+			ReaperCandidateResult::BudgetLimited => {
+				metrics.preserved_candidates = metrics.preserved_candidates.saturating_add(1);
+				metrics.scan_limited = true;
 			},
 			ReaperCandidateResult::Failed => {
 				metrics.failures = metrics.failures.saturating_add(1);
@@ -3801,17 +4292,13 @@ fn replace_managed(
 	)?;
 	let staging_name = CString::new(staging_candidate).map_err(|_| "io_error")?;
 	let candidate_name = CString::new(candidate.clone()).map_err(|_| "io_error")?;
-	if rename_replacement_candidate_no_replace(
+	rename_replacement_candidate_no_replace(
 		&recovery_parent,
 		&staging_name,
 		&recovery_parent,
 		&candidate_name,
 		move || drop(staging_file),
-	)
-	.is_err()
-	{
-		return Err("rollback_unavailable");
-	}
+	)?;
 	let candidate_file = open_existing(&recovery_parent, &candidate, false)?;
 	let candidate_identity = regular_identity(&candidate_file)?;
 	if !same_expected_after_rename(
@@ -4674,7 +5161,8 @@ mod tests {
 		created_at_secs: u64,
 	) -> String {
 		format!(
-			"{family}-{pid}-{:032x}-{}-{counter}-{created_at_secs}",
+			"{family}-{pid}-{}-{:032x}-{}-{counter}-{created_at_secs}",
+			publisher.pid_namespace,
 			u128::from_be_bytes(publisher.boot_id),
 			publisher.start_time_ticks,
 		)
@@ -4740,8 +5228,22 @@ mod tests {
 				created_at_secs: None,
 			})
 		);
-		let publisher =
-			ManagedPublisherIdentity { boot_id: [0x12; 16], start_time_ticks: 123 };
+		assert_eq!(
+			parse_managed_recovery_name(
+				b".gjc-managed-replace-17-00000000000000000000000000000012-123-9-42"
+			),
+			Some(ManagedRecoveryName {
+				pid:             17,
+				publisher:       None,
+				kind:            ManagedRecoveryKind::Replace,
+				created_at_secs: Some(42),
+			})
+		);
+		let publisher = ManagedPublisherIdentity {
+			pid_namespace:    77,
+			boot_id:          [0x12; 16],
+			start_time_ticks: 123,
+		};
 		let timestamped = recovery_name_with_publisher(".gjc-managed-replace", 17, publisher, 9, 42);
 		assert_eq!(
 			parse_managed_recovery_name(timestamped.as_bytes()),
@@ -4774,6 +5276,10 @@ mod tests {
 		let parsed = parse_managed_recovery_name(generated.as_bytes()).expect("parse managed name");
 		assert_eq!(parsed.pid, pid);
 		assert_eq!(parsed.publisher, Some(current));
+		assert_eq!(
+			parsed.publisher.map(|publisher| publisher.pid_namespace),
+			linux_current_pid_namespace_identity(),
+		);
 		assert_eq!(parsed.kind, ManagedRecoveryKind::Replace);
 		assert!(parsed.created_at_secs.is_some());
 	}
@@ -4793,30 +5299,101 @@ mod tests {
 		let now = RECOVERY_REAPER_REPLACE_GRACE_SECS + RECOVERY_REAPER_CLOCK_GRACE_SECS + 100_000;
 		let expired_at =
 			now - RECOVERY_REAPER_REPLACE_GRACE_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS - 1;
-		let current =
-			ManagedPublisherIdentity { boot_id: [0x34; 16], start_time_ticks: 900 };
-		let previous =
-			ManagedPublisherIdentity { boot_id: [0x34; 16], start_time_ticks: 899 };
+		let current = ManagedPublisherIdentity {
+			pid_namespace:    44,
+			boot_id:          [0x34; 16],
+			start_time_ticks: 900,
+		};
+		let previous = ManagedPublisherIdentity {
+			pid_namespace:    44,
+			boot_id:          [0x34; 16],
+			start_time_ticks: 899,
+		};
 		let reused_name =
 			recovery_name_with_publisher(".gjc-managed-replace", 801, previous, 0, expired_at);
 		let live_name =
 			recovery_name_with_publisher(".gjc-managed-replace", 801, current, 1, expired_at + 1);
+		let same_tick_name =
+			recovery_name_with_publisher(".gjc-managed-replace", 802, current, 2, expired_at + 1);
 		write_reaper_file(&temporary.0, &reused_name, b"reused", 0o600);
 		write_reaper_file(&temporary.0, &live_name, b"live", 0o600);
+		write_reaper_file(&temporary.0, &same_tick_name, b"same-tick", 0o600);
 
 		let mut cookie = 0;
 		let metrics = reap_managed_recovery_at(&directory, now, &mut cookie, |candidate| {
 			process_generation_is_definitely_different(candidate.publisher, current)
 		});
 		assert_eq!(metrics.reaped_files, 1);
-		assert_eq!(metrics.preserved_candidates, 1);
+		assert_eq!(metrics.preserved_candidates, 2);
 		assert!(!temporary.0.join(reused_name).exists());
 		assert!(temporary.0.join(live_name).exists());
+		assert!(temporary.0.join(same_tick_name).exists());
 
 		assert!(!process_generation_is_definitely_different(None, current));
-		let after_reboot =
-			ManagedPublisherIdentity { boot_id: [0x35; 16], start_time_ticks: 899 };
+		let after_reboot = ManagedPublisherIdentity {
+			pid_namespace:    44,
+			boot_id:          [0x35; 16],
+			start_time_ticks: 899,
+		};
 		assert!(process_generation_is_definitely_different(Some(previous), after_reboot));
+	}
+
+	#[test]
+	fn reaper_only_uses_pid_liveness_evidence_in_the_publisher_namespace() {
+		let candidate = ManagedRecoveryName {
+			pid:             801,
+			publisher:       Some(ManagedPublisherIdentity {
+				pid_namespace:    22,
+				boot_id:          [0x34; 16],
+				start_time_ticks: 900,
+			}),
+			kind:            ManagedRecoveryKind::Replace,
+			created_at_secs: Some(1),
+		};
+		let observations = Cell::new(0);
+		let dead_checks = Cell::new(0);
+		let cross_namespace = process_is_definitely_dead_for_candidate_with_observations(
+			candidate,
+			Some(11),
+			|_| {
+				observations.set(observations.get() + 1);
+				Some(ManagedPublisherIdentity {
+					pid_namespace:    11,
+					boot_id:          [0x35; 16],
+					start_time_ticks: 1,
+				})
+			},
+			|_| {
+				dead_checks.set(dead_checks.get() + 1);
+				true
+			},
+		);
+		assert!(!cross_namespace);
+		assert_eq!(observations.get(), 0);
+		assert_eq!(dead_checks.get(), 0);
+		assert!(!process_is_definitely_dead_for_candidate_with_observations(
+			candidate,
+			None,
+			|_| panic!("must not inspect a PID without a known reaper namespace"),
+			|_| panic!("must not probe a PID without a known reaper namespace"),
+		));
+
+		let unobservable_procfs = process_is_definitely_dead_for_candidate_with_observations(
+			candidate,
+			Some(22),
+			|_| None,
+			|_| false,
+		);
+		assert!(!unobservable_procfs, "missing procfs/boot-ID data preserves the candidate");
+		assert_eq!(parse_linux_boot_id("00000000-0000-0000-0000-000000000000"), None,);
+
+		let legacy = ManagedRecoveryName { publisher: None, ..candidate };
+		assert!(!process_is_definitely_dead_for_candidate_with_observations(
+			legacy,
+			Some(22),
+			|_| None,
+			|_| true,
+		));
 	}
 
 	#[test]
@@ -4992,6 +5569,88 @@ mod tests {
 	}
 
 	#[test]
+	fn reaper_reports_candidates_that_exceed_the_remaining_byte_budget() {
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let now = unix_now_secs();
+		let stale = now - RECOVERY_REAPER_REMOVE_TTL_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS;
+		let name = recovery_name(".gjc-managed-remove", 909, 1, stale);
+		write_reaper_file(&temporary.0, &name, b"over-budget", 0o600);
+
+		let mut cookie = 0;
+		let metrics = reap_managed_recovery_at_with_cursor(
+			&directory,
+			now,
+			&mut cookie,
+			8,
+			0,
+			|_| Ok(()),
+			|_| true,
+		);
+		assert_eq!(metrics.reaped_files, 0);
+		assert_eq!(metrics.preserved_candidates, 1);
+		assert!(metrics.scan_limited);
+		assert!(temporary.0.join(name).exists());
+	}
+
+	#[test]
+	fn reaper_cursor_continues_after_a_fresh_state_instance() {
+		let valid_cursor = reaper_cursor_contents((1, 2), 3);
+		assert_eq!(parse_reaper_cursor(valid_cursor.as_bytes(), (1, 2)), Some(3));
+		assert_eq!(parse_reaper_cursor(valid_cursor.as_bytes(), (1, 3)), None);
+		let mut corrupted_cursor = valid_cursor.as_bytes().to_vec();
+		corrupted_cursor[0] = b'9';
+		assert_eq!(parse_reaper_cursor(&corrupted_cursor, (1, 2)), None);
+		assert_eq!(parse_reaper_cursor(b"corrupt", (1, 2)), None);
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let initialization = Arc::new(Mutex::new(RecoveryReaperState::default()));
+		let initialized =
+			reap_managed_recovery_with_limits(&directory, &initialization, true, 2, 1024, |_| false);
+		assert_eq!(initialized.scanned_entries, 0);
+
+		let now = unix_now_secs();
+		let stale = now - RECOVERY_REAPER_REPLACE_GRACE_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS - 1;
+		let publisher = ManagedPublisherIdentity {
+			pid_namespace:    77,
+			boot_id:          [0x45; 16],
+			start_time_ticks: 123,
+		};
+		for pid in 900..903 {
+			let name =
+				recovery_name_with_publisher(".gjc-managed-replace", pid, publisher, pid as u64, stale);
+			write_reaper_file(&temporary.0, &name, b"candidate", 0o600);
+		}
+		let ordered_candidates = fs::read_dir(&temporary.0)
+			.expect("read recovery directory")
+			.map(|entry| entry.expect("read directory entry").file_name())
+			.filter_map(|name| name.into_string().ok())
+			.filter(|name| parse_managed_recovery_name(name.as_bytes()).is_some())
+			.collect::<Vec<_>>();
+		assert_eq!(ordered_candidates.len(), 3);
+		let target_name = ordered_candidates[2].clone();
+		let target_pid = parse_managed_recovery_name(target_name.as_bytes())
+			.expect("target managed name")
+			.pid;
+
+		let first_state = Arc::new(Mutex::new(RecoveryReaperState::default()));
+		let first =
+			reap_managed_recovery_with_limits(&directory, &first_state, true, 2, 1024, |_| false);
+		assert_eq!(first.scanned_entries, 2);
+		assert_eq!(first.preserved_candidates, 2);
+		assert!(temporary.0.join(&target_name).exists());
+
+		let fresh_state = Arc::new(Mutex::new(RecoveryReaperState::default()));
+		let continued =
+			reap_managed_recovery_with_limits(&directory, &fresh_state, true, 2, 1024, |candidate| {
+				candidate.pid == target_pid
+			});
+		assert_eq!(continued.scanned_entries, 1);
+		assert_eq!(continued.reaped_files, 1);
+		assert!(!temporary.0.join(target_name).exists());
+	}
+
+	#[test]
 	fn cold_open_reaches_expired_entries_after_a_preserved_prefix() {
 		let temporary = TempDir::new();
 		let recovery = temporary.0.join(".gjc-recovery");
@@ -5007,9 +5666,14 @@ mod tests {
 		if !process_is_definitely_dead(dead_pid) {
 			return;
 		}
-		let expired = recovery_name(
+		let publisher = linux_process_identity(
+			libc::pid_t::try_from(std::process::id()).expect("test process id fits Linux pid_t"),
+		)
+		.expect("read current publisher namespace and generation");
+		let expired = recovery_name_with_publisher(
 			".gjc-managed-replace",
 			dead_pid as u32,
+			publisher,
 			701,
 			now - RECOVERY_REAPER_REPLACE_GRACE_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS,
 		);
@@ -5064,6 +5728,10 @@ mod tests {
 		if !process_is_definitely_dead(dead_pid) {
 			return;
 		}
+		let publisher = linux_process_identity(
+			libc::pid_t::try_from(std::process::id()).expect("test process id fits Linux pid_t"),
+		)
+		.expect("read current publisher namespace and generation");
 		let stale =
 			unix_now_secs() - RECOVERY_REAPER_REMOVE_TTL_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS;
 
@@ -5095,7 +5763,8 @@ mod tests {
 		fs::create_dir(&recovery_path).expect("create recovery directory after root open");
 		fs::set_permissions(&recovery_path, fs::Permissions::from_mode(0o700))
 			.expect("secure recovery directory");
-		let acquire_name = recovery_name(".gjc-managed-replace", dead_pid as u32, 1, stale);
+		let acquire_name =
+			recovery_name_with_publisher(".gjc-managed-replace", dead_pid as u32, publisher, 1, stale);
 		write_reaper_file(&recovery_path, &acquire_name, b"acquire", 0o600);
 		let child = File::open(&child_path).expect("open child directory");
 		let child_identity = identity(&child).expect("child identity");
@@ -5994,6 +6663,31 @@ mod tests {
 		);
 		assert_eq!(fs::read(temporary.0.join("destination")).expect("destination"), b"new");
 		assert_eq!(fs::read(temporary.0.join("candidate")).expect("candidate"), b"old");
+	}
+
+	#[test]
+	fn replacement_candidate_fallback_rolls_back_its_link_when_source_unlink_fails() {
+		let temporary = TempDir::new();
+		let parent = temporary.root();
+		write_reaper_file(&temporary.0, "staging", b"candidate", 0o600);
+		let source_name = CString::new("staging").expect("staging name");
+		let destination_name = CString::new("replacement").expect("replacement name");
+		set_retained_publish_faults([RetainedPublishFault::ReplacementCandidateUnlink(libc::EIO)]);
+
+		let result = rename_replacement_candidate_no_replace(
+			&parent,
+			&source_name,
+			&parent,
+			&destination_name,
+			|| (),
+		);
+
+		assert_eq!(result, Err("io_error"));
+		assert!(temporary.0.join("staging").exists(), "rollback must not delete the source");
+		assert!(!temporary.0.join("replacement").exists(), "rollback removes only its new link");
+		let source_metadata = fs::metadata(temporary.0.join("staging")).expect("source metadata");
+		assert_eq!(source_metadata.nlink(), 1, "source link count is restored");
+		assert_eq!(fs::read(temporary.0.join("staging")).expect("source contents"), b"candidate",);
 	}
 
 	/// The crash boundary. A three-step emulation is only equivalent to

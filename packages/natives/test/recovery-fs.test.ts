@@ -21,14 +21,12 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
-	it("reaps expired dead-owner replacement bytes and reports them on root open", async () => {
+	it("reaps expired completed-predecessor bytes and reports them on root open", async () => {
 		const root = await temporaryDirectory();
 		const recovery = path.join(root, ".gjc-recovery");
 		await fs.mkdir(recovery, { mode: 0o700 });
-		const child = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
-		expect(await child.exited).toBe(0);
 		const expired = Math.floor(Date.now() / 1000) - 3 * 60 * 60;
-		const artifact = path.join(recovery, `.gjc-managed-replace-${child.pid}-0-${expired}`);
+		const artifact = path.join(recovery, `.gjc-managed-replace-complete-${process.pid}-0-${expired}`);
 		await fs.writeFile(artifact, "abandoned", { mode: 0o600 });
 		const authority = openRecoveryFsRoot(root);
 		try {
