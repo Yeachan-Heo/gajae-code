@@ -101,6 +101,32 @@ describe("flushWorktreeOnPromptDeadline", () => {
 		expect((await run(root, ["rev-parse", "HEAD~1"])).trim()).toBe(headBefore);
 	});
 
+	test("autosaves user files but excludes the active agent directory's SDK state", async () => {
+		const root = await initRepo("gjc-deadline-flush-agent-sdk-");
+		const agentDir = path.join(root, "agent-state");
+		const sdkDir = path.join(agentDir, "sdk");
+		const sessionLockInfo = path.join(sdkDir, "sessions", "index.jsonl.lock", "info");
+		const startupLockInfo = path.join(sdkDir, "broker.startup.lock.removing", "info");
+		await fsp.mkdir(path.dirname(sessionLockInfo), { recursive: true });
+		await fsp.mkdir(path.dirname(startupLockInfo), { recursive: true });
+		await fsp.mkdir(path.join(root, "sdk"), { recursive: true });
+		await fsp.writeFile(path.join(root, "work.ts"), "export const work = true;\n");
+		await fsp.writeFile(path.join(root, "sdk", "user-data.ts"), "export const userData = true;\n");
+		await fsp.writeFile(sessionLockInfo, "transient session-index lock owner\n");
+		await fsp.writeFile(startupLockInfo, "transient startup-lock removal state\n");
+
+		const result = await flushWorktreeOnPromptDeadline(root, { explicitOptIn: true, agentDir });
+
+		expect(result).toBeDefined();
+		expect(await run(root, ["show", "HEAD:work.ts"])).toBe("export const work = true;\n");
+		// The active agent's SDK state is reserved, but an unrelated top-level sdk/ path remains autosaveable.
+		expect(await run(root, ["show", "HEAD:sdk/user-data.ts"])).toBe("export const userData = true;\n");
+		expect(await run(root, ["ls-tree", "-r", "--name-only", "HEAD", "--", "agent-state/sdk"])).toBe("");
+		const sdkStatus = await run(root, ["status", "--porcelain=v1", "--untracked-files=all", "--", "agent-state/sdk"]);
+		expect(sdkStatus).toContain("agent-state/sdk/sessions/index.jsonl.lock/info");
+		expect(sdkStatus).toContain("agent-state/sdk/broker.startup.lock.removing/info");
+	});
+
 	test("creates no commit when the worktree is already clean", async () => {
 		const root = await initRepo("gjc-deadline-flush-clean-");
 		const headBefore = (await run(root, ["rev-parse", "HEAD"])).trim();
