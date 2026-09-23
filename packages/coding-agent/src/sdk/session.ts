@@ -1552,27 +1552,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let asyncJobManagerOwned = false;
 	let asyncJobManagerAdmitted = false;
 	let priorAsyncJobManager: AsyncJobManager | undefined;
-	type OwnedMcpManagerCleanup = (options?: { retryAfterStartupFailure?: boolean }) => Promise<void>;
+	type OwnedMcpManagerCleanup = () => Promise<void>;
 	let cleanupOwnedMcpManager: OwnedMcpManagerCleanup | undefined;
+	let cleanupOwnedMcpManagerOwner: MCPManager | undefined;
 	const registerOwnedMcpManagerCleanup = (owned: MCPManager): OwnedMcpManagerCleanup => {
 		let cleanupAttempt: Promise<void> | undefined;
-		const cleanup: OwnedMcpManagerCleanup = cleanupOptions => {
+		const cleanup: OwnedMcpManagerCleanup = () => {
 			if (cleanupAttempt) return cleanupAttempt;
 			cleanupAttempt = Promise.resolve()
 				.then(() => owned.disconnectAll())
 				.then(
 					() => {
-						if (cleanupOwnedMcpManager === cleanup) cleanupOwnedMcpManager = undefined;
+						if (cleanupOwnedMcpManager === cleanup) {
+							cleanupOwnedMcpManager = undefined;
+							cleanupOwnedMcpManagerOwner = undefined;
+						}
 					},
 					error => {
-						if (cleanupOptions?.retryAfterStartupFailure) cleanupAttempt = undefined;
-						else if (cleanupOwnedMcpManager === cleanup) cleanupOwnedMcpManager = undefined;
+						cleanupAttempt = undefined;
 						throw error;
 					},
 				);
 			return cleanupAttempt;
 		};
 		cleanupOwnedMcpManager = cleanup;
+		cleanupOwnedMcpManagerOwner = owned;
 		return cleanup;
 	};
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
@@ -3295,7 +3299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				let cleanupError: unknown;
 				let cleanupFailed = false;
 				try {
-					await cleanupOwned({ retryAfterStartupFailure: retryAfterStartupCleanupFailure });
+					await cleanupOwned();
 				} catch (disconnectError) {
 					cleanupFailed = true;
 					cleanupError = disconnectError;
@@ -5217,6 +5221,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		const cleanupOwnedManager = cleanupOwnedMcpManager;
+		const sessionOwnedMcpManager = ownsMcpManager ? mcpManager : undefined;
+		if (cleanupOwnedManager && cleanupOwnedMcpManagerOwner !== sessionOwnedMcpManager) {
+			session.registerToolSessionCleanup(cleanupOwnedManager);
+		}
 		if (masterModeContext) {
 			// One scoped, no-probe peer snapshot immediately before the FIRST accepted
 			// provider request; see createMasterPeerSnapshotContributor for the
