@@ -287,6 +287,11 @@ describe("red-team: conventional MCP autoload", () => {
 				[{ name: "late_lookup", inputSchema: { type: "object", properties: {} } }],
 			);
 			if (!lateConventionalTool) throw new Error("late conventional MCP tool was not created");
+			const [renamedLateConventionalTool] = MCPTool.fromTools(
+				{ name: "slow-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "renamed_late_lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!renamedLateConventionalTool) throw new Error("renamed conventional MCP tool was not created");
 			const [pluginTool] = MCPTool.fromTools(
 				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
 				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
@@ -304,6 +309,8 @@ describe("red-team: conventional MCP autoload", () => {
 			const reconnectSyncSealCheck = Promise.withResolvers<void>();
 			const pluginToolPublishedCheck = Promise.withResolvers<void>();
 			const removedSnapshotSealCheck = Promise.withResolvers<void>();
+			const lateConventionalToolPublishedCheck = Promise.withResolvers<void>();
+			const renamedConventionalToolPublishedCheck = Promise.withResolvers<void>();
 			const setOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
 			let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
 			vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
@@ -323,6 +330,12 @@ describe("red-team: conventional MCP autoload", () => {
 				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
 				if (nextTools.includes(cachedTool)) cachedToolPublishedCheck.resolve();
 				if (nextTools.some(tool => tool.name === reconnectedTool.name)) reconnectedToolPublished = true;
+				if (nextTools.some(tool => tool.name === lateConventionalTool.name)) {
+					lateConventionalToolPublishedCheck.resolve();
+				}
+				if (nextTools.some(tool => tool.name === renamedLateConventionalTool.name)) {
+					renamedConventionalToolPublishedCheck.resolve();
+				}
 				if (nextTools.includes(pluginTool)) {
 					pluginToolPublished = true;
 					pluginToolPublishedCheck.resolve();
@@ -387,9 +400,10 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getSelectedMCPToolNames()).not.toContain("mcp__domain_docs_lookup");
 
 				// Simulate the conventional manager's reconnect publication while
-				// retaining the plugin tool in the manager's complete snapshot.
+				// retaining the plugin tool. New conventional names stay deselected.
 				publishToolsChanged([reconnectedTool, lateConventionalTool, pluginTool]);
 				await reconnectSyncSealCheck.promise;
+				await lateConventionalToolPublishedCheck.promise;
 				expect(reconnectedToolPublished).toBe(true);
 				expect(sealConnectionSet).not.toHaveBeenCalled();
 				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
@@ -401,6 +415,16 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getActiveToolNames()).toContain(lateConventionalTool.name);
 				await session.setActiveToolsByName(["read"]);
 				expect(session.getActiveToolNames()).not.toContain(lateConventionalTool.name);
+				publishToolsChanged([reconnectedTool, renamedLateConventionalTool, pluginTool]);
+				await renamedConventionalToolPublishedCheck.promise;
+				expect(session.getAllToolNames()).not.toContain(lateConventionalTool.name);
+				expect(session.getAllToolNames()).toContain(renamedLateConventionalTool.name);
+				expect(session.getActiveToolNames()).not.toContain(renamedLateConventionalTool.name);
+				expect(session.getSelectedMCPToolNames()).not.toContain(renamedLateConventionalTool.name);
+				await session.setActiveToolsByName(["read", renamedLateConventionalTool.name]);
+				expect(session.getActiveToolNames()).toContain(renamedLateConventionalTool.name);
+				await session.setActiveToolsByName(["read"]);
+				expect(session.getActiveToolNames()).not.toContain(renamedLateConventionalTool.name);
 
 				// Once the cached server's tools leave the live catalog, the hold must
 				// clear and restore the mixed-session fixed-connection contract.
@@ -461,8 +485,11 @@ describe("red-team: conventional MCP autoload", () => {
 			const originalReplaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
 			let ownerSession: AgentSession | undefined;
 			let failNextCatalogReplacement = false;
+			let holdNextOwnerReplacement = false;
 			const failedCatalogReplacement = Promise.withResolvers<void>();
 			const failureLogged = Promise.withResolvers<void>();
+			const ownerReplacementEntered = Promise.withResolvers<void>();
+			const releaseOwnerReplacement = Promise.withResolvers<void>();
 			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
 				this: AgentSession,
 				previousNames,
@@ -478,6 +505,11 @@ describe("red-team: conventional MCP autoload", () => {
 					failedCatalogReplacement.resolve();
 					throw new Error("injected owner tool registry failure");
 				}
+				if (this === ownerSession && holdNextOwnerReplacement) {
+					holdNextOwnerReplacement = false;
+					ownerReplacementEntered.resolve();
+					await releaseOwnerReplacement.promise;
+				}
 				await originalReplaceNamedCustomTools.call(this, previousNames, nextTools, options);
 			});
 			vi.spyOn(logger, "warn").mockImplementation(message => {
@@ -489,6 +521,7 @@ describe("red-team: conventional MCP autoload", () => {
 				settings: Settings.isolated({ "tools.discoveryMode": "all" }),
 			});
 			ownerSession = session;
+			let sessionDisposed = false;
 			try {
 				if (!mcpManager) throw new Error("plugin-only MCP manager was not retained");
 				expect(connectServers).toHaveBeenCalledTimes(1);
@@ -532,8 +565,28 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getSelectedMCPToolNames()).not.toContain(renamedPluginTool.name);
 				await publishCatalog([], [], [renamedPluginTool.name]);
 				expect(mcpManager.getTools()).toEqual([]);
+
+				const disconnectAll = vi.spyOn(mcpManager, "disconnectAll");
+				holdNextOwnerReplacement = true;
+				publishedTools = [pluginTool];
+				if (!publishToolsChanged) throw new Error("plugin-only owner callback was not registered");
+				publishToolsChanged(publishedTools);
+				await ownerReplacementEntered.promise;
+				let disposeCompleted = false;
+				const disposing = session.dispose().then(() => {
+					disposeCompleted = true;
+					sessionDisposed = true;
+				});
+				await Bun.sleep(0);
+				expect(disposeCompleted).toBe(false);
+				expect(disconnectAll).not.toHaveBeenCalled();
+				releaseOwnerReplacement.resolve();
+				await disposing;
+				expect(disposeCompleted).toBe(true);
+				expect(disconnectAll).toHaveBeenCalledTimes(1);
 			} finally {
-				await session.dispose();
+				releaseOwnerReplacement.resolve();
+				if (!sessionDisposed) await session.dispose();
 			}
 		});
 
@@ -604,14 +657,22 @@ describe("red-team: conventional MCP autoload", () => {
 			let childUpdateCount = 0;
 			let childMandatoryMcpToolNames: string[] = [];
 			let holdChildUpdate = false;
+			let failNextChildReplacement = false;
 			const childUpdateEntered = Promise.withResolvers<void>();
 			const releaseChildUpdate = Promise.withResolvers<void>();
+			const failedChildReplacement = Promise.withResolvers<void>();
+			const childFailureLogged = Promise.withResolvers<void>();
 			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
 				this: AgentSession,
 				previousNames,
 				nextTools,
 				options,
 			) {
+				const failAfterReplace =
+					this === childSession &&
+					failNextChildReplacement &&
+					nextTools.some(tool => tool.name === pluginTool.name);
+				if (failAfterReplace) failNextChildReplacement = false;
 				if (this === childSession && holdChildUpdate) {
 					holdChildUpdate = false;
 					childUpdateEntered.resolve();
@@ -622,6 +683,13 @@ describe("red-team: conventional MCP autoload", () => {
 					childUpdateCount++;
 					childMandatoryMcpToolNames = [...(options?.mandatoryMCPToolNames ?? [])];
 				}
+				if (failAfterReplace) {
+					failedChildReplacement.resolve();
+					throw new Error("injected inherited MCP catalog replacement failure");
+				}
+			});
+			vi.spyOn(logger, "warn").mockImplementation(message => {
+				if (message === "Failed to publish inherited MCP tools") childFailureLogged.resolve();
 			});
 			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
 			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
@@ -687,6 +755,16 @@ describe("red-team: conventional MCP autoload", () => {
 				await publishCatalog([cachedTool]);
 				expect(child.session.getAllToolNames()).not.toContain("mcp__domain_docs_renamed_lookup");
 				expect(child.session.getSelectedMCPToolNames()).not.toContain("mcp__domain_docs_renamed_lookup");
+
+				failNextChildReplacement = true;
+				await publishCatalog([cachedTool, pluginTool]);
+				await failedChildReplacement.promise;
+				await childFailureLogged.promise;
+				expect(child.session.getAllToolNames()).toContain(pluginTool.name);
+				await publishCatalog([cachedTool, renamedPluginTool]);
+				expect(child.session.getAllToolNames()).not.toContain(pluginTool.name);
+				expect(child.session.getAllToolNames()).toContain(renamedPluginTool.name);
+				expect(child.session.getSelectedMCPToolNames()).not.toContain(renamedPluginTool.name);
 
 				holdChildUpdate = true;
 				const pendingCatalogUpdate = publishCatalog([cachedTool, pluginTool]);

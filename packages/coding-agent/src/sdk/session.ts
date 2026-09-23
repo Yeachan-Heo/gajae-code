@@ -5365,7 +5365,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// Each link swallows (and logs) its own failure so one bad
 			// publication cannot kill the chain for every later one.
 			let ownedMcpToolsSync: Promise<void> = Promise.resolve();
+			let acceptingOwnedMcpTools = true;
 			const syncOwnedMcpTools = (tools: readonly CustomTool[]): Promise<void> => {
+				if (!acceptingOwnedMcpTools) return ownedMcpToolsSync;
 				ownedMcpToolsSync = ownedMcpToolsSync
 					.then(async () => {
 						if (session.isDisposed || mcpManager !== manager) return;
@@ -5471,6 +5473,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 				return ownedMcpToolsSync;
 			};
+			session.registerToolSessionCleanup(async () => {
+				acceptingOwnedMcpTools = false;
+				await ownedMcpToolsSync;
+			});
 			manager.setOnToolsChanged(tools => {
 				void syncOwnedMcpTools(tools);
 			});
