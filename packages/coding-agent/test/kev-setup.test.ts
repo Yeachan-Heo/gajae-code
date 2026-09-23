@@ -298,6 +298,20 @@ describe("Kev lifecycle", () => {
 		expect(stopRequests(f.control)).toEqual([]);
 	});
 
+	test("a record naming a different control socket is foreign and is never sent the token", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		const file = path.join(f.root, "server.json");
+		const record = (await Bun.file(file).json()) as Record<string, unknown>;
+		const before = f.control.length;
+		// Schema-valid and otherwise identical: only the socket is redirected.
+		await privateJson(file, { ...record, socket: path.join(f.base, "attacker.sock") });
+		expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ state: "foreign" });
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "foreign" });
+		expect(f.control.slice(before)).toEqual([]);
+	});
+
 	test("PID reuse with identical command text but a different incarnation fails closed", async () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);

@@ -237,6 +237,10 @@ function owns(record: ServiceRecord, install: Installation, observed: KevProcess
 	return (
 		record.root === install.root &&
 		record.model === install.model &&
+		// The socket is authority, not a hint: an otherwise valid record pointing at
+		// an attacker-chosen path would send the stop token to a listener of their
+		// choosing. Only the socket this installation's supervisor binds is accepted.
+		record.socket === controlSocket(install.root) &&
 		record.argvDigest === digest(expected) &&
 		JSON.stringify(record.argv) === JSON.stringify(expected) &&
 		observed?.incarnation === record.incarnation &&
