@@ -1885,25 +1885,6 @@ function buildParams(
 		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
 	}
 
-	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
-		// DeepSeek reasoning models accept tools/tool_choice, but reject that
-		// control field while thinking is enabled. Keep the tool-selection
-		// contract and suppress reasoning for this single request.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-	}
-
-	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
-		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
-		// with thinking enabled`. Suppress thinking for this single forced-tool
-		// turn while keeping the tool-selection contract intact.
-		delete params.reasoning_effort;
-		delete params.reasoning;
-		if (compat.thinkingFormat === "zai") {
-			params.thinking = { type: "disabled" };
-		}
-	}
-
 	// OpenRouter provider routing preferences
 	if (model.baseUrl.includes("openrouter.ai") && compat.openRouterRouting) {
 		params.provider = compat.openRouterRouting;
@@ -1943,6 +1924,26 @@ function buildParams(
 		}
 		Object.assign(params, restExtra);
 	}
+
+	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
+		// DeepSeek reasoning models accept tools/tool_choice, but reject that
+		// control field while thinking is enabled. Keep the tool-selection
+		// contract and suppress reasoning for this single request.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+	}
+
+	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {
+		// Backends like Kimi 400 with `tool_choice 'specified' is incompatible
+		// with thinking enabled`. Suppress thinking for this single forced-tool
+		// turn while keeping the tool-selection contract intact.
+		delete params.reasoning_effort;
+		delete params.reasoning;
+		if (compat.thinkingFormat === "zai") {
+			params.thinking = { type: "disabled" };
+		}
+	}
+
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
 	if (!supportsReasoningParams) {
 		delete params.reasoning;

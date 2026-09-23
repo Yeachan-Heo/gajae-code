@@ -968,6 +968,44 @@ describe("openai-completions compatibility", () => {
 		expect(payload.tool_choice).toBe("auto");
 	});
 
+	it("suppresses reasoning for an extraBody tool_choice default", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			reasoning: true,
+			compat: {
+				supportsReasoningEffort: true,
+				disableReasoningOnToolChoice: true,
+				extraBody: {
+					tool_choice: "auto",
+				},
+			},
+		};
+
+		const tool: Tool = {
+			name: "get_weather",
+			description: "Get the weather",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		const context: Context = {
+			...baseContext(),
+			tools: [tool],
+		};
+
+		const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+		global.fetch = createMockFetch(["[DONE]"]);
+		streamOpenAICompletions(model, context, {
+			apiKey: "test-key",
+			reasoning: "high",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await promise;
+		expect(payload.tool_choice).toBe("auto");
+		expect(payload).not.toHaveProperty("reasoning_effort");
+	});
+
 	it("keeps an explicit forced tool_choice over the extraBody default", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
