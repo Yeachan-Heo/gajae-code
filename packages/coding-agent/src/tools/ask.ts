@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
 import {
@@ -86,7 +87,7 @@ import {
 
 export { askSchema } from "./ask-contract";
 
-import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
+import { formatErrorMessage, formatMeta, formatTitle, shortenPath } from "./render-utils";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
@@ -114,6 +115,18 @@ export interface AskToolDetails {
 	clarificationQuestion?: string;
 	/** Multi-part question mode */
 	results?: QuestionResult[];
+	/** Runtime-authenticated free-text replies, bound to this exact Ask call. */
+	userAnswerEvidence?: {
+		version: 1;
+		toolCallId: string;
+		answers: Array<{ questionId: string; answer: string }>;
+	};
+}
+
+interface AskUserAnswerEvidence {
+	version: 1;
+	toolCallId: string;
+	answers: Array<{ questionId: string; answer: string }>;
 }
 
 // =============================================================================
@@ -168,6 +181,42 @@ function errorMessage(error: unknown): string {
 
 function nonEmptyCustomInput(value: string | undefined): string | undefined {
 	return value !== undefined && value.trim().length > 0 ? value : undefined;
+}
+
+function safeApprovalDisplayField(value: string, maxLength: number): string {
+	const safe = [...value]
+		.slice(0, maxLength)
+		.map(character => (/\p{C}|[\u2028\u2029]/u.test(character) ? "�" : character))
+		.join("");
+	return safe || "[unavailable]";
+}
+
+function executionApprovalIdentityText(presentation: ExecutionApprovalPresentation): string {
+	if (
+		typeof presentation.artifact_path !== "string" ||
+		!path.isAbsolute(presentation.artifact_path) ||
+		path.resolve(presentation.artifact_path) !== presentation.artifact_path ||
+		!Number.isSafeInteger(presentation.state_revision) ||
+		presentation.state_revision < 0 ||
+		!/^[a-f0-9]{64}$/.test(presentation.artifact_sha256)
+	)
+		throw new ToolAbortError("Execution approval publication identity is malformed");
+	return [
+		"Runtime-captured execution approval identity:",
+		`Canonical artifact path: ${safeApprovalDisplayField(shortenPath(presentation.artifact_path), 4096)}`,
+		`SHA-256: ${presentation.artifact_sha256}`,
+		`State revision: ${presentation.state_revision}`,
+	].join("\n");
+}
+
+function askUserAnswerEvidence(
+	toolCallId: string,
+	answers: Array<{ questionId: string; answer: string }>,
+): AskUserAnswerEvidence | undefined {
+	const boundedAnswers = answers.filter(
+		answer => answer.answer.trim().length > 0 && [...answer.answer].length <= MAX_USER_RESPONSE_LENGTH,
+	);
+	return boundedAnswers.length > 0 ? { version: 1, toolCallId, answers: boundedAnswers } : undefined;
 }
 
 function deepInterviewExecutionTarget(selectedOptions: readonly string[]): "ultragoal" | undefined {
@@ -351,6 +400,7 @@ interface SelectionResult {
 	clarificationQuestion?: string;
 	executionGateId?: string;
 	executionPresentation?: ExecutionApprovalPresentation;
+	userAnswerAccepted?: boolean;
 	timedOut: boolean;
 	navigation?: "back" | "forward";
 	cancelled?: boolean;
@@ -970,10 +1020,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			}
 			return new Promise<never>(() => {});
 		};
-		const settleActiveRemote = async (settlement: AskSettlement): Promise<void> => {
+		const settleActiveRemote = async (settlement: AskSettlement): Promise<AskSettlementResult | undefined> => {
 			const receipt = activeRemoteReceipt;
 			activeRemoteReceipt = undefined;
-			if (receipt) await receipt.settle(settlement);
+			return receipt ? await receipt.settle(settlement) : undefined;
 		};
 		const gateEmitter = this.session.getWorkflowGateEmitter?.();
 		// A durable workflow-gate emitter now exists for every session, and its
@@ -1308,12 +1358,37 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			const isExecutionApprovalQuestion =
 				(q.workflowGate?.stage === "deep-interview" && q.workflowGate.kind === "execution") ||
 				(q.workflowGate?.stage === "ralplan" && q.workflowGate.kind === "approval");
+			let executionGateId: string | undefined = isExecutionApprovalQuestion
+				? `interactive-${randomUUID()}`
+				: undefined;
+			let executionPresentation: ExecutionApprovalPresentation | undefined;
+			if (isExecutionApprovalQuestion) {
+				const sessionId = this.session.getSessionId?.();
+				if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
+				try {
+					executionPresentation = await captureExecutionApprovalPresentation(
+						this.session.cwd,
+						sessionId,
+						q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
+					);
+				} catch (error) {
+					throw new ToolAbortError(
+						error instanceof Error
+							? `Execution approval publication could not be authenticated: ${error.message}`
+							: "Execution approval publication could not be authenticated",
+					);
+				}
+			}
+			const executionIdentity = executionPresentation
+				? executionApprovalIdentityText(executionPresentation)
+				: undefined;
 			// Route headless asks through the SDK workflow-gate emitter; a connected
 			// SDK responder supplies the durable answer instead of an interactive UI.
 			if (gateEmitter && canUseWorkflowGate) {
+				const correlationQuestionId = isExecutionApprovalQuestion ? `ask-execution-${randomUUID()}` : q.id;
 				const gateQuestion: AskGateQuestion = {
-					id: q.id,
-					question: q.question,
+					id: correlationQuestionId,
+					question: executionIdentity ? `${executionIdentity}\n\n${q.question}` : q.question,
 					options: q.options,
 					multi: q.multi,
 					recommended,
@@ -1322,27 +1397,6 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					allowEmpty: q.multi === true && params.questions.length > 1,
 					navigationLabel: questionIndex === params.questions.length - 1 ? "Done" : "Next",
 				};
-				let executionGateId: string | undefined = isExecutionApprovalQuestion
-					? `interactive-${randomUUID()}`
-					: undefined;
-				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (isExecutionApprovalQuestion) {
-					const sessionId = this.session.getSessionId?.();
-					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
-					try {
-						executionPresentation = await captureExecutionApprovalPresentation(
-							this.session.cwd,
-							sessionId,
-							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
-						);
-					} catch (error) {
-						throw new ToolAbortError(
-							error instanceof Error
-								? `Execution approval publication could not be authenticated: ${error.message}`
-								: "Execution approval publication could not be authenticated",
-						);
-					}
-				}
 				const stopGateObservation = gateEmitter.onGateEmitted?.(gate => {
 					const stageState = gate.context?.stage_state;
 					if (
@@ -1350,7 +1404,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 						gate.kind === q.workflowGate?.kind &&
 						((gate.stage === "deep-interview" && gate.kind === "execution") ||
 							(gate.stage === "ralplan" && gate.kind === "approval")) &&
-						stageState?.question_id === q.id
+						stageState?.question_id === correlationQuestionId
 					)
 						executionGateId = gate.gate_id;
 				});
@@ -1368,40 +1422,23 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					clarificationQuestion: decoded.clarificationQuestion,
 					executionGateId,
 					executionPresentation,
+					userAnswerAccepted: true,
 					navigation: undefined as NavigationControls | undefined,
 					cancelled: false,
 					timedOut: false,
 				};
 			}
 			try {
-				let executionPresentation: ExecutionApprovalPresentation | undefined;
-				if (isExecutionApprovalQuestion) {
-					const sessionId = this.session.getSessionId?.();
-					if (!sessionId) throw new ToolAbortError("Execution approval requires a session");
-					try {
-						executionPresentation = await captureExecutionApprovalPresentation(
-							this.session.cwd,
-							sessionId,
-							q.workflowGate?.stage === "ralplan" ? "ralplan" : "deep-interview",
-						);
-					} catch (error) {
-						throw new ToolAbortError(
-							error instanceof Error
-								? `Execution approval publication could not be authenticated: ${error.message}`
-								: "Execution approval publication could not be authenticated",
-						);
-					}
-				}
-				const executionGateId: string | undefined = isExecutionApprovalQuestion
-					? `interactive-${randomUUID()}`
-					: undefined;
 				const deepInterviewPrompt = formatDeepInterviewSelectorPrompt(q.question);
 				const isDeepInterviewQuestion = deepInterviewPrompt !== null || q.deepInterview !== undefined;
 				const baseDisplayQuestion = deepInterviewPrompt ?? q.question;
+				const displayQuestionBase = executionIdentity
+					? `${executionIdentity}\n\n${baseDisplayQuestion}`
+					: baseDisplayQuestion;
 				const displayQuestion =
 					emptyCustomAttempt > 0
-						? `${baseDisplayQuestion}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
-						: baseDisplayQuestion;
+						? `${displayQuestionBase}\n\n${EMPTY_CUSTOM_RETRY_MESSAGE} (attempt ${emptyCustomAttempt + 1} of ${MAX_EMPTY_CUSTOM_ATTEMPTS})`
+						: displayQuestionBase;
 				const shouldNumberOptions = isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question);
 				const optionLabels = shouldNumberOptions ? numberOptionLabels(rawOptionLabels) : rawOptionLabels;
 				const clarificationOptionLabel = shouldNumberOptions
@@ -1503,6 +1540,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					: displaySelectedOptions;
 				if ((isDeepInterviewQuestion || isDeepInterviewAskQuestion(q.question)) && customInput !== undefined)
 					assertDeepInterviewInputWithinLimit(customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
+				let userAnswerAccepted = !cancelled && !timedOut && clarificationQuestion === undefined;
 				if (activeRemoteReceipt) {
 					const settlement: AskSettlement =
 						clarificationQuestion !== undefined
@@ -1522,7 +1560,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 												: selectedOptions.length > 0 || (customInput?.trim().length ?? 0) > 0
 													? { kind: "commit" }
 													: { kind: "resolve_without_commit", reason: "cancelled" };
-					await settleActiveRemote(settlement);
+					const settled = await settleActiveRemote(settlement);
+					userAnswerAccepted =
+						settlement.kind === "commit" && settled?.kind === "committed" && settled.ack.status === "delivered";
 					activeRemoteRequest = undefined;
 					if (settlement.kind === "invalid") {
 						if (emptyCustomAttempt + 1 >= MAX_EMPTY_CUSTOM_ATTEMPTS) {
@@ -1554,6 +1594,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					clarificationQuestion,
 					executionGateId,
 					executionPresentation,
+					userAnswerAccepted,
 					navigation,
 					cancelled,
 					timedOut,
@@ -1584,6 +1625,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				clarificationQuestion,
 				executionGateId,
 				executionPresentation,
+				userAnswerAccepted,
 				cancelled,
 				timedOut,
 			} = await askQuestion(q);
@@ -1617,6 +1659,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				selectedOptions,
 				customInput,
 				clarificationQuestion,
+				...(userAnswerAccepted && !timedOut && !cancelled && clarificationQuestion === undefined && customInput
+					? {
+							userAnswerEvidence: askUserAnswerEvidence(_toolCallId, [
+								{ questionId: q.id, answer: customInput },
+							]),
+						}
+					: {}),
 			};
 
 			const responseParts: string[] = [];
@@ -1655,6 +1704,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		const executionPresentationsByIndex: Array<ExecutionApprovalPresentation | undefined> = Array.from({
 			length: params.questions.length,
 		});
+		const userAnswerEvidenceByIndex: Array<{ questionId: string; answer: string } | undefined> = Array.from({
+			length: params.questions.length,
+		});
 		let questionIndex = 0;
 		while (questionIndex < params.questions.length) {
 			const q = params.questions[questionIndex]!;
@@ -1671,6 +1723,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				clarificationQuestion,
 				executionGateId,
 				executionPresentation,
+				userAnswerAccepted,
 				navigation: navAction,
 				cancelled,
 				timedOut,
@@ -1692,6 +1745,10 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			};
 			executionGateIdsByIndex[questionIndex] = executionGateId;
 			executionPresentationsByIndex[questionIndex] = executionPresentation;
+			userAnswerEvidenceByIndex[questionIndex] =
+				userAnswerAccepted && !timedOut && !cancelled && clarificationQuestion === undefined && customInput
+					? { questionId: q.id, answer: customInput }
+					: undefined;
 
 			if (
 				clarificationQuestion === undefined &&
@@ -1719,7 +1776,13 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			};
 		});
 
-		const details: AskToolDetails = { results };
+		const userAnswerEvidence = askUserAnswerEvidence(
+			_toolCallId,
+			userAnswerEvidenceByIndex.filter(
+				(answer): answer is { questionId: string; answer: string } => answer !== undefined,
+			),
+		);
+		const details: AskToolDetails = { results, ...(userAnswerEvidence ? { userAnswerEvidence } : {}) };
 		for (const [index, result] of results.entries())
 			await this.#recordDeepInterviewExecutionApproval(
 				params.questions[index]!,
