@@ -33,6 +33,7 @@ import {
 	type BrokerFenceReason,
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
+	writeBrokerExitRecordSynchronously,
 } from "./broker-exit";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
@@ -155,6 +156,8 @@ export interface BrokerSettings {
 	 * value its launcher decided, with no cast/assumed tag in between.
 	 */
 	restartRequestId?: string;
+	/** Test-only delay after publication to exercise signal handoff ordering. */
+	startupPostPublicationDelayMs?: number;
 }
 
 type ResolvedBrokerSettings = {
@@ -1504,6 +1507,7 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
@@ -1537,6 +1541,12 @@ export class Broker {
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#startupPostPublicationDelayMs =
+			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
+			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
+			(settings.startupPostPublicationDelayMs ?? 0) <= 10_000
+				? (settings.startupPostPublicationDelayMs as number)
+				: 0;
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
@@ -3848,6 +3858,7 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
+			if (this.#startupPostPublicationDelayMs > 0) await Bun.sleep(this.#startupPostPublicationDelayMs);
 			// This process is now the independently verified successor: its own
 			// discovery just published under its own retained authority. Release the
 			// predecessor's reservation only now, keyed to the exact request this
@@ -4170,6 +4181,8 @@ export class Broker {
 			writtenAt: Date.now(),
 		};
 		(mode === "lost-root" ? logger.warn : logger.info)("sdk broker: exiting", exitRecord);
+		const recordPersistedSynchronously =
+			reason === "signal" && writeBrokerExitRecordSynchronously(this.settings.agentDir, exitRecord);
 		this.#stopping = true;
 		this.#publicationState = "stopping";
 		// A lost-root broker has been fenced: it no longer owns the published root, and
@@ -4182,14 +4195,17 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
-			const recordWrite = Promise.withResolvers<boolean>();
-			const recordWriteTimer = setTimeout(() => recordWrite.resolve(false), BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
-			void writeBrokerExitRecord(this.settings.agentDir, exitRecord).then(
-				() => recordWrite.resolve(true),
-				() => recordWrite.resolve(false),
-			);
-			const recordPersisted = await recordWrite.promise;
-			clearTimeout(recordWriteTimer);
+			let recordPersisted = recordPersistedSynchronously;
+			if (!recordPersisted) {
+				const recordWrite = Promise.withResolvers<boolean>();
+				const recordWriteTimer = setTimeout(() => recordWrite.resolve(false), BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
+				void writeBrokerExitRecord(this.settings.agentDir, exitRecord).then(
+					() => recordWrite.resolve(true),
+					() => recordWrite.resolve(false),
+				);
+				recordPersisted = await recordWrite.promise;
+				clearTimeout(recordWriteTimer);
+			}
 			if (!recordPersisted) {
 				logger.error("sdk broker: failed to persist exit reason", {
 					reason: "exit-record-write-failed-or-timed-out",
