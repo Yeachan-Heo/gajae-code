@@ -136,4 +136,69 @@ describe("usage-limit mark captures one stored row", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	test("does not report exhaustion when the sole failed row vanishes during marking", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mark-vanished-"));
+		const store: AuthCredentialStore = await SqliteAuthCredentialStore.open(path.join(root, "auth.db"));
+		const storage = new AuthStorage(store, {
+			rankingStrategyResolver: () => ({
+				findWindowLimits: report => ({ primary: report.limits[0] }),
+				windowDefaults: { primaryMs: 3_600_000, secondaryMs: 86_400_000 },
+			}),
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<UsageReport | null>();
+		let pending: ReturnType<typeof storage.markUsageLimitReached> | undefined;
+		let parked = false;
+		vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { apiKey: credential.access, newCredentials: credential } : null;
+		});
+		store.getUsageReport = async (_provider, credential) => {
+			if (parked && credential.accountId === "a") {
+				entered.resolve();
+				return release.promise;
+			}
+			return null;
+		};
+		try {
+			await storage.set(provider, {
+				type: "oauth",
+				access: "synthetic-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				accountId: "a",
+			});
+			const target = store.listAuthCredentials(provider)[0];
+			if (!target) throw new Error("Missing sole OAuth row");
+			await storage.getApiKey(provider, "sole-row-session");
+			parked = true;
+			pending = storage.markUsageLimitReached(provider, "sole-row-session", {
+				rowId: target.id,
+				retryAfterMs: 120_000,
+			});
+			await entered.promise;
+			const removalTarget = storage.listCredentialRemovalTargets(provider).find(row => row.id === target.id);
+			if (!removalTarget) throw new Error("Missing sole OAuth removal target");
+			const removal = storage.removeAuthCredentialsHard(provider, [removalTarget]);
+			if (removal.kind !== "removed") throw new Error("Could not remove sole OAuth row");
+			parked = false;
+			release.resolve(null);
+			const result = await pending;
+			expect(result).toEqual({
+				state: "not-marked",
+				failedRowId: target.id,
+				credentialKind: "oauth",
+				remainingCredentialIds: [],
+			});
+			expect(storage.getEarliestUnblockAt(provider)).toBeUndefined();
+		} finally {
+			parked = false;
+			release.resolve(null);
+			if (pending) await Promise.allSettled([pending]);
+			vi.restoreAllMocks();
+			storage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });
