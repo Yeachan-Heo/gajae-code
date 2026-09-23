@@ -41,6 +41,33 @@ import { getSeparator } from "./status-line/separators";
 import { calculateTokensPerSecond } from "./status-line/token-rate";
 import type { SeparatorDef } from "./status-line/types";
 
+function usageReportAccountId(report: unknown): string | undefined {
+	if (!report || typeof report !== "object") return undefined;
+	const record = report as {
+		metadata?: unknown;
+		limits?: unknown;
+	};
+	const metadata = record.metadata;
+	const rawMetadataAccountId =
+		metadata && typeof metadata === "object" ? (metadata as { accountId?: unknown }).accountId : undefined;
+	const metadataAccountId =
+		typeof rawMetadataAccountId === "string" && rawMetadataAccountId.trim() ? rawMetadataAccountId.trim() : undefined;
+	if (!Array.isArray(record.limits)) return metadataAccountId;
+
+	const scopeAccountIds = new Set<string>();
+	for (const limit of record.limits) {
+		if (!limit || typeof limit !== "object") continue;
+		const scope = (limit as { scope?: unknown }).scope;
+		if (!scope || typeof scope !== "object") continue;
+		const accountId = (scope as { accountId?: unknown }).accountId;
+		if (typeof accountId === "string" && accountId.trim()) scopeAccountIds.add(accountId.trim());
+	}
+	if (scopeAccountIds.size > 1) return undefined;
+	const [scopeAccountId] = scopeAccountIds;
+	if (metadataAccountId && scopeAccountId && metadataAccountId !== scopeAccountId) return undefined;
+	return metadataAccountId ?? scopeAccountId;
+}
+
 export interface StatusLineSegmentOptions {
 	model?: { showThinkingLevel?: boolean; showContextPercent?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
@@ -218,6 +245,7 @@ export class StatusLineComponent implements Component {
 	#cachedUsage: SegmentContext["usage"] = null;
 	#cachedUsageReports: unknown = null;
 	#cachedUsageProvider: string | undefined;
+	#cachedUsageAccountId: string | undefined;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
 
@@ -702,7 +730,12 @@ export class StatusLineComponent implements Component {
 			.then(reports => {
 				this.#cachedUsageReports = reports;
 				this.#cachedUsageProvider = this.#activeUsageProvider();
-				this.#cachedUsage = this.#normalizeUsageReports(reports);
+				this.#cachedUsageAccountId = this.#activeCodexAccountId(this.#cachedUsageProvider);
+				this.#cachedUsage = this.#normalizeUsageReports(
+					reports,
+					this.#cachedUsageProvider,
+					this.#cachedUsageAccountId,
+				);
 				this.#usageFetchedAt = Date.now();
 				if (this.#onBranchChange) {
 					this.#onBranchChange();
@@ -720,10 +753,25 @@ export class StatusLineComponent implements Component {
 			});
 	}
 
-	#normalizeUsageReports(reports: unknown): SegmentContext["usage"] {
-		const activeProvider = this.#activeUsageProvider();
-
+	#normalizeUsageReports(
+		reports: unknown,
+		activeProvider = this.#activeUsageProvider(),
+		activeCodexAccountId = this.#activeCodexAccountId(activeProvider),
+	): SegmentContext["usage"] {
 		if (!activeProvider || !Array.isArray(reports)) return null;
+		const activeCodexReportCount =
+			activeProvider === "openai-codex" && activeCodexAccountId
+				? reports.filter(report => {
+						if (!report || typeof report !== "object") return false;
+						const provider = (report as { provider?: unknown }).provider;
+						return (
+							typeof provider === "string" &&
+							resolveOAuthStorageProvider(provider) === activeProvider &&
+							usageReportAccountId(report) === activeCodexAccountId
+						);
+					}).length
+				: 0;
+		const ambiguousActiveCodexReports = activeCodexReportCount > 1;
 		const windows: NonNullable<SegmentContext["usage"]>["windows"] = [];
 		const seen = new Set<string>();
 		const now = Date.now();
@@ -759,6 +807,14 @@ export class StatusLineComponent implements Component {
 			const provider = (report as { provider?: unknown }).provider;
 			const providerId = typeof provider === "string" ? resolveOAuthStorageProvider(provider) : undefined;
 			if (providerId !== activeProvider) continue;
+			// Codex usage fetches cover every OAuth account; fail closed unless this session's account matches uniquely.
+			if (
+				providerId === "openai-codex" &&
+				(!activeCodexAccountId ||
+					ambiguousActiveCodexReports ||
+					usageReportAccountId(report) !== activeCodexAccountId)
+			)
+				continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
@@ -808,11 +864,21 @@ export class StatusLineComponent implements Component {
 		return typeof provider === "string" && provider.length > 0 ? resolveOAuthStorageProvider(provider) : undefined;
 	}
 
+	#activeCodexAccountId(activeProvider: string | undefined): string | undefined {
+		if (activeProvider !== "openai-codex") return undefined;
+		const modelRegistry = this.session.modelRegistry;
+		return modelRegistry.authStorage.getOAuthAccountId(activeProvider, this.session.credentialSessionId, {
+			owner: modelRegistry.getAuthStorageOwner(),
+		});
+	}
+
 	#syncCachedUsageForActiveProvider(): void {
 		const activeProvider = this.#activeUsageProvider();
-		if (this.#cachedUsageProvider === activeProvider) return;
+		const activeCodexAccountId = this.#activeCodexAccountId(activeProvider);
+		if (this.#cachedUsageProvider === activeProvider && this.#cachedUsageAccountId === activeCodexAccountId) return;
 		this.#cachedUsageProvider = activeProvider;
-		this.#cachedUsage = this.#normalizeUsageReports(this.#cachedUsageReports);
+		this.#cachedUsageAccountId = activeCodexAccountId;
+		this.#cachedUsage = this.#normalizeUsageReports(this.#cachedUsageReports, activeProvider, activeCodexAccountId);
 	}
 
 	#buildSegmentContext(

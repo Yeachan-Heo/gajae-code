@@ -220,7 +220,10 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/extensibility/gjc-plugins/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
-	"packages/coding-agent/src/sdk/session.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/sdk/session.ts": [
+		...EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
+	],
 };
 
 export interface PackageManifest {
@@ -518,7 +521,15 @@ function isRustTestKey(key: string): boolean {
 
 // Tasks that need the Rust toolchain (and nextest) provisioned on their shard.
 function taskNeedsRust(key: string): boolean {
-	return key === "rust-check" || isRustTestKey(key) || key === "ci-selftest" || key === "ci-dry-run" || key === "affected-selftest" || key === "affected-dry-run";
+	return (
+		key === "rust-check" ||
+		isRustTestKey(key) ||
+		key === "ci-selftest" ||
+		key === "ci-dry-run" ||
+		key === "affected-selftest" ||
+		key === "affected-dry-run" ||
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"
+	);
 }
 
 // Build the machine-readable descriptor list for the current changed-path plan.
@@ -1226,6 +1237,7 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 	}
 
 	const total = codingAgentTestShards();
+	addTestFileTask(tasks, "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts");
 	for (let shard = 1; shard <= total; shard++) {
 		addCodingAgentTestShard(tasks, shard, total);
 	}

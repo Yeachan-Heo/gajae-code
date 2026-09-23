@@ -2341,6 +2341,20 @@ function rawKind(action: string, args: SdkSessionCliArgs): SdkSessionCliRawKind 
 	return action === "control" || action === "query" || action === "global" ? action : undefined;
 }
 
+function warnIfRepoIgnoredForExactSession(args: SdkSessionCliArgs): void {
+	const action = args.action;
+	const exactSessionAction =
+		action === "inspect" ||
+		action === "send" ||
+		action === "status" ||
+		action === "query" ||
+		(action === "raw" && args.rawAction === "query");
+	if (args.repo !== undefined && exactSessionAction)
+		process.stderr.write(
+			"Warning: --repo is ignored for exact-session commands; the session ID selects the broker target.\n",
+		);
+}
+
 /** Runs the broker-bound `gjc sdk session` command family without exposing endpoint credentials. */
 export async function runSdkSessionCli(
 	args: SdkSessionCliArgs,
@@ -2383,10 +2397,12 @@ export async function runSdkSessionCli(
 		}
 		if (action === "inspect") {
 			writeOutput(stripSecretFields(await runInspect(agentDir, requireValue(args.sessionId, "<sessionId>"))));
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "send") {
 			writeOutput(stripSecretFields(await runSend(agentDir, requireValue(args.sessionId, "<sessionId>"), args)));
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "status") {
@@ -2400,6 +2416,7 @@ export async function runSdkSessionCli(
 					),
 				),
 			);
+			warnIfRepoIgnoredForExactSession(args);
 			return;
 		}
 		if (action === "tail") {
@@ -2506,6 +2523,7 @@ export async function runSdkSessionCli(
 					: await runRawQuery(agentDir, sessionId, operation, input, args),
 			),
 		);
+		warnIfRepoIgnoredForExactSession(args);
 	} catch (error) {
 		throw normalizeSessionFailure(error, args);
 	}

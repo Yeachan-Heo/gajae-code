@@ -484,7 +484,9 @@ jobs:
           git remote add guard-head "https://github.com/${HEAD_REPOSITORY}.git"
           git remote add guard-base "https://github.com/${BASE_REPOSITORY}.git"
           git fetch --no-tags guard-head "refs/heads/${HEAD_REF}:refs/remotes/guard-head/${HEAD_REF}"
+          head_ref_sha="$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
           base_ref_sha=''
+          head_ref_descends_from_event_head=''
           case "${GUARD_EVENT_NAME}" in
             pull_request)
               # The immutable event base object remains authoritative while a queued
@@ -498,15 +500,27 @@ jobs:
               ;;
             push)
               git fetch --no-tags guard-base "${GITHUB_BASE_SHA}"
+              if git merge-base --is-ancestor "${GITHUB_HEAD_SHA}" "${head_ref_sha}"; then
+                head_ref_descends_from_event_head=true
+              else
+                status=$?
+                if [ "${status}" -eq 1 ]; then
+                  echo "::error::Fetched push head ref ${HEAD_REF} does not descend from immutable event head ${GITHUB_HEAD_SHA}."
+                else
+                  echo "::error::Could not prove immutable event head ${GITHUB_HEAD_SHA} is an ancestor of fetched push head ref ${HEAD_REF} (merge-base exit ${status})."
+                fi
+                exit 1
+              fi
               ;;
           esac
           {
             echo "GUARD_CHECKED_OUT_HEAD=$(git rev-parse --verify HEAD^{commit})"
-            echo "GUARD_HEAD_REF_SHA=$(git rev-parse --verify "refs/remotes/guard-head/${HEAD_REF}^{commit}")"
+            echo "GUARD_HEAD_REF_SHA=${head_ref_sha}"
+            echo "GUARD_HEAD_REF_DESCENDS_FROM_EVENT_HEAD=${head_ref_descends_from_event_head}"
             echo "GUARD_BASE_OBJECT_SHA=$(git rev-parse --verify "${GITHUB_BASE_SHA}^{commit}")"
             echo "GUARD_BASE_REF_SHA=${base_ref_sha}"
           } >> "${GITHUB_ENV}"
-          printf 'guard evidence: base %s@%s; head %s@%s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${HEAD_REPOSITORY}" "${HEAD_REF}"
+          printf 'guard evidence: base %s@%s; event head %s; fetched head %s@%s; descendant proof %s\n' "${BASE_REPOSITORY}" "${GITHUB_BASE_SHA}" "${GITHUB_HEAD_SHA}" "${HEAD_REPOSITORY}" "${head_ref_sha}" "${head_ref_descends_from_event_head:-not-applicable}"
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: "1.4.0"

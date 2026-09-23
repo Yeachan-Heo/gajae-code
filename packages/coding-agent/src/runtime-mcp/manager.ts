@@ -432,7 +432,8 @@ export class MCPManager {
 	#authStorage: AuthStorage | null = null;
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
-	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
+	#onToolsChanged?: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void;
+	readonly #toolChangeListeners = new Set<(tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void>();
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
 	#notificationsEnabled = false;
@@ -1015,11 +1016,44 @@ export class MCPManager {
 	}
 
 	/**
-	 * Set a callback to fire when any server's tools change.
+	 * Set a callback to receive a read-only catalog snapshot when server tools change.
 	 */
-	setOnToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void): void {
+	setOnToolsChanged(handler: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void): void {
 		if (this.#toolsOnly) return;
 		this.#onToolsChanged = handler;
+	}
+
+	/** Subscribe to readonly catalog snapshots without replacing the manager owner's callback. */
+	subscribeToToolsChanged(
+		handler: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void,
+	): () => void {
+		if (this.#toolsOnly) return () => {};
+		this.#toolChangeListeners.add(handler);
+		return () => {
+			this.#toolChangeListeners.delete(handler);
+		};
+	}
+
+	#notifyToolsChanged(): void {
+		const listeners = [...this.#toolChangeListeners];
+		// Keep live MCPTool instances for reconnect behavior, but never expose the
+		// manager-owned array; callback types make their tool descriptors readonly.
+		const snapshot = this.#onToolsChanged || listeners.length > 0 ? Object.freeze([...this.#tools]) : undefined;
+		if (snapshot && this.#onToolsChanged) {
+			try {
+				this.#onToolsChanged(snapshot);
+			} catch (error) {
+				logger.warn("MCP tool catalog owner callback failed", { error: classifyMCPStartupFailure(error) });
+			}
+		}
+		if (!snapshot) return;
+		for (const listener of listeners) {
+			try {
+				listener(snapshot);
+			} catch (error) {
+				logger.warn("MCP tool catalog listener failed", { error: classifyMCPStartupFailure(error) });
+			}
+		}
 	}
 
 	/**
@@ -1410,7 +1444,7 @@ export class MCPManager {
 						this.#exactToolOptions(name, config.sharing === "shared"),
 					);
 					this.#replaceServerTools(name, customTools);
-					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
+					if (!this.#toolsOnly) this.#notifyToolsChanged();
 					if (!this.#toolsOnly && this.#shouldCacheServerTools(name))
 						void this.toolCache?.set(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
@@ -1631,7 +1665,10 @@ export class MCPManager {
 		}
 
 		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#publishToolCatalog(allTools);
+		if (shouldPublishToolSnapshot) {
+			this.#publishToolCatalog(allTools);
+			this.#notifyToolsChanged();
+		}
 		allowBackgroundLogging = true;
 
 		return {
@@ -2497,7 +2534,7 @@ export class MCPManager {
 			);
 			if (hadTools) {
 				this.#publishToolCatalog(remainingTools);
-				this.#onToolsChanged?.(this.#tools);
+				this.#notifyToolsChanged();
 			} else {
 				this.#tools = remainingTools;
 			}
@@ -2608,7 +2645,9 @@ export class MCPManager {
 			this.#pendingExactSuspensions.clear();
 			this.#pendingExactControlServers.clear();
 			this.#connections.clear();
+			const hadTools = this.#tools.length > 0;
 			this.#publishToolCatalog([]);
+			if (hadTools) this.#notifyToolsChanged();
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures,
@@ -2900,7 +2939,7 @@ export class MCPManager {
 			);
 			if (this.#shouldCacheServerTools(name)) void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
-			this.#onToolsChanged?.(this.#tools);
+			this.#notifyToolsChanged();
 			void this.#loadServerResourcesAndPrompts(name, connection);
 			return connection;
 		} catch (error) {
@@ -2972,7 +3011,7 @@ export class MCPManager {
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
-		this.#onToolsChanged?.(this.#tools);
+		this.#notifyToolsChanged();
 	}
 
 	/**

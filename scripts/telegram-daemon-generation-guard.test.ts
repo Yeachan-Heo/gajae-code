@@ -1136,6 +1136,7 @@ test("fails closed when a protected native authority declaration is missing or m
 			baseSha: base,
 			checkedOutHead: head,
 			headRefSha: head,
+			headRefDescendsFromEventHead: undefined,
 			baseObjectSha: base,
 			baseRefSha: undefined,
 		};
@@ -1149,14 +1150,24 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => assertGuardAuthority({ ...dispatch, baseRefSha: "c".repeat(40) })).toThrow("dispatch base ref does not resolve");
 		// A mismatched or unfetchable event base object fails closed.
 		expect(() => assertGuardAuthority({ ...pr, baseObjectSha: "c".repeat(40) })).toThrow("base object does not equal event base SHA");
-		// Head-ref and checked-out-head mismatches still fail closed.
+		// Pull request and dispatch head refs remain strict even if a live ref advances.
 		expect(() => assertGuardAuthority({ ...pr, headRefSha: "d".repeat(40) })).toThrow("head ref does not resolve to event head SHA");
+		expect(() => assertGuardAuthority({ ...dispatch, headRefSha: "d".repeat(40) })).toThrow("head ref does not resolve to event head SHA");
 		expect(() => assertGuardAuthority({ ...pr, checkedOutHead: "e".repeat(40) })).toThrow("checked-out head object does not equal event head SHA");
 		// Repository provenance still fails closed (base repo must be this repo).
 		expect(() => assertGuardAuthority({ ...pr, baseRepository: "evil/repo" })).toThrow("base repository must be this repository");
-		// Push semantics preserved: the head repository must be this repository.
-		expect(() => assertGuardAuthority({ ...pr, eventName: "push", headRepository: "fork/repo" })).toThrow("push head repository");
-		expect(() => assertGuardAuthority({ ...pr, eventName: "push", headRepository: "owner/repo" })).not.toThrow();
+		// Push accepts its exact fetched tip and a proven fast-forward-advanced tip,
+		// but rejects an unproven/divergent head ref. Its head repository stays local.
+		const push = { ...pr, eventName: "push" as const, headRepository: "owner/repo" };
+		expect(() => assertGuardAuthority(push)).not.toThrow();
+		expect(() => assertGuardAuthority({ ...push, headRefSha: "c".repeat(40), headRefDescendsFromEventHead: "true" })).not.toThrow();
+		expect(() => assertGuardAuthority({ ...push, headRefSha: "d".repeat(40), headRefDescendsFromEventHead: "false" })).toThrow(
+			"push head ref is not proven to descend from event head SHA",
+		);
+		expect(() => assertGuardAuthority({ ...push, headRefSha: "c".repeat(40), headRefDescendsFromEventHead: undefined })).toThrow(
+			"push head ref is not proven to descend from event head SHA",
+		);
+		expect(() => assertGuardAuthority({ ...push, headRepository: "fork/repo" })).toThrow("push head repository");
 		// Unsupported events fail closed.
 		expect(() => assertGuardAuthority({ ...pr, eventName: "schedule" })).toThrow("unsupported CI event");
 	});

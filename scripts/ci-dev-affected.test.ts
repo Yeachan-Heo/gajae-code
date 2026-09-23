@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import telegramDaemonGenerationManifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
 import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isSchemaContractPath, isTelegramDaemonGenerationGuardFile, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsTelegramDaemonGenerationGuard, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { enumerateTestFiles } from "./run-bun-test-files";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -948,6 +949,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			"check:@gajae-code/agent-core", "test:@gajae-code/agent-core",
 			"check:@gajae-code/ai", "test:@gajae-code/ai",
 			"check:@gajae-code/coding-agent",
+			"test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
@@ -1129,9 +1131,11 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/startup-update-contract.test.ts",
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
 		"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
+		"packages/coding-agent/test/sdk-mcp-discovery.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
+		"packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1171,6 +1175,18 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
 		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
 		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
+	});
+
+	test("the Cargo owner-session regression's direct PR task requires Rust", () => {
+		const testFile = "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts";
+		const tasks = targeted([testFile]);
+		expect(testFiles).toContain(testFile);
+		const directTask = describeTasks(tasks).find(entry => entry.key === `test:${testFile}`);
+		const unrelatedTask = describeTasks(targeted(["packages/coding-agent/test/edit/foo.test.ts"])).find(
+			entry => entry.key === "test:packages/coding-agent/test/edit/foo.test.ts",
+		);
+		expect(directTask?.rust).toBe(true);
+		expect(unrelatedTask?.rust).toBe(false);
 	});
 
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
@@ -1432,25 +1448,25 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		);
 		expect(keys).toContain("test:packages/coding-agent/test/managed-scope-self-heal-budget.test.ts");
 	});
+	const extensibilityOwnerTests = [
+		"packages/coding-agent/test/function-hooks.test.ts",
+		"packages/coding-agent/test/extensions-discovery.test.ts",
+		"packages/coding-agent/test/extensions-runner.test.ts",
+		"packages/coding-agent/test/extensions-wrapper.test.ts",
+		"packages/coding-agent/test/hook-event-normalization.test.ts",
+		"packages/coding-agent/test/gjc-plugin-schema.test.ts",
+		"packages/coding-agent/test/gjc-plugin-aliases.test.ts",
+		"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
+		"packages/coding-agent/test/gjc-plugin-registry.test.ts",
+		"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
+		"packages/coding-agent/test/gjc-plugin-loader.test.ts",
+		"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
+		"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
+		"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
+		"packages/coding-agent/test/gjc-plugin-observability.test.ts",
+		"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
+	];
 	test("extensibility sources select the bounded Function Hooks/plugin owner shard", () => {
-		const ownerTests = [
-			"packages/coding-agent/test/function-hooks.test.ts",
-			"packages/coding-agent/test/extensions-discovery.test.ts",
-			"packages/coding-agent/test/extensions-runner.test.ts",
-			"packages/coding-agent/test/extensions-wrapper.test.ts",
-			"packages/coding-agent/test/hook-event-normalization.test.ts",
-			"packages/coding-agent/test/gjc-plugin-schema.test.ts",
-			"packages/coding-agent/test/gjc-plugin-aliases.test.ts",
-			"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
-			"packages/coding-agent/test/gjc-plugin-registry.test.ts",
-			"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
-			"packages/coding-agent/test/gjc-plugin-loader.test.ts",
-			"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
-			"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
-			"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
-			"packages/coding-agent/test/gjc-plugin-observability.test.ts",
-			"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
-		];
 		const changedSources = [
 			"packages/coding-agent/src/extensibility/extensions/function-hooks.ts",
 			"packages/coding-agent/src/extensibility/extensions/function-hooks-internal.ts",
@@ -1465,14 +1481,21 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/extensibility/gjc-plugins/registry.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts",
-			"packages/coding-agent/src/sdk/session.ts",
 		];
 		for (const changedSource of changedSources) {
 			const keys = targeted([changedSource]).map(task => task.key);
-			for (const ownerTest of ownerTests) expect(keys).toContain(`test:${ownerTest}`);
+			for (const ownerTest of extensibilityOwnerTests) expect(keys).toContain(`test:${ownerTest}`);
+			expect(keys).not.toContain("test:packages/coding-agent/test/sdk-mcp-discovery.test.ts");
 			expect(keys).not.toContain("test:@gajae-code/coding-agent");
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
 		}
+	});
+	test("SDK session changes select MCP discovery cleanup without widening extension owners", () => {
+		const keys = targeted(["packages/coding-agent/src/sdk/session.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-mcp-discovery.test.ts");
+		for (const ownerTest of extensibilityOwnerTests) expect(keys).toContain(`test:${ownerTest}`);
+		expect(keys).not.toContain("test:@gajae-code/coding-agent");
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
 	});
 	test("never emits a runnable task for a nonexistent test path", () => {
 		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
@@ -1784,6 +1807,23 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
 	});
 
+	test("push mode runs the Cargo owner-session regression directly with Rust, outside general shards", async () => {
+		const testFile = "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts";
+		const files = await enumerateTestFiles("packages/coding-agent");
+		expect(files).not.toContain(testFile);
+
+		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
+		const entries = describeTasks(tasks);
+		const directTask = entries.find(entry => entry.key === `test:${testFile}`);
+		expect(directTask).toMatchObject({
+			command: ["bun", "test", testFile],
+			rust: true,
+		});
+		const generalShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(generalShards).toHaveLength(8);
+		expect(generalShards.every(entry => !entry.rust)).toBe(true);
+	});
+
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {
 		const ai: WorkspacePackage = {
 			name: "@gajae-code/ai",
@@ -1946,10 +1986,11 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 	}
 
 	test("default env emits the complete task union and omits root-check", () => {
-		const keys = withEnv(
+		const tasks = withEnv(
 			{ CI_CODING_AGENT_TEST_SHARDS: undefined, CI_RUST_TEST_PARTITIONS: undefined },
-			() => planFullTasks(fullModePackages).map(task => task.key),
+			() => planFullTasks(fullModePackages),
 		);
+		const keys = tasks.map(task => task.key);
 		// root-check is covered by the dedicated native-free `check` job.
 		expect(keys).not.toContain("root-check");
 		expect(keys).toContain("native-linux-x64");
@@ -1962,6 +2003,16 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-")).length).toBe(8);
 		expect(keys).toContain("test:@gajae-code/coding-agent:shard-1-of-8");
 		expect(keys).toContain("test:@gajae-code/coding-agent:sdk-production-host-isolated");
+		const entries = describeTasks(tasks);
+		const cargoTask = entries.find(
+			entry => entry.key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts",
+		);
+		expect(cargoTask).toMatchObject({
+			command: ["bun", "test", "packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"],
+			rust: true,
+		});
+		const codingAgentShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(codingAgentShards.every(entry => !entry.rust)).toBe(true);
 		// Default rust-test stays a single unpartitioned task.
 		expect(keys).toContain("rust-test");
 		expect(keys.some(key => key.startsWith("rust-test:partition-"))).toBe(false);

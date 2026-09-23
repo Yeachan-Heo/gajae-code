@@ -1047,14 +1047,39 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		await expect(createAgentSession(createIsolatedSessionOptions())).rejects.toMatchObject({
 			code: "MCP_MANAGER_CLEANUP_FAILED",
 		});
-		expect(disconnectAll).toHaveBeenCalledTimes(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
+	});
+	it("retries transient cleanup after an enableMCP:false startup failure", async () => {
+		const startupError = new Error("plugin startup failed");
+		const cleanupError = new Error("plugin cleanup failed");
+		const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
+		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
+		expect(installed.ok).toBe(true);
+
+		let failure: unknown;
+		try {
+			await createAgentSession({ ...createIsolatedSessionOptions(), enableMCP: false });
+		} catch (error) {
+			failure = error;
+		}
+
+		expect(failure).toBe(startupError);
+		expect(connectServers).toHaveBeenCalledTimes(1);
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 
 	it("preserves plugin MCP cleanup diagnostics alongside a setup failure", async () => {
 		const startupError = new Error("plugin startup failed");
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -1067,9 +1092,11 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				error: "plugin startup failed",
 				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
 			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 		} finally {
 			await session.dispose();
 		}
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 	it("preserves a frozen primary MCP startup error when cleanup also fails", async () => {
 		const startupError = Object.freeze(new Error("frozen MCP startup failure"));
@@ -1151,7 +1178,10 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		const cleanupError = new Error("plugin cleanup failed");
 		vi.spyOn(MCPManager.prototype, "connectServers").mockRejectedValue(startupError);
-		vi.spyOn(MCPManager.prototype, "disconnectAll").mockRejectedValue(cleanupError);
+		const disconnectAll = vi
+			.spyOn(MCPManager.prototype, "disconnectAll")
+			.mockRejectedValueOnce(cleanupError)
+			.mockResolvedValue(undefined);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		const installed = await installGjcBundle({ cwd: tempDir }, "project", validSixSurfacePluginBundle);
 		expect(installed.ok).toBe(true);
@@ -1161,13 +1191,18 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				([message]) => message === "Failed to wire GJC plugin MCP servers",
 			);
 			expect(cleanupWarning).toBeDefined();
-			expect(cleanupWarning?.[1]).toMatchObject({ error: "<unprintable error>" });
+			expect(cleanupWarning?.[1]).toMatchObject({
+				error: "<unprintable error>",
+				cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED", cause: "plugin cleanup failed" },
+			});
+			expect(disconnectAll).toHaveBeenCalledTimes(1);
 			const serialized = JSON.stringify(cleanupWarning?.[1]);
 			expect(serialized).toContain("<unprintable error>");
 			expect(serialized).toContain("MCP_MANAGER_CLEANUP_FAILED");
 		} finally {
 			await session.dispose();
 		}
+		expect(disconnectAll).toHaveBeenCalledTimes(2);
 	});
 	it("serializes explicit MCP startup and cleanup proxy diagnostics safely", async () => {
 		const trapError = new Error("explicit MCP hostile trap");

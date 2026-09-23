@@ -174,7 +174,26 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 		expect(nativeCommand).toBe("false && printf prefix-edge-ran");
 	});
 
-	it("executes and minimizes a simple Cargo build through native execution", async () => {
+	const cargoBinDir = path.join(process.env.CARGO_HOME || path.join(os.homedir(), ".cargo"), "bin");
+	const cargoPath = [cargoBinDir, process.env.PATH ?? ""].filter(Boolean).join(path.delimiter);
+	let cargoAvailable = false;
+	try {
+		cargoAvailable =
+			Bun.spawnSync(["cargo", "--version"], {
+				env: { ...process.env, PATH: cargoPath },
+				stderr: "ignore",
+				stdout: "ignore",
+			}).exitCode === 0;
+	} catch {
+		// A missing executable and an unusable rustup shim are both unmet prerequisites.
+	}
+
+	const cargoBuildTest = it.skipIf(!cargoAvailable);
+	const cargoBuildTestName = "executes and minimizes a simple Cargo build through native execution";
+	const cargoUnavailableReason =
+		"skipped: requires a working Cargo toolchain; cargo --version must succeed using the test Cargo-bin PATH";
+	const cargoTestTitle = cargoAvailable ? cargoBuildTestName : `${cargoBuildTestName} (${cargoUnavailableReason})`;
+	const runCargoBuild = async () => {
 		const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "bash-cargo-minimizer-"));
 		let nativeCommand: string | undefined;
 		let nativeUnsetEnv: string[] | undefined;
@@ -203,7 +222,6 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 			await fs.writeFile(path.join(fixtureDir, "src", "lib.rs"), "pub fn fixture() {}\n");
 
 			const command = "cargo build --offline --manifest-path Cargo.toml --target-dir target";
-			const cargoBinDir = path.join(process.env.CARGO_HOME || path.join(os.homedir(), ".cargo"), "bin");
 			const result = await new BashTool(
 				createSession("minimizer-session", undefined, {
 					disableShellPrefix: true,
@@ -212,7 +230,7 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 			).execute("call", {
 				command,
 				cwd: fixtureDir,
-				env: { PATH: [cargoBinDir, process.env.PATH ?? ""].filter(Boolean).join(path.delimiter) },
+				env: { PATH: cargoPath, CARGO_TERM_COLOR: "never" },
 			});
 			const output = textOf(result);
 
@@ -236,5 +254,6 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 		} finally {
 			await fs.rm(fixtureDir, { recursive: true, force: true });
 		}
-	}, 30_000);
+	};
+	cargoBuildTest(cargoTestTitle, runCargoBuild, 30_000);
 });

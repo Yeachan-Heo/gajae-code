@@ -16,6 +16,147 @@ import { deriveSessionLifecycleIdempotencyKey, SessionLifecycleService } from ".
 import { SessionRouter } from "../src/sdk/router";
 
 describe("sdk session raw control envelope", () => {
+	test("keeps JSON failure stderr empty for ignored exact-session repo", async () => {
+		const repo = "/private/workspace/path";
+		const stderr: string[] = [];
+		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			for (const { args, command } of [
+				{ args: { action: "inspect", repo, json: true }, command: ["sdk", "session", "inspect"] },
+				{ args: { action: "send", repo, json: true }, command: ["sdk", "session", "send"] },
+				{ args: { action: "status", repo, json: true }, command: ["sdk", "session", "status"] },
+				{
+					args: { action: "raw", rawAction: "query", query: "session.checkpoint", repo, json: true },
+					command: ["sdk", "session", "raw", "query"],
+				},
+			]) {
+				const error = await runSdkSessionCli(args, () => {}).catch(error => error);
+				expect(error).toBeInstanceOf(PublicCommandFailure);
+				expect(error).toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+				const rendered = await renderPublicCommandFailure(error, { command, json: true });
+				expect(rendered.exitCode).toBe(2);
+				expect(rendered.stderr).toBe("");
+				expect(rendered.stdout).not.toContain(repo);
+			}
+			expect(stderr.join("")).toBe("");
+		} finally {
+			stderrSpy.mockRestore();
+		}
+	});
+
+	test("keeps JSON stderr empty when an exact-session broker request fails", async () => {
+		const repo = "/private/workspace/path";
+		const stderr: string[] = [];
+		const ensure = spyOn(brokerEnsure, "ensureBroker").mockRejectedValue(new Error("private broker detail"));
+		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			const error = await runSdkSessionCli(
+				{
+					action: "inspect",
+					sessionId: "session-5862-target",
+					repo,
+					agentDir: "/tmp/gjc-5862-agent",
+					json: true,
+				},
+				() => {},
+			).catch(error => error);
+			expect(error).toBeInstanceOf(PublicCommandFailure);
+			const rendered = await renderPublicCommandFailure(error, {
+				command: ["sdk", "session", "inspect"],
+				json: true,
+			});
+			expect(rendered.exitCode).toBe(1);
+			expect(rendered.stderr).toBe("");
+			expect(rendered.stdout).not.toContain(repo);
+			expect(rendered.stdout).not.toContain("private broker detail");
+			expect(stderr.join("")).toBe("");
+		} finally {
+			stderrSpy.mockRestore();
+			ensure.mockRestore();
+		}
+	});
+
+	test("ignores repo while routing successful exact-session calls by session ID", async () => {
+		const repo = "/private/workspace/path";
+		const sessionId = "session-5862-target";
+		const listInputs: Record<string, unknown>[] = [];
+		const routedTargets: Array<{ sessionId: string; operation: string }> = [];
+		const warnings: string[] = [];
+		const ensure = spyOn(brokerEnsure, "ensureBroker").mockResolvedValue({} as never);
+		const start = spyOn(SessionRouter.prototype, "start").mockResolvedValue(undefined);
+		const stop = spyOn(SessionRouter.prototype, "stop").mockResolvedValue(undefined);
+		const attachment = spyOn(SessionRouter.prototype, "attachment").mockReturnValue({ generation: 1 } as never);
+		const list = spyOn(SessionRouter.prototype, "listBrokerSessions").mockImplementation(async input => {
+			listInputs.push(input);
+			return {
+				ok: true,
+				result: {
+					sessions: [
+						{
+							sessionId,
+							locator: { cwd: "/workspace/target", worktreeRoot: null, stateRoot: "/workspace/target/state" },
+							endpointGeneration: 1,
+							pid: 123,
+							live: true,
+							deleted: false,
+							indexSeq: 1,
+						},
+					],
+				},
+			};
+		});
+		const request = spyOn(SessionRouter.prototype, "request").mockImplementation(async (routedSessionId, frame) => {
+			routedTargets.push({ sessionId: routedSessionId, operation: String(frame.operation ?? frame.query) });
+			return {
+				ok: true,
+				result: frame.type === "control_request" ? { accepted: true } : { status: "complete" },
+			};
+		});
+		const stderr = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			warnings.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			const outputs: unknown[] = [];
+			for (const args of [
+				{ action: "inspect", sessionId, repo, json: true },
+				{ action: "send", sessionId, text: "hello", repo, json: true },
+				{ action: "status", sessionId, opRef: "op-5862", repo, json: true },
+				{ action: "raw", rawAction: "query", sessionId, query: "session.checkpoint", repo, json: true },
+			]) {
+				await runSdkSessionCli({ ...args, agentDir: "/tmp/gjc-5862-agent" }, value => outputs.push(value));
+			}
+			expect(outputs).toHaveLength(4);
+			expect(outputs.every(output => (output as { ok?: unknown }).ok === true)).toBe(true);
+			expect(listInputs).toEqual([{ resolveSessionId: sessionId }]);
+			expect(routedTargets).toEqual([
+				{ sessionId, operation: "turn.prompt" },
+				{ sessionId, operation: "turn.result" },
+				{ sessionId, operation: "session.checkpoint" },
+			]);
+			expect(warnings.join("")).toBe(
+				"Warning: --repo is ignored for exact-session commands; the session ID selects the broker target.\n".repeat(
+					4,
+				),
+			);
+			expect(JSON.stringify({ listInputs, routedTargets, warnings, outputs })).not.toContain(repo);
+		} finally {
+			stderr.mockRestore();
+			request.mockRestore();
+			list.mockRestore();
+			attachment.mockRestore();
+			stop.mockRestore();
+			start.mockRestore();
+			ensure.mockRestore();
+		}
+	});
+
 	test("invalid JSON throws before output and the boundary never echoes its body", async () => {
 		const output: unknown[] = [];
 		const secret = "secret-body-not-for-output";

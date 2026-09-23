@@ -54,9 +54,14 @@ results. The broker is started on demand (`ensureBroker`) when discovery is
 absent, and an unavailable broker fails closed with a typed operational error
 (exit 1).
 
-`--agent-dir` selects the broker state directory; `--repo` selects the
-workspace directory used for saved-session resolution (default: the current
-directory).
+`--agent-dir` selects the broker state directory. It may appear at the session
+family level before the verb (`gjc sdk session --agent-dir <dir> list`) or on a
+leaf command. `--repo` selects the workspace directory for scoped listing or
+saved-session resolution (default: the current directory). For compatibility,
+`inspect`, `send`, `status`, and `raw query` also accept `--repo`, but ignore it:
+the exact session ID selects the broker target. Successful calls print a
+path-free warning to stderr. Failed `--json` calls keep stderr empty and return
+their structured error; command-local help identifies `--repo` as compatibility-only.
 
 ## Semantic verbs
 
