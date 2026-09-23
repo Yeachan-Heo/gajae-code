@@ -1638,9 +1638,9 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	if (process.platform !== "linux" && (await isAbsentBeneathRealDirectories(agent, target)))
 		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 	try {
+		// This is a read-only load; privateDurable is a Linux-only guarded-write mode.
 		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
 			cwd: agent,
-			privateDurable: { directory: path.dirname(target) },
 		});
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
