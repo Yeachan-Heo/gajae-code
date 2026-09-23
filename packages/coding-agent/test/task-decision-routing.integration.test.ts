@@ -149,7 +149,7 @@ describe("fresh-subagent decision integration", () => {
 		const f = await fixture({ decide: async () => recommendation });
 		const attempts: string[] = [];
 		vi.spyOn(sdk, "createAgentSession").mockImplementation(async init => {
-			attempts.push(init.model?.id ?? "unknown");
+			attempts.push(init?.model?.id ?? "unknown");
 			throw Object.assign(new Error("synthetic transient failure"), { transient: true });
 		});
 		const result = await runSubprocess({ ...f.options, autoroutingPreflight: true });

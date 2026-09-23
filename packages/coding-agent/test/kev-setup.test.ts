@@ -139,6 +139,7 @@ async function fixture() {
 		health: async () => true,
 		sleep: async () => {},
 		readyTimeoutMs: 1,
+		stopTimeoutMs: 1,
 	};
 	return { root, base, stateDir, snapshot, calls, processes, spawned, killedHandles, control, supervisor, deps };
 }
@@ -405,19 +406,57 @@ describe("Kev lifecycle", () => {
 		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(true);
 	});
 
-	test("an unreachable control socket on a dead supervisor retires the record without signaling", async () => {
+	test("a dead supervisor whose port still has a listener is orphaned, not stopped", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		f.processes.delete(f.supervisor.pid!);
+		// The supervisor is gone but its child still holds the port.
+		f.deps.portAvailable = () => false;
+		const kills = captureSignals();
+		try {
+			expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ ok: false, state: "orphaned" });
+			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: false, state: "orphaned" });
+		} finally {
+			kills.restore();
+		}
+		expect(realSignals(kills)).toEqual([]);
+		expect(stopRequests(f.control)).toEqual([]);
+		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(true);
+	});
+
+	test("a dead supervisor retires the record only once the port is free", async () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.processes.delete(f.supervisor.pid!);
 		const kills = captureSignals();
 		try {
-			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
+			expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ state: "stale" });
+			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: true, state: "stopped" });
 		} finally {
 			kills.restore();
 		}
 		expect(realSignals(kills)).toEqual([]);
 		expect(stopRequests(f.control)).toEqual([]);
+		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(false);
+	});
+
+	test("a live service outranks missing installation metadata and is stopped through its token", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		await fs.rm(path.join(f.root, "install.json"));
+		// Never `not-installed`: that reads as "nothing to do" for a running server.
+		expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ ok: false, state: "orphaned", pid: 42 });
+		f.supervisor.acceptsToken = false;
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: false, state: "stopping" });
+		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(true);
+		expect(f.supervisor.running).toBe(true);
+		f.supervisor.acceptsToken = true;
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: true, state: "stopped" });
+		expect(stopRequests(f.control)).toHaveLength(2);
+		expect(stopRequests(f.control).every(call => call.socket === path.join(f.root, "control.sock"))).toBe(true);
 		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(false);
 	});
 });

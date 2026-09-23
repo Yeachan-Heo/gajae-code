@@ -92,10 +92,18 @@ export interface KevSetupDeps {
 	control?: (socketPath: string, message: string) => Promise<KevControlReply | undefined>;
 	sleep?: (ms: number) => Promise<void>;
 	readyTimeoutMs?: number;
+	/** How long a stop waits for the recorded port to go quiet before failing closed. */
+	stopTimeoutMs?: number;
 }
 export interface KevStatus {
 	ok: boolean;
-	state: "not-installed" | "stopped" | "starting" | "running" | "stopping" | "stale" | "foreign";
+	/**
+	 * `orphaned` means a service is (or may still be) running that this tool can no
+	 * longer prove it owns — installation metadata went missing, or the recorded
+	 * port still has a listener after the supervisor is gone. It is never success:
+	 * retiring the record here would forget a live server.
+	 */
+	state: "not-installed" | "stopped" | "starting" | "running" | "stopping" | "stale" | "foreign" | "orphaned";
 	root: string;
 	model?: string;
 	port?: number;
@@ -290,24 +298,77 @@ async function installed(root: string): Promise<Installation | undefined> {
 	if (metadata && metadata.root !== root) throw new Error("Kev installation root mismatch");
 	return metadata;
 }
-async function status(root: string, deps: KevSetupDeps): Promise<KevStatus> {
-	const install = await installed(root);
-	if (!install) return { ok: false, state: "not-installed", root };
-	let record: ServiceRecord | undefined;
+/** A recorded service, or the fact that its metadata is unreadable. Never both. */
+async function readService(root: string): Promise<{ record?: ServiceRecord; unsafe: boolean }> {
 	try {
-		record = await readPrivate(path.join(root, SERVICE_FILE), serviceSchema);
+		return { record: await readPrivate(path.join(root, SERVICE_FILE), serviceSchema), unsafe: false };
 	} catch {
-		return { ok: false, state: "foreign", root, error: "Invalid or unsafe Kev ownership metadata" };
+		return { unsafe: true };
 	}
-	if (!record) return { ok: true, state: "stopped", root, model: install.model };
+}
+/** Is anything still listening on the recorded loopback port, whoever owns it now? */
+function portHasListener(port: number, deps: KevSetupDeps): boolean {
+	return !(deps.portAvailable ?? portAvailable)(port);
+}
+/** Wait, bounded, for the recorded port to go quiet. False means a listener outlived the stop. */
+async function awaitPortRelease(port: number, deps: KevSetupDeps): Promise<boolean> {
+	const deadline = Date.now() + (deps.stopTimeoutMs ?? 5_000);
+	for (;;) {
+		if (!portHasListener(port, deps)) return true;
+		if (Date.now() >= deadline) return false;
+		await (deps.sleep ?? Bun.sleep)(100);
+	}
+}
+async function status(root: string, deps: KevSetupDeps): Promise<KevStatus> {
+	// The service record is read first. A running server must never be reported as
+	// `not-installed` just because its installation metadata was removed — that
+	// answer reads as "nothing to do" and leaves the server running forever.
+	const service = await readService(root);
+	if (service.unsafe) return { ok: false, state: "foreign", root, error: "Invalid or unsafe Kev ownership metadata" };
+	const record = service.record;
+	let install: Installation | undefined;
+	try {
+		install = await installed(root);
+	} catch {
+		install = undefined;
+	}
+	if (!record) {
+		if (!install) return { ok: false, state: "not-installed", root };
+		return { ok: true, state: "stopped", root, model: install.model };
+	}
+	if (!install) {
+		return {
+			ok: false,
+			state: "orphaned",
+			root,
+			model: record.model,
+			port: record.port,
+			pid: record.pid,
+			error: "Kev service record exists without readable installation metadata",
+		};
+	}
 	const observed = (deps.inspect ?? inspectDefault)(record.pid);
-	if (!observed) return { ok: true, state: "stale", root, model: record.model, port: record.port, pid: record.pid };
+	if (!observed) {
+		// The supervisor is gone. Only an idle port proves the service went with it.
+		if (portHasListener(record.port, deps)) {
+			return {
+				ok: false,
+				state: "orphaned",
+				root,
+				model: record.model,
+				port: record.port,
+				pid: record.pid,
+				error: "Kev supervisor is gone but its recorded port still has a listener",
+			};
+		}
+		return { ok: true, state: "stale", root, model: record.model, port: record.port, pid: record.pid };
+	}
 	if (!owns(record, install, observed))
 		return { ok: false, state: "foreign", root, error: "Kev process ownership or incarnation does not match" };
 	// The supervisor does not hold the port; its child does. Ask the authenticated
 	// control channel which pid that is, so `listens` still proves the listener is
 	// ours rather than any process that happens to answer on the loopback port.
-	const reported = await (deps.control ?? kevControl)(record.socket, controlRequest("status", record.token));
+	const reported = await (deps.control ?? kevControl)(controlSocket(root), controlRequest("status", record.token));
 	const servicePid = reported?.ok && reported.state === "running" ? reported.pid : undefined;
 	const ready =
 		servicePid !== undefined &&
@@ -425,7 +486,7 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 	await verifyCheckout(root, install, deps);
 	await checkDirectory(path.join(root, "repo", ".venv"));
 	const current = await status(root, deps);
-	if (current.state === "foreign") throw new Error(current.error);
+	if (current.state === "foreign" || current.state === "orphaned") throw new Error(current.error);
 	if (current.state === "running" || current.state === "starting") {
 		if (current.port !== port) throw new Error("Owned Kev server already uses a different port");
 		return current;
@@ -505,40 +566,55 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	const current = await status(root, deps);
 	if (current.state === "foreign") return current;
-	if (["not-installed", "stale", "stopped"].includes(current.state)) {
-		if (current.state !== "not-installed") await fs.rm(path.join(root, SERVICE_FILE), { force: true });
-		return { ok: true, state: "stopped", root };
+	const service = await readService(root);
+	if (service.unsafe) return { ok: false, state: "foreign", root, error: "Invalid or unsafe Kev ownership metadata" };
+	const record = service.record;
+	if (!record) return { ok: true, state: "stopped", root };
+	let install: Installation | undefined;
+	try {
+		install = await installed(root);
+	} catch {
+		install = undefined;
 	}
-	const install = await installed(root);
-	const record = await readPrivate(path.join(root, SERVICE_FILE), serviceSchema);
-	if (!install || !record || !owns(record, install, (deps.inspect ?? inspectDefault)(record.pid))) {
+	const observed = (deps.inspect ?? inspectDefault)(record.pid);
+	// Ownership can become unprovable (installation metadata removed) while the
+	// service keeps running. That is a reason to stop it through its own
+	// authenticated channel, never a reason to call it stopped and walk away.
+	if (install && observed && !owns(record, install, observed)) {
 		return { ok: false, state: "foreign", root, error: "Kev ownership changed before stop" };
 	}
-	// Nothing below resolves `record.pid` into a signal. Ownership is proven to the
-	// supervisor by a token over its own socket, and the supervisor signals a child
-	// handle it holds — so a pid recycled between this check and the stop is never
-	// the thing that gets signaled, because no pid is ever signaled here.
-	const reply = await (deps.control ?? kevControl)(record.socket, controlRequest("stop", record.token));
-	if (reply?.ok) {
-		await fs.rm(path.join(root, SERVICE_FILE), { force: true });
-		return { ok: true, state: "stopped", root };
+	const retained = { root, model: record.model, port: record.port, pid: record.pid } as const;
+	if (observed) {
+		// Nothing below resolves `record.pid` into a signal. Ownership is proven to
+		// the supervisor by a token over this installation's own socket, and the
+		// supervisor signals a child handle it holds — so a pid recycled between the
+		// check and the stop is never signaled, because no pid is ever signaled here.
+		const reply = await (deps.control ?? kevControl)(controlSocket(root), controlRequest("stop", record.token));
+		if (!reply?.ok && (deps.inspect ?? inspectDefault)(record.pid)) {
+			return {
+				ok: false,
+				state: "stopping",
+				...retained,
+				error:
+					reply === undefined
+						? "Kev supervisor did not answer its control socket; ownership retained and nothing was signaled"
+						: `Kev supervisor refused the stop (${reply.error ?? "unknown"}); ownership retained and nothing was signaled`,
+			};
+		}
 	}
-	// The control channel gave no confirmation. A supervisor that is gone leaves
-	// only a stale record to retire; one that is still alive keeps its ownership
-	// record so a later stop can retry against the same authenticated channel.
-	const observed = (deps.inspect ?? inspectDefault)(record.pid);
-	if (!observed || !owns(record, install, observed)) {
-		await fs.rm(path.join(root, SERVICE_FILE), { force: true });
-		return { ok: true, state: "stopped", root };
+	// The supervisor is gone — confirmed, already absent, or exited mid-stop. The
+	// record is retired only once the recorded port is actually free, so a child
+	// that outlived its supervisor is reported rather than forgotten.
+	if (!(await awaitPortRelease(record.port, deps))) {
+		return {
+			ok: false,
+			state: "orphaned",
+			...retained,
+			error: "Kev stopped its supervisor but the recorded port still has a listener; ownership retained",
+		};
 	}
-	return {
-		...current,
-		state: "stopping",
-		error:
-			reply === undefined
-				? "Kev supervisor did not answer its control socket; ownership retained and nothing was signaled"
-				: `Kev supervisor refused the stop (${reply.error ?? "unknown"}); ownership retained and nothing was signaled`,
-	};
+	await fs.rm(path.join(root, SERVICE_FILE), { force: true });
+	return { ok: true, state: "stopped", root };
 }
 
 export async function runKevSetup(
