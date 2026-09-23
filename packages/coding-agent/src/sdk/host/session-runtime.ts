@@ -774,13 +774,14 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation;
 		acceptedAt: number;
 		deadlineMaxAt?: number;
+		pendingOutcome?: InvocationOutcome;
 	}>;
 	hydrate(): Promise<void>;
-	notePendingStoppedOutcome(
+	stagePendingTerminalOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
-		outcome: Extract<InvocationOutcome, { kind: "stopped" }>,
-	): Promise<boolean>;
+		outcome: InvocationOutcomeInput,
+	): Promise<InvocationOutcome | undefined>;
 	claimPendingOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -816,6 +817,8 @@ export function createInvocationReconciliation(
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
 	const TERMINAL_CAPACITY = 512;
+	const PENDING_TERMINAL_OUTCOME_RETRIES = 3;
+	const PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS = 25;
 	const records = new Map<string, InvocationRecord>();
 	const reservations = new Map<string, InvocationKind>();
 	const reservationCounts = new Map<InvocationKind, number>([
@@ -1392,38 +1395,60 @@ export function createInvocationReconciliation(
 						record.deadlineRecoveryPending === true &&
 						record.terminalAt === undefined,
 				)
-				.map(record => ({
-					correlation: { commandId: record.commandId, turnId: record.turnId },
-					acceptedAt: record.acceptedAt,
-					...((record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt === undefined
-						? {}
-						: { deadlineMaxAt: (record as unknown as { deadlineMaxAt: number }).deadlineMaxAt }),
-				}));
+				.map(record => {
+					const deadlineMaxAt = (record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+					const pendingOutcome = canonicalTerminalOutcome(
+						(record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+						undefined,
+						failureEvidence(record),
+					);
+					return {
+						correlation: { commandId: record.commandId, turnId: record.turnId },
+						acceptedAt: record.acceptedAt,
+						...(deadlineMaxAt === undefined ? {} : { deadlineMaxAt }),
+						...(pendingOutcome === undefined ? {} : { pendingOutcome }),
+					};
+				});
 		},
 		hydrate,
-		async notePendingStoppedOutcome(kind, correlation, outcome) {
+		async stagePendingTerminalOutcome(kind, correlation, outcome) {
 			const recordKey = key(kind, correlation);
-			const record = records.get(recordKey);
-			if (!record || record.kind !== kind || record.terminalAt !== undefined) return false;
-			if (record.error !== undefined && record.error.code !== "prompt_deadline_exceeded") return false;
-			const normalized = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record));
-			if (normalized?.kind !== "stopped") return false;
-			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-			if (pending !== undefined) {
-				const prior = canonicalTerminalOutcome(pending, undefined, failureEvidence(record));
-				if (prior?.kind === "stopped") return true;
-				if (prior?.kind !== "failed" || prior.provenance !== "deadline") return false;
+			for (let attempt = 0; attempt < PENDING_TERMINAL_OUTCOME_RETRIES; attempt += 1) {
+				const record = records.get(recordKey);
+				if (!record || record.kind !== kind || record.terminalAt !== undefined) return undefined;
+				const requested = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record));
+				if (requested === undefined) return undefined;
+				const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+				const prior =
+					pending === undefined
+						? undefined
+						: canonicalTerminalOutcome(pending, undefined, failureEvidence(record));
+				let staged = requested;
+				if (record.error !== undefined && record.error.code !== "prompt_deadline_exceeded") {
+					staged = canonicalFailedOutcome(
+						record.error,
+						"agent_failed",
+						failureEvidence(record),
+						requested.kind === "failed" ? requested.providerCode : undefined,
+					);
+				} else if (prior !== undefined && !(prior.kind === "failed" && prior.provenance === "deadline")) {
+					// A real, already-staged terminal intent is stronger than this
+					// publisher's duplicate event. Provider errors were handled above.
+					return prior;
+				}
+				const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
+				next.pendingOutcome = staged;
+				records.set(recordKey, next);
+				try {
+					await persist();
+					return staged;
+				} catch (error) {
+					if (records.get(recordKey) === next) records.set(recordKey, record);
+					if (attempt + 1 >= PENDING_TERMINAL_OUTCOME_RETRIES) throw error;
+					await Bun.sleep(PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS);
+				}
 			}
-			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
-			next.pendingOutcome = normalized;
-			records.set(recordKey, next);
-			try {
-				await persist();
-				return true;
-			} catch (error) {
-				if (records.get(recordKey) === next) records.set(recordKey, record);
-				throw error;
-			}
+			return undefined;
 		},
 		async claimPendingOutcome(kind, correlation, outcome) {
 			const record = records.get(key(kind, correlation));
@@ -1597,6 +1622,18 @@ export function createInvocationReconciliation(
 			const record = records.get(recordKey);
 			if (!record || record.kind !== kind) return;
 			if (record.terminalAt !== undefined && record.error?.code !== "prompt_deadline_exceeded") return;
+			const pendingOutcome = canonicalTerminalOutcome(
+				(record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+				undefined,
+				failureEvidence(record),
+			);
+			const preserveRealPendingOutcome =
+				pendingOutcome !== undefined &&
+				!(
+					pendingOutcome.kind === "failed" &&
+					pendingOutcome.code === "prompt_deadline_exceeded" &&
+					pendingOutcome.provenance === "deadline"
+				);
 			const next: InvocationRecord = {
 				...record,
 				status: record.startedAt === undefined ? "accepted" : "in_flight",
@@ -1607,9 +1644,8 @@ export function createInvocationReconciliation(
 			if (next.error?.code === "prompt_deadline_exceeded" || !isPreservedProviderFailure(next.error?.code))
 				delete next.error;
 			delete next.receiptState;
-			delete (next as unknown as { outcome?: unknown; pendingOutcome?: unknown; pendingReceiptState?: unknown })
-				.outcome;
-			delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+			delete (next as unknown as { outcome?: unknown; pendingReceiptState?: unknown }).outcome;
+			if (!preserveRealPendingOutcome) delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 			delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
 			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
 			if (deadlineMaxAt !== undefined) (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt = deadlineMaxAt;
@@ -4944,8 +4980,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		const terminalPublicationByCorrelation = new Map<string, boolean>();
-		const deferredStoppedOutcomeRequired = new Set<string>();
-		const deferredStoppedOutcomeReady = new Set<string>();
+		const deferredTerminalOutcomeRequired = new Set<string>();
+		const deferredTerminalOutcomeReady = new Set<string>();
+		const stagedTerminalOutcomes = new Map<string, InvocationOutcome>();
 		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		// Retained BEFORE the first durable await: from here this publisher can still
 		// reach the claim below, so no later boundary may evict its correlations while
@@ -4961,6 +4998,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						type === "agent_end" &&
 						invocation.kind === "prompt" &&
 						current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation);
+					let invocationTerminalOutcome = terminalOutcome;
 					if (type === "agent_end" && invocation.kind === "prompt")
 						current.deadlineManager.noteTerminalTransition(
 							invocation.correlation,
@@ -4969,7 +5007,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								? ({
 										content: terminalContent,
 										hasActivity: terminalHasActivity,
-										...(terminalOutcome?.kind === "stopped" ? { outcome: terminalOutcome } : {}),
+										...(terminalOutcome === undefined ? {} : { outcome: terminalOutcome }),
 									} satisfies PromptTerminalTransitionEvidence)
 								: undefined,
 							deferDeadlineTerminal,
@@ -4987,17 +5025,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							} as never);
 							current.unrecordedFailureReasons?.delete(reasonKey);
 						}
-						if (deferDeadlineTerminal && terminalOutcome?.kind === "stopped") {
+						if (deferDeadlineTerminal) {
 							const terminalKey = lifecycleCorrelationKey(invocation.correlation);
-							deferredStoppedOutcomeRequired.add(terminalKey);
-							if (
-								await current.reconciliation.notePendingStoppedOutcome(
+							deferredTerminalOutcomeRequired.add(terminalKey);
+							if (terminalOutcome !== undefined) {
+								const staged = await current.reconciliation.stagePendingTerminalOutcome(
 									invocation.kind,
 									invocation.correlation,
 									terminalOutcome,
-								)
-							)
-								deferredStoppedOutcomeReady.add(terminalKey);
+								);
+								if (staged !== undefined) {
+									deferredTerminalOutcomeReady.add(terminalKey);
+									invocationTerminalOutcome = staged;
+									stagedTerminalOutcomes.set(terminalKey, staged);
+								}
+							}
 						}
 					}
 					// agent_failed is additive diagnostic state; agent_end remains the
@@ -5015,8 +5057,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 										? { content: terminalContent }
 										: {}),
 									...(type === "agent_end" && terminalHasActivity ? { hasActivity: true } : {}),
-									...(type === "agent_end" && terminalOutcome !== undefined
-										? { outcome: terminalOutcome }
+									...(type === "agent_end" && invocationTerminalOutcome !== undefined
+										? { outcome: invocationTerminalOutcome }
 										: {}),
 								};
 					// The deadline manager flushes only after the run and its tools settle;
@@ -5111,7 +5153,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// the boundary to each owner instead of one signal nobody can claim. A
 				// continuing maintenance checkpoint never reaches this branch: it returned
 				// above with the one uncorrelated frame, so it cannot settle a live prompt.
-				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
 				for (const invocation of transitions) {
 					// Claim synchronously, immediately before the emit: the durable awaits
 					// above give the deadline expiry room to publish this correlation's
@@ -5122,7 +5163,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// Flipping it would make a terminal abort's durable row refuse to claim
 					// terminalPublished for a boundary that IS on the wire.
 					const terminalKey = correlationKey(invocation.correlation);
-					if (deferredStoppedOutcomeRequired.has(terminalKey) && !deferredStoppedOutcomeReady.has(terminalKey)) {
+					const outcome =
+						stagedTerminalOutcomes.get(terminalKey) ??
+						terminalOutcome ??
+						terminalStoppedOutcome(stopReason, maintenanceOutcome);
+					if (deferredTerminalOutcomeRequired.has(terminalKey) && !deferredTerminalOutcomeReady.has(terminalKey)) {
 						terminalPublicationByCorrelation.set(terminalKey, false);
 						observed = false;
 						continue;
@@ -5271,29 +5316,38 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			: undefined;
 		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
-		const failure = providerFailureFromAgentEnd(event);
 		const failureCandidates = endedBatch
 			? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
 			: currentInvocation
 				? [currentInvocation]
 				: [];
+		const eventFailure = providerFailureFromAgentEnd(event);
+		const recordedFailureCode = failureCandidates
+			.map(({ correlation }) => owner?.failureDiagnosticCodes.get(lifecycleCorrelationKey(correlation)))
+			.find((code): code is string => code !== undefined);
+		const failure =
+			eventFailure ??
+			(recordedFailureCode === undefined
+				? undefined
+				: Object.assign(new Error("agent run failed"), { code: recordedFailureCode }));
 		const genericFailureKeys = failureCandidates
 			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
 			.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
 		const hasExistingFailure = failureCandidates.some(({ correlation }) =>
 			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
 		);
-		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
+		const failureAlreadyPublished =
+			eventFailure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
-			event.stopReason === "cancelled" ||
-			(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
-				? terminalStoppedOutcome(
-						event.stopReason,
-						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-					)
-				: failure !== undefined
-					? canonicalFailedOutcome(failure)
+			failure !== undefined
+				? canonicalFailedOutcome(failure)
+				: event.stopReason === "cancelled" ||
+						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
+					? terminalStoppedOutcome(
+							event.stopReason,
+							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+						)
 					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
 						? terminalStoppedOutcome(
 								event.stopReason,
@@ -5708,8 +5762,30 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			connectionId: string | undefined;
 			sdkRunToken: string;
 		}> = [];
-		for (const { correlation, acceptedAt, deadlineMaxAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
+		for (const {
+			correlation,
+			acceptedAt,
+			deadlineMaxAt,
+			pendingOutcome,
+		} of reconciliation.listDeadlineRecoveryPendingPrompts()) {
 			deadlineManager.recoverPending(correlation, acceptedAt, deadlineMaxAt);
+			if (
+				pendingOutcome !== undefined &&
+				!(
+					pendingOutcome.kind === "failed" &&
+					pendingOutcome.code === "prompt_deadline_exceeded" &&
+					pendingOutcome.provenance === "deadline"
+				)
+			)
+				deadlineManager.noteTerminalTransition(
+					correlation,
+					pendingOutcome.kind === "failed"
+						? { code: pendingOutcome.providerCode ?? pendingOutcome.code, message: pendingOutcome.message }
+						: undefined,
+					{ outcome: pendingOutcome },
+					true,
+				);
+		}
 		const openLifecycleBatches: Array<{
 			epoch: number;
 			invocations: Array<{
