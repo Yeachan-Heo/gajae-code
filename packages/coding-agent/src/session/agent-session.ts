@@ -23762,8 +23762,9 @@ export class AgentSession {
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
 	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
+		const model = this.model;
 		if (
-			!this.model ||
+			!model ||
 			(trigger.class !== "auth" &&
 				trigger.class !== "quota" &&
 				trigger.class !== "rate_limit" &&
@@ -23775,7 +23776,7 @@ export class AgentSession {
 		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return "unchanged";
 
 		const authStorage = this.#modelRegistry.authStorage;
-		const provider = this.model.provider;
+		const provider = model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
 		if (
 			authStorage.hasRuntimeApiKey(provider) ||
@@ -23787,6 +23788,43 @@ export class AgentSession {
 		}
 
 		const credentialSessionId = this.credentialSessionId;
+		const resolveSameKindPeer = async (
+			excludedRowId: number | undefined,
+			credentialKind: "oauth" | "api_key" | undefined,
+		): Promise<{ rowId: number | undefined; credentialKind: "oauth" | "api_key" | undefined }> => {
+			if (credentialKind === "oauth") {
+				const peers = authStorage
+					.listCredentialInventory(provider)
+					.filter(
+						credential =>
+							!credential.disabled &&
+							credential.id !== excludedRowId &&
+							credential.credentialKind === credentialKind,
+					);
+				for (const peer of peers) {
+					try {
+						await this.#modelRegistry.getApiKey(model, credentialSessionId, {
+							credentialSelector: { kind: "id", value: String(peer.id) },
+						});
+					} catch (error) {
+						const peerStillActive = authStorage
+							.listCredentialInventory(provider)
+							.some(credential => credential.id === peer.id && !credential.disabled);
+						if (peerStillActive) throw error;
+						continue;
+					}
+					const rowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+					const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
+					if (rowId === peer.id && selectedKind === credentialKind) return { rowId, credentialKind: selectedKind };
+				}
+			} else {
+				await this.#modelRegistry.getApiKey(model, credentialSessionId);
+			}
+			return {
+				rowId: authStorage.getSessionCredentialRowId(provider, credentialSessionId),
+				credentialKind: authStorage.getSessionCredentialType(provider, credentialSessionId),
+			};
+		};
 		if (trigger.class !== "auth") {
 			if (
 				trigger.class === "credential" &&
@@ -23812,18 +23850,24 @@ export class AgentSession {
 							credential.credentialKind === beforeType,
 					);
 				if (failedRowStillActive) return "exhausted";
-				await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
-				const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-				const afterType = authStorage.getSessionCredentialType(provider, credentialSessionId);
-				return after !== undefined && after !== before && afterType === beforeType ? "rotated" : "unchanged";
+				const after = await resolveSameKindPeer(before, beforeType);
+				return after.rowId !== undefined && after.rowId !== before && after.credentialKind === beforeType
+					? "rotated"
+					: "unchanged";
 			}
-			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
-			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			if (before !== undefined && after !== undefined && before !== after) return "rotated";
-			if (before === undefined) return "alternate";
-			return "unchanged";
+			const failedRowAtMark = before ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const after = await resolveSameKindPeer(failedRowAtMark, beforeType);
+			if (
+				before !== undefined &&
+				after.rowId !== undefined &&
+				after.rowId !== before &&
+				after.credentialKind === beforeType
+			) {
+				return "rotated";
+			}
+			return "alternate";
 		}
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+		const activeApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 
 		if (!isAuthenticated(activeApiKey)) return "unchanged";
 		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
@@ -23833,7 +23877,7 @@ export class AgentSession {
 		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
-		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+		if ((await this.#modelRegistry.getApiKey(model, credentialSessionId)) !== activeApiKey) {
 			return "rotated";
 		}
 		return remaining ? "unchanged" : "exhausted";
