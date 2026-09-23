@@ -375,13 +375,14 @@ test("the prior file's directories are removed before the runner exits", () => {
 	}, 30_000);
 
 	test("cleans isolated dirs when os.tmpdir is nested under the real home", async () => {
-		const ownedRoot = path.join(os.homedir(), `.gjc-test-preload-tmp-${crypto.randomUUID()}`);
+		const defaultWorld = getDefaultSafeCleanupWorld();
+		const trustedHome = defaultWorld.homeAliases[0] ?? os.homedir();
+		const ownedRoot = path.join(trustedHome, `.gjc-test-preload-tmp-${crypto.randomUUID()}`);
 		const forgetOwnedRoot = registerOwnedDeletionRoot(ownedRoot);
 		fs.mkdirSync(ownedRoot, { mode: 0o700 });
 		const tempRoot = path.join(ownedRoot, "tmp");
 		fs.mkdirSync(tempRoot, { mode: 0o700 });
 		try {
-			const defaultWorld = getDefaultSafeCleanupWorld();
 			expect(
 				defaultWorld.allowedRoots.some(root => {
 					const relative = path.relative(root, tempRoot);
@@ -394,11 +395,11 @@ test("the prior file's directories are removed before the runner exits", () => {
 
 			const env: Record<string, string | undefined> = {
 				...process.env,
-				HOME: os.homedir(),
+				HOME: trustedHome,
 				TMPDIR: tempRoot,
 				TMP: tempRoot,
 				TEMP: tempRoot,
-				GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+				GJC_CODING_AGENT_DIR: path.join(trustedHome, ".gjc", "agent"),
 				PI_CODING_AGENT_DIR: "",
 				GJC_CONFIG_DIR: "",
 				PI_CONFIG_DIR: "",
