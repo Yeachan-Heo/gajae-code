@@ -18299,7 +18299,6 @@ export class AgentSession {
 		thinkingLevel: ThinkingLevel | undefined,
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
-		this.#clearActiveRetryFallback();
 		if (model) {
 			// Restoring a captured live model is compensation, not a new selection:
 			// the old credential may have disappeared after the forward mutation.
@@ -18307,6 +18306,7 @@ export class AgentSession {
 			this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
 			this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 		} else {
+			this.#clearActiveRetryFallback();
 			this.#setModelWithProviderSessionReset(undefined);
 			this.#syncAppendOnlyContext(undefined);
 		}
