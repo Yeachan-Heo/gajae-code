@@ -256,43 +256,47 @@ describe("red-team: conventional MCP autoload", () => {
 			}
 		}, 30_000);
 
-		it.skipIf(process.platform !== "linux")(
-			"keeps a mixed manager reconnectable while cached conventional tools are published",
-			async () => {
-				const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
-				expect(r.ok).toBe(true);
-				await writeProjectConfig(".gjc/mcp.json", { mcpServers: { "slow-demo": demoConfig() } });
-				const [cachedTool] = DeferredMCPTool.fromTools(
-					"slow-demo",
-					[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
-					async () => {
-						throw new Error("cached server is disconnected");
-					},
-				);
-				if (!cachedTool) throw new Error("cached MCP tool was not created");
-				const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
-					tools: [cachedTool],
-					errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
-					connectedServers: ["domain_docs"],
-					exaApiKeys: [],
-				});
-				vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
-				const sealConnectionSet = vi.spyOn(MCPManager.prototype, "sealConnectionSet");
+		it("keeps a mixed manager reconnectable while cached conventional tools are published", async () => {
+			const pluginBundlePath = path.join(projectDir, "mixed-reconnect-plugin");
+			await writeProjectConfig("mixed-reconnect-plugin/gajae-plugin.json", {
+				kind: "gajae-code-plugin",
+				name: "mixed-reconnect-plugin",
+				version: "1.0.0",
+				mcps: [{ name: "domain_docs", transport: "http", url: "https://example.com/mcp" }],
+			});
+			const r = await installGjcBundle({ cwd: projectDir }, "project", pluginBundlePath);
+			expect(r.ok).toBe(true);
+			await writeProjectConfig(".gjc/mcp.json", { mcpServers: { "slow-demo": demoConfig() } });
+			const [cachedTool] = DeferredMCPTool.fromTools(
+				"slow-demo",
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+				async () => {
+					throw new Error("cached server is disconnected");
+				},
+			);
+			if (!cachedTool) throw new Error("cached MCP tool was not created");
+			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+				tools: [cachedTool],
+				errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
+				connectedServers: ["domain_docs"],
+				exaApiKeys: [],
+			});
+			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
+			const sealConnectionSet = vi.spyOn(MCPManager.prototype, "sealConnectionSet");
 
-				const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
-				try {
-					expect(connectServers).toHaveBeenCalledTimes(1);
-					expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
-					expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("slow-demo");
-					expect(mcpManager).toBeDefined();
-					expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
-					expect(sealConnectionSet).not.toHaveBeenCalled();
-					expect(mcpManager?.isConnectionSetSealed()).toBe(false);
-				} finally {
-					await session.dispose();
-				}
-			},
-		);
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				expect(connectServers).toHaveBeenCalledTimes(1);
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("slow-demo");
+				expect(mcpManager).toBeDefined();
+				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_hello");
+				expect(sealConnectionSet).not.toHaveBeenCalled();
+				expect(mcpManager?.isConnectionSetSealed()).toBe(false);
+			} finally {
+				await session.dispose();
+			}
+		});
 
 		it("plugin-bundle MCPs override conventional entries on name collisions; both load otherwise", async () => {
 			const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
