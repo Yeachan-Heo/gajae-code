@@ -74,6 +74,8 @@ export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "f
 	provenance: "deadline";
 };
 
+export type PromptDeadlineTerminalization = "settled" | "idle" | "uncertain";
+
 export interface PromptTerminalTransitionEvidence {
 	content?: TurnResultContent;
 	hasActivity?: boolean;
@@ -100,6 +102,10 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+	readonly #onDeadlineTerminalization?: (
+		correlation: InvocationCorrelation,
+		isCurrent: () => boolean,
+	) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
 	readonly #onDeadlineExceeded?: (
 		correlation: InvocationCorrelation,
 		signal: AbortSignal,
@@ -113,6 +119,10 @@ export class PromptDeadlineManager {
 		getMaxMs: () => number;
 		now?: () => number;
 		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+		onDeadlineTerminalization?: (
+			correlation: InvocationCorrelation,
+			isCurrent: () => boolean,
+		) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
 		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
@@ -141,6 +151,7 @@ export class PromptDeadlineManager {
 		this.#getMaxMs = options.getMaxMs;
 		this.#now = options.now ?? Date.now;
 		this.#onExpired = options.onExpired;
+		this.#onDeadlineTerminalization = options.onDeadlineTerminalization;
 		this.#onDeadlineExceeded = options.onDeadlineExceeded;
 		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
 	}
@@ -285,28 +296,55 @@ export class PromptDeadlineManager {
 		// claim must cancel this expiry instance instead of surfacing an exceeded
 		// outcome for a prompt that is demonstrably alive.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
-		// Durability BEFORE the durable terminal (#5583, #5623 review round 4). The
-		// claim above is already the durable pending marker, so a process death
-		// anywhere in this window leaves the record PENDING and restart recovery
-		// retries the prompt — work that was never autosaved is never reported as
-		// finished. Running the flush after `finalizeOutcome` instead made the
-		// autosave the one step a crash could silently skip, which is the whole
-		// durability guarantee of this change. The cost is that the durable terminal
-		// is delayed by at most the flush's bound.
-		//
-		// The wait is BOUNDED, not just guarded (#5623 review round 2): a hook that
-		// never settles — a blocking git lock, a credential prompt — would leave the
-		// finalize, `#onExpired` and `clear` below unreachable, stranding the prompt
-		// with neither a terminal nor an owner. A try/catch cannot rescue a promise
-		// that never settles, so the flush is raced against a real timer and
-		// abandoned if it outruns it.
-		await this.#runDeadlineFlush(correlation, lease, generation);
-		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
-		// like any other here, and up to ten seconds long, so progress can land and
-		// renew the lease while it runs. A renewed prompt must not be terminalized as
-		// deadline-exceeded by this stale pass; `#backOffIfSuperseded` reschedules on
-		// the way out, so it keeps a live deadline.
+		let terminalization: PromptDeadlineTerminalization = "settled";
+		try {
+			terminalization =
+				(await this.#onDeadlineTerminalization?.(correlation, () => {
+					const current = this.#leases.get(key);
+					return current === lease && current.generation === generation;
+				})) ?? "settled";
+		} catch {
+			terminalization = "uncertain";
+		}
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		if (terminalization === "uncertain") {
+			try {
+				const current = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+				if (current.status === "terminal_ok" || current.status === "failed") {
+					this.clear(correlation);
+					return;
+				}
+			} catch {
+				this.#retry(key);
+				return;
+			}
+			this.#recoverUncertainty(key, correlation, lease, generation);
+			return;
+		}
+		if (terminalization === "settled") {
+			// An active run is fenced before its worktree is flushed. Otherwise a
+			// tool can still be writing while the deadline autosave snapshots it.
+			// The claim above remains the durable pending marker throughout both
+			// bounded operations, so restart recovery never reports unsaved work as
+			// finished.
+			await this.#runDeadlineFlush(correlation, lease, generation);
+			// Fence again AFTER the flush (#5623 review round 2): progress can land
+			// while the bounded git operation runs and renew the lease.
+			if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		}
+		// A real agent_end observed while the deadline was fencing its run is
+		// authoritative. Keep that stopped/failed result instead of publishing a
+		// second synthetic deadline terminal over it.
+		try {
+			const current = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+			if (current.status === "terminal_ok" || current.status === "failed") {
+				this.clear(correlation);
+				return;
+			}
+		} catch {
+			this.#retry(key);
+			return;
+		}
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome, () => {
 				const current = this.#leases.get(key);
