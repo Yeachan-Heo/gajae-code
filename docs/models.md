@@ -223,6 +223,8 @@ For future routing evaluation, opt in before starting GJC:
 GJC_TASK_COLLECTION=metadata bun run dev
 ```
 
+Opting in does not mean unbounded storage. Every append prunes the local store to `task.decision.collectionRetentionDays` (default 30, 1–365) and `task.decision.collectionMaxEvents` (default 50000, 1000–1000000, oldest dropped first), and export streams the store a page at a time rather than loading it whole.
+
 Collection alone is local only and disabled by default. It does not call Kev, change model/effort selection, inject hints, train models, or upload data. Opt in explicitly with `task.decision.collection` (`off`, `metadata`, or `content`) or `GJC_TASK_COLLECTION`. Decision enablement is separate and never enables persistence by itself. Explicit `off` or unsupported values and `GJC_DISABLE_TELEMETRY=1` prevent persistence. Use a trusted shell/user environment; a repository `.env` cannot opt you in.
 
 Each logical subagent execution records a begin event, observed model selections, and a terminal outcome linked by `decision_id`. Autorouting probes are not counted as executed model calls. Requested selectors/effort remain separate from resolved models/effort and provider-reported model identity. Resume/message invocations are separate decisions with task/session grouping. A process crash can leave a begin event without an outcome: absence is unknown, not failure.

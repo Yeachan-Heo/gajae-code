@@ -3037,6 +3037,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						options.settings?.get("task.decision.collection") === "off"
 							? undefined
 							: options.settings?.get("task.decision.collection"),
+					retentionDays: options.settings?.get("task.decision.collectionRetentionDays"),
+					maxEvents: options.settings?.get("task.decision.collectionMaxEvents"),
 				},
 			);
 		} catch {

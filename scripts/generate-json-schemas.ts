@@ -163,6 +163,16 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.minimum = 1;
 		schema.maximum = 60_000;
 	}
+	if (settingPath === "task.decision.collectionRetentionDays") {
+		schema.type = "integer";
+		schema.minimum = 1;
+		schema.maximum = 365;
+	}
+	if (settingPath === "task.decision.collectionMaxEvents") {
+		schema.type = "integer";
+		schema.minimum = 1000;
+		schema.maximum = 1_000_000;
+	}
 	return schema;
 }
 

@@ -3814,6 +3814,18 @@ export const SETTINGS_SCHEMA = {
 		default: "kev-latest",
 	},
 
+	"task.decision.collectionRetentionDays": {
+		type: "number",
+		default: 30,
+		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 365,
+	},
+
+	"task.decision.collectionMaxEvents": {
+		type: "number",
+		default: 50_000,
+		validate: (value: number) => Number.isInteger(value) && value >= 1000 && value <= 1_000_000,
+	},
+
 	"task.autorouting.tiers": {
 		type: "constrained-record",
 		default: {} as AutoroutingTierMapInput,

@@ -79,11 +79,17 @@ export interface TaskDecisionStoreOptions {
 	rootDir?: string;
 	mode?: TaskCollectionMode | "off";
 	decisionEnabled?: boolean;
+	/** Drop events older than this many days on every append. */
+	retentionDays?: number;
+	/** Keep at most this many events, oldest first, on every append. */
+	maxEvents?: number;
 }
 
 export interface ExportTaskDecisionOptions {
 	rootDir?: string;
 	includeContent?: boolean;
+	/** Rows read per query; the export never loads the whole table at once. */
+	pageSize?: number;
 }
 
 export interface TaskDecisionEvent {
@@ -100,6 +106,13 @@ export interface TaskDecisionEvent {
 
 const SCHEMA_VERSION = 1;
 const DB_FILENAME = "task-decisions.db";
+/** Opting in must not mean unbounded growth; these bound the store without further consent. */
+const DEFAULT_RETENTION_DAYS = 30;
+const DEFAULT_MAX_EVENTS = 50_000;
+const DAY_MS = 86_400_000;
+/** Rows per export query. Bounded so a large store is never materialised in one go. */
+const DEFAULT_EXPORT_PAGE = 1000;
+const MAX_EXPORT_PAGE = 10_000;
 const MAX_CONTENT = 4096;
 const BUSY_TIMEOUT_MS = 2000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -349,6 +362,39 @@ function nextSequence(db: Database, decisionId: string): number {
 	return row.next;
 }
 
+function boundedInt(value: unknown, fallback: number, low: number, high: number): number {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < low || value > high) return fallback;
+	return value;
+}
+
+interface RetentionPolicy {
+	readonly retentionDays: number;
+	readonly maxEvents: number;
+}
+
+/**
+ * The user-facing settings are bounded more tightly than this (see
+ * `task.decision.collectionMaxEvents`); these are the bounds of the programmatic
+ * store API, which callers and tests may drive to smaller values.
+ */
+function retentionPolicy(options?: TaskDecisionStoreOptions): RetentionPolicy {
+	return {
+		retentionDays: boundedInt(options?.retentionDays, DEFAULT_RETENTION_DAYS, 1, 365),
+		maxEvents: boundedInt(options?.maxEvents, DEFAULT_MAX_EVENTS, 1, 1_000_000),
+	};
+}
+
+/**
+ * Trim the store to the retention policy. Runs inside the append transaction so
+ * the file can never grow past the bound between a write and a later sweep.
+ */
+function pruneEvents(db: Database, policy: RetentionPolicy): void {
+	db.prepare("DELETE FROM events WHERE created_at_ms < ?").run(Date.now() - policy.retentionDays * DAY_MS);
+	db.prepare("DELETE FROM events WHERE rowid NOT IN (SELECT rowid FROM events ORDER BY rowid DESC LIMIT ?)").run(
+		policy.maxEvents,
+	);
+}
+
 function appendEvent(
 	db: Database,
 	installationId: string,
@@ -356,6 +402,7 @@ function appendEvent(
 	decisionId: string,
 	eventType: TaskDecisionEvent["event_type"],
 	payload: Record<string, unknown>,
+	policy: RetentionPolicy,
 ): void {
 	const schema =
 		eventType === "begin"
@@ -372,6 +419,7 @@ function appendEvent(
 		db.prepare(
 			"INSERT INTO events(event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(randomUUID(), decisionId, installationId, sequence, eventType, mode, Date.now(), JSON.stringify(validated));
+		pruneEvents(db, policy);
 		db.run("COMMIT");
 	} catch (error) {
 		db.run("ROLLBACK");
@@ -391,6 +439,7 @@ export async function beginTaskDecision(
 ): Promise<TaskDecisionRecorder | undefined> {
 	const mode = resolveMode(options);
 	if (!mode) return undefined;
+	const policy = retentionPolicy(options);
 	const rootDir = options?.rootDir ?? defaultRoot();
 	let opened: { db: Database; installationId: string } | undefined;
 	try {
@@ -420,14 +469,14 @@ export async function beginTaskDecision(
 			payload.context_truncated = context.truncated ?? false;
 		}
 		const decisionId = input.decisionId && UUID_RE.test(input.decisionId) ? input.decisionId : randomUUID();
-		appendEvent(opened.db, opened.installationId, mode, decisionId, "begin", payload);
+		appendEvent(opened.db, opened.installationId, mode, decisionId, "begin", payload, policy);
 		const { db, installationId } = opened;
 		let finished = false;
 		return {
 			recordModel: async model => {
 				if (finished) return;
 				try {
-					appendEvent(db, installationId, mode, decisionId, "model", { ...model });
+					appendEvent(db, installationId, mode, decisionId, "model", { ...model }, policy);
 				} catch (error) {
 					warnStorageFailure(error);
 				}
@@ -491,6 +540,7 @@ export async function beginTaskDecision(
 								Date.now(),
 								JSON.stringify(payload),
 							);
+						pruneEvents(separate.db, policy);
 						separate.db.run("COMMIT");
 					} catch (error) {
 						try {
@@ -510,7 +560,7 @@ export async function beginTaskDecision(
 				if (finished) return;
 				finished = true;
 				try {
-					appendEvent(db, installationId, mode, decisionId, "outcome", { ...outcome });
+					appendEvent(db, installationId, mode, decisionId, "outcome", { ...outcome }, policy);
 				} catch (error) {
 					warnStorageFailure(error);
 				} finally {
@@ -533,14 +583,21 @@ export async function beginTaskDecision(
 	}
 }
 
-export async function exportTaskDecisionEvents(options?: ExportTaskDecisionOptions): Promise<TaskDecisionEvent[]> {
+/**
+ * Yield every stored event in insertion order, reading one bounded page at a
+ * time. An opted-in store can hold up to the configured maximum, so the whole
+ * table is never materialised — neither in SQLite's result set nor here.
+ */
+export async function* streamTaskDecisionEvents(
+	options?: ExportTaskDecisionOptions,
+): AsyncGenerator<TaskDecisionEvent, void, undefined> {
 	const rootDir = options?.rootDir ?? defaultRoot();
 	const file = dbPath(rootDir);
 	try {
 		const rootStat = await fs.lstat(rootDir);
 		if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("unsafe storage root");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
 	}
 	try {
@@ -555,9 +612,10 @@ export async function exportTaskDecisionEvents(options?: ExportTaskDecisionOptio
 			}
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
 	}
+	const pageSize = boundedInt(options?.pageSize, DEFAULT_EXPORT_PAGE, 1, MAX_EXPORT_PAGE);
 	const db = new Database(file, { readonly: true, strict: true });
 	try {
 		db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
@@ -565,55 +623,70 @@ export async function exportTaskDecisionEvents(options?: ExportTaskDecisionOptio
 			| { value?: string }
 			| undefined;
 		if (!version || Number(version.value) !== SCHEMA_VERSION) throw new Error("task decision schema mismatch");
-		const rows = db
-			.prepare(
-				"SELECT event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json FROM events ORDER BY rowid ASC",
-			)
-			.all() as Array<Record<string, unknown>>;
-		return rows.map(row => {
-			if (
-				!UUID_RE.test(String(row.event_id)) ||
-				!UUID_RE.test(String(row.decision_id)) ||
-				!UUID_RE.test(String(row.installation_id)) ||
-				!Number.isInteger(Number(row.sequence)) ||
-				Number(row.sequence) < 0 ||
-				!["begin", "model", "outcome", "decision"].includes(String(row.event_type)) ||
-				!["metadata", "content"].includes(String(row.mode)) ||
-				!Number.isFinite(Number(row.created_at_ms))
-			) {
-				throw new Error("invalid task decision envelope");
-			}
-			const schema =
-				row.event_type === "begin"
-					? beginPayloadSchema
-					: row.event_type === "model"
-						? modelPayloadSchema
-						: row.event_type === "outcome"
-							? outcomePayloadSchema
-							: decisionPayloadSchema;
-			const payload: Record<string, unknown> = schema.parse(JSON.parse(String(row.payload_json)));
-			if (row.mode === "metadata" && (payload.assignment !== undefined || payload.context !== undefined)) {
-				throw new Error("unexpected content in metadata event");
-			}
-			if (!options?.includeContent) {
-				delete payload.assignment;
-				delete payload.context;
-			}
-			return {
-				...payload,
-				schema_version: SCHEMA_VERSION,
-				event_id: String(row.event_id),
-				decision_id: String(row.decision_id),
-				installation_id: String(row.installation_id),
-				sequence: Number(row.sequence),
-				event_type: row.event_type as TaskDecisionEvent["event_type"],
-				mode: row.mode as TaskCollectionMode,
-				created_at_ms: Number(row.created_at_ms),
-			};
-		});
+		const page = db.prepare(
+			"SELECT rowid AS row_id, event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json FROM events WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
+		);
+		// A rowid cursor, not OFFSET: pages cannot skip or repeat a row if the
+		// writer prunes between reads.
+		let cursor = 0;
+		for (;;) {
+			const rows = page.all(cursor, pageSize) as Array<Record<string, unknown>>;
+			if (rows.length === 0) return;
+			cursor = Number(rows[rows.length - 1]?.row_id);
+			for (const row of rows) yield readEvent(row, options?.includeContent === true);
+			if (rows.length < pageSize) return;
+		}
 	} finally {
 		db.close();
 	}
+}
+
+export async function exportTaskDecisionEvents(options?: ExportTaskDecisionOptions): Promise<TaskDecisionEvent[]> {
+	const events: TaskDecisionEvent[] = [];
+	for await (const event of streamTaskDecisionEvents(options)) events.push(event);
+	return events;
+}
+
+function readEvent(row: Record<string, unknown>, includeContent: boolean): TaskDecisionEvent {
+	if (
+		!UUID_RE.test(String(row.event_id)) ||
+		!UUID_RE.test(String(row.decision_id)) ||
+		!UUID_RE.test(String(row.installation_id)) ||
+		!Number.isInteger(Number(row.sequence)) ||
+		Number(row.sequence) < 0 ||
+		!["begin", "model", "outcome", "decision"].includes(String(row.event_type)) ||
+		!["metadata", "content"].includes(String(row.mode)) ||
+		!Number.isFinite(Number(row.created_at_ms))
+	) {
+		throw new Error("invalid task decision envelope");
+	}
+	const schema =
+		row.event_type === "begin"
+			? beginPayloadSchema
+			: row.event_type === "model"
+				? modelPayloadSchema
+				: row.event_type === "outcome"
+					? outcomePayloadSchema
+					: decisionPayloadSchema;
+	const payload: Record<string, unknown> = schema.parse(JSON.parse(String(row.payload_json)));
+	if (row.mode === "metadata" && (payload.assignment !== undefined || payload.context !== undefined)) {
+		throw new Error("unexpected content in metadata event");
+	}
+	if (!includeContent) {
+		delete payload.assignment;
+		delete payload.context;
+	}
+	return {
+		...payload,
+		schema_version: SCHEMA_VERSION,
+		event_id: String(row.event_id),
+		decision_id: String(row.decision_id),
+		installation_id: String(row.installation_id),
+		sequence: Number(row.sequence),
+		event_type: row.event_type as TaskDecisionEvent["event_type"],
+		mode: row.mode as TaskCollectionMode,
+		created_at_ms: Number(row.created_at_ms),
+	};
 }
 
 export function hashTaskDecisionValue(value: string): string {

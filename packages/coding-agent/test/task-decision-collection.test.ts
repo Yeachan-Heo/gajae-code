@@ -3,7 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beginTaskDecision, exportTaskDecisionEvents, hashTaskDecisionValue } from "../src/task/decision-collection";
+import {
+	beginTaskDecision,
+	exportTaskDecisionEvents,
+	hashTaskDecisionValue,
+	streamTaskDecisionEvents,
+} from "../src/task/decision-collection";
 
 const input = {
 	role: "worker",
@@ -254,6 +259,65 @@ describe("task decision collection", () => {
 			db.close();
 		}
 		await expect(exportTaskDecisionEvents({ rootDir: root })).rejects.toThrow();
+	});
+
+	test("retention prunes by age on the next append", async () => {
+		const root = await createRoot();
+		const recorder = await beginTaskDecision(input, { rootDir: root, mode: "metadata", retentionDays: 1 });
+		await recorder?.finish({ status: "completed" });
+		// Age the existing rows past the window without touching the writer.
+		const aged = new Database(path.join(root, "task-decisions.db"));
+		try {
+			aged.run("UPDATE events SET created_at_ms = ?", [Date.now() - 3 * 86_400_000]);
+		} finally {
+			aged.close();
+		}
+		const second = await beginTaskDecision(
+			{ ...input, taskId: "task-2" },
+			{ rootDir: root, mode: "metadata", retentionDays: 1 },
+		);
+		await second?.finish({ status: "completed" });
+		const events = await exportTaskDecisionEvents({ rootDir: root });
+		expect(events.map(event => event.task_id ?? event.status)).toEqual(["task-2", "completed"]);
+	});
+
+	test("retention keeps at most the configured number of events, dropping the oldest", async () => {
+		const root = await createRoot();
+		const store = { rootDir: root, mode: "metadata" as const, maxEvents: 4 };
+		for (let index = 0; index < 4; index++) {
+			const recorder = await beginTaskDecision({ ...input, taskId: `task-${index}` }, store);
+			await recorder?.recordModel({ actualModel: `model-${index}` });
+			await recorder?.finish({ status: "completed" });
+		}
+		// Twelve events were written; the bound is four, applied on every append.
+		const events = await exportTaskDecisionEvents({ rootDir: root });
+		expect(events).toHaveLength(4);
+		expect(events.map(event => event.event_type)).toEqual(["outcome", "begin", "model", "outcome"]);
+		expect(events.at(-1)?.status).toBe("completed");
+		expect(JSON.stringify(events)).not.toContain("model-0");
+	});
+
+	test("export pages through a store larger than one page, in order and without gaps", async () => {
+		const root = await createRoot();
+		const store = { rootDir: root, mode: "metadata" as const };
+		for (let index = 0; index < 5; index++) {
+			const recorder = await beginTaskDecision({ ...input, taskId: `task-${index}` }, store);
+			await recorder?.recordModel({ actualModel: `model-${index}` });
+			await recorder?.finish({ status: "completed" });
+		}
+		const whole = await exportTaskDecisionEvents({ rootDir: root });
+		expect(whole).toHaveLength(15);
+		// Two rows per query: boundaries must neither drop nor repeat a row.
+		const paged = await exportTaskDecisionEvents({ rootDir: root, pageSize: 2 });
+		expect(paged.map(event => event.event_id)).toEqual(whole.map(event => event.event_id));
+		expect(new Set(paged.map(event => event.event_id)).size).toBe(15);
+		// Partial consumption is the point of streaming: stopping early is allowed.
+		const firstThree: string[] = [];
+		for await (const event of streamTaskDecisionEvents({ rootDir: root, pageSize: 2 })) {
+			firstThree.push(String(event.event_id));
+			if (firstThree.length === 3) break;
+		}
+		expect(firstThree).toEqual(whole.slice(0, 3).map(event => String(event.event_id)));
 	});
 
 	test("exporting an absent store does not create it", async () => {

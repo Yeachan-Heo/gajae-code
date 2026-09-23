@@ -173,5 +173,20 @@ describe("generated JSON Schemas", () => {
 		const decision = configSchema.properties.task.properties.decision.properties;
 		expect(decision.timeoutMs).toMatchObject({ type: "integer", minimum: 1, maximum: 60000 });
 		expect(decision.collection.enum).toEqual(["off", "metadata", "content"]);
+		// Opting in must not mean unbounded local storage.
+		expect(decision.collectionRetentionDays).toMatchObject({
+			type: "integer",
+			default: 30,
+			minimum: 1,
+			maximum: 365,
+		});
+		expect(decision.collectionMaxEvents).toMatchObject({
+			type: "integer",
+			default: 50_000,
+			minimum: 1000,
+			maximum: 1_000_000,
+		});
+		// The endpoint is not configurable; local inference goes through the owned socket.
+		expect(decision.kevEndpoint).toBeUndefined();
 	});
 });

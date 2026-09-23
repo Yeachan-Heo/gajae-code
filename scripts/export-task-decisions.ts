@@ -1,4 +1,4 @@
-import { exportTaskDecisionEvents } from "../packages/coding-agent/src/task/decision-collection";
+import { streamTaskDecisionEvents } from "../packages/coding-agent/src/task/decision-collection";
 
 const includeContent = process.argv.includes("--include-content");
 const args = process.argv.slice(2);
@@ -13,8 +13,9 @@ if (unknown.length > 0) {
 	process.exit();
 }
 try {
-	const events = await exportTaskDecisionEvents({ includeContent });
-	for (const event of events) process.stdout.write(`${JSON.stringify(event)}\n`);
+	// Streamed a page at a time: a large opted-in store must not be held in memory.
+	for await (const event of streamTaskDecisionEvents({ includeContent }))
+		process.stdout.write(`${JSON.stringify(event)}\n`);
 } catch {
 	process.stderr.write("task decision export failed\n");
 	process.exitCode = 1;
