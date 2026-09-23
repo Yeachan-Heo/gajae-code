@@ -1567,6 +1567,62 @@ describe("signed model preset registry", () => {
 		expect(secondHeaders[0]?.get("if-none-match")).toBeNull();
 	});
 
+	test("refreshes the accepted profile snapshot through the live ModelRegistry API", async () => {
+		const data = await fixture();
+		const remote = signedRegistry(data.privateKey, 1, [registryProfile("refreshed-profile")], undefined, undefined, [
+			"provider",
+		]);
+		await Bun.write(
+			path.join(data.agentDir, "models.yml"),
+			`providers:
+  provider:
+    baseUrl: https://provider.example/v1
+    api: openai-completions
+    auth: none
+`,
+		);
+		let calls = 0;
+		const fetchImpl = registryFetch(remote);
+		const countingFetch = (async (input, init) => {
+			calls++;
+			return fetchImpl(input, init);
+		}) as typeof fetch;
+		const authStorage = await AuthStorage.create(path.join(data.agentDir, "registry-refresh-auth.db"));
+		let modelRegistry: ModelRegistry | undefined;
+		let unsubscribe: (() => void) | undefined;
+		let catalogChanged = false;
+		try {
+			modelRegistry = data.run(
+				() =>
+					new ModelRegistry(authStorage, path.join(data.agentDir, "models.yml"), undefined, {
+						agentDir: data.agentDir,
+						manifestUrl,
+						fetch: countingFetch,
+						automaticRefresh: false,
+					}),
+			);
+			expect(modelRegistry.getModelProfile("refreshed-profile")).toBeUndefined();
+			expect(modelRegistry.getModelProfiles().has("refreshed-profile")).toBe(false);
+			unsubscribe = modelRegistry.onCatalogChanged(() => {
+				catalogChanged = true;
+			});
+
+			await expect(data.run(() => modelRegistry!.refreshModelPresetProfilesFromRegistry())).resolves.toMatchObject({
+				status: "updated",
+				revision: 1,
+			});
+
+			expect(calls).toBe(4);
+			expect(catalogChanged).toBe(true);
+			expect(modelRegistry.getModelProfile("refreshed-profile")).toMatchObject({ source: "registry" });
+			expect(modelRegistry.getModelProfiles().get("refreshed-profile")).toMatchObject({ source: "registry" });
+		} finally {
+			unsubscribe?.();
+			if (modelRegistry) await modelRegistry.dispose();
+			authStorage.close();
+		}
+	});
+
 	test("never awaits startup network and publishes a later accepted catalog to the live registry", async () => {
 		const data = await fixture();
 		const remote = signedRegistry(data.privateKey, 1, [registryProfile("background-profile")]);

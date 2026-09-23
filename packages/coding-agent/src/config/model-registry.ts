@@ -83,6 +83,8 @@ import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-disc
 import {
 	loadAcceptedModelPresetProfiles,
 	type ModelPresetRegistryDependencies,
+	type ModelPresetRegistryRefreshResult,
+	refreshModelPresetRegistry,
 	refreshModelPresetRegistryInBackground,
 } from "./model-preset-registry";
 
@@ -1900,6 +1902,17 @@ export class ModelRegistry {
 				this.#resumeRebuild();
 			}
 		});
+	}
+
+	/** Refresh the signed profile catalog online, then publish its accepted snapshot. */
+	async refreshModelPresetProfilesFromRegistry(): Promise<ModelPresetRegistryRefreshResult> {
+		const result = await refreshModelPresetRegistry({
+			...this.#modelPresetRegistryDependencies,
+			agentDir: this.#modelPresetRegistryAgentDir,
+			knownManifestSha256: this.#loadedModelPresetRegistryManifestSha256,
+		});
+		await this.refreshStatic();
+		return result;
 	}
 
 	/**
