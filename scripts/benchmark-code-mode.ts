@@ -1938,9 +1938,14 @@ async function main(): Promise<void> {
 	const taskWorkspace = await resolveTaskWorkspace(options);
 	await fs.mkdir(path.dirname(options.outputPath), { recursive: true });
 	if (!options.resume) {
+		const preflight = JSON.stringify(
+			{ formatVersion: 1, benchmark: "issue-5792-code-mode-measurement", executionStatus: "preflight" },
+			null,
+			2,
+		);
 		await fs.writeFile(
 			options.outputPath,
-			`${JSON.stringify({ formatVersion: 1, benchmark: "issue-5792-code-mode-measurement", executionStatus: "preflight" }, null, 2)}\n`,
+			`${preflight}\n`,
 			{ flag: "wx" },
 		);
 	}
