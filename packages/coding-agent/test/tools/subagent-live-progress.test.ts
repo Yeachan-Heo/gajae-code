@@ -547,6 +547,17 @@ describe("subagentAwaitRenderedStateSignature", () => {
 		expect(subagentAwaitRenderedStateSignature([withRawNested])).toBe(subagentAwaitRenderedStateSignature([safe]));
 	});
 
+	it("coalesces child activity within one bucket but changes across buckets", () => {
+		const at = (lastActivityMs: number) =>
+			subagentAwaitRenderedStateSignature([
+				makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", lastActivityMs } }),
+			]);
+		// Streamed deltas inside one bucket must not re-emit.
+		expect(at(10_000)).toBe(at(14_999));
+		// Real later activity must.
+		expect(at(15_000)).not.toBe(at(10_000));
+	});
+
 	it("changes when only approved fastMode flips", () => {
 		const slow = makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", fastMode: false } });
 		const fast = makeSnapshot({ id: "0-A", progress: { id: "0-A", status: "running", fastMode: true } });

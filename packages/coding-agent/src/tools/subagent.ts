@@ -1122,6 +1122,9 @@ function previewJobOutput(
  * countdown ticking is sacrificed by design; every real transition still changes
  * the signature.
  */
+/** Granularity at which child activity alone re-emits an await update. */
+const LAST_ACTIVITY_SIGNATURE_BUCKET_MS = 5_000;
+
 export function subagentAwaitRenderedStateSignature(
 	subagents: readonly SubagentSnapshot[],
 	receipt?: Pick<SubagentToolDetails, "awaitOutcome" | "interrupted">,
@@ -1172,9 +1175,13 @@ function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unkno
 		toolCount: progress.toolCount ?? 0,
 		contextTokens: progress.contextTokens ?? null,
 		contextWindow: progress.contextWindow ?? null,
-		// Event timestamp, not a wall-clock tick: it only changes when the child
-		// actually does something, so idle gating still holds.
-		lastActivityMs: progress.lastActivityMs ?? null,
+		// Event timestamp, bucketed: it only moves when the child actually does
+		// something (idle gating holds), and the bucket keeps a streaming child from
+		// re-emitting on every delta. The status line renders the exact age itself.
+		lastActivityBucket:
+			progress.lastActivityMs === undefined
+				? null
+				: Math.floor(progress.lastActivityMs / LAST_ACTIVITY_SIGNATURE_BUCKET_MS),
 		fastMode: progress.fastMode ?? false,
 		retryFailure: progress.retryFailure ?? null,
 		retryState: progress.retryState
