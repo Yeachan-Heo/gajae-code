@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker, setManagedCloseWaitForTest } from "../src/sdk/broker/broker";
+import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import {
 	deriveIdempotencyIdentity,
 	deriveLegacyIdentity,
@@ -364,29 +365,10 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			spawnSubstrateProvider: substrate({ count: 0 }),
 			spawnPromptLayer: promptLayer,
 		});
-		const discovery = await broker.start();
-		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
-		try {
-			await attest(broker, controlRoot);
-			const denied = await request(ws, "define-publishing", "task.dag", {
-				controlRoot,
-				enrollmentId: "enrollment",
-				ownerSessionId: ownerId,
-				attestationEpoch: epoch,
-				masterCapability: grant,
-				worktrees: [controlRoot],
-				action: "define",
-				graphId: "must-not-retry",
-				expectedRevision: 0,
-				nodes: [node("n", controlRoot, "must-not-retry")],
-			});
-			expect(denied).toMatchObject({ ok: false, error: { message: "native managed evidence exists" } });
-			expect((await loadManagedEnrollmentRecord(agentDir)).publishingRoots).toContain(controlRoot);
-			await expect(fs.stat(managedTaskDomainPath(controlRoot))).rejects.toThrow();
-		} finally {
-			ws.close();
-			await broker.stop();
-		}
+		await expect(broker.start()).rejects.toThrow("Broker cannot establish complete managed enrollment membership.");
+		expect(broker.discovery).toBeNull();
+		expect(await readBrokerDiscovery(agentDir)).toBeNull();
+		await broker.stop();
 
 		const recoveredRoot = path.join(root, "published-control");
 		await fs.mkdir(recoveredRoot, { mode: 0o700 });
@@ -938,6 +920,302 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			await broker.stop();
 		}
 	});
+	it("holds seed dispatch under the domain lock until the handoff finishes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-seed-lock-"));
+		roots.push(root);
+		const tracked = trackedSubstrate();
+		const registrationEntered = Promise.withResolvers<void>();
+		const registrationRelease = Promise.withResolvers<void>();
+		const dispatchEntered = Promise.withResolvers<void>();
+		const dispatchRelease = Promise.withResolvers<void>();
+		const order: string[] = [];
+		let dispatches = 0;
+		const persistTransition = SpawnAuthorityStore.prototype.persistTransition;
+		const holdDispatch = spyOn(SpawnAuthorityStore.prototype, "persistTransition").mockImplementation(async function (
+			this: SpawnAuthorityStore,
+			identity,
+			input,
+		) {
+			const result = await persistTransition.call(this, identity, input);
+			if (input.from === "seed_prepared" && input.to === "dispatching") order.push("dispatching-durable");
+			return result;
+		});
+		const spawnPromptLayer = {
+			...promptLayer,
+			awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+				registrationEntered.resolve();
+				await registrationRelease.promise;
+				return {
+					ok: true as const,
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 4242,
+						processIncarnation: "inc-4242",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
+				};
+			},
+			dispatch: async () => {
+				dispatches += 1;
+				order.push("dispatch-entered");
+				dispatchEntered.resolve();
+				await dispatchRelease.promise;
+				order.push("dispatch-returned");
+				return {
+					kind: "accepted" as const,
+					commandId: "cmd-seed-lock",
+					turnId: "turn-seed-lock",
+					acceptedAt: Date.now(),
+				};
+			},
+		};
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: tracked.provider,
+			spawnPromptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsCancel = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-seed-lock", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "g",
+					expectedRevision: 0,
+					nodes: [node("n", root, "seed-lock")],
+				}),
+			).toMatchObject({ ok: true });
+			const beforeAdvance = (
+				(await request(wsCancel, "status-seed-lock", "task.dag", { ...auth, action: "status" })).result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			const advance = request(
+				ws,
+				"advance-seed-lock",
+				"task.dag",
+				{ ...auth, action: "advance", graphId: "g", nodeId: "n", expectedRevision: beforeAdvance },
+				"seed-lock-key",
+			);
+			await registrationEntered.promise;
+			const liveRevision = (
+				(await request(wsCancel, "status-before-seed", "task.dag", { ...auth, action: "status" })).result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			registrationRelease.resolve();
+			await dispatchEntered.promise;
+			const cancel = request(wsCancel, "cancel-seed-lock", "task.dag", {
+				...auth,
+				action: "cancel",
+				graphId: "g",
+				expectedRevision: liveRevision,
+				nodeIds: ["n"],
+			}).then(response => {
+				order.push("cancel-returned");
+				return response;
+			});
+			let cancelSettled = false;
+			void cancel.then(() => {
+				cancelSettled = true;
+			});
+			await Promise.race([
+				cancel.then(() => {
+					throw new Error("cancel returned while seed dispatch was paused");
+				}),
+				Bun.sleep(50),
+			]);
+			expect(cancelSettled).toBe(false);
+			const duringDispatch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: Array<{ fence: string }> }>;
+			};
+			expect(duringDispatch.graphs[0]!.attempts[0]!.fence).toBe("current");
+			expect(order).toEqual(["dispatching-durable", "dispatch-entered"]);
+			dispatchRelease.resolve();
+			expect(await advance).toMatchObject({ ok: true });
+			expect(await cancel).toMatchObject({ ok: true });
+			expect(order).toEqual(["dispatching-durable", "dispatch-entered", "dispatch-returned", "cancel-returned"]);
+			expect(dispatches).toBe(1);
+			expect([...tracked.closed]).toEqual([tracked.launched[0]]);
+			const after = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: Array<{ fence: string }> }>;
+			};
+			expect(after.graphs[0]!.attempts[0]!.fence).toBe("canceled");
+		} finally {
+			registrationRelease.resolve();
+			dispatchRelease.resolve();
+			holdDispatch.mockRestore();
+			ws.close();
+			wsCancel.close();
+			await broker.stop();
+		}
+	});
+	it("joins a same-key retry and keeps cancel tracking the blocked dispatch", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-retry-flight-"));
+		roots.push(root);
+		const tracked = trackedSubstrate();
+		const registrationEntered = Promise.withResolvers<void>();
+		const registrationRelease = Promise.withResolvers<void>();
+		const dispatchEntered = Promise.withResolvers<void>();
+		const dispatchRelease = Promise.withResolvers<void>();
+		let dispatches = 0;
+		const spawnPromptLayer = {
+			...promptLayer,
+			awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
+				registrationEntered.resolve();
+				await registrationRelease.promise;
+				return {
+					ok: true as const,
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 4242,
+						processIncarnation: "inc-4242",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
+				};
+			},
+			dispatch: async () => {
+				dispatches += 1;
+				dispatchEntered.resolve();
+				await dispatchRelease.promise;
+				return {
+					kind: "accepted" as const,
+					commandId: "cmd-retry-flight",
+					turnId: "turn-retry-flight",
+					acceptedAt: Date.now(),
+				};
+			},
+		};
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: tracked.provider,
+			spawnPromptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsRetry = await connect(`${discovery.url}/?token=${discovery.token}`);
+		const wsCancel = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-retry-flight", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "g",
+					expectedRevision: 0,
+					nodes: [node("n", root, "retry-flight")],
+				}),
+			).toMatchObject({ ok: true });
+			const beforeAdvance = (
+				(await request(wsCancel, "status-retry-flight", "task.dag", { ...auth, action: "status" })).result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			const advanceInput = {
+				...auth,
+				action: "advance",
+				graphId: "g",
+				nodeId: "n",
+				expectedRevision: beforeAdvance,
+			};
+			const advance = request(ws, "advance-retry-flight", "task.dag", advanceInput, "retry-flight-key");
+			await registrationEntered.promise;
+			const liveRevision = (
+				(await request(wsCancel, "status-before-retry-dispatch", "task.dag", { ...auth, action: "status" }))
+					.result as {
+					stateRevision: number;
+				}
+			).stateRevision;
+			registrationRelease.resolve();
+			await dispatchEntered.promise;
+			const retry = request(
+				wsRetry,
+				"advance-retry-again",
+				"task.dag",
+				{ ...advanceInput, expectedRevision: liveRevision },
+				"retry-flight-key",
+			);
+			let retrySettled = false;
+			void retry.then(() => {
+				retrySettled = true;
+			});
+			await Promise.race([
+				retry.then(() => {
+					throw new Error("exact retry did not join the blocked completion");
+				}),
+				Bun.sleep(50),
+			]);
+			expect(retrySettled).toBe(false);
+			const cancel = request(wsCancel, "cancel-retry-flight", "task.dag", {
+				...auth,
+				action: "cancel",
+				graphId: "g",
+				expectedRevision: liveRevision,
+				nodeIds: ["n"],
+			});
+			let cancelSettled = false;
+			void cancel.then(() => {
+				cancelSettled = true;
+			});
+			await Promise.race([
+				cancel.then(() => {
+					throw new Error("cancel returned while dispatch was paused");
+				}),
+				Bun.sleep(50),
+			]);
+			expect(cancelSettled).toBe(false);
+			const duringDispatch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: Array<{ fence: string }> }>;
+			};
+			expect(duringDispatch.graphs[0]!.attempts[0]!.fence).toBe("current");
+			dispatchRelease.resolve();
+			expect(await advance).toMatchObject({ ok: true });
+			expect(await retry).toMatchObject({ ok: true });
+			expect(await cancel).toMatchObject({ ok: true });
+			expect(dispatches).toBe(1);
+			expect(tracked.launched).toHaveLength(1);
+			expect([...tracked.closed]).toEqual([tracked.launched[0]]);
+			const after = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				graphs: Array<{ attempts: Array<{ fence: string; worker: string }> }>;
+			};
+			expect(after.graphs[0]!.attempts[0]!.fence).toBe("canceled");
+			expect(after.graphs[0]!.attempts[0]!.worker).toBe("closed");
+		} finally {
+			registrationRelease.resolve();
+			dispatchRelease.resolve();
+			ws.close();
+			wsRetry.close();
+			wsCancel.close();
+			await broker.stop();
+		}
+	});
 	it("cancel winning the current fence before launch yields provider 0", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-cancel-first-"));
 		roots.push(root);
@@ -1446,6 +1724,87 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			setManagedCloseWaitForTest(broker, undefined);
 			ws.close();
 			wsCancel.close();
+			await broker.stop();
+		}
+	});
+	it("withholds discovery when restart cannot establish managed enrollment membership", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-enrollment-loss-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const tracked = trackedSubstrate();
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: tracked.provider,
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, root);
+			const auth = {
+				controlRoot: root,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [root],
+			};
+			expect(
+				await request(ws, "define-enrollment-loss", "task.dag", {
+					...auth,
+					action: "define",
+					graphId: "g",
+					expectedRevision: 0,
+					nodes: [node("n", root, "enrollment-loss")],
+				}),
+			).toMatchObject({ ok: true });
+			expect(
+				await request(
+					ws,
+					"advance-enrollment-loss",
+					"task.dag",
+					{ ...auth, action: "advance", graphId: "g", nodeId: "n", expectedRevision: 1 },
+					"enrollment-loss-key",
+				),
+			).toMatchObject({ ok: true });
+			expect(tracked.launched).toHaveLength(1);
+			const managedDomainBeforeRestart = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				state_revision: number;
+			};
+			ws.close();
+			await broker.stop();
+			await Bun.write(managedEnrollmentIndexPath(agentDir), "{ corrupt enrollment index");
+
+			const restartedBroker = new Broker({
+				agentDir,
+				packageGeneration: "test",
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: tracked.provider,
+				spawnPromptLayer: promptLayer,
+			});
+			try {
+				await expect(restartedBroker.start()).rejects.toThrow(
+					"Broker cannot establish complete managed enrollment membership.",
+				);
+				expect(restartedBroker.discovery).toBeNull();
+				expect(await readBrokerDiscovery(agentDir)).toBeNull();
+				expect([...tracked.closed]).toEqual([]);
+				expect(await tracked.provider.verify({ pid: tracked.launched[0] })).toBe("verified");
+				const after = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+					state_revision: number;
+					graphs: Array<{ attempts: Array<{ fence: string; retired: boolean; worker: string }> }>;
+				};
+				expect(after.state_revision).toBe(managedDomainBeforeRestart.state_revision);
+				expect(after.graphs[0]!.attempts[0]!.fence).toBe("current");
+				expect(after.graphs[0]!.attempts[0]!.retired).toBe(false);
+				expect(after.graphs[0]!.attempts[0]!.worker).not.toBe("closed");
+			} finally {
+				await restartedBroker.stop();
+			}
+		} finally {
+			ws.close();
 			await broker.stop();
 		}
 	});

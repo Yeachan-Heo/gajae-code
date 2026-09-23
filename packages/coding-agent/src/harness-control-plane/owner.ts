@@ -177,6 +177,7 @@ export class RuntimeOwner {
 	#retiring = false;
 	#retirePromise: Promise<PrimitiveResponse> | null = null;
 	#lifecycleMutation: Promise<void> = Promise.resolve();
+	#activeRetirementSensitiveWork = new Set<Promise<void>>();
 	#activeValidationWork = new Set<{
 		controller: AbortController;
 		done: Promise<void>;
@@ -292,7 +293,7 @@ export class RuntimeOwner {
 				const latest = await readSessionState(this.#opts.root, this.#opts.sessionId);
 				if (!latest) throw new Error(`session_not_found:${this.#opts.sessionId}`);
 				const current = reconcileLiveOwnerState(latest);
-				if (current.reconciled) await writeSessionState(this.#opts.root, current.state);
+				if (current.reconciled) await this.#framePersistence.writeSessionState(this.#opts.root, current.state);
 				return current.state;
 			});
 		return state;
@@ -460,6 +461,25 @@ export class RuntimeOwner {
 		}
 	}
 
+	#withRetirementSensitiveWork<T>(work: () => Promise<T>): Promise<T> {
+		const operation = work();
+		let done!: Promise<void>;
+		done = operation
+			.then(
+				() => undefined,
+				() => undefined,
+			)
+			.then(() => {
+				this.#activeRetirementSensitiveWork.delete(done);
+			});
+		this.#activeRetirementSensitiveWork.add(done);
+		return operation;
+	}
+
+	async #joinRetirementSensitiveWork(): Promise<void> {
+		await Promise.all([...this.#activeRetirementSensitiveWork]);
+	}
+
 	#withOwnedValidationWork<T>(requestSignal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
 		const controller = new AbortController();
 		const done = Promise.withResolvers<void>();
@@ -546,9 +566,17 @@ export class RuntimeOwner {
 	}
 
 	async #handle(req: EndpointHandlerRequest): Promise<unknown> {
+		if (this.#stopPromise && !this.#retiring && req.verb === "retire") {
+			return { ok: false, error: "owner_stopping" };
+		}
 		if (
 			(this.#stopPromise || this.#retiring) &&
-			(req.verb === "validate" || req.verb === "finalize" || req.verb === "operate")
+			(req.verb === "submit" ||
+				req.verb === "recover" ||
+				req.verb === "observe" ||
+				req.verb === "validate" ||
+				req.verb === "finalize" ||
+				req.verb === "operate")
 		) {
 			return { ok: false, error: this.#retiring ? "owner_retiring" : "owner_stopping" };
 		}
@@ -556,15 +584,17 @@ export class RuntimeOwner {
 			case "ping":
 				return { ok: true, ownerId: this.ownerId, leaseEpoch: this.#leaseEpoch };
 			case "submit":
-				return this.#submit(req.input);
+				return this.#withRetirementSensitiveWork(() => this.#submit(req.input));
 			case "observe":
-				return this.#observe();
+				return this.#withRetirementSensitiveWork(() => this.#observe());
 			case "retire":
 				return this.#retire();
 			case "finalize":
 				return this.#withReceiptSpoolFromInput(req.input, () => this.#finalize(req.input, req.signal));
 			case "recover":
-				return this.#withReceiptSpoolFromInput(req.input, () => this.#recover());
+				return this.#withRetirementSensitiveWork(() =>
+					this.#withReceiptSpoolFromInput(req.input, () => this.#recover()),
+				);
 			case "validate":
 				return this.#withReceiptSpoolFromInput(req.input, () => this.#validate(req.signal));
 			case "operate":
@@ -966,9 +996,10 @@ export class RuntimeOwner {
 	}
 
 	async #retireOnce(): Promise<PrimitiveResponse> {
-		// Fence new validation-bearing work first, then abort and join every request
-		// that could still commit a receipt before recording terminal retirement.
+		// Fence new mutating work first, then abort validation and join every request
+		// that could still commit state or a receipt before recording retirement.
 		await this.#stopActiveValidationWork();
+		await this.#joinRetirementSensitiveWork();
 		const state = await this.#withLifecycleMutation(async () => {
 			const current = await readSessionState(this.#opts.root, this.#opts.sessionId);
 			if (!current) throw new Error(`session_not_found:${this.#opts.sessionId}`);
@@ -1067,6 +1098,7 @@ export class RuntimeOwner {
 		// Validation owns independent subprocess groups. Cancel and join those exact
 		// requests before transport/endpoint teardown can surrender the owner lease.
 		await this.#stopActiveValidationWork();
+		await this.#joinRetirementSensitiveWork();
 		const unsubscribe = this.#unsubscribeFrames;
 		if (unsubscribe) {
 			try {

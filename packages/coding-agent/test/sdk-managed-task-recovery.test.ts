@@ -3,8 +3,15 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { managedEnrollmentIndexPath, managedIdentity, managedTaskDomainPath } from "../src/sdk/broker/managed-task-dag";
+import {
+	loadManagedEnrollmentRecord,
+	managedEnrollmentIndexPath,
+	managedIdentity,
+	managedTaskDomainPath,
+	recordManagedEnrollment,
+} from "../src/sdk/broker/managed-task-dag";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
 
@@ -392,18 +399,30 @@ describe("managed native recovery (M3)", () => {
 			await broker.stop();
 		}
 	});
-	it("corrupt established managed domain does not abort unmanaged broker start", async () => {
+	it("corrupt indexed native domain blocks startup before spawn-claim recovery", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-isolate-"));
 		roots.push(root);
 		const launches = { count: 0 };
 		const closes = { count: 0 };
+		let dispatches = 0;
 		const agentDir = path.join(root, "agent");
 		const first = new Broker({
 			agentDir,
 			packageGeneration: "test",
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: substrate(launches, closes),
-			spawnPromptLayer: promptLayer(),
+			spawnPromptLayer: {
+				...promptLayer(),
+				dispatch: async () => {
+					dispatches += 1;
+					return {
+						kind: "accepted" as const,
+						commandId: "cmd-native-domain",
+						turnId: "turn-native-domain",
+						acceptedAt: Date.now(),
+					};
+				},
+			},
 		});
 		const discovery = await first.start();
 		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
@@ -423,23 +442,158 @@ describe("managed native recovery (M3)", () => {
 					nodes: [node("a", root)],
 				}),
 			).toMatchObject({ ok: true });
+			expect(
+				await request(
+					ws,
+					"advance-a",
+					"task.dag",
+					{
+						controlRoot: root,
+						enrollmentId: "enrollment",
+						ownerSessionId: ownerId,
+						attestationEpoch: epoch,
+						masterCapability: grant,
+						worktrees: [root],
+						action: "advance",
+						graphId: "a",
+						nodeId: "a",
+						expectedRevision: 1,
+					},
+					"key-a",
+				),
+			).toMatchObject({ ok: true });
 		} finally {
 			ws.close();
 			await first.stop();
 		}
+		expect(launches.count).toBe(1);
+		expect(dispatches).toBe(1);
 		await fs.writeFile(managedTaskDomainPath(root), "{");
+		const recoveryEffects = { verifies: 0, dispatches: 0, reconciles: 0 };
+		const probeStore = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+		await probeStore.open();
+		const probe = await probeStore.claimOrJoin("recovery-probe", "a".repeat(64));
+		if (probe.kind !== "owner") throw new Error("expected recovery probe owner");
+		await probeStore.persistTransition("recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "recovery-probe-child",
+		});
+		const probeAt = Date.now();
+		await probeStore.persistTransition("recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "recovery-probe-child",
+			authority: {
+				version: 1,
+				authorityId: "recovery-probe-authority",
+				claimId: probe.claim.claimId,
+				childId: "recovery-probe-child",
+				ownerSessionId: ownerId,
+				lifecycleIdentity: "recovery-probe",
+				substrateKind: "headless",
+				providerIdentity: "recovery-probe-provider",
+				pid: 8989,
+				processIncarnation: "inc-8989",
+				endpointGeneration: 1,
+				endpointPid: 8989,
+				endpointIncarnation: "inc-8989",
+				endpointCwd: root,
+				endpointStateRoot: path.join(root, ".gjc", "state"),
+				closeState: "active",
+				createdAt: probeAt,
+				updatedAt: probeAt,
+			},
+		});
+		const probeSeed = { version: 2 as const, phase: "prepared" as const, clientRef: "recovery-probe-client-ref" };
+		await probeStore.persistTransition("recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "authority_active",
+			to: "seed_prepared",
+			seed: probeSeed,
+		});
+		await probeStore.persistTransition("recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "seed_prepared",
+			to: "dispatching",
+			leaseEpoch: probe.claim.preSendLease?.epoch ?? "",
+			seed: { ...probeSeed, phase: "dispatching" },
+		});
+		await probeStore.releaseOwner("recovery-probe");
 		const second = new Broker({
 			agentDir,
 			packageGeneration: "test",
 			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: substrate(launches, closes),
+			spawnSubstrateProvider: {
+				...substrate(launches, closes),
+				verify: async () => {
+					recoveryEffects.verifies += 1;
+					return "verified" as const;
+				},
+			},
+			spawnPromptLayer: {
+				...promptLayer(),
+				dispatch: async () => {
+					recoveryEffects.dispatches += 1;
+					return {
+						kind: "accepted" as const,
+						commandId: "recovery-command",
+						turnId: "recovery-turn",
+						acceptedAt: Date.now(),
+					};
+				},
+				reconcile: async () => {
+					recoveryEffects.reconciles += 1;
+					return { status: "unknown" as const };
+				},
+			},
+		});
+		try {
+			await expect(second.start()).rejects.toThrow(
+				"Broker cannot establish complete managed enrollment membership.",
+			);
+			expect(second.discovery).toBeNull();
+			expect(await readBrokerDiscovery(agentDir)).toBeNull();
+			expect(launches.count).toBe(1);
+			expect(closes.count).toBe(0);
+			expect(dispatches).toBe(1);
+			expect(recoveryEffects).toEqual({ verifies: 0, dispatches: 0, reconciles: 0 });
+			const recoveredProbe = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await recoveredProbe.open();
+			expect(recoveredProbe.claim("recovery-probe")?.state).toBe("dispatching");
+			const enrollment = await loadManagedEnrollmentRecord(agentDir);
+			expect(enrollment.byRoot[root]).toHaveLength(1);
+			expect(enrollment.nativeIdentities).toEqual(enrollment.byRoot[root]);
+		} finally {
+			await second.stop();
+		}
+	});
+	it("reclaims an empty pending enrollment before allowing broker startup", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-pending-startup-"));
+		roots.push(root);
+		const agentDir = path.join(root, "agent");
+		const pendingRoot = path.join(root, "pending");
+		await Promise.all([fs.mkdir(agentDir, { mode: 0o700 }), fs.mkdir(pendingRoot, { mode: 0o700 })]);
+		await recordManagedEnrollment(agentDir, pendingRoot);
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: substrate({ count: 0 }, { count: 0 }),
 			spawnPromptLayer: promptLayer(),
 		});
-		const restarted = await second.start();
-		expect(restarted.url).toMatch(/^ws:\/\//);
-		await second.stop();
+		try {
+			const discovery = await broker.start();
+			expect(discovery.url).toMatch(/^ws:\/\//);
+			expect(broker.discovery).not.toBeNull();
+			expect((await loadManagedEnrollmentRecord(agentDir)).controlRoots).not.toContain(pendingRoot);
+		} finally {
+			await broker.stop();
+		}
 	});
-	it("unreadable enrollment index refuses ordinary spawn without blocking unrelated keys when the index is readable", async () => {
+	it("unreadable enrollment index prevents publication without closing or retiring managed children", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-index-"));
 		roots.push(root);
 		const launches = { count: 0 };
@@ -454,6 +608,7 @@ describe("managed native recovery (M3)", () => {
 		});
 		const discovery = await first.start();
 		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		let domainBeforeRestartRevision: number | undefined;
 		try {
 			await attest(first, root);
 			expect(
@@ -491,54 +646,104 @@ describe("managed native recovery (M3)", () => {
 					"key-a",
 				),
 			).toMatchObject({ ok: true });
+			domainBeforeRestartRevision = (
+				JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+					state_revision: number;
+				}
+			).state_revision;
 		} finally {
 			ws.close();
 			await first.stop();
 		}
+		const probeStore = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+		await probeStore.open();
+		const probe = await probeStore.claimOrJoin("enrollment-recovery-probe", "a".repeat(64));
+		if (probe.kind !== "owner") throw new Error("expected recovery probe owner");
+		await probeStore.persistTransition("enrollment-recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "recovery-probe-child",
+		});
+		const authorityNow = Date.now();
+		await probeStore.persistTransition("enrollment-recovery-probe", {
+			claimId: probe.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "recovery-probe-child",
+			authority: {
+				version: 1,
+				authorityId: "recovery-probe-authority",
+				claimId: probe.claim.claimId,
+				childId: "recovery-probe-child",
+				ownerSessionId: ownerId,
+				lifecycleIdentity: "enrollment-recovery-probe",
+				substrateKind: "headless",
+				providerIdentity: "managed-fixture",
+				pid: 9898,
+				processIncarnation: "inc-9898",
+				endpointGeneration: 1,
+				endpointPid: 9898,
+				endpointIncarnation: "inc-9898",
+				endpointCwd: root,
+				endpointStateRoot: path.join(root, ".gjc", "state"),
+				closeState: "active",
+				createdAt: authorityNow,
+				updatedAt: authorityNow,
+			},
+		});
+		await probeStore.releaseOwner("enrollment-recovery-probe");
 		await fs.writeFile(managedEnrollmentIndexPath(agentDir), "{");
+		const recoveryEffects = { verifies: 0, dispatches: 0, reconciles: 0 };
 		const second = new Broker({
 			agentDir,
 			packageGeneration: "test",
 			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: substrate(launches, closes),
-			spawnPromptLayer: promptLayer(),
+			spawnSubstrateProvider: {
+				...substrate(launches, closes),
+				verify: async () => {
+					recoveryEffects.verifies += 1;
+					return "verified" as const;
+				},
+			},
+			spawnPromptLayer: {
+				...promptLayer(),
+				dispatch: async () => {
+					recoveryEffects.dispatches += 1;
+					return {
+						kind: "accepted" as const,
+						commandId: "recovery-probe-command",
+						turnId: "recovery-probe-turn",
+						acceptedAt: Date.now(),
+					};
+				},
+				reconcile: async () => {
+					recoveryEffects.reconciles += 1;
+					return { status: "unknown" as const };
+				},
+			},
 		});
-		const restarted = await second.start();
-		const ws2 = await connect(`${restarted.url}/?token=${restarted.token}`);
 		try {
-			await attest(second, root);
-			const managed = await request(
-				ws2,
-				"ordinary-managed",
-				"session.spawn",
-				{
-					cwd: root,
-					task: "Task a",
-					ownerSessionId: ownerId,
-					attestationEpoch: epoch,
-					masterCapability: grant,
-				},
-				"key-a",
+			await expect(second.start()).rejects.toThrow(
+				"Broker cannot establish complete managed enrollment membership.",
 			);
-			expect(managed).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			expect(second.discovery).toBeNull();
+			expect(await readBrokerDiscovery(agentDir)).toBeNull();
 			expect(launches.count).toBe(1);
-			const unrelated = await request(
-				ws2,
-				"ordinary-unrelated",
-				"session.spawn",
-				{
-					cwd: root,
-					task: "unrelated",
-					ownerSessionId: ownerId,
-					attestationEpoch: epoch,
-					masterCapability: grant,
-				},
-				"key-unrelated",
-			);
-			expect(unrelated).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
-			expect(launches.count).toBe(1);
+			expect(closes.count).toBe(0);
+			expect(recoveryEffects).toEqual({ verifies: 0, dispatches: 0, reconciles: 0 });
+			const replayedProbe = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await replayedProbe.open();
+			expect(replayedProbe.claim("enrollment-recovery-probe")?.state).toBe("authority_active");
+			const after = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+				state_revision: number;
+				graphs: Array<{ attempts: Array<{ fence: string; retired: boolean; worker: string }> }>;
+			};
+			expect(after.state_revision).toBe(domainBeforeRestartRevision);
+			expect(after.graphs[0]!.attempts[0]!.fence).toBe("current");
+			expect(after.graphs[0]!.attempts[0]!.retired).toBe(false);
+			expect(after.graphs[0]!.attempts[0]!.worker).not.toBe("closed");
 		} finally {
-			ws2.close();
 			await second.stop();
 		}
 	});

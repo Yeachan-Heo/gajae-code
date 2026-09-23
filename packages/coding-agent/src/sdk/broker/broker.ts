@@ -405,6 +405,7 @@ type SpawnInFlight = {
 	resolve: (response: BrokerResponse) => void;
 	claimId?: string;
 	phase?: SpawnClaimV2["state"];
+	managedRequestHash?: string;
 };
 
 /** Complete five-leg child endpoint pin captured at registration. */
@@ -1960,6 +1961,12 @@ export class Broker {
 				ownerSessionId: auth.ownerSessionId,
 				controlRoot: binding.controlRoot,
 			});
+			const active = this.#spawnInFlight.get(scopedIdentity);
+			if (active) {
+				if (active.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await active.completion;
+			}
 			const reserved = await transactManagedTaskDomain(
 				{ binding, expectedRevision: input.expectedRevision },
 				async state => {
@@ -2011,15 +2018,20 @@ export class Broker {
 				)
 			)
 				return error("spawn_failed", "managed attempt ref mismatch");
-			this.#managedAttempts.set(attemptRef.nativeIdentity, attemptRef);
-			await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot, attemptRef.nativeIdentity);
+			const activeAfterAdmission = this.#spawnInFlight.get(attemptRef.nativeIdentity);
+			if (activeAfterAdmission) {
+				if (activeAfterAdmission.managedRequestHash !== requestHash)
+					return error("idempotency_conflict", "idempotency key conflicts with a live managed task.dag advance");
+				return await activeAfterAdmission.completion;
+			}
 			const node = reserved.state.graphs
 				.find(graph => graph.id === attemptRef.graphId)
 				?.nodes.find(item => item.definition.id === attemptRef.nodeId);
 			const persisted = reserved.state.graphs
 				.flatMap(graph => graph.attempts)
-				.find(item => item.id === attemptRef.attemptId);
+				?.find(item => item.id === attemptRef.attemptId);
 			if (!node || !persisted) return error("spawn_failed", "admitted node missing");
+			this.#managedAttempts.set(attemptRef.nativeIdentity, attemptRef);
 			const spawnAdmission: SpawnAdmissionInput = {
 				task: node.definition.task,
 				masterCapability: "",
@@ -2031,12 +2043,17 @@ export class Broker {
 				managedNativeVector: managedNativeVector(persisted),
 			};
 			const completion = Promise.withResolvers<BrokerResponse>();
-			const inFlight: SpawnInFlight = { completion: completion.promise, resolve: completion.resolve };
+			const inFlight: SpawnInFlight = {
+				completion: completion.promise,
+				resolve: completion.resolve,
+				managedRequestHash: requestHash,
+			};
 			this.#spawnInFlight.set(attemptRef.nativeIdentity, inFlight);
 			this.#spawnTasks.set(inFlight, spawnAdmission.task);
 			let becameOwner = false;
 			let completionResult: BrokerResponse = error("spawn_failed", "managed advance did not complete");
 			try {
+				await recordManagedEnrollment(this.settings.agentDir, binding.controlRoot, attemptRef.nativeIdentity);
 				const driven = await this.#driveVerifiedSpawn(
 					attemptRef.nativeIdentity,
 					spawnAdmission,
@@ -2048,7 +2065,7 @@ export class Broker {
 				completionResult = driven;
 				if (!driven.ok) return driven;
 				const liveRevision = await currentManagedRevision(binding);
-				return {
+				completionResult = {
 					ok: true,
 					result: {
 						...this.#managedPublic(liveRevision, reserved.state.graphs),
@@ -2057,10 +2074,18 @@ export class Broker {
 						spawn: driven.result,
 					},
 				};
+				return completionResult;
+			} catch (caught) {
+				completionResult = error(
+					"spawn_failed",
+					caught instanceof Error ? caught.message : "managed advance failed",
+				);
+				throw caught;
 			} finally {
 				completion.resolve(completionResult);
 				this.#spawnTasks.delete(inFlight);
-				this.#spawnInFlight.delete(attemptRef.nativeIdentity);
+				if (this.#spawnInFlight.get(attemptRef.nativeIdentity) === inFlight)
+					this.#spawnInFlight.delete(attemptRef.nativeIdentity);
 				if (becameOwner) await this.#spawnAuthority?.releaseOwner(attemptRef.nativeIdentity);
 			}
 		} catch (caught) {
@@ -2104,6 +2129,8 @@ export class Broker {
 		if (typeof input.graphId !== "string") return error("invalid_input", "graphId is required");
 		const auth = await this.#verifiedManagedOwner(input);
 		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error("terminal_uncertain", "managed enrollment membership is unprovable; revision was not applied");
 		try {
 			const binding = await createManagedDomainBinding({
 				controlRoot: auth.controlRoot,
@@ -2144,6 +2171,11 @@ export class Broker {
 		if (ids.length === 0) return error("invalid_input", "nodeIds are required");
 		const auth = await this.#verifiedManagedOwner(input);
 		if (auth.kind === "denied") return auth.response;
+		if (this.#managedEnrollmentFailed || this.#managedFailedRoots.has(auth.controlRoot))
+			return error(
+				"terminal_uncertain",
+				"managed enrollment membership is unprovable; cancellation was not applied",
+			);
 		try {
 			const binding = await createManagedDomainBinding({
 				controlRoot: auth.controlRoot,
@@ -2613,18 +2645,27 @@ export class Broker {
 			const childId = current.childId;
 			const preparedSeed = current.seed;
 			const preSendLeaseEpoch = current.preSendLease.epoch;
+			const exactPinnedRegistration = pinnedRegistration;
 			// Dispatch without a complete pin must never consume the pre-send lease.
-			if (pinnedRegistration === undefined)
+			if (exactPinnedRegistration === undefined)
 				return error("terminal_uncertain", "session.spawn endpoint pin is unavailable before dispatch");
+			const dispatchSeed = async (): Promise<SpawnPromptDispatch> =>
+				await this.#spawnPromptLayer.dispatch({
+					sessionId: childId,
+					task: admission.task,
+					clientRef: preparedSeed.clientRef,
+					pinned: exactPinnedRegistration,
+				});
+			let dispatched: SpawnPromptDispatch;
 			if (admission.managedAttempt && admission.managedBinding && admission.managedNativeVector) {
 				try {
-					current = await withManagedNativeEffectAuthorized(
+					dispatched = await withManagedNativeEffectAuthorized(
 						admission.managedBinding,
 						admission.managedAttempt.nativeIdentity,
 						admission.managedNativeVector,
 						"seed",
-						async () =>
-							(
+						async () => {
+							current = (
 								await store.persistTransition(lifecycleIdentity, {
 									claimId: current.claimId,
 									from: "seed_prepared",
@@ -2632,9 +2673,14 @@ export class Broker {
 									leaseEpoch: preSendLeaseEpoch,
 									seed: { ...preparedSeed, phase: "dispatching" },
 								})
-							).claim,
+							).claim;
+							inFlight.phase = current.state;
+							handedOff = true;
+							return await dispatchSeed();
+						},
 					);
 				} catch (caught) {
+					if (handedOff) throw caught;
 					return error("spawn_failed", caught instanceof Error ? caught.message : "managed native fence denied");
 				}
 			} else {
@@ -2647,15 +2693,10 @@ export class Broker {
 						seed: { ...preparedSeed, phase: "dispatching" },
 					})
 				).claim;
+				inFlight.phase = current.state;
+				handedOff = true;
+				dispatched = await dispatchSeed();
 			}
-			inFlight.phase = current.state;
-			handedOff = true;
-			const dispatched = await this.#spawnPromptLayer.dispatch({
-				sessionId: childId,
-				task: admission.task,
-				clientRef: preparedSeed.clientRef,
-				pinned: pinnedRegistration,
-			});
 			if (dispatched.kind === "accepted") {
 				current = (
 					await store.persistTransition(lifecycleIdentity, {
@@ -3722,8 +3763,10 @@ export class Broker {
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
-			await this.#recoverSpawnClaims();
 			await this.#restoreManagedAttempts();
+			if (this.#managedEnrollmentFailed || this.#managedFailedRoots.size > 0)
+				throw new Error("Broker cannot establish complete managed enrollment membership.");
+			await this.#recoverSpawnClaims();
 			await this.#reconcileManagedNativeLifetimes();
 			const reconciledRoots = new Set<string>();
 			for (const ref of this.#managedAttempts.values()) {

@@ -6,3 +6,4 @@
 
 - Hardened enrollment recovery, cross-root idempotency, cancellation, and verification so interrupted or uncertain managed task lifetimes remain fail-closed.
 - Bound owner validation subprocesses to owner shutdown and rejected private durable publication beneath unsafe roots.
+- Serialized owner submission, recovery, observation, and finalization against retirement so lifecycle writes and receipts cannot outlive owner authority.
