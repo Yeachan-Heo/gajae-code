@@ -1,6 +1,6 @@
 import { projectEnvSnapshot } from "../packages/utils/src/env-file";
 import { getAgentProfileAuthority, getTrustedHomeDir, resetAgentDirFromEnvironment } from "../packages/utils/src/dirs";
-import { installRuntimeDeletionGuard } from "./safe-cleanup";
+import { installRuntimeDeletionGuard, safeRmSync } from "./safe-cleanup";
 import { decideAgentDirIsolation, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import { decideLogDirIsolation, defaultLogDirFor } from "./test-log-dir-isolation";
 import { formatWorkspaceDependencyFailure, inspectWorkspaceDependencies } from "./worktree-deps";
@@ -38,6 +38,32 @@ try {
 } catch {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
+
+const testTempRoot = path.resolve(os.tmpdir());
+const isolatedTempDirs: Array<{ dir: string; prefix: string }> = [];
+export function cleanupIsolatedTempDirs(): void {
+	let cleanupError: unknown;
+	for (const { dir, prefix } of isolatedTempDirs) {
+		const resolvedDir = path.resolve(dir);
+		if (path.dirname(resolvedDir) !== testTempRoot || !path.basename(resolvedDir).startsWith(prefix)) {
+			cleanupError ??= new Error(`Refusing to remove test temp directory outside os.tmpdir(): ${dir}`);
+			continue;
+		}
+		try {
+			// safeRmSync confines recursive deletion to the safe-cleanup world;
+			// force makes an already-removed directory an idempotent no-op.
+			safeRmSync(resolvedDir, { recursive: true, force: true });
+		} catch (error) {
+			cleanupError ??= error;
+		}
+	}
+	if (cleanupError !== undefined) throw cleanupError;
+}
+// Bun test file isolates can be disposed without process lifecycle events; the
+// test-only preload bridge also calls this from afterAll. Keep these hooks for
+// ordinary process shutdown. Forceful safe removal makes every call idempotent.
+process.on("beforeExit", cleanupIsolatedTempDirs);
+process.on("exit", cleanupIsolatedTempDirs);
 
 // Hermetic unit shards must not discover the operator's provider credentials or
 // proxy endpoints. Explicitly opted-in E2E runs are different: their tests use
@@ -116,16 +142,16 @@ const isolation = decideAgentDirIsolation({
 	projectEnv: projectEnv.values,
 });
 if (isolation.action === "isolate") {
-	let agentDir: string;
 	try {
-		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-agent-"));
+		const agentDir = fs.mkdtempSync(path.join(testTempRoot, "gjc-test-agent-"));
+		isolatedTempDirs.push({ dir: agentDir, prefix: "gjc-test-agent-" });
+		process.env.GJC_CODING_AGENT_DIR = agentDir;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
 	} catch (error) {
 		throw new Error(
 			`Test agent-directory isolation failed (${isolation.reason}); refusing to run tests against the live agent dir: ${String(error)}`,
 		);
 	}
-	process.env.GJC_CODING_AGENT_DIR = agentDir;
-	process.env.PI_CODING_AGENT_DIR = agentDir;
 }
 
 // `dirs.ts` was loaded above to capture the operator profile. Rebuild its
@@ -181,7 +207,9 @@ if (logIsolation.action === "fail") {
 }
 if (logIsolation.action === "isolate") {
 	try {
-		process.env.GJC_LOG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-logs-"));
+		const logDir = fs.mkdtempSync(path.join(testTempRoot, "gjc-test-logs-"));
+		isolatedTempDirs.push({ dir: logDir, prefix: "gjc-test-logs-" });
+		process.env.GJC_LOG_DIR = logDir;
 	} catch (error) {
 		throw new Error(
 			`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,

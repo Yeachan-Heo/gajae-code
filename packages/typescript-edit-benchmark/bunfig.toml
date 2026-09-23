@@ -4,4 +4,4 @@
 # guard and canonicalizes TMPDIR for the native owner-only primitive —
 # silently never runs in package-cwd test processes (issue #4794).
 [test]
-preload = ["../../scripts/test-preload.ts"]
+preload = ["../../scripts/test-preload-after-all.ts"]
