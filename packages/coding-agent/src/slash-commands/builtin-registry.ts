@@ -286,7 +286,7 @@ function providerSetupUsage(): string {
 	return [
 		"Provider onboarding",
 		"Presets: /provider add --preset <id> [--force]",
-		"Aliases include minimax, zai, alibaba, cline, command-code, and goat.",
+		"Aliases include minimax, zai, alibaba, cline, command-code, goat, and ionet.",
 		`API providers: ${MODEL_ONBOARDING_API_PROVIDER_COMMAND} [--force]`,
 		`Available presets:\n${formatProviderPresetList()}`,
 		"OAuth/subscription providers: /provider login [provider-id] or /login [provider-id]",

@@ -307,6 +307,44 @@ describe("provider onboarding setup core", () => {
 		expect(findProviderPreset("command-code")?.id).toBe("commandcode-goat");
 	});
 
+	it("adds IO Intelligence with automatic discovery and the documented compat flags", async () => {
+		const modelsPath = await tempModelsPath();
+		const result = await addApiCompatibleProvider({ preset: "ionet", modelsPath });
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			providers?: Record<
+				string,
+				{
+					baseUrl?: string;
+					api?: string;
+					apiKeyEnv?: string;
+					discovery?: unknown;
+					compat?: Record<string, unknown>;
+					models?: Array<{ id: string }>;
+				}
+			>;
+		};
+		const provider = parsed.providers?.ionet;
+
+		expect(result.providerId).toBe("ionet");
+		expect(result.presetName).toBe("IO Intelligence (io.net)");
+		expect(provider).toMatchObject({
+			baseUrl: "https://api.intelligence.io.solutions/api/v1",
+			api: "openai-completions",
+			apiKeyEnv: "IONET_API_KEY",
+			discovery: { type: "openai-models-list" },
+		});
+		expect(result.modelIds).toEqual([]);
+		expect(formatProviderSetupResult(result)).toContain("Models: discovered automatically");
+		expect(provider?.models).toBeUndefined();
+		expect(provider?.compat).toMatchObject({
+			maxTokensField: "max_tokens",
+			reasoningContentField: "reasoning_content",
+			extraBody: { tool_choice: "auto" },
+		});
+		expect(findProviderPreset("io-net")?.id).toBe("ionet");
+		expect(findProviderPreset("io-intelligence")?.id).toBe("ionet");
+	});
+
 	it("loads the generated Alibaba Token Plan config into ModelRegistry with per-model routing and exact profile efforts", async () => {
 		const modelsPath = await tempModelsPath();
 		await addApiCompatibleProvider({ preset: "alibaba-token-plan", modelsPath });
