@@ -4,7 +4,7 @@
 
 **Reviewed:** 2026-09-23
 **Original task-fixture base:** `dev` at `1431b449495be731d44aa6ee21092aee45f88b82` (pinned by merged PR #5857).
-**Safety-gate follow-up base:** `dev` at `246dcae1464d80d495a3904972758ba2c2f6b1a3`.
+**Safety-gate follow-up base:** `dev` at `6d692705e08bac50f2c93ae2e5bdc09c9f194bc2`.
 
 ## Decision requested before live runs
 
