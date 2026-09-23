@@ -115,6 +115,7 @@ import {
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
+import { PromptImageUploadStore } from "../host/prompt-image-upload";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -1225,6 +1226,8 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	imageUploads: PromptImageUploadStore;
+	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
 	broadcastEventFrame: (event: SdkFrame) => string[];
@@ -2599,6 +2602,9 @@ function sdkControlSurface(
 	pendingInteractive: Map<string, PendingInteractiveAsk>,
 	gatePresentations: PresentationArbiter | undefined,
 	api: ExtensionAPI,
+	imageUploads: PromptImageUploadStore,
+	retainAcceptedImage: (correlation: { commandId: string; turnId: string }, release: () => void) => void,
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void,
 	isBusy: () => boolean,
 	onPromptAccepted: (
 		correlation: { commandId: string; turnId: string },
@@ -2889,6 +2895,7 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation = false,
+		onCorrelation?: (correlation: { commandId: string; turnId: string }) => void,
 	) => {
 		const trimmedClientRef = typeof clientRef === "string" ? clientRef.trim() : undefined;
 		if (clientRef !== undefined && (!trimmedClientRef || trimmedClientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
@@ -2951,6 +2958,7 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
+		onCorrelation?.({ commandId, turnId });
 		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
@@ -3093,8 +3101,39 @@ function sdkControlSurface(
 		cancelPendingPreflights(): Promise<void>;
 		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
 	} = {
-		prompt: (text, images, clientRef) =>
-			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
+		prompt: async (text, images, clientRef, stagedImages) => {
+			if (stagedImages !== undefined && images !== undefined)
+				throw Object.assign(new Error("Direct and staged images cannot be mixed."), { code: "invalid_input" });
+			const reservation =
+				stagedImages === undefined
+					? undefined
+					: imageUploads.redeem(controlRequesterContext.getStore(), stagedImages);
+			let correlation: { commandId: string; turnId: string } | undefined;
+			try {
+				return await submitPrompt(
+					text,
+					reservation?.images ?? images,
+					false,
+					undefined,
+					true,
+					controlRequesterContext.getStore(),
+					clientRef,
+					true,
+					current => {
+						correlation = current;
+						if (reservation) retainAcceptedImage(current, reservation.release);
+					},
+				);
+			} catch (error) {
+				if (correlation) releaseAcceptedImage(correlation);
+				else reservation?.release();
+				throw error;
+			}
+		},
+		imageBegin: input => imageUploads.begin(controlRequesterContext.getStore(), input),
+		imageAppend: input => imageUploads.append(controlRequesterContext.getStore(), input),
+		imageFinish: input => imageUploads.finish(controlRequesterContext.getStore(), input),
+		imageDiscard: input => imageUploads.discard(controlRequesterContext.getStore(), input),
 		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
@@ -4563,6 +4602,8 @@ export function createNotificationsExtension(
 		if (reason === "session" && requestedRuntime) {
 			requestedRuntime.inboundFenced = true;
 			requestedRuntime.stopping = true;
+			requestedRuntime.imageUploads.close();
+			requestedRuntime.releaseAcceptedImages();
 			requestedRuntime.abortEphemeralTurns();
 		}
 		if (reason === "session" && requestedRuntime) requestedRuntime.stopSessionNameObserver();
@@ -4831,6 +4872,13 @@ export function createNotificationsExtension(
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
+		const imageUploads = new PromptImageUploadStore();
+		const acceptedImages = new Map<string, () => void>();
+		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
+			const key = `${correlation.commandId}:${correlation.turnId}`;
+			acceptedImages.get(key)?.();
+			acceptedImages.delete(key);
+		};
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const workLease = ctx.getSessionWorkLease?.() ?? createSessionWorkLease();
@@ -6078,6 +6126,7 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation)) return;
+			releaseAcceptedImage(correlation);
 			if (!runtime) {
 				// The runtime (and with it the positioned ring) is gone, so the
 				// terminal can never be published from this process; expire the
@@ -6252,6 +6301,9 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
+			imageUploads,
+			(correlation, release) => acceptedImages.set(`${correlation.commandId}:${correlation.turnId}`, release),
+			releaseAcceptedImage,
 			() =>
 				runtime?.busy === true ||
 				pendingPromptCorrelations.length > 0 ||
@@ -7705,6 +7757,11 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			imageUploads,
+			releaseAcceptedImages: () => {
+				for (const release of acceptedImages.values()) release();
+				acceptedImages.clear();
+			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
 			revisions,
@@ -8009,6 +8066,7 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
+				imageUploads.disconnect(connectionId);
 				closeHostConnection(connectionId);
 				connectionCloseHandler?.(connectionId);
 				void controlSurface
