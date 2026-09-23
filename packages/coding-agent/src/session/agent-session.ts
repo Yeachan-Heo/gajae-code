@@ -23806,9 +23806,7 @@ export class AgentSession {
 				...(before === undefined ? {} : { rowId: before }),
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
-			if (remainingCredentialIds.length === 0) {
-				return state === "marked" || failedRowId !== undefined ? "exhausted" : "unchanged";
-			}
+			if (remainingCredentialIds.length === 0) return state === "marked" ? "exhausted" : "unchanged";
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
 				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
