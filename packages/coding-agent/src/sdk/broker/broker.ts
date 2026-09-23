@@ -1837,7 +1837,6 @@ export class Broker {
 					...(input.expectedRevision === 0
 						? {
 								assertNoManagedEvidence: async () => {
-									const store = this.#spawnAuthority;
 									let enrolled: ManagedEnrollmentRecord;
 									try {
 										enrolled = await loadManagedEnrollmentRecord(this.settings.agentDir);
@@ -1845,17 +1844,6 @@ export class Broker {
 										throw new Error("native managed evidence exists");
 									}
 									if (rootWasEnrolled || (enrolled.byRoot[binding.controlRoot] ?? []).length > 0)
-										throw new Error("native managed evidence exists");
-									const enrolledNatives = new Set(enrolled.nativeIdentities);
-									if (
-										store
-											?.claims()
-											.some(
-												claim =>
-													this.#managedAttempts.has(claim.lifecycleIdentity) ||
-													enrolledNatives.has(claim.lifecycleIdentity),
-											)
-									)
 										throw new Error("native managed evidence exists");
 								},
 							}

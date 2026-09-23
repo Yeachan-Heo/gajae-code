@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
-import { managedIdentity, managedTaskDomainPath } from "../src/sdk/broker/managed-task-dag";
+import { managedIdentity, managedTaskDomainPath, recordManagedEnrollment } from "../src/sdk/broker/managed-task-dag";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
 
@@ -285,6 +285,75 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			expect(
 				persisted.graphs.some(graph => graph.attempts.some(attempt => attempt.native.identity === nativeA)),
 			).toBe(true);
+		} finally {
+			ws.close();
+			await broker.stop();
+		}
+	});
+	it("defines a sibling root with a live managed attempt while rejecting an already-enrolled root", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-sibling-root-"));
+		roots.push(root);
+		const rootA = path.join(root, "root-a");
+		const rootB = path.join(root, "root-b");
+		const enrolledRoot = path.join(root, "enrolled-root");
+		await Promise.all([fs.mkdir(rootA), fs.mkdir(rootB), fs.mkdir(enrolledRoot)]);
+		const launches = { count: 0 };
+		const broker = new Broker({
+			agentDir: path.join(root, "agent"),
+			packageGeneration: "test",
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: substrate(launches),
+			spawnPromptLayer: promptLayer,
+		});
+		const discovery = await broker.start();
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			await attest(broker, rootA);
+			await recordManagedEnrollment(broker.settings.agentDir, enrolledRoot);
+			const auth = (controlRoot: string) => ({
+				controlRoot,
+				enrollmentId: "enrollment",
+				ownerSessionId: ownerId,
+				attestationEpoch: epoch,
+				masterCapability: grant,
+				worktrees: [controlRoot],
+			});
+			expect(
+				await request(ws, "define-a", "task.dag", {
+					...auth(rootA),
+					action: "define",
+					graphId: "a",
+					expectedRevision: 0,
+					nodes: [node("a", rootA, "a")],
+				}),
+			).toMatchObject({ ok: true });
+			const advance = await request(
+				ws,
+				"advance-a",
+				"task.dag",
+				{ ...auth(rootA), action: "advance", graphId: "a", nodeId: "a", expectedRevision: 1 },
+				"key-a",
+			);
+			expect(advance).toMatchObject({ ok: true, result: { attemptId: "attempt-key-a" } });
+			expect(launches.count).toBe(1);
+			expect(
+				await request(ws, "define-b", "task.dag", {
+					...auth(rootB),
+					action: "define",
+					graphId: "b",
+					expectedRevision: 0,
+					nodes: [node("b", rootB, "b")],
+				}),
+			).toMatchObject({ ok: true });
+			expect(
+				await request(ws, "define-enrolled", "task.dag", {
+					...auth(enrolledRoot),
+					action: "define",
+					graphId: "enrolled",
+					expectedRevision: 0,
+					nodes: [node("enrolled", enrolledRoot, "enrolled")],
+				}),
+			).toMatchObject({ ok: false, error: { code: "spawn_failed", message: "native managed evidence exists" } });
 		} finally {
 			ws.close();
 			await broker.stop();
