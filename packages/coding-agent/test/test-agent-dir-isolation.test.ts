@@ -6,9 +6,11 @@
  * because importing the preload would apply its environment mutations.
  */
 import { describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getDefaultSafeCleanupWorld, registerOwnedDeletionRoot } from "../../../scripts/safe-cleanup";
 import {
 	decideAgentDirIsolation,
 	defaultAgentDirFor,
@@ -369,6 +371,71 @@ test("the prior file's directories are removed before the runner exits", () => {
 			}
 		} finally {
 			await fs.promises.rm(tempRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("cleans isolated dirs when os.tmpdir is nested under the real home", async () => {
+		const ownedRoot = path.join(os.homedir(), `.gjc-test-preload-tmp-${crypto.randomUUID()}`);
+		const forgetOwnedRoot = registerOwnedDeletionRoot(ownedRoot);
+		fs.mkdirSync(ownedRoot, { mode: 0o700 });
+		const tempRoot = path.join(ownedRoot, "tmp");
+		fs.mkdirSync(tempRoot, { mode: 0o700 });
+		try {
+			const defaultWorld = getDefaultSafeCleanupWorld();
+			expect(
+				defaultWorld.allowedRoots.some(root => {
+					const relative = path.relative(root, tempRoot);
+					return (
+						relative === "" ||
+						(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+					);
+				}),
+			).toBe(false);
+
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				HOME: os.homedir(),
+				TMPDIR: tempRoot,
+				TMP: tempRoot,
+				TEMP: tempRoot,
+				GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: "",
+				GJC_CONFIG_DIR: "",
+				PI_CONFIG_DIR: "",
+				GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			};
+			delete env.GJC_LOG_DIR;
+			delete env.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+			delete env.XDG_STATE_HOME;
+
+			const probe = Bun.spawnSync({
+				cmd: [
+					process.execPath,
+					"--preload",
+					preload,
+					"-e",
+					"console.log(JSON.stringify({ agentDir: process.env.GJC_CODING_AGENT_DIR, logDir: process.env.GJC_LOG_DIR }))",
+				],
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode, `nested-home preload failed:\n${probe.stderr.toString()}`).toBe(0);
+			const dirs = JSON.parse(probe.stdout.toString().trim()) as { agentDir: string; logDir: string };
+			for (const [dir, prefix] of [
+				[dirs.agentDir, "gjc-test-agent-"],
+				[dirs.logDir, "gjc-test-logs-"],
+			] as const) {
+				expect(path.dirname(path.resolve(dir))).toBe(path.resolve(tempRoot));
+				expect(path.basename(dir).startsWith(prefix)).toBe(true);
+				expect(fs.existsSync(dir)).toBe(false);
+			}
+		} finally {
+			try {
+				await fs.promises.rm(ownedRoot, { recursive: true, force: true });
+			} finally {
+				forgetOwnedRoot();
+			}
 		}
 	}, 30_000);
 
