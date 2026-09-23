@@ -208,7 +208,7 @@ export default class Index extends Command {
 			if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
 			assertMasterLaunchArgs(launchParsed);
 			if (
-				launchDefaultTmuxIfNeeded({
+				await launchDefaultTmuxIfNeeded({
 					parsed: launchParsed,
 					rawArgs: launch.args,
 					cwd: launch.cwd,

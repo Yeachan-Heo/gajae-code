@@ -179,6 +179,7 @@
 		"./config/model-bindings-applier.js": null,
 		"./config/model-discovery-manager": null,
 		"./config/model-discovery-manager.js": null,
+		"./gjc-runtime/managed-owner-admission": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts"

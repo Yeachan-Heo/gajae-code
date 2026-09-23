@@ -7,6 +7,7 @@ import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
+import { admitManagedOwnerPredecessorBeforeLaunch as admitManagedOwnerPredecessorInParent } from "./managed-owner-admission";
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
@@ -50,7 +51,6 @@ import {
 	resolveGjcTmuxProviderContext,
 } from "./tmux-common";
 import {
-	type AdmitPredecessorRequest,
 	captureOwnerGenerationBaselineSync,
 	classifyCgroup,
 	executeTmuxOwnerIsolationPlanSync,
@@ -63,7 +63,6 @@ import {
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
 	type TmuxServerProof,
-	tmuxOwnerIsolationBootstrapArgv,
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
@@ -118,13 +117,6 @@ export interface TmuxLaunchContext {
 	platform?: NodeJS.Platform;
 	tty?: TtyState;
 	spawnSync?: TmuxSpawnSync;
-	/** Test seam for observing the stdin-only trusted predecessor admission handoff. */
-	ownerPredecessorAdmissionRunner?: (input: {
-		command: string[];
-		cwd: string;
-		env: NodeJS.ProcessEnv;
-		stdinLine: string;
-	}) => TmuxSpawnResult;
 	/**
 	 * Provider authority boundaries. Production resolves, persists, and asserts
 	 * the durable psmux authority; tests may inject deterministic equivalents.
@@ -1289,7 +1281,10 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	rebuildManagedOwnerChildCommand(plan, context, stateDir, sessionId);
 }
 
-function admitManagedOwnerPredecessorBeforeLaunch(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+async function admitManagedOwnerPredecessorBeforeLaunch(
+	plan: TmuxLaunchPlan,
+	context: TmuxLaunchContext,
+): Promise<void> {
 	const predecessor = plan.ownerPredecessor;
 	if (!predecessor) return;
 	if (
@@ -1301,75 +1296,14 @@ function admitManagedOwnerPredecessorBeforeLaunch(plan: TmuxLaunchPlan, context:
 	)
 		throw new Error("managed_owner_predecessor_identity_unavailable");
 	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
-	const request: AdmitPredecessorRequest = {
-		schema_version: 1,
-		op: "admit_predecessor",
-		state_dir: stateDir,
+	await admitManagedOwnerPredecessorInParent({
+		stateDir,
 		cwd: plan.cwd,
-		session_id: predecessor.sessionId,
-		owner_generation: plan.ownerGeneration,
-		owner_run_id: plan.ownerRunId,
-		owner_incarnation: plan.ownerIncarnation,
-		predecessor_generation: predecessor.generation,
-		predecessor_run_id: predecessor.runId,
-		predecessor_incarnation: predecessor.incarnation,
-		predecessor_token: predecessor.predecessorToken,
-		transcript_path: context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
-	};
-	const stdinLine = JSON.stringify(request);
-	const helperEnvironment = { ...process.env, ...(context.env ?? {}) };
-	delete helperEnvironment[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
-	delete helperEnvironment.GJC_MANAGED_OWNER_CHILD_TOKEN;
-	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN;
-	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_GENERATION;
-	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_RUN_ID;
-	delete helperEnvironment.GJC_MANAGED_OWNER_PREDECESSOR_INCARNATION;
-	if (request.transcript_path) helperEnvironment.GJC_MANAGED_OWNER_TRANSCRIPT_PATH = request.transcript_path;
-	else delete helperEnvironment.GJC_MANAGED_OWNER_TRANSCRIPT_PATH;
-	const command = tmuxOwnerIsolationBootstrapArgv();
-	const result = context.ownerPredecessorAdmissionRunner?.({
-		command,
-		cwd: plan.cwd,
-		env: helperEnvironment,
-		stdinLine,
+		sessionId: predecessor.sessionId,
+		ownerGeneration: plan.ownerGeneration,
+		predecessor,
+		transcriptPath: context.env?.GJC_SESSION_FILE ?? process.env.GJC_SESSION_FILE ?? "",
 	});
-	const subprocess =
-		result ??
-		(() => {
-			const child = Bun.spawnSync({
-				cmd: command,
-				cwd: plan.cwd,
-				env: helperEnvironment,
-				stdin: Buffer.from(`${stdinLine}\n`),
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			return {
-				exitCode: child.exitCode,
-				stdout: Buffer.from(child.stdout).toString("utf8"),
-				stderr: Buffer.from(child.stderr).toString("utf8"),
-			};
-		})();
-	if (subprocess.exitCode !== 0) throw new Error("managed_owner_predecessor_admission_failed");
-	const responseText = subprocess.stdout ?? "";
-	if (Buffer.byteLength(responseText) > 16 * 1024 || !responseText.endsWith("\n"))
-		throw new Error("managed_owner_predecessor_admission_failed");
-	try {
-		const response: unknown = JSON.parse(responseText.slice(0, -1));
-		if (
-			!response ||
-			typeof response !== "object" ||
-			Array.isArray(response) ||
-			Object.keys(response).sort().join(",") !== "code,disposition,ok,schema_version" ||
-			(response as Record<string, unknown>).schema_version !== 1 ||
-			(response as Record<string, unknown>).ok !== true ||
-			(response as Record<string, unknown>).code !== "predecessor_admitted" ||
-			(response as Record<string, unknown>).disposition !== "resume"
-		)
-			throw new Error("managed_owner_predecessor_admission_failed");
-	} catch {
-		throw new Error("managed_owner_predecessor_admission_failed");
-	}
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
@@ -1581,7 +1515,7 @@ function emitOptionalProfileDiagnostics(profile: GjcTmuxProfileResult, diagnosti
 	}
 }
 
-export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
+export async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Promise<boolean> {
 	const env = context.env ?? process.env;
 	// Planning performs only applicability checks. It must precede both the ambient
 	// window rename and provider refusal so inapplicable root launches reach main
@@ -1886,7 +1820,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		return true;
 	}
 	try {
-		admitManagedOwnerPredecessorBeforeLaunch(plan, context);
+		await admitManagedOwnerPredecessorBeforeLaunch(plan, context);
 	} catch (error) {
 		cleanupCoordinatorSidecarBootstrap(plan);
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner predecessor admission failed: ${String(error)}`);

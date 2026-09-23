@@ -46,6 +46,7 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
+import { admitManagedOwnerPredecessorBeforeLaunch } from "../../src/gjc-runtime/managed-owner-admission";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -53,28 +54,6 @@ function args(overrides: Partial<Args> = {}): Args {
 		fileArgs: [],
 		unknownFlags: new Map(),
 		...overrides,
-	};
-}
-
-function runPredecessorAdmissionHelper(input: { cwd: string; env: NodeJS.ProcessEnv; stdinLine: string }): {
-	exitCode: number | null;
-	stdout: string;
-	stderr: string;
-} {
-	const cliModule = new URL("../../src/gjc-runtime/tmux-owner-isolation-cli.ts", import.meta.url).href;
-	const source = `import { runTmuxOwnerIsolationCli } from ${JSON.stringify(cliModule)}; const input = await new Response(Bun.stdin.stream()).text(); const response = await runTmuxOwnerIsolationCli(input); process.stdout.write(response + "\\n"); if (JSON.parse(response).ok !== true) process.exitCode = 1;`;
-	const child = Bun.spawnSync({
-		cmd: [process.execPath, "-e", source],
-		cwd: input.cwd,
-		env: input.env,
-		stdin: Buffer.from(`${input.stdinLine}\n`),
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	return {
-		exitCode: child.exitCode,
-		stdout: Buffer.from(child.stdout).toString("utf8"),
-		stderr: Buffer.from(child.stderr).toString("utf8"),
 	};
 }
 
@@ -144,11 +123,11 @@ function launchContext(context: TmuxLaunchContext): TmuxLaunchContext {
 	};
 }
 
-function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
+async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Promise<boolean> {
 	let createdSessionName = context.env?.GJC_TMUX_SESSION;
 	const suppliedSpawnSync = context.spawnSync;
 	const psmuxMetadata = new Map<string, string>();
-	return launchDefaultTmuxIfNeededRaw(
+	return await launchDefaultTmuxIfNeededRaw(
 		launchContext({
 			...context,
 			providerAuthorityResolver:
@@ -266,7 +245,7 @@ afterAll(() => {
 const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 afterEach(() => {
-	process.exitCode = undefined;
+	process.exitCode = 0;
 	__setTmuxProviderAuthorityPlatformForTests(null);
 });
 
@@ -279,7 +258,7 @@ function stderrError(code: string): Error {
 describe("default GJC tmux launch", () => {
 	afterEach(() => {
 		process.stderr.write = originalStderrWrite;
-		process.exitCode = undefined;
+		process.exitCode = 0;
 		vi.restoreAllMocks();
 	});
 
@@ -320,9 +299,9 @@ describe("default GJC tmux launch", () => {
 		expect(buildGjcTmuxWindowTitle("/tmp/...", "feature/demo")).toBe("GJC-gjc-feature/demo");
 	});
 
-	it("passes sanitized dot-prefixed cwd basenames to tmux rename-window", () => {
+	it("passes sanitized dot-prefixed cwd basenames to tmux rename-window", async () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/tmp/.claude",
@@ -351,11 +330,11 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
-	it("configures the tmux client terminal title before managed attach", () => {
+	it("configures the tmux client terminal title before managed attach", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
 
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -399,10 +378,10 @@ describe("default GJC tmux launch", () => {
 		expect(calls.some(call => call.args[3] === "set-titles" && call.args[4] === "on")).toBe(true);
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
-	it("uses the live tmux session name for already renamed managed sessions", () => {
+	it("uses the live tmux session name for already renamed managed sessions", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
 			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
@@ -429,9 +408,9 @@ describe("default GJC tmux launch", () => {
 		]);
 	});
 
-	it("stores literal fallback titles outside the tmux title format", () => {
+	it("stores literal fallback titles outside the tmux title format", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -460,10 +439,10 @@ describe("default GJC tmux launch", () => {
 		);
 	});
 
-	it("honors title opt-out while launching managed tmux", () => {
+	it("honors title opt-out while launching managed tmux", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true, noTitle: true }),
 			rawArgs: ["--tmux", "--no-title", "hello world"],
 			cwd: "/repo",
@@ -488,10 +467,10 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
-	it("honors PI_NO_TITLE while launching managed tmux", () => {
+	it("honors PI_NO_TITLE while launching managed tmux", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -516,9 +495,9 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).not.toHaveBeenCalled();
 	});
 
-	it("quotes identity-guarded tmux window titles as one command argument", () => {
+	it("quotes identity-guarded tmux window titles as one command argument", async () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
 			rawArgs: ["hello world"],
 			cwd: "/tmp/-repo",
@@ -672,12 +651,12 @@ describe("default GJC tmux launch", () => {
 		}
 	}
 
-	it("never writes the coordinator sidecar bootstrap key when tmux is unavailable", () => {
+	it("never writes the coordinator sidecar bootstrap key when tmux is unavailable", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-unavailable-"));
 		try {
 			const diagnostics: string[] = [];
 			const writeSpy = spyOn(fs, "writeFileSync");
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -701,7 +680,7 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("never writes the coordinator sidecar bootstrap key when attaching an existing session", () => {
+	it("never writes the coordinator sidecar bootstrap key when attaching an existing session", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-attach-"));
 		try {
 			const calls: string[][] = [];
@@ -716,7 +695,7 @@ describe("default GJC tmux launch", () => {
 				return spawnResult(0, "");
 			}) as unknown as typeof Bun.spawnSync);
 			const writeSpy = spyOn(fs, "writeFileSync");
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true, continue: true }),
 				rawArgs: ["--tmux", "--continue", "hello"],
 				cwd: root,
@@ -746,7 +725,7 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("scrubs the coordinator sidecar bootstrap key when the second attach proof fails", () => {
+	it("scrubs the coordinator sidecar bootstrap key when the second attach proof fails", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-second-proof-"));
 		try {
 			const calls: string[][] = [];
@@ -765,7 +744,7 @@ describe("default GJC tmux launch", () => {
 				return spawnResult(0, "");
 			}) as unknown as typeof Bun.spawnSync);
 			const writeSpy = spyOn(fs, "writeFileSync");
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true, continue: true }),
 				rawArgs: ["--tmux", "--continue", "hello"],
 				cwd: root,
@@ -795,11 +774,11 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("uses a one-shot coordinator sidecar bootstrap endpoint only for the launching managed owner", () => {
+	it("uses a one-shot coordinator sidecar bootstrap endpoint only for the launching managed owner", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-launch-"));
 		try {
 			let commandBootstrapPath: string | undefined;
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -978,9 +957,9 @@ describe("default GJC tmux launch", () => {
 		expect(plan).toBeUndefined();
 	});
 
-	it("keeps a newly created managed tmux window in automatic sizing mode before attaching", () => {
+	it("keeps a newly created managed tmux window in automatic sizing mode before attaching", async () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -1019,11 +998,11 @@ describe("default GJC tmux launch", () => {
 		expect(calls[setWindowSizeIndex]?.args).toEqual(["set-window-option", "-t", "$0:", "window-size", "latest"]);
 	});
 
-	it("creates a managed psmux session through the injected provider authority", () => {
+	it("creates a managed psmux session through the injected provider authority", async () => {
 		const calls: string[][] = [];
 		try {
 			expect(
-				launchDefaultTmuxIfNeeded({
+				await launchDefaultTmuxIfNeeded({
 					parsed: args({ messages: ["hello world"], tmux: true }),
 					rawArgs: ["--tmux", "hello world"],
 					cwd: "/repo",
@@ -1069,10 +1048,10 @@ describe("default GJC tmux launch", () => {
 	it.each([
 		["dropped", () => ({ exitCode: 1, stderr: "option missing" })],
 		["changed", () => ({ exitCode: 0, stdout: "unexpected" })],
-	] as const)("rejects %s required psmux ownership metadata before attach", (_case, metadataReadback) => {
+	] as const)("rejects %s required psmux ownership metadata before attach", async (_case, metadataReadback) => {
 		const calls: string[][] = [];
 		const diagnostics: string[] = [];
-		launchDefaultTmuxIfNeeded({
+		await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: ["--tmux"],
 			cwd: "/repo",
@@ -1102,11 +1081,11 @@ describe("default GJC tmux launch", () => {
 		"GJC_COORDINATOR_SESSION_BRANCH",
 		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
 		"GJC_COORDINATOR_SESSION_READINESS_FILE",
-	])("manages psmux when %s is the only lifecycle marker", markerName => {
+	])("manages psmux when %s is the only lifecycle marker", async markerName => {
 		const calls: string[][] = [];
 		try {
 			expect(
-				launchDefaultTmuxIfNeeded({
+				await launchDefaultTmuxIfNeeded({
 					parsed: args({ tmux: true }),
 					rawArgs: ["--tmux"],
 					cwd: "/repo",
@@ -1132,11 +1111,11 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("refuses an explicit psmux continuation without durable managed authority", () => {
+	it("refuses an explicit psmux continuation without durable managed authority", async () => {
 		const calls: string[][] = [];
 		const diagnostics: string[] = [];
 		try {
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: "/repo",
@@ -1161,7 +1140,7 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("preserves an unmanaged psmux session when foreground creation fails", () => {
+	it("preserves an unmanaged psmux session when foreground creation fails", async () => {
 		const results = [
 			{ exitCode: 1, stderr: "no server running" },
 			{ exitCode: 1, stderr: "create failed" },
@@ -1170,7 +1149,7 @@ describe("default GJC tmux launch", () => {
 		const calls: string[][] = [];
 		const diagnostics: string[] = [];
 		try {
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ tmux: true }),
 				rawArgs: ["--tmux"],
 				cwd: "/repo",
@@ -1206,12 +1185,12 @@ describe("default GJC tmux launch", () => {
 		["list models", args({ tmux: true, listModels: true }), ["--tmux", "--list-models"], {}, false],
 		["direct policy", args({ tmux: true }), ["--tmux", "hello"], { GJC_LAUNCH_POLICY: "direct" }, false],
 		["already launched", args({ tmux: true }), ["--tmux", "hello"], { [GJC_TMUX_LAUNCHED_ENV]: "1" }, false],
-	])("leaves psmux root launch unhandled when %s", (_label, parsed, rawArgs, extraEnv, expectedHandled) => {
+	])("leaves psmux root launch unhandled when %s", async (_label, parsed, rawArgs, extraEnv, expectedHandled) => {
 		const calls: string[][] = [];
 		const diagnostics: string[] = [];
 		try {
 			expect(
-				launchDefaultTmuxIfNeeded({
+				await launchDefaultTmuxIfNeeded({
 					parsed,
 					rawArgs,
 					cwd: "/repo",
@@ -1316,9 +1295,9 @@ describe("default GJC tmux launch", () => {
 		).toThrow("Bun virtual paths and PATH fallback are not accepted");
 	});
 
-	it("does not implicitly attach existing tagged session for plain worktree branch launch", () => {
+	it("does not implicitly attach existing tagged session for plain worktree branch launch", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -1343,9 +1322,9 @@ describe("default GJC tmux launch", () => {
 		);
 	});
 
-	it("explicit continue attaches existing tagged session for matching worktree branch", () => {
+	it("explicit continue attaches existing tagged session for matching worktree branch", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
 			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
@@ -1368,11 +1347,11 @@ describe("default GJC tmux launch", () => {
 		expect(calls.at(-1)?.args).toEqual(["attach-session", "-t", "=gajae_code_feature"]);
 	});
 
-	it("refuses psmux before existing-session attach", () => {
+	it("refuses psmux before existing-session attach", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
 		expect(
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
 				rawArgs: ["--tmux", "--continue", "hello world"],
 				cwd: "/repo",
@@ -1395,9 +1374,9 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics.length).toBeGreaterThan(0);
 	});
 
-	it("value-less resume launches inner picker instead of attaching an existing tagged session", () => {
+	it("value-less resume launches inner picker instead of attaching an existing tagged session", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true, resume: true }),
 			rawArgs: ["--tmux", "--resume"],
 			cwd: "/repo",
@@ -1443,9 +1422,9 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.innerCommand).toContain("abc123");
 	});
 
-	it("falls through to a fresh session when existing tagged session attach fails", () => {
+	it("falls through to a fresh session when existing tagged session attach fails", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true, continue: true }),
 			rawArgs: ["--tmux", "--continue", "hello world"],
 			cwd: "/repo",
@@ -1641,7 +1620,7 @@ describe("default GJC tmux launch", () => {
 		expect(plan?.project).toBe("/repo/worktree-b");
 	});
 
-	it("cleans up a newly created managed session when attach fails", () => {
+	it("cleans up a newly created managed session when attach fails", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
 		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
@@ -1650,7 +1629,7 @@ describe("default GJC tmux launch", () => {
 		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
 
 		try {
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ tmux: true }),
 				rawArgs: [],
 				cwd: "/repo",
@@ -1681,7 +1660,7 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("omits the server PID guard clause when cleaning up on a platform that cannot prove it", () => {
+	it("omits the server PID guard clause when cleaning up on a platform that cannot prove it", async () => {
 		// The non-Linux server probe reports a placeholder PID. Exact cleanup
 		// therefore cannot prove the original server and must preserve the
 		// provisional session rather than dispatching an unguarded destruction.
@@ -1692,7 +1671,7 @@ describe("default GJC tmux launch", () => {
 		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
 
 		try {
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ tmux: true }),
 				rawArgs: [],
 				cwd: "/repo",
@@ -1881,9 +1860,9 @@ describe("default GJC tmux launch", () => {
 		).toBeUndefined();
 	});
 
-	it("renames the originating tmux window through an identity and index guard", () => {
+	it("renames the originating tmux window through an identity and index guard", async () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
 			rawArgs: ["hello world"],
 			cwd: "/repo",
@@ -1924,7 +1903,7 @@ describe("default GJC tmux launch", () => {
 		});
 	});
 
-	it("preserves tmux window names when the originating pane identity cannot be proven", () => {
+	it("preserves tmux window names when the originating pane identity cannot be proven", async () => {
 		const cases = [
 			{ name: "missing pane", env: { TMUX: "/tmp/tmux" }, stdout: "%7\t@3\t2" },
 			{ name: "pane mismatch", env: { TMUX: "/tmp/tmux", TMUX_PANE: "%7" }, stdout: "%8\t@3\t2" },
@@ -1934,7 +1913,7 @@ describe("default GJC tmux launch", () => {
 
 		for (const testCase of cases) {
 			const calls: string[][] = [];
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello world"] }),
 				rawArgs: ["hello world"],
 				cwd: "/repo",
@@ -1964,7 +1943,7 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it.skipIf(!nativeTmux)("keeps real tmux renames on the originating window and refuses index drift", () => {
+	it.skipIf(!nativeTmux)("keeps real tmux renames on the originating window and refuses index drift", async () => {
 		const tmuxCommand = nativeTmux;
 		if (!tmuxCommand) throw new Error("tmux unavailable");
 		const socket = `gjc-rename-${process.pid}-${Date.now()}`;
@@ -1993,8 +1972,8 @@ describe("default GJC tmux launch", () => {
 				.trim();
 			let moveAfterProbe = false;
 
-			const invokeDirectLaunch = (branch: string): void => {
-				const handled = launchDefaultTmuxIfNeeded({
+			const invokeDirectLaunch = async (branch: string): Promise<void> => {
+				const handled = await launchDefaultTmuxIfNeeded({
 					parsed: args({ messages: ["hello world"] }),
 					rawArgs: ["hello world"],
 					cwd: "/repo",
@@ -2023,7 +2002,7 @@ describe("default GJC tmux launch", () => {
 				expect(handled).toBe(false);
 			};
 
-			invokeDirectLaunch("feature/demo';kill-window");
+			await invokeDirectLaunch("feature/demo';kill-window");
 			expect(
 				requireSuccess(["display-message", "-p", "-t", windowId, "#{window_name}"]).stdout.toString().trim(),
 			).toBe("GJC-repo-feature/demo';kill-window");
@@ -2033,7 +2012,7 @@ describe("default GJC tmux launch", () => {
 
 			requireSuccess(["rename-window", "-t", windowId, "--", "origin"]);
 			moveAfterProbe = true;
-			invokeDirectLaunch("feature/drift");
+			await invokeDirectLaunch("feature/drift");
 
 			expect(
 				requireSuccess(["display-message", "-p", "-t", windowId, "#{window_index}\t#{window_name}"])
@@ -2048,9 +2027,9 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("does not rename direct launches already inside a GJC-launched tmux wrapper", () => {
+	it("does not rename direct launches already inside a GJC-launched tmux wrapper", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"] }),
 			rawArgs: ["hello world"],
 			cwd: "/repo",
@@ -2075,7 +2054,7 @@ describe("default GJC tmux launch", () => {
 		expect(calls).toEqual([]);
 	});
 
-	it("skips direct tmux rename when guard conditions are not met", () => {
+	it("skips direct tmux rename when guard conditions are not met", async () => {
 		const cases = [
 			{
 				name: "non-interactive",
@@ -2099,7 +2078,7 @@ describe("default GJC tmux launch", () => {
 
 		for (const testCase of cases) {
 			const calls: Array<{ command: string; args: string[] }> = [];
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: testCase.parsed,
 				rawArgs: ["hello world"],
 				cwd: "/repo",
@@ -2121,9 +2100,9 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("renames managed tmux windows after creating the session", () => {
+	it("renames managed tmux windows after creating the session", async () => {
 		const calls: Array<{ command: string; args: string[]; options: TmuxSpawnOptions }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -2149,14 +2128,14 @@ describe("default GJC tmux launch", () => {
 		expect(renameIndex).toBeGreaterThan(newSessionIndex);
 		expect(calls[renameIndex]?.args).toEqual(["rename-window", "-t", "$0", "--", "GJC-repo-feature/demo"]);
 	});
-	it("falls through to direct launch when session creation fails", () => {
+	it("falls through to direct launch when session creation fails", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const stdout = process.stdout as typeof process.stdout & { isTTY?: boolean };
 		const previousIsTTY = stdout.isTTY;
 		const writeSpy = spyOn(process.stdout, "write").mockImplementation(() => true);
 		Object.defineProperty(stdout, "isTTY", { configurable: true, value: true });
 		try {
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ tmux: true }),
 				rawArgs: [],
 				cwd: "/repo",
@@ -2183,10 +2162,10 @@ describe("default GJC tmux launch", () => {
 		}
 	});
 
-	it("handles and reports partial launch when required profile tagging fails", () => {
+	it("handles and reports partial launch when required profile tagging fails", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2214,10 +2193,10 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0].length).toBeLessThan(320);
 	});
 
-	it("continues root launch when non-ownership metadata tagging fails", () => {
+	it("continues root launch when non-ownership metadata tagging fails", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2252,10 +2231,10 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics).toEqual(["optional tmux profile command failed"]);
 	});
 
-	it("handles and reports partial launch when attach fails after profile succeeds", () => {
+	it("handles and reports partial launch when attach fails after profile succeeds", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2284,10 +2263,10 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0].length).toBeLessThan(320);
 	});
 
-	it("preserves a newly created managed session when attach reports SSH disconnect EIO", () => {
+	it("preserves a newly created managed session when attach reports SSH disconnect EIO", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2319,10 +2298,10 @@ describe("default GJC tmux launch", () => {
 	it.each([
 		"attach failed: EIO",
 		"write /dev/tty: input/output error",
-	])("recognizes exact tmux attach disconnect diagnostics: %s", stderr => {
+	])("recognizes exact tmux attach disconnect diagnostics: %s", async stderr => {
 		const diagnostics: string[] = [];
 		const calls: string[][] = [];
-		launchDefaultTmuxIfNeeded({
+		await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2351,10 +2330,10 @@ describe("default GJC tmux launch", () => {
 		"xEIO",
 		"input/output errors",
 		"preinput/output error",
-	])("does not mistake a partial tmux attach disconnect diagnostic for EIO: %s", stderr => {
+	])("does not mistake a partial tmux attach disconnect diagnostic for EIO: %s", async stderr => {
 		const diagnostics: string[] = [];
 		const calls: string[][] = [];
-		launchDefaultTmuxIfNeeded({
+		await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2379,10 +2358,10 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0]).not.toContain("attach disconnected");
 	});
 
-	it("strips terminal controls and bounds multibyte tmux diagnostics", () => {
+	it("strips terminal controls and bounds multibyte tmux diagnostics", async () => {
 		const diagnostics: string[] = [];
 		const detail = `before\x1b[31mred\x1b[0m\x1b]52;c;secret\x07\u009b31m\u009dhidden\x07\n${"😀".repeat(300)}`;
-		launchDefaultTmuxIfNeeded({
+		await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2408,12 +2387,12 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostic.endsWith("\n")).toBe(true);
 	});
 
-	it("does not throw when reporting attach disconnect EIO to closed stderr", () => {
+	it("does not throw when reporting attach disconnect EIO to closed stderr", async () => {
 		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
 			throw stderrError("EIO");
 		});
 
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2435,10 +2414,10 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).toHaveBeenCalledWith(process.stderr.fd, expect.stringContaining("attach disconnected"));
 	});
 
-	it("preserves a newly created managed session when attach receives SIGHUP", () => {
+	it("preserves a newly created managed session when attach receives SIGHUP", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2466,10 +2445,10 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
 	});
 
-	it("preserves a live newly created managed session when attach exits after PTY close", () => {
+	it("preserves a live newly created managed session when attach exits after PTY close", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2498,12 +2477,12 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0]).toStartWith("gjc --tmux failed after creating tmux session: attach disconnected.");
 	});
 
-	it("does not throw when the default tmux diagnostic write hits a closed stderr", () => {
+	it("does not throw when the default tmux diagnostic write hits a closed stderr", async () => {
 		const writeSpy = spyOn(fs, "writeSync").mockImplementation(() => {
 			throw stderrError("EIO");
 		});
 
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ tmux: true }),
 			rawArgs: [],
 			cwd: "/repo",
@@ -2525,10 +2504,10 @@ describe("default GJC tmux launch", () => {
 		expect(writeSpy).toHaveBeenCalledWith(process.stderr.fd, expect.stringContaining("attach failed"));
 	});
 
-	it("treats explicit --tmux unavailability as a terminal handled failure", () => {
+	it("treats explicit --tmux unavailability as a terminal handled failure", async () => {
 		const diagnostics: string[] = [];
 		const calls: string[][] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -2598,9 +2577,9 @@ describe("default GJC tmux launch", () => {
 		expect(diagnostics[0]).toContain("GJC_TMUX_COMMAND");
 	});
 
-	it("applies session-scoped mouse scrolling when launching tmux on WSL/Linux", () => {
+	it("applies session-scoped mouse scrolling when launching tmux on WSL/Linux", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -2631,9 +2610,9 @@ describe("default GJC tmux launch", () => {
 		expect(calls.flatMap(call => call.args)).not.toContain("-g");
 	});
 
-	it("honors GJC_MOUSE=off on WSL/Linux without disabling the rest of the profile", () => {
+	it("honors GJC_MOUSE=off on WSL/Linux without disabling the rest of the profile", async () => {
 		const calls: { command: string; args: string[]; options: TmuxSpawnOptions }[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -2707,7 +2686,7 @@ it("emits a BOM-less UTF-16LE encoded command and a direct `&` invocation for na
 	expect(script).toContain("Set-Content -LiteralPath");
 });
 
-it("captures psmux stderr in the attach-failed diagnostic", () => {
+it("captures psmux stderr in the attach-failed diagnostic", async () => {
 	// exit when attach-session fails. The previous defaultSpawnSync dropped
 	// Bun.spawnSync's result.stderr, so the "attach failed" diagnostic
 	// template rendered with an empty detail and the user could not
@@ -2716,7 +2695,7 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 	// emits the captured text so future regressions in the same lane are
 	// diagnosable from the test surface alone.
 	const diagnostics: string[] = [];
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -2754,7 +2733,7 @@ it("captures psmux stderr in the attach-failed diagnostic", () => {
 	expect(diagnostics[0]).toContain("cannot create session");
 });
 
-it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windows", () => {
+it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windows", async () => {
 	// Regression: when gjc.cmd / gjc.bat on PATH has been overwritten with
 	// PE-binary garbage (a 194MB PE image or similar), cmd.exe hangs reading
 	// it as text and the user sees a silent exit. The wrapper-corruption
@@ -2773,7 +2752,7 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 	process.env.PATH = dir + path.delimiter + (originalPath ?? "");
 	try {
 		const diagnostics: string[] = [];
-		launchDefaultTmuxIfNeeded({
+		await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
 			cwd: "/repo",
@@ -2811,7 +2790,7 @@ it("surfaces a wrapper-corruption warning in the new-session diagnostic on Windo
 	}
 });
 
-it("pipes default control-command stderr while preserving interactive attach stderr", () => {
+it("pipes default control-command stderr while preserving interactive attach stderr", async () => {
 	const calls: Array<{ cmd: string[]; stderr: string }> = [];
 	const diagnostics: string[] = [];
 	let createdSessionName = "";
@@ -2827,7 +2806,7 @@ it("pipes default control-command stderr while preserving interactive attach std
 		if (command.at(-1) === "#{session_id}\t#{session_name}") return spawnResult(0, `$0\t${createdSessionName}`);
 		return spawnResult(0, "");
 	});
-	const handled = launchDefaultTmuxIfNeededRaw({
+	const handled = await launchDefaultTmuxIfNeededRaw({
 		parsed: args({ messages: ["hello"], tmux: true }),
 		rawArgs: ["--tmux", "hello"],
 		cwd: launchTestRoot,
@@ -2856,10 +2835,10 @@ it("pipes default control-command stderr while preserving interactive attach std
 	expect(diagnostics.join("\n")).not.toContain("\u001b]");
 });
 
-it("preserves a native Linux registration probe failure without retrying or cleaning up", () => {
+it("preserves a native Linux registration probe failure without retrying or cleaning up", async () => {
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const diagnostics: string[] = [];
-	const result = launchDefaultTmuxIfNeeded({
+	const result = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -2888,10 +2867,10 @@ it("preserves a native Linux registration probe failure without retrying or clea
 	]);
 });
 
-it("preserves a native Linux profile failure without retrying or cleaning up", () => {
+it("preserves a native Linux profile failure without retrying or cleaning up", async () => {
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const diagnostics: string[] = [];
-	const result = launchDefaultTmuxIfNeeded({
+	const result = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -2918,10 +2897,10 @@ it("preserves a native Linux profile failure without retrying or cleaning up", (
 	expect(diagnostics).toEqual([expect.stringContaining("profile tagging failed. native profile failed")]);
 });
 
-it("launches psmux through its managed provider namespace", () => {
+it("launches psmux through its managed provider namespace", async () => {
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const diagnostics: string[] = [];
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -2944,7 +2923,7 @@ it("launches psmux through its managed provider namespace", () => {
 	expect(calls.some(call => call.command === "attach-session")).toBe(true);
 	expect(diagnostics).toEqual([]);
 });
-it("rebuilds the managed owner command with the canonical psmux authority executable", () => {
+it("rebuilds the managed owner command with the canonical psmux authority executable", async () => {
 	__setTmuxProviderAuthorityPlatformForTests("win32");
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const metadata = new Map<string, string>();
@@ -2952,7 +2931,7 @@ it("rebuilds the managed owner command with the canonical psmux authority execut
 	const canonicalCommand = "C:\\canonical\\psmux.exe";
 	let createdSessionName: string | undefined;
 	let authorityInputCommand: string | undefined;
-	const handled = launchDefaultTmuxIfNeededRaw(
+	const handled = await launchDefaultTmuxIfNeededRaw(
 		launchContext({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
@@ -3011,13 +2990,13 @@ it("rebuilds the managed owner command with the canonical psmux authority execut
 	expect(script).toContain(`$env:GJC_TMUX_OWNER_SERVER_KEY = '${canonicalCommand}'`);
 	expect(metadata.get("@gjc-owner-server-key")).toBe(canonicalCommand);
 });
-it("provisions psmux authority before generation publication and verifies later namespaced commands", () => {
+it("provisions psmux authority before generation publication and verifies later namespaced commands", async () => {
 	const events: string[] = [];
 	const calls: string[][] = [];
 	const namespace = "gjc-test-000000000000000000000000000000000000";
 	let createdSessionName: string | undefined;
 	const metadata = new Map<string, string>();
-	const handled = launchDefaultTmuxIfNeededRaw(
+	const handled = await launchDefaultTmuxIfNeededRaw(
 		launchContext({
 			parsed: args({ messages: ["hello world"], tmux: true }),
 			rawArgs: ["--tmux", "hello world"],
@@ -3067,13 +3046,13 @@ it("provisions psmux authority before generation publication and verifies later 
 	expect(events.at(-1)).toBe("assert");
 	expect(metadata.get("@gjc-psmux-incarnation")).toMatch(/^[0-9a-f-]{36}$/);
 });
-it("does not recreate a published psmux session after attach recovery finds it missing", () => {
+it("does not recreate a published psmux session after attach recovery finds it missing", async () => {
 	const calls: string[][] = [];
 	const diagnostics: string[] = [];
 	let published = false;
 	let attachAttempted = false;
 	let sessionTarget = "";
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -3116,11 +3095,11 @@ it("does not recreate a published psmux session after attach recovery finds it m
 		"tmux attach recovery found the published session missing; preserving lifecycle state without recreation.\n",
 	]);
 });
-it("does not retry attach recovery when published psmux metadata no longer proves ownership", () => {
+it("does not retry attach recovery when published psmux metadata no longer proves ownership", async () => {
 	const calls: string[][] = [];
 	const diagnostics: string[] = [];
 	let attachAttempted = false;
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -3150,7 +3129,7 @@ it("does not retry attach recovery when published psmux metadata no longer prove
 		"tmux created session proof failed after attach recovery probe; preserving session without attach.\n",
 	]);
 });
-it("keeps a failed provisional authority publication inactive and permits a retry without a predecessor", () => {
+it("keeps a failed provisional authority publication inactive and permits a retry without a predecessor", async () => {
 	const events: string[] = [];
 	const stateFile = path.join(launchTestRoot, "failed-provisional-authority-retry.json");
 	const lifecycleRoot = path.join(path.dirname(stateFile), TEST_SESSION_ID, "owner-lifecycle");
@@ -3186,11 +3165,11 @@ it("keeps a failed provisional authority publication inactive and permits a retr
 			spawnSync: () => ({ exitCode: 0, stdout: "" }),
 		});
 
-	expect(launchDefaultTmuxIfNeeded(context())).toBe(true);
+	expect(await launchDefaultTmuxIfNeeded(context())).toBe(true);
 	expect(fs.existsSync(path.join(lifecycleRoot, "generation.json"))).toBe(false);
 	expect(events).toEqual(["authority-write"]);
 
-	expect(launchDefaultTmuxIfNeeded(context())).toBe(true);
+	expect(await launchDefaultTmuxIfNeeded(context())).toBe(true);
 	const generation = JSON.parse(fs.readFileSync(path.join(lifecycleRoot, "generation.json"), "utf8")) as {
 		predecessor?: unknown;
 	};
@@ -3199,9 +3178,9 @@ it("keeps a failed provisional authority publication inactive and permits a retr
 	expect(events).toContain("assert");
 });
 
-it("does not retry a native tmux attach os error 10061", () => {
+it("does not retry a native tmux attach os error 10061", async () => {
 	const calls: string[][] = [];
-	launchDefaultTmuxIfNeeded({
+	await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -3225,9 +3204,9 @@ it("does not retry a native tmux attach os error 10061", () => {
 	expect(calls.filter(call => call[0] === "new-session")).toHaveLength(1);
 });
 
-it("uses the captured native session ID for every post-create target", () => {
+it("uses the captured native session ID for every post-create target", async () => {
 	const calls: string[][] = [];
-	launchDefaultTmuxIfNeeded({
+	await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -3266,10 +3245,10 @@ it.each([
 	["unverifiable", { state: "unverifiable" as const }],
 	["incomplete", { state: "safe" as const, pid: 1, cgroup: { classification: "safe" as const } }],
 	["changed", { state: "safe" as const, pid: 2, startTime: "1", cgroup: { classification: "safe" as const } }],
-])("surfaces %s cleanup proof uncertainty without killing the created session", (_label, uncertainProof) => {
+])("surfaces %s cleanup proof uncertainty without killing the created session", async (_label, uncertainProof) => {
 	const calls: string[][] = [];
 	let probeCount = 0;
-	launchDefaultTmuxIfNeeded({
+	await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello"], tmux: true }),
 		rawArgs: ["--tmux", "hello"],
 		cwd: launchTestRoot,
@@ -3309,10 +3288,10 @@ it.each([
 	"not-a-session-id",
 	"$0 trailing",
 	"$-1",
-])("fails closed and preserves a native session when new-session stdout is %p", stdout => {
+])("fails closed and preserves a native session when new-session stdout is %p", async stdout => {
 	const calls: string[][] = [];
 	const diagnostics: string[] = [];
-	const handled = launchDefaultTmuxIfNeeded({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello world"], tmux: true }),
 		rawArgs: ["--tmux", "hello world"],
 		cwd: "/repo",
@@ -3346,7 +3325,7 @@ describe("tmux owner isolation launch gate", () => {
 		__setMutationServerProofForTests(null);
 	});
 
-	it("fails closed when a simulated Linux server probe cannot establish host identity", () => {
+	it("fails closed when a simulated Linux server probe cannot establish host identity", async () => {
 		const previousPlatform = Object.getOwnPropertyDescriptor(process, "platform");
 		Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
 		const calls: string[][] = [];
@@ -3357,7 +3336,7 @@ describe("tmux owner isolation launch gate", () => {
 			if (command[0] === "systemd-run") return spawnResult(1, "", "scoped bootstrap intentionally stopped");
 			return spawnResult(1, "", "unexpected command");
 		});
-		const handled = launchDefaultTmuxIfNeededRaw({
+		const handled = await launchDefaultTmuxIfNeededRaw({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
 			cwd: launchTestRoot,
@@ -3380,7 +3359,7 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls.some(command => command[0] === "systemd-run")).toBe(false);
 	});
 
-	it("persists scoped launch capabilities exclusively at mode 0600 and fsyncs the file and parent directory", () => {
+	it("persists scoped launch capabilities exclusively at mode 0600 and fsyncs the file and parent directory", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-attempt-"));
 		const opened: Array<{ file: fs.PathOrFileDescriptor; flags: string | number; mode?: string | number }> = [];
 		const originalOpenSync = fs.openSync;
@@ -3396,7 +3375,7 @@ describe("tmux owner isolation launch gate", () => {
 					? spawnResult(1, "", "no server running")
 					: spawnResult(1, "", "scoped bootstrap intentionally stopped");
 			});
-			launchDefaultTmuxIfNeededRaw({
+			await launchDefaultTmuxIfNeededRaw({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -3426,7 +3405,7 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("fails closed rather than overwriting an existing scoped launch capability", () => {
+	it("fails closed rather than overwriting an existing scoped launch capability", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-attempt-"));
 		const diagnostics: string[] = [];
 		const originalOpenSync = fs.openSync;
@@ -3439,7 +3418,7 @@ describe("tmux owner isolation launch gate", () => {
 				}
 				return originalOpenSync(file, flags, mode);
 			});
-			const handled = launchDefaultTmuxIfNeededRaw({
+			const handled = await launchDefaultTmuxIfNeededRaw({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -3470,10 +3449,10 @@ describe("tmux owner isolation launch gate", () => {
 		],
 		["unverifiable", { state: "unverifiable" as const }, "server_unverifiable"],
 		["malformed safe", { state: "safe" as const }, "server_unverifiable"],
-	])("rejects a %s Linux target server before every tmux mutation", (_label, proof, diagnostic) => {
+	])("rejects a %s Linux target server before every tmux mutation", async (_label, proof, diagnostic) => {
 		const calls: string[][] = [];
 		const diagnostics: string[] = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
 			cwd: "/repo",
@@ -3510,10 +3489,10 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls.filter(call => mutatingCommands.has(call[0] ?? ""))).toEqual([]);
 	});
 
-	it("uses the scoped bootstrap receipt native ID for every post-create target", () => {
+	it("uses the scoped bootstrap receipt native ID for every post-create target", async () => {
 		const calls: Array<{ command: string; args: string[] }> = [];
 		let probeCount = 0;
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
 			cwd: launchTestRoot,
@@ -3570,9 +3549,9 @@ describe("tmux owner isolation launch gate", () => {
 	it.each([
 		'{"schema_version":1,"ok":true,"code":"bootstrapped","native_session_id":"$42"} trailing',
 		'{"schema_version":1,"ok":true,"code":"bootstrapped","native_session_id":"not-an-id"}',
-	])("does not mutate after a malformed scoped bootstrap receipt: %s", stdout => {
+	])("does not mutate after a malformed scoped bootstrap receipt: %s", async stdout => {
 		const calls: Array<{ command: string; args: string[] }> = [];
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true }),
 			rawArgs: ["--tmux", "hello"],
 			cwd: launchTestRoot,
@@ -3597,7 +3576,7 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls).toEqual([expect.objectContaining({ command: "systemd-run" })]);
 	});
 
-	it("does not title-mutate or attach an existing session after its server proof changes", () => {
+	it("does not title-mutate or attach an existing session after its server proof changes", async () => {
 		const calls: string[][] = [];
 		__setBinaryResolverForTests(candidate => (candidate === "tmux" ? "C:\\native\\tmux.exe" : null));
 		__setExecutableIdentityResolverForTests(() => "native-tmux");
@@ -3617,7 +3596,7 @@ describe("tmux owner isolation launch gate", () => {
 			if (command.includes("display-message")) return spawnResult(0, "$42\n");
 			return spawnResult(0, "");
 		});
-		const handled = launchDefaultTmuxIfNeeded({
+		const handled = await launchDefaultTmuxIfNeeded({
 			parsed: args({ messages: ["hello"], tmux: true, continue: true }),
 			rawArgs: ["--tmux", "--continue", "hello"],
 			cwd: launchTestRoot,
@@ -3721,10 +3700,10 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls.filter(call => call[1] === "kill-session")).toEqual([]);
 	});
 
-	it("refuses psmux before any existing-session mutation", () => {
+	it("refuses psmux before any existing-session mutation", async () => {
 		const calls: string[][] = [];
 		expect(
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true, continue: true }),
 				rawArgs: ["--tmux", "--continue", "hello"],
 				cwd: launchTestRoot,
@@ -3746,10 +3725,10 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls.some(call => call[0] === "attach-session")).toBe(false);
 	});
 
-	it("preserves a psmux session after attach failure without killing by reusable name", () => {
+	it("preserves a psmux session after attach failure without killing by reusable name", async () => {
 		const calls: string[][] = [];
 		expect(
-			launchDefaultTmuxIfNeeded({
+			await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: launchTestRoot,
@@ -3771,13 +3750,13 @@ describe("tmux owner isolation launch gate", () => {
 		expect(calls.some(call => call[0] === "if-shell")).toBe(false);
 	});
 
-	it("refuses a server swap after new-session before profile or cleanup mutation", () => {
+	it("refuses a server swap after new-session before profile or cleanup mutation", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-server-swap-"));
 		try {
 			const calls: string[][] = [];
 			const diagnostics: string[] = [];
 			let probeCount = 0;
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -3814,13 +3793,13 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("publishes one generation and propagates its lifecycle metadata to the managed child", () => {
+	it("publishes one generation and propagates its lifecycle metadata to the managed child", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-"));
 		try {
 			const sessionId = "managed-owner-session";
 			const stateFile = path.join(root, "runtime-state.json");
 			const calls: string[][] = [];
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,
@@ -3872,7 +3851,7 @@ describe("tmux owner isolation launch gate", () => {
 		}
 	});
 
-	it("admits an exact predecessor over stdin without exposing its bearer to a direct pane", () => {
+	it("validates exact predecessor evidence in the parent before any tmux create or attach", async () => {
 		if (process.platform !== "linux") return;
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-replacement-"));
 		try {
@@ -3911,101 +3890,71 @@ describe("tmux owner isolation launch gate", () => {
 				path.join(ownerRoot, `sigabrt-${predecessorToken}.receipt.json`),
 				`${JSON.stringify({ schema_version: 2, generation, session_id: sessionId, run_id: runId, endpoint_incarnation: incarnation, child_token: predecessorToken, command_sha256: commandSha256, supervisor_pid: supervisorPid, supervisor_start_time: supervisorStartTime, child_pid: 2, child_start_time: "2", signal: "SIGABRT", signal_number: 6, exit_code: null, received_at: "2026-07-19T00:00:00.000Z" })}\n`,
 			);
-			const calls: string[][] = [];
+			const calls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
 			const diagnostics: string[] = [];
 			const events: string[] = [];
-			const admissionResults: string[] = [];
-			const admissionInputs: Array<{
-				command: string[];
-				cwd: string;
-				env: NodeJS.ProcessEnv;
-				stdinLine: string;
-			}> = [];
-			const handled = launchDefaultTmuxIfNeeded({
-				parsed: args({ messages: ["hello"], tmux: true }),
-				rawArgs: ["--tmux", "hello"],
-				cwd: root,
-				env: {
-					GJC_COORDINATOR_SESSION_ID: sessionId,
-					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
-					GJC_SESSION_FILE: transcriptPath,
-					GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: "caller-supplied-decoy",
-				},
-				argv: ["bun", "cli.ts"],
-				execPath: "/bin/bun",
-				platform: "darwin",
-				tty: interactiveTty,
-				tmuxAvailable: true,
-				existingBranchSessionName: null,
-				diagnosticWriter: message => diagnostics.push(message),
-				ownerPredecessorAdmissionRunner: input => {
-					events.push("admission");
-					admissionInputs.push(input);
-					const result = runPredecessorAdmissionHelper(input);
-					admissionResults.push(result.stdout);
-					return result;
-				},
-				spawnSync: (_command, spawnArgs) => {
-					if (spawnArgs[0] === "new-session") events.push("new-session");
-					calls.push(spawnArgs);
-					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
-				},
-			});
+			const launchPreviousExitCode = process.exitCode;
+			let handled: boolean;
+			try {
+				handled = await launchDefaultTmuxIfNeeded({
+					parsed: args({ messages: ["hello"], tmux: true }),
+					rawArgs: ["--tmux", "hello"],
+					cwd: root,
+					env: {
+						GJC_COORDINATOR_SESSION_ID: sessionId,
+						GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+						GJC_SESSION_FILE: transcriptPath,
+						GJC_MANAGED_OWNER_PREDECESSOR_TOKEN: "caller-supplied-decoy",
+					},
+					argv: ["bun", "cli.ts"],
+					execPath: "/bin/bun",
+					platform: "darwin",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+					diagnosticWriter: message => diagnostics.push(message),
+					spawnSync: (command, spawnArgs, options) => {
+						events.push(spawnArgs[0] ?? "");
+						calls.push({ command, args: spawnArgs, env: options.env });
+						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+					},
+				});
+			} finally {
+				process.exitCode = launchPreviousExitCode ?? 0;
+			}
 			expect(handled).toBe(true);
-			expect(events.indexOf("admission")).toBeGreaterThanOrEqual(0);
 			expect(events).not.toContain("new-session");
-			expect(calls.some(call => call[0] === "new-session")).toBe(false);
-			expect(calls.some(call => call[0] === "attach-session")).toBe(false);
+			expect(events).not.toContain("attach-session");
+			expect(calls.some(call => call.args[0] === "new-session")).toBe(false);
+			expect(calls.some(call => call.args[0] === "attach-session")).toBe(false);
 			expect(diagnostics.join("\n")).toContain("tmux owner predecessor admission failed");
-			expect(admissionInputs).toHaveLength(1);
-			const admissionInput = admissionInputs[0]!;
-			expect(admissionInput.command.join(" ")).toContain("--internal-tmux-owner-isolation");
-			expect(admissionInput.command.join(" ")).not.toContain(predecessorToken);
-			expect(admissionInput.env.GJC_MANAGED_OWNER_PREDECESSOR_TOKEN).toBeUndefined();
-			expect(admissionInput.stdinLine).toContain(predecessorToken);
-			expect(JSON.parse(admissionResults[0]!)).toMatchObject({
-				ok: false,
-				code: "predecessor_rejected",
-				reason: "safe_session_resume_seam_unavailable",
-			});
-			expect(JSON.parse(admissionInput.stdinLine)).toMatchObject({
-				op: "admit_predecessor",
-				session_id: sessionId,
-				owner_generation: expect.any(String),
-				owner_run_id: expect.any(String),
-				owner_incarnation: expect.any(String),
-				predecessor_generation: generation,
-				predecessor_run_id: runId,
-				predecessor_incarnation: incarnation,
-				predecessor_token: predecessorToken,
-			});
-			const admissionRequest = JSON.parse(admissionInput.stdinLine) as Record<string, string>;
-			const ownerGeneration = admissionRequest.owner_generation!;
-			const ownerRunId = admissionRequest.owner_run_id!;
-			const ownerIncarnation = admissionRequest.owner_incarnation!;
-			expect(JSON.parse(admissionInput.stdinLine)).toMatchObject({
-				owner_generation: ownerGeneration,
-				owner_run_id: ownerRunId,
-				owner_incarnation: ownerIncarnation,
-			});
-
-			const newOwnerRoot = lifecyclePaths(root, sessionId, ownerGeneration).root;
 			const admissionHandoffs = fs
-				.readdirSync(newOwnerRoot)
+				.readdirSync(ownerRoot)
 				.filter(file => file.startsWith("admission-handoff-"))
-				.map(file => JSON.parse(fs.readFileSync(path.join(newOwnerRoot, file), "utf8")) as Record<string, unknown>);
+				.map(file => JSON.parse(fs.readFileSync(path.join(ownerRoot, file), "utf8")) as Record<string, unknown>);
 			expect(admissionHandoffs).toHaveLength(1);
 			expect(admissionHandoffs[0]).toMatchObject({
 				state: "fail_closed_handoff",
 				reason: "safe_session_resume_seam_unavailable",
 				generation,
 				session_id: sessionId,
-				predecessor_child_token: predecessorToken,
 				predecessor_run_id: runId,
 				terminal_reconciliation: "unavailable_without_owning_store_cas",
 				b0_preserved: true,
 			});
+			expect(admissionHandoffs[0]).not.toHaveProperty("predecessor_child_token");
 			expect(admissionHandoffs[0]?.reason).not.toBe("recovery_transcript_changed");
+			expect(
+				calls.every(
+					call =>
+						!JSON.stringify({ command: call.command, args: call.args, env: call.env }).includes(
+							predecessorToken,
+						) &&
+						!JSON.stringify({ command: call.command, args: call.args, env: call.env }).includes(
+							"caller-supplied-decoy",
+						),
+				),
+			).toBe(true);
 			const recoveryDecision = JSON.parse(
 				fs.readFileSync(path.join(sessionStateDir(root, sessionId), "ultragoal-owner-loss-recovery.json"), "utf8"),
 			) as Record<string, unknown>;
@@ -4015,6 +3964,9 @@ describe("tmux owner isolation launch gate", () => {
 			});
 			expect(recoveryDecision.reason).not.toBe("recovery_transcript_changed");
 
+			const ownerGeneration = "linux-supervisor-generation";
+			const ownerRunId = "linux-supervisor-run";
+			const ownerIncarnation = "linux-supervisor-incarnation";
 			const childToken = "linux-supervisor-child";
 			const directAdmissionEnv = {
 				...process.env,
@@ -4027,7 +3979,7 @@ describe("tmux owner isolation launch gate", () => {
 			const childCommand = ["gjc", "--resume"];
 			const childCommandSha256 = createHash("sha256").update(JSON.stringify(childCommand)).digest("hex");
 			fs.writeFileSync(
-				path.join(newOwnerRoot, `child-${childToken}.binding.json`),
+				path.join(ownerRoot, `child-${childToken}.binding.json`),
 				`${JSON.stringify({ schema_version: 2, generation: ownerGeneration, session_id: sessionId, run_id: ownerRunId, endpoint_incarnation: ownerIncarnation, child_token: childToken, command: childCommand, command_sha256: childCommandSha256, supervisor_pid: 1, supervisor_start_time: "1", created_at: "2026-09-23T00:00:00.000Z" })}\n`,
 			);
 			const linuxAdmission = runManagedOwnerAdmission({
@@ -4041,19 +3993,33 @@ describe("tmux owner isolation launch gate", () => {
 			const foreignReceipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as Record<string, unknown>;
 			foreignReceipt.run_id = "foreign-run";
 			fs.writeFileSync(receiptPath, `${JSON.stringify(foreignReceipt)}\n`);
-			const rejected = runPredecessorAdmissionHelper(admissionInput);
-			expect(rejected.exitCode).not.toBe(0);
-			expect(JSON.parse(rejected.stdout)).toMatchObject({
-				ok: false,
-				code: "predecessor_rejected",
-				reason: "exact_sigabrt_receipt_untrusted",
-			});
+			const rejectedEvidencePreviousExitCode = process.exitCode;
+			try {
+				await expect(
+					admitManagedOwnerPredecessorBeforeLaunch({
+						stateDir: root,
+						cwd: root,
+						sessionId,
+						ownerGeneration: "rejected-owner-generation",
+						predecessor: {
+							generation,
+							sessionId,
+							runId,
+							incarnation,
+							predecessorToken,
+						},
+						transcriptPath,
+					}),
+				).rejects.toThrow("exact_sigabrt_receipt_untrusted");
+			} finally {
+				process.exitCode = rejectedEvidencePreviousExitCode ?? 0;
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("exact-rolls back a spawned owner when generation publication loses its baseline", () => {
+	it("exact-rolls back a spawned owner when generation publication loses its baseline", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-tmux-owner-generation-race-"));
 		try {
 			const sessionId = "managed-owner-race";
@@ -4061,7 +4027,7 @@ describe("tmux owner isolation launch gate", () => {
 			const calls: string[][] = [];
 			const diagnostics: string[] = [];
 			let replaced = false;
-			const handled = launchDefaultTmuxIfNeeded({
+			const handled = await launchDefaultTmuxIfNeeded({
 				parsed: args({ messages: ["hello"], tmux: true }),
 				rawArgs: ["--tmux", "hello"],
 				cwd: root,

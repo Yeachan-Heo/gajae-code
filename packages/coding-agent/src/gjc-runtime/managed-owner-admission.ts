@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { openPortableRecoveryFsRoot } from "@gajae-code/natives";
 import type { ManagedOwnerBinding, ManagedOwnerSigabrtReceipt } from "./managed-owner-supervisor";
 import { assertSafePathComponent } from "./session-layout";
-import { type AdmitPredecessorRequest, type AdmitPredecessorResponse, lifecyclePaths } from "./tmux-owner-isolation";
+import { lifecyclePaths, type ManagedOwnerPredecessorEvidence } from "./tmux-owner-isolation";
 import {
 	persistUltragoalRecoveryDecision,
 	planUltragoalOwnerLossRecovery,
@@ -21,11 +21,12 @@ const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 
 export interface ManagedOwnerRecoveryContext {
 	root: string;
+	cwd: string;
 	binding: ManagedOwnerBinding;
 	receipt: ManagedOwnerSigabrtReceipt;
 	admission: { session_id: string; endpoint_incarnation: string; owner_generation: string; admitted: true };
 	decision: UltragoalRecoveryDecision;
-	/** Exact transcript selected by the parent-side stdin admission request. */
+	/** Exact transcript selected by the parent launch flow. */
 	transcriptPath: string;
 }
 export type ManagedOwnerAdmission = { kind: "fresh" | "supervised" } | { kind: "blocked" };
@@ -282,76 +283,79 @@ export async function admitManagedOwnerBeforeCli(): Promise<ManagedOwnerAdmissio
 	return blockAdmission(owner, "exact_child_binding_unavailable", exactReaderDetails(read));
 }
 
-/** Validate and persist predecessor recovery authority through the private parent stdin handoff. */
-export async function admitManagedOwnerPredecessorBeforeLaunch(
-	request: AdmitPredecessorRequest,
-): Promise<AdmitPredecessorResponse> {
+/** Validate and persist predecessor recovery authority in the trusted parent launch process. */
+export async function admitManagedOwnerPredecessorBeforeLaunch(input: {
+	stateDir: string;
+	cwd: string;
+	sessionId: string;
+	ownerGeneration: string;
+	predecessor: ManagedOwnerPredecessorEvidence;
+	transcriptPath: string;
+}): Promise<void> {
 	const owner = {
-		root: lifecyclePaths(request.state_dir, request.session_id, request.owner_generation).root,
-		generation: request.owner_generation,
-		sessionId: request.session_id,
+		root: lifecyclePaths(input.stateDir, input.sessionId, input.ownerGeneration).root,
+		generation: input.ownerGeneration,
+		sessionId: input.sessionId,
 	};
-	const reject = async (reason: string, details: Record<string, unknown> = {}): Promise<AdmitPredecessorResponse> => {
+	const reject = async (reason: string, details: Record<string, unknown> = {}): Promise<never> => {
 		await blockAdmission(owner, reason, details);
-		return { schema_version: 1, ok: false, code: "predecessor_rejected", reason };
+		throw new Error(reason);
 	};
-	if (!safeChildToken(request.predecessor_token)) return await reject("replacement_predecessor_binding_untrusted");
-	const predecessorRoot = lifecyclePaths(request.state_dir, request.session_id, request.predecessor_generation).root;
+	const predecessor = input.predecessor;
+	if (input.sessionId !== predecessor.sessionId || !safeChildToken(predecessor.predecessorToken))
+		return await reject("replacement_predecessor_binding_untrusted");
+	const predecessorRoot = lifecyclePaths(input.stateDir, predecessor.sessionId, predecessor.generation).root;
 	const read = await readPortableExactJsons(predecessorRoot, [
-		`child-${request.predecessor_token}.binding.json`,
-		`sigabrt-${request.predecessor_token}.receipt.json`,
+		`child-${predecessor.predecessorToken}.binding.json`,
+		`sigabrt-${predecessor.predecessorToken}.receipt.json`,
 	]);
 	const [binding, receipt] = exactJsonValues(read);
 	if (
 		!isBinding(binding, {
-			generation: request.predecessor_generation,
-			sessionId: request.session_id,
-			runId: request.predecessor_run_id,
-			incarnation: request.predecessor_incarnation,
-			token: request.predecessor_token,
+			generation: predecessor.generation,
+			sessionId: predecessor.sessionId,
+			runId: predecessor.runId,
+			incarnation: predecessor.incarnation,
+			token: predecessor.predecessorToken,
 		})
 	)
 		return await reject("replacement_predecessor_binding_untrusted", exactReaderDetails(read));
 	if (!isReceipt(receipt, binding)) return await reject("exact_sigabrt_receipt_untrusted", exactReaderDetails(read));
 	const admission = {
-		session_id: request.session_id,
-		endpoint_incarnation: request.predecessor_incarnation,
-		owner_generation: request.predecessor_generation,
+		session_id: input.sessionId,
+		endpoint_incarnation: predecessor.incarnation,
+		owner_generation: predecessor.generation,
 		admitted: true,
 	} as const;
 	const bindingContext = {
-		sessionId: request.session_id,
-		endpointIncarnation: request.predecessor_incarnation,
-		ownerGeneration: request.predecessor_generation,
-		cwd: request.cwd,
+		sessionId: input.sessionId,
+		endpointIncarnation: predecessor.incarnation,
+		ownerGeneration: predecessor.generation,
+		cwd: input.cwd,
 	};
 	const decision = await planUltragoalOwnerLossRecovery({
 		binding: bindingContext,
 		receipt,
 		admission,
-		transcriptPath: request.transcript_path,
+		transcriptPath: input.transcriptPath,
 	});
 	await persistUltragoalRecoveryDecision({
-		cwd: request.cwd,
-		sessionId: request.session_id,
+		cwd: input.cwd,
+		sessionId: input.sessionId,
 		binding: bindingContext,
 		decision,
 	});
 	if (decision.disposition !== "resume") return await reject(decision.reason);
 	const terminal = await completeManagedOwnerRecovery({
 		root: owner.root,
+		cwd: input.cwd,
 		binding,
 		receipt,
 		admission,
 		decision,
-		transcriptPath: request.transcript_path,
+		transcriptPath: input.transcriptPath,
 	});
-	return {
-		schema_version: 1,
-		ok: false,
-		code: "predecessor_rejected",
-		reason: terminal.reason,
-	};
+	throw new Error(terminal.reason);
 }
 
 /**
@@ -366,7 +370,7 @@ export async function completeManagedOwnerRecovery(
 		sessionId: context.binding.session_id,
 		endpointIncarnation: context.binding.endpoint_incarnation,
 		ownerGeneration: context.binding.generation,
-		cwd: process.cwd(),
+		cwd: context.cwd,
 	};
 	const revalidated = await planUltragoalOwnerLossRecovery({
 		binding: recoveryBinding,
@@ -402,7 +406,6 @@ export async function completeManagedOwnerRecovery(
 		decision,
 	});
 	await durableHandoff(context.root, context.binding.generation, context.binding.session_id, reason, {
-		predecessor_child_token: context.binding.child_token,
 		predecessor_run_id: context.binding.run_id,
 		terminal_reconciliation: "unavailable_without_owning_store_cas",
 		b0_preserved: b0Unchanged,
