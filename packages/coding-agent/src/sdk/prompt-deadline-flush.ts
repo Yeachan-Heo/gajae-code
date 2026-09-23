@@ -63,6 +63,8 @@ export interface PromptDeadlineFlushResult {
 }
 
 export interface PromptDeadlineFlushOptions {
+	/** Active session's agent directory, used to keep volatile broker state out of the WIP commit. */
+	readonly agentDir?: string;
 	/**
 	 * Whether the caller resolved `sdk.flushWorktreeOnDeadline` to `true` from a
 	 * value the user actually wrote, rather than from the schema default. Only an
@@ -86,6 +88,23 @@ function wipCommitMessage(branch: string | undefined): string {
 const UNMERGED_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 
 const AUTOSAVE_PATHS = [":(top)**", ":(top,exclude).gjc/agents/**", ":(top,exclude).gjc/skills/**"] as const;
+
+function autosavePaths(worktreeRoot: string, agentDir: string | undefined): readonly string[] {
+	if (!agentDir) return AUTOSAVE_PATHS;
+	const sdkDir = path.resolve(agentDir, "sdk");
+	const relativeSdkDir = path.relative(path.resolve(worktreeRoot), sdkDir);
+	if (
+		!relativeSdkDir ||
+		relativeSdkDir === ".." ||
+		relativeSdkDir.startsWith(`..${path.sep}`) ||
+		path.isAbsolute(relativeSdkDir)
+	)
+		return AUTOSAVE_PATHS;
+	// Git pathspecs always use `/`. Literal mode avoids interpreting special
+	// characters in an agent directory's name as pathspec patterns.
+	const pathspec = relativeSdkDir.split(path.sep).join("/");
+	return [...AUTOSAVE_PATHS, `:(top,exclude,literal)${pathspec}`];
+}
 
 type IndexSnapshot = Uint8Array | undefined;
 
@@ -159,6 +178,7 @@ export async function flushWorktreeOnPromptDeadline(
 	options?: AbortSignal | PromptDeadlineFlushOptions,
 ): Promise<PromptDeadlineFlushResult | undefined> {
 	const {
+		agentDir,
 		explicitOptIn = false,
 		isCurrent,
 		signal,
@@ -179,7 +199,8 @@ export async function flushWorktreeOnPromptDeadline(
 			);
 			return undefined;
 		}
-		const statusText = await git.status(worktreeRoot, { porcelainV1: true, signal: bound });
+		const paths = autosavePaths(worktreeRoot, agentDir);
+		const statusText = await git.status(worktreeRoot, { pathspecs: paths, porcelainV1: true, signal: bound });
 		const summary = git.status.parse(statusText);
 		if (summary.staged + summary.unstaged + summary.untracked === 0) return undefined;
 		if (hasUnmergedPaths(statusText)) {
@@ -211,7 +232,7 @@ export async function flushWorktreeOnPromptDeadline(
 			() =>
 				autosave(
 					repository,
-					{ headState, headSha, indexPath, indexSnapshot, message: wipCommitMessage(branch), refName },
+					{ headState, headSha, indexPath, indexSnapshot, message: wipCommitMessage(branch), paths, refName },
 					bound,
 					isCurrent,
 				),
@@ -243,13 +264,14 @@ async function autosave(
 		indexPath: string;
 		indexSnapshot: IndexSnapshot;
 		message: string;
+		paths: readonly string[];
 		refName: string;
 	},
 	bound: AbortSignal,
 	isCurrent?: () => boolean,
 ): Promise<string | undefined> {
 	const worktreeRoot = repository.repoRoot;
-	const { headSha, headState, indexPath, indexSnapshot, message, refName } = target;
+	const { headSha, headState, indexPath, indexSnapshot, message, paths, refName } = target;
 	// Inside the git dir, never the worktree (where it would show up as untracked
 	// and be staged by our own `add -A`) and never /tmp (a different filesystem
 	// breaks git's rename-into-place).
@@ -277,7 +299,7 @@ async function autosave(
 			!sameBytes(await snapshotIndex(indexPath), indexSnapshot)
 		)
 			return undefined;
-		await git.stage.files(worktreeRoot, AUTOSAVE_PATHS, { env, signal: bound });
+		await git.stage.files(worktreeRoot, paths, { env, signal: bound });
 		const tree = await git.writeTree(worktreeRoot, { env, signal: bound });
 		// `git status` counts paths git will not necessarily commit (a dirty
 		// submodule at the same SHA, for one). Without this an autosave could land

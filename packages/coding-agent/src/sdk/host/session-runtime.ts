@@ -5440,7 +5440,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						? options.settings.has("sdk.flushWorktreeOnDeadline" as never)
 						: configured === true;
 				const explicitOptIn = hasExplicitSetting === true && configured === true;
-				await flushWorktreeOnPromptDeadline(ctx.cwd, { explicitOptIn, isCurrent, signal });
+				await flushWorktreeOnPromptDeadline(ctx.cwd, {
+					agentDir: options.settings?.getAgentDir(),
+					explicitOptIn,
+					isCurrent,
+					signal,
+				});
 			},
 			onExpired: (correlation, deadlineOutcome) => {
 				const owner = lifecycleOwnerHolder.state;
