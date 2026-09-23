@@ -65,7 +65,11 @@ import {
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
 import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
-import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
+import {
+	PromptDeadlineManager,
+	type PromptDeadlineTerminalization,
+	type PromptTerminalTransitionEvidence,
+} from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
@@ -77,6 +81,7 @@ import {
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
+import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
 import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
@@ -379,11 +384,10 @@ export interface SdkOnlyTerminalAbortSeams {
 	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
 	 * ledger holds for an execution handle (#5637). Strictly read-only: it
 	 * never claims, reserves, seals or quarantines ledger state. Declared here
-	 * so both hosts expose ONE seam contract — the bus route consumes it for its
-	 * deadline tool-boundary wait, and this route threads it so a future boundary
-	 * wait or deadline abort reads the ledger rather than silently falling back
-	 * to the event-derived set. Optional so an older host that does not thread it
-	 * degrades to that fallback instead of failing to construct.
+	 * so both hosts expose ONE seam contract. Both deadline paths wait for the
+	 * dispatched tool boundary before aborting; an older host may omit this seam,
+	 * but it still must provide a settled abort proof before a terminal result is
+	 * published.
 	 */
 	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
@@ -2484,7 +2488,7 @@ function createControlSurface(
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
 	terminalPublicationCapture?: {
-		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+		waiters?: Array<{ epoch: number; correlationKey?: string; resolve: (observed: boolean) => void }>;
 	},
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string>; lifecycleEpoch?: number },
 	retirePendingOwner?: (
@@ -4442,7 +4446,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// reaches the stopped path awaits it; a concurrent abort for the same turn
 	// is settled by the durable marker transaction instead.
 	const terminalPublicationCapture: {
-		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+		waiters?: Array<{ epoch: number; correlationKey?: string; resolve: (observed: boolean) => void }>;
 	} = {};
 	// Shared with the control surface: the SDK connection owning the currently
 	// active prompt/skill turn. Cleared at every agent_end (terminal lifecycle
@@ -4762,10 +4766,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				? failureBatch.epoch
 				: current.lifecycleEpoch;
 		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
+			if (type !== "agent_end") return;
 			const waiters = terminalPublicationCapture.waiters;
 			if (!waiters) return;
-			const matched = waiters.filter(waiter => waiter.epoch === eventLifecycleEpoch);
-			const remaining = waiters.filter(waiter => waiter.epoch !== eventLifecycleEpoch);
+			const transitionsMatch = (waiter: { correlationKey?: string }): boolean =>
+				waiter.correlationKey === undefined ||
+				transitions.some(({ correlation }) => lifecycleCorrelationKey(correlation) === waiter.correlationKey);
+			const matched = waiters.filter(waiter => waiter.epoch === eventLifecycleEpoch && transitionsMatch(waiter));
+			const remaining = waiters.filter(waiter => !matched.includes(waiter));
 			terminalPublicationCapture.waiters = remaining.length === 0 ? undefined : remaining;
 			for (const waiter of matched) waiter.resolve(observed);
 		};
@@ -4943,7 +4951,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								};
 					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
 					if ((type as string) === "agent_end") {
-						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+						if (invocation.kind === "prompt" && !current.deadlineManager.isExpiring(invocation.correlation))
+							current.deadlineManager.clear(invocation.correlation);
 					}
 				} catch {
 					// One broken durable transition must not strand the rest of a
@@ -5104,7 +5113,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
 			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
-				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+				if (invocation.kind === "prompt" && !current.deadlineManager.isExpiring(invocation.correlation))
+					current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 			if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
 			// Resolve EVERY concurrent waiter for the aborted turn: the turn emits
@@ -5426,6 +5436,90 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
 			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
+			onDeadlineTerminalization: async (correlation, isCurrent): Promise<PromptDeadlineTerminalization> => {
+				const owner = lifecycleOwnerHolder.state;
+				if (!owner) return "uncertain";
+				const target = lifecycleCorrelationKey(correlation);
+				const currentBatch = owner.openLifecycleBatches.find(batch => batch.epoch === owner.lifecycleEpoch);
+				const pending = owner.pending.some(entry => lifecycleCorrelationKey(entry.correlation) === target);
+				if (!currentBatch) return pending ? "idle" : "uncertain";
+				const belongsToCurrentRun = [...currentBatch.invocations, ...currentBatch.attachedInvocations].some(
+					entry => lifecycleCorrelationKey(entry.correlation) === target,
+				);
+				if (!belongsToCurrentRun) {
+					return pending ? "idle" : "uncertain";
+				}
+
+				const seams = options.terminalAbortSeams;
+				const handle = seams?.getActivePromptHandle();
+				const epoch = seams?.getTerminalTurnEpoch();
+				if (!seams || !handle || epoch === undefined) return "uncertain";
+				if (seams.pendingToolExecutions !== undefined) {
+					await waitForToolCallBoundary({
+						pending: () => seams.pendingToolExecutions?.(handle) ?? [],
+						whenIdle: () => new Promise<void>(() => {}),
+						graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+					});
+				}
+				if (!isCurrent() || seams.getActivePromptHandle() !== handle || seams.getTerminalTurnEpoch() !== epoch)
+					return "uncertain";
+
+				const terminalPublication = Promise.withResolvers<boolean>();
+				const waiter = {
+					epoch: currentBatch.epoch,
+					correlationKey: target,
+					resolve: terminalPublication.resolve,
+				};
+				if (!terminalPublicationCapture.waiters) terminalPublicationCapture.waiters = [];
+				terminalPublicationCapture.waiters.push(waiter);
+				const removeWaiter = () => {
+					const waiters = terminalPublicationCapture.waiters;
+					if (waiters === undefined) return;
+					const index = waiters.indexOf(waiter);
+					if (index >= 0) waiters.splice(index, 1);
+					if (waiters.length === 0) terminalPublicationCapture.waiters = undefined;
+				};
+				let steeringSnapshotToken: number | undefined;
+				let proof: { status: string; terminalScope?: unknown } | undefined;
+				try {
+					steeringSnapshotToken = seams.captureTerminalAbortSteeringSnapshot?.();
+					proof = await seams.abortPromptAndWaitWithTerminal(handle, {
+						graceMs: 10_000,
+						terminal: {
+							scope: "owned",
+							expectedEpoch: epoch,
+							...(steeringSnapshotToken === undefined ? {} : { steeringSnapshotToken }),
+						},
+					});
+					if (proof.status !== "settled") return "uncertain";
+					const terminalScope = proof.terminalScope as
+						| { abortedAttemptEpoch?: unknown; lineageIdHash?: unknown }
+						| undefined;
+					if (
+						terminalScope?.abortedAttemptEpoch !== epoch ||
+						typeof terminalScope.lineageIdHash !== "string" ||
+						isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, epoch)
+					)
+						return "uncertain";
+					const exactJobs = findOwnedRegistrationsForTurn(terminalScope.lineageIdHash, epoch);
+					if (exactJobs.length > 0) {
+						const endpointId = exactJobs[0]?.endpointId;
+						const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+						if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") return "uncertain";
+					}
+					const observed = await Promise.race([
+						terminalPublication.promise,
+						Bun.sleep(SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS).then(() => false as const),
+					]);
+					return observed ? "settled" : "uncertain";
+				} catch {
+					return "uncertain";
+				} finally {
+					removeWaiter();
+					if (steeringSnapshotToken !== undefined && proof?.status !== "settled")
+						seams.discardTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
+				}
+			},
 			// Persist the agent's uncommitted work before the retirement below tears
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
