@@ -36,7 +36,7 @@ import {
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
 } from "@agentclientprotocol/sdk";
-import { getAgentDir, logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { getAgentDir, logger, resolveEquivalentPath, SUPPORTED_IMAGE_MIME_TYPES } from "@gajae-code/utils";
 import packageJson from "../../../package.json" with { type: "json" };
 import {
 	ACP_SESSION_RECONNECT,
@@ -69,6 +69,8 @@ import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } f
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import { MAX_IMAGE_INPUT_BYTES } from "../../utils/image-loading";
+import { MAX_PASTED_IMAGE_SOURCE_BYTES } from "../../utils/pasted-image-loading";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	type AgentSessionEvent,
@@ -110,7 +112,9 @@ const CANCEL_SETTLEMENT_GRACE_MS = 5_000;
  */
 const MAX_PROMPT_FRAME_BYTES = 256 * 1024;
 const IMAGE_UPLOAD_CHUNK_BYTES = 96 * 1024;
-const CANONICAL_IMAGE_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const MAX_PROMPT_IMAGES = 16;
+const INVALID_IMAGE_BASE64_CHARACTER = /[^A-Za-z0-9+/]/;
+const CANONICAL_TWO_BYTE_TAIL = "AEIMQUYcgkosw048";
 /**
  * `SdkClient` wraps every control request as `{type,operation,input,id}` with a UUID
  * `id` before it reaches the socket, so the prompt must be measured inside that
@@ -2268,6 +2272,31 @@ export class AcpAgent implements Agent {
 			});
 			if (promptError) throw new AcpSdkAdapterError(promptError.code, promptError.message);
 		}
+		// Check encoded lengths before serializing the complete SDK frame or allocating
+		// decoded buffers. The host applies these same bounds to staged source bytes.
+		if (payload.images.length > MAX_PROMPT_IMAGES)
+			throw new AcpSdkAdapterError("invalid_input", "ACP prompts cannot contain more than 16 images.");
+		let sourceBytes = 0;
+		for (const image of payload.images) {
+			if (!SUPPORTED_IMAGE_MIME_TYPES.has(image.mimeType))
+				throw new AcpSdkAdapterError("invalid_input", "Unsupported ACP image MIME type.");
+			const data = image.data;
+			if (!data || data.length % 4 !== 0)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+			const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+			const byteLength = (data.length / 4) * 3 - padding;
+			if (byteLength <= 0 || byteLength > MAX_IMAGE_INPUT_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image exceeds the 20 MiB source limit.");
+			sourceBytes += byteLength;
+			if (sourceBytes > MAX_PASTED_IMAGE_SOURCE_BYTES)
+				throw new AcpSdkAdapterError("invalid_input", "ACP images exceed the 64 MiB source limit.");
+			if (
+				data.search(INVALID_IMAGE_BASE64_CHARACTER) !== (padding ? data.length - padding : -1) ||
+				(padding === 2 && !"AQgw".includes(data.at(-3)!)) ||
+				(padding === 1 && !CANONICAL_TWO_BYTE_TAIL.includes(data.at(-2)!))
+			)
+				throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
+		}
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		if (isAcpUnavailableSlashCommand(payload.text)) {
@@ -2441,8 +2470,6 @@ export class AcpAgent implements Agent {
 				}
 			if (stageImages) {
 				for (const image of payload.images) {
-					if (!CANONICAL_IMAGE_BASE64.test(image.data) || !image.data)
-						throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
 					const bytes = Buffer.from(image.data, "base64");
 					if (bytes.toString("base64") !== image.data)
 						throw new AcpSdkAdapterError("invalid_input", "ACP image data must be canonical base64.");
@@ -2466,12 +2493,12 @@ export class AcpAgent implements Agent {
 						() => undefined,
 					);
 					const { id, nextSequence } = await whileActive(begin);
+					if (typeof id === "string" && id) stagedIds.add(id);
 					if (typeof id !== "string" || !id || nextSequence !== 0)
 						throw new AcpSdkAdapterError(
 							"invalid_prompt_acknowledgement",
 							"SDK image begin acknowledgement is invalid.",
 						);
-					stagedIds.add(id);
 					let sequence = 0;
 					for (let offset = 0; offset < bytes.length; offset += IMAGE_UPLOAD_CHUNK_BYTES) {
 						const chunk = bytes.subarray(offset, offset + IMAGE_UPLOAD_CHUNK_BYTES);
