@@ -935,6 +935,7 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset glm
   ${APP_NAME} setup provider --preset cline-pass
   ${APP_NAME} setup provider --preset commandcode-goat
+  ${APP_NAME} setup provider --preset ionet
   ${APP_NAME} setup provider --preset litellm --base-url https://litellm.example.com/v1
   ${APP_NAME} setup provider --preset openai-compatible-proxy --base-url https://gateway.example.com/v1
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example

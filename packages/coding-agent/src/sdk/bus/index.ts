@@ -6011,6 +6011,7 @@ export function createNotificationsExtension(
 					const explicitOptIn = hasExplicitSetting === true && configured === true;
 					await runBoundedDeadlineFlush(signal =>
 						flushWorktreeOnPromptDeadline(ctx.cwd, {
+							agentDir: settings?.getAgentDir(),
 							explicitOptIn,
 							isCurrent: () =>
 								deadlineAttemptStatus(promptSubmissionKey(correlation), submission, deadlineAttempt) ===
