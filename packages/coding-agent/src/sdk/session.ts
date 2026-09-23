@@ -3187,14 +3187,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 			const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
+			// Published conventional tools can reconnect through this manager even
+			// after startup cleanup marks their cached server disconnected.
+			const publishedConventionalNames = new Set(
+				result.tools.flatMap(tool => {
+					const name = tool.mcpServerName;
+					return name !== undefined && !pluginNames.has(name) && Object.hasOwn(conventionalConfigs, name)
+						? [name]
+						: [];
+				}),
+			);
 			// Retain while any conventional server is still live: "connecting"
 			// covers the declared-timeout window, and a server that landed in
 			// "connected" inside the microtask between connectServers() resolving
-			// and this synchronous check must not be torn down either.
+			// and this synchronous check must not be torn down either. Cached tools
+			// also keep their server unsettled so plugin presence cannot seal off
+			// their reconnect path.
 			const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
-				name => owned.getConnectionStatus(name) !== "disconnected",
+				name => owned.getConnectionStatus(name) !== "disconnected" || publishedConventionalNames.has(name),
 			);
-			// Cached deferred tools still reconnect through this manager even after startup cleanup marks their server disconnected.
 			const retainOwnedManager =
 				result.connectedServers.length > 0 || unsettledConventionalNames.length > 0 || result.tools.length > 0;
 			if (retainOwnedManager) {
