@@ -151,8 +151,14 @@ export interface BrokerSettings {
 	 * value its launcher decided, with no cast/assumed tag in between.
 	 */
 	restartRequestId?: string;
+	/** Cancel bootstrap before retained publication when the owning CLI receives a signal. */
+	startupAbortSignal?: AbortSignal;
+	/** Called synchronously when retained publication establishes broker readiness. */
+	onStartupReady?: () => void;
 	/** Test-only delay after session checkpoint to verify unpublished discovery ownership. */
 	startupPrePublicationDelayMs?: number;
+	/** Test-only notification at the cached-discovery, pre-publication boundary. */
+	startupPrePublicationTestHook?: () => Promise<void>;
 	/** Test-only delay after publication to exercise signal handoff ordering. */
 	startupPostPublicationDelayMs?: number;
 }
@@ -1492,7 +1498,10 @@ export class Broker {
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
+	#startupAbortSignal: AbortSignal | undefined;
+	#onStartupReady: (() => void) | undefined;
 	#startupPrePublicationDelayMs: number;
+	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
 	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
@@ -1527,12 +1536,15 @@ export class Broker {
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#ownsResolveModelPin = settings.resolveModelPin === undefined;
 		this.#resolveModelPin = settings.resolveModelPin ?? createDefaultSdkHostModelResolver(this.settings.agentDir);
+		this.#startupAbortSignal = settings.startupAbortSignal;
+		this.#onStartupReady = settings.onStartupReady;
 		this.#startupPrePublicationDelayMs =
 			Number.isSafeInteger(settings.startupPrePublicationDelayMs) &&
 			(settings.startupPrePublicationDelayMs ?? 0) > 0 &&
 			(settings.startupPrePublicationDelayMs ?? 0) <= 10_000
 				? (settings.startupPrePublicationDelayMs as number)
 				: 0;
+		this.#startupPrePublicationTestHook = settings.startupPrePublicationTestHook;
 		this.#startupPostPublicationDelayMs =
 			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
 			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
@@ -3715,6 +3727,10 @@ export class Broker {
 			logger.warn(`sdk broker: stale lock artifact reap failed: ${String(error)}`);
 		}
 	}
+	#throwIfStartupAborted(): void {
+		if (this.#startupAbortSignal?.aborted)
+			throw new Error("SDK broker startup was interrupted before retained publication.");
+	}
 
 	async start(): Promise<BrokerDiscovery> {
 		if (this.#completionTask) {
@@ -3738,8 +3754,11 @@ export class Broker {
 		this.#publishedAt = null;
 		this.#startedAt = process.hrtime.bigint();
 		this.#watchInFlight = false;
+		this.#throwIfStartupAborted();
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
+		this.#throwIfStartupAborted();
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
+		this.#throwIfStartupAborted();
 		for (;;) {
 			try {
 				await this.#createLock();
@@ -3782,9 +3801,11 @@ export class Broker {
 			}
 			await this.#reclaimStaleLock(snapshot);
 		}
+		this.#throwIfStartupAborted();
 		// Only the lock holder reaps, so concurrent brokers cannot race the removal.
 		await this.#reapLockArtifacts();
 		try {
+			this.#throwIfStartupAborted();
 			await this.index.open();
 			await this.ledger.open();
 			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
@@ -3816,6 +3837,7 @@ export class Broker {
 			const token = newBrokerToken();
 			this.#transport = new BrokerTransport(this, token, this.settings.port);
 			const port = await this.#transport.start();
+			this.#throwIfStartupAborted();
 			this.discovery = {
 				version: 1,
 				protocolVersion: 3,
@@ -3839,10 +3861,15 @@ export class Broker {
 			// interval; publishing first allowed it to kill an endpoint already handed
 			// to callers when a legitimate index-lock wait outlived the fence.
 			await this.#checkpointSessionHeartbeats();
+			this.#throwIfStartupAborted();
+			await this.#startupPrePublicationTestHook?.();
 			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
+			this.#throwIfStartupAborted();
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
+			this.#throwIfStartupAborted();
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
+			this.#onStartupReady?.();
 			const cadenceMs = Math.max(
 				10,
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
