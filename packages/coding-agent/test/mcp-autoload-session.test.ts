@@ -16,7 +16,9 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
-import { DeferredMCPTool, type MCPLoadResult, MCPManager } from "../src/runtime-mcp";
+import { DeferredMCPTool, loadAllMCPConfigs, type MCPLoadResult, MCPManager, MCPToolCache } from "../src/runtime-mcp";
+import * as mcpClient from "../src/runtime-mcp/client";
+import { AgentStorage } from "../src/session/agent-storage";
 
 const DEMO_MCP_SERVER_SCRIPT = `
 const readline = require('node:readline');
@@ -126,6 +128,56 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
 		} finally {
 			await session.dispose();
+		}
+	}, 30_000);
+
+	it("loads persisted cached conventional tools through the session-owned manager", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow-demo",
+			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 1_000 },
+			cwd: projectDir,
+		});
+
+		const configPath = path.join(projectDir, ".gjc", "mcp.json");
+		const configDocument = JSON.parse(await fs.promises.readFile(configPath, "utf8")) as {
+			mcpServers: Record<string, Record<string, unknown>>;
+		};
+		delete configDocument.mcpServers["slow-demo"]?.timeout;
+		await fs.promises.writeFile(configPath, JSON.stringify(configDocument, null, 2));
+		const connectSpy = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => new Promise<never>(() => {}));
+
+		const options = isolatedSessionOptions();
+		const loaded = await loadAllMCPConfigs(projectDir, {
+			agentDir,
+			enableProjectConfig: true,
+			autoloadOnly: true,
+			nativeOnly: true,
+			settings: options.settings,
+		});
+		const config = loaded.configs["slow-demo"];
+		if (!config) throw new Error("slow-demo config was not loaded");
+
+		const storage = await AgentStorage.open();
+		try {
+			await new MCPToolCache(storage).set("slow-demo", config, [
+				{ name: "cached_hello", inputSchema: { type: "object", properties: {} } },
+			]);
+
+			const { session, mcpManager } = await createAgentSession(options);
+			try {
+				expect(connectSpy).toHaveBeenCalledTimes(1);
+				expect(mcpManager).toBeDefined();
+				const cachedTool = mcpManager?.getTools().find(tool => tool.name === "mcp__slow_demo_cached_hello");
+				expect(cachedTool).toBeInstanceOf(DeferredMCPTool);
+				expect(session.getAllToolNames()).toContain("mcp__slow_demo_cached_hello");
+				expect(session.getActiveToolNames()).toContain("mcp__slow_demo_cached_hello");
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			storage.close();
 		}
 	}, 30_000);
 

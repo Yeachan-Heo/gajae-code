@@ -145,7 +145,14 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { DeferredMCPTool, isMCPStartupTimeoutError, loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import {
+	DeferredMCPTool,
+	isMCPStartupTimeoutError,
+	loadAllMCPConfigs,
+	MCPManager,
+	type MCPToolCache,
+	resolveMCPToolCache,
+} from "../runtime-mcp";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
@@ -2357,6 +2364,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
+		let ownedMcpToolCache: MCPToolCache | null | undefined;
+		const getOwnedMcpToolCache = async (): Promise<MCPToolCache | null> => {
+			if (ownedMcpToolCache === undefined) ownedMcpToolCache = await resolveMCPToolCache();
+			return ownedMcpToolCache;
+		};
 		const cwdCapturingToolNames: string[] = [];
 		const ownedConventionalMcpServerNames = new Set<string>();
 		const cachedConventionalMcpServerNames = new Set<string>();
@@ -3195,24 +3207,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 			const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
-			// Published conventional tools can reconnect through this manager even
-			// after startup cleanup marks their cached server disconnected.
-			const publishedConventionalNames = new Set(
-				result.tools.flatMap(tool => {
-					const name = tool.mcpServerName;
-					return name !== undefined && !pluginNames.has(name) && Object.hasOwn(conventionalConfigs, name)
-						? [name]
-						: [];
-				}),
-			);
-			// Retain while any conventional server is still live: "connecting"
-			// covers the declared-timeout window, and a server that landed in
-			// "connected" inside the microtask between connectServers() resolving
-			// and this synchronous check must not be torn down either. Cached tools
-			// also keep their server unsettled so plugin presence cannot seal off
-			// their reconnect path.
+			// Only a connection still in its startup window or a cached fallback
+			// needs the mixed manager to remain mutable. Successfully connected
+			// ordinary tools do not delay the synchronous seal; cached fallbacks keep
+			// their reconnect path available while they remain published.
 			const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
-				name => owned.getConnectionStatus(name) !== "disconnected" || publishedConventionalNames.has(name),
+				name => owned.getConnectionStatus(name) === "connecting" || cachedConventionalMcpServerNames.has(name),
 			);
 			const retainOwnedManager =
 				result.connectedServers.length > 0 || unsettledConventionalNames.length > 0 || result.tools.length > 0;
@@ -3356,7 +3356,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// own bypass of the same mismatch at the manager boundary).
 				const mergedSourceMetas = mergedSources as Record<string, SourceMeta>;
 				if (Object.keys(mergedConfigs).length > 0) {
-					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+					const owned = new MCPManager(
+						cwd,
+						Object.keys(conventionalConfigs).length > 0 ? await getOwnedMcpToolCache() : null,
+						{ sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") },
+					);
 					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					// Interactive launches may paint before MCP connects; the deferred

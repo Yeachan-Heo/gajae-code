@@ -44,7 +44,7 @@ export interface MCPToolsLoadOptions {
 	sharedPoolIdleMs?: number;
 }
 
-async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
+export async function resolveMCPToolCache(storage?: AgentStorage | null): Promise<MCPToolCache | null> {
 	if (storage === null) return null;
 	try {
 		const resolved = storage ?? (await AgentStorage.open());
@@ -63,7 +63,7 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
  * @returns MCP tools in LoadedCustomTool format for integration
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
-	const toolCache = await resolveToolCache(options?.cacheStorage);
+	const toolCache = await resolveMCPToolCache(options?.cacheStorage);
 	const manager = new MCPManager(cwd, toolCache, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);

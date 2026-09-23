@@ -362,6 +362,69 @@ describe("red-team: conventional MCP autoload", () => {
 			}
 		});
 
+		it("seals connected ordinary conventional tools before asynchronous publication", async () => {
+			const pluginBundlePath = path.join(projectDir, "ordinary-seal-plugin");
+			await writeProjectConfig("ordinary-seal-plugin/gajae-plugin.json", {
+				kind: "gajae-code-plugin",
+				name: "ordinary-seal-plugin",
+				version: "1.0.0",
+				mcps: [{ name: "domain_docs", transport: "http", url: "https://example.com/mcp" }],
+			});
+			const r = await installGjcBundle({ cwd: projectDir }, "project", pluginBundlePath);
+			expect(r.ok).toBe(true);
+			await runMCPCommand({
+				action: "add",
+				name: "fast-demo",
+				commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+				flags: { project: true, timeout: 5_000 },
+				cwd: projectDir,
+			});
+
+			const [conventionalTool] = MCPTool.fromTools(
+				{ name: "fast-demo" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "hello", inputSchema: { type: "object", properties: {} } }],
+			);
+			const [pluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!conventionalTool || !pluginTool) throw new Error("MCP test tools were not created");
+
+			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+				tools: [pluginTool, conventionalTool],
+				errors: new Map(),
+				connectedServers: ["domain_docs", "fast-demo"],
+				exaApiKeys: [],
+			});
+			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([pluginTool, conventionalTool]);
+			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockReturnValue("connected");
+			const syncStarted = Promise.withResolvers<void>();
+			const syncGate = Promise.withResolvers<void>();
+			const replaceTools = AgentSession.prototype.replaceNamedCustomTools;
+			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+				this: AgentSession,
+				previousNames,
+				nextTools,
+			) {
+				if (nextTools.includes(conventionalTool)) {
+					syncStarted.resolve();
+					await syncGate.promise;
+				}
+				return await replaceTools.call(this, previousNames, nextTools);
+			});
+
+			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+			try {
+				await syncStarted.promise;
+				expect(connectServers).toHaveBeenCalledTimes(1);
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
+				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+			} finally {
+				syncGate.resolve();
+				await session.dispose();
+			}
+		});
+
 		it("plugin-bundle MCPs override conventional entries on name collisions; both load otherwise", async () => {
 			const r = await installGjcBundle({ cwd: projectDir }, "project", mcpBundle);
 			expect(r.ok).toBe(true);
