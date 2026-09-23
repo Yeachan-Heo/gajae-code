@@ -88,6 +88,33 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 
 }
 
 describe("interactive PTY fold ownership", () => {
+	it("removes ambient coordinator markers while preserving explicit env overrides", async () => {
+		const dir = await tempDir();
+		const ambientMarker = "GJC_COORDINATOR_SESSION_STATE_FILE";
+		const overrideMarker = "GJC_COORDINATOR_SESSION_ID";
+		const previousAmbientMarker = process.env[ambientMarker];
+		process.env[ambientMarker] = "ambient-pty-marker";
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			const result = await runInteractiveBashPty(createTestUi(), {
+				command: `printf "%s\\n" "\${GJC_COORDINATOR_SESSION_STATE_FILE-unset}|\${GJC_COORDINATOR_SESSION_ID-unset}"`,
+				cwd: dir,
+				timeoutMs: 20_000,
+				env: { [overrideMarker]: "explicit-pty-value" },
+				unsetEnv: [ambientMarker, overrideMarker],
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("unset|explicit-pty-value");
+			expect(result.output).not.toContain("ambient-pty-marker");
+		} finally {
+			resetSettingsForTest();
+			if (previousAmbientMarker === undefined) delete process.env[ambientMarker];
+			else process.env[ambientMarker] = previousAmbientMarker;
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("settles the foreground on fold while the process keeps running to completion", async () => {
 		const dir = await tempDir();
 		try {

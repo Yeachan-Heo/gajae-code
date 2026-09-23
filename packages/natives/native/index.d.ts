@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -2257,6 +2256,8 @@ export interface PtyStartOptions {
   cwd?: string
   /** Environment variables for this command. */
   env?: Record<string, string>
+  /** Environment variable names to remove from the child process. */
+  unsetEnv?: Array<string>
   /** Timeout in milliseconds before cancelling. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */
@@ -2522,6 +2523,8 @@ export interface ShellRunOptions {
   cwd?: string
   /** Environment variables to apply for this command only. */
   env?: Record<string, string>
+  /** Environment variable names to mask for this command only. */
+  unsetEnv?: Array<string>
   /** Timeout in milliseconds before cancelling the command. */
   timeoutMs?: number
   /** Abort signal for cancelling the operation. */

@@ -97,6 +97,7 @@ const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
 const COORDINATOR_ONLY_BASH_ENV = [
 	"GJC_COORDINATOR_SESSION_STATE_FILE",
 	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_COORDINATOR_SESSION_BRANCH",
 	"GJC_COORDINATOR_SESSION_LAUNCH_ID",
 	"GJC_COORDINATOR_SESSION_READINESS_FILE",
 	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
@@ -669,16 +670,6 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 }
 
 /**
- * The shell runner's per-command env map can override ambient entries, but cannot
- * remove them. Unset coordinator-only names before the command in the shell's
- * command scope; explicit tool env values remain available to that command.
- */
-function scrubCoordinatorAmbientEnv(command: string, explicitEnv: Record<string, string> | undefined): string {
-	const envNames = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(explicitEnv ?? {}, name));
-	return envNames.length > 0 ? `unset ${envNames.join(" ")}\n${command}` : command;
-}
-
-/**
  * Return true only for a direct, shell-syntax-free `gjc sdk spawn` command.
  *
  * Master authority is process-local and must not become ambient state for an
@@ -1069,6 +1060,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
@@ -1126,6 +1118,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								timeout: options.timeoutMs,
 								signal: runSignal,
 								env: options.resolvedEnv,
+								unsetEnv: options.unsetEnv,
 								artifactPath,
 								artifactId,
 								artifactPublisher,
@@ -1306,9 +1299,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		ctx?: AgentToolContext,
 	): Promise<{
 		command: string;
-		clientCommand: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		requestedTimeoutSec: number;
 		timeoutSec: number;
@@ -1481,8 +1474,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
-		const clientCommand = command;
-		if (!directMasterSpawn) command = scrubCoordinatorAmbientEnv(command, expandedEnv);
+		const unsetEnv = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name));
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
@@ -1513,9 +1505,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		return {
 			command,
-			clientCommand,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1679,6 +1671,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						timeout: monitorTimeoutMs,
 						signal,
 						env: prepared.resolvedEnv,
+						unsetEnv: prepared.unsetEnv,
 						artifactPath,
 						artifactId,
 						artifactPublisher,
@@ -1763,9 +1756,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		);
 		const {
 			command,
-			clientCommand,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1805,6 +1798,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded: true,
@@ -1857,6 +1851,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded,
@@ -1995,7 +1990,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 			const createPromise = Promise.resolve().then(() =>
 				clientBridge.createTerminal!({
-					command: clientCommand,
+					command,
 					cwd: commandCwd,
 					env: resolvedEnv
 						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
@@ -2629,6 +2624,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,
@@ -2797,6 +2793,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,
