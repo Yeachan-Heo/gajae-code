@@ -37,8 +37,21 @@ async function pathExists(target: string): Promise<boolean> {
 	}
 }
 
+const nativeKill = process.kill.bind(process);
+
+/**
+ * Record every signal attempt and deliver none. These tests assert that the stop
+ * path signals nothing, so a regression must be caught rather than delivered to
+ * whatever process currently holds a fixture pid. Liveness probes still pass
+ * through so the lock owner check keeps working.
+ */
+function spyOnSignals() {
+	return spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) =>
+		signal === 0 ? nativeKill(pid, signal) : true) as unknown as typeof process.kill);
+}
+
 /** Signals other than the liveness probe used by the lock owner check. */
-function realSignals(spy: ReturnType<typeof spyOn<typeof process, "kill">>): unknown[][] {
+function realSignals(spy: ReturnType<typeof spyOnSignals>): unknown[][] {
 	return spy.mock.calls.filter(call => call[1] !== 0);
 }
 
@@ -163,7 +176,7 @@ describe("Kev lifecycle", () => {
 		expect((await fs.stat(path.join(f.root, "supervisor.py"))).mode & 0o777).toBe(0o600);
 		await runKevSetup("start", {}, f.deps);
 		expect(f.spawned).toHaveLength(1);
-		const kills = spyOn(process, "kill");
+		const kills = spyOnSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 			await runKevSetup("stop", {}, f.deps);
@@ -204,7 +217,7 @@ describe("Kev lifecycle", () => {
 			if ((JSON.parse(message.trim()) as { op?: string }).op === "stop") reusedNow = true;
 			return answer(socketPath, message);
 		};
-		const kills = spyOn(process, "kill");
+		const kills = spyOnSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 		} finally {
@@ -228,7 +241,7 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.supervisor.acceptsToken = false;
-		const kills = spyOn(process, "kill");
+		const kills = spyOnSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopping" });
 		} finally {
@@ -329,7 +342,7 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.deps.control = async () => undefined;
-		const kills = spyOn(process, "kill");
+		const kills = spyOnSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopping" });
 		} finally {
@@ -344,7 +357,7 @@ describe("Kev lifecycle", () => {
 		await runKevSetup("install", { root: f.root }, f.deps);
 		await runKevSetup("start", {}, f.deps);
 		f.processes.delete(f.supervisor.pid!);
-		const kills = spyOn(process, "kill");
+		const kills = spyOnSignals();
 		try {
 			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 		} finally {
