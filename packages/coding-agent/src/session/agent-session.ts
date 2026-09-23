@@ -23795,7 +23795,7 @@ export class AgentSession {
 		const resolveSameKindPeer = async (
 			excludedRowId: number | undefined,
 			credentialKind: "oauth" | "api_key" | undefined,
-		): Promise<{ rowId: number | undefined; credentialKind: "oauth" | "api_key" | undefined }> => {
+		): Promise<{ rowId: number | undefined; credentialKind: "oauth" | "api_key" | undefined; peerSelected: boolean }> => {
 			if (credentialKind === "oauth") {
 				const peers = authStorage
 					.listCredentialInventory(provider)
@@ -23819,14 +23819,19 @@ export class AgentSession {
 					}
 					const rowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 					const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
-					if (rowId === peer.id && selectedKind === credentialKind) return { rowId, credentialKind: selectedKind };
+					if (rowId === peer.id && selectedKind === credentialKind)
+						return { rowId, credentialKind: selectedKind, peerSelected: true };
 				}
 			} else {
 				await this.#modelRegistry.getApiKey(model, credentialSessionId);
 			}
+			const rowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
 			return {
-				rowId: authStorage.getSessionCredentialRowId(provider, credentialSessionId),
-				credentialKind: authStorage.getSessionCredentialType(provider, credentialSessionId),
+				rowId,
+				credentialKind: selectedKind,
+				peerSelected:
+					credentialKind !== undefined && rowId !== undefined && rowId !== excludedRowId && selectedKind === credentialKind,
 			};
 		};
 		if (trigger.class !== "auth") {
@@ -23844,25 +23849,27 @@ export class AgentSession {
 				...(before === undefined ? {} : { rowId: before }),
 			});
 			if (!remaining) {
-				if (before === undefined || beforeType === undefined) return "unchanged";
+				if (beforeType === undefined) return "unchanged";
+				const failedRowAtMark = before ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 				const failedRowStillActive = authStorage
 					.listCredentialInventory(provider)
 					.some(
 						credential =>
-							credential.id === before &&
+							credential.id === failedRowAtMark &&
+							failedRowAtMark !== undefined &&
 							!credential.disabled &&
 							credential.credentialKind === beforeType,
 					);
 				if (failedRowStillActive) return "exhausted";
-				const after = await resolveSameKindPeer(before, beforeType);
-				return after.rowId !== undefined && after.rowId !== before && after.credentialKind === beforeType
-					? "rotated"
-					: "unchanged";
+				const after = await resolveSameKindPeer(failedRowAtMark, beforeType);
+				if (!after.peerSelected) return "unchanged";
+				return before === undefined ? "alternate" : "rotated";
 			}
 			const failedRowAtMark = before ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 			const after = await resolveSameKindPeer(failedRowAtMark, beforeType);
 			if (
 				before !== undefined &&
+				after.peerSelected &&
 				after.rowId !== undefined &&
 				after.rowId !== before &&
 				after.credentialKind === beforeType
