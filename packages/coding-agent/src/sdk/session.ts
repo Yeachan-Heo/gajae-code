@@ -67,9 +67,11 @@ import {
 	formatModelString,
 	parseModelPattern,
 	parseModelString,
+	refreshMissingQualifiedModelProviders,
 	resolveAllowedModels,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
+	resolveStartupModelRefreshSelectors,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { normalizeModelSelectorValue } from "../config/model-selector-value";
@@ -1911,6 +1913,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		}
 		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
+			// Match the CLI's awaited startup discovery: the background refresh below
+			// is not a readiness barrier, so resolving a fresh configured default first
+			// can reject a model that the provider would discover moments later.
+			const startupModelSelectors = resolveStartupModelRefreshSelectors(
+				{
+					model: options.modelPattern ?? (options.model ? formatModelString(options.model) : undefined),
+					credential: options.credentialSelector ? "session" : undefined,
+					resume: hasExistingSession,
+					hasStartupProfile: Boolean(options.activeModelProfile || settings.get("modelProfile.default")),
+				},
+				settings,
+			);
+			await refreshMissingQualifiedModelProviders(startupModelSelectors, modelRegistry, credentialSessionId);
 			modelRegistry.refreshInBackground("online-if-uncached", credentialSessionId);
 		}
 
