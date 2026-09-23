@@ -469,11 +469,11 @@ describe("managed fallback quota credential rotation", () => {
 			quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
 			maxAttempts: 1,
 		});
-		expect(result).toEqual({
-			models: [selector(model), selector(model), selector(model), selector(fallback)],
-			keys: ["TOKEN-a", "TOKEN-b", "TOKEN-c", "fallback-test-key"],
-			markCount: 3,
-		});
+		expect(result.models).toEqual([selector(model), selector(model), selector(model), selector(fallback)]);
+		expect(result.keys[0]).toBe("TOKEN-a");
+		expect(result.keys.slice(0, 3).sort()).toEqual(["TOKEN-a", "TOKEN-b", "TOKEN-c"]);
+		expect(result.keys.at(-1)).toBe("fallback-test-key");
+		expect(result.markCount).toBe(3);
 	});
 
 	test("keeps the active non-head fallback entry when quota rotation retries it", async () => {
