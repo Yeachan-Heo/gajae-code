@@ -5313,7 +5313,10 @@ async function executeToolCalls(
 	};
 
 	const settleDispatchedCancellationCleanup = async (record: (typeof records)[number]): Promise<void> => {
-		if (record.cleanupClaimed) return record.cleanupSettled.promise;
+		if (record.cleanupClaimed) {
+			await Promise.race([record.cleanupSettled.promise, Bun.sleep(1_000)]);
+			return;
+		}
 		record.cleanupClaimed = true;
 		try {
 			if (afterToolCall) {
