@@ -82,6 +82,9 @@ const argument = (description: string, extra: Partial<PublicArgumentDescriptor> 
 });
 const agentDir = stringFlag("SDK broker/state directory (default: the configured agent directory).");
 const repo = stringFlag("Workspace directory for scope or saved-session resolution (default: current directory).");
+const exactSessionRepo = stringFlag(
+	"Accepted for compatibility only; ignored because the exact session ID selects the broker target.",
+);
 const timeout = positive("Request or live-follow timeout in milliseconds; send uses this for its --wait window.");
 const idempotency = stringFlag(
 	"Caller idempotency key; retain it when reconciling an uncertain mutation, never blindly replay.",
@@ -275,6 +278,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	node("sdk session", {
 		description: "Manage broker-bound credential-free sessions.",
 		children: ["list", "inspect", "send", "status", "tail", "retire", "raw"],
+		flags: sessionFlags,
 		syntax: "<command>",
 	}),
 	node("sdk session list", {
@@ -294,7 +298,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	node("sdk session inspect", {
 		description: "Inspect a session without exposing endpoint credentials.",
 		args: sessionArg,
-		flags: sessionFlags,
+		flags: { ...sessionFlags, repo: exactSessionRepo },
 		syntax: "<sessionId>",
 	}),
 	node("sdk session send", {
@@ -302,6 +306,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		args: sessionArg,
 		flags: {
 			...sessionFlags,
+			repo: exactSessionRepo,
 			...jsonInput,
 			text: stringFlag("Prompt text, alternative to nonempty JSON input."),
 			"op-ref": stringFlag(
@@ -324,7 +329,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 	node("sdk session status", {
 		description: "Read the durable prompt result for a known operation reference.",
 		args: { ...sessionArg, opRef: argument("Exact operation reference returned or supplied by send.") },
-		flags: { ...sessionFlags, "timeout-ms": timeout },
+		flags: { ...sessionFlags, repo: exactSessionRepo, "timeout-ms": timeout },
 		syntax: "<sessionId> <opRef>",
 	}),
 	node("sdk session tail", {
@@ -392,6 +397,7 @@ export const PUBLIC_COMMANDS: readonly PublicCommandDescriptor[] = [
 		operationKind: "query",
 		flags: {
 			...sessionFlags,
+			repo: exactSessionRepo,
 			...jsonInput,
 			query: stringFlag("Query ID (including registered query aliases).", { required: true }),
 			cursor: stringFlag("Raw query continuation cursor."),

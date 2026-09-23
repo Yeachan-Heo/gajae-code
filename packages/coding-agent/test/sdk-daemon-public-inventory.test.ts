@@ -42,11 +42,12 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 	"sdk serve": ["stdio", "socket", "session", "pending-ceiling"],
 	"sdk search": ["agent-dir", "repo", "scope", "limit", "cursor"],
 	"sdk spawn": ["agent-dir", "cwd", "prompt", "model", "profile", "idempotency-key"],
-	"sdk session": [],
+	"sdk session": ["agent-dir"],
 	"sdk session list": ["agent-dir", "repo", "scope"],
-	"sdk session inspect": ["agent-dir"],
+	"sdk session inspect": ["agent-dir", "repo"],
 	"sdk session send": [
 		"agent-dir",
+		"repo",
 		"json-input",
 		"json-input-file",
 		"json-input-stdin",
@@ -55,7 +56,7 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 		"wait",
 		"timeout-ms",
 	],
-	"sdk session status": ["agent-dir", "timeout-ms"],
+	"sdk session status": ["agent-dir", "repo", "timeout-ms"],
 	"sdk session tail": [
 		"agent-dir",
 		"repo",
@@ -80,6 +81,7 @@ const OPERATION_FLAGS: Record<string, string[]> = {
 	],
 	"sdk session raw query": [
 		"agent-dir",
+		"repo",
 		"json-input",
 		"json-input-file",
 		"json-input-stdin",
@@ -144,6 +146,8 @@ describe("static SDK/daemon public inventory", () => {
 					.sort(),
 			).toEqual([...flags].sort());
 		}
+		for (const path of ["sdk session inspect", "sdk session send", "sdk session status", "sdk session raw query"])
+			expect(command(path).flags.repo?.description).toContain("ignored");
 		expect(command("sdk session list").flags.scope?.options).toEqual(["repo", "cwd", "worktree", "all"]);
 		expect(command("sdk search").flags.scope?.options).toEqual(["repo", "pwd", "global"]);
 		expect(command("sdk search").flags.limit?.kind).toBe("integer");

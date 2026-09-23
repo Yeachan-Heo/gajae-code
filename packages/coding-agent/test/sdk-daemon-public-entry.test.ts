@@ -22,6 +22,33 @@ describe("inert public command entry scanner", () => {
 		expect(result.operationArgv).toEqual(["session", "raw", "query", "session-id", "--query", "session.inspect"]);
 	});
 
+	it("accepts session-family agent-dir placement while retaining leaf placement", () => {
+		const agentDir = "/tmp/gjc-agent";
+		for (const argv of [
+			["session", "--agent-dir", agentDir, "list", "--scope", "all"],
+			["session", "list", "--scope", "all", "--agent-dir", agentDir],
+			["session", "inspect", "session-id", "--agent-dir", agentDir],
+		]) {
+			const result = scanPublicCommand("sdk", argv);
+			expect(result.kind).toBe("operation");
+			expect(result.flags["agent-dir"]).toBe(agentDir);
+		}
+	});
+
+	it("accepts repo on exact-session commands without changing their target contract", () => {
+		const repo = "/tmp/gjc-repo";
+		for (const argv of [
+			["session", "inspect", "session-id", "--repo", repo],
+			["session", "send", "session-id", "--text", "hello", "--repo", repo],
+			["session", "status", "session-id", "operation-ref", "--repo", repo],
+			["session", "raw", "query", "session-id", "--query", "session.inspect", "--repo", repo],
+		]) {
+			const result = scanPublicCommand("sdk", argv);
+			expect(result.kind).toBe("operation");
+			expect(result.flags.repo).toBe(repo);
+		}
+	});
+
 	it("does not infer help or JSON from operands, equals values or tokens after --", () => {
 		for (const value of ["--json", "--help", "-h"]) {
 			const result = scanPublicCommand("sdk", ["session", "send", "s", `--text=${value}`]);

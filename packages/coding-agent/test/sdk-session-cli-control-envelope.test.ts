@@ -16,6 +16,35 @@ import { deriveSessionLifecycleIdempotencyKey, SessionLifecycleService } from ".
 import { SessionRouter } from "../src/sdk/router";
 
 describe("sdk session raw control envelope", () => {
+	test("reports when repo is ignored for exact-session commands without echoing its value", async () => {
+		const repo = "/private/workspace/path";
+		const warnings: string[] = [];
+		const stderr = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			warnings.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			for (const args of [
+				{ action: "inspect", repo },
+				{ action: "send", repo },
+				{ action: "status", repo },
+				{ action: "raw", rawAction: "query", query: "session.checkpoint", repo },
+			]) {
+				const error = await runSdkSessionCli(args, () => {}).catch(error => error);
+				expect(error).toBeInstanceOf(PublicCommandFailure);
+				expect(error).toMatchObject({ input: { kind: "usage", proof: "pre-effect" } });
+			}
+			expect(warnings.join("")).toBe(
+				"Warning: --repo is ignored for exact-session commands; the session ID selects the broker target.\n".repeat(
+					4,
+				),
+			);
+			expect(warnings.join("")).not.toContain(repo);
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+
 	test("invalid JSON throws before output and the boundary never echoes its body", async () => {
 		const output: unknown[] = [];
 		const secret = "secret-body-not-for-output";
