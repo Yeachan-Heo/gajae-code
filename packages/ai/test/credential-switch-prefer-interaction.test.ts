@@ -54,7 +54,11 @@ describe("merged contract: /credential switch vs --prefer-credential (PR #4317)"
 		storage.setRuntimePreferredCredentialSelector("anthropic", { kind: "id", value: String(rowA.id) });
 		storage.switchSessionCredential("anthropic", "live-session", { kind: "id", value: String(rowB.id) });
 		expect(await storage.getApiKey("anthropic", "live-session")).toBe("token-account-b");
-		expect(await storage.markUsageLimitReached("anthropic", "live-session", { retryAfterMs: 60_000 })).toBe(true);
+		const result = await storage.markUsageLimitReached("anthropic", "live-session", { retryAfterMs: 60_000 });
+		expect(result.state).toBe("marked");
+		expect(result.failedRowId).toBe(rowB.id);
+		expect(result.credentialKind).toBe("oauth");
+		expect(result.remainingCredentialIds).toEqual([rowA.id]);
 
 		// Blocked switched row falls through to the soft-preferred row, not to a 429.
 		expect(await storage.getApiKey("anthropic", "live-session")).toBe("token-account-a");

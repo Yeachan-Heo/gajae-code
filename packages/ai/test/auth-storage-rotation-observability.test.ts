@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
+import { AuthStorage, SqliteAuthCredentialStore, type UsageLimitMarkResult } from "../src/auth-storage";
 
 /**
  * Characterizes the rotation facts a `credential_switched` observer depends on:
@@ -129,13 +129,13 @@ describe("AuthStorage rotation observability", () => {
 			{ type: "api_key", key: "rot-key-3" },
 		]);
 		const sessionId = "exhaustion-session";
-		const observed: Array<{ row: number | undefined; more: boolean }> = [];
+		const observed: Array<{ row: number | undefined; result: UsageLimitMarkResult }> = [];
 
 		for (let attempt = 0; attempt < 3; attempt++) {
 			await storage().getApiKey(PROVIDER, sessionId);
 			const row = storage().getSessionCredentialRowId(PROVIDER, sessionId);
-			const more = await storage().markUsageLimitReached(PROVIDER, sessionId, { retryAfterMs: 60_000 });
-			observed.push({ row, more });
+			const result = await storage().markUsageLimitReached(PROVIDER, sessionId, { retryAfterMs: 60_000 });
+			observed.push({ row, result });
 		}
 
 		// Each attempt used a DISTINCT row: no entry is blocked twice, which is
@@ -144,9 +144,10 @@ describe("AuthStorage rotation observability", () => {
 		expect(new Set(rows).size).toBe(3);
 		expect(rows.every(row => typeof row === "number")).toBe(true);
 
-		// Only the final attempt reports that nothing is left. Consumers advance
-		// the model chain on that transition and not before.
-		expect(observed.map(entry => entry.more)).toEqual([true, true, false]);
+		// Each existing row is marked; only the final attempt has no unblocked
+		// same-kind peers left, so consumers advance the model chain then.
+		expect(observed.map(entry => entry.result.state)).toEqual(["marked", "marked", "marked"]);
+		expect(observed.map(entry => entry.result.remainingCredentialIds.length)).toEqual([2, 1, 0]);
 	});
 
 	it("selects credentials in stored order for a fresh session", async () => {
@@ -174,7 +175,11 @@ describe("AuthStorage rotation observability", () => {
 		await storage().getApiKey(PROVIDER, sessionId);
 		const before = storage().getSessionCredentialRowId(PROVIDER, sessionId);
 
-		expect(await storage().markUsageLimitReached(PROVIDER, sessionId, { retryAfterMs: 60_000 })).toBe(false);
+		const result = await storage().markUsageLimitReached(PROVIDER, sessionId, { retryAfterMs: 60_000 });
+		expect(result.state).toBe("marked");
+		expect(result.failedRowId).toBe(before);
+		expect(result.credentialKind).toBe("api_key");
+		expect(result.remainingCredentialIds).toEqual([]);
 
 		await storage().getApiKey(PROVIDER, sessionId);
 		expect(storage().getSessionCredentialRowId(PROVIDER, sessionId)).toBe(before);
