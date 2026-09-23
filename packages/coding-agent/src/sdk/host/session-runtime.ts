@@ -437,6 +437,7 @@ export class SessionSdkSessionRuntime {
 			this.host.handleDisconnect(connectionId);
 		});
 		this.#capabilitiesDisposer = options.transport.onNegotiatedCapabilities?.((connectionId, negotiated) => {
+			if (options.connectionCapabilities && this.#connectionCapabilitiesProvider(connectionId) === undefined) return;
 			this.#connectionIds.add(connectionId);
 			this.#connectionCapabilities.set(connectionId, new Set(negotiated));
 		});
@@ -455,13 +456,6 @@ export class SessionSdkSessionRuntime {
 
 	getProviderDefinitions(capability: string): unknown | undefined {
 		return this.host.getProviderDefinitions(capability);
-	}
-
-	/** Snapshot connections that negotiated every capability in the requirement set. */
-	connectionIdsWithCapabilities(required: readonly string[]): string[] {
-		return [...this.#connectionCapabilities].flatMap(([connectionId, capabilities]) =>
-			required.every(capability => capabilities.has(capability)) ? [connectionId] : [],
-		);
 	}
 
 	/** Persist the host's current observable activity for broker/session-list consumers. */

@@ -247,7 +247,6 @@ async function createHostHarness(
 			sent.length = 0;
 			broadcasts.length = 0;
 		},
-		setCapabilities: (connectionId, capabilities) => negotiatedCapabilities?.(connectionId, capabilities),
 		setIdle: value => {
 			idle = value;
 		},

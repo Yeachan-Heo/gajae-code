@@ -8002,7 +8002,8 @@ export function createNotificationsExtension(
 				if (typeof id !== "string" || !Array.isArray(negotiated)) return;
 				const normalized = negotiated.filter((capability): capability is string => typeof capability === "string");
 				rememberHostCapabilities(id, normalized);
-				if (liveHostCapabilities(id) !== undefined) hostAttachedConnections.add(id);
+				if (liveHostCapabilities(id) === undefined) return;
+				hostAttachedConnections.add(id);
 				negotiatedCapabilitiesHandler?.(id, normalized);
 			});
 			server.onConnectionClose((_err, connectionId) => {
