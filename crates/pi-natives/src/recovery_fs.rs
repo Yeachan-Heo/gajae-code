@@ -17,7 +17,7 @@ use std::{
 	},
 	path::{Component, Path},
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
@@ -99,8 +99,23 @@ struct RecoveryReaperMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManagedRecoveryName {
 	pid:             libc::pid_t,
+	publisher:       Option<ManagedPublisherIdentity>,
 	kind:            ManagedRecoveryKind,
 	created_at_secs: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManagedPublisherIdentity {
+	boot_id:          [u8; 16],
+	start_time_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinuxBootInfo {
+	boot_id: [u8; 16],
 }
 
 #[cfg(target_os = "linux")]
@@ -2695,7 +2710,23 @@ fn managed_recovery_name(family: &str, counter: u64) -> Result<String, &'static 
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_err(|_| "io_error")?
 		.as_secs();
-	Ok(format!("{family}-{}-{counter}-{created_at_secs}", std::process::id()))
+	let pid = libc::pid_t::try_from(std::process::id()).map_err(|_| "io_error")?;
+	let process = linux_process_identity(pid);
+	if family == ".gjc-managed-replace" && process.is_none() {
+		// Never publish an in-flight candidate that cannot be tied to this process
+		// generation; a later PID reuse would make its live-publisher guard unsafe.
+		return Err("io_error");
+	}
+	if let Some(publisher) = process {
+		return Ok(format!(
+			"{family}-{pid}-{:032x}-{}-{counter}-{created_at_secs}",
+			u128::from_be_bytes(publisher.boot_id),
+			publisher.start_time_ticks,
+		));
+	}
+	// Completion/removal names do not need live-publisher identity, so retain their
+	// timestamped format when procfs is unavailable.
+	Ok(format!("{family}-{pid}-{counter}-{created_at_secs}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2710,6 +2741,89 @@ fn parse_canonical_u64(bytes: &[u8]) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_boot_id_hex(bytes: &[u8]) -> Option<[u8; 16]> {
+	if bytes.len() != 32
+		|| !bytes
+			.iter()
+			.all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+	{
+		return None;
+	}
+	let hex = std::str::from_utf8(bytes).ok()?;
+	let boot_id = u128::from_str_radix(hex, 16).ok()?.to_be_bytes();
+	(boot_id != [0; 16]).then_some(boot_id)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_boot_id(value: &str) -> Option<[u8; 16]> {
+	let bytes = value.trim().as_bytes();
+	if bytes.len() != 36
+		|| bytes[8] != b'-'
+		|| bytes[13] != b'-'
+		|| bytes[18] != b'-'
+		|| bytes[23] != b'-'
+	{
+		return None;
+	}
+	let compact = bytes
+		.iter()
+		.copied()
+		.filter(|byte| *byte != b'-')
+		.collect::<Vec<_>>();
+	parse_boot_id_hex(&compact)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_info() -> Option<LinuxBootInfo> {
+	static BOOT_INFO: OnceLock<LinuxBootInfo> = OnceLock::new();
+	if let Some(boot_info) = BOOT_INFO.get() {
+		return Some(*boot_info);
+	}
+	let boot_id =
+		parse_linux_boot_id(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?)?;
+	let _ = BOOT_INFO.set(LinuxBootInfo { boot_id });
+	BOOT_INFO.get().copied()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_start_ticks(stat: &[u8]) -> Option<u64> {
+	let command_end = stat
+		.windows(2)
+		.rposition(|window| window == b") ")?
+		.checked_add(2)?;
+	let start_time = stat
+		.get(command_end..)?
+		.split(|byte| byte.is_ascii_whitespace())
+		.filter(|field| !field.is_empty())
+		.nth(19)?;
+	parse_canonical_u64(start_time)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_identity(pid: libc::pid_t) -> Option<ManagedPublisherIdentity> {
+	if pid <= 0 {
+		return None;
+	}
+	let boot = linux_boot_info()?;
+	let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+	let start_time_ticks = parse_linux_process_start_ticks(&stat)?;
+	Some(ManagedPublisherIdentity { boot_id: boot.boot_id, start_time_ticks })
+}
+
+#[cfg(target_os = "linux")]
+fn process_generation_is_definitely_different(
+	publisher: Option<ManagedPublisherIdentity>,
+	current: ManagedPublisherIdentity,
+) -> bool {
+	match publisher {
+		Some(publisher) => publisher != current,
+		// Old names have no generation token. Their timestamp is wall-clock based,
+		// so it cannot safely prove PID reuse after a realtime clock adjustment.
+		None => false,
+	}
+}
+
+#[cfg(target_os = "linux")]
 fn parse_managed_recovery_name(name: &[u8]) -> Option<ManagedRecoveryName> {
 	let (kind, remainder) =
 		if let Some(remainder) = name.strip_prefix(b".gjc-managed-replace-complete-") {
@@ -2721,16 +2835,36 @@ fn parse_managed_recovery_name(name: &[u8]) -> Option<ManagedRecoveryName> {
 		};
 	let mut fields = remainder.split(|byte| *byte == b'-');
 	let pid = parse_canonical_u64(fields.next()?)?;
-	let _counter = parse_canonical_u64(fields.next()?)?;
-	let created_at_secs = match fields.next() {
-		Some(timestamp) => Some(parse_canonical_u64(timestamp)?),
-		None => None,
+	let next = fields.next()?;
+	let (publisher, _counter, created_at_secs) = if next.len() == 32
+		&& next.iter().all(|byte| byte.is_ascii_hexdigit())
+	{
+		let boot_id = parse_boot_id_hex(next)?;
+		let start_time_ticks = parse_canonical_u64(fields.next()?)?;
+		let counter = parse_canonical_u64(fields.next()?)?;
+		let created_at_secs = parse_canonical_u64(fields.next()?)?;
+		(Some(ManagedPublisherIdentity { boot_id, start_time_ticks }), counter, Some(created_at_secs))
+	} else {
+		let counter = parse_canonical_u64(next)?;
+		let created_at_secs = match fields.next() {
+			Some(timestamp) => Some(parse_canonical_u64(timestamp)?),
+			None => None,
+		};
+		(None, counter, created_at_secs)
 	};
 	if fields.next().is_some() || created_at_secs == Some(0) {
 		return None;
 	}
 	let pid = libc::pid_t::try_from(pid).ok()?;
-	(pid > 0).then_some(ManagedRecoveryName { pid, kind, created_at_secs })
+	(pid > 0).then_some(ManagedRecoveryName { pid, publisher, kind, created_at_secs })
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_definitely_dead_for_candidate(candidate: ManagedRecoveryName) -> bool {
+	if let Some(current) = linux_process_identity(candidate.pid) {
+		return process_generation_is_definitely_different(candidate.publisher, current);
+	}
+	process_is_definitely_dead(candidate.pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2779,7 +2913,7 @@ fn reap_managed_recovery(
 		recovery,
 		unix_now.as_secs(),
 		&mut state.directory_cookie,
-		process_is_definitely_dead,
+		process_is_definitely_dead_for_candidate,
 	);
 	record_reaper_metrics(&mut state, metrics)
 }
@@ -3036,13 +3170,13 @@ fn reap_managed_recovery_candidate(
 	candidate: ManagedRecoveryName,
 	now_secs: u64,
 	remaining_bytes: u64,
-	process_is_dead: &mut impl FnMut(libc::pid_t) -> bool,
+	process_is_dead: &mut impl FnMut(ManagedRecoveryName) -> bool,
 ) -> ReaperCandidateResult {
 	// Replacement staging may still be in-flight, so retain it while its
 	// publisher is alive. Successful replacements are atomically moved to the
 	// completed family before returning; completed predecessors and detached
 	// removals expire after their TTL even if their publisher remains alive.
-	if candidate.kind == ManagedRecoveryKind::Replace && !process_is_dead(candidate.pid) {
+	if candidate.kind == ManagedRecoveryKind::Replace && !process_is_dead(candidate) {
 		return ReaperCandidateResult::Preserved;
 	}
 	let Ok(named_before) = statat(recovery, name) else {
@@ -3184,7 +3318,7 @@ fn reap_managed_recovery_at(
 	recovery: &File,
 	now_secs: u64,
 	directory_cookie: &mut libc::c_long,
-	mut process_is_dead: impl FnMut(libc::pid_t) -> bool,
+	mut process_is_dead: impl FnMut(ManagedRecoveryName) -> bool,
 ) -> RecoveryReaperMetrics {
 	let mut metrics = RecoveryReaperMetrics::default();
 	// Never rename or recreate this directory: retained descriptors must continue
@@ -4532,6 +4666,20 @@ mod tests {
 		format!("{family}-{pid}-{counter}-{created_at_secs}")
 	}
 
+	fn recovery_name_with_publisher(
+		family: &str,
+		pid: u32,
+		publisher: ManagedPublisherIdentity,
+		counter: u64,
+		created_at_secs: u64,
+	) -> String {
+		format!(
+			"{family}-{pid}-{:032x}-{}-{counter}-{created_at_secs}",
+			u128::from_be_bytes(publisher.boot_id),
+			publisher.start_time_ticks,
+		)
+	}
+
 	fn write_reaper_file(directory: &std::path::Path, name: &str, contents: &[u8], mode: u32) {
 		let path = directory.join(name);
 		fs::write(&path, contents).expect("write recovery file");
@@ -4551,6 +4699,7 @@ mod tests {
 			parse_managed_recovery_name(b".gjc-managed-replace-17-0-42"),
 			Some(ManagedRecoveryName {
 				pid:             17,
+				publisher:       None,
 				kind:            ManagedRecoveryKind::Replace,
 				created_at_secs: Some(42),
 			})
@@ -4559,6 +4708,7 @@ mod tests {
 			parse_managed_recovery_name(b".gjc-managed-replace-complete-17-1-42"),
 			Some(ManagedRecoveryName {
 				pid:             17,
+				publisher:       None,
 				kind:            ManagedRecoveryKind::CompletedReplace,
 				created_at_secs: Some(42),
 			})
@@ -4567,6 +4717,7 @@ mod tests {
 			parse_managed_recovery_name(b".gjc-managed-remove-18-9-43"),
 			Some(ManagedRecoveryName {
 				pid:             18,
+				publisher:       None,
 				kind:            ManagedRecoveryKind::Remove,
 				created_at_secs: Some(43),
 			})
@@ -4575,6 +4726,7 @@ mod tests {
 			parse_managed_recovery_name(b".gjc-managed-remove-18-9"),
 			Some(ManagedRecoveryName {
 				pid:             18,
+				publisher:       None,
 				kind:            ManagedRecoveryKind::Remove,
 				created_at_secs: None,
 			})
@@ -4583,8 +4735,21 @@ mod tests {
 			parse_managed_recovery_name(b".gjc-managed-replace-18-9"),
 			Some(ManagedRecoveryName {
 				pid:             18,
+				publisher:       None,
 				kind:            ManagedRecoveryKind::Replace,
 				created_at_secs: None,
+			})
+		);
+		let publisher =
+			ManagedPublisherIdentity { boot_id: [0x12; 16], start_time_ticks: 123 };
+		let timestamped = recovery_name_with_publisher(".gjc-managed-replace", 17, publisher, 9, 42);
+		assert_eq!(
+			parse_managed_recovery_name(timestamped.as_bytes()),
+			Some(ManagedRecoveryName {
+				pid:             17,
+				publisher:       Some(publisher),
+				kind:            ManagedRecoveryKind::Replace,
+				created_at_secs: Some(42),
 			})
 		);
 		for name in [
@@ -4592,10 +4757,66 @@ mod tests {
 			b".gjc-managed-remove-018-9-43".as_slice(),
 			b".gjc-managed-replace-17-0-43-extra".as_slice(),
 			b".gjc-managed-remove-17-x-43".as_slice(),
+			b".gjc-managed-replace-17-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-123-0-42".as_slice(),
 			b".gjc-managed-tree-remove-17-9-43".as_slice(),
 		] {
 			assert_eq!(parse_managed_recovery_name(name), None, "{name:?}");
 		}
+	}
+
+	#[test]
+	fn generated_replacement_names_bind_the_current_process_generation() {
+		let pid =
+			libc::pid_t::try_from(std::process::id()).expect("test process id fits Linux pid_t");
+		let current = linux_process_identity(pid).expect("read current process identity");
+		let generated =
+			managed_recovery_name(".gjc-managed-replace", 3).expect("generate managed name");
+		let parsed = parse_managed_recovery_name(generated.as_bytes()).expect("parse managed name");
+		assert_eq!(parsed.pid, pid);
+		assert_eq!(parsed.publisher, Some(current));
+		assert_eq!(parsed.kind, ManagedRecoveryKind::Replace);
+		assert!(parsed.created_at_secs.is_some());
+	}
+
+	#[test]
+	fn process_stat_parser_handles_non_utf8_command_names() {
+		let mut stat = b"4321 (comm with ) and ".to_vec();
+		stat.push(0xff);
+		stat.extend_from_slice(b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20");
+		assert_eq!(parse_linux_process_start_ticks(&stat), Some(19));
+	}
+
+	#[test]
+	fn reaper_distinguishes_reused_pids_from_the_original_publisher() {
+		let temporary = TempDir::new();
+		let directory = temporary.root();
+		let now = RECOVERY_REAPER_REPLACE_GRACE_SECS + RECOVERY_REAPER_CLOCK_GRACE_SECS + 100_000;
+		let expired_at =
+			now - RECOVERY_REAPER_REPLACE_GRACE_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS - 1;
+		let current =
+			ManagedPublisherIdentity { boot_id: [0x34; 16], start_time_ticks: 900 };
+		let previous =
+			ManagedPublisherIdentity { boot_id: [0x34; 16], start_time_ticks: 899 };
+		let reused_name =
+			recovery_name_with_publisher(".gjc-managed-replace", 801, previous, 0, expired_at);
+		let live_name =
+			recovery_name_with_publisher(".gjc-managed-replace", 801, current, 1, expired_at + 1);
+		write_reaper_file(&temporary.0, &reused_name, b"reused", 0o600);
+		write_reaper_file(&temporary.0, &live_name, b"live", 0o600);
+
+		let mut cookie = 0;
+		let metrics = reap_managed_recovery_at(&directory, now, &mut cookie, |candidate| {
+			process_generation_is_definitely_different(candidate.publisher, current)
+		});
+		assert_eq!(metrics.reaped_files, 1);
+		assert_eq!(metrics.preserved_candidates, 1);
+		assert!(!temporary.0.join(reused_name).exists());
+		assert!(temporary.0.join(live_name).exists());
+
+		assert!(!process_generation_is_definitely_different(None, current));
+		let after_reboot =
+			ManagedPublisherIdentity { boot_id: [0x35; 16], start_time_ticks: 899 };
+		assert!(process_generation_is_definitely_different(Some(previous), after_reboot));
 	}
 
 	#[test]
@@ -4626,8 +4847,9 @@ mod tests {
 		}
 
 		let mut cookie = 0;
-		let metrics =
-			reap_managed_recovery_at(&directory, now, &mut cookie, |pid| pid != 101 && pid != 110);
+		let metrics = reap_managed_recovery_at(&directory, now, &mut cookie, |candidate| {
+			candidate.pid != 101 && candidate.pid != 110
+		});
 		assert_eq!(metrics.reaped_files, 4);
 		assert_eq!(
 			metrics.reaped_bytes,
@@ -4731,7 +4953,9 @@ mod tests {
 		)
 		.expect("age marker for deterministic retention test");
 		let mut cookie = 0;
-		let metrics = reap_managed_recovery_at(&directory, first_seen, &mut cookie, |pid| pid == 711);
+		let metrics = reap_managed_recovery_at(&directory, first_seen, &mut cookie, |candidate| {
+			candidate.pid == 711
+		});
 		assert_eq!(metrics.reaped_files, 1);
 		assert_eq!(metrics.reaped_bytes, b"legacy-data".len() as u64);
 		assert!(!temporary.0.join(name).exists());
@@ -4811,9 +5035,14 @@ mod tests {
 
 		let now = unix_now_secs();
 		let live_pid = std::process::id();
-		let live_name = recovery_name(
+		let live_process = linux_process_identity(
+			libc::pid_t::try_from(live_pid).expect("test process id fits Linux pid_t"),
+		)
+		.expect("read current process identity");
+		let live_name = recovery_name_with_publisher(
 			".gjc-managed-replace",
 			live_pid,
+			live_process,
 			0,
 			now - RECOVERY_REAPER_REPLACE_GRACE_SECS - RECOVERY_REAPER_CLOCK_GRACE_SECS,
 		);
