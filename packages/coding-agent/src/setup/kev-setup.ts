@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { z } from "zod";
+import { acquireFileLock, FileLockAcquireError } from "../config/file-lock";
 
 export type KevSetupAction = "install" | "start" | "stop" | "status";
 export const DEFAULT_KEV_MODEL = "jaredpalmer/kev-4b";
@@ -475,11 +476,12 @@ export async function runKevSetup(
 		result = await status(root, deps);
 	} else {
 		await fs.chmod(root, 0o700);
-		const lock = path.join(root, ".lifecycle.lock");
+		const lock = path.join(root, ".lifecycle");
+		let releaseLock: (() => Promise<void>) | undefined;
 		try {
-			await fs.mkdir(lock, { mode: 0o700 });
+			releaseLock = await acquireFileLock(lock, { retries: 3, retryDelayMs: 100 });
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST")
+			if (error instanceof FileLockAcquireError)
 				throw new Error("Kev lifecycle is busy; inspect the existing lock before retrying");
 			throw error;
 		}
@@ -491,7 +493,7 @@ export async function runKevSetup(
 						? await startKev(root, options, deps)
 						: await stopKev(root, deps);
 		} finally {
-			await fs.rmdir(lock);
+			await releaseLock?.();
 		}
 	}
 	if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

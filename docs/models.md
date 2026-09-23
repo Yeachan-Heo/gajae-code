@@ -223,7 +223,7 @@ For future routing evaluation, opt in before starting GJC:
 GJC_TASK_COLLECTION=metadata bun run dev
 ```
 
-Collection alone is local only and disabled by default. It does not call Kev, change model/effort selection, inject hints, train models, or upload data. Enabling the separate decision feature below automatically permits metadata collection only when `GJC_TASK_COLLECTION` is unset. Explicit `off` or unsupported values and `GJC_DISABLE_TELEMETRY=1` prevent persistence. Use a trusted shell/user environment; a repository `.env` cannot opt you in.
+Collection alone is local only and disabled by default. It does not call Kev, change model/effort selection, inject hints, train models, or upload data. Opt in explicitly with `task.decision.collection` (`off`, `metadata`, or `content`) or `GJC_TASK_COLLECTION`. Decision enablement is separate and never enables persistence by itself. Explicit `off` or unsupported values and `GJC_DISABLE_TELEMETRY=1` prevent persistence. Use a trusted shell/user environment; a repository `.env` cannot opt you in.
 
 Each logical subagent execution records a begin event, observed model selections, and a terminal outcome linked by `decision_id`. Autorouting probes are not counted as executed model calls. Requested selectors/effort remain separate from resolved models/effort and provider-reported model identity. Resume/message invocations are separate decisions with task/session grouping. A process crash can leave a begin event without an outcome: absence is unknown, not failure.
 
@@ -262,6 +262,7 @@ This optional feature selects a **subagent tier**, resolved through the existing
 | `task.decision.enabled` | `false` | No extra decision requests/events while off; ordinary opted-in collection still works. |
 | `task.decision.provider` | `kev` | Local `kev` or explicitly selected paid `jev`; no automatic provider fallback. |
 | `task.decision.mode` | `shadow` | Observe without delaying child launch; `routing` applies valid recommendations. |
+| `task.decision.collection` | `off` | Explicit persistence consent: `metadata` or `content`; decision enablement alone does not collect. |
 | `task.decision.timeoutMs` | `5000` | One absolute deadline, including credential lookup, response reading, and validation; integer 1–60000 ms. |
 | `task.decision.kevEndpoint` | `http://127.0.0.1:8009/v1/systemone` | Loopback-only decision endpoint. |
 | `task.decision.kevModel` | `kev-latest` | Server request model alias; installation defaults to `jaredpalmer/kev-4b`. |
