@@ -167,4 +167,11 @@ describe("generated JSON Schemas", () => {
 			});
 		}
 	});
+
+	it("bounds task decision timeout and exposes collection consent", () => {
+		const configSchema = JSON_SCHEMA_OUTPUTS.find(output => output.path === "schemas/config.schema.json")?.schema as any;
+		const decision = configSchema.properties.task.properties.decision.properties;
+		expect(decision.timeoutMs).toMatchObject({ type: "integer", minimum: 1, maximum: 60000 });
+		expect(decision.collection.enum).toEqual(["off", "metadata", "content"]);
+	});
 });

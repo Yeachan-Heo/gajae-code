@@ -6,6 +6,7 @@ import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
 import { AsyncJobManager } from "../src/async";
 import type { ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
+import { reconcileSettingsSchema } from "../src/config/settings-schema";
 import * as sdk from "../src/sdk";
 import { TaskTool } from "../src/task";
 import type {
@@ -329,6 +330,12 @@ describe("decision context construction", () => {
 			setupError: "invalid_configuration",
 			providerName: "kev",
 		});
+	});
+
+	test("enforce mode is rejected and never creates a provider", () => {
+		expect(reconcileSettingsSchema({ task: { decision: { mode: "enforce" } } }).report.valid).toBe(false);
+		const settings = Settings.isolated({ "task.decision.enabled": true, "task.decision.mode": "enforce" as never });
+		expect(createTaskDecisionProvider({ settings })).toMatchObject({ setupError: "invalid_configuration" });
 	});
 
 	test("candidate mapping survives source mutation and respects literal colon-bearing model IDs", () => {
