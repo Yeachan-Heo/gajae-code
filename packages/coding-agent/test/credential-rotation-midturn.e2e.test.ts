@@ -22,7 +22,11 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
-function usageLimitStream(model: Model, trigger: "quota" | "rate_limit" | "credential"): AssistantMessageEventStream {
+function usageLimitStream(
+	model: Model,
+	trigger: "quota" | "rate_limit" | "credential",
+	retryMaxAttempts?: number,
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	const message: AssistantMessage = {
 		role: "assistant",
@@ -48,7 +52,11 @@ function usageLimitStream(model: Model, trigger: "quota" | "rate_limit" | "crede
 		timestamp: Date.now(),
 		transportFailure:
 			trigger === "quota"
-				? { kind: "transport", providerCode: "usage_limit_reached" }
+				? {
+						kind: "transport",
+						providerCode: "usage_limit_reached",
+						...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
+					}
 				: trigger === "credential"
 					? {
 							kind: "transport",
@@ -57,7 +65,12 @@ function usageLimitStream(model: Model, trigger: "quota" | "rate_limit" | "crede
 							credentialModelUnavailable: true,
 							headers: { "retry-after": "3600" },
 						}
-					: { kind: "transport", status: 429, providerCode: "rate_limit_exceeded" },
+					: {
+							kind: "transport",
+							status: 429,
+							providerCode: "rate_limit_exceeded",
+							...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
+						},
 	};
 	expect(classifyFallbackTrigger(message.transportFailure).class).toBe(trigger);
 	queueMicrotask(() => {
@@ -272,6 +285,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	accounts: readonly string[];
 	quotaKeys: readonly string[];
 	maxAttempts?: number;
+	providerRetryMaxAttempts?: number;
 	trigger?: "quota" | "rate_limit";
 	preblockedAccounts?: readonly string[];
 	runtimeApiKey?: string;
@@ -354,7 +368,7 @@ async function runManagedFallbackQuotaScenario(options: {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
 				if (requestedModel.provider === provider && quotaKeys.has(key)) {
-					return usageLimitStream(requestedModel, options.trigger ?? "quota");
+					return usageLimitStream(requestedModel, options.trigger ?? "quota", options.providerRetryMaxAttempts);
 				}
 				return success.stream(requestedModel, context, streamOptions);
 			},
@@ -507,6 +521,22 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.keys.slice(0, 3).sort()).toEqual(["TOKEN-a", "TOKEN-b", "TOKEN-c"]);
 		expect(result.keys.at(-1)).toBe("fallback-test-key");
 		expect(result.markCount).toBe(3);
+	});
+
+	test("honors provider retry ceilings after a successful credential rotation", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b", "c"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+			providerRetryMaxAttempts: 2,
+		});
+		expect(result.models).toEqual([selector(model), selector(model), selector(fallback)]);
+		expect(result.keys[0]).toBe("TOKEN-a");
+		expect(["TOKEN-b", "TOKEN-c"]).toContain(result.keys[1]);
+		expect(result.keys.at(-1)).toBe("fallback-test-key");
+		expect(result.markCount).toBe(1);
 	});
 
 	test("keeps the active non-head fallback entry when quota rotation retries it", async () => {
