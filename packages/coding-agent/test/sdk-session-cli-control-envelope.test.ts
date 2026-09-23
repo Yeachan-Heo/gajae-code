@@ -47,6 +47,41 @@ describe("sdk session raw control envelope", () => {
 		}
 	});
 
+	test("keeps JSON stderr empty when an exact-session broker request fails", async () => {
+		const repo = "/private/workspace/path";
+		const stderr: string[] = [];
+		const ensure = spyOn(brokerEnsure, "ensureBroker").mockRejectedValue(new Error("private broker detail"));
+		const stderrSpy = spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => {
+			stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			return true;
+		});
+		try {
+			const error = await runSdkSessionCli(
+				{
+					action: "inspect",
+					sessionId: "session-5862-target",
+					repo,
+					agentDir: "/tmp/gjc-5862-agent",
+					json: true,
+				},
+				() => {},
+			).catch(error => error);
+			expect(error).toBeInstanceOf(PublicCommandFailure);
+			const rendered = await renderPublicCommandFailure(error, {
+				command: ["sdk", "session", "inspect"],
+				json: true,
+			});
+			expect(rendered.exitCode).toBe(1);
+			expect(rendered.stderr).toBe("");
+			expect(rendered.stdout).not.toContain(repo);
+			expect(rendered.stdout).not.toContain("private broker detail");
+			expect(stderr.join("")).toBe("");
+		} finally {
+			stderrSpy.mockRestore();
+			ensure.mockRestore();
+		}
+	});
+
 	test("ignores repo while routing successful exact-session calls by session ID", async () => {
 		const repo = "/private/workspace/path";
 		const sessionId = "session-5862-target";
