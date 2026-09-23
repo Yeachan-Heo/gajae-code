@@ -2317,6 +2317,22 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
 
+	const control = async (requestId: string, operation: string, input: Record<string, unknown>) => {
+		const frame = JSON.stringify({
+			type: "control_request",
+			id: requestId,
+			operation,
+			input,
+		});
+		expect(Buffer.byteLength(frame)).toBeLessThan(256 * 1024);
+		socket.send(frame);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === requestId),
+			`${requestId} response`,
+		);
+		return frames.find(frame => frame.type === "control_response" && frame.id === requestId)!;
+	};
+
 	const prompt = async (requestId: string, input: Record<string, unknown>) => {
 		socket.send(
 			JSON.stringify({
@@ -2343,6 +2359,35 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 		text: "",
 		images: [{ data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
 	});
+	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+	const original = Buffer.from(
+		await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+	);
+	expect(original.length).toBeGreaterThan(256 * 1024);
+	const digest = Buffer.from(await crypto.subtle.digest("SHA-256", original)).toString("hex");
+	const begun = await control("stage-begin", "turn.image.begin", {
+		mimeType: "image/png",
+		byteLength: original.length,
+		sha256: digest,
+	});
+	const uploadId = (begun.result as { id: string }).id;
+	expect(uploadId).toMatch(/^[0-9a-f]{8}-/);
+	expect(begun).toMatchObject({ ok: true, result: { id: uploadId, nextSequence: 0 } });
+	let sequence = 0;
+	for (let offset = 0; offset < original.length; offset += 96 * 1024) {
+		const response = await control(`stage-chunk-${sequence}`, "turn.image.append", {
+			id: uploadId,
+			sequence,
+			data: original.subarray(offset, offset + 96 * 1024).toString("base64"),
+		});
+		expect(response).toMatchObject({ ok: true, result: { nextSequence: ++sequence } });
+	}
+	expect(await control("stage-finish", "turn.image.finish", { id: uploadId })).toMatchObject({ ok: true });
+	expect(
+		await control("staged-image", "turn.prompt", { text: "Read this image", stagedImages: [{ id: uploadId }] }),
+	).toMatchObject({ ok: true, result: { accepted: true } });
+	expect((sent[2]?.[0] as Array<{ type: string; data?: string }>)[1]?.data).toBe(original.toString("base64"));
 
 	expect(sent).toEqual([
 		[
@@ -2359,6 +2404,17 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 		],
 		[
 			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
+			{
+				preflightSignal: expect.any(AbortSignal),
+				onQueuedPromoted: expect.any(Function),
+				onDispatchDisposition: expect.any(Function),
+			},
+		],
+		[
+			[
+				{ type: "text", text: "Read this image" },
+				{ type: "image", data: original.toString("base64"), mimeType: "image/png" },
+			],
 			{
 				preflightSignal: expect.any(AbortSignal),
 				onQueuedPromoted: expect.any(Function),

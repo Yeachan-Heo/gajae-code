@@ -2871,6 +2871,7 @@ function createControlSurface(
 	) => void,
 	armPromptDeadline: (correlation: InvocationCorrelation) => void,
 	steerReconciliation: KindAwareReconciliation,
+	imageUploads: PromptImageUploadStore,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -2898,7 +2899,6 @@ function createControlSurface(
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 	onInvocationCompletionReconciledForTests?: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	publishLifecycleFrame?: (frame: SdkFrame) => void,
-	imageUploads?: PromptImageUploadStore,
 	retainAcceptedImage?: (correlation: InvocationCorrelation, release: () => void) => void,
 	releaseAcceptedImage?: (correlation: InvocationCorrelation) => void,
 ): ControlSurface {
@@ -6623,6 +6623,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
+					if (kind === "prompt") releaseAcceptedImage(correlation);
 				} catch (transitionError) {
 					// Keep prompt recovery leased; skill recovery has no prompt lease.
 					if (kind === "skill") scheduleSkillRecovery(correlation);
@@ -6676,6 +6677,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			correlation => deadlineManager.onAccepted(correlation),
 			steerReconciliation,
+			imageUploads,
 			(kind, correlation, connectionId, sdkRunToken, promotion) => {
 				const bindPromotedToken = (batch?: LifecycleBatch): void => {
 					const owner = lifecycleOwnerHolder.state;
@@ -6868,7 +6870,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			trackGateResolution,
 			options.onInvocationCompletionReconciledForTests,
 			frame => runtime.emitEvent(frame),
-			imageUploads,
 			(correlation, release) => acceptedImages.set(imageKey(correlation), release),
 			releaseAcceptedImage,
 		);

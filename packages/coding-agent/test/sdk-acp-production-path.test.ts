@@ -950,7 +950,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	reconnectingSessionTransport = true;
 	closeSessionTransport!();
 	await waitFor(
-		() => providerRegistrations.length > initialProviderRegistrationCount,
+		() =>
+			providerRegistrations
+				.slice(initialProviderRegistrationCount)
+				.some(registration => registration.connectionId === "acp-contract-reconnected"),
 		"ACP provider re-registration after transport reconnect",
 	);
 	await index.refresh();

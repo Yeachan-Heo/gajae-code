@@ -67,7 +67,7 @@ import type {
 } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
-import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../../sdk/router";
+import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
