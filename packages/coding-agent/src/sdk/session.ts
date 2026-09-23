@@ -2409,7 +2409,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const ownedConventionalMcpServerNames = new Set<string>();
 		const cachedConventionalMcpServerNames = new Set<string>();
 		let ownedMcpManagerToolNames: string[] = [];
-		let publishOwnedConventionalMcpTools = false;
+		let publishOwnedMcpTools = false;
 		let ownedPluginServersConnected = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
@@ -2468,7 +2468,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				ownedConventionalMcpServerNames.clear();
 				cachedConventionalMcpServerNames.clear();
 				ownedMcpManagerToolNames = [];
-				publishOwnedConventionalMcpTools = false;
+				publishOwnedMcpTools = false;
 				ownedPluginServersConnected = false;
 				let nextManager: MCPManager | undefined;
 				try {
@@ -2497,7 +2497,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						Object.keys(loaded.configs).filter(name => !pluginNames.has(name)),
 					);
 					for (const name of conventionalCacheServerNames) ownedConventionalMcpServerNames.add(name);
-					publishOwnedConventionalMcpTools = conventionalCacheServerNames.size > 0;
+					publishOwnedMcpTools = Object.keys(mergedConfigs).length > 0;
 					if (Object.keys(mergedConfigs).length > 0) {
 						nextManager = new MCPManager(
 							to,
@@ -3393,7 +3393,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						conventionalMcpToolNames.push(tool.name);
 					}
 				}
-				publishOwnedConventionalMcpTools = conventionalServerNames.size > 0;
+				publishOwnedMcpTools = true;
 				ownedPluginServersConnected = connectedPluginNames.size > 0;
 				// Keep plugin config authority fixed even while a conventional cached
 				// fallback needs reconnects; a full reload would disconnect and lose the
@@ -5350,19 +5350,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// createAgentSession rather than surfacing as an unhandled rejection.
 		if (!options.deferMemoryBackendStartup) await startMemoryBackend();
 
-		// Wire the owned manager's late tool publications into the live session,
-		// including plugin servers that finish after cached conventional fallbacks.
+		// Wire late catalog publications from every owned manager into the live
+		// session. Plugin-only managers also change after startup through
+		// tools/list_changed; mixed managers additionally publish cached fallbacks.
 		// Shared by eager startup and the deferred conventional starter.
 		const wireOwnedMcpToolSync = (): void => {
 			const manager = mcpManager;
-			if (!manager || !publishOwnedConventionalMcpTools) return;
+			if (!manager || !publishOwnedMcpTools) return;
 			// Late MCP connections can publish near-simultaneously.
 			// Serialize the swaps so an older snapshot cannot interleave with a
 			// newer one inside replaceNamedCustomTools and leave a stale list.
 			// Each link swallows (and logs) its own failure so one bad
 			// publication cannot kill the chain for every later one.
 			let ownedMcpToolsSync: Promise<void> = Promise.resolve();
-			const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
+			const syncOwnedMcpTools = (tools: readonly CustomTool[]): Promise<void> => {
 				ownedMcpToolsSync = ownedMcpToolsSync
 					.then(async () => {
 						if (session.isDisposed || mcpManager !== manager) return;
@@ -5463,9 +5464,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return ownedMcpToolsSync;
 			};
 			manager.setOnToolsChanged(tools => {
-				void syncConventionalTools(tools as CustomTool[]);
+				void syncOwnedMcpTools(tools);
 			});
-			void syncConventionalTools(manager.getTools() as CustomTool[]);
+			void syncOwnedMcpTools(manager.getTools());
 		};
 		const wireOwnedMcpManagerLifecycle = (): void => {
 			if (!mcpManager) return;
@@ -5517,11 +5518,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// deferral wires its own callbacks from the starter after it connects, so
 		// nothing is wired here yet.
 		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined && !deferredConventionalMcp) {
-			if (publishOwnedConventionalMcpTools) {
+			if (publishOwnedMcpTools) {
 				wireOwnedMcpToolSync();
 			} else if (!ownsMcpManager) {
 				mcpManager.setOnToolsChanged(tools => {
-					void session.refreshMCPTools(tools);
+					void session.refreshMCPTools(tools.map(tool => tool as CustomTool));
 				});
 			}
 			wireOwnedMcpManagerLifecycle();

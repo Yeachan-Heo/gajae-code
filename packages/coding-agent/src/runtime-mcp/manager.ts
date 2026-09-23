@@ -432,8 +432,8 @@ export class MCPManager {
 	#authStorage: AuthStorage | null = null;
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
-	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
-	readonly #toolChangeListeners = new Set<(tools: readonly CustomTool<TSchema, MCPToolDetails>[]) => void>();
+	#onToolsChanged?: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void;
+	readonly #toolChangeListeners = new Set<(tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void>();
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
 	#onPromptsChanged?: (serverName: string) => void;
 	#notificationsEnabled = false;
@@ -1016,15 +1016,17 @@ export class MCPManager {
 	}
 
 	/**
-	 * Set a callback to fire when any server's tools change.
+	 * Set a callback to receive a read-only catalog snapshot when server tools change.
 	 */
-	setOnToolsChanged(handler: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void): void {
+	setOnToolsChanged(handler: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void): void {
 		if (this.#toolsOnly) return;
 		this.#onToolsChanged = handler;
 	}
 
-	/** Subscribe to tool catalog changes without replacing the manager owner's callback. */
-	subscribeToToolsChanged(handler: (tools: readonly CustomTool<TSchema, MCPToolDetails>[]) => void): () => void {
+	/** Subscribe to readonly catalog snapshots without replacing the manager owner's callback. */
+	subscribeToToolsChanged(
+		handler: (tools: readonly Readonly<CustomTool<TSchema, MCPToolDetails>>[]) => void,
+	): () => void {
 		if (this.#toolsOnly) return () => {};
 		this.#toolChangeListeners.add(handler);
 		return () => {
@@ -1034,11 +1036,15 @@ export class MCPManager {
 
 	#notifyToolsChanged(): void {
 		const listeners = [...this.#toolChangeListeners];
-		const snapshot = listeners.length > 0 ? Object.freeze([...this.#tools]) : undefined;
-		try {
-			this.#onToolsChanged?.(this.#tools);
-		} catch (error) {
-			logger.warn("MCP tool catalog owner callback failed", { error: classifyMCPStartupFailure(error) });
+		// Keep live MCPTool instances for reconnect behavior, but never expose the
+		// manager-owned array; callback types make their tool descriptors readonly.
+		const snapshot = this.#onToolsChanged || listeners.length > 0 ? Object.freeze([...this.#tools]) : undefined;
+		if (snapshot && this.#onToolsChanged) {
+			try {
+				this.#onToolsChanged(snapshot);
+			} catch (error) {
+				logger.warn("MCP tool catalog owner callback failed", { error: classifyMCPStartupFailure(error) });
+			}
 		}
 		if (!snapshot) return;
 		for (const listener of listeners) {
@@ -1659,7 +1665,10 @@ export class MCPManager {
 		}
 
 		// Update cached tools
-		if (shouldPublishToolSnapshot) this.#publishToolCatalog(allTools);
+		if (shouldPublishToolSnapshot) {
+			this.#publishToolCatalog(allTools);
+			this.#notifyToolsChanged();
+		}
 		allowBackgroundLogging = true;
 
 		return {

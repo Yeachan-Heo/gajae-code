@@ -290,7 +290,7 @@ describe("red-team: conventional MCP autoload", () => {
 			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
 				tools: [cachedTool],
 				errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
-				connectedServers: [],
+				connectedServers: ["domain_docs"],
 				exaApiKeys: [],
 			});
 			vi.spyOn(MCPManager.prototype, "getTools").mockReturnValue([cachedTool]);
@@ -308,7 +308,6 @@ describe("red-team: conventional MCP autoload", () => {
 			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
 			let reconnectedToolPublished = false;
 			let pluginToolPublished = false;
-			let latePluginConnected = false;
 			let cachedServerToolsRemoved = false;
 			vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
 				this: AgentSession,
@@ -341,9 +340,7 @@ describe("red-team: conventional MCP autoload", () => {
 			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
 				const status =
 					name === "domain_docs"
-						? latePluginConnected
-							? "connected"
-							: "connecting"
+						? "connected"
 						: name === "slow-demo" && reconnectedToolPublished
 							? "connected"
 							: getConnectionStatus.call(this, name);
@@ -373,10 +370,9 @@ describe("red-team: conventional MCP autoload", () => {
 					"connection set is frozen",
 				);
 
-				// A plugin MCP can finish after the cached fallback. Its late tools
-				// must join the session catalog despite the conventional cache scope.
+				// The connected plugin server can publish its first tool catalog after
+				// the cached fallback. Its tools must join the live session catalog.
 				if (!publishToolsChanged) throw new Error("MCP tools-changed handler was not registered");
-				latePluginConnected = true;
 				publishToolsChanged([cachedTool, pluginTool]);
 				await pluginToolPublishedCheck.promise;
 				expect(pluginToolPublished).toBe(true);
@@ -400,6 +396,88 @@ describe("red-team: conventional MCP autoload", () => {
 				await removedSnapshotSealCheck.promise;
 				expect(sealConnectionSet).toHaveBeenCalledTimes(1);
 				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+		});
+
+		it("updates a plugin-only owned session after live catalog changes", async () => {
+			const pluginBundlePath = path.join(projectDir, "plugin-only-refresh-plugin");
+			await writeProjectConfig("plugin-only-refresh-plugin/gajae-plugin.json", {
+				kind: "gajae-code-plugin",
+				name: "plugin-only-refresh-plugin",
+				version: "1.0.0",
+				mcps: [{ name: "domain_docs", transport: "http", url: "https://example.com/mcp" }],
+			});
+			const installed = await installGjcBundle({ cwd: projectDir }, "project", pluginBundlePath);
+			expect(installed.ok).toBe(true);
+
+			const [pluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			const [renamedPluginTool] = MCPTool.fromTools(
+				{ name: "domain_docs" } as unknown as Parameters<typeof MCPTool.fromTools>[0],
+				[{ name: "renamed_lookup", inputSchema: { type: "object", properties: {} } }],
+			);
+			if (!pluginTool || !renamedPluginTool) throw new Error("plugin MCP test tools were not created");
+
+			let publishedTools: MCPTool[] = [];
+			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
+				tools: [],
+				errors: new Map(),
+				connectedServers: ["domain_docs"],
+				exaApiKeys: [],
+			});
+			vi.spyOn(MCPManager.prototype, "getTools").mockImplementation(() => publishedTools as never);
+			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
+			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
+				return name === "domain_docs" ? "connected" : getConnectionStatus.call(this, name);
+			});
+			const setOnToolsChanged = MCPManager.prototype.setOnToolsChanged;
+			let publishToolsChanged: Parameters<MCPManager["setOnToolsChanged"]>[0] | undefined;
+			vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (this: MCPManager, handler) {
+				setOnToolsChanged.call(this, handler);
+				publishToolsChanged = handler;
+			});
+
+			const { session, mcpManager } = await createAgentSession({
+				...isolatedSessionOptions(),
+				settings: Settings.isolated({ "tools.discoveryMode": "all" }),
+			});
+			try {
+				if (!mcpManager) throw new Error("plugin-only MCP manager was not retained");
+				expect(connectServers).toHaveBeenCalledTimes(1);
+				expect(connectServers.mock.calls[0]?.[0]).toHaveProperty("domain_docs");
+				expect(Object.keys(connectServers.mock.calls[0]?.[0] ?? {})).toEqual(["domain_docs"]);
+				expect(session.getAllToolNames()).not.toContain("mcp__domain_docs_lookup");
+
+				const publishCatalog = async (tools: MCPTool[], present: string[], absent: string[]): Promise<void> => {
+					publishedTools = tools;
+					if (!publishToolsChanged) throw new Error("plugin-only owner callback was not registered");
+					publishToolsChanged(tools);
+					const deadline = Date.now() + 5_000;
+					while (
+						present.some(
+							name => !session.getAllToolNames().includes(name) || !session.getActiveToolNames().includes(name),
+						) ||
+						absent.some(
+							name => session.getAllToolNames().includes(name) || session.getActiveToolNames().includes(name),
+						)
+					) {
+						if (Date.now() >= deadline) throw new Error("plugin-only owner catalog did not converge");
+						await Bun.sleep(1);
+					}
+				};
+
+				await publishCatalog([pluginTool], [pluginTool.name], []);
+				expect(session.getActiveToolNames()).toContain(pluginTool.name);
+				expect(session.getSelectedMCPToolNames()).not.toContain(pluginTool.name);
+				await publishCatalog([renamedPluginTool], [renamedPluginTool.name], [pluginTool.name]);
+				expect(session.getActiveToolNames()).toContain(renamedPluginTool.name);
+				expect(session.getSelectedMCPToolNames()).not.toContain(renamedPluginTool.name);
+				await publishCatalog([], [], [renamedPluginTool.name]);
+				expect(mcpManager.getTools()).toEqual([]);
 			} finally {
 				await session.dispose();
 			}
@@ -444,7 +522,7 @@ describe("red-team: conventional MCP autoload", () => {
 			const connectServers = vi.spyOn(MCPManager.prototype, "connectServers").mockResolvedValue({
 				tools: [cachedTool],
 				errors: new Map([["slow-demo", "MCP server connection timed out during startup: slow-demo"]]),
-				connectedServers: [],
+				connectedServers: ["domain_docs"],
 				exaApiKeys: [],
 			});
 			vi.spyOn(MCPManager.prototype, "getTools").mockImplementation(() => publishedTools as never);
@@ -470,6 +548,7 @@ describe("red-team: conventional MCP autoload", () => {
 			const replaceNamedCustomTools = AgentSession.prototype.replaceNamedCustomTools;
 			let childSession: AgentSession | undefined;
 			let childUpdateCount = 0;
+			let childMandatoryMcpToolNames: string[] = [];
 			let holdChildUpdate = false;
 			const childUpdateEntered = Promise.withResolvers<void>();
 			const releaseChildUpdate = Promise.withResolvers<void>();
@@ -485,11 +564,14 @@ describe("red-team: conventional MCP autoload", () => {
 					await releaseChildUpdate.promise;
 				}
 				await replaceNamedCustomTools.call(this, previousNames, nextTools, options);
-				if (this === childSession) childUpdateCount++;
+				if (this === childSession) {
+					childUpdateCount++;
+					childMandatoryMcpToolNames = [...(options?.mandatoryMCPToolNames ?? [])];
+				}
 			});
 			const getConnectionStatus = MCPManager.prototype.getConnectionStatus;
 			vi.spyOn(MCPManager.prototype, "getConnectionStatus").mockImplementation(function (this: MCPManager, name) {
-				return name === "domain_docs" ? "connecting" : getConnectionStatus.call(this, name);
+				return name === "domain_docs" ? "connected" : getConnectionStatus.call(this, name);
 			});
 			const disconnectAll = vi.spyOn(MCPManager.prototype, "disconnectAll");
 
@@ -498,7 +580,7 @@ describe("red-team: conventional MCP autoload", () => {
 				const manager = parent.mcpManager;
 				if (!manager) throw new Error("parent MCP manager was not retained");
 				expect(connectServers).toHaveBeenCalledTimes(1);
-				expect(manager.getConnectionStatus("domain_docs")).toBe("connecting");
+				expect(manager.getConnectionStatus("domain_docs")).toBe("connected");
 
 				const child = await createAgentSession({
 					...isolatedSessionOptions(),
@@ -528,6 +610,7 @@ describe("red-team: conventional MCP autoload", () => {
 				await publishCatalog([cachedTool, pluginTool, lateConventionalTool]);
 				expect(child.session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
 				expect(child.session.getActiveToolNames()).toContain("mcp__domain_docs_lookup");
+				expect(childMandatoryMcpToolNames).toContain("mcp__domain_docs_lookup");
 				expect(child.session.getSelectedMCPToolNames()).not.toContain("mcp__domain_docs_lookup");
 				expect(child.session.getAllToolNames()).toContain("mcp__slow_demo_late_lookup");
 				await child.session.activateDiscoveredTools(["mcp__slow_demo_late_lookup"]);
