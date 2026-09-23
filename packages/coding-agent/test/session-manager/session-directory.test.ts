@@ -736,6 +736,42 @@ describe("managed session write protocol", () => {
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
 		expect(await committedReceiptNames(receipts)).toHaveLength(1);
 	});
+	it("coalesces a migrated legacy transcript without full-reading unrelated v2 transcripts", async () => {
+		const { cwd, sessionsRoot, scope } = await fixture();
+		const legacy = legacyDirectory(sessionsRoot, cwd);
+		await fs.mkdir(legacy, { recursive: true });
+		const source = path.join(legacy, "2026-01-01_session-a.jsonl");
+		await fs.writeFile(source, transcript("session-a", cwd));
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		const unrelated = ["session-b", "session-c", "session-d"].map(id =>
+			path.join(scope.directoryPath, `2026-01-02_${id}.jsonl`),
+		);
+		for (const [index, file] of unrelated.entries())
+			await fs.writeFile(file, transcript(["session-b", "session-c", "session-d"][index]!, cwd), { mode: 0o600 });
+		const listed = listManagedCandidates(scope);
+		if (listed.kind !== "complete") throw new Error("listing incomplete");
+		const legacyCandidate = listed.owned.find(candidate => candidate.provenance === "legacy");
+		if (!legacyCandidate) throw new Error("legacy candidate missing");
+		const opened = await openManagedCandidateForWrite(scope, legacyCandidate);
+		if (opened.kind !== "opened") throw new Error("migration failed");
+
+		const capture = vi.spyOn(managedSessionStorage, "captureManagedFileNoFollow");
+		const coalesced = listManagedCandidates(scope);
+		const fullyRead = capture.mock.calls.map(([pathname]) => pathname);
+		capture.mockRestore();
+
+		if (coalesced.kind !== "complete") throw new Error("listing incomplete");
+		expect(coalesced.owned.map(candidate => [candidate.sessionId, candidate.migrationState]).sort()).toEqual([
+			["session-a", "migrated_v2"],
+			["session-b", "native_v2"],
+			["session-c", "native_v2"],
+			["session-d", "native_v2"],
+		]);
+		// Only the matching (source, destination) pair is verified byte-for-byte.
+		for (const file of unrelated) expect(fullyRead).not.toContain(file);
+		expect(fullyRead).toContain(opened.path);
+		expect(fullyRead).toContain(source);
+	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
 		await prepareManagedSessionScopeForWrite(scope);

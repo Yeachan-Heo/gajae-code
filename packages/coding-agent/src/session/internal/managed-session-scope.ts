@@ -1852,6 +1852,16 @@ function receiptMatches(
 				tree?: unknown;
 			};
 		};
+		// A receipt is keyed by its source and names exactly one destination. The
+		// resume listing probes every (legacy source, v2 destination) pair, so reject
+		// on these cheap receipt fields before hashing both transcripts and walking
+		// the artifact manifest; the full conjunction below would be false anyway.
+		if (
+			record.destination?.path !== destination.path ||
+			record.source?.path !== source.path ||
+			record.source?.sha256 !== source.identity.sha256
+		)
+			return false;
 		const exact = (
 			recorded: { dev?: unknown; ino?: unknown; size?: unknown; mtimeNs?: unknown } | undefined,
 			candidate: ManagedCandidate,
