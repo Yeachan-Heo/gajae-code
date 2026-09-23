@@ -398,6 +398,44 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("getProviderBaseUrl follows the catalog after a models config reload", async () => {
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://first.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://first.example.com/v1");
+
+			writeRawModelsJson({
+				"base-url-proxy": {
+					baseUrl: "https://second.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "proxy-model" }],
+				},
+			});
+			await registry.refresh("offline");
+
+			expect(registry.getProviderBaseUrl("base-url-proxy")).toBe("https://second.example.com/v1");
+			expect(registry.getProviderBaseUrl("no-such-provider")).toBeUndefined();
+		});
+
+		test("getProviderBaseUrl env fallback still applies to providers without a catalog base URL", () => {
+			const restore = setEnvForTest("MY_LATE_PROXY_BASE_URL", "https://late.example.com/v1");
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://late.example.com/v1");
+				Bun.env.MY_LATE_PROXY_BASE_URL = "https://later.example.com/v1";
+				expect(registry.getProviderBaseUrl("my-late-proxy")).toBe("https://later.example.com/v1");
+			} finally {
+				restore();
+			}
+		});
+
 		test("does not apply OPENAI_BASE_URL to OpenAI Codex models", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-proxy.example.com/v1");
 			try {
