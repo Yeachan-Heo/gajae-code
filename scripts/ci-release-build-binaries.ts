@@ -195,9 +195,9 @@ async function main(): Promise<void> {
 		await generateBundle();
 		if (isDryRun) console.log("DRY RUN bun packages/coding-agent/scripts/embed-mupdf.ts");
 		else {
-			const materials = await verifyMuPdfReleaseMaterials();
-			console.log(`Verified MuPDF corresponding-source materials: ${materials}`);
-			await generateMuPdfAsset();
+			const { directory, wasmPath } = await verifyMuPdfReleaseMaterials();
+			console.log(`Verified MuPDF corresponding-source materials: ${directory}`);
+			await generateMuPdfAsset({ wasmPath });
 		}
 		for (const target of selectedTargets) {
 			await buildBinary(target);
