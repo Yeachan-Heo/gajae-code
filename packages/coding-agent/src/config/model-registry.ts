@@ -3343,7 +3343,7 @@ export class ModelRegistry {
 				state.error === undefined &&
 				!state.stale &&
 				((state.status === "ok" && discovery.fetched) ||
-					(state.status === "empty" && discovery.fetched) ||
+					state.status === "empty" ||
 					(state.status === "ok" && !discovery.fetched));
 			if (
 				evidence !== undefined &&
@@ -3353,7 +3353,9 @@ export class ModelRegistry {
 			) {
 				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
 			} else if (
-				(state?.status !== "cached" && !(state?.status === "ok" && !discovery.fetched)) ||
+				(state?.status !== "cached" &&
+					state?.status !== "empty" &&
+					!(state?.status === "ok" && !discovery.fetched)) ||
 				state.error !== undefined ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint

@@ -7144,6 +7144,51 @@ describe("ModelRegistry", () => {
 			await registry.dispose();
 		});
 
+		test("retains fresh authoritative empty discovery evidence after online-if-uncached refresh", async () => {
+			const provider = "openai";
+			const endpoint = "http://127.0.0.1:1234/v1";
+			authStorage.setRuntimeApiKey(provider, "empty-openai-discovery-key");
+			writeRawModelsJson({
+				openai: {
+					baseUrl: endpoint,
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration(provider, "empty-openai-discovery-key"),
+				endpoint,
+				"openai-responses",
+			);
+			writeModelCache(provider, Date.now(), [], true, "", cacheDbPath, [], provenance);
+
+			const bundledModel = getBundledModels(provider)[0];
+			if (!bundledModel) throw new Error("Expected a bundled OpenAI model");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			const hasAvailableOpenAiModel = () =>
+				registry.getAvailable().some(model => model.provider === provider && model.id === bundledModel.id);
+			expect(hasAvailableOpenAiModel()).toBe(false);
+
+			let modelsListRequests = 0;
+			using _hook = hookFetch(() => {
+				modelsListRequests++;
+				throw new Error("fresh authoritative empty cache must not make a models-list request");
+			});
+			await registry.refreshProvider(provider, "online-if-uncached");
+
+			expect(modelsListRequests).toBe(0);
+			expect(registry.getProviderDiscoveryState(provider)).toMatchObject({
+				status: "empty",
+				stale: false,
+				models: [],
+				fetchedAt: expect.any(Number),
+			});
+			expect(hasAvailableOpenAiModel()).toBe(false);
+			await registry.dispose();
+		});
+
 		test("does not mutate configured discovery evidence during stored-credential cache validation", async () => {
 			const modelId = "stored-litellm-model";
 			const endpoint = "http://localhost:4000/v1";

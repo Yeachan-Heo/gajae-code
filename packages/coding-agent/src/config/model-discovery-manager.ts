@@ -222,11 +222,11 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 					? result.stale
 						? "cached"
 						: "ok"
-					: result.fetched
+					: result.fetched ||
+							(result.cacheFresh && result.cacheAuthoritative && result.dynamicModelIds?.length === 0)
 						? "empty"
-						: // No fetch happened (non-authoritative retry backoff, or an
-							// ineligible cache) and no eligible row served models: the
-							// provider is unvalidated, not authoritatively empty.
+						: // No fetch happened and no fresh authoritative empty row
+							// attested to this result, so the provider is unvalidated.
 							"unavailable";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
