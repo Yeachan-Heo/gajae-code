@@ -1,4 +1,4 @@
-import { Container, type SelectItem, SelectList, Spacer, Text } from "@gajae-code/tui";
+import { Container, type SelectItem, SelectList, Spacer, Text, truncateToWidth } from "@gajae-code/tui";
 import {
 	applyGjcBundleUpdate,
 	type GjcLifecycleContext,
@@ -20,7 +20,10 @@ import type {
 	GjcUpdatePreview,
 } from "../../extensibility/gjc-plugins/types";
 import { getSelectListTheme, theme } from "../../modes/theme/theme";
+import { sanitizeStatusText } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+
+const MAX_RUNTIME_FINDING_DISPLAY_WIDTH = 120;
 
 /** Injectable lifecycle boundary; Settings never reads registries or executes bundle code. */
 export interface GjcBundleLifecyclePort {
@@ -243,6 +246,23 @@ export class GjcBundleSettingsComponent extends Container {
 					0,
 				),
 			);
+		}
+		const runtime = findingsForBundle(
+			this.dependencies.runtimeSnapshotProvider,
+			bundle.identity,
+			this.dependencies.activationGeneration ?? 0,
+		);
+		if (runtime.status === "current") {
+			for (const finding of runtime.findings) {
+				const detail = truncateToWidth(
+					sanitizeStatusText(`${finding.surfaceId}: ${finding.message}`),
+					MAX_RUNTIME_FINDING_DISPLAY_WIDTH,
+				);
+				const label = finding.decision === "error" ? "Runtime error" : "Runtime finding";
+				this.addChild(
+					new Text(theme.fg(finding.decision === "error" ? "error" : "warning", `  ${label}: ${detail}`), 0, 0),
+				);
+			}
 		}
 		if (this.#message) this.addChild(new Text(theme.fg("warning", `  ${this.#message}`), 0, 0));
 		const actions: SelectItem[] = [];

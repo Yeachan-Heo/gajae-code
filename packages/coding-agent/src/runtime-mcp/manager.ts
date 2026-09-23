@@ -330,10 +330,10 @@ export interface MCPManagerOptions {
 	/** Restrict this instance to tools from an explicit MCP config. */
 	toolsOnly?: boolean;
 	/**
-	 * Ceiling for the startup wait, in milliseconds. Only ACP lifecycle launches
-	 * set this, so a slow ACP MCP handshake gets the readiness budget while every
-	 * other consumer keeps the short default. Non-positive or non-finite values
-	 * are ignored and the default applies.
+	 * Ceiling for the startup wait, in milliseconds. ACP lifecycle launches and
+	 * plugin MCP startup use bounded caller-owned budgets; other consumers keep
+	 * the short default. Non-positive or non-finite values are ignored and the
+	 * default applies.
 	 */
 	maxStartupTimeoutMs?: number;
 	/** Connection pool used for every physical MCP open/close. */

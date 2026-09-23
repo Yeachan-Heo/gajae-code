@@ -120,6 +120,21 @@ describe("AgentSession profile resume defaults", () => {
 		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-5.5"]);
 	});
 
+	it("preserves a restored runtime fallback chain during model rollback", async () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		session.setDefaultFallbackRuntimeModel("anthropic/claude-opus-5:high");
+		const snapshot = session.getDefaultFallbackRuntimeState();
+
+		// Mirror SelectorController.#restoreDefaultAssignmentRollback: restore the
+		// fallback snapshot before restoring the live model.
+		session.setDefaultFallbackRuntimeModel("openai-codex/gpt-5.5");
+		session.restoreDefaultFallbackRuntimeState(snapshot);
+		await session.restoreModelSelectionForRollback(base, undefined);
+
+		expect(session.getDefaultFallbackRuntimeState().chain).toEqual(snapshot.chain);
+	});
+
 	it("rollback of a failed activation restores the pre-activation resume default, not the transient live model", async () => {
 		// A = persisted resume default, B = transient live model (e.g. retry/
 		// fallback/plan switch), profileMain = the profile's main model the failed

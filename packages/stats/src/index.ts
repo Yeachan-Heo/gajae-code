@@ -17,6 +17,8 @@ export {
 export { closeDb } from "./db";
 export { startServer } from "./server";
 export type {
+	AgentRole,
+	AgentStats,
 	AggregatedStats,
 	DashboardStats,
 	FolderStats,
@@ -45,7 +47,7 @@ function normalizePremiumRequests(n: number): number {
  */
 async function printStats(): Promise<void> {
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder } = stats;
+	const { overall, byModel, byFolder, byAgent } = stats;
 
 	console.log("\n=== AI Usage Statistics ===\n");
 
@@ -69,6 +71,15 @@ async function printStats(): Promise<void> {
 		for (const m of byModel.slice(0, 10)) {
 			console.log(
 				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache`,
+			);
+		}
+	}
+
+	if (byAgent.length > 0) {
+		console.log("\nBy Agent Role:");
+		for (const agent of byAgent) {
+			console.log(
+				`  ${agent.agent}: ${formatNumber(agent.totalRequests)} reqs, ${formatNumber(agent.totalInputTokens)} input / ${formatNumber(agent.totalOutputTokens)} output, ${formatPercent(agent.cacheRate)} cache, ${formatCost(agent.totalCost)}`,
 			);
 		}
 	}

@@ -542,7 +542,7 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const { session } = await createAgentSession(isolatedSessionOptions());
 		try {
 			const startupWarning = warnSpy.mock.calls.find(([message]) =>
-				String(message).includes("GJC plugin MCP connect failed"),
+				String(message).includes("MCP server connection failed"),
 			);
 			if (!startupWarning) throw new Error("conventional MCP startup warning was not logged");
 			expect(startupWarning[1]).toMatchObject({ path: "mcp:upstream", error: "transport-error" });

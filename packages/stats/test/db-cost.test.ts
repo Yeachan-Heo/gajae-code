@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { getAgentDir, getStatsDbPath, setAgentDir, TempDir } from "@gajae-code/utils";
-import { closeDb, getOverallStats, getRecentRequests, initDb, insertMessageStats } from "../src/db";
+import { closeDb, getOverallStats, getRecentRequests, getStatsByAgent, initDb, insertMessageStats } from "../src/db";
 import { parseSessionFile } from "../src/parser";
 import type { MessageStats, ParsedMessageStats } from "../src/types";
 
@@ -37,6 +37,7 @@ function createCodexGptStats(entryId: string): MessageStats {
 		sessionFile: "/tmp/session.jsonl",
 		entryId,
 		folder: "/tmp/project",
+		agent: "default",
 		model: "gpt-5.4",
 		provider: "openai-codex",
 		api: "openai-codex-responses",
@@ -246,5 +247,74 @@ describe("stats GPT cost correction", () => {
 
 		const request = getRecentRequests(1)[0];
 		expect(request?.usage.cost.total).toBeCloseTo(expectedCodexGptCost().total, 8);
+	});
+
+	it("updates existing rows when role attribution is recovered", async () => {
+		await initDb();
+		const unclassified = createCodexGptStats("role-backfill");
+		unclassified.agent = "unknown";
+		expect(insertMessageStats([unclassified])).toBe(1);
+
+		expect(insertMessageStats([{ ...unclassified, agent: "executor" }])).toBe(1);
+		expect(getRecentRequests(1)[0]?.agent).toBe("executor");
+		expect(getStatsByAgent()).toMatchObject([{ agent: "executor", totalRequests: 1 }]);
+	});
+
+	it("adds the agent column and resets offsets for existing stats databases", async () => {
+		await fs.mkdir(path.dirname(getStatsDbPath()), { recursive: true });
+		const legacy = new Database(getStatsDbPath());
+		legacy.exec(`
+			CREATE TABLE messages (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_file TEXT NOT NULL,
+				entry_id TEXT NOT NULL,
+				folder TEXT NOT NULL,
+				model TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				api TEXT NOT NULL,
+				timestamp INTEGER NOT NULL,
+				duration INTEGER,
+				ttft INTEGER,
+				stop_reason TEXT NOT NULL,
+				error_message TEXT,
+				input_tokens INTEGER NOT NULL,
+				output_tokens INTEGER NOT NULL,
+				cache_read_tokens INTEGER NOT NULL,
+				cache_write_tokens INTEGER NOT NULL,
+				total_tokens INTEGER NOT NULL,
+				cost_input REAL NOT NULL,
+				cost_output REAL NOT NULL,
+				cost_cache_read REAL NOT NULL,
+				cost_cache_write REAL NOT NULL,
+				cost_total REAL NOT NULL,
+				UNIQUE(session_file, entry_id)
+			);
+			CREATE TABLE file_offsets (
+				session_file TEXT PRIMARY KEY,
+				offset INTEGER NOT NULL,
+				last_modified INTEGER NOT NULL
+			);
+			INSERT INTO messages (
+				session_file, entry_id, folder, model, provider, api, timestamp,
+				duration, ttft, stop_reason, error_message,
+				input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
+				cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total
+			) VALUES ('/tmp/legacy.jsonl', 'old', '/tmp', 'old-model', 'old-provider', 'old-api', 1,
+				NULL, NULL, 'stop', NULL, 1, 1, 0, 0, 2, 0, 0, 0, 0, 0);
+			INSERT INTO file_offsets (session_file, offset, last_modified)
+			VALUES ('/tmp/legacy.jsonl', 10, 1);
+		`);
+		legacy.close();
+
+		const migrated = await initDb();
+		const columns = migrated.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
+		const row = migrated.prepare("SELECT agent FROM messages WHERE entry_id = 'old'").get() as { agent: string };
+		const offsets = migrated.prepare("SELECT COUNT(*) as count FROM file_offsets").get() as { count: number };
+		const indexes = migrated.prepare("PRAGMA index_list(messages)").all() as { name: string }[];
+
+		expect(columns.some(column => column.name === "agent")).toBe(true);
+		expect(row.agent).toBe("unknown");
+		expect(offsets.count).toBe(0);
+		expect(indexes.some(index => index.name === "idx_messages_agent")).toBe(true);
 	});
 });

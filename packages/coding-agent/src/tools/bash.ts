@@ -94,6 +94,15 @@ const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const MASTER_OWNER_SESSION_ENV = "GJC_MASTER_OWNER_SESSION_ID";
+const COORDINATOR_ONLY_BASH_ENV = [
+	"GJC_COORDINATOR_SESSION_STATE_FILE",
+	"GJC_COORDINATOR_SESSION_ID",
+	"GJC_COORDINATOR_SESSION_BRANCH",
+	"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+	"GJC_COORDINATOR_SESSION_READINESS_FILE",
+	"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+	"GJC_COORDINATOR_SIDECAR_KEY_ID",
+] as const;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
@@ -1051,6 +1060,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
@@ -1108,6 +1118,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								timeout: options.timeoutMs,
 								signal: runSignal,
 								env: options.resolvedEnv,
+								unsetEnv: options.unsetEnv,
 								artifactPath,
 								artifactId,
 								artifactPublisher,
@@ -1290,6 +1301,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		command: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
+		unsetEnv: string[];
 		directMasterSpawn: boolean;
 		requestedTimeoutSec: number;
 		timeoutSec: number;
@@ -1462,6 +1474,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
+		const unsetEnv = COORDINATOR_ONLY_BASH_ENV.filter(name => !Object.hasOwn(expandedEnv ?? {}, name));
 
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
 			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
@@ -1494,6 +1507,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1657,6 +1671,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						timeout: monitorTimeoutMs,
 						signal,
 						env: prepared.resolvedEnv,
+						unsetEnv: prepared.unsetEnv,
 						artifactPath,
 						artifactId,
 						artifactPublisher,
@@ -1743,6 +1758,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			unsetEnv,
 			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
@@ -1782,6 +1798,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded: true,
@@ -1834,6 +1851,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				unsetEnv,
 				directMasterSpawn,
 				onUpdate,
 				startBackgrounded,
@@ -2606,6 +2624,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,
@@ -2774,6 +2793,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
+					unsetEnv,
 					artifactPath,
 					artifactId,
 					artifactPublisher,

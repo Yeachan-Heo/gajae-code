@@ -9,6 +9,7 @@
  */
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
+import { formatNumber } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import { providerRetryPhaseLabel } from "../task/provider-retry-status";
@@ -22,6 +23,7 @@ import {
 	truncateToWidth,
 } from "./render-utils";
 import {
+	SUBAGENT_ACTIVITY_BUCKET_MS,
 	type SubagentLiveProgress,
 	type SubagentSnapshot,
 	type SubagentToolDetails,
@@ -186,7 +188,28 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 			)
 		: theme.fg("dim", snapshot.status);
 	const duration = theme.fg("dim", formatDuration(snapshot.durationMs));
-	return `${icon} ${id} ${status} ${duration}`;
+	const live = snapshot.liveProgressAvailable !== false ? snapshot.progress : undefined;
+	return `${icon} ${id} ${status} ${duration}${live ? formatLiveStats(live, theme, Date.now()) : ""}`;
+}
+
+// Live stats ride the cheap status line (rebuilt every render), never the cached
+// body. Quantize age to the producer cadence so incidental renders do not churn it.
+function formatLiveStats(progress: SubagentLiveProgress, theme: Theme, nowMs: number): string {
+	const parts: string[] = [];
+	if (progress.toolCount) parts.push(`${progress.toolCount} ${progress.toolCount === 1 ? "tool" : "tools"}`);
+	if (progress.contextTokens) {
+		parts.push(
+			progress.contextWindow
+				? `${formatNumber(progress.contextTokens)}/${formatNumber(progress.contextWindow)} ctx`
+				: `${formatNumber(progress.contextTokens)} ctx`,
+		);
+	}
+	if (progress.lastActivityMs !== undefined && progress.status === "running") {
+		const ageMs = Math.max(0, nowMs - progress.lastActivityMs);
+		const ageBucketMs = Math.floor(ageMs / SUBAGENT_ACTIVITY_BUCKET_MS) * SUBAGENT_ACTIVITY_BUCKET_MS;
+		parts.push(`last activity ${formatDuration(ageBucketMs)} ago`);
+	}
+	return parts.map(part => `${theme.sep.dot}${theme.fg("dim", part)}`).join("");
 }
 
 function renderSubagentLiveProgress(

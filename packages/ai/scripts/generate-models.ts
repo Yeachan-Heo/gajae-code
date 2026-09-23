@@ -602,7 +602,7 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 // `claude-opus-*` prefix match: a future generation must be reviewed before we
 // assert capabilities for it. `claude-opus-vision.test.ts` imports this list and
 // fails when the catalog bundles a newer Opus generation than any declared here.
-export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5];
+export const VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS: readonly number[] = [4.8, 5, 5.5];
 
 /**
  * Known separator-less generation aliases. Upstream normally writes

@@ -141,8 +141,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * crashes, recovery, and attachment retirement cannot replay ambiguous work.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 79,
-	slack: 86,
+	discord: 80,
+	slack: 87,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

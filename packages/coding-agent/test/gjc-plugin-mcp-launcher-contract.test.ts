@@ -171,7 +171,9 @@ async function expectBunLaunchRefused(cwd: string, name: string): Promise<void> 
 				cleanupRegistered = true;
 			},
 		}),
-	).rejects.toThrow("Authenticated plugin MCP Bun launch capsules are unavailable");
+	).rejects.toThrow(
+		"Authenticated plugin MCP Bun launch capsules are unavailable: Bun's clearable runtime plugin hooks cannot enforce the authenticated module-loading boundary required to restrict plugin imports to verified capsule bytes",
+	);
 	expect(cleanupRegistered).toBe(false);
 }
 

@@ -12,6 +12,7 @@ import {
 	type GjcPluginLoadErrorCode,
 	installGjcBundle,
 } from "../src/extensibility/gjc-plugins";
+import { safePluginMcpDiagnostic } from "../src/extensibility/gjc-plugins/runtime-adapters";
 import { isPluginMcpPublicNetworkBound } from "../src/runtime-mcp/plugin-network-boundary";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -99,12 +100,24 @@ afterEach(async () => {
 });
 
 describe("plugin MCP runtime config conversion", () => {
+	test("bounds and redacts plugin MCP diagnostics", () => {
+		const secret = "plugin-startup-secret-value";
+		const diagnostic = safePluginMcpDiagnostic(`api_key=${secret}\u001b[31m ${"x".repeat(1_200)}`);
+		expect(diagnostic).toContain("api_key=«redacted»");
+		expect(diagnostic).not.toContain(secret);
+		expect(diagnostic).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+		expect(diagnostic.length).toBe(1_024);
+		const splitBearer = safePluginMcpDiagnostic(`Bearer\u0001${secret}`);
+		expect(splitBearer).toContain("«redacted-auth»");
+		expect(splitBearer).not.toContain(secret);
+	});
+
 	test("converts a bundled stdio MCP into a root-confined runtime config", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-"));
 		tempDirs.push(cwd);
 		const r = await installGjcBundle({ cwd }, "project", sixSurface);
 		expect(r.ok).toBe(true);
-		const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
+		const { configs, quarantine, serverProvenance } = await buildPluginMcpConfigs({ cwd });
 		if (process.platform !== "linux") {
 			expect(configs).toEqual({});
 			expect(quarantine).toEqual([
@@ -119,6 +132,10 @@ describe("plugin MCP runtime config conversion", () => {
 		}
 
 		expect(quarantine).toHaveLength(0);
+		expect(serverProvenance.get("domain_docs")).toEqual({
+			identity: { kind: "gjc-bundle", scope: "project", name: "valid-six-surface-bundle" },
+			surfaceId: "mcp:domain_docs",
+		});
 		const docs = configs.domain_docs;
 		expect(docs.type).toBe("stdio");
 		expect(docs.command).toBe("/proc/self/exe");
@@ -126,16 +143,28 @@ describe("plugin MCP runtime config conversion", () => {
 		const installedRoot = path.join(cwd, ".gjc", "gjc-plugins", "valid-six-surface-bundle");
 		expect(docs.args).toEqual(["mcp/domain-docs.ts"]);
 		expect(path.resolve(docs.cwd)).toBe(path.resolve(installedRoot));
-		await expect(docs.prepareSpawn?.({ command: docs.command, args: docs.args, cwd: docs.cwd })).rejects.toThrow(
-			"Authenticated plugin MCP Bun launch capsules are unavailable",
+		let cleanupRegistered = false;
+		await expect(
+			docs.prepareSpawn?.({
+				command: docs.command,
+				args: docs.args,
+				cwd: docs.cwd,
+				registerCleanup: () => {
+					cleanupRegistered = true;
+				},
+			}),
+		).rejects.toThrow(
+			"Authenticated plugin MCP Bun launch capsules are unavailable: Bun's clearable runtime plugin hooks cannot enforce the authenticated module-loading boundary required to restrict plugin imports to verified capsule bytes",
 		);
+		expect(cleanupRegistered).toBe(false);
 	});
 
 	test("empty when no plugins installed", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-empty-"));
 		tempDirs.push(cwd);
-		const { configs } = await buildPluginMcpConfigs({ cwd });
+		const { configs, serverProvenance } = await buildPluginMcpConfigs({ cwd });
 		expect(configs).toEqual({});
+		expect(serverProvenance.size).toBe(0);
 	});
 
 	test("binds bundled remote MCP configs to the public-network transport", async () => {
@@ -155,10 +184,14 @@ describe("plugin MCP runtime config conversion", () => {
 
 		const r = await installGjcBundle({ cwd }, "project", bundle);
 		expect(r.ok).toBe(true);
-		const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
+		const { configs, quarantine, serverProvenance } = await buildPluginMcpConfigs({ cwd });
 
 		expect(quarantine).toHaveLength(0);
-		expect(configs.remote_docs).toMatchObject({ type: "http", url });
+		expect(configs.remote_docs).toMatchObject({ type: "http", url, timeout: 5_000 });
+		expect(serverProvenance.get("remote_docs")).toEqual({
+			identity: { kind: "gjc-bundle", scope: "project", name: "remote-mcp-bundle" },
+			surfaceId: "mcp:remote_docs",
+		});
 		expect(isPluginMcpPublicNetworkBound(configs.remote_docs)).toBe(true);
 		expect(isPluginMcpPublicNetworkBound({ ...configs.remote_docs })).toBe(true);
 	});

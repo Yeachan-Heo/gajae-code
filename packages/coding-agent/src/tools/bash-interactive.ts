@@ -331,6 +331,7 @@ export async function runInteractiveBashPty(
 		timeoutMs: number;
 		signal?: AbortSignal;
 		env?: Record<string, string>;
+		unsetEnv?: string[];
 		artifactPath?: string;
 		artifactId?: string;
 		artifactPublisher?: TerminalArtifactPublisher;
@@ -422,6 +423,7 @@ export async function runInteractiveBashPty(
 				cwd: options.cwd,
 				timeoutMs: options.timeoutMs,
 				env: { ...NON_INTERACTIVE_ENV, ...options.env },
+				unsetEnv: options.unsetEnv,
 				signal: processAbortController.signal,
 				cols: initialPtySize.cols,
 				rows: initialPtySize.rows,

@@ -118,9 +118,11 @@ import { resolveCurrentPhaseForParent } from "../extensibility/gjc-plugins/injec
 import { currentActivationFingerprint } from "../extensibility/gjc-plugins/lifecycle";
 import {
 	buildPluginMcpConfigs,
+	type GjcPluginMcpServerProvenance,
 	getGjcPluginToolDeclarations,
 	loadAlwaysOnPluginTools,
 	renderAlwaysOnSystemAppendices,
+	safePluginMcpDiagnostic,
 } from "../extensibility/gjc-plugins/runtime-adapters";
 import {
 	GjcRuntimeFindingAccumulator,
@@ -156,6 +158,7 @@ import {
 	resolveMCPToolCache,
 } from "../runtime-mcp";
 import type { MCPLoadResult } from "../runtime-mcp/manager";
+import { MCP_STARTUP_WAIT_GRACE_MS } from "../runtime-mcp/startup-policy";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -1288,7 +1291,7 @@ class ExactMcpToolNameCollisionError extends Error {
 class McpManagerCleanupError extends Error {
 	readonly code = "MCP_MANAGER_CLEANUP_FAILED";
 	constructor(cause: unknown) {
-		super(`Owned MCP manager cleanup failed: ${safeErrorDescription(cause)}`, { cause });
+		super(`Owned MCP manager cleanup failed: ${safePluginMcpDiagnostic(cause)}`, { cause });
 		this.name = "McpManagerCleanupError";
 	}
 }
@@ -1298,7 +1301,7 @@ class McpManagerCleanupDiagnosticError extends Error {
 	readonly primaryError: unknown;
 	readonly cleanupDiagnostic: { code: "MCP_MANAGER_CLEANUP_FAILED"; cause: unknown };
 	constructor(primaryError: unknown, cleanupError: unknown) {
-		super(safeErrorDescription(primaryError), { cause: primaryError });
+		super(safePluginMcpDiagnostic(primaryError), { cause: primaryError });
 		this.name = "McpManagerCleanupDiagnosticError";
 		this.primaryError = primaryError;
 		this.cleanupDiagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED", cause: cleanupError };
@@ -1327,8 +1330,8 @@ function safeCleanupDiagnosticForLog(value: unknown): { code: string; cause: str
 	const code = safeReadProperty(value, "code");
 	const nestedCause = safeReadProperty(value, "cause");
 	return {
-		code: typeof code === "string" ? code : "MCP_MANAGER_CLEANUP_FAILED",
-		cause: safeErrorDescription(nestedCause === undefined ? value : nestedCause),
+		code: typeof code === "string" ? safePluginMcpDiagnostic(code) : "MCP_MANAGER_CLEANUP_FAILED",
+		cause: safePluginMcpDiagnostic(nestedCause === undefined ? value : nestedCause),
 	};
 }
 function safeReadCleanupDiagnostic(value: unknown): unknown {
@@ -2551,7 +2554,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
 				await session.replaceOwnedMcpManager(nextManager);
-				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[]);
+				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[], {
+					mandatoryMCPToolNames: pluginMcpToolNames,
+				});
 			}
 			cwdCapturingToolNames.length = 0;
 			cwdCapturingToolNames.push(...nextCwdCapturing);
@@ -3246,20 +3251,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mergedSources: Record<string, SourceMeta>,
 			conventionalConfigs: Record<string, MCPServerConfig>,
 			pluginNames: ReadonlySet<string>,
+			pluginMcpProvenance: ReadonlyMap<string, GjcPluginMcpServerProvenance>,
 		): Promise<MCPLoadResult> => {
 			let result: MCPLoadResult;
 			try {
 				result = await owned.connectServers(mergedConfigs, mergedSources as never);
 			} catch (error) {
-				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
+				if (
+					safeIsInstanceOf(error, McpManagerCleanupError) ||
+					safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
+					safeReadCleanupDiagnostic(error) !== undefined
+				)
+					throw error;
 				// Avoid leaking partially-started server processes on failure.
 				let cleanupError: unknown;
 				try {
 					await owned.disconnectAll();
+					cleanupOwnedMcpManager = undefined;
 				} catch (disconnectError) {
 					cleanupError = disconnectError;
-				} finally {
-					cleanupOwnedMcpManager = undefined;
 				}
 				if (cleanupError !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupError);
 				throw error;
@@ -3273,14 +3283,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 			for (const [server, err] of result.errors) {
-				// A server that failed to connect leaves this generation incomplete: its
-				// surfaces produced no evidence, so publishing would present a partial
-				// pass as a clear one. On the deferred path this flag is already
-				// consumed (publication happens before the starter can run), which is
-				// acceptable only because deferral never carries plugin-bundle servers.
-				gjcProducersComplete = false;
-				if (!isMCPStartupTimeoutError(err)) {
-					logger.warn("GJC plugin MCP connect failed", {
+				const provenance = pluginMcpProvenance.get(server);
+				if (provenance) {
+					gjcFindings.add({
+						identity: provenance.identity,
+						surfaceId: provenance.surfaceId,
+						code: "runtime_mismatch",
+						message: `MCP server connection failed: ${safePluginMcpDiagnostic(err)}`,
+						decision: "error",
+						provenance: {
+							source: "plugin-bundle",
+							plugin: provenance.identity.name,
+							scope: provenance.identity.scope,
+						},
+					});
+				}
+				if (provenance) {
+					logger.error("GJC plugin MCP connection failed", {
+						path: `mcp:${server}`,
+						error: safePluginMcpDiagnostic(err),
+					});
+				} else if (!isMCPStartupTimeoutError(err)) {
+					logger.warn("MCP server connection failed", {
 						path: `mcp:${server}`,
 						// MCPLoadResult stores failures as strings, so their original
 						// type is unavailable here; use the manager classifier's safe fallback.
@@ -3288,7 +3312,56 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 				}
 			}
-			const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
+			const failedPluginNames = new Set([...result.errors.keys()].filter(name => pluginMcpProvenance.has(name)));
+			const connectedPluginNames = new Set(
+				result.connectedServers.filter(name => pluginNames.has(name) && !failedPluginNames.has(name)),
+			);
+			const unsettledPluginNames = [...pluginNames].filter(
+				name =>
+					!failedPluginNames.has(name) &&
+					!connectedPluginNames.has(name) &&
+					owned.getConnectionStatus(name) !== "disconnected",
+			);
+			let pluginCleanupFailed = false;
+			for (const server of unsettledPluginNames) {
+				const provenance = pluginMcpProvenance.get(server);
+				if (!provenance) continue;
+				let message =
+					"MCP server did not produce a complete startup result within its declared startup window; its tools are unavailable for this session";
+				let cleanupDiagnostic: string | undefined;
+				failedPluginNames.add(server);
+				try {
+					await owned.disconnectServer(server);
+				} catch (error) {
+					pluginCleanupFailed = true;
+					cleanupDiagnostic = safePluginMcpDiagnostic(error);
+				}
+				if (owned.getConnectionStatus(server) !== "disconnected") {
+					pluginCleanupFailed = true;
+					cleanupDiagnostic ??= "server remained connected or connecting after disconnect";
+				}
+				if (cleanupDiagnostic !== undefined) message += `; cleanup diagnostic: ${cleanupDiagnostic}`;
+				gjcFindings.add({
+					identity: provenance.identity,
+					surfaceId: provenance.surfaceId,
+					code: "runtime_mismatch",
+					message,
+					decision: "error",
+					provenance: {
+						source: "plugin-bundle",
+						plugin: provenance.identity.name,
+						scope: provenance.identity.scope,
+					},
+				});
+				logger.error("GJC plugin MCP startup did not settle", {
+					path: `mcp:${server}`,
+					error: message,
+					...(cleanupDiagnostic === undefined ? {} : { cleanupDiagnostic }),
+				});
+			}
+			const successfulTools = result.tools.filter(
+				tool => tool.mcpServerName === undefined || !failedPluginNames.has(tool.mcpServerName),
+			);
 			// Only a connection still in its startup window or a cached fallback
 			// needs the mixed manager to remain mutable. Successfully connected
 			// ordinary tools do not delay the synchronous seal; cached fallbacks keep
@@ -3297,17 +3370,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				name => owned.getConnectionStatus(name) === "connecting" || cachedConventionalMcpServerNames.has(name),
 			);
 			const retainOwnedManager =
-				result.connectedServers.length > 0 || unsettledConventionalNames.length > 0 || result.tools.length > 0;
+				result.connectedServers.length > 0 ||
+				unsettledConventionalNames.length > 0 ||
+				successfulTools.length > 0 ||
+				pluginCleanupFailed;
 			if (retainOwnedManager) {
 				mcpManager = owned;
 				ownsMcpManager = true;
-				customTools.push(...(result.tools as CustomTool[]));
-				ownedMcpManagerToolNames = result.tools.map(tool => tool.name);
-				cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
+				customTools.push(...(successfulTools as CustomTool[]));
+				ownedMcpManagerToolNames = successfulTools.map(tool => tool.name);
+				cwdCapturingToolNames.push(...successfulTools.map(tool => tool.name));
 				for (const name of conventionalServerNames) ownedConventionalMcpServerNames.add(name);
-				pluginMcpManagerServers.set(owned, new Set(pluginNames));
+				pluginMcpManagerServers.set(owned, connectedPluginNames);
 				conventionalMcpManagerServers.set(owned, conventionalServerNames);
-				for (const tool of result.tools) {
+				for (const tool of successfulTools) {
 					const serverName = tool.mcpServerName;
 					if (serverName === undefined) continue;
 					if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
@@ -3332,7 +3408,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await owned.disconnectAll();
 					cleanupOwnedMcpManager = undefined;
 				} catch (cleanupError) {
-					cleanupOwnedMcpManager = undefined;
 					throw new McpManagerCleanupError(cleanupError);
 				}
 			}
@@ -3417,7 +3492,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// tools are surfaced as always-on tools rather than gated behind MCP
 			// selection.
 			try {
-				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
+				const { configs, quarantine, serverProvenance: pluginMcpProvenance } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
 					gjcFindings.add({
 						identity: q.identity,
@@ -3447,12 +3522,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const conventionalCacheServerNames = new Set(
 						Object.keys(conventionalConfigs).filter(name => !pluginNames.has(name)),
 					);
+					const maxPluginMcpTimeoutMs = Object.values(configs).reduce((maximum, config) => {
+						const timeout = config.timeout;
+						return typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0
+							? Math.max(maximum, timeout)
+							: maximum;
+					}, 0);
+					const maxPluginMcpStartupWaitMs =
+						maxPluginMcpTimeoutMs > 0 ? maxPluginMcpTimeoutMs + MCP_STARTUP_WAIT_GRACE_MS : undefined;
 					const owned = new MCPManager(
 						cwd,
 						conventionalCacheServerNames.size > 0 ? await getOwnedMcpToolCache() : null,
 						{
 							sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
 							toolCacheServerNames: conventionalCacheServerNames,
+							...(maxPluginMcpStartupWaitMs === undefined
+								? {}
+								: { maxStartupTimeoutMs: maxPluginMcpStartupWaitMs }),
 						},
 					);
 					owned.setAuthStorage(authStorage);
@@ -3482,11 +3568,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mergedSourceMetas,
 							conventionalConfigs,
 							pluginNames,
+							pluginMcpProvenance,
 						);
 					}
 				}
 			} catch (error) {
-				if (safeIsInstanceOf(error, McpManagerCleanupError)) throw error;
+				if (
+					safeIsInstanceOf(error, McpManagerCleanupError) ||
+					safeIsInstanceOf(error, McpManagerCleanupDiagnosticError) ||
+					safeReadCleanupDiagnostic(error) !== undefined
+				)
+					throw error;
 				gjcProducersComplete = false;
 				const cleanupDiagnostic = safeReadCleanupDiagnostic(error);
 				logger.warn("Failed to wire GJC plugin MCP servers", {
@@ -5478,6 +5570,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								conventional.sources,
 								conventional.conventionalConfigs,
 								new Set<string>(),
+								new Map<string, GjcPluginMcpServerProvenance>(),
 							);
 							const resultTools = result.tools as CustomTool[];
 							if (!cancelled && !session.isDisposed) {

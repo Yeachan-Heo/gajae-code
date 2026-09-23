@@ -6263,6 +6263,7 @@ export class AgentSession {
 		nextTools: CustomTool[],
 		options?: { mandatoryMCPToolNames?: readonly string[] },
 	): Promise<void> {
+		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
 		const previous = new Set(previousNames);
 		const previousActive = this.getActiveToolNames();
 		for (const name of previous) this.#toolRegistry.delete(name);
@@ -6282,10 +6283,13 @@ export class AgentSession {
 			);
 		}
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
-		await this.#applyActiveToolsByName([
-			...previousActive.filter(name => !previous.has(name)),
-			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
-		]);
+		await this.#applyActiveToolsByName(
+			[
+				...previousActive.filter(name => !previous.has(name)),
+				...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+			],
+			{ previousSelectedMCPToolNames },
+		);
 	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
@@ -13003,6 +13007,7 @@ export class AgentSession {
 		options: {
 			selectedMCPToolNames?: string[];
 			activeMCPToolNames?: string[];
+			mandatoryMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
 		} = {},
 	): Promise<void> {
@@ -13037,6 +13042,11 @@ export class AgentSession {
 		}
 
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
+		if (options.mandatoryMCPToolNames !== undefined) {
+			this.#mandatoryMCPToolNames = new Set(
+				options.mandatoryMCPToolNames.map(name => name.toLowerCase()).filter(name => this.#toolRegistry.has(name)),
+			);
+		}
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
 		if (options.selectedMCPToolNames) {
@@ -19637,11 +19647,13 @@ export class AgentSession {
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
 			allowPromptContinuationReentry?: boolean;
+			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
 		if (options?.signal?.aborted) return;
 		const identity = this.#captureSessionSelectionIdentity();
+		const expectedSessionId = identity.sessionId;
 		try {
 			return await this.#withSelectionAdmission(
 				identity,
@@ -19651,11 +19663,15 @@ export class AgentSession {
 					const previousEditMode = this.#resolveActiveEditMode();
 					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
 					if (options?.signal?.aborted) return;
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
 					this.#assertSelectionMutationReady(identity);
 					if (!apiKey) {
 						throw new Error(`No API key for ${model.provider}/${model.id}`);
 					}
 					if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
+					options?.onMutationStarted?.();
 
 					const isTemporaryOperation = options?.cause === undefined || options.cause === "temporary-operation";
 					const autoCreateScope = isTemporaryOperation && !suppliedScope;
@@ -19731,15 +19747,19 @@ export class AgentSession {
 	): Promise<void> {
 		const identity = this.#captureSessionSelectionIdentity();
 		return this.#withSelectionAdmission(identity, async () => {
-			if (model) {
-				await this.setModelTemporary(model, thinkingLevel, { cause: "rollback", reason: "other" });
-				this.#assertSessionSelectionIdentityCurrent(identity);
-				return;
-			}
 			const previousEditMode = this.#resolveActiveEditMode();
 			this.#assertSelectionMutationReady(identity);
-			this.#clearActiveRetryFallback();
-			this.#setModelWithProviderSessionReset(undefined);
+			if (model) {
+				// Restoring a captured live model is compensation, not a new selection:
+				// the old credential may have disappeared after the forward mutation.
+				this.#setModelAuthoritatively(model, "rollback");
+				this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
+				this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+			} else {
+				this.#clearActiveRetryFallback();
+				this.#setModelWithProviderSessionReset(undefined);
+				this.#syncAppendOnlyContext(undefined);
+			}
 			this.setThinkingLevel(thinkingLevel);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			this.#assertSessionSelectionIdentityCurrent(identity);

@@ -34,6 +34,7 @@ import {
 	applyModelProfileRuntimeBindings,
 	ModelProfileCredentialError,
 } from "./config/model-profile-activation";
+import { UnknownModelProfileError } from "./config/model-profile-contract";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
 	parseModelString,
@@ -467,23 +468,33 @@ type StartupModelProfileArgs = {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "default" | "model" | "mpreset" | "thinking">;
+	parsedArgs: Pick<Args, "continue" | "default" | "fork" | "model" | "mpreset" | "resume" | "thinking">;
 	startupModel?: CreateAgentSessionOptions["model"];
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
 };
 
+function staleDefaultProfileMessage(error: UnknownModelProfileError, profileCatalogRefreshUnavailable = false): string {
+	const refreshNotice = profileCatalogRefreshUnavailable
+		? " The online profile catalog could not be refreshed; continuing with the last accepted catalog."
+		: "";
+	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml or .gjc/settings.json if set there, or run gjc config reset modelProfile.default for the global setting.${refreshNotice}`;
+}
+
 async function applyStartupModelProfilesWithPolicy(
 	args: StartupModelProfileArgs,
 	onCredentialError?: (error: ModelProfileCredentialError) => void,
+	onUnknownDefault?: (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) => void,
 ): Promise<void> {
+	let profileCatalogRefreshUnavailable = false;
 	const applyProfile = async (
 		profileName: string,
 		persistDefault: boolean,
 		options: {
 			thinkingLevelOverride?: CreateAgentSessionOptions["thinkingLevel"];
 			tolerateCredentialError?: boolean;
+			tolerateUnknownDefault?: boolean;
 			runtimeBindingsOnly?: boolean;
 		} = {},
 	): Promise<boolean> => {
@@ -508,6 +519,14 @@ async function applyStartupModelProfilesWithPolicy(
 				else process.stderr.write(`${chalk.yellow(`Warning: ${error.message}`)}\n`);
 				return false;
 			}
+			if (error instanceof UnknownModelProfileError && options.tolerateUnknownDefault) {
+				if (onUnknownDefault) onUnknownDefault(error, profileCatalogRefreshUnavailable);
+				else
+					process.stderr.write(
+						`${chalk.yellow(`Warning: ${staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable)}`)}\n`,
+					);
+				return false;
+			}
 			throw error;
 		}
 	};
@@ -515,8 +534,8 @@ async function applyStartupModelProfilesWithPolicy(
 	// An explicit startup selector (--mpreset or --model) fully replaces the
 	// persisted default profile for this session, so a failing default must not
 	// abort a non-interactive run: it is reported as a warning and the explicit
-	// selection proceeds. Without an explicit selector the historic fatal
-	// contract is unchanged.
+	// selection proceeds. Without an explicit selector, failures remain fatal
+	// except for a stale default on input-free interactive startup.
 	const tolerateDefaultProfileFailure = args.parsedArgs.mpreset !== undefined || args.parsedArgs.model !== undefined;
 
 	// Capture the explicitly-selected startup model BEFORE profile activation can
@@ -527,7 +546,7 @@ async function applyStartupModelProfilesWithPolicy(
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
-	const applyConfiguredProfiles = async (): Promise<boolean> => {
+	const applyConfiguredProfiles = async (allowMissingDefault: boolean): Promise<boolean> => {
 		let applied = true;
 		if (defaultProfile) {
 			applied =
@@ -536,6 +555,8 @@ async function applyStartupModelProfilesWithPolicy(
 						? args.settings.get("defaultThinkingLevel")
 						: undefined,
 					tolerateCredentialError: tolerateDefaultProfileFailure,
+					tolerateUnknownDefault:
+						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
 					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
 				})) && applied;
 		}
@@ -549,12 +570,23 @@ async function applyStartupModelProfilesWithPolicy(
 		let applied: boolean;
 		let refreshedOnline = false;
 		try {
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(false);
 		} catch (error) {
 			if (error instanceof ModelProfileCredentialError) throw error;
+			if (error instanceof UnknownModelProfileError) {
+				try {
+					await args.modelRegistry.refreshModelPresetProfilesFromRegistry();
+				} catch (refreshError) {
+					if (args.modelRegistry.getError()) throw refreshError;
+					profileCatalogRefreshUnavailable = true;
+					logger.warn("Failed to refresh model profile catalog before startup recovery", {
+						error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+					});
+				}
+			}
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 			refreshedOnline = true;
-			applied = await applyConfiguredProfiles();
+			applied = await applyConfiguredProfiles(true);
 		}
 		if (applied && !refreshedOnline)
 			args.modelRegistry.refreshInBackground("online-if-uncached", args.session.credentialSessionId);
@@ -562,7 +594,7 @@ async function applyStartupModelProfilesWithPolicy(
 		if (defaultProfile || args.parsedArgs.mpreset) {
 			await args.modelRegistry.refresh("online-if-uncached", args.session.credentialSessionId);
 		}
-		await applyConfiguredProfiles();
+		await applyConfiguredProfiles(true);
 	}
 
 	// Explicit CLI --model/--thinking must win over any activated or skipped profile.
@@ -618,6 +650,20 @@ export function isStartupModelProfileCredentialRecoveryEligible(options: {
 	);
 }
 
+function isStartupModelProfileStaleDefaultRecoveryEligible(
+	options: Parameters<typeof isStartupModelProfileCredentialRecoveryEligible>[0] & {
+		parsedArgs: Pick<Args, "continue" | "fork" | "resume">;
+	},
+): boolean {
+	return (
+		isStartupModelProfileCredentialRecoveryEligible(options) &&
+		options.parsedArgs.continue !== true &&
+		options.parsedArgs.fork === undefined &&
+		((options.parsedArgs.resume === undefined && options.resumeAction === undefined) ||
+			(options.parsedArgs.resume === true && options.resumeAction === "open-idle"))
+	);
+}
+
 export async function applyStartupModelProfilesForRoot(
 	args: StartupModelProfileArgs & {
 		isInteractive: boolean;
@@ -627,19 +673,21 @@ export async function applyStartupModelProfilesForRoot(
 		resumeAction: "continue-tail" | "open-idle" | undefined;
 	},
 ): Promise<{ recoverableErrors: string[] }> {
-	const policyArgs = { ...args, preferCachedModels: args.isInteractive };
-	if (!isStartupModelProfileCredentialRecoveryEligible(args)) {
-		try {
-			await applyStartupModelProfilesWithPolicy(policyArgs);
-		} catch (error) {
-			await exitForStartupModelProfileError(args, error);
-		}
-		return { recoverableErrors: [] };
-	}
-
+	const policyArgs = {
+		...args,
+		preferCachedModels: args.isInteractive,
+		preferCachedDefaultProfile: args.isInteractive,
+	};
 	const recoverableErrors: string[] = [];
+	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
+		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
+		: undefined;
+	const onUnknownDefault = isStartupModelProfileStaleDefaultRecoveryEligible(args)
+		? (error: UnknownModelProfileError, profileCatalogRefreshUnavailable: boolean) =>
+				recoverableErrors.push(staleDefaultProfileMessage(error, profileCatalogRefreshUnavailable))
+		: undefined;
 	try {
-		await applyStartupModelProfilesWithPolicy(policyArgs, error => recoverableErrors.push(error.message));
+		await applyStartupModelProfilesWithPolicy(policyArgs, onCredentialError, onUnknownDefault);
 	} catch (error) {
 		await exitForStartupModelProfileError(args, error);
 	}
@@ -669,7 +717,9 @@ async function applyDeferredStartupModelProfilesForRoot(
 	const onCredentialError = isStartupModelProfileCredentialRecoveryEligible(args)
 		? (error: ModelProfileCredentialError) => recoverableErrors.push(error.message)
 		: undefined;
-	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError);
+	await applyStartupModelProfilesWithPolicy({ ...args, preferCachedModels: true }, onCredentialError, error =>
+		recoverableErrors.push(staleDefaultProfileMessage(error)),
+	);
 	return { recoverableErrors };
 }
 

@@ -83,6 +83,8 @@ import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-disc
 import {
 	loadAcceptedModelPresetProfiles,
 	type ModelPresetRegistryDependencies,
+	type ModelPresetRegistryRefreshResult,
+	refreshModelPresetRegistry,
 	refreshModelPresetRegistryInBackground,
 } from "./model-preset-registry";
 
@@ -1900,6 +1902,17 @@ export class ModelRegistry {
 				this.#resumeRebuild();
 			}
 		});
+	}
+
+	/** Refresh the signed profile catalog online, then publish its accepted snapshot. */
+	async refreshModelPresetProfilesFromRegistry(): Promise<ModelPresetRegistryRefreshResult> {
+		const result = await refreshModelPresetRegistry({
+			...this.#modelPresetRegistryDependencies,
+			agentDir: this.#modelPresetRegistryAgentDir,
+			knownManifestSha256: this.#loadedModelPresetRegistryManifestSha256,
+		});
+		await this.refreshStatic();
+		return result;
 	}
 
 	/**
@@ -5425,6 +5438,10 @@ export class ModelRegistry {
 	 */
 	getAvailableForProfileActivation(): Model<Api>[] {
 		const bundledIdsByProvider = new Map<string, Set<string>>();
+		// Evidence staleness depends only on the provider, and resolving it scans the
+		// catalog for the provider base URL. Decide it once per provider per call so a
+		// multi-thousand-model catalog is not rescanned for every model.
+		const staleEvidenceByProvider = new Map<string, boolean>();
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
 			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
@@ -5439,12 +5456,15 @@ export class ModelRegistry {
 				bundledIdsByProvider.set(model.provider, bundledModelIds);
 			}
 			if (!bundledModelIds.has(model.id)) return true;
-			if (
-				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
-				evidence.profileEndpoint !==
-					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "")
-			)
-				return true;
+			let staleEvidence = staleEvidenceByProvider.get(model.provider);
+			if (staleEvidence === undefined) {
+				staleEvidence =
+					evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
+					evidence.profileEndpoint !==
+						this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "");
+				staleEvidenceByProvider.set(model.provider, staleEvidence);
+			}
+			if (staleEvidence) return true;
 			return evidence.profileModelIds.has(model.id);
 		});
 	}

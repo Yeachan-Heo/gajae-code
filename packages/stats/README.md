@@ -8,6 +8,7 @@ Local observability dashboard for AI usage statistics.
 - **SQLite aggregation**: Efficient stats storage and querying using `bun:sqlite`
 - **Web dashboard**: Real-time metrics visualization with Chart.js
 - **Incremental sync**: Only processes new/modified log entries
+- **Role usage breakdown**: `gjc stats --summary` and JSON report usage by default, executor, planner, architect, and critic; custom roles and legacy sessions without identity metadata are grouped as `other` or `unknown`
 
 ## Metrics Tracked
 
@@ -50,6 +51,7 @@ const { processed, files } = await syncAllSessions();
 const stats = await getDashboardStats();
 console.log(stats.overall.totalCost);
 console.log(stats.byModel[0].avgTokensPerSecond);
+console.log(stats.byAgent.find(agent => agent.agent === "executor")?.totalCost);
 ```
 
 ## API Endpoints

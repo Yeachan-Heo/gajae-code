@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { getPriorityPremiumRequests, type ServiceTier } from "@gajae-code/ai";
 import { getSessionsDir, isEnoent } from "@gajae-code/utils";
 import type {
+	AgentRole,
 	ParsedMessageStats,
 	SessionAssistantMessage,
 	SessionEntry,
@@ -68,6 +69,30 @@ function isServiceTierChange(entry: SessionEntry): entry is SessionServiceTierCh
 	return isObject(entry) && entry.type === "service_tier_change";
 }
 
+function inferAgentRoleFromPath(sessionPath: string): AgentRole {
+	const relativePath = path.relative(getSessionsDir(), sessionPath);
+	const pathDepth = relativePath.split(path.sep).filter(Boolean).length;
+	// Root transcripts live directly under a project directory. Task transcripts
+	// live in a directory nested beneath their parent transcript, so legacy child
+	// sessions without a persisted identity must not be mistaken for `default`.
+	return pathDepth <= 2 ? "default" : "unknown";
+}
+
+function agentRoleFromSessionEntry(entry: unknown): AgentRole | undefined {
+	if (!isObject(entry) || entry.type !== "configured_model_chain") return undefined;
+	if (entry.role !== "default" || entry.origin !== "subagent") return undefined;
+	if (!isNonemptyString(entry.identity)) return "unknown";
+	switch (entry.identity) {
+		case "executor":
+		case "planner":
+		case "architect":
+		case "critic":
+			return entry.identity;
+		default:
+			return "other";
+	}
+}
+
 /**
  * Extract plain text from a user message content payload.
  */
@@ -120,6 +145,7 @@ function extractStats(
 	folder: string,
 	entry: SessionMessageEntry,
 	currentServiceTier: ServiceTier | undefined,
+	agentRole: AgentRole,
 ): ParsedMessageStats | null {
 	const msg = entry.message as SessionAssistantMessage;
 	if (msg?.role !== "assistant") return null;
@@ -150,6 +176,7 @@ function extractStats(
 		sessionFile,
 		entryId: entry.id,
 		folder,
+		agent: agentRole,
 		model: msg.model,
 		provider: msg.provider,
 		api: msg.api,
@@ -191,14 +218,20 @@ function parseSessionEntriesLenient(bytes: Uint8Array): { entries: SessionEntry[
 	return { entries, read: cursor };
 }
 
-function scanLastServiceTier(bytes: Uint8Array): ServiceTier | undefined {
+function scanSessionMetadata(
+	bytes: Uint8Array,
+	initialAgentRole: AgentRole,
+): { serviceTier: ServiceTier | undefined; agentRole: AgentRole } {
 	let cursor = 0;
 	let currentServiceTier: ServiceTier | undefined;
+	let currentAgentRole = initialAgentRole;
 
 	while (cursor < bytes.length) {
 		const { values, error, read, done } = Bun.JSONL.parseChunk(bytes, cursor, bytes.length);
 		for (const value of values as SessionEntry[]) {
 			if (isServiceTierChange(value)) currentServiceTier = value.serviceTier ?? undefined;
+			const agentRole = agentRoleFromSessionEntry(value);
+			if (agentRole !== undefined) currentAgentRole = agentRole;
 		}
 
 		if (error) {
@@ -213,23 +246,19 @@ function scanLastServiceTier(bytes: Uint8Array): ServiceTier | undefined {
 		if (done) break;
 	}
 
-	return currentServiceTier;
+	return { serviceTier: currentServiceTier, agentRole: currentAgentRole };
 }
 /**
  * Parse a session file and extract all assistant message stats.
  * Uses incremental reading with offset tracking.
  *
- * Service-tier carry-over: `currentServiceTier` is a session-scoped piece of
- * state derived from `service_tier_change` entries that affects whether
- * subsequent OpenAI assistant replies count as premium requests. Incremental
- * syncs that resume past the most-recent tier change would otherwise lose
- * that state and silently record `premiumRequests = 0` for priority traffic
- * (the coding-agent stopped folding the tier into `usage.premiumRequests`
- * after 13f59162e — the parser is now the sole source of truth). When
- * `fromOffset > 0` we therefore scan the bytes preceding `fromOffset`
- * for the latest service-tier value before parsing the unprocessed tail.
- * The scan only keeps the current tier and does not materialize prefix
- * entries, preserving offset-based memory behavior for large sessions.
+ * Service-tier and agent-role carry-over are session-scoped state. Incremental
+ * syncs that resume after either metadata entry would otherwise lose the
+ * context needed to attribute priority requests and assistant usage. When
+ * `fromOffset > 0`, scan the prefix for the current values before parsing the
+ * unprocessed tail. The scan keeps only current metadata and does not
+ * materialize prefix entries, preserving offset-based memory behavior for
+ * large sessions.
  */
 export interface ParseSessionResult {
 	stats: ParsedMessageStats[];
@@ -252,15 +281,24 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 	const userLinks: UserMessageLink[] = [];
 	const userByEntryId = new Map<string, UserMessageStats>();
 	const start = Math.max(0, Math.min(fromOffset, bytes.length));
+	const initialAgentRole = inferAgentRoleFromPath(sessionPath);
 	const unprocessed = bytes.subarray(start);
 	const { entries, read } = parseSessionEntriesLenient(unprocessed);
 	let currentServiceTier: ServiceTier | undefined;
+	let currentAgentRole = initialAgentRole;
 	if (start > 0) {
-		currentServiceTier = scanLastServiceTier(bytes.subarray(0, start));
+		const metadata = scanSessionMetadata(bytes.subarray(0, start), initialAgentRole);
+		currentServiceTier = metadata.serviceTier;
+		currentAgentRole = metadata.agentRole;
 	}
 	for (const entry of entries) {
 		if (isServiceTierChange(entry)) {
 			currentServiceTier = entry.serviceTier ?? undefined;
+			continue;
+		}
+		const agentRole = agentRoleFromSessionEntry(entry);
+		if (agentRole !== undefined) {
+			currentAgentRole = agentRole;
 			continue;
 		}
 		if (isUserMessage(entry)) {
@@ -272,7 +310,7 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 			continue;
 		}
 		if (isAssistantMessage(entry)) {
-			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier);
+			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier, currentAgentRole);
 			if (msgStats) stats.push(msgStats);
 			// Link assistant's responding model back to the user message it answered.
 			const parentId = (entry as SessionMessageEntry).parentId;
