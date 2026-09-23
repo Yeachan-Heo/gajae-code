@@ -21,6 +21,29 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native recovery filesystem authority", () => {
+	it("reaps expired dead-owner replacement bytes and reports them on root open", async () => {
+		const root = await temporaryDirectory();
+		const recovery = path.join(root, ".gjc-recovery");
+		await fs.mkdir(recovery, { mode: 0o700 });
+		const child = Bun.spawn(["true"], { stdout: "ignore", stderr: "ignore" });
+		expect(await child.exited).toBe(0);
+		const expired = Math.floor(Date.now() / 1000) - 3 * 60 * 60;
+		const artifact = path.join(recovery, `.gjc-managed-replace-${child.pid}-0-${expired}`);
+		await fs.writeFile(artifact, "abandoned", { mode: 0o600 });
+		const authority = openRecoveryFsRoot(root);
+		try {
+			expect(authority.recoveryReaperMetrics()).toMatchObject({
+				ok: true,
+				totalReapedFiles: "1",
+				totalReapedBytes: "9",
+				totalFailures: "0",
+			});
+			await expect(fs.access(artifact)).rejects.toThrow();
+		} finally {
+			authority.close();
+		}
+	});
+
 	it("creates, installs, fsyncs, and reports descriptor identities", async () => {
 		const root = await temporaryDirectory();
 		const authority = openRecoveryFsRoot(root);
@@ -206,6 +229,12 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 			ok: false,
 			code: "cleanup_pending",
 			identity: { dev: replaced.identity.dev, ino: replaced.identity.ino },
+		});
+		expect(authority.recoveryReaperMetrics()).toMatchObject({
+			ok: true,
+			totalReapedFiles: "0",
+			totalReapedBytes: "0",
+			totalFailures: "0",
 		});
 		expect(cleanup.recoveryPath).toMatch(/^\.gjc-recovery\/\.gjc-managed-remove-/);
 		await expect(fs.access(path.join(root, cleanup.recoveryPath ?? ""))).resolves.toBeNull();

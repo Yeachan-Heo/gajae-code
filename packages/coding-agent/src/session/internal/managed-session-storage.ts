@@ -1178,11 +1178,20 @@ export function retainManagedDirectoryAuthority(
 		)
 			throw new Error("Managed root authority changed");
 		const relative = path.relative(root.canonicalPath, resolved).split(path.sep).join("/");
-		return rootAuthority.retainManagedDirectory(
+		const authority = rootAuthority.retainManagedDirectory(
 			relative,
 			canonicalFileId(named.dev).toString(),
 			canonicalFileId(named.ino).toString(),
 		);
+		const recovery = authority.recoveryReaperMetrics();
+		if (recovery.totalReapedFiles !== "0" || recovery.totalFailures !== "0" || recovery.scanLimited)
+			logger.warn("Managed recovery sidecar reaping", {
+				reapedCount: recovery.totalReapedFiles,
+				reapedBytes: recovery.totalReapedBytes,
+				failureCount: recovery.totalFailures,
+				scanLimited: recovery.scanLimited,
+			});
+		return authority;
 	} finally {
 		rootAuthority.close();
 	}
