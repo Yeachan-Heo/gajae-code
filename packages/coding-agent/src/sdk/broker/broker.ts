@@ -45,6 +45,7 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 	redactBrokerDiscovery,
+	rollbackBrokerDiscoveryIfCurrent,
 } from "./discovery";
 import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import {
@@ -159,6 +160,8 @@ export interface BrokerSettings {
 	startupPrePublicationDelayMs?: number;
 	/** Test-only notification at the cached-discovery, pre-publication boundary. */
 	startupPrePublicationTestHook?: () => Promise<void>;
+	/** Test-only delay hook after discovery rename and before retained publication authority. */
+	startupAfterDiscoveryWriteTestHook?: () => Promise<void>;
 	/** Test-only delay after publication to exercise signal handoff ordering. */
 	startupPostPublicationDelayMs?: number;
 }
@@ -1502,6 +1505,7 @@ export class Broker {
 	#onStartupReady: (() => void) | undefined;
 	#startupPrePublicationDelayMs: number;
 	#startupPrePublicationTestHook: (() => Promise<void>) | undefined;
+	#startupAfterDiscoveryWriteTestHook: (() => Promise<void>) | undefined;
 	#startupPostPublicationDelayMs: number;
 	#completionTask: Promise<void> | null = null;
 	#completion!: Promise<void>;
@@ -1545,6 +1549,7 @@ export class Broker {
 				? (settings.startupPrePublicationDelayMs as number)
 				: 0;
 		this.#startupPrePublicationTestHook = settings.startupPrePublicationTestHook;
+		this.#startupAfterDiscoveryWriteTestHook = settings.startupAfterDiscoveryWriteTestHook;
 		this.#startupPostPublicationDelayMs =
 			Number.isSafeInteger(settings.startupPostPublicationDelayMs) &&
 			(settings.startupPostPublicationDelayMs ?? 0) > 0 &&
@@ -3865,7 +3870,13 @@ export class Broker {
 			await this.#startupPrePublicationTestHook?.();
 			if (this.#startupPrePublicationDelayMs > 0) await Bun.sleep(this.#startupPrePublicationDelayMs);
 			this.#throwIfStartupAborted();
-			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
+			this.#publication = await publishBrokerDiscovery(
+				this.settings.agentDir,
+				this.discovery,
+				process.platform,
+				this.#startupAbortSignal,
+				this.#startupAfterDiscoveryWriteTestHook,
+			);
 			this.#throwIfStartupAborted();
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
@@ -3898,6 +3909,17 @@ export class Broker {
 			}
 			return this.discovery;
 		} catch (error) {
+			if (this.#startupAbortSignal?.aborted && this.discovery) {
+				try {
+					await rollbackBrokerDiscoveryIfCurrent(this.settings.agentDir, this.discovery);
+				} catch (rollbackError) {
+					logger.error("sdk broker: cancelled startup publication rollback failed", {
+						reason: "startup-publication-rollback-failed",
+						pid: process.pid,
+						error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+					});
+				}
+			}
 			await this.#transport?.stop();
 			this.#transport = null;
 			this.#publication?.close();
