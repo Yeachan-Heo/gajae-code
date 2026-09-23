@@ -8,7 +8,7 @@ import * as path from "node:path";
 export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_CONCURRENCY = 1;
-export const TEST_PRELOAD = "./scripts/test-preload.ts";
+export const TEST_PRELOAD = "./scripts/test-preload-after-all.ts";
 
 export interface HarnessOptions {
 	root: string;
