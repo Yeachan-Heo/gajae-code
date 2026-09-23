@@ -609,9 +609,16 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 
 /** A terse acknowledgement has no requirement context of its own and cannot anchor a Crystal item. */
 function isContextFreeAcknowledgement(value: string): boolean {
-	const normalized = value.replace(/[\p{P}\s]+$/gu, "").trim();
-	return /^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)$/iu.test(
-		normalized,
+	const normalized = value
+		.normalize("NFC")
+		.replace(/[\p{P}\s]+/gu, " ")
+		.trim();
+	return (
+		/^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)$/iu.test(
+			normalized,
+		) ||
+		/^(?:yes|yep|yeah|yup) (?:exactly|please|indeed)$/iu.test(normalized) ||
+		/^(?:absolutely|certainly|definitely|of course) (?:yes|no|yep|yeah|yup)$/iu.test(normalized)
 	);
 }
 
@@ -947,7 +954,8 @@ function requirementBearingClauses(
 					!clause ||
 					/^(?:what|why|how|when|where|who|which)\b/i.test(clause) ||
 					/\basked\b[^"“”]*["“”][^"“”]*(?:should|could|would|can|will)\b/i.test(clause) ||
-					/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal)|yes|no|ok|okay|done|acknowledged|understood|got it|thanks|thank you)$/i.test(
+					isContextFreeAcknowledgement(clause) ||
+					/^(?:no further changes|nothing else|another question remains|the ambiguity remains open|continue (?:again|with the remaining goal))$/i.test(
 						clause,
 					)
 				)
