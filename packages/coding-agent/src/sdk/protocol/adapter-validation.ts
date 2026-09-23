@@ -40,10 +40,18 @@ function hasUsablePromptImage(value: unknown): boolean {
 	);
 }
 
+function hasStagedPromptImage(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const image = value as Record<string, unknown>;
+	return typeof image.id === "string" && image.id.length > 0;
+}
+
 /** Rejects instruction-bearing controls before correlation or provider work. */
 export function validateRequiredPromptText(operation: string, input: Input): AdapterValidationError | undefined {
 	const hasUsableImage =
-		operation === "turn.prompt" && Array.isArray(input.images) && input.images.some(hasUsablePromptImage);
+		operation === "turn.prompt" &&
+		((Array.isArray(input.images) && input.images.some(hasUsablePromptImage)) ||
+			(Array.isArray(input.stagedImages) && input.stagedImages.some(hasStagedPromptImage)));
 	if (
 		PROMPT_OPERATIONS.has(operation) &&
 		(typeof input.text !== "string" || (input.text.trim().length === 0 && !hasUsableImage))

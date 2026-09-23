@@ -125,6 +125,10 @@ const controls = [
 	["retry.now", "Immediately retry pending backoff."],
 	["bash.background", "Move active managed bash to the background."],
 	["model.profile.set", "Activate a model profile for the current session."],
+	["turn.image.begin", "Begin a bounded host-owned image upload."],
+	["turn.image.append", "Append a canonical base64 image chunk."],
+	["turn.image.finish", "Verify and stage a complete image."],
+	["turn.image.discard", "Discard an unfinished or staged image."],
 ] as const;
 
 const globals = [
@@ -230,6 +234,15 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
+	if (["C54", "C55", "C56", "C57"].includes(id))
+		return dispositions({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+			mcp: "prohibited",
+			acp: "machine_only",
+			daemonCli: "machine_only",
+		});
 	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48"].includes(id))
 		return dispositions({
 			telegram: "prohibited",
@@ -289,6 +302,10 @@ function controlErrors(id: string): string[] {
 		C50: ["nothing_to_retry", "busy"],
 		C51: ["retry_not_pending"],
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
+		C54: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
+		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
+		C56: ["invalid_input", "resource_gone", "operation_prohibited"],
+		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];
 }

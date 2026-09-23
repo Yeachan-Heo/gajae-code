@@ -9,6 +9,10 @@ import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const methodByOperation: Record<string, string> = {
 	"turn.prompt": "prompt",
+	"turn.image.begin": "imageBegin",
+	"turn.image.append": "imageAppend",
+	"turn.image.finish": "imageFinish",
+	"turn.image.discard": "imageDiscard",
 	"turn.steer": "steer",
 	"turn.follow_up": "followUp",
 	"turn.abort": "abort",

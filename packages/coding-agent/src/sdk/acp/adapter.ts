@@ -414,6 +414,9 @@ export class AcpSdkAdapter {
 		const invalid = validateRequiredPromptText("turn.prompt", {
 			text,
 			...(typeof params === "object" && Array.isArray(params.images) ? { images: params.images } : {}),
+			...(typeof params === "object" && Array.isArray(params.stagedImages)
+				? { stagedImages: params.stagedImages }
+				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
 		return await this.#requestSession({
@@ -421,6 +424,42 @@ export class AcpSdkAdapter {
 			operation: "turn.prompt",
 			input: { ...(typeof params === "object" ? params : {}), text },
 		});
+	}
+	/** Machine-origin upload controls; never route these through the public control() disposition. */
+	async uploadImageBegin(input: {
+		mimeType: string;
+		byteLength: number;
+		sha256: string;
+	}): Promise<{ id: string; nextSequence: number }> {
+		return (await this.#requestImageUpload("turn.image.begin", input)) as {
+			id: string;
+			nextSequence: number;
+		};
+	}
+	async uploadImageAppend(input: {
+		id: string;
+		sequence: number;
+		data: string;
+	}): Promise<{ id: string; nextSequence: number; receivedBytes: number }> {
+		return (await this.#requestImageUpload("turn.image.append", input)) as {
+			id: string;
+			nextSequence: number;
+			receivedBytes: number;
+		};
+	}
+	async uploadImageFinish(id: string): Promise<{ id: string; byteLength: number; sha256: string; mimeType: string }> {
+		return (await this.#requestImageUpload("turn.image.finish", { id })) as {
+			id: string;
+			byteLength: number;
+			sha256: string;
+			mimeType: string;
+		};
+	}
+	async uploadImageDiscard(id: string): Promise<void> {
+		await this.#requestImageUpload("turn.image.discard", { id });
+	}
+	async #requestImageUpload(operation: string, input: JsonObject): Promise<unknown> {
+		return await this.#requestSession({ type: "control_request", operation, input });
 	}
 	/**
 	 * Ends the active turn with a C04 terminal abort. The default `scope:"turn"`
