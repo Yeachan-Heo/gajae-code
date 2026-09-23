@@ -405,7 +405,6 @@ import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
 	readVisibleSkillActiveState,
-	syncSkillActiveState,
 } from "../skill-state/active-state";
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
@@ -533,9 +532,9 @@ import {
 	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelope,
 	isOwnedCompletionEnvelopeAllowed,
+	type LineageBinding,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
-	type LineageBinding,
 	mintTurnLineageIdHash,
 	type OwnedCompletionEnvelope,
 	registerTerminalTurnScope,
@@ -3054,8 +3053,16 @@ export class AgentSession {
 	}
 
 	#settleTrackedQueuedInputTerminal(scope: AttemptScope | undefined): void {
-		if (scope === undefined) return;
-		const logicalRunId = this.#logicalRunIdByAttemptScope.get(scope);
+		// Identity transitions own the old queued work and terminalize it at their
+		// explicit pre-disconnect boundary; an abort terminal inside that window is
+		// not successful completion for tracked inputs that will be removed/rearmed.
+		if (scope === undefined || this.#sessionTransitionKind !== undefined) return;
+		const scopeKey = this.#attemptScopeKey(scope);
+		const activeLogicalRunId =
+			this.#activeAttemptScope !== undefined && this.#attemptScopeKey(this.#activeAttemptScope) === scopeKey
+				? this.#activeLogicalRunId
+				: undefined;
+		const logicalRunId = this.#logicalRunIdByAttemptScope.get(scope) ?? activeLogicalRunId;
 		const states =
 			(logicalRunId === undefined ? undefined : this.#trackedQueuedInputsByLogicalRunId.get(logicalRunId)) ??
 			this.#trackedQueuedInputsByAttemptScope.get(scope);
@@ -3064,11 +3071,13 @@ export class AgentSession {
 			if (state.terminalSettled) continue;
 			state.terminalSettled = true;
 			this.#clearTrackedQueuedInputQueueOwnership(state);
+			// A logical run can rotate attempt scopes before its terminal event;
+			// keep the receipt bound to the attempt that consumed this submission.
 			state.terminal.resolve({
 				submissionId: state.submission.submissionId,
 				delivery: state.delivery,
 				disposition: "completed",
-				attemptScope: this.#scopeRef(scope),
+				attemptScope: this.#scopeRef(state.attemptScope ?? scope),
 			});
 			this.#forgetTrackedQueuedInputOwnership(state);
 			this.#trackedQueuedInputs.delete(state.submission.submissionId);
@@ -4316,9 +4325,11 @@ export class AgentSession {
 		}
 		this.#sessionTransitionSettlement = Promise.withResolvers<void>();
 		this.#sessionTransitionKind = kind;
-		this.#promptPreflightCancellationGeneration++;
-		this.#promptPreflightAbortController.abort();
-		this.#promptPreflightAbortController = new AbortController();
+		if (kind !== "auto-compaction") {
+			this.#promptPreflightCancellationGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+		}
 		this.#coordinatorPersistGeneration += 1;
 		this.#wakeFollowUpReservationTransitionWaiters();
 	}
@@ -9590,9 +9601,34 @@ export class AgentSession {
 		generation: number,
 		resourceRunId?: string,
 		scheduledSessionIdentity?: SessionSelectionIdentity,
+		allowOwnedAutoCompactionTransition = false,
 	): Promise<boolean> {
 		const continuationIdentity = scheduledSessionIdentity ?? this.#captureSessionSelectionIdentity();
-		if (this.#sessionTransitionKind !== undefined || !this.#isSessionSelectionIdentityCurrent(continuationIdentity)) {
+		if (this.#sessionTransitionKind !== undefined) {
+			if (!allowOwnedAutoCompactionTransition || this.#sessionTransitionKind !== "auto-compaction") return false;
+			const precedingDeferredAutoContinue = this.#deferredAutoContinueDuringTransition;
+			this.#deferredAutoContinueDuringTransition = () => {
+				precedingDeferredAutoContinue?.();
+				// Track the actual retry task before releasing the transition. A bare
+				// async callback here could outlive waitForIdle without a session work
+				// lease, or race the transition fence and silently skip the retry.
+				this.#schedulePostPromptTask(
+					async signal => {
+						if (signal.aborted) return;
+						await this.#scheduleOverflowRetryContinuation(generation, resourceRunId, continuationIdentity);
+					},
+					{
+						generation,
+						resourceRunId,
+						scheduledSessionId: continuationIdentity.sessionId,
+						scheduledSessionIdentityEpoch: continuationIdentity.sessionIdentityEpoch,
+						onSkip: () => this.#logCompactionContinuationSkipped("overflow_retry", "aborted_signal"),
+					},
+				);
+			};
+			return true;
+		}
+		if (!this.#isSessionSelectionIdentityCurrent(continuationIdentity)) {
 			return false;
 		}
 		this.#stripOverflowFailedTurnForRetry();
@@ -17479,13 +17515,15 @@ export class AgentSession {
 
 		if (this.#extensionRunner && savedCompactionEntry) {
 			if (identityIsCurrent?.() === false) return undefined;
-			await this.#withActiveCompactionHook(() =>
-				this.#runCommittedSuccessorHook(() =>
-					this.#extensionRunner!.emit({
-						type: "session_compact",
-						compactionEntry: savedCompactionEntry,
-						fromExtension: fromExtension ?? false,
-					}),
+			await this.#withPostCommitTransitionIngress(() =>
+				this.#withActiveCompactionHook(() =>
+					this.#runCommittedSuccessorHook(() =>
+						this.#extensionRunner!.emit({
+							type: "session_compact",
+							compactionEntry: savedCompactionEntry,
+							fromExtension: fromExtension ?? false,
+						}),
+					),
 				),
 			);
 		}
@@ -21870,9 +21908,17 @@ export class AgentSession {
 			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
 				const status = await this.#runAutoCompaction("overflow", true, false, {
 					beforeTerminalOverflowNoop: () => {
-						if (!continuationIdentityIsCurrent()) return;
+						if (!this.#isSessionSelectionIdentityCurrent(continuationIdentity)) return;
 						if (onTerminalOverflowNoop) {
 							onTerminalOverflowNoop();
+							return;
+						}
+						const logicalRunId = this.agent.currentManagedLogicalRunId;
+						if (logicalRunId !== undefined) {
+							this.agent.requestRunTerminal(logicalRunId, {
+								stopReason: "error",
+								messages: [assistantMessage],
+							});
 						} else if (removedOverflowAssistant) {
 							this.agent.appendMessage(assistantMessage);
 						}
@@ -23481,8 +23527,10 @@ export class AgentSession {
 	): Promise<AutoCompactionTerminalStatus> {
 		const compactionSessionId = this.sessionId;
 		const compactionSessionIdentityEpoch = this.#sessionIdentityEpoch;
+		let ownsAutoCompactionTransition = false;
 		const compactionIdentityIsCurrent = (): boolean =>
-			this.#sessionTransitionKind === undefined &&
+			(this.#sessionTransitionKind === undefined ||
+				(ownsAutoCompactionTransition && this.#sessionTransitionKind === "auto-compaction")) &&
 			this.sessionId === compactionSessionId &&
 			this.#sessionIdentityEpoch === compactionSessionIdentityEpoch;
 		if (!compactionIdentityIsCurrent()) return { kind: "skipped" };
@@ -23549,7 +23597,6 @@ export class AgentSession {
 		let action: "context-full" | "handoff" =
 			compactionSettings.strategy === "handoff" && reason !== "overflow" ? "handoff" : "context-full";
 		const continueAfterMaintenance = options?.continueAfterMaintenance !== false;
-		let ownsAutoCompactionTransition = false;
 		const acquireAutoCompactionTransition = (): boolean => {
 			if (ownsAutoCompactionTransition) return true;
 			if (this.#sessionTransitionKind !== undefined || this.#cancelAndSubmitInProgress) return false;
@@ -23696,16 +23743,24 @@ export class AgentSession {
 				if (continuationSkipReason) {
 					this.#logCompactionContinuationSkipped("overflow_retry", continuationSkipReason);
 				}
-				if (overflowNoopWouldReplay) {
-					options?.beforeTerminalOverflowNoop?.();
-				}
 				const overflowContinuationScheduled =
 					!overflowNoopWouldReplay && willRetry && !continuationSkipReason
-						? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId, {
-								sessionId: compactionSessionId,
-								sessionIdentityEpoch: compactionSessionIdentityEpoch,
-							})
+						? await this.#scheduleOverflowRetryContinuation(
+								generation,
+								options?.resourceRunId,
+								{
+									sessionId: compactionSessionId,
+									sessionIdentityEpoch: compactionSessionIdentityEpoch,
+								},
+								ownsAutoCompactionTransition,
+							)
 						: false;
+				if (willRetry && !overflowContinuationScheduled) {
+					// No retry owns this logical run now. Terminalize it before the
+					// observable maintenance boundary so clients cannot retain a live
+					// managed owner after a no-op overflow recovery.
+					options?.beforeTerminalOverflowNoop?.();
+				}
 				await this.#emitSessionEvent({
 					type: "auto_compaction_end",
 					action,
@@ -24064,10 +24119,15 @@ export class AgentSession {
 			}
 			const overflowContinuationScheduled =
 				willRetry && !continuationSkipReason
-					? await this.#scheduleOverflowRetryContinuation(generation, options?.resourceRunId, {
-							sessionId: compactionSessionId,
-							sessionIdentityEpoch: compactionSessionIdentityEpoch,
-						})
+					? await this.#scheduleOverflowRetryContinuation(
+							generation,
+							options?.resourceRunId,
+							{
+								sessionId: compactionSessionId,
+								sessionIdentityEpoch: compactionSessionIdentityEpoch,
+							},
+							ownsAutoCompactionTransition,
+						)
 					: false;
 			await this.#emitSessionEvent({
 				type: "auto_compaction_end",

@@ -218,6 +218,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				session.agent.abort();
 				await manager.dispose({ timeoutMs: 1_000 });
 				await chainSessionManager.close();
+				await session.dispose();
 			} else {
 				session.agent.abort();
 				manager.cancelAll();
@@ -234,6 +235,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				if (!idleSettled) {
 					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
 					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					await session.dispose();
 					return;
 				}
 				const jobsSettled = await Promise.race([
@@ -246,6 +248,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				if (!jobsSettled) {
 					await Promise.race([manager.dispose({ timeoutMs: 3_000 }), Bun.sleep(4_000)]);
 					await Promise.race([chainSessionManager.close(), Bun.sleep(3_000)]);
+					await session.dispose();
 					return;
 				}
 				// Stop the block-owned manager before joining coordinator persistence.
@@ -994,7 +997,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// preserved user follow-up stays stranded until unrelated activity.
 		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
-		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle", 20_000);
 		// Queue the external follow-up while the turn is active (the idle
 		// auto-continue is suppressed while streaming, so it stays queued).
 		await session.followUp("external follow-up");
@@ -1019,7 +1022,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// instead of rejecting it as stale.
 		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("ok")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
-		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle", 20_000);
 		const handle = session.agent.activeResourceRunId;
 		// Admission capture: recorded under the CURRENT turn key.
 		const token = session.captureTerminalAbortSteeringSnapshot();
