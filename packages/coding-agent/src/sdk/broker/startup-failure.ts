@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { processIncarnation } from "./process-incarnation";
@@ -129,18 +131,34 @@ function boundedMarker(
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
 	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+	signal?: AbortSignal,
 ): Promise<boolean> {
+	let tempPath: string | undefined;
 	try {
+		if (signal?.aborted) return false;
 		const incarnation = failure.incarnation ?? processIncarnation(failure.pid);
 		if (!incarnation) return false;
-		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
+		const markerPath = brokerStartupFailurePath(agentDir);
+		const markerDirectory = path.dirname(markerPath);
+		await fs.mkdir(markerDirectory, { recursive: true, mode: 0o700 });
+		if (signal?.aborted) return false;
+
+		tempPath = path.join(markerDirectory, `.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`);
 		await Bun.write(
-			brokerStartupFailurePath(agentDir),
+			tempPath,
 			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
 		);
+		if (signal?.aborted) return false;
+
+		// There must be no async gap between the cancellation check and publication:
+		// a timed-out caller cannot be followed by a late marker rename.
+		renameSync(tempPath, markerPath);
+		tempPath = undefined;
 		return true;
 	} catch {
 		return false;
+	} finally {
+		if (tempPath) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
 }
 

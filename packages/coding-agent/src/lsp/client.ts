@@ -1065,6 +1065,8 @@ export function getActiveClients(): LspServerStatus[] {
 // =============================================================================
 
 // Register cleanup on module unload
+// SIGINT/SIGTERM exit status belongs to shared postmortem; active LSP clients
+// register their shutdown disposer through ensureLspCleanup().
 if (typeof process !== "undefined") {
 	process.on("beforeExit", () => {
 		void shutdownAll();
@@ -1074,17 +1076,5 @@ if (typeof process !== "undefined") {
 		for (const client of clients.values()) {
 			client.proc.kill();
 		}
-	});
-	process.on("SIGINT", () => {
-		void (async () => {
-			await shutdownAll();
-			process.exit(0);
-		})();
-	});
-	process.on("SIGTERM", () => {
-		void (async () => {
-			await shutdownAll();
-			process.exit(0);
-		})();
 	});
 }

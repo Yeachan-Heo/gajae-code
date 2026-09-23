@@ -653,7 +653,7 @@ it("records SIGTERM and SIGINT received before broker readiness", async () => {
 			try {
 				await waitForFile(path.join(signalDir, "startup-signal-ready"));
 				const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-				const expectedExitCode = 0;
+				const expectedExitCode = signal === "SIGTERM" ? 143 : 130;
 				expect(code).toBe(expectedExitCode);
 				let diagnostics: Record<string, unknown>[];
 				try {
@@ -698,6 +698,49 @@ it("records SIGTERM and SIGINT received before broker readiness", async () => {
 	}
 }, 15_000);
 
+it("records a startup signal after discovery caching but before publication", async () => {
+	if (process.platform === "win32") return;
+	const dir = await temp();
+	const signalDir = path.join(dir, "signals");
+	try {
+		await fs.mkdir(signalDir, { recursive: true });
+		const child = Bun.spawn([process.execPath, cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_PRE_PUBLICATION_DELAY_MS: "5000",
+				GJC_SDK_TEST_BROKER_SIGNAL_DIR: signalDir,
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+			},
+		});
+		try {
+			await waitForFile(path.join(signalDir, "pre-publication-ready"));
+			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+			process.kill(child.pid, "SIGTERM");
+			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+			expect(code).toBe(143);
+			expect(stderr).toContain("SDK broker startup interrupted by SIGTERM before readiness.");
+			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
+				mode: "startup",
+				reason: "startup-signal",
+				signal: "SIGTERM",
+				exitCode: 143,
+				pid: child.pid,
+			});
+			expect(await readBrokerExitRecord(dir)).toBeUndefined();
+			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+		} finally {
+			if (child.exitCode === null) child.kill("SIGKILL");
+			await child.exited;
+		}
+	} finally {
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
+
 it("persists an active signal exit during the publication handoff", async () => {
 	if (process.platform === "win32") return;
 	const dir = await temp();
@@ -708,8 +751,8 @@ it("persists an active signal exit during the publication handoff", async () => 
 		stderr: "pipe",
 		env: {
 			...process.env,
-			GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS: "4000",
-			GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "10000",
+			GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS: "7000",
+			GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "5000",
 		},
 	});
 	try {
@@ -717,9 +760,11 @@ it("persists an active signal exit during the publication handoff", async () => 
 		await waitForFile(brokerDiscovery.brokerDiscoveryPath(dir));
 		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
 		expect(discovery?.pid).toBe(child.pid);
+		await Bun.sleep(5_500);
+		expect(child.exitCode).toBeNull();
 		process.kill(child.pid, "SIGTERM");
 		const [code] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-		expect([0, 143]).toContain(code);
+		expect(code).toBe(143);
 		expect(await readBrokerExitRecord(dir)).toMatchObject({
 			mode: "owned-root",
 			reason: "signal",
