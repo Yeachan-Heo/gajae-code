@@ -68,6 +68,8 @@ Each expected answer must contain the required facts and file evidence. The grad
 
 For this evaluation harness only, the serialized `program` is a strict UTF-8 JSON array of call objects with exactly `id` (string), `tool` (string), and `args` (object) fields. The GPT Lark grammar and non-GPT `program: string` adapter must feed the same local parser/validator/dispatcher. This candidate format is not a product runtime contract.
 
+The candidate validator accepts 1–8 calls, unique ids matching `[a-z][a-z0-9_]{0,31}`, only `find`, `search`, or `read`, and each tool's exact frozen argument schema. A reference is exactly `{"$ref":"prior_id","pointer":"/rfc6901/path"}`; it must resolve to an earlier call result, and the pointer must resolve. Reject duplicate JSON keys, extra fields, malformed references, unknown tools, invalid arguments, and any invalid call in the complete program before dispatching its first call. These rules define the parser behavior exercised by S01–S16 below.
+
 Before any live model request, test the evaluation executor's parser, validator, and dispatcher against the same deterministic corpus through both code-mode encodings. Feed the crafted payloads directly to the local boundary; a provider refusing to generate them is not a test pass. The following strings are exact UTF-8 test inputs, with no added whitespace except where shown. Instrument the dispatcher and side-effect APIs so every attempted tool invocation and side effect is recorded.
 
 Run these 16 negative cases per encoding:
