@@ -3071,6 +3071,7 @@ function sdkControlSurface(
 					onQueuedPromoted: promotion => {
 						admission.hooks.onQueuedPromoted(promotion);
 						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
+						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
 					onDispatchDisposition: disposition => {
 						admission.hooks.onDispatchDisposition(disposition);
