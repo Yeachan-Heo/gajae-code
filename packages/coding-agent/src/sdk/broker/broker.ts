@@ -22,6 +22,14 @@ import {
 	resolveManagedSessionScope,
 } from "../session-directory";
 import {
+	type BrokerExitMode,
+	type BrokerExitReason,
+	type BrokerExitRecord,
+	type BrokerFenceReason,
+	type BrokerStopRequest,
+	writeBrokerExitRecord,
+} from "./broker-exit";
+import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerPublicationObservation,
@@ -1275,6 +1283,7 @@ const BROKER_LIVENESS_GRACE_MS = 60_000;
 // still fresh to every reader.
 const BROKER_LIVENESS_TTL_MULTIPLIER = 4;
 const BROKER_SETTLEMENT_MS = 2_000;
+const BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS = 1_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
@@ -1439,7 +1448,6 @@ type BrokerPublicationState =
 	| "observation-ambiguous"
 	| "heartbeat-ambiguous"
 	| "stopping";
-type BrokerStopMode = "owned-root" | "lost-root";
 
 const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
@@ -1470,9 +1478,11 @@ export class Broker {
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
 	#publicationState: BrokerPublicationState = "healthy-owned";
+	#fenceReason: BrokerFenceReason | null = null;
 	#lossAt: bigint | null = null;
 	#ambiguousAt: bigint | null = null;
 	#publishedAt: bigint | null = null;
+	#startedAt: bigint | null = null;
 	#watchInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
@@ -3703,9 +3713,11 @@ export class Broker {
 		}
 		this.#stopping = false;
 		this.#publicationState = "healthy-owned";
+		this.#fenceReason = null;
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
 		this.#publishedAt = null;
+		this.#startedAt = process.hrtime.bigint();
 		this.#watchInFlight = false;
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
@@ -3723,6 +3735,7 @@ export class Broker {
 				// clean exit, so name the reason here (#3963).
 				logger.info(
 					`sdk broker: lock contention, yielding to the live broker owner (ownerId=${live.ownerId}, pid=${live.pid}); this process exits without owning discovery`,
+					{ reason: "startup-race-lost", ownerId: live.ownerId, pid: live.pid, exitCode: 0 },
 				);
 				this.discovery = live;
 				return live;
@@ -3734,6 +3747,7 @@ export class Broker {
 				if (starting) {
 					logger.info(
 						`sdk broker: lock contention, yielding to the broker that just started (ownerId=${starting.ownerId}, pid=${starting.pid}); this process exits without owning discovery`,
+						{ reason: "startup-race-lost", ownerId: starting.ownerId, pid: starting.pid, exitCode: 0 },
 					);
 					this.discovery = starting;
 					return starting;
@@ -3953,7 +3967,7 @@ export class Broker {
 		// this process has actually exited -- would let a racing ordinary
 		// `ensureBroker` treat the still-live old owner as idle and spawn early.
 		setTimeout(() => {
-			void this.#complete("owned-root").finally(() => {
+			void this.#complete("owned-root", "restart-committed").finally(() => {
 				if (this.#restart === current) this.#restart = undefined;
 			});
 		}, 0);
@@ -3978,9 +3992,10 @@ export class Broker {
 	status(): RedactedBrokerDiscovery | null {
 		return this.discovery ? redactBrokerDiscovery(this.discovery) : null;
 	}
-	#fence(kind: "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous"): void {
+	#fence(kind: BrokerFenceReason): void {
 		if (this.#publicationState === "stopping") return;
 		this.#publicationState = kind;
+		this.#fenceReason = kind;
 		this.#startupAdmissions.close();
 		if (kind === "suspect-unpublished") {
 			this.#lossAt ??= process.hrtime.bigint();
@@ -4030,10 +4045,7 @@ export class Broker {
 		// The lock is deliberately left behind: this process is about to exit, and the
 		// dead-owner reclaim (#3963) is what hands it to the successor.
 		if (this.#unprovenBeyondLivenessDeadline()) {
-			logger.error(
-				`sdk broker: no publication has succeeded in ${this.#livenessGraceMs()}ms; terminating so peers can reclaim the lock (#4704)`,
-			);
-			void this.#complete("lost-root");
+			void this.#complete("lost-root", "publication-liveness-timeout");
 			return;
 		}
 		// Ticks must not stack behind a stalled one: each would add another pending
@@ -4055,7 +4067,7 @@ export class Broker {
 		} catch {
 			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return;
 		}
 		if (this.#stopping || this.#publication !== publication) return;
@@ -4065,6 +4077,7 @@ export class Broker {
 			// authority. A replacement can win between this observation and that write;
 			// reopening here would admit lifecycle work under stale authority.
 			this.#publicationState = "healthy-owned";
+			this.#fenceReason = null;
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) {
@@ -4077,7 +4090,7 @@ export class Broker {
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 	}
 	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
 		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
@@ -4120,8 +4133,26 @@ export class Broker {
 			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
 		}
 	}
-	async #complete(mode: BrokerStopMode): Promise<void> {
+	async #complete(
+		mode: BrokerExitMode,
+		reason: BrokerExitReason,
+		signal: BrokerExitRecord["signal"] = null,
+	): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
+		const now = process.hrtime.bigint();
+		const fenceStartedAt = this.#lossAt ?? this.#ambiguousAt;
+		const exitRecord: BrokerExitRecord & Record<string, unknown> = {
+			version: 1,
+			mode,
+			reason,
+			fenceReason: this.#fenceReason,
+			fencedForMs: fenceStartedAt === null ? 0 : Math.max(0, Number((now - fenceStartedAt) / 1_000_000n)),
+			uptimeMs: this.#startedAt === null ? 0 : Math.max(0, Number((now - this.#startedAt) / 1_000_000n)),
+			pid: process.pid,
+			signal,
+			writtenAt: Date.now(),
+		};
+		(mode === "lost-root" ? logger.warn : logger.info)("sdk broker: exiting", exitRecord);
 		this.#stopping = true;
 		this.#publicationState = "stopping";
 		// A lost-root broker has been fenced: it no longer owns the published root, and
@@ -4134,6 +4165,21 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
+			const recordWrite = Promise.withResolvers<boolean>();
+			const recordWriteTimer = setTimeout(() => recordWrite.resolve(false), BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
+			void writeBrokerExitRecord(this.settings.agentDir, exitRecord).then(
+				() => recordWrite.resolve(true),
+				() => recordWrite.resolve(false),
+			);
+			const recordPersisted = await recordWrite.promise;
+			clearTimeout(recordWriteTimer);
+			if (!recordPersisted) {
+				logger.error("sdk broker: failed to persist exit reason", {
+					reason: "exit-record-write-failed-or-timed-out",
+					mode,
+					pid: process.pid,
+				});
+			}
 			try {
 				await this.#transport?.stop();
 				this.#transport = null;
@@ -4196,12 +4242,12 @@ export class Broker {
 			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
 		} catch {
 			this.#fence("observation-ambiguous");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		if (observation !== "owned") {
 			this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
-			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
+			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root", "ownership-fence-expired");
 			return { authorized: false };
 		}
 		return { authorized: true, value: effect() };
@@ -4212,8 +4258,12 @@ export class Broker {
 	 * queued behind this broker is granted a slot that frees after completion and
 	 * spawns a child the broker has no authority over.
 	 */
-	async stop(): Promise<void> {
-		await this.#complete(this.#provenOwnedRoot() ? "owned-root" : "lost-root");
+	async stop(request: BrokerStopRequest = { kind: "shutdown-request" }): Promise<void> {
+		await this.#complete(
+			this.#provenOwnedRoot() ? "owned-root" : "lost-root",
+			request.kind,
+			request.kind === "signal" ? request.signal : null,
+		);
 	}
 	async #endpoint(input: Record<string, unknown>): Promise<BrokerResponse> {
 		const sessionId = input.sessionId;

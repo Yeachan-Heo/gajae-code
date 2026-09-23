@@ -161,6 +161,6 @@ export class BrokerTransport {
 		}
 	}
 	#scheduleStopAfterShutdownResponse(): void {
-		setTimeout(() => void this.#broker.stop(), 25);
+		setTimeout(() => void this.#broker.stop({ kind: "shutdown-request" }), 25);
 	}
 }

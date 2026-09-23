@@ -593,6 +593,12 @@ it("kills a broker bootstrap that outlives the startup fence deadline", async ()
 		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 		expect(code).toBe(1);
 		expect(error).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+		expect(JSON.parse(error)).toMatchObject({
+			reason: "startup-deadline",
+			timeoutMs: 250,
+			pid: child.pid,
+			exitCode: 1,
+		});
 
 		const discovery = await ensureBroker({ agentDir: dir });
 		brokerPid = discovery.pid;
