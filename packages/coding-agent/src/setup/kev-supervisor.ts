@@ -14,7 +14,10 @@ import * as net from "node:net";
 import { z } from "zod";
 
 export const SUPERVISOR_FILE = "supervisor.py";
+export const SERVICE_SHIM_FILE = "kev-service.py";
 export const CONTROL_FILE = "control.sock";
+/** Names the inherited pipe the service watches; kept out of argv so ownership text stays fixed. */
+export const WATCH_FD_ENV = "GJC_KEV_WATCH_FD";
 /** macOS `sun_path` is 104 bytes including the terminator; bind must never silently truncate. */
 export const CONTROL_SOCKET_PATH_MAX = 103;
 /** Longer than the supervisor's terminate grace so a legitimate slow shutdown is still observed. */
@@ -80,6 +83,78 @@ export function kevControl(socketPath: string, message: string): Promise<KevCont
 }
 
 /**
+ * Service shim source, written beside the supervisor as a 0600 file at start.
+ *
+ * Invoked as `python kev-service.py -- <module> [args...]`. It runs the server
+ * module in its own process through runpy — so the supervisor's child pid *is*
+ * the server, with no extra process in between — after arming a watchdog on the
+ * pipe the supervisor passes down. Losing that pipe means the supervisor died,
+ * including by SIGKILL, and the server takes itself down rather than outliving
+ * the only thing that could have stopped it.
+ */
+export const KEV_SERVICE_SHIM_SOURCE = `"""GJC-managed Kev service shim.
+
+Written by \`gjc setup kev start\`. Runs the server module in this process and
+exits with the supervisor: a supervisor that dies for any reason closes the
+write end of an inherited pipe, and the read below returns EOF.
+"""
+
+import os
+import runpy
+import signal
+import sys
+import threading
+import time
+
+WATCH_FD_ENV = "${WATCH_FD_ENV}"
+GRACE_SECONDS = 10.0
+EXIT_SUPERVISOR_LOST = 71
+
+
+def fail(message):
+    sys.stderr.write("gjc-kev-service: %s\\n" % message)
+    sys.stderr.flush()
+    raise SystemExit(2)
+
+
+def shutdown_when_supervisor_is_lost(fd):
+    try:
+        while os.read(fd, 1):
+            pass
+    except OSError:
+        pass
+    # EOF: the supervisor holds the only write end and never writes to it, so
+    # this can only mean the supervisor is gone. Ask this process to stop, then
+    # leave unconditionally so a server ignoring SIGTERM cannot outlive it.
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except OSError:
+        pass
+    time.sleep(GRACE_SECONDS)
+    os._exit(EXIT_SUPERVISOR_LOST)
+
+
+def main(argv):
+    if len(argv) < 2 or argv[0] != "--":
+        fail("usage: kev-service.py -- <module> [args...]")
+    module = argv[1]
+    descriptor = os.environ.get(WATCH_FD_ENV, "")
+    if not descriptor.isdigit():
+        fail("supervisor watch descriptor was not provided")
+    watcher = threading.Thread(
+        target=shutdown_when_supervisor_is_lost, args=(int(descriptor),), daemon=True
+    )
+    watcher.start()
+    sys.argv = [module] + list(argv[2:])
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+`;
+
+/**
  * Supervisor source, written into the private Kev root as a 0600 file at start.
  *
  * Invoked as `python supervisor.py --socket <path> -- <command> [args...]`.
@@ -122,7 +197,7 @@ def reply(connection, payload):
         pass
 
 
-def cleanup(listener, socket_path):
+def cleanup(listener, socket_path, watch_write=None):
     try:
         listener.close()
     except OSError:
@@ -131,6 +206,11 @@ def cleanup(listener, socket_path):
         os.unlink(socket_path)
     except OSError:
         pass
+    if watch_write is not None:
+        try:
+            os.close(watch_write)
+        except OSError:
+            pass
 
 
 def terminate(child):
@@ -222,11 +302,26 @@ def main(argv):
     finally:
         os.umask(previous_umask)
 
-    child = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    # The child inherits the read end and this process keeps the write end open
+    # without ever writing to it. Whatever ends this process — clean exit, crash,
+    # SIGKILL — closes that write end, and the child's watchdog sees EOF. Without
+    # it a SIGKILLed supervisor would leave the server running and unstoppable.
+    watch_read, watch_write = os.pipe()
+    os.set_inheritable(watch_read, True)
+    child_environment = dict(os.environ)
+    child_environment["${WATCH_FD_ENV}"] = str(watch_read)
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        env=child_environment,
+        pass_fds=(watch_read,),
+    )
+    # Only the child needs the read end; only this process may hold the write end.
+    os.close(watch_read)
 
     def shutdown(_signum, _frame):
         terminate(child)
-        cleanup(listener, socket_path)
+        cleanup(listener, socket_path, watch_write)
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -234,7 +329,7 @@ def main(argv):
 
     while True:
         if child.poll() is not None:
-            cleanup(listener, socket_path)
+            cleanup(listener, socket_path, watch_write)
             return 0
         try:
             connection, _ = listener.accept()
@@ -246,7 +341,7 @@ def main(argv):
             raise
         try:
             if serve(connection, child, token):
-                cleanup(listener, socket_path)
+                cleanup(listener, socket_path, watch_write)
                 return 0
         finally:
             try:

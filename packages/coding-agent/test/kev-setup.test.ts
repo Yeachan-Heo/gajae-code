@@ -7,6 +7,7 @@ import { type KevProcessIdentity, type KevSetupDeps, runKevSetup } from "../src/
 import {
 	controlRequest,
 	controlSocketPathIsBindable,
+	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
 	kevControl,
@@ -27,6 +28,53 @@ afterEach(async () => {
 	}
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
+
+/** Shared-checkout isolation: only this window may be bound by these tests. */
+const PORT_BASE = Number(process.env.PORT_BASE ?? 42040);
+const PORT_LIMIT = PORT_BASE + 20;
+
+/** The same predicate the setup code uses to decide whether a service still holds its port. */
+function loopbackPortIsFree(port: number): boolean {
+	try {
+		const server = Bun.listen({
+			hostname: "127.0.0.1",
+			port,
+			socket: {
+				data() {},
+				open(socket) {
+					socket.end();
+				},
+			},
+		});
+		server.stop(true);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") return false;
+		throw error;
+	}
+}
+
+function reservedLoopbackPort(): number | undefined {
+	for (let port = PORT_BASE; port < PORT_LIMIT; port++) if (loopbackPortIsFree(port)) return port;
+	return undefined;
+}
+
+async function until(predicate: () => boolean | Promise<boolean>, attempts = 240): Promise<boolean> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		if (await predicate()) return true;
+		await Bun.sleep(25);
+	}
+	return false;
+}
+
+function processIsGone(pid: number): boolean {
+	try {
+		nativeKill(pid, 0);
+		return false;
+	} catch {
+		return true;
+	}
+}
 
 async function pathExists(target: string): Promise<boolean> {
 	try {
@@ -509,6 +557,61 @@ describe("Kev lifecycle lock", () => {
 const python = Bun.which("python3");
 
 describe.skipIf(!python)("Kev supervisor process", () => {
+	test("a SIGKILLed supervisor takes its server down and frees the port", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-crash-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const supervisorScript = path.join(base, "supervisor.py");
+		const shim = path.join(base, "kev-service.py");
+		await Bun.write(supervisorScript, KEV_SUPERVISOR_SOURCE);
+		await Bun.write(shim, KEV_SERVICE_SHIM_SOURCE);
+		await fs.chmod(supervisorScript, 0o600);
+		await fs.chmod(shim, 0o600);
+		const socketPath = path.join(base, "control.sock");
+		expect(controlSocketPathIsBindable(socketPath)).toBe(true);
+		const port = reservedLoopbackPort();
+		expect(port).toBeDefined();
+
+		const token = "c".repeat(64);
+		// `http.server` stands in for `kev.serve`: a runpy-able module that holds a
+		// loopback port, started through the same shim the real service uses.
+		const supervisor = Bun.spawn(
+			[
+				python!,
+				supervisorScript,
+				"--socket",
+				socketPath,
+				"--",
+				python!,
+				shim,
+				"--",
+				"http.server",
+				String(port),
+				"--bind",
+				"127.0.0.1",
+			],
+			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
+		);
+		spawnedPids.push(supervisor.pid);
+		supervisor.stdin.write(`${token}\n`);
+		supervisor.stdin.end();
+
+		expect(await until(() => pathExists(socketPath))).toBe(true);
+		const started = await kevControl(socketPath, controlRequest("status", token));
+		expect(started).toMatchObject({ ok: true, state: "running" });
+		const servicePid = started!.pid!;
+		spawnedPids.push(servicePid);
+		expect(await until(() => !loopbackPortIsFree(port!))).toBe(true);
+
+		// SIGKILL: the supervisor runs no shutdown code at all. Only the inherited
+		// pipe closing can tell the server that nothing is left to stop it.
+		nativeKill(supervisor.pid, "SIGKILL");
+		await supervisor.exited;
+
+		expect(await until(() => processIsGone(servicePid))).toBe(true);
+		expect(await until(() => loopbackPortIsFree(port!))).toBe(true);
+	}, 60_000);
+
 	test("refuses a wrong token, then stops its child for the right one", async () => {
 		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-sup-"));
 		roots.push(base);

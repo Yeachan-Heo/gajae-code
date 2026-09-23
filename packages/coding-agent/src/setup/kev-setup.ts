@@ -9,9 +9,11 @@ import {
 	CONTROL_FILE,
 	controlRequest,
 	controlSocketPathIsBindable,
+	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
 	kevControl,
+	SERVICE_SHIM_FILE,
 	SUPERVISOR_FILE,
 } from "./kev-supervisor";
 
@@ -216,9 +218,29 @@ function controlSocket(root: string): string {
 	return path.join(root, CONTROL_FILE);
 }
 /**
- * The recorded process is the supervisor; `kev.serve` follows `--` as the
- * command the supervisor owns. Ownership proof therefore covers both the
- * supervised server arguments and the exact control socket it answers on.
+ * The supervised command. `kev.serve` is reached through the shim rather than
+ * `-m` so the server process carries the watchdog that ends it if the
+ * supervisor dies; runpy keeps it a single process, so this is still the pid
+ * that holds the port.
+ */
+function serviceCommand(root: string, run: string, port: number): string[] {
+	return [
+		executable(root),
+		path.join(root, SERVICE_SHIM_FILE),
+		"--",
+		"kev.serve",
+		"--run",
+		run,
+		"--fallback",
+		run,
+		"--port",
+		String(port),
+	];
+}
+/**
+ * The recorded process is the supervisor; the supervised command follows `--`.
+ * Ownership proof therefore covers both the supervised server arguments and the
+ * exact control socket it answers on.
  */
 function serviceArgv(root: string, run: string, port: number, ownerId: string): string[] {
 	return [
@@ -229,15 +251,7 @@ function serviceArgv(root: string, run: string, port: number, ownerId: string): 
 		"--socket",
 		controlSocket(root),
 		"--",
-		executable(root),
-		"-m",
-		"kev.serve",
-		"--run",
-		run,
-		"--fallback",
-		run,
-		"--port",
-		String(port),
+		...serviceCommand(root, run, port),
 	];
 }
 function owns(record: ServiceRecord, install: Installation, observed: KevProcessIdentity | undefined): boolean {
@@ -498,6 +512,7 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 		throw new Error("Kev control socket path is too long for a Unix socket; choose a shorter --root");
 	await fs.rm(socket, { force: true });
 	await writePrivateText(path.join(root, SUPERVISOR_FILE), KEV_SUPERVISOR_SOURCE);
+	await writePrivateText(path.join(root, SERVICE_SHIM_FILE), KEV_SERVICE_SHIM_SOURCE);
 	const token = randomBytes(32).toString("hex");
 	const logPath = path.join(root, "server.log");
 	const log = await fs.open(logPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
