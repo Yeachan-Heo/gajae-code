@@ -76,7 +76,8 @@ describe("claude usage request headers", () => {
 
 		const headers = calls[0]?.init?.headers;
 		expect(getHeaderCaseInsensitive(headers, "authorization")).toBe(`Bearer ${token}`);
-		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(claudeCodeVersion).toBe("2.1.280");
+		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe("claude-cli/2.1.280 (external, cli)");
 
 		const beta = getHeaderCaseInsensitive(headers, "anthropic-beta");
 		expect(beta).toBeDefined();
