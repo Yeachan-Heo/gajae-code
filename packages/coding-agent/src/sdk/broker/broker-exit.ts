@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
-import path from "node:path";
+import * as path from "node:path";
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import type {
 	BrokerExitWriterTestBarrier,
@@ -311,7 +311,7 @@ async function writeAtomicExitRecord(destination: string, record: object, signal
 	};
 
 	const directory = path.dirname(destination);
-	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+	const temporary = `${destination}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	throwIfAborted();
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	let workerDispatched = false;
