@@ -851,6 +851,16 @@ function getRequiredTool(session: AgentSession, name: string): AnyAgentTool {
 	return tool;
 }
 
+function createRepositoryScopedTool(root: string, name: "read" | "search", tool: AnyAgentTool): AnyAgentTool {
+	return {
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate, context) {
+			await assertRepositoryScopedArguments(root, name, params);
+			return tool.execute(toolCallId, params, signal, onUpdate, context);
+		},
+	};
+}
+
 function getAttemptTraceValidation(
 	arm: Arm,
 	aTrace: AToolTraceEntry[],
@@ -1564,6 +1574,69 @@ function isPathInside(parent: string, child: string): boolean {
 	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
+function staticGlobPrefix(value: string): string {
+	const normalized = value.replace(/[\\/]+/g, path.sep);
+	const wildcard = normalized.search(/[?*[{]/);
+	if (wildcard < 0) return value;
+	const beforeWildcard = normalized.slice(0, wildcard);
+	const separator = beforeWildcard.lastIndexOf(path.sep);
+	return separator < 0 ? "." : beforeWildcard.slice(0, separator) || path.parse(normalized).root || ".";
+}
+
+function readFilesystemPath(value: string): string {
+	const drivePrefix = /^[A-Za-z]:[\\/]/.test(value) ? 2 : 0;
+	const selector = value.indexOf(":", drivePrefix);
+	return selector < 0 ? value : value.slice(0, selector);
+}
+
+export async function assertRepositoryScopedArguments(
+	workspaceRoot: string,
+	toolName: "read" | "search",
+	args: unknown,
+): Promise<void> {
+	if (!isRecord(args)) throw new Error(`${toolName} arguments must be an object.`);
+	const root = await fs.realpath(workspaceRoot);
+	if (toolName === "search" && args.gitignore === false) {
+		throw new Error("Repository benchmark search may not disable gitignore and enter ignored host-local data.");
+	}
+	let candidates: string[];
+	if (toolName === "read") {
+		if (typeof args.path !== "string" || args.path.trim().length === 0 || args.path.includes("://")) {
+			throw new Error("Repository benchmark reads require a local path inside the task repository.");
+		}
+		candidates = [readFilesystemPath(args.path)];
+	} else {
+		if (args.paths == null) return;
+		if (!Array.isArray(args.paths) || args.paths.some(candidate => typeof candidate !== "string")) {
+			throw new Error("Repository benchmark search paths must be strings inside the task repository.");
+		}
+		candidates = args.paths.map(candidate => staticGlobPrefix(candidate as string));
+	}
+	for (const candidate of candidates) {
+		const lexicalPath = path.resolve(root, candidate);
+		if (!isPathInside(root, lexicalPath)) {
+			throw new Error(`Repository benchmark ${toolName} path is outside the task repository.`);
+		}
+		const canonicalPath = await fs.realpath(lexicalPath);
+		if (!isPathInside(root, canonicalPath)) {
+			throw new Error(`Repository benchmark ${toolName} path resolves through a symlink outside the task repository.`);
+		}
+	}
+}
+
+async function assertTrackedSymlinksStayInsideWorkspace(root: string): Promise<void> {
+	const records = await gitText(root, "ls-files", "--stage", "-z");
+	for (const record of records.split("\0")) {
+		const tab = record.indexOf("\t");
+		if (tab < 0 || record.slice(0, tab).split(" ", 1)[0] !== "120000") continue;
+		const relativePath = record.slice(tab + 1);
+		const canonicalTarget = await fs.realpath(path.join(root, relativePath));
+		if (!isPathInside(root, canonicalTarget)) {
+			throw new Error(`Clean task repository contains a symlink escaping the benchmark workspace: ${relativePath}.`);
+		}
+	}
+}
+
 async function resolveFuturePath(candidate: string): Promise<string> {
 	let parent = path.dirname(candidate);
 	const suffix = [path.basename(candidate)];
@@ -1596,6 +1669,7 @@ async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace>
 	if ((await fs.realpath(gitRoot)) !== root) throw new Error("--task-repo must be the root of a Git checkout or worktree.");
 	if (taskHead !== originDev) throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
 	if (status.length > 0) throw new Error("--task-repo must have a clean working tree before benchmark tasks begin.");
+	await assertTrackedSymlinksStayInsideWorkspace(root);
 	for (const sentinel of SEARCH_CORPUS_SENTINELS) {
 		let exists = false;
 		try {
@@ -1788,8 +1862,16 @@ async function runBenchmark(
 						`Handler session resolved ${modelKey(handlerSessionResult.session.model) ?? "no model"}, expected ${resolvedModel}.`,
 					);
 				}
-				readTool = getRequiredTool(handlerSessionResult.session, "read");
-				searchTool = getRequiredTool(handlerSessionResult.session, "search");
+				readTool = createRepositoryScopedTool(
+					taskWorkspace.root,
+					"read",
+					getRequiredTool(handlerSessionResult.session, "read"),
+				);
+				searchTool = createRepositoryScopedTool(
+					taskWorkspace.root,
+					"search",
+					getRequiredTool(handlerSessionResult.session, "search"),
+				);
 			} catch (error) {
 				let setupError = error;
 				try {
