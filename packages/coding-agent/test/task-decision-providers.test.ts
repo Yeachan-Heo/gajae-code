@@ -75,6 +75,20 @@ function reservedLoopbackPort(): number {
 }
 
 describe("task decision providers", () => {
+	test("constructors use the default timeout when omitted and reject invalid explicit values", () => {
+		const authStorage = { getApiKey: async () => undefined };
+		expect(() => new KevDecisionProvider()).not.toThrow();
+		expect(() => new JevDecisionProvider({ authStorage })).not.toThrow();
+		for (const timeoutMs of [1, 60_000]) {
+			expect(() => new KevDecisionProvider({ timeoutMs })).not.toThrow();
+			expect(() => new JevDecisionProvider({ timeoutMs, authStorage })).not.toThrow();
+		}
+		for (const timeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 60_001, "invalid"]) {
+			expect(() => new KevDecisionProvider({ timeoutMs })).toThrow();
+			expect(() => new JevDecisionProvider({ timeoutMs, authStorage })).toThrow();
+		}
+	});
+
 	test("Kev sends only a bounded typed packet through its owned control channel", async () => {
 		const calls: ControlCall[] = [];
 		const provider = kevThroughControl(() => okReply(answer("balanced", { fast: 0.25, balanced: 0.75 })), {

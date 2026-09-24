@@ -49,9 +49,11 @@ export type JevDecisionProviderOptions = {
 
 const failure = (code: DecisionErrorCode): DecisionOutcome => ({ error: { code } });
 function boundedTimeout(value: unknown): number {
-	return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 60_000
-		? value
-		: DEFAULT_TIMEOUT_MS;
+	if (value === undefined) return DEFAULT_TIMEOUT_MS;
+	if (typeof value !== "number") throw new TypeError("timeoutMs must be an integer from 1 to 60000");
+	if (!Number.isInteger(value) || value < 1 || value > 60_000)
+		throw new RangeError("timeoutMs must be an integer from 1 to 60000");
+	return value;
 }
 interface DeadlineLease {
 	signal: AbortSignal;
