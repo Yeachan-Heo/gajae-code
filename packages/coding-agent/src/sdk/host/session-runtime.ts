@@ -1343,8 +1343,9 @@ export function createInvocationReconciliation(
 			}
 			const next = { ...record, revision: ++mutationRevision };
 			const preserveDeadlineRecovery =
-				frame.type === "agent_start" &&
-				(frame as unknown as { preserveDeadlineRecovery?: boolean }).preserveDeadlineRecovery === true;
+				(frame.type === "agent_start" &&
+					(frame as unknown as { preserveDeadlineRecovery?: boolean }).preserveDeadlineRecovery === true) ||
+				(frame.type === "agent_failed" && record.deadlineRecoveryPending === true);
 			if (!preserveDeadlineRecovery) {
 				delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
 				delete (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;

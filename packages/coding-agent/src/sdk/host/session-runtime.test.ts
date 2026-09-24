@@ -790,6 +790,15 @@ test("Q26 keeps deadline restart uncertainty nonterminal and hides pending outco
 			provenance: "client_cancel",
 		});
 		await reconciliation.markUncertain("prompt", correlation, undefined, Date.now() + 60_000);
+		await reconciliation.noteTransition("prompt", correlation, {
+			type: "agent_failed",
+			error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+		});
+		expect(store.snapshot().find(record => record.commandId === correlation.commandId)).toMatchObject({
+			status: "in_flight",
+			deadlineRecoveryPending: true,
+			pendingOutcome: { kind: "stopped" },
+		});
 
 		harness = await invocationHarness(sessionId, cwd, {
 			settings: {
@@ -6256,18 +6265,22 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(accepted.ok).toBe(true);
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+			});
 			await Bun.sleep(150);
 			expect(abortCalls).toBe(0);
 			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
 				result: { status: "in_flight" },
 			});
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
-			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
 			const settled = await settledStatus(harness, "turn.prompt_status", correlation);
-			expect(settled).toMatchObject({ status: "terminal_ok", outcome: { kind: "stopped" } });
+			expect(settled).toMatchObject({ status: "failed", error: { code: "provider_unavailable" } });
 			await Bun.sleep(25);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(10);
