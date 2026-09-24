@@ -3633,10 +3633,50 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 				}),
 			).toMatchObject({ ok: false, error: { code: "busy" } });
 			expect(reserved).toBe(1);
+			// An unrelated start after the fatal record's TTL invokes delivery
+			// cleanup. Its terminal still has no authority over the original run.
+			const now = Date.now();
+			const clock = spyOn(Date, "now").mockReturnValue(now + 6 * 60_000);
+			try {
+				await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			} finally {
+				clock.mockRestore();
+			}
+			expect(reserved).toBe(1);
+			const ledger = createRunResourceLedger();
+			const successorDomain = ledger.open("successor-image-run");
+			if (!successorDomain) throw new Error("Successor run domain could not open.");
+			const successorEnd = { type: "agent_end" as const, messages: [] };
+			setAgentTerminalOwnerContext(successorEnd, {
+				resourceRunId: "successor-image-run",
+				domain: successorDomain,
+			});
+			await handlers.get("agent_end")?.(successorEnd, sessionContext);
+			expect(reserved).toBe(1);
 			// Fatal closure cleared the run's correlation; an uncorrelated end
 			// cannot prove that this exact accepted image has been released.
 			await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
 			expect(reserved).toBe(1);
+			if (settlement === "throws") {
+				const originalDomain = ledger.open("live-image-run");
+				if (!originalDomain) throw new Error("Original run domain could not open.");
+				const originalEnd = { type: "agent_end" as const, messages: [] };
+				setAgentTerminalOwnerContext(originalEnd, {
+					resourceRunId: "live-image-run",
+					domain: originalDomain,
+				});
+				await handlers.get("agent_end")?.(originalEnd, sessionContext);
+				expect(reserved).toBe(0);
+				expect(releases).toBe(1);
+				live.idle = true;
+				expect(
+					await other.control("recovered-prompt", "turn.prompt", {
+						text: "Capacity returns after the exact original run ended",
+						stagedImages: [{ id: secondId }],
+					}),
+				).toMatchObject({ ok: true, result: { accepted: true } });
+				expect(reserved).toBe(1);
+			}
 			const shutdownFailure = await Promise.resolve(
 				handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
 			).then(
@@ -3645,7 +3685,7 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 			);
 			expect(shutdownFailure).toBeUndefined();
 			expect(reserved).toBe(0);
-			expect(releases).toBe(1);
+			expect(releases).toBe(settlement === "throws" ? 2 : 1);
 		} finally {
 			redeemSpy.mockRestore();
 			warnSpy.mockRestore();

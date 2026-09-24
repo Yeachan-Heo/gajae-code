@@ -49,6 +49,7 @@ import {
 	type RunResourceProducerLease,
 	type RunSettlementProof,
 	resolveTelemetry,
+	setAgentTerminalOwnerContext,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";

@@ -1241,6 +1241,7 @@ interface SessionRuntime {
 	retireJoinedPromptOwners: () => void;
 	imageUploads: PromptImageUploadStore;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
+	releaseAcceptedImagesForRun: (handle: string) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -4935,10 +4936,20 @@ export function createNotificationsExtension(
 			return incarnation !== undefined && !incarnation.closed;
 		});
 		const acceptedImages = new Map<string, () => void>();
+		const acceptedImageRunHandles = new Map<string, string>();
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
 			acceptedImages.get(key)?.();
 			acceptedImages.delete(key);
+			acceptedImageRunHandles.delete(key);
+		};
+		const releaseAcceptedImagesForRun = (handle: string) => {
+			for (const [key, owner] of acceptedImageRunHandles) {
+				if (owner !== handle) continue;
+				acceptedImages.get(key)?.();
+				acceptedImages.delete(key);
+				acceptedImageRunHandles.delete(key);
+			}
 		};
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
@@ -6252,6 +6263,7 @@ export function createNotificationsExtension(
 				}
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
+				if (handle && acceptedImages.has(key)) acceptedImageRunHandles.set(key, handle);
 			}
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
@@ -8225,9 +8237,11 @@ export function createNotificationsExtension(
 			retireJoinedPromptOwners,
 			imageUploads,
 			releaseAcceptedImage,
+			releaseAcceptedImagesForRun,
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
+				acceptedImageRunHandles.clear();
 			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
@@ -10148,6 +10162,7 @@ export function createNotificationsExtension(
 		// The Agent's terminal owner is independent of delivery correlation. Never
 		// borrow a successor's run handle to settle a predecessor's SDK prompts.
 		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner.resourceRunId);
 		const rootCorrelation = rt.activePromptCorrelation;
 		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
 		if (
