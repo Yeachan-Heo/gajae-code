@@ -157,6 +157,48 @@ describe("lifecycle session explicit model pin", () => {
 		}
 	}, 30_000);
 
+	test("preserves incomplete cleanup when owned registry disposal fails", async () => {
+		const cwd = tempCwd();
+		const ownedStorage = await AuthStorage.create(":memory:");
+		const storageClose = vi.spyOn(ownedStorage, "close");
+		const createStorage = vi.spyOn(AuthStorage, "create").mockResolvedValue(ownedStorage);
+		const configureRegistry = vi
+			.spyOn(ModelRegistry.prototype, "applyConfiguredModelBindings")
+			.mockImplementation(() => {
+				throw new Error("controlled registry setup failure");
+			});
+		let ownedRegistry: ModelRegistry | undefined;
+		const disposeRegistry = vi.spyOn(ModelRegistry.prototype, "dispose").mockImplementation(async function (
+			this: ModelRegistry,
+		) {
+			ownedRegistry = this;
+			throw new Error("controlled registry disposal failure");
+		});
+		try {
+			const created = await createLifecycleAgentSession({
+				cwd,
+				agentDir: cwd,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+			});
+			if (!("failure" in created)) throw new Error("Expected registry setup failure.");
+			expect(created.cleanupComplete).toBe(false);
+			expect(storageClose).toHaveBeenCalledTimes(1);
+		} finally {
+			disposeRegistry.mockRestore();
+			configureRegistry.mockRestore();
+			createStorage.mockRestore();
+			storageClose.mockRestore();
+			await ownedRegistry?.dispose().catch(() => {});
+			await ownedStorage.close();
+		}
+	}, 30_000);
+
 	test("keeps the pin as the effective model after default-profile and mpreset processing", async () => {
 		const cwd = tempCwd();
 		const settings = Settings.isolated();

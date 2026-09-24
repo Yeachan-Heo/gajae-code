@@ -81,7 +81,7 @@ async function disposePartialSession(session: AgentSession): Promise<void> {
 function hasConstructionCleanupDiagnostic(error: unknown): boolean {
 	if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
 	try {
-		return "cleanupDiagnostic" in error;
+		return "cleanupDiagnostic" in error || "startupCleanupDiagnostic" in error;
 	} catch {
 		return true;
 	}
