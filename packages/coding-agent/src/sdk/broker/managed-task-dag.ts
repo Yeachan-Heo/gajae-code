@@ -1657,13 +1657,14 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 		throw error;
 	}
 	try {
-		// This is a read-only load; privateDurable is a Linux-only guarded-write mode.
+		// Existing-only locking prevents a concurrent removal after lstat from
+		// recreating the enrollment directory. Linux also revalidates its private mode.
 		return await withWorkflowStateLock(
 			target,
 			() => loadEnrollmentIndexUnderLock(target),
 			process.platform === "linux"
-				? { cwd: agent, privateDurable: { directory: enrollmentDirectory } }
-				: { cwd: agent },
+				? { cwd: agent, createMissingParents: false, privateDurable: { directory: enrollmentDirectory } }
+				: { cwd: agent, createMissingParents: false },
 		);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyRecord;
