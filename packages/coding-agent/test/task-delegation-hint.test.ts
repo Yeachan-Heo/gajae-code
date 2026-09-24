@@ -174,6 +174,47 @@ describe("task delegation decision hint", () => {
 		expect(notices[0]).not.toContain("/synthetic/");
 	});
 
+	it("counts bounded apply_patch file headers without sending patch content", async () => {
+		let metrics: unknown;
+		let sent = "";
+		const notices: string[] = [];
+		const patch = [
+			"*** Begin Patch",
+			"*** Add File: packages/alpha/a.ts",
+			"+private patch body alpha",
+			"*** Add File: packages/beta/b.ts",
+			"+private patch body beta",
+			"*** Add File: packages/gamma/c.ts",
+			"+private patch body gamma",
+			"*** End Patch",
+		].join("\n");
+		const hint = controller({
+			mode: "hint",
+			autoroutingEnabled: true,
+			tiers: { strong: ["anthropic/strong"] },
+			fetcher: fixtureFetch(positiveDecision, (_input, init) => {
+				const payload = JSON.parse(String(init?.body));
+				metrics = JSON.parse(payload.messages[1].content).metrics;
+				sent = JSON.stringify(payload);
+			}),
+			notify: message => notices.push(message),
+		});
+		hint.onTurnStart();
+		hint.observeAfterToolCall({ toolName: "apply_patch", args: { input: patch }, isError: false });
+		await flushTurn();
+		expect(metrics).toEqual({
+			toolCount: 1,
+			editCount: 1,
+			fileCount: 3,
+			packageCount: 3,
+			verificationCount: 0,
+			consecutiveEdits: 1,
+		});
+		expect(sent).not.toContain("packages/alpha");
+		expect(sent).not.toContain("private patch body");
+		expect(notices).toHaveLength(1);
+	});
+
 	it("keeps the tier suggestion absent when no autorouting tier is configured", async () => {
 		let choices: unknown;
 		const notices: string[] = [];
