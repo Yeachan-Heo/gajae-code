@@ -964,9 +964,9 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			}
 		}
 
-		// Each session reads once for its initial tool set and again after subscribing
-		// to reconcile any updates that raced session construction.
-		expect(getTools).toHaveBeenCalledTimes(6);
+		// Each session captures one initial snapshot after subscribing; a raced
+		// update is reconciled from the snapshot publication, not by rereading.
+		expect(getTools).toHaveBeenCalledTimes(3);
 		expect(disconnectAll).not.toHaveBeenCalled();
 	});
 	it("emits one generic warning for a missing explicit config through the real loader and manager", async () => {
