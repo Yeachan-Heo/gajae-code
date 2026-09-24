@@ -10,4 +10,4 @@
 - Crystallization now accepts only runtime-authenticated free-text answers from their exact committed Ask call, not timeout/autoselection results, and execution approval prompts display the captured artifact identity across local and remote surfaces. Agreement-only anchors, incomplete ready-Crystal state fences, orphaned intent-contract markers, and malformed explicit workflow versions also fail closed (#5134).
 - Headless workflow-gate Ask calls now honor the configured answer deadline, so unanswered gates abort the turn instead of hanging indefinitely (#5451).
 - Ordinary approval audit validation reads a bounded tail so append-only growth does not permanently block consent (#5451).
-- JSONL and audit appenders refuse hard-linked files before changing permissions or writing (#5451).
+- JSONL and audit appenders refuse hard-linked files before changing permissions or writing, while concurrent first-time JSONL appends retry exclusive-create races without dropping records (#5451).
