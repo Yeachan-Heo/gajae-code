@@ -76,6 +76,11 @@ export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "f
 
 export type PromptDeadlineTerminalization = "settled" | "uncertain";
 
+export interface PromptDeadlinePublicationResult {
+	outcome: SdkPromptTerminalOutcome;
+	published: boolean;
+}
+
 export interface PromptTerminalTransitionEvidence {
 	content?: TurnResultContent;
 	hasActivity?: boolean;
@@ -99,6 +104,7 @@ export class PromptDeadlineManager {
 	readonly #pendingTerminalTransitions = new Set<string>();
 	readonly #deadlineDeferredTerminalTransitions = new Set<string>();
 	readonly #deadlineTerminalizationConfirmed = new Set<string>();
+	readonly #terminalPublicationPending = new Map<string, SdkPromptTerminalOutcome>();
 	readonly #deadlineStartCleanup = new Map<string, () => void>();
 	readonly #pendingTerminalFailureReasons = new Map<string, { code: string; message: string }>();
 	readonly #pendingTerminalEvidence = new Map<string, PromptTerminalTransitionEvidence>();
@@ -114,7 +120,7 @@ export class PromptDeadlineManager {
 	readonly #onDeadlinePublishTerminal?: (
 		correlation: InvocationCorrelation,
 		isCurrent: () => boolean,
-	) => SdkPromptTerminalOutcome | false | Promise<SdkPromptTerminalOutcome | false>;
+	) => PromptDeadlinePublicationResult | false | Promise<PromptDeadlinePublicationResult | false>;
 	readonly #onDeadlineExceeded?: (
 		correlation: InvocationCorrelation,
 		signal: AbortSignal,
@@ -136,7 +142,7 @@ export class PromptDeadlineManager {
 		onDeadlinePublishTerminal?: (
 			correlation: InvocationCorrelation,
 			isCurrent: () => boolean,
-		) => SdkPromptTerminalOutcome | false | Promise<SdkPromptTerminalOutcome | false>;
+		) => PromptDeadlinePublicationResult | false | Promise<PromptDeadlinePublicationResult | false>;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
 		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
@@ -211,9 +217,11 @@ export class PromptDeadlineManager {
 		this.#clearTimer(key);
 		const deadlineAt = promptDeadlineAt(lease);
 		const dueDelayMs = Math.max(0, deadlineAt - this.#now());
-		const delayMs = this.#uncertaintyRecoveryPending.has(key)
-			? Math.max(dueDelayMs, UNCERTAINTY_RETRY_DELAY_MS)
-			: dueDelayMs;
+		const delayMs = this.#terminalPublicationPending.has(key)
+			? UNCERTAINTY_RETRY_DELAY_MS
+			: this.#uncertaintyRecoveryPending.has(key)
+				? Math.max(dueDelayMs, UNCERTAINTY_RETRY_DELAY_MS)
+				: dueDelayMs;
 		const timer = setTimeout(() => {
 			void this.#onDeadline(key);
 		}, delayMs);
@@ -236,6 +244,10 @@ export class PromptDeadlineManager {
 		const correlation = this.#correlations.get(key);
 		const lease = this.#leases.get(key);
 		if (!correlation || !lease) return;
+		if (this.#terminalPublicationPending.has(key)) {
+			await this.#retryTerminalPublication(key, correlation, lease);
+			return;
+		}
 		// Re-check deadline still due (monotonic, but handle clock skew).
 		if (this.#now() < promptDeadlineAt(lease)) {
 			this.#schedule(key);
@@ -392,23 +404,28 @@ export class PromptDeadlineManager {
 				(this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineStartCleanup.has(key)) &&
 				this.#onDeadlinePublishTerminal !== undefined
 			) {
-				let publishedOutcome: SdkPromptTerminalOutcome | false = false;
+				let publication: PromptDeadlinePublicationResult | false = false;
 				try {
-					publishedOutcome = await this.#onDeadlinePublishTerminal(correlation, () => {
+					publication = await this.#onDeadlinePublishTerminal(correlation, () => {
 						const current = this.#leases.get(key);
 						return (
 							current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
 						);
 					});
 				} catch {}
-				if (publishedOutcome === false) {
+				if (publication === false) {
 					if (this.#backOffIfSuperseded(key, lease, generation)) return;
 					this.#recoverUncertainty(key, correlation, lease, lease.generation);
 					return;
 				}
+				if (!publication.published) {
+					this.#terminalPublicationPending.set(key, publication.outcome);
+					this.#scheduleTerminalPublicationRetry(key);
+					return;
+				}
 				const evidence = this.#pendingTerminalEvidence.get(key);
 				if (evidence !== undefined)
-					this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publishedOutcome });
+					this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publication.outcome });
 			}
 			this.#deadlineTerminalizationConfirmed.add(key);
 			try {
@@ -492,6 +509,43 @@ export class PromptDeadlineManager {
 			return true;
 		}
 		return false;
+	}
+
+	async #retryTerminalPublication(
+		key: string,
+		correlation: InvocationCorrelation,
+		lease: PromptDeadlineLease,
+	): Promise<void> {
+		if (!this.#terminalPublicationPending.has(key)) return;
+		const publish = this.#onDeadlinePublishTerminal;
+		if (publish === undefined) {
+			this.#scheduleTerminalPublicationRetry(key);
+			return;
+		}
+		let publication: PromptDeadlinePublicationResult | false = false;
+		try {
+			publication = await publish(correlation, () => this.#leases.get(key) === lease);
+		} catch {}
+		if (publication === false || !publication.published) {
+			if (publication !== false) this.#terminalPublicationPending.set(key, publication.outcome);
+			this.#scheduleTerminalPublicationRetry(key);
+			return;
+		}
+		const evidence = this.#pendingTerminalEvidence.get(key);
+		if (evidence !== undefined) this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publication.outcome });
+		this.#terminalPublicationPending.delete(key);
+		this.#expiryRetries.delete(key);
+		try {
+			this.#onExpired?.(correlation);
+		} catch {}
+		this.clear(correlation);
+	}
+
+	#scheduleTerminalPublicationRetry(key: string): void {
+		this.#clearTimer(key);
+		const timer = setTimeout(() => void this.#onDeadline(key), UNCERTAINTY_RETRY_DELAY_MS);
+		(timer as unknown as { unref?: () => void }).unref?.();
+		this.#timers.set(key, timer);
 	}
 
 	#retry(key: string): void {
@@ -723,6 +777,7 @@ export class PromptDeadlineManager {
 		this.#pendingTerminalTransitions.delete(key);
 		this.#deadlineDeferredTerminalTransitions.delete(key);
 		this.#deadlineTerminalizationConfirmed.delete(key);
+		this.#terminalPublicationPending.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
 	}
@@ -744,6 +799,7 @@ export class PromptDeadlineManager {
 		this.#pendingTerminalTransitions.clear();
 		this.#deadlineDeferredTerminalTransitions.clear();
 		this.#deadlineTerminalizationConfirmed.clear();
+		this.#terminalPublicationPending.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
 	}

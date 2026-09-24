@@ -321,6 +321,51 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
+	test("a durable terminal retains a retry owner until publication succeeds", async () => {
+		let now = 0;
+		let publicationAttempts = 0;
+		let expired = 0;
+		const { reconciliation, state } = fakeReconciliation();
+		const outcome = {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+			provenance: "deadline",
+			phase: "post_start",
+			category: "deadline",
+		} as const;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+			onDeadlineTerminalization: async () => "settled" as const,
+			onDeadlinePublishTerminal: async () => {
+				publicationAttempts += 1;
+				return { outcome, published: publicationAttempts > 1 };
+			},
+			onExpired: () => {
+				expired += 1;
+			},
+		});
+		const correlation = { commandId: "cmd-publish-retry", turnId: "turn-publish-retry" };
+		manager.onAccepted(correlation);
+		manager.noteTerminalTransition(correlation, undefined, { outcome }, true);
+		now = 20;
+		const firstAttemptDeadline = Date.now() + 2_000;
+		while (publicationAttempts === 0 && Date.now() < firstAttemptDeadline) await Bun.sleep(5);
+		expect(publicationAttempts).toBe(1);
+		expect(manager.has(correlation)).toBe(true);
+		expect(state.uncertainCalls).toBe(0);
+
+		const settledDeadline = Date.now() + 3_000;
+		while (expired === 0 && Date.now() < settledDeadline) await Bun.sleep(5);
+		expect(publicationAttempts).toBe(2);
+		expect(expired).toBe(1);
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
+
 	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.noteTransitionFailures = 1;

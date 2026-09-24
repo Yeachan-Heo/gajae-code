@@ -67,6 +67,7 @@ import { projectQ10Models } from "../models.js";
 import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
 import {
 	PromptDeadlineManager,
+	type PromptDeadlinePublicationResult,
 	type PromptDeadlineTerminalization,
 	type PromptTerminalTransitionEvidence,
 } from "../prompt-deadline-manager";
@@ -4661,6 +4662,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		eventCaptured: boolean;
 		eventPrepared: boolean;
 		deadlineAbortStarted: boolean;
+		terminalCommitted: boolean;
 		eventCapture: Promise<void>;
 		resolveEventCapture: () => void;
 		observed?: boolean;
@@ -5960,6 +5962,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					eventCaptured: false,
 					eventPrepared: false,
 					deadlineAbortStarted: false,
+					terminalCommitted: false,
 					eventCapture: eventCapture.promise,
 					resolveEventCapture: () => eventCapture.resolve(),
 					releaseTerminalRetention: retainTerminalBoundaries([{ correlation }]),
@@ -6088,36 +6091,37 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					: undefined;
 				if (!observation?.eventCaptured || !observation.eventPrepared || terminalOutcome === undefined)
 					return false;
-				const pendingTools = options.terminalAbortSeams?.pendingToolExecutions;
-				let terminalIsCurrent = false;
-				let pendingToolCount = -1;
-				try {
-					terminalIsCurrent = isCurrent();
-					if (pendingTools) pendingToolCount = pendingTools(observation.handle).length;
-				} catch {
-					return false;
-				}
-				if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) return false;
-				try {
-					if (!isCurrent() || pendingTools(observation.handle).length > 0) {
+				if (!observation.terminalCommitted) {
+					const pendingTools = options.terminalAbortSeams?.pendingToolExecutions;
+					let terminalIsCurrent = false;
+					let pendingToolCount = -1;
+					try {
+						terminalIsCurrent = isCurrent();
+						if (pendingTools) pendingToolCount = pendingTools(observation.handle).length;
+					} catch {
 						return false;
 					}
-					// Commit the authoritative Q26 result before exposing its terminal
-					// boundary; a crash between publication and this write would strand
-					// restart recovery with only a hidden pending claim.
-					await reconciliation.noteTransition("prompt", correlation, {
-						type: "agent_end",
-						...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
-						...(observation.terminalHasActivity ? { hasActivity: true } : {}),
-						outcome: terminalOutcome,
-					});
-					observation.terminalOutcome = terminalOutcome;
-					observation.clearUnrecordedFailure?.();
-					const published = publishDeadlineTerminalBoundary(observation, correlation, terminalOutcome);
-					return published ? terminalOutcome : false;
-				} catch {
-					return false;
+					if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) return false;
+					try {
+						if (!isCurrent() || pendingTools(observation.handle).length > 0) return false;
+						// Commit the authoritative Q26 result before exposing its terminal
+						// boundary; a crash between publication and this write would strand
+						// restart recovery with only a hidden pending claim.
+						await reconciliation.noteTransition("prompt", correlation, {
+							type: "agent_end",
+							...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
+							...(observation.terminalHasActivity ? { hasActivity: true } : {}),
+							outcome: terminalOutcome,
+						});
+						observation.terminalOutcome = terminalOutcome;
+						observation.terminalCommitted = true;
+						observation.clearUnrecordedFailure?.();
+					} catch {
+						return false;
+					}
 				}
+				const published = publishDeadlineTerminalBoundary(observation, correlation, terminalOutcome);
+				return { outcome: terminalOutcome, published } satisfies PromptDeadlinePublicationResult;
 			},
 			// Persist the agent's uncommitted work before the retirement below tears
 			// the session down (#5583). Best effort by contract: failures are logged
