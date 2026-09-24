@@ -118,6 +118,7 @@ import {
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
+	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
@@ -24041,11 +24042,12 @@ export class AgentSession {
 				const failedProvider = this.model.provider;
 				const authStorage = this.#modelRegistry.authStorage;
 				const credentialKind = authStorage.getSessionCredentialType(failedProvider, this.credentialSessionId);
+				const storageProvider = resolveOAuthStorageProvider(failedProvider);
 				const activeCredentialCount =
 					credentialKind === undefined
 						? 0
 						: authStorage
-								.listCredentialInventory(failedProvider)
+								.listCredentialInventory(storageProvider)
 								.filter(credential => !credential.disabled && credential.credentialKind === credentialKind)
 								.length;
 				// An exhausted typed pool should not spend the remaining model retry

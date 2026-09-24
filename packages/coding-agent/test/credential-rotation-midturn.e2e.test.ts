@@ -17,6 +17,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import * as z from "zod/v4";
 
 const provider = "openai-codex";
+const providerAlias = "openai-codex-device";
 const selector = (model: Model) => `${model.provider}/${model.id}`;
 function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter(m => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
@@ -303,6 +304,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	runtimeApiKey?: string;
 	addApiKeyDuringMark?: string;
 	predecessorModel?: Model;
+	modelProviderAlias?: boolean;
 	terminalCodexEntry?: boolean;
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
@@ -339,10 +341,11 @@ async function runManagedFallbackQuotaScenario(options: {
 		usageProviderResolver: currentProvider => (currentProvider === provider ? usageProvider : undefined),
 		rankingStrategyResolver: currentProvider => (currentProvider === provider ? strategy : undefined),
 	});
-	const model = getBundledModel(provider, "gpt-5.1-codex");
+	const aliasSourceId = `fixture:${root}`;
+	let registeredRegistry: ModelRegistry | undefined;
+	let model = getBundledModel(provider, "gpt-5.1-codex");
 	const fallback = getBundledModel("openai", "gpt-4o-mini");
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
-	const initialModel = options.predecessorModel ?? model;
 	let restoreUnknownRowId: (() => void) | undefined;
 	let restorePeerResolver: (() => void) | undefined;
 	const unresolvablePeerIds = new Set<number>();
@@ -377,6 +380,41 @@ async function runManagedFallbackQuotaScenario(options: {
 		if (options.runtimeApiKey !== undefined) storage.setRuntimeApiKey(provider, options.runtimeApiKey);
 		storage.setRuntimeApiKey("openai", "fallback-test-key");
 		const registry = new ModelRegistry(storage, path.join(root, "models.yml"));
+		registeredRegistry = registry;
+		if (options.modelProviderAlias) {
+			registry.registerProvider(
+				providerAlias,
+				{
+					baseUrl: model.baseUrl,
+					api: model.api,
+					oauth: {
+						name: "Fixture OAuth",
+						async login() {
+							return { access: "unused-fixture-token", refresh: "unused-fixture-refresh", expires: Date.now() };
+						},
+					},
+					models: [
+						{
+							id: model.id,
+							name: model.name,
+							api: model.api,
+							reasoning: model.reasoning,
+							input: model.input,
+							cost: model.cost,
+							contextWindow: model.contextWindow,
+							maxTokens: model.maxTokens,
+							...(model.thinking === undefined ? {} : { thinking: model.thinking }),
+						},
+					],
+				},
+				aliasSourceId,
+			);
+			const aliasModel = registry.find(providerAlias, model.id);
+			if (!aliasModel) throw new Error("Could not register the Codex device-alias fixture model");
+			model = aliasModel;
+		}
+		const initialModel = options.predecessorModel ?? model;
+		const credentialModelProvider = options.modelProviderAlias ? providerAlias : provider;
 		if (options.unresolvablePeerDuringMark) {
 			const getApiKeyBeforeMock = registry.getApiKey.bind(registry);
 			const getApiKeySpy = vi.spyOn(registry, "getApiKey");
@@ -409,7 +447,7 @@ async function runManagedFallbackQuotaScenario(options: {
 			streamFn: (requestedModel, context, streamOptions) => {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
-				if (requestedModel.provider === provider) {
+				if (requestedModel.provider === credentialModelProvider) {
 					providerDispatchCount++;
 					if (options.dispatchGuardLimit !== undefined && providerDispatchCount > options.dispatchGuardLimit) {
 						dispatchGuardExceeded = true;
@@ -417,14 +455,14 @@ async function runManagedFallbackQuotaScenario(options: {
 					}
 				}
 				if (
-					requestedModel.provider === provider &&
+					requestedModel.provider === credentialModelProvider &&
 					options.failFirstProviderDispatch &&
 					!firstProviderDispatchQuotaInjected
 				) {
 					quotaKeys.add(key);
 					firstProviderDispatchQuotaInjected = true;
 				}
-				if (requestedModel.provider === provider && quotaKeys.has(key)) {
+				if (requestedModel.provider === credentialModelProvider && quotaKeys.has(key)) {
 					if (options.unknownRowIdBeforeMark && !unknownRowIdInjected) {
 						const rowIdSpy = vi.spyOn(storage, "getSessionCredentialRowId").mockReturnValueOnce(undefined);
 						restoreUnknownRowId = () => rowIdSpy.mockRestore();
@@ -482,7 +520,7 @@ async function runManagedFallbackQuotaScenario(options: {
 					}
 				}
 				if (markOptions?.rowId !== undefined && options.addApiKeyDuringMark !== undefined && !addedApiKey) {
-					storage.upsertCredential(markProvider, { type: "api_key", key: options.addApiKeyDuringMark });
+					storage.upsertCredential(provider, { type: "api_key", key: options.addApiKeyDuringMark });
 					addedApiKey = true;
 				}
 				const markResult = await pendingMark;
@@ -507,6 +545,7 @@ async function runManagedFallbackQuotaScenario(options: {
 		restoreUnknownRowId?.();
 		restorePeerResolver?.();
 		await session?.dispose();
+		registeredRegistry?.clearSourceRegistrations(aliasSourceId);
 		storage.close();
 		await fs.rm(root, { recursive: true, force: true });
 	}
@@ -524,6 +563,23 @@ describe("managed fallback quota credential rotation", () => {
 		});
 	});
 
+	test("canonicalizes the device alias inventory before advancing after OAuth exhaustion", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			addApiKeyDuringMark: "unrelated-codex-api-key",
+			modelProviderAlias: true,
+		});
+		expect(result).toEqual({
+			models: [`${providerAlias}/${model.id}`, `${providerAlias}/${model.id}`, selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
+			markCount: 2,
+		});
+	});
+
 	test("stays within the failed credential kind when another kind is also stored", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!model) throw new Error("Missing bundled Codex fixture model");
@@ -537,6 +593,24 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "TOKEN-b"],
 			markCount: 1,
 		});
+	});
+
+	test("does not count a different-kind row as an OAuth alternate", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const apiKey = "stored-codex-api-key";
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a"],
+			quotaKeys: ["TOKEN-a", apiKey],
+			addApiKeyDuringMark: apiKey,
+		});
+		expect(result.models).toEqual([selector(model), selector(model), selector(model), selector(fallback)]);
+		expect(result.keys).toHaveLength(4);
+		expect(result.keys[0]).toBe("TOKEN-a");
+		for (const key of result.keys.slice(0, 3)) expect(["TOKEN-a", apiKey]).toContain(key);
+		expect(result.keys[3]).toBe("fallback-test-key");
+		expect(result.markCount).toBe(3);
 	});
 
 	test("rotates through API-key rows as the same credential kind", async () => {
