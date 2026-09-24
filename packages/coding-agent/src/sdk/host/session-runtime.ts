@@ -854,6 +854,7 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation,
 		outcome: InvocationOutcomeInput,
 		keepDeadlineRecoveryPending?: boolean,
+		deadlineMaxAt?: number,
 	): Promise<InvocationOutcome | undefined>;
 	claimPendingOutcome(
 		kind: InvocationKind,
@@ -1517,7 +1518,13 @@ export function createInvocationReconciliation(
 				});
 		},
 		hydrate,
-		async stagePendingTerminalOutcome(kind, correlation, outcome, keepDeadlineRecoveryPending = false) {
+		async stagePendingTerminalOutcome(
+			kind,
+			correlation,
+			outcome,
+			keepDeadlineRecoveryPending = false,
+			deadlineMaxAt,
+		) {
 			const recordKey = key(kind, correlation);
 			for (let attempt = 0; attempt < PENDING_TERMINAL_OUTCOME_RETRIES; attempt += 1) {
 				const record = records.get(recordKey);
@@ -1543,7 +1550,12 @@ export function createInvocationReconciliation(
 						// A real, already-staged terminal intent is stronger than this
 						// publisher's duplicate event. Provider errors were handled above.
 						staged = prior;
-						if ((record.deadlineRecoveryPending === true) === keepDeadlineRecoveryPending) return prior;
+						const storedDeadlineMaxAt = (record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+						if (
+							(record.deadlineRecoveryPending === true) === keepDeadlineRecoveryPending &&
+							(deadlineMaxAt === undefined || storedDeadlineMaxAt === deadlineMaxAt)
+						)
+							return prior;
 					}
 				}
 				const next = { ...record, revision: ++mutationRevision } as InvocationRecord & {
@@ -1554,6 +1566,7 @@ export function createInvocationReconciliation(
 				next.pendingOutcome = staged;
 				if (keepDeadlineRecoveryPending) {
 					next.deadlineRecoveryPending = true;
+					if (deadlineMaxAt !== undefined) next.deadlineMaxAt = deadlineMaxAt;
 				} else if (!(staged.kind === "failed" && staged.provenance === "deadline")) {
 					delete next.deadlineRecoveryPending;
 					delete next.deadlineMaxAt;
@@ -4658,6 +4671,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		handle: string;
 		epoch: number;
 		lifecycleEpoch: number;
+		deadlineMaxAt: number;
 		terminalPublication: Promise<boolean>;
 		eventCaptured: boolean;
 		eventPrepared: boolean;
@@ -5274,6 +5288,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 										invocation.correlation,
 										capturedOutcome,
 										true,
+										observation?.deadlineMaxAt,
 									);
 									if (staged !== undefined) capturedOutcome = staged;
 								} catch {
@@ -5687,6 +5702,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							invocation.correlation,
 							capturedOutcome,
 							true,
+							observation?.deadlineMaxAt,
 						);
 						if (staged !== undefined) capturedOutcome = staged;
 					} catch {
@@ -5931,7 +5947,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
 			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
-			onDeadlineStarted: correlation => {
+			onDeadlineStarted: (correlation, deadlineMaxAt) => {
 				const owner = lifecycleOwnerHolder.state;
 				if (!owner) return;
 				const key = lifecycleCorrelationKey(correlation);
@@ -5958,6 +5974,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					handle,
 					epoch,
 					lifecycleEpoch: currentBatch.epoch,
+					deadlineMaxAt,
 					terminalPublication: terminalPublication.promise,
 					eventCaptured: false,
 					eventPrepared: false,

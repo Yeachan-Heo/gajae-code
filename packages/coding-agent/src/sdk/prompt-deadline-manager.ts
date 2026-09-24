@@ -113,7 +113,10 @@ export class PromptDeadlineManager {
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
-	readonly #onDeadlineStarted?: (correlation: InvocationCorrelation) => undefined | (() => void);
+	readonly #onDeadlineStarted?: (
+		correlation: InvocationCorrelation,
+		deadlineMaxAt: number,
+	) => undefined | (() => void);
 	readonly #onDeadlineTerminalization?: (
 		correlation: InvocationCorrelation,
 		isCurrent: () => boolean,
@@ -135,7 +138,7 @@ export class PromptDeadlineManager {
 		getMaxMs: () => number;
 		now?: () => number;
 		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
-		onDeadlineStarted?: (correlation: InvocationCorrelation) => undefined | (() => void);
+		onDeadlineStarted?: (correlation: InvocationCorrelation, deadlineMaxAt: number) => undefined | (() => void);
 		onDeadlineTerminalization?: (
 			correlation: InvocationCorrelation,
 			isCurrent: () => boolean,
@@ -202,10 +205,10 @@ export class PromptDeadlineManager {
 		}
 	}
 
-	#captureDeadlineStart(key: string, correlation: InvocationCorrelation): void {
+	#captureDeadlineStart(key: string, correlation: InvocationCorrelation, deadlineMaxAt: number): void {
 		if (this.#deadlineStartCleanup.has(key)) return;
 		try {
-			const cleanup = this.#onDeadlineStarted?.(correlation);
+			const cleanup = this.#onDeadlineStarted?.(correlation, deadlineMaxAt);
 			if (cleanup !== undefined) this.#deadlineStartCleanup.set(key, cleanup);
 		} catch {
 			// The terminalization hook fails closed when it cannot observe the run.
@@ -258,7 +261,7 @@ export class PromptDeadlineManager {
 		// A successor agent_start must not drain this correlation while its
 		// durable upgrade is still pending or being retried.
 		this.#expiring.add(key);
-		this.#captureDeadlineStart(key, correlation);
+		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
 		if (
 			this.#pendingTerminalTransitions.has(key) &&
 			((!this.#deadlineDeferredTerminalTransitions.has(key) && !this.#deadlineStartCleanup.has(key)) ||
@@ -829,7 +832,9 @@ export class PromptDeadlineManager {
 	captureExpiringRun(correlation: InvocationCorrelation): void {
 		const key = leaseKey(correlation);
 		if (!this.#expiring.has(key)) return;
-		this.#captureDeadlineStart(key, correlation);
+		const lease = this.#leases.get(key);
+		if (!lease) return;
+		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
 	}
 
 	/** Whether a deadline has captured exact active-run terminal evidence for this prompt. */

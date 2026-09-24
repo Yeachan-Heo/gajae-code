@@ -18,6 +18,7 @@ import { Broker } from "../broker/broker";
 import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation";
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
+import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
 import { SESSION_HOST_OBSERVER_CAPABILITY, TURN_STREAM_CAPABILITY } from "./host";
 import { CursorRegistry, QueryHandlers, type QueryResponse, RevisionStore } from "./query";
@@ -749,6 +750,120 @@ test("a deadline-deferred stopped outcome reloads consistently before terminal c
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("deferred terminal staging preserves the acceptance-time hard maximum across restart", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-deferred-max-reload-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		await Bun.write(sessionFile, "");
+		const sessionId = "deferred-max-reload";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const reconciliation = createInvocationReconciliation({ store });
+		const correlation = { commandId: "deferred-max-command", turnId: "deferred-max-turn" };
+		await reconciliation.noteAccepted("prompt", correlation, "deferred-max-ref");
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+		const acceptedAt = store.snapshot().find(record => record.commandId === correlation.commandId)?.acceptedAt;
+		if (acceptedAt === undefined) throw new Error("Accepted prompt record is missing its timestamp.");
+		const deadlineMaxAt = acceptedAt + 1_000;
+		await reconciliation.stagePendingTerminalOutcome(
+			"prompt",
+			correlation,
+			{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+			true,
+			deadlineMaxAt,
+		);
+		expect(store.snapshot().find(record => record.commandId === correlation.commandId)).toMatchObject({
+			deadlineRecoveryPending: true,
+			deadlineMaxAt,
+		});
+
+		const reopened = createInvocationReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId }),
+		});
+		await reopened.hydrate();
+		const recovery = reopened.listDeadlineRecoveryPendingPrompts()[0];
+		expect(recovery?.deadlineMaxAt).toBe(deadlineMaxAt);
+		const now = deadlineMaxAt - 100;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reopened,
+			getLeaseMs: () => 20_000,
+			getMaxMs: () => 120_000,
+			now: () => now,
+		});
+		manager.recoverPending(correlation, recovery?.acceptedAt ?? acceptedAt, recovery?.deadlineMaxAt);
+		expect(manager.deadlineAt(correlation)).toBe(deadlineMaxAt);
+		manager.clearAll();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("staging after a failed deadline claim preserves the acceptance-time hard maximum", async () => {
+	const backing = { records: [] as SdkOnlyInvocationRecord[] };
+	let failNextWrite = false;
+	const store: SdkOnlyReconciliationStore = {
+		path: null,
+		load: async () => backing.records.map(record => ({ ...record })),
+		transact: async mutator => {
+			const candidate = mutator(backing.records.map(record => ({ ...record })));
+			if (failNextWrite) {
+				failNextWrite = false;
+				throw new Error("injected transient deadline claim failure");
+			}
+			backing.records = candidate;
+		},
+		snapshotTerminalScopes: () => [],
+		snapshotTerminalKeys: () => [],
+		transactTerminalScopes: async () => {},
+		transactTerminalState: async () => {},
+	};
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "deferred-max-command", turnId: "deferred-max-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "deferred-max-ref");
+	await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+	const acceptedAt = backing.records.find(record => record.commandId === correlation.commandId)?.acceptedAt;
+	if (acceptedAt === undefined) throw new Error("Accepted prompt record is missing its timestamp.");
+	const deadlineMaxAt = acceptedAt + 1_000;
+	failNextWrite = true;
+	await expect(
+		reconciliation.claimPendingOutcome(
+			"prompt",
+			correlation,
+			{
+				kind: "failed",
+				code: "prompt_deadline_exceeded",
+				message: "Prompt deadline exceeded.",
+				provenance: "deadline",
+			},
+			deadlineMaxAt,
+		),
+	).rejects.toThrow("injected transient deadline claim failure");
+	await reconciliation.stagePendingTerminalOutcome(
+		"prompt",
+		correlation,
+		{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+		true,
+		deadlineMaxAt,
+	);
+	expect(backing.records.find(record => record.commandId === correlation.commandId)).toMatchObject({
+		deadlineRecoveryPending: true,
+		deadlineMaxAt,
+	});
+
+	const reopened = createInvocationReconciliation({ store });
+	await reopened.hydrate();
+	const recovery = reopened.listDeadlineRecoveryPendingPrompts()[0];
+	expect(recovery?.deadlineMaxAt).toBe(deadlineMaxAt);
+	const manager = new PromptDeadlineManager({
+		reconciliation: reopened,
+		getLeaseMs: () => 20_000,
+		getMaxMs: () => 120_000,
+		now: () => deadlineMaxAt - 100,
+	});
+	manager.recoverPending(correlation, recovery?.acceptedAt ?? acceptedAt, recovery?.deadlineMaxAt);
+	expect(manager.deadlineAt(correlation)).toBe(deadlineMaxAt);
+	manager.clearAll();
 });
 
 test("uncertain recovery retains a staged stopped intent for restart", async () => {
