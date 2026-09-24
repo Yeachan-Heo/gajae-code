@@ -2598,6 +2598,7 @@ describe("coordinator runtime state sidecar", () => {
 				generation,
 				supervisor_pid: process.pid,
 				supervisor_start_time: supervisorStartTime,
+				tmux_command: "tmux",
 				server_pid: process.pid,
 				server_start_time: supervisorStartTime,
 				native_session_id: "$test",

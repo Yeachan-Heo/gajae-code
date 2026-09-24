@@ -207,6 +207,7 @@ try {
 			generation,
 			supervisor_pid: supervisorPid,
 			supervisor_start_time: supervisorStartTime,
+			tmux_command: env.GJC_TMUX_COMMAND!,
 			server_pid: serverPid,
 			server_start_time: serverStartTime,
 			native_session_id: nativeSessionId,

@@ -2298,6 +2298,7 @@ export async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Pro
 				generation: plan.ownerGeneration!,
 				supervisor_pid: supervisorPid,
 				supervisor_start_time: supervisorStartTime,
+				tmux_command: plan.tmuxCommand,
 				server_pid: plan.createdServerIdentity.pid,
 				server_start_time: plan.createdServerIdentity.startTime,
 				native_session_id: plan.createdSessionId!,

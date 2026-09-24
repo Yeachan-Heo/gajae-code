@@ -1594,6 +1594,7 @@ describe("GJC tmux session management", () => {
 				supervisor_pid: process.pid,
 				supervisor_start_time: parentIdentity.incarnation,
 				supervisor_is_parent: true,
+				tmux_command: "tmux",
 				server_pid: fixture.serverPid,
 				server_start_time: fixture.serverStartTime,
 				native_session_id: fixture.nativeSessionId,

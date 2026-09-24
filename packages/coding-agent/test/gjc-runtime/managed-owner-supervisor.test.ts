@@ -112,6 +112,7 @@ async function publishTestSupervisorAuthority(
 	sessionId: string,
 	generation: string,
 	supervisorPid: number,
+	tmuxCommand: string,
 ): Promise<void> {
 	const [supervisorStartTime, serverStartTime] = await Promise.all([
 		processStartTime(supervisorPid),
@@ -125,6 +126,7 @@ async function publishTestSupervisorAuthority(
 		generation,
 		supervisor_pid: supervisorPid,
 		supervisor_start_time: supervisorStartTime,
+		tmux_command: tmuxCommand,
 		server_pid: process.pid,
 		server_start_time: serverStartTime,
 		native_session_id: "$test",
@@ -140,9 +142,10 @@ async function startAuthorizedSupervisor(
 	const sessionId = env.GJC_COORDINATOR_SESSION_ID ?? "session-2681";
 	const generation = env.GJC_TMUX_OWNER_GENERATION ?? options.generation ?? "generation-2681";
 	ensureTestGenerationCurrent(stateDir, sessionId, generation);
-	const supervisor = startSupervisor(stateDir, command, { GJC_TMUX_COMMAND: "tmux", ...env }, options);
+	const childEnv = { GJC_TMUX_COMMAND: "tmux", ...env };
+	const supervisor = startSupervisor(stateDir, command, childEnv, options);
 	try {
-		await publishTestSupervisorAuthority(stateDir, sessionId, generation, supervisor.pid);
+		await publishTestSupervisorAuthority(stateDir, sessionId, generation, supervisor.pid, childEnv.GJC_TMUX_COMMAND);
 	} catch (error) {
 		supervisor.kill("SIGKILL");
 		await supervisor.exited;
@@ -179,16 +182,12 @@ async function runSupervisor(
 		: undefined;
 	if (staged && baseline && paths && !persistedStage)
 		prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
+	const stagedChildEnv = { GJC_TMUX_COMMAND: "tmux", GJC_TMUX_OWNER_SERVER_KEY: "tmux", ...env };
 	const child = staged
-		? startSupervisor(
-				stateDir,
-				command,
-				{ GJC_TMUX_COMMAND: "tmux", GJC_TMUX_OWNER_SERVER_KEY: "tmux", ...env },
-				options,
-			)
+		? startSupervisor(stateDir, command, stagedChildEnv, options)
 		: await startAuthorizedSupervisor(stateDir, command, env, options);
 	if (staged && baseline) {
-		await publishTestSupervisorAuthority(stateDir, sessionId, generation, child.pid);
+		await publishTestSupervisorAuthority(stateDir, sessionId, generation, child.pid, stagedChildEnv.GJC_TMUX_COMMAND);
 		await waitForStagedOwnerSupervisorActive(stateDir, sessionId, generation, baseline);
 		replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline, { stagedSupervisor: true });
 	}
@@ -470,7 +469,11 @@ describe("managed owner supervisor", () => {
 			const supervisor = startSupervisor(
 				stateDir,
 				[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
-				{ GJC_MANAGED_OWNER_SUPERVISED: "1", GJC_TMUX_OWNER_SERVER_KEY: "tmux" },
+				{
+					GJC_MANAGED_OWNER_SUPERVISED: "1",
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_OWNER_SERVER_KEY: "tmux",
+				},
 				{ internalEntry: true },
 			);
 			publishManagedOwnerSupervisorAuthoritySync({
@@ -481,12 +484,45 @@ describe("managed owner supervisor", () => {
 				generation: "generation-2681",
 				supervisor_pid: supervisor.pid + 1,
 				supervisor_start_time: "forged",
+				tmux_command: "tmux",
 				server_pid: process.pid,
 				server_start_time: "forged",
 				native_session_id: "$forged",
 			});
 			expect(await supervisor.exited).not.toBe(0);
 			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a supervisor when its tmux command differs from parent-published authority", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-command-mismatch-"));
+		const marker = path.join(stateDir, "command-mismatch-child-ran");
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		try {
+			ensureTestGenerationCurrent(stateDir, sessionId, generation);
+			const supervisor = startSupervisor(
+				stateDir,
+				[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
+				{
+					GJC_TMUX_COMMAND: "conflicting-tmux-command",
+					GJC_TMUX_OWNER_SERVER_KEY: "tmux",
+				},
+			);
+			try {
+				await publishTestSupervisorAuthority(stateDir, sessionId, generation, supervisor.pid, "tmux");
+				const [stderr, exitCode] = await Promise.all([new Response(supervisor.stderr).text(), supervisor.exited]);
+				expect(exitCode).not.toBe(0);
+				expect(stderr).toContain("managed_owner_supervisor_server_command_mismatch");
+				expect(await Bun.file(marker).exists()).toBe(false);
+			} finally {
+				if (supervisor.exitCode === null) {
+					supervisor.kill("SIGKILL");
+					await supervisor.exited;
+				}
+			}
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
@@ -652,6 +688,7 @@ describe("managed owner supervisor", () => {
 				generation,
 				supervisor_pid: supervisor.pid,
 				supervisor_start_time: supervisorStartTime,
+				tmux_command: "tmux",
 				server_pid: process.pid,
 				server_start_time: serverStartTime,
 				native_session_id: "$test",
@@ -727,6 +764,7 @@ describe("managed owner supervisor", () => {
 				generation,
 				supervisor_pid: runningSupervisor.pid,
 				supervisor_start_time: supervisorStartTime,
+				tmux_command: "tmux",
 				server_pid: process.pid,
 				server_start_time: serverStartTime,
 				native_session_id: "$test",

@@ -1264,6 +1264,7 @@ export interface StagedOwnerSupervisorAuthorityRecord {
 	supervisor_pid: number;
 	supervisor_start_time: string;
 	supervisor_is_parent?: true;
+	tmux_command: string;
 	server_pid: number;
 	server_start_time: string;
 	native_session_id: string;
@@ -1706,6 +1707,7 @@ function isStagedOwnerSupervisorAuthorityRecord(
 		"generation",
 		"supervisor_pid",
 		"supervisor_start_time",
+		"tmux_command",
 		"server_pid",
 		"server_start_time",
 		"native_session_id",
@@ -1721,6 +1723,7 @@ function isStagedOwnerSupervisorAuthorityRecord(
 		(value.supervisor_pid as number) > 0 &&
 		nonEmpty(value.supervisor_start_time) &&
 		(value.supervisor_is_parent === undefined || value.supervisor_is_parent === true) &&
+		nonEmpty(value.tmux_command) &&
 		Number.isSafeInteger(value.server_pid) &&
 		(value.server_pid as number) > 0 &&
 		nonEmpty(value.server_start_time) &&
@@ -1853,6 +1856,7 @@ function sameStagedOwnerSupervisorAuthority(
 		left.supervisor_pid === right.supervisor_pid &&
 		left.supervisor_start_time === right.supervisor_start_time &&
 		left.supervisor_is_parent === right.supervisor_is_parent &&
+		left.tmux_command === right.tmux_command &&
 		left.server_pid === right.server_pid &&
 		left.server_start_time === right.server_start_time &&
 		left.native_session_id === right.native_session_id

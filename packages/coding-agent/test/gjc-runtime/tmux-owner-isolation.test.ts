@@ -51,6 +51,7 @@ import {
 } from "../../src/gjc-runtime/tmux-owner-isolation-cli";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
+const testTmuxCommand = process.env.GJC_TMUX_COMMAND?.trim() || "tmux";
 const ownerIsolationCliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
 const packagedGjcEntry = path.join(repoRoot, "packages", "coding-agent", "bin", "gjc.js");
 const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.ts");
@@ -89,6 +90,7 @@ function publishStagedSupervisorAuthority(
 		generation,
 		supervisor_pid: supervisorPid,
 		supervisor_start_time: supervisorStartTime,
+		tmux_command: testTmuxCommand,
 		server_pid: process.pid,
 		server_start_time: serverStartTime,
 		native_session_id: "$test",
@@ -108,7 +110,11 @@ async function startStagedSupervisor(
 	const nativeModule = "@gajae-code/utils/native-process";
 	const keepOpen = options.holdOpenAfterActivation ? "setInterval(() => {}, 1000);" : "";
 	const script = `const { writeFileSync, existsSync } = await import("node:fs"); const owner = await import(${JSON.stringify(ownerModule)}); const proc = await import(${JSON.stringify(procModule)}); const native = await import(${JSON.stringify(nativeModule)}); writeFileSync(${JSON.stringify(readyFile)}, "ready\\n"); const deadline = Date.now() + 5000; const authority = ${JSON.stringify(path.join(lifecyclePaths(stateDir, sessionId, generation).root, `supervisor-authority-${generation}.json`))}; while (!existsSync(authority)) { if (Date.now() >= deadline) process.exit(4); await Bun.sleep(10); } const startTime = process.platform === "linux" ? await proc.readLinuxProcStartTime(process.pid) : native.nativeProcessBindings().Process.fromPid(process.pid)?.incarnation; if (!startTime) process.exit(5); await owner.activateStagedOwnerSupervisor({ stateDir: ${JSON.stringify(stateDir)}, sessionId: ${JSON.stringify(sessionId)}, generation: ${JSON.stringify(generation)}, supervisorPid: process.pid, supervisorStartTime: startTime }); writeFileSync(${JSON.stringify(activeFile)}, "active\\n"); ${keepOpen}`;
-	const worker = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "ignore" });
+	const worker = Bun.spawn([process.execPath, "-e", script], {
+		stdout: "ignore",
+		stderr: "ignore",
+		env: { ...process.env, GJC_TMUX_COMMAND: testTmuxCommand },
+	});
 	for (let attempt = 0; attempt < 100; attempt += 1) {
 		if (fsSync.existsSync(readyFile)) break;
 		await Bun.sleep(10);

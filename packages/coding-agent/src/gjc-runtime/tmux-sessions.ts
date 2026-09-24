@@ -1005,6 +1005,7 @@ export function createGjcTmuxSession(
 				session_id: sessionId,
 				generation,
 				...managedOwnerSupervisorAuthorityProcessBinding(platform, supervisorPid, supervisorStartTime),
+				tmux_command: tmuxCommand,
 				server_pid: authorityServer.pid,
 				server_start_time: authorityServer.startTime,
 				native_session_id: nativeSessionId,

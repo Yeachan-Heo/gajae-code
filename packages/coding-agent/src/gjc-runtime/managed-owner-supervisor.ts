@@ -86,6 +86,7 @@ interface ManagedOwnerSupervisorAuthority {
 	supervisor_pid: number;
 	supervisor_start_time: string;
 	supervisor_is_parent?: true;
+	tmux_command: string;
 	server_pid: number;
 	server_start_time: string;
 	native_session_id: string;
@@ -183,12 +184,15 @@ async function requireManagedOwnerSupervisorAuthority(
 		record.session_id !== sessionId ||
 		record.generation !== generation ||
 		!supervisorIdentityMatches ||
+		typeof record.tmux_command !== "string" ||
+		!record.tmux_command.trim() ||
 		typeof record.server_pid !== "number" ||
 		typeof record.server_start_time !== "string" ||
 		typeof record.native_session_id !== "string"
 	)
 		throw new Error("managed_owner_supervisor_authority_mismatch");
-	if (!process.env[GJC_TMUX_COMMAND_ENV]?.trim()) throw new Error("managed_owner_supervisor_server_unavailable");
+	if (process.env[GJC_TMUX_COMMAND_ENV] !== record.tmux_command)
+		throw new Error("managed_owner_supervisor_server_command_mismatch");
 	const serverStartTime = await managedOwnerProcessProvenance(record.server_pid);
 	if (serverStartTime !== record.server_start_time) throw new Error("managed_owner_supervisor_server_mismatch");
 }
