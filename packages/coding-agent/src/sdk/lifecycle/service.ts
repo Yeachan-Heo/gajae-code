@@ -11,6 +11,9 @@ import {
 } from "../broker/session-scope";
 import type { SessionBindingAuthority } from "../session-authority";
 import {
+	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
+	type SessionListSavedSessionOmission,
+	type SessionListSavedSessionOmissionDetailCode,
 	SessionListTraversalError,
 	type SessionListTraversalPage,
 	sessionListPageFromResponse,
@@ -238,6 +241,7 @@ export interface SessionLifecycleListResult {
 	readonly sessions: readonly SessionLifecycleListEntry[];
 	readonly warnings: readonly string[];
 	readonly savedSession?: SessionLifecycleSavedSession;
+	readonly savedSessionOmission?: SessionListSavedSessionOmission;
 }
 
 export type SessionScopedListResult = SdkSearchResultV1;
@@ -652,9 +656,115 @@ function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSe
 function savedSessionFromResult(value: unknown): SessionLifecycleSavedSession | undefined {
 	if (!isRecord(value)) return undefined;
 	const identity = savedSessionTranscriptIdentity(value.identity);
-	if (typeof value.id !== "string" || typeof value.path !== "string" || value.path.length === 0 || !identity)
+	if (
+		typeof value.id !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.id) ||
+		typeof value.path !== "string" ||
+		value.path.length === 0 ||
+		!identity
+	)
 		return undefined;
 	return { id: value.id, path: value.path, identity };
+}
+
+const savedSessionOmissionFields = new Set([
+	"sessionId",
+	"reason",
+	"detailCode",
+	"candidateCount",
+	"missingIdentityFields",
+]);
+const savedSessionOmissionDetailCodes = new Set<string>(SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES);
+const savedSessionScopeDetailCodes = new Set([
+	"cwd_missing",
+	"cwd_not_directory",
+	"identity_unavailable",
+	"network_unsupported",
+	"sessions_root_unavailable",
+	"binding_conflict",
+	"binding_invalid",
+	"migration_busy",
+	"atomic_unavailable",
+	"invalid_request",
+	"durability_failed",
+	"durability_not_provable",
+	"capacity_exceeded",
+]);
+const savedSessionScanDetailCodes = new Set(["scan_failed", "unsafe_root", "invalid_candidate"]);
+const savedSessionCandidateDetailCodes = new Set([
+	"invalid_header",
+	"unreadable_candidate",
+	"source_changed",
+	"cwd_not_found",
+	"cwd_not_utf8",
+	"cwd_network_unsupported",
+	"cwd_identity_unavailable",
+	"cwd_io_error",
+]);
+
+function isSafeSavedSessionOmissionDetailCode(value: unknown): value is SessionListSavedSessionOmissionDetailCode {
+	return typeof value === "string" && savedSessionOmissionDetailCodes.has(value);
+}
+
+function savedSessionOmissionDetailMatchesReason(
+	reason: SessionListSavedSessionOmission["reason"],
+	detailCode: SessionListSavedSessionOmissionDetailCode,
+): boolean {
+	if (reason === "scope_unavailable") return savedSessionScopeDetailCodes.has(detailCode);
+	if (reason === "candidate_scan_failed") return savedSessionScanDetailCodes.has(detailCode);
+	if (reason === "candidate_invalid") return savedSessionCandidateDetailCodes.has(detailCode);
+	return false;
+}
+
+function savedSessionOmissionFromResult(value: unknown): SessionListSavedSessionOmission | undefined {
+	if (!isRecord(value)) return undefined;
+	if (Object.keys(value).some(field => !savedSessionOmissionFields.has(field))) return undefined;
+	if (
+		typeof value.sessionId !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.sessionId) ||
+		(value.reason !== "scope_unavailable" &&
+			value.reason !== "candidate_scan_failed" &&
+			value.reason !== "candidate_not_found" &&
+			value.reason !== "candidate_ambiguous" &&
+			value.reason !== "candidate_invalid" &&
+			value.reason !== "identity_incomplete")
+	)
+		return undefined;
+	if (
+		value.detailCode !== undefined &&
+		(!isSafeSavedSessionOmissionDetailCode(value.detailCode) ||
+			!savedSessionOmissionDetailMatchesReason(value.reason, value.detailCode))
+	)
+		return undefined;
+	if (
+		value.candidateCount !== undefined &&
+		(value.reason !== "candidate_ambiguous" ||
+			typeof value.candidateCount !== "number" ||
+			!Number.isSafeInteger(value.candidateCount) ||
+			value.candidateCount < 2)
+	)
+		return undefined;
+	let missingIdentityFields: ("nlink" | "ctimeNs")[] | undefined;
+	if (value.missingIdentityFields !== undefined) {
+		if (
+			value.reason !== "identity_incomplete" ||
+			!Array.isArray(value.missingIdentityFields) ||
+			value.missingIdentityFields.length === 0 ||
+			value.missingIdentityFields.some(field => field !== "nlink" && field !== "ctimeNs") ||
+			new Set(value.missingIdentityFields).size !== value.missingIdentityFields.length
+		)
+			return undefined;
+		missingIdentityFields = value.missingIdentityFields as ("nlink" | "ctimeNs")[];
+	}
+	if (value.reason === "candidate_ambiguous" && value.candidateCount === undefined) return undefined;
+	if (value.reason === "identity_incomplete" && missingIdentityFields === undefined) return undefined;
+	return {
+		sessionId: value.sessionId,
+		reason: value.reason,
+		...(value.detailCode === undefined ? {} : { detailCode: value.detailCode }),
+		...(value.candidateCount === undefined ? {} : { candidateCount: value.candidateCount }),
+		...(missingIdentityFields === undefined ? {} : { missingIdentityFields }),
+	};
 }
 
 function listResult(value: unknown): SessionLifecycleListResult | undefined {
@@ -702,8 +812,19 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	}
 	const savedSessionPresent = Object.hasOwn(value, "savedSession");
 	const savedSession = savedSessionPresent ? savedSessionFromResult(value.savedSession) : undefined;
-	if (savedSessionPresent && !savedSession) return undefined;
-	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
+	const savedSessionOmissionPresent = Object.hasOwn(value, "savedSessionOmission");
+	const savedSessionOmission = savedSessionOmissionPresent
+		? savedSessionOmissionFromResult(value.savedSessionOmission)
+		: undefined;
+	if (savedSessionPresent && (!savedSession || savedSessionOmissionPresent)) return undefined;
+	if (savedSessionOmissionPresent && !savedSessionOmission) return undefined;
+	return {
+		indexSeq,
+		sessions,
+		warnings,
+		...(savedSession ? { savedSession } : {}),
+		...(savedSessionOmission ? { savedSessionOmission } : {}),
+	};
 }
 
 function scopedPage(value: unknown): { scope: SdkSearchResultV1["scope"]; observedAt: string } | undefined {
@@ -993,6 +1114,13 @@ export class SessionLifecycleService {
 				"malformed_response",
 				"lifecycle broker returned a malformed scoped list result",
 			);
+		if (result.savedSession !== undefined || result.savedSessionOmission !== undefined)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker attached an exact saved session to a scoped list result",
+			);
 		if (JSON.stringify(pageScope.scope) !== JSON.stringify(locallyResolvedScope))
 			return failure(
 				"session.list",
@@ -1178,6 +1306,35 @@ export class SessionLifecycleService {
 		const scopeRequest = target.scope === undefined ? undefined : scopeRequestV1(target.scope);
 		if (target.scope !== undefined && !scopeRequest)
 			return failure("session.list", "terminal", "invalid_request", "scope must be a valid ScopeRequestV1");
+		if (target.cwd !== undefined && (typeof target.cwd !== "string" || target.cwd.length === 0))
+			return failure("session.list", "terminal", "invalid_request", "cwd must be a non-empty string");
+		if (target.cursor !== undefined && (typeof target.cursor !== "string" || target.cursor.length === 0))
+			return failure("session.list", "terminal", "invalid_request", "cursor must be a non-empty opaque string");
+		if (
+			target.resolveSessionId !== undefined &&
+			(typeof target.resolveSessionId !== "string" ||
+				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(target.resolveSessionId))
+		)
+			return failure(
+				"session.list",
+				"terminal",
+				"invalid_request",
+				"resolveSessionId must be a canonical safe identifier",
+			);
+		if (scopeRequest !== undefined && (target.cwd !== undefined || target.resolveSessionId !== undefined))
+			return failure(
+				"session.list",
+				"terminal",
+				"invalid_request",
+				"cwd and resolveSessionId cannot be combined with a scoped session.list target",
+			);
+		if (target.cursor !== undefined && (target.cwd !== undefined || target.resolveSessionId !== undefined))
+			return failure(
+				"session.list",
+				"terminal",
+				"invalid_request",
+				"cursor cannot be combined with cwd or resolveSessionId",
+			);
 		let locallyResolvedScope: SdkSearchResultV1["scope"] | undefined;
 		if (scopeRequest !== undefined) {
 			try {
@@ -1253,6 +1410,30 @@ export class SessionLifecycleService {
 				"lifecycle broker returned a malformed list result",
 			);
 		const { result } = firstPage.page;
+		const requestedSessionId = typeof target.resolveSessionId === "string" ? target.resolveSessionId : undefined;
+		const exactSavedSessionTarget = requestedSessionId !== undefined && typeof target.cwd === "string";
+		if (requestedSessionId !== undefined && pages.length > 1)
+			return failure(
+				"session.list",
+				"uncertain",
+				"malformed_response",
+				"lifecycle broker paginated an exact session.list result",
+			);
+		for (const page of pages) {
+			const { savedSession, savedSessionOmission } = page.page.result;
+			if (savedSession === undefined && savedSessionOmission === undefined) continue;
+			if (
+				!exactSavedSessionTarget ||
+				(savedSession !== undefined && savedSession.id !== requestedSessionId) ||
+				(savedSessionOmission !== undefined && savedSessionOmission.sessionId !== requestedSessionId)
+			)
+				return failure(
+					"session.list",
+					"uncertain",
+					"malformed_response",
+					"lifecycle broker returned a saved session that does not match the requested target",
+				);
+		}
 		if (request.target?.scope !== undefined) {
 			const scope = firstPage.page.scope;
 			const observedAt = firstPage.page.observedAt;
@@ -1323,6 +1504,7 @@ export class SessionLifecycleService {
 				sessions: pages.flatMap(page => page.page.result.sessions),
 				warnings: result.warnings,
 				...(result.savedSession === undefined ? {} : { savedSession: result.savedSession }),
+				...(result.savedSessionOmission === undefined ? {} : { savedSessionOmission: result.savedSessionOmission }),
 			},
 		};
 	}

@@ -112,7 +112,9 @@ gjc sdk session raw global --op session.list --page --cursor <opaque-cursor> \
 `--page` preserves the Broker page envelope, including `indexSeq`, `warnings`,
 the bounded `sessions` array, and the opaque `continuationCursor`. The cursor
 is a snapshot continuation: pass it back unchanged, with the same `--limit`,
-and never restart from the first page or locally slice an all-pages result.
+and never restart from the first page or locally slice an all-pages result. A
+continuation cursor cannot be combined with `cwd` or `resolveSessionId`; exact
+saved-session resolution is a separate, single-page lookup.
 Semantic `gjc sdk session list` remains the fully paginated, scope-filtered
 operation.
 
