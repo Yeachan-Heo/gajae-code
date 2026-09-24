@@ -1,3 +1,3 @@
 ### Fixed
 
-- Remove per-process test agent and log isolation directories after each Bun test file completes, while keeping the isolated log sink available throughout the run. Set `GJC_TEST_KEEP_TMP=1` to preserve per-file test sandboxes and their isolated state for debugging (#5852).
+- Remove per-process test agent and log isolation directories after each Bun test file completes, while keeping the isolated log sink available throughout the run. Set `GJC_TEST_KEEP_TMP=1` to preserve per-file test sandboxes and their isolated state for debugging, including failed preload initialization (#5852).

@@ -67,6 +67,7 @@ function createIsolatedTempDir(prefix: string): string {
 }
 
 export function cleanupIsolatedTempDirs(): void {
+	// Debugging deliberately preserves temp state even when preload setup later fails.
 	if (keepIsolatedTempDirs) return;
 
 	let cleanupError: unknown;
@@ -98,6 +99,7 @@ export function cleanupIsolatedTempDirs(): void {
 }
 
 function cleanupAfterInitializationFailure(error: unknown): never {
+	// Roll back roots created before a later preload error; the explicit debug opt-out still wins.
 	try {
 		cleanupIsolatedTempDirs();
 	} catch (cleanupError) {
