@@ -259,6 +259,15 @@ describe("stable release policy", () => {
 		expect(publishScript.slice(publishScript.indexOf("await publishFromExpectedEvidence"))).not.toContain("checkTypeDeclarations");
 	});
 
+	test("observes registry state through uncached per-document reads outside the publish boundary", async () => {
+		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		// Finalize re-observes right after publication; a CDN-cached packument read
+		// (`npm view`, max-age=300) would see a stale 404 or an old dist-tag and fail it.
+		expect(publishScript).not.toMatch(/\$`npm view/u);
+		expect(publishScript).toContain("async function readRegistryDocument(");
+		expect(publishScript).toContain('packageName.replace("/", "%2f")');
+	});
+
 	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {
 		const ci = await workflow();
 		const publish = jobSection(ci, "publish");
