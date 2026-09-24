@@ -72,6 +72,7 @@ describe("managed enrollment index reads", () => {
 			nativeIdentities: [],
 			byRoot: {},
 		});
+		await expect(fs.access(path.join(agentDir, ".gjc"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
 
