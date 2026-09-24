@@ -114,7 +114,7 @@ export class PromptDeadlineManager {
 	readonly #onDeadlinePublishTerminal?: (
 		correlation: InvocationCorrelation,
 		isCurrent: () => boolean,
-	) => boolean | Promise<boolean>;
+	) => SdkPromptTerminalOutcome | false | Promise<SdkPromptTerminalOutcome | false>;
 	readonly #onDeadlineExceeded?: (
 		correlation: InvocationCorrelation,
 		signal: AbortSignal,
@@ -136,7 +136,7 @@ export class PromptDeadlineManager {
 		onDeadlinePublishTerminal?: (
 			correlation: InvocationCorrelation,
 			isCurrent: () => boolean,
-		) => boolean | Promise<boolean>;
+		) => SdkPromptTerminalOutcome | false | Promise<SdkPromptTerminalOutcome | false>;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
 		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
@@ -388,20 +388,23 @@ export class PromptDeadlineManager {
 				}
 			}
 			if (this.#deadlineDeferredTerminalTransitions.has(key) && this.#onDeadlinePublishTerminal !== undefined) {
-				let published = false;
+				let publishedOutcome: SdkPromptTerminalOutcome | false = false;
 				try {
-					published = await this.#onDeadlinePublishTerminal(correlation, () => {
+					publishedOutcome = await this.#onDeadlinePublishTerminal(correlation, () => {
 						const current = this.#leases.get(key);
 						return (
 							current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
 						);
 					});
 				} catch {}
-				if (!published) {
+				if (publishedOutcome === false) {
 					if (this.#backOffIfSuperseded(key, lease, generation)) return;
 					this.#recoverUncertainty(key, correlation, lease, lease.generation);
 					return;
 				}
+				const evidence = this.#pendingTerminalEvidence.get(key);
+				if (evidence !== undefined)
+					this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publishedOutcome });
 			}
 			this.#deadlineTerminalizationConfirmed.add(key);
 			try {

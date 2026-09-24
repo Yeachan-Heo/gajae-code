@@ -413,6 +413,14 @@ grace period, which is not configurable. A controlled terminal failure reaches A
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
+At expiry, the SDK fences the exact accepted prompt's run and waits for its
+dispatched tools to settle before publishing `prompt_deadline_exceeded`. A
+cancellation produced by that deadline fence does not replace the timeout
+failure with a successful `cancelled` result. If exact run or tool settlement
+cannot be proven, Q26 remains `accepted` or `in_flight`, the pending outcome
+stays private, and no terminal frame is published until recovery proves
+settlement.
+
 ## Skill invoke reconciliation
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
