@@ -1056,7 +1056,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(session.isRetrying).toBe(false);
 			expect(session.isStreaming).toBe(false);
 
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -1084,7 +1084,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryRequestedModels).toHaveLength(2);
 		expect(retryEvents.retryStartEvents).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("stop");
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 		waitSpy.mockClear();
 
@@ -1156,7 +1156,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(waitSpy).toHaveBeenCalled();
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -1221,7 +1221,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage });
 			expect(session.isRetrying).toBe(false);
 			expect(session.isStreaming).toBe(false);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -2134,7 +2134,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(noProgressModels).toHaveLength(2);
 		expect(lastAssistant(session).stopReason).toBe("stop");
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 
 		const progressModels: string[] = [];
