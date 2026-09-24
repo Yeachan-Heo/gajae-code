@@ -254,9 +254,47 @@ test("redemption is atomic, ordered and connection-owned; discard, disconnect an
 		expect(() => store.redeem("sender", [{ id: disconnected.id }])).toThrow(
 			expect.objectContaining({ code: "resource_gone" }),
 		);
+		expect(() => store.append("sender", { id: disconnected.id, sequence: 0, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		await expect(store.finish("sender", { id: disconnected.id })).rejects.toMatchObject({ code: "resource_gone" });
+		expect(() => store.discard("sender", { id: disconnected.id })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
 		const closed = store.begin("sender", descriptor(bytes));
 		store.close();
-		await expect(store.finish("sender", { id: closed.id })).rejects.toMatchObject({ code: "resource_gone" });
+		await expect(store.finish("sender", { id: closed.id })).rejects.toMatchObject({
+			code: "resource_gone",
+		});
+	} finally {
+		store.close();
+	}
+});
+
+test("live-connection gate rejects queued image mutations after the disconnect sweep", async () => {
+	const live = new Set(["sender", "other"]);
+	const store = new PromptImageUploadStore(owner => live.has(owner));
+	const input = { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) };
+	try {
+		const pending = store.begin("sender", input);
+		store.append("sender", { id: pending.id, sequence: 0, data: "AA==" });
+		live.delete("sender");
+		store.disconnect("sender");
+		expect(() => store.begin("sender", input)).toThrow(expect.objectContaining({ code: "resource_gone" }));
+		expect(() => store.append("sender", { id: pending.id, sequence: 1, data: "AA==" })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		await expect(store.finish("sender", { id: pending.id })).rejects.toMatchObject({ code: "resource_gone" });
+		expect(() => store.discard("sender", { id: pending.id })).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		expect(() => store.redeem("sender", [{ id: pending.id }])).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+		const healthy = store.begin("other", input);
+		expect(store.append("other", { id: healthy.id, sequence: 0, data: "AA==" })).toMatchObject({
+			receivedBytes: 1,
+		});
 	} finally {
 		store.close();
 	}
@@ -327,7 +365,9 @@ test("pending uploads enforce the 64 MiB session budget and recover capacity on 
 		expect(store.append("sender", { id: next.id, sequence: 0, data: "AA==" })).toMatchObject({ receivedBytes: 1 });
 		store.disconnect("sender");
 		const resumed = store.begin("sender", { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) });
-		expect(store.append("sender", { id: resumed.id, sequence: 0, data: "AA==" })).toMatchObject({ receivedBytes: 1 });
+		expect(store.append("sender", { id: resumed.id, sequence: 0, data: "AA==" })).toMatchObject({
+			receivedBytes: 1,
+		});
 	} finally {
 		store.close();
 	}

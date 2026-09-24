@@ -346,6 +346,8 @@ export interface SessionSdkTransport {
 	stop(): Promise<void>;
 	broadcastFrame?(frame: SdkFrame): void;
 	onConnectionClose?(handler: (connectionId: string) => void): undefined | (() => void);
+	/** Authoritative transport socket membership, checked when queued image work executes. */
+	isConnectionOpen?(connectionId: string): boolean;
 	onNegotiatedCapabilities?(
 		handler: (connectionId: string, capabilities: readonly string[]) => void,
 	): undefined | (() => void);
@@ -516,6 +518,8 @@ export class SessionSdkSessionRuntime {
 			},
 			onFrame: handler =>
 				options.transport.onFrame((connectionId, frame) => {
+					// Stock WebSocket transport only dispatches frames while its socket is
+					// registered; close removes the socket before invoking onConnectionClose.
 					this.#connectionIds.add(connectionId);
 					handler(connectionId, frame);
 				}),
@@ -6639,7 +6643,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			void attempt(3);
 		};
 
-		const imageUploads = new PromptImageUploadStore();
+		// Never fall back to the runtime's frame-observer set: it is not the
+		// transport's authoritative socket membership. Missing liveness fails closed.
+		const imageUploads = new PromptImageUploadStore(
+			connectionId => transport.isConnectionOpen?.(connectionId) === true,
+		);
 		currentImageUploads = imageUploads;
 		const controlSurface = createControlSurface(
 			ctx,
