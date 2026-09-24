@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as http from "node:http";
 import * as stream from "node:stream";
 import { AUTOROUTING_TIERS, type AutoroutingTier } from "../config/autorouting-contract";
+import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 
 export const KEV_SYSTEMONE_ENDPOINT = "http://127.0.0.1:8009/v1/systemone";
 export const KEV_SYSTEMONE_MODEL = "kev-latest";
@@ -11,6 +12,7 @@ const TIERS = AUTOROUTING_TIERS;
 const EDIT_TOOLS = new Set(["write", "edit", "apply_patch", "ast_edit"]);
 const MAX_COUNTER = 10_000;
 const MAX_TASKS = 32;
+const MAX_PATCH_INPUT_CHARS = 64 * 1024;
 const MAX_TRACKED_FILES = 128;
 const MAX_TRACKED_PACKAGES = 32;
 const MAX_RESPONSE_BYTES = 16 * 1024;
@@ -309,6 +311,21 @@ function stringsFromPathFields(args: Record<string, unknown>): string[] {
 			for (const key of ["path", "file_path", "rename"]) {
 				if (typeof value[key] === "string") paths.push((value[key] as string).slice(0, 4096));
 			}
+		}
+	}
+	const input = args.input;
+	if (
+		typeof input === "string" &&
+		input.length <= MAX_PATCH_INPUT_CHARS &&
+		input.trimStart().startsWith("*** Begin Patch")
+	) {
+		try {
+			for (const entry of expandApplyPatchToEntries({ input }).slice(0, MAX_TRACKED_FILES)) {
+				paths.push(entry.path.slice(0, 4096));
+				if (entry.rename) paths.push(entry.rename.slice(0, 4096));
+			}
+		} catch {
+			// A malformed patch simply contributes no parsed file counts.
 		}
 	}
 	return paths;
