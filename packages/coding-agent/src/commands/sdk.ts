@@ -775,7 +775,6 @@ export async function runSessionHost(
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
 		if (!directory) return;
-		mcpConfigDirectory = undefined;
 		const cleanupComplete = await runBoundedStartupCleanup(async () => {
 			try {
 			const identity = directory.directoryIdentity;
@@ -804,7 +803,10 @@ export async function runSessionHost(
 			)
 				throw new Error("MCP temporary directory identity changed before cleanup.");
 			const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
-			if (removed.ok) return;
+			if (removed.ok) {
+				mcpConfigDirectory = undefined;
+				return;
+			}
 			if (
 				removed.code === "cleanup_pending" &&
 				removed.payloadDurable === true &&
@@ -857,6 +859,7 @@ export async function runSessionHost(
 					!retainedTreeIsScrubbed
 				)
 					throw new Error("MCP temporary directory retained unresolved cleanup authority.");
+				mcpConfigDirectory = undefined;
 				return;
 			}
 			throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
