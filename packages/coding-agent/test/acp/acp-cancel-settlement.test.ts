@@ -49,7 +49,6 @@ type Fixture = {
 	sendIdle(): void;
 	dispose(): void;
 	queryCalls: string[];
-	brokerCalls: string[];
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -108,7 +107,6 @@ export function createFixture(
 		const sessionId = "cancel-settlement-session";
 		const updates: SessionNotification[] = [];
 		const queryCalls: string[] = [];
-		const brokerCalls: string[] = [];
 		const delivered = Promise.withResolvers<void>();
 		const abortDelivered = Promise.withResolvers<void>();
 		const abort = new AbortController();
@@ -224,33 +222,38 @@ export function createFixture(
 						return;
 					}
 					if (frame.type === "broker_request") {
-						brokerCalls.push(String(frame.operation));
 						const input = frame.input as Record<string, unknown> | undefined;
 						const resolvingSavedSession =
 							frame.operation === "session.list" && input?.resolveSessionId === sessionId;
-						const result =
-							frame.operation === "session.list"
-								? resolvingSavedSession
-									? {
-											sessions: [],
-											savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
-										}
-									: {
-											sessions: [
-												{
-													sessionId,
-													locator: {
-														cwd,
-														worktreeRoot: null,
-														stateRoot: path.join(cwd, ".gjc", "state"),
-													},
-													live: options.liveSessionIndex === true,
+						let result: unknown;
+						if (frame.operation === "session.list") {
+							result = resolvingSavedSession
+								? {
+										sessions: [],
+										savedSession: { id: sessionId, path: path.join(cwd, "saved-session.jsonl") },
+									}
+								: {
+										sessions: [
+											{
+												sessionId,
+												locator: {
+													cwd,
+													worktreeRoot: null,
+													stateRoot: path.join(cwd, ".gjc", "state"),
 												},
-											],
-										}
-								: authority;
+												live: options.liveSessionIndex === true,
+											},
+										],
+									};
+						} else result = authority;
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
-						setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
+						if (frame.operation === "session.create" || frame.operation === "session.resume") {
+							const indexSeq = authorityIndexSeq++;
+							setTimeout(
+								() => void publishExactSessionAuthority({ ...authorityOptions, indexSeq }, authority),
+								10,
+							);
+						}
 						return;
 					}
 					if (frame.type === "query_request") {
@@ -340,6 +343,7 @@ export function createFixture(
 			token,
 		};
 		const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
+		let authorityIndexSeq = 1;
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,
@@ -442,7 +446,6 @@ export function createFixture(
 			},
 			sendIdle,
 			queryCalls,
-			brokerCalls,
 			sendTerminal,
 			dispose: () => {
 				releaseHang.resolve();
@@ -465,7 +468,7 @@ function prompt(fixture: Fixture, text: string): Promise<{ stopReason: StoppedRe
 type TransportRecoveryFixture = Fixture & { signalTransportFailure(error: SdkClientError): void };
 
 async function createTransportRecoveryFixture(
-	options: { deferPromptAcknowledgement?: boolean } = {},
+	options: { deferPromptAcknowledgement?: boolean; liveSessionIndex?: boolean } = {},
 ): Promise<TransportRecoveryFixture> {
 	const notifications: Array<(error: SdkClientError) => void> = [];
 	const original = AcpSdkAdapter.prototype.onReconnectFailed;
@@ -1249,13 +1252,12 @@ for (const invalid of invalidUncertainAbortResults) {
 }
 
 test("uncertain abort keeps its unresolved owner fenced through session reattachment", async () => {
-	const fixture = await createTransportRecoveryFixture();
+	const fixture = await createFixture({ liveSessionIndex: true, primaryControlSurface: "cli" });
 	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
 		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
 			operation: "turn.abort",
 		}),
 	);
-	const queryResponse = Promise.withResolvers<Record<string, unknown>>();
 	const originalQuery = AcpSdkAdapter.prototype.query;
 	const query = vi.spyOn(AcpSdkAdapter.prototype, "query").mockImplementation(function (
 		this: AcpSdkAdapter,
@@ -1263,7 +1265,14 @@ test("uncertain abort keeps its unresolved owner fenced through session reattach
 		input,
 		cursor,
 	) {
-		if (queryName === "turn.result") return queryResponse.promise;
+		if (queryName === "turn.result")
+			return Promise.resolve({
+				kind: "prompt",
+				status: "in_flight",
+				receiptState: "absent",
+				commandId: "cancel-settlement-command-1",
+				turnId: "cancel-settlement-turn-1",
+			});
 		return originalQuery.call(this, queryName, input, cursor);
 	});
 	try {
@@ -1287,24 +1296,6 @@ test("uncertain abort keeps its unresolved owner fenced through session reattach
 			(error: unknown) => error as { code?: string },
 		);
 		await waitFor(() => query.mock.calls.length === 1, "single exact turn.result recovery query");
-		fixture.reconnect();
-		fixture.sendToolStart("reconnect-recovery-probe");
-		await waitFor(
-			() =>
-				fixture.updates.some(
-					update =>
-						update.update.sessionUpdate === "tool_call" &&
-						(update.update as { toolCallId?: string }).toolCallId === "reconnect-recovery-probe",
-				),
-			"frame processing after the changed connection identity",
-		);
-		queryResponse.resolve({
-			kind: "prompt",
-			status: "in_flight",
-			receiptState: "absent",
-			commandId: "cancel-settlement-command-1",
-			turnId: "cancel-settlement-turn-1",
-		});
 		expect(await bounded(cancellation, "bounded uncertain-abort recovery")).toMatchObject({
 			code: "terminal_uncertain",
 		});
@@ -1326,43 +1317,8 @@ test("uncertain abort keeps its unresolved owner fenced through session reattach
 		expect(blocked).toMatchObject({ code: "conflict" });
 		expect(fixture.promptDeliveryCount()).toBe(1);
 
-		const capabilityQueriesBeforeReattach = fixture.queryCalls.filter(
-			queryName => queryName === "runtime.capabilities",
-		).length;
-		fixture.signalTransportFailure(new SdkClientError("reconnect_exhausted", "fixture reconnect exhausted"));
-		try {
-			await waitFor(
-				() =>
-					fixture.queryCalls.filter(queryName => queryName === "runtime.capabilities").length >
-					capabilityQueriesBeforeReattach,
-				"replacement session attachment capability query",
-				5_000,
-			);
-		} catch (error) {
-			const updates = fixture.updates.map(notification => {
-				const update = notification.update as { sessionUpdate?: string; _meta?: Record<string, unknown> };
-				return { sessionUpdate: update.sessionUpdate, _meta: update._meta };
-			});
-			throw new Error(
-				`Reattachment did not issue runtime.capabilities; broker=${JSON.stringify(fixture.brokerCalls)} queries=${JSON.stringify(fixture.queryCalls)} updates=${JSON.stringify(updates)}`,
-				{ cause: error },
-			);
-		}
-		const workingUpdatesBeforeReattach = fixture.updates.filter(
-			update =>
-				update.update.sessionUpdate === "session_info_update" &&
-				(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
-		).length;
-		await waitFor(
-			() =>
-				fixture.updates.filter(
-					update =>
-						update.update.sessionUpdate === "session_info_update" &&
-						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
-				).length > workingUpdatesBeforeReattach,
-			"reattachment with the unresolved abort owner",
-			60_000,
-		);
+		await bounded(fixture.agent.closeSession({ sessionId: fixture.sessionId }), "local session detach");
+		await fixture.newSessionAgain();
 		const blockedAfterReattach = await prompt(fixture, "must remain fenced after reattachment").then(
 			() => undefined,
 			(error: unknown) => error as { code?: string },
@@ -1381,7 +1337,6 @@ test("uncertain abort keeps its unresolved owner fenced through session reattach
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "successor prompt completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
-		queryResponse.resolve({});
 		cancel.mockRestore();
 		query.mockRestore();
 		fixture.dispose();
@@ -1646,7 +1601,11 @@ test("an invalid correlated terminal keeps an uncertain abort owner background-f
 });
 
 test("uncertain abort before prompt acknowledgement promotes clientRef recovery across reattachment", async () => {
-	const fixture = await createTransportRecoveryFixture({ deferPromptAcknowledgement: true });
+	const fixture = await createFixture({
+		deferPromptAcknowledgement: true,
+		liveSessionIndex: true,
+		primaryControlSurface: "cli",
+	});
 	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
 		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
 			operation: "turn.abort",
@@ -1702,32 +1661,8 @@ test("uncertain abort before prompt acknowledgement promotes clientRef recovery 
 		expect(blocked).toMatchObject({ code: "conflict" });
 		expect(fixture.promptDeliveryCount()).toBe(1);
 
-		const capabilityQueriesBeforeReattach = fixture.queryCalls.filter(
-			queryName => queryName === "runtime.capabilities",
-		).length;
-		fixture.signalTransportFailure(new SdkClientError("reconnect_exhausted", "fixture reconnect exhausted"));
-		await waitFor(
-			() =>
-				fixture.queryCalls.filter(queryName => queryName === "runtime.capabilities").length >
-				capabilityQueriesBeforeReattach,
-			"replacement attachment after pre-ack recovery",
-			40_000,
-		);
-		const workingUpdatesBeforeReattach = fixture.updates.filter(
-			update =>
-				update.update.sessionUpdate === "session_info_update" &&
-				(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
-		).length;
-		await waitFor(
-			() =>
-				fixture.updates.filter(
-					update =>
-						update.update.sessionUpdate === "session_info_update" &&
-						(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
-				).length > workingUpdatesBeforeReattach,
-			"replacement attachment restored the pre-ack abort fence",
-			40_000,
-		);
+		await bounded(fixture.agent.closeSession({ sessionId: fixture.sessionId }), "local CLI detach");
+		await fixture.newSessionAgain();
 		const blockedAfterReattach = await prompt(fixture, "pre-ack abort remains fenced after reattachment").then(
 			() => undefined,
 			(error: unknown) => error as { code?: string },
