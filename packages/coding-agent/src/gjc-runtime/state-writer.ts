@@ -141,6 +141,11 @@ export interface StateWriterOptions {
 	activeStateScopeLockHeld?: boolean;
 }
 
+export interface WorkflowStateLockOptions extends StateWriterOptions {
+	/** Avoid creating a missing target parent while acquiring a read-side lock. */
+	createMissingParents?: boolean;
+}
+
 export class StateWriteConflictError extends Error {
 	constructor(
 		public readonly path: string,
@@ -652,6 +657,7 @@ async function closePrivatePublicationContext(context: PrivatePublicationContext
 async function preparePrivateDirectory(
 	filePath: string,
 	options: StateWriterOptions,
+	createMissingParents = true,
 ): Promise<PrivatePublicationContext> {
 	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
 	const boundary = resolveGjcTarget(options.privateDurable!.directory, cwdForOptions(options));
@@ -687,11 +693,13 @@ async function preparePrivateDirectory(
 			const childPath = path.join(directoryPath(parent), segment);
 			directory = path.join(directory, segment);
 			let created = false;
-			try {
-				await fs.mkdir(childPath, { mode: 0o700 });
-				created = true;
-			} catch (error) {
-				if (!isErrno(error, "EEXIST")) throw error;
+			if (createMissingParents) {
+				try {
+					await fs.mkdir(childPath, { mode: 0o700 });
+					created = true;
+				} catch (error) {
+					if (!isErrno(error, "EEXIST")) throw error;
+				}
 			}
 			let createdIdentity: { dev: number; ino: number } | undefined;
 			if (created) {
@@ -1103,12 +1111,16 @@ export async function writeTextAtomic(targetPath: string, text: string, options?
 export async function withWorkflowStateLock<T>(
 	targetPath: string,
 	fn: () => Promise<T>,
-	options?: StateWriterOptions,
+	options?: WorkflowStateLockOptions,
 ): Promise<T> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const privateContext = options?.privateDurable ? await preparePrivateDirectory(filePath, options) : undefined;
+	const createMissingParents = options?.createMissingParents !== false;
+	const privateContext = options?.privateDurable
+		? await preparePrivateDirectory(filePath, options, createMissingParents)
+		: undefined;
+	const lockOptions = createMissingParents ? options?.lock : { ...options?.lock, createParent: false };
 	try {
-		return await lockResolvedWorkflowTarget(filePath, fn, options?.lock);
+		return await lockResolvedWorkflowTarget(filePath, fn, lockOptions, createMissingParents);
 	} finally {
 		if (privateContext) await closePrivatePublicationContext(privateContext);
 	}
@@ -1118,10 +1130,12 @@ async function lockResolvedWorkflowTarget<T>(
 	filePath: string,
 	fn: () => Promise<T>,
 	lockOptions?: FileLockOptions,
+	createMissingParents = true,
 ): Promise<T> {
 	// `withFileLock` creates the lock dir next to the target with a non-recursive
-	// mkdir, so the parent directory must exist before the lock is acquired.
-	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	// mkdir, so normal callers create the parent. Read-only callers can instead
+	// require it to remain present and let a concurrent removal fail with ENOENT.
+	if (createMissingParents) await fs.mkdir(path.dirname(filePath), { recursive: true });
 	return withFileLock(filePath, fn, lockOptions);
 }
 

@@ -25,6 +25,8 @@ export interface FileLockOptions {
 	staleMs?: number;
 	retries?: number;
 	retryDelayMs?: number;
+	/** Require the lock parent to exist instead of creating it during acquisition. */
+	createParent?: boolean;
 	signal?: AbortSignal;
 	onAcquired?: () => void;
 	onContended?: () => void;
@@ -94,6 +96,7 @@ const DEFAULT_OPTIONS: Required<
 	staleMs: 10_000,
 	retries: 50,
 	retryDelayMs: 100,
+	createParent: true,
 };
 
 /**
@@ -1702,10 +1705,13 @@ async function tryAcquireLock(
 	previousOwnerHostIds: readonly string[],
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
+	createParent = true,
 ): Promise<FileLockAcquisitionResult> {
-	await ensureLockParent(path.dirname(lockPath));
-	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
-	if (afterParentMkdir) await afterParentMkdir(lockPath);
+	if (createParent) {
+		await ensureLockParent(path.dirname(lockPath));
+		const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
+		if (afterParentMkdir) await afterParentMkdir(lockPath);
+	}
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	let removePending = false;
@@ -2180,10 +2186,11 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const orphanTransitionAgeMs = Math.max(0, opts.retries * opts.retryDelayMs);
+	const createParent = opts.createParent !== false;
 
 	if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 	const lockPath = getLockPath(filePath);
-	await ensureLockParent(path.dirname(lockPath));
+	if (createParent) await ensureLockParent(path.dirname(lockPath));
 	try {
 		await reapOrphanedLockStagingDirs(lockPath);
 	} catch (error) {
@@ -2208,6 +2215,7 @@ export async function acquireFileLock(filePath: string, options: FileLockOptions
 			opts.previousOwnerHostIds ?? [],
 			ownerToken,
 			opts.onAcquired,
+			createParent,
 		);
 		if (isFileLockOrphanTransition(result))
 			throw new FileLockAcquireError(
