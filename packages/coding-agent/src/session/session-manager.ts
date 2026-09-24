@@ -96,6 +96,7 @@ import {
 	deleteManagedSessionCandidate,
 	isRecoverableOwnerOnlyModeDrift,
 	listManagedCandidates,
+	type ManagedCandidate,
 	type ManagedCandidateWriteAuthority,
 	type ManagedMigrationPolicy,
 	type ManagedOpenCandidateResult,
@@ -6487,34 +6488,95 @@ class NdjsonFileWriter {
 	}
 }
 
-const PROJECT_SESSION_SCAN_MAX_DIRECTORIES = 4096;
-const PROJECT_SESSION_SCAN_MAX_FILES = 1000;
+interface ProjectManagedTranscriptCandidate {
+	scope: ManagedScope;
+	candidate: ManagedCandidate;
+}
 
-export function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: string): boolean {
-	if (isStagedSessionPath(filePath)) return false;
-	const relative = path.relative(projectGjcDir, filePath);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
-	const segments = relative.split(path.sep).filter(Boolean);
-	if (segments.includes(SESSION_STAGING_DIRNAME)) return false;
-	if (segments.length < 2) return false;
-	if (segments[0] !== "agent-session" && segments[0] !== "sessions") return false;
-	const fileName = segments.at(-1);
-	return Boolean(fileName && !fileName.startsWith(".") && fileName.endsWith(".jsonl"));
+function listProjectManagedTranscriptCandidates(
+	cwd: string,
+	managedAgentDir?: string,
+): readonly ProjectManagedTranscriptCandidate[] {
+	try {
+		const agentDir = managedAgentDir ?? getAgentDir();
+		const sessionsRoot = getSessionsDir(agentDir);
+		const resolved = resolveManagedScope({ cwd, agentDir, sessionsRoot });
+		if (resolved.kind !== "resolved") return [];
+		const listing = listManagedCandidates(resolved.scope);
+		return listing.kind === "complete"
+			? listing.owned
+					.filter(
+						candidate =>
+							candidate.provenance === "v2" &&
+							path.resolve(path.dirname(candidate.path)) === path.resolve(resolved.scope.directoryPath) &&
+							!isStagedSessionPath(candidate.path),
+					)
+					.map(candidate => ({ scope: resolved.scope, candidate }))
+			: [];
+	} catch {
+		return [];
+	}
+}
+
+function findProjectManagedTranscriptCandidate(
+	projectGjcDir: string,
+	filePath: string,
+	managedAgentDir?: string,
+): ProjectManagedTranscriptCandidate | undefined {
+	const root = path.resolve(projectGjcDir);
+	if (path.basename(root) !== ".gjc") return undefined;
+	const requestedPath = path.resolve(filePath);
+	return listProjectManagedTranscriptCandidates(path.dirname(root), managedAgentDir).find(
+		({ candidate }) => path.resolve(candidate.path) === requestedPath,
+	);
+}
+
+function projectCandidateMatchesRecoveryIdentity(
+	candidate: ManagedCandidate,
+	identity: native.RecoveryFsIdentity | undefined,
+): boolean {
+	if (!identity?.sha256) return false;
+	try {
+		return (
+			BigInt(identity.dev) === candidate.identity.dev &&
+			BigInt(identity.ino) === candidate.identity.ino &&
+			BigInt(identity.nlink) === candidate.identity.nlink &&
+			Number(identity.size) === candidate.identity.size &&
+			BigInt(identity.mtimeNs) === candidate.identity.mtimeNs &&
+			BigInt(identity.ctimeNs) === candidate.identity.ctimeNs &&
+			identity.sha256 === candidate.identity.sha256
+		);
+	} catch {
+		return false;
+	}
+}
+
+/** True only when `filePath` is an exact candidate in the user's managed scope for this project cwd. */
+export function isProjectSessionTranscriptPath(
+	projectGjcDir: string,
+	filePath: string,
+	managedAgentDir?: string,
+): boolean {
+	return findProjectManagedTranscriptCandidate(projectGjcDir, filePath, managedAgentDir) !== undefined;
 }
 
 export function readAuthorizedProjectSessionTranscript(
 	projectGjcDir: string,
 	filePath: string,
 	maxBytes: number,
+	managedAgentDir?: string,
 ): Buffer | undefined {
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes === Number.MAX_SAFE_INTEGER) return undefined;
 	const root = path.resolve(projectGjcDir);
 	const candidate = path.resolve(filePath);
-	if (!isProjectSessionTranscriptPath(root, candidate)) return undefined;
-	const relativePath = path.relative(root, candidate).split(path.sep).join("/");
+	const managed = findProjectManagedTranscriptCandidate(root, candidate, managedAgentDir);
+	if (!managed || managed.candidate.identity.size > maxBytes) return undefined;
+	const managedRoot = path.resolve(managed.scope.directoryPath);
+	if (path.dirname(candidate) !== managedRoot) return undefined;
+	const relativePath = path.relative(managedRoot, candidate).split(path.sep).join("/");
 	let authority: native.RecoveryFsRoot | undefined;
 	try {
-		authority = nativeSessionManager().openRecoveryFsRoot(root);
+		authority = nativeSessionManager().openRecoveryFsRoot(managedRoot);
 	} catch (error) {
 		if (!(error instanceof Error) || error.message !== "unsupported_platform") throw error;
 	}
@@ -6524,8 +6586,8 @@ export function readAuthorizedProjectSessionTranscript(
 			code: "unsupported_platform",
 		};
 		if (!result.ok && result.code === "unsupported_platform") {
-			const relativeParts = path.relative(root, path.dirname(candidate)).split(path.sep).filter(Boolean);
-			const parentPaths = [root];
+			const relativeParts = path.relative(managedRoot, path.dirname(candidate)).split(path.sep).filter(Boolean);
+			const parentPaths = [managedRoot];
 			for (const part of relativeParts) parentPaths.push(path.join(parentPaths[parentPaths.length - 1]!, part));
 			const parentIdentities = parentPaths.map(parentPath => {
 				const stat = fs.lstatSync(parentPath, { bigint: true });
@@ -6574,6 +6636,16 @@ export function readAuthorizedProjectSessionTranscript(
 					fs.closeSync(parentFd);
 				}
 			}
+			if (
+				captured.identity.dev !== managed.candidate.identity.dev ||
+				captured.identity.ino !== managed.candidate.identity.ino ||
+				captured.identity.nlink !== managed.candidate.identity.nlink ||
+				captured.identity.size !== managed.candidate.identity.size ||
+				captured.identity.mtimeNs !== managed.candidate.identity.mtimeNs ||
+				captured.identity.ctimeNs !== managed.candidate.identity.ctimeNs ||
+				captured.identity.sha256 !== managed.candidate.identity.sha256
+			)
+				throw new Error("project transcript managed candidate identity changed during read");
 			for (const expected of parentIdentities) {
 				const stat = fs.lstatSync(expected.path, { bigint: true });
 				if (
@@ -6586,82 +6658,30 @@ export function readAuthorizedProjectSessionTranscript(
 				)
 					throw new Error("project transcript parent identity changed during read");
 			}
-			if (captured.identity.size > BigInt(maxBytes) || captured.bytes.byteLength > maxBytes) return undefined;
+			if (captured.identity.size > maxBytes || captured.bytes.byteLength > maxBytes) return undefined;
 			return Buffer.from(captured.bytes);
 		}
-		if (!result.ok || !result.data || result.data.byteLength > maxBytes) return undefined;
+		if (
+			!result.ok ||
+			!result.data ||
+			result.data.byteLength !== managed.candidate.identity.size ||
+			result.data.byteLength > maxBytes ||
+			!projectCandidateMatchesRecoveryIdentity(managed.candidate, result.identity)
+		)
+			return undefined;
 		return Buffer.from(result.data);
 	} finally {
 		authority?.close();
 	}
 }
 
-/**
- * Discover resumable transcripts intentionally stored inside a project's `.gjc`.
- * Runtime token/audit JSONL files are excluded by requiring a known transcript
- * container (`agent-session` or `sessions`).
- */
-export function listProjectSessionTranscriptFiles(cwd: string): string[] {
-	const projectGjcDir = path.join(path.resolve(cwd), ".gjc");
-	let rootStat: fs.Stats;
-	try {
-		rootStat = fs.lstatSync(projectGjcDir);
-	} catch {
-		return [];
-	}
-	if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
-
-	const directories = [projectGjcDir];
-	const files: string[] = [];
-	let scannedDirectories = 0;
-	while (directories.length > 0 && scannedDirectories < PROJECT_SESSION_SCAN_MAX_DIRECTORIES) {
-		const directory = directories.pop()!;
-		scannedDirectories++;
-		let entries: fs.Dirent[];
-		try {
-			entries = fs.readdirSync(directory, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-		for (const entry of entries) {
-			if (entry.isSymbolicLink()) continue;
-			const entryPath = path.join(directory, entry.name);
-			if (entry.isDirectory()) {
-				if (entry.name === SESSION_STAGING_DIRNAME) continue;
-				directories.push(entryPath);
-				continue;
-			}
-			if (
-				entry.isFile() &&
-				!entry.name.startsWith(".") &&
-				entry.name.endsWith(".jsonl") &&
-				isProjectSessionTranscriptPath(projectGjcDir, entryPath)
-			) {
-				files.push(entryPath);
-				if (files.length >= PROJECT_SESSION_SCAN_MAX_FILES) return files;
-			}
-		}
-	}
-	return files;
-}
-
-async function collectProjectSessions(cwd: string, storage: FileSessionStorage): Promise<SessionInfo[]> {
-	return await collectSessionsFromFiles(listProjectSessionTranscriptFiles(cwd), storage);
+/** Discover validated user-managed transcripts belonging to the requested project cwd. */
+export function listProjectSessionTranscriptFiles(cwd: string, managedAgentDir?: string): string[] {
+	return listProjectManagedTranscriptCandidates(cwd, managedAgentDir).map(({ candidate }) => candidate.path);
 }
 
 export function prioritizeStarredSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
 	return [...sessions.filter(session => session.starred), ...sessions.filter(session => !session.starred)];
-}
-
-function mergeSessionInventories(...inventories: SessionInfo[][]): SessionInfo[] {
-	const sessions = new Map<string, SessionInfo>();
-	for (const inventory of inventories) {
-		for (const session of inventory) {
-			const current = sessions.get(session.id);
-			if (!current || session.modified.getTime() > current.modified.getTime()) sessions.set(session.id, session);
-		}
-	}
-	return [...sessions.values()].sort((left, right) => right.modified.getTime() - left.modified.getTime());
 }
 
 const DEFAULT_WELCOME_RECENT_SESSION_LIMIT = 20;
@@ -17678,21 +17698,20 @@ export class SessionManager {
 		if (isStagedSessionPath(session.path)) throw new Error("Staged session paths are not resumable");
 		const directory = await fs.promises.realpath(path.dirname(session.path));
 		const sessionPath = path.join(directory, path.basename(session.path));
+		let authorizedCandidate: ManagedCandidate | undefined;
 		if (explicitSessionDir) {
 			const root = await fs.promises.realpath(explicitSessionDir);
 			if (!pathIsWithin(root, sessionPath)) throw new Error("Session is outside the configured session directory.");
-		} else if (
-			!isProjectSessionTranscriptPath(path.join(canonicalizeTrustedPath(session.cwd), ".gjc"), sessionPath)
-		) {
-			const sessionsRoot = path.dirname(directory);
-			const resolved = resolveManagedScope({ cwd: session.cwd, agentDir: path.dirname(sessionsRoot), sessionsRoot });
+		} else {
+			const sessionsRoot = getSessionsDir();
+			const resolved = resolveManagedScope({ cwd: session.cwd, agentDir: getAgentDir(), sessionsRoot });
 			if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);
 			const listing = listManagedCandidates(resolved.scope);
-			if (
-				listing.kind !== "complete" ||
-				!listing.owned.some(candidate => path.resolve(candidate.path) === sessionPath)
-			)
-				throw new Error("Session is not an authorized managed candidate.");
+			authorizedCandidate =
+				listing.kind === "complete"
+					? listing.owned.find(candidate => path.resolve(candidate.path) === sessionPath)
+					: undefined;
+			if (!authorizedCandidate) throw new Error("Session is not an authorized managed candidate.");
 		}
 		const authority = new ManagedSessionDescendantStore(managedDirectoryRoot(directory), directory);
 		try {
@@ -17703,6 +17722,12 @@ export class SessionManager {
 				throw new Error("Session is too large to star from the picker. Use /star or /unstar in the session.");
 			const snapshot = authority.readExpected(relativePath);
 			if (!snapshot) throw new Error("Selected session no longer exists.");
+			if (
+				authorizedCandidate &&
+				(!resumeIdentityMatchesDescriptor(authorizedCandidate.identity, snapshot.identity) ||
+					authorizedCandidate.identity.sha256 !== snapshot.identity.sha256)
+			)
+				throw new Error("Selected session identity changed. Reopen the session picker.");
 			const content = snapshot.bytes.toString("utf8");
 			const newline = content.indexOf("\n");
 			const rawHeader: unknown = JSON.parse(newline === -1 ? content : content.slice(0, newline));
@@ -21427,7 +21452,7 @@ export class SessionManager {
 			listing.owned.filter(candidate => !isStagedSessionPath(candidate.path)).map(candidate => candidate.path),
 			storage,
 		);
-		return mergeSessionInventories(managed, await collectProjectSessions(cwd, storage));
+		return managed;
 	}
 
 	/**
@@ -21451,39 +21476,19 @@ export class SessionManager {
 		}
 	}
 
-	/** Delete an authorized managed or project-local picker candidate. */
-	static async deleteManagedCandidate(sessionPath: string): Promise<void> {
+	/** Delete an authorized managed picker candidate. */
+	static async deleteManagedCandidate(sessionPath: string, managedAgentDir?: string): Promise<void> {
+		const agentDir = managedAgentDir ?? getAgentDir();
+		const sessionsRoot = getSessionsDir(agentDir);
+		if (!pathIsWithin(path.resolve(sessionsRoot), path.resolve(sessionPath)))
+			throw new Error("Session is not an authorized managed candidate.");
 		const storage = new FileSessionStorage();
 		const inspected = inspectTranscriptHeaderBounded(sessionPath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 		if (!inspected.ok || !inspected.inspection.cwd) throw new Error("Session has no valid workspace header.");
 		const headerCwd = inspected.inspection.cwd;
-		const projectGjcDir = path.join(path.resolve(headerCwd), ".gjc");
-		if (isProjectSessionTranscriptPath(projectGjcDir, sessionPath)) {
-			const relativePath = path.relative(projectGjcDir, path.resolve(sessionPath)).split(path.sep).join("/");
-			const authority = nativeSessionManager().openRecoveryFsRoot(projectGjcDir);
-			try {
-				const observed = authority.stat(relativePath);
-				if (!observed.ok || !observed.identity?.sha256)
-					throw new Error("Project session is no longer an authorized candidate.");
-				const removed = authority.removeManaged(
-					relativePath,
-					observed.identity.dev,
-					observed.identity.ino,
-					observed.identity.size,
-					observed.identity.mtimeNs,
-					observed.identity.ctimeNs,
-					observed.identity.sha256,
-				);
-				if (!removed.ok) throw new Error(removed.code ?? "Could not delete project session.");
-				return;
-			} finally {
-				authority.close();
-			}
-		}
-		const sessionsRoot = path.resolve(sessionPath, "../..");
 		const resolved = resolveManagedScope({
 			cwd: headerCwd,
-			agentDir: path.resolve(sessionsRoot, ".."),
+			agentDir,
 			sessionsRoot,
 		});
 		if (resolved.kind === "error") throw new Error(`Could not resolve managed session scope: ${resolved.message}`);

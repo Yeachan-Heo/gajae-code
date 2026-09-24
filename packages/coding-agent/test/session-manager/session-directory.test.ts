@@ -942,7 +942,9 @@ describe("managed session write protocol", () => {
 			syncFs.writeFileSync(lockPath, "{}\n", { mode: 0o600 });
 		};
 
-		await expect(SessionManager.deleteManagedCandidate(source)).rejects.toBeInstanceOf(SessionMigrationBusyError);
+		await expect(SessionManager.deleteManagedCandidate(source, path.dirname(sessionsRoot))).rejects.toBeInstanceOf(
+			SessionMigrationBusyError,
+		);
 		expect(releaseFenceTriggered).toBe(true);
 	});
 
