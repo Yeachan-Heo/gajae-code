@@ -8,7 +8,7 @@ import * as path from "node:path";
 export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_CONCURRENCY = 1;
-export const TEST_PRELOAD = "./scripts/test-preload.ts";
+export const TEST_PRELOAD = "./scripts/test-preload-after-all.ts";
 
 export interface HarnessOptions {
 	root: string;
@@ -389,6 +389,7 @@ export async function runHarness(
 	if (allFiles.length === 0) throw new Error(`No test files found under ${options.root}.`);
 	if (files.length === 0) throw new Error(`Shard contains no test files under ${options.root}.`);
 	const workerCount = Math.min(options.concurrency, files.length);
+	const preserveSandboxesForDebugging = process.env.GJC_TEST_KEEP_TMP === "1";
 	process.stdout.write(
 		`fresh-process test harness: root=${options.root} files=${files.length}/${allFiles.length}${options.shard ? ` shard=${options.shard.index}/${options.shard.total}` : ""} concurrency=${workerCount} ci-shards=${process.env.CI_CODING_AGENT_TEST_SHARDS ?? "unset"}\n`,
 	);
@@ -420,7 +421,11 @@ export async function runHarness(
 				process.stderr.write(`${file}: harness runner failed: ${error instanceof Error ? error.message : String(error)}\n`);
 				result = { exitCode: 1, timedOut: false };
 			} finally {
-				await fs.rm(sandbox, { recursive: true, force: true });
+				if (preserveSandboxesForDebugging) {
+					process.stderr.write(`GJC_TEST_KEEP_TMP=1: preserving test sandbox ${sandbox}\n`);
+				} else {
+					await fs.rm(sandbox, { recursive: true, force: true });
+				}
 				const wallMs = Math.round(performance.now() - startedAt);
 				if (result.durationMs === undefined) result.durationMs = wallMs;
 				const childMs = Math.round(result.durationMs);
