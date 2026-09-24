@@ -105,11 +105,12 @@ describe.serial("AgentSession resilient retry", () => {
 	function createRetryTestSessionManager(): SessionManager {
 		const manager = SessionManager.inMemory(tempDir.path());
 		// A coordinator state-file pin is process-wide authority for one session.
-		// Give each in-memory session its own sidecar instead of making unrelated
-		// retry cases contend on the same lock and its real retry backoff.
+		// Put each in-memory session in a separate namespace too: the state sidecar
+		// transaction lock is parent-directory scoped, not state-file scoped.
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(
 			tempDir.path(),
-			`runtime-state-${manager.getSessionId()}.json`,
+			`session-${manager.getSessionId()}`,
+			"runtime-state.json",
 		);
 		return manager;
 	}
@@ -118,7 +119,7 @@ describe.serial("AgentSession resilient retry", () => {
 		// waitForIdle() does not include the sidecar write. Join it before dispose
 		// closes the session manager, or teardown can wait on the flush until its
 		// 120s disposal deadline.
-		await value.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
+		await value.awaitCoordinatorRuntimeStatePersistenceForTests();
 		await value.dispose();
 	}
 
@@ -140,7 +141,10 @@ describe.serial("AgentSession resilient retry", () => {
 		const currentTempDir = tempDir;
 		session = undefined;
 		if (currentSession) {
-			await disposeAfterCoordinatorPersistence(currentSession);
+			// Keep teardown failures from masking the case result. The explicit loop
+			// disposals below propagate persistence failures after their assertions.
+			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
+			await currentSession.dispose();
 		}
 		currentAuthStorage.close();
 		currentTempDir.removeSync();
