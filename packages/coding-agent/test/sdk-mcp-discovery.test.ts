@@ -304,6 +304,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			publication,
 			generation,
 		});
+		const setOnToolsChanged = vi.spyOn(MCPManager.prototype, "setOnToolsChanged");
 
 		const { session, startDeferredMcpConfig } = await createAgentSession({
 			...createIsolatedSessionOptions(),
@@ -312,6 +313,7 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 		});
 		try {
 			await expect(startDeferredMcpConfig!()).resolves.toEqual({ loadedToolCount: 0, hasErrors: true });
+			expect(setOnToolsChanged).not.toHaveBeenCalled();
 			expect(session.getAllToolNames()).not.toContain(staleTool.name);
 			expect(session.getActiveToolNames()).not.toContain(staleTool.name);
 		} finally {
@@ -929,9 +931,18 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 	});
 	it("preserves caller-owned normal MCP manager reuse in canonical sub-session shapes", async () => {
 		const callerMcpManager = new MCPManager(tempDir);
-		const getTools = vi
-			.spyOn(callerMcpManager, "getTools")
-			.mockReturnValue([createMcpCustomTool("mcp__caller_lookup", "caller", "lookup")] as never);
+		const initialTool = createMcpCustomTool("mcp__caller_lookup", "caller", "lookup");
+		const lateTool = createMcpCustomTool("mcp__caller_late_lookup", "caller", "late_lookup");
+		const subscribeToToolsChanged = callerMcpManager.subscribeToToolsChanged;
+		let publishToolsChanged: Parameters<MCPManager["subscribeToToolsChanged"]>[0] | undefined;
+		vi.spyOn(callerMcpManager, "subscribeToToolsChanged").mockImplementation(handler => {
+			publishToolsChanged = handler;
+			return subscribeToToolsChanged.call(callerMcpManager, handler);
+		});
+		const getTools = vi.spyOn(callerMcpManager, "getTools").mockImplementation(() => {
+			publishToolsChanged?.([lateTool] as never);
+			return [initialTool] as never;
+		});
 		const disconnectAll = vi.spyOn(callerMcpManager, "disconnectAll");
 
 		for (const subSessionOptions of [
@@ -946,7 +957,8 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 			});
 			try {
 				expect(mcpManager).toBe(callerMcpManager);
-				expect(session.getAllToolNames()).toContain("mcp__caller_lookup");
+				expect(session.getAllToolNames()).toContain(lateTool.name);
+				expect(session.getAllToolNames()).not.toContain(initialTool.name);
 			} finally {
 				await session.dispose();
 			}

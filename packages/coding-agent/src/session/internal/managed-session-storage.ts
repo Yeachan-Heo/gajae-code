@@ -1178,11 +1178,40 @@ export function retainManagedDirectoryAuthority(
 		)
 			throw new Error("Managed root authority changed");
 		const relative = path.relative(root.canonicalPath, resolved).split(path.sep).join("/");
-		return rootAuthority.retainManagedDirectory(
+		const rootRecovery = rootAuthority.recoveryReaperMetrics();
+		const rootRecoveryUnhealthy = !rootRecovery.ok || Boolean(rootRecovery.code);
+		if (rootRecoveryUnhealthy)
+			logger.warn("Managed recovery sidecar reaping", {
+				ok: rootRecovery.ok,
+				code: rootRecovery.code,
+				reapedCount: rootRecovery.totalReapedFiles,
+				reapedBytes: rootRecovery.totalReapedBytes,
+				failureCount: rootRecovery.totalFailures,
+				scanLimited: rootRecovery.scanLimited,
+			});
+		const authority = rootAuthority.retainManagedDirectory(
 			relative,
 			canonicalFileId(named.dev).toString(),
 			canonicalFileId(named.ino).toString(),
 		);
+		const recovery = authority.recoveryReaperMetrics();
+		if (
+			!rootRecoveryUnhealthy &&
+			(!recovery.ok ||
+				recovery.code ||
+				recovery.totalReapedFiles !== "0" ||
+				recovery.totalFailures !== "0" ||
+				recovery.scanLimited)
+		)
+			logger.warn("Managed recovery sidecar reaping", {
+				ok: recovery.ok,
+				code: recovery.code,
+				reapedCount: recovery.totalReapedFiles,
+				reapedBytes: recovery.totalReapedBytes,
+				failureCount: recovery.totalFailures,
+				scanLimited: recovery.scanLimited,
+			});
+		return authority;
 	} finally {
 		rootAuthority.close();
 	}
