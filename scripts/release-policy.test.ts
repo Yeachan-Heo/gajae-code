@@ -208,6 +208,11 @@ describe("stable release policy", () => {
 		expect(publish).toContain("Publish sealed tarballs to npm");
 		expect(publish).toContain("sha512sum --check --strict");
 		expect(publish).toContain("gajae-release-oidc-publish-receipt-v1.json");
+		// Registry observation must bypass the CDN-cached packument (max-age=300):
+		// `npm view` made every package wait up to five minutes and timed out 0.17.5.
+		expect(publish).not.toContain("npm view");
+		expect(publish).toContain('"${registry}$(registry_path "$1")/$2"');
+		expect(publish).toContain('"${registry}-/package/$(registry_path "$1")/dist-tags"');
 	});
 
 	test("gates the OIDC boundary on the approval environment without changing the publish subject", async () => {
