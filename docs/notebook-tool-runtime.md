@@ -2,7 +2,7 @@
 
 This document describes how coding-agent reads and edits Jupyter notebooks (`.ipynb`) and how that relates to Python execution.
 
-The critical distinction: **there is no dedicated `notebook` tool, and nothing executes notebook cells**. `read` and `edit` convert a notebook to an editable plain-text cell representation and write edits back to the notebook JSON. Running Python goes through the `eval` tool (`language: "py"`) or the `python` tool, neither of which reads or writes `.ipynb` files.
+The critical distinction: **there is no dedicated `notebook` tool, and nothing automatically executes notebook cells**. The notebook-aware `read` route and the `replace`, `patch`, `hashline`, and `apply_patch` edit modes convert a notebook to an editable plain-text cell representation and serialize those edits back to notebook JSON; `vim` and `write` use their ordinary text paths described below. Running Python goes through the `eval` tool (`language: "py"`) or the `python` tool. Neither automatically loads notebook cells, though supplied Python code can use ordinary filesystem APIs to read or write files.
 
 ## Implementation files
 
@@ -26,7 +26,7 @@ df = pd.read_csv("data.csv")
 
 - Marker format: `# %% [<cell_type>] cell:<index>`, where `<cell_type>` is `code`, `markdown`, or `raw` and `<index>` is the cell's position in the original notebook.
 - A cell with empty source renders as the marker line alone.
-- Only cell sources are shown. Outputs, execution counts, and cell/notebook metadata are not part of the text, but they are preserved on write (see [Round-trip semantics](#3-round-trip-semantics)).
+- Only cell sources are shown. On round-trip, top-level notebook fields and metadata on matched original cells are preserved. Existing outputs and execution counts are preserved only for matched cells that remain code cells; changing a matched cell to a non-code type removes those fields. New and removed cells follow the rules in [Round-trip semantics](#3-round-trip-semantics).
 - A cell source that ends with a newline shows as a blank line before the next marker and round-trips with that newline intact.
 
 ## 2) Tool integration
@@ -39,18 +39,18 @@ df = pd.read_csv("data.csv")
 
 ### `edit`
 
-The `replace`, `patch`, and `hashline` edit modes (and `apply_patch`, which expands into patch-mode entries) load files through `readEditFileText()` and write through `serializeEditFileText()`:
+For `.ipynb` updates, the `replace`, `patch`, and `hashline` edit modes and `apply_patch` updates route existing-file content through `readEditFileText()` and serialize edits through `serializeEditFileText()`. An `apply_patch` create operation skips the read step but still uses the serializer when writing the new `.ipynb` file.
 
-- `readEditFileText()` enforces the `MAX_EDIT_FILE_BYTES` (8 MiB) guard **before** notebook conversion, so an oversized notebook fails fast instead of being parsed on the main thread.
+- On the existing-file read path, `readEditFileText()` enforces the `MAX_EDIT_FILE_BYTES` (8 MiB) guard **before** notebook conversion, so an oversized notebook fails fast instead of being parsed on the main thread.
 - For `.ipynb`, the edit mode then operates on the editable text, and `serializeEditFileText()` maps the edited text back to notebook JSON via `serializeEditedNotebookText()`.
 - If the notebook does not exist at serialization time (an edit mode creating a new file), edits apply to a new empty notebook (`nbformat` 4, `nbformat_minor` 5).
 - Notebook JSON is written with `JSON.stringify(notebook, null, 1)`.
 
-The `vim` edit mode reads and writes the file's raw bytes, so on a `.ipynb` it edits the notebook JSON directly.
+The `vim` edit mode reads the file as UTF-8 text and edits the notebook's raw JSON text directly; it does not use the notebook cell converter. Saving follows the ordinary write-through path.
 
 ### `write`
 
-`write` does not use the notebook converter. Content passed to `write` for a `.ipynb` path is written verbatim, so it must already be notebook JSON.
+`write` does not use the notebook converter. It follows the ordinary write path and does not translate editable cell markers into notebook JSON, so supply valid notebook JSON when the result should remain a notebook.
 
 ## 3) Round-trip semantics
 
@@ -85,9 +85,9 @@ Conversion throws for:
 
 ## 5) Relationship to Python execution
 
-Notebook handling and Python execution share no code path:
+Notebook conversion and Python execution share no code path:
 
-- `read`/`edit` never start a kernel, never execute cells, and never update cell `outputs` or `execution_count`.
+- Notebook-aware `read`/`edit` paths never start a kernel or execute cells. The edit converter preserves or clears output fields according to the round-trip rules above; it does not execute cells to produce new outputs.
 - `eval` (`language: "py"`) and `python` run code in a subprocess-backed Python runner (`src/eval/py/`). Kernel lifecycle, session reuse, cancellation, display capture, and output truncation are documented in [`python-repl.md`](python-repl.md).
 
-To run code from a notebook, read the relevant cells and pass their source to `eval` or `python` explicitly. No current tool both mutates an `.ipynb` file and executes its cells in a kernel.
+To run code from a notebook, read the relevant cells and pass their source to `eval` or `python` explicitly. No built-in notebook-aware path both edits an `.ipynb` document and automatically executes its cells in a kernel.
