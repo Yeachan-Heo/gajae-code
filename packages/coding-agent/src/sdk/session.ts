@@ -1540,29 +1540,77 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// / session would silently miss credential_disabled events.
 	// Injected auth is the caller's authority. Only the CLI root can hand off its
 	// explicit startup snapshot; never discover global config for injected SDK auth.
-	const startupAuthConfig = hasInjectedAuth
-		? options.modelRegistryStartupMutation?.owner === "cli-root"
-			? options.startupAuthConfig
-			: undefined
-		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsModelRegistry = options.modelRegistry === undefined;
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
-	const modelRegistry =
-		options.modelRegistry ??
-		new ModelRegistry(
-			options.authStorage ??
-				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
-			path.join(agentDir, "models.yml"),
-			undefined,
-			{ agentDir },
-		);
-	const authStorage = modelRegistry.authStorage;
-	const authStorageOwner = modelRegistry.getAuthStorageOwner();
-	if (options.authStorage && options.authStorage !== authStorage) {
+	const ownsScopedSettings = options.settings === undefined;
+	if (options.modelRegistry && options.authStorage && options.authStorage !== options.modelRegistry.authStorage) {
 		throw new Error(
 			"options.authStorage and options.modelRegistry.authStorage must be the same instance when both are provided",
 		);
 	}
+	const settingsPromise =
+		options.settings === undefined
+			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
+			: Promise.resolve(options.settings);
+	const startupAuthConfigPromise = Promise.resolve(
+		hasInjectedAuth
+			? options.modelRegistryStartupMutation?.owner === "cli-root"
+				? options.startupAuthConfig
+				: undefined
+			: (options.startupAuthConfig ?? resolveStartupAuthConfig(agentDir)),
+	);
+	const authStoragePromise = options.modelRegistry
+		? Promise.resolve(options.modelRegistry.authStorage)
+		: options.authStorage
+			? Promise.resolve(options.authStorage)
+			: startupAuthConfigPromise.then(startupAuthConfig =>
+					logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig)),
+				);
+	const [settingsResult, authStorageResult] = await Promise.allSettled([settingsPromise, authStoragePromise]);
+	if (settingsResult.status === "rejected") {
+		if (authStorageResult.status === "fulfilled" && ownsAuthStorage) {
+			try {
+				authStorageResult.value.close();
+			} catch (cleanupError) {
+				logger.warn("Failed to close auth storage after scoped settings load failure", { error: cleanupError });
+			}
+		}
+		throw settingsResult.reason;
+	}
+	const settings = settingsResult.value;
+	const closeOwnedSettings = async (): Promise<void> => {
+		if (!ownsScopedSettings) return;
+		try {
+			await settings.close();
+		} finally {
+			releaseSettingsScope(settings);
+		}
+	};
+	if (authStorageResult.status === "rejected") {
+		try {
+			await closeOwnedSettings();
+		} catch (cleanupError) {
+			logger.warn("Failed to close scoped settings after auth storage setup failure", { error: cleanupError });
+		}
+		throw authStorageResult.reason;
+	}
+	const startupAuthConfig = await startupAuthConfigPromise;
+	const authStorage = authStorageResult.value;
+	let modelRegistry: ModelRegistry;
+	try {
+		modelRegistry =
+			options.modelRegistry ??
+			new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), settings, { agentDir });
+	} catch (error) {
+		if (ownsAuthStorage) authStorage.close();
+		try {
+			await closeOwnedSettings();
+		} catch (cleanupError) {
+			logger.warn("Failed to close scoped settings after model registry setup failure", { error: cleanupError });
+		}
+		throw error;
+	}
+	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 
 	let agent: Agent;
 	let sessionAgent: Agent | undefined;
@@ -1622,7 +1670,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let authStorageClosed = false;
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
-	let closeOwnedSettings: () => Promise<void> = async () => {};
 	const closeOwnedAuthStorage = async (): Promise<void> => {
 		if (ownsModelRegistry) await modelRegistry.dispose();
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
@@ -1666,19 +1713,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
-		const ownsScopedSettings = options.settings === undefined;
-		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
-		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
-		closeOwnedSettings = async (): Promise<void> => {
-			if (!ownsScopedSettings) return;
-			try {
-				await settings.close();
-			} finally {
-				releaseSettingsScope(settings);
-			}
-		};
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
 		// capturing the launch root. Before the manager exists the launch cwd is the
