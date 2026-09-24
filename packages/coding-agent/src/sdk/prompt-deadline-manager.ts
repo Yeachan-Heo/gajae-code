@@ -76,6 +76,7 @@ export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "f
 
 export type PromptDeadlineTerminalization = "settled" | "uncertain";
 
+/** Durable terminal state is committed before publication; an unpublished committed boundary retains its retry owner. */
 export interface PromptDeadlinePublicationResult {
 	outcome: SdkPromptTerminalOutcome;
 	published: boolean;
@@ -400,6 +401,7 @@ export class PromptDeadlineManager {
 					return;
 				}
 			}
+			let terminalCommitted = false;
 			if (
 				(this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineStartCleanup.has(key)) &&
 				this.#onDeadlinePublishTerminal !== undefined
@@ -423,19 +425,22 @@ export class PromptDeadlineManager {
 					this.#scheduleTerminalPublicationRetry(key);
 					return;
 				}
+				terminalCommitted = true;
 				const evidence = this.#pendingTerminalEvidence.get(key);
 				if (evidence !== undefined)
 					this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publication.outcome });
 			}
-			this.#deadlineTerminalizationConfirmed.add(key);
-			try {
-				await this.#reconciliation.noteTransition("prompt", correlation, {
-					type: "agent_end",
-					...this.#pendingTerminalEvidence.get(key),
-				});
-			} catch {
-				this.#retry(key);
-				return;
+			if (!terminalCommitted) {
+				this.#deadlineTerminalizationConfirmed.add(key);
+				try {
+					await this.#reconciliation.noteTransition("prompt", correlation, {
+						type: "agent_end",
+						...this.#pendingTerminalEvidence.get(key),
+					});
+				} catch {
+					this.#retry(key);
+					return;
+				}
 			}
 			this.#expiryRetries.delete(key);
 			try {
