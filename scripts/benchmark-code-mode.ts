@@ -45,6 +45,8 @@ const SEARCH_CORPUS_SENTINELS = [
 	"scripts/benchmark-code-mode-runs.json.gz",
 	"scripts/benchmark-code-mode-exploratory-results.json",
 	"scripts/benchmark-code-mode-exploratory-runs.json.gz",
+	"scripts/benchmark-code-mode-timeout-censored-results.json",
+	"scripts/benchmark-code-mode-timeout-censored-runs.json.gz",
 ] as const;
 const SYSTEM_PROMPT = benchmarkCodeModePrompts.trim();
 const RUN_RETRY_REASON = "The preceding attempt did not reach a validated final answer.";

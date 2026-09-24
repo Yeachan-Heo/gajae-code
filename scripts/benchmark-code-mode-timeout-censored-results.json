@@ -2,8 +2,8 @@
   "formatVersion": 1,
   "benchmark": "issue-5792-code-mode-measurement",
   "executionStatus": "complete",
-  "decisionEligible": true,
-  "validityStatus": "isolated decision-eligible rerun",
+  "decisionEligible": false,
+  "validityStatus": "timeout-censored-not-decision-eligible",
   "harnessCommit": "95eb9547969906f65c039d2178ae0157bdb5ed8f",
   "harnessCommitPurpose": "reachable source-equivalent benchmark harness commit; the clean run occurred before history was rebased, and the source/task/prompt/description Git blobs listed below are identical to the recorded run inputs",
   "harnessSourceBlobs": {
@@ -317,5 +317,17 @@
     "Attempt deadlines cover session creation and agent/tool execution; handler-session setup and cleanup use separately bounded timeouts.",
     "Arm B invokes the same read/search handler objects directly without AgentToolContext or the ordinary agent-loop dispatcher; interpret outcomes as specific to this consumer prototype."
   ],
-  "priorExploratoryArtifact": "scripts/benchmark-code-mode-exploratory-results.json"
+  "priorExploratoryArtifact": "scripts/benchmark-code-mode-exploratory-results.json",
+  "validityReason": "The 30-second full-attempt deadline censored comparisons asymmetrically: 47 of 48 Arm B attempts and 9 of 47 Arm A attempts timed out. Request and completion statistics are not decision-eligible.",
+  "detailedArtifact": "scripts/benchmark-code-mode-timeout-censored-runs.json.gz",
+  "timeoutAudit": {
+    "attempts": {
+      "A": 47,
+      "B": 48
+    },
+    "timeoutAttempts": {
+      "A": 9,
+      "B": 47
+    }
+  }
 }
