@@ -2,12 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getBundledModel } from "@gajae-code/ai/core";
+import { readDurableModelProfileOwnership } from "../config/model-profile-ownership";
+import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
 import { offBackend } from "../memory-backend/off-backend";
 import type { MemoryBackend } from "../memory-backend/types";
 import type { SttModeController } from "../modes/controllers/stt-controller";
 import { ensureSttControllerForToggle } from "../modes/interactive-mode";
 import { createAgentSession } from "../sdk/session";
+import { AuthStorage } from "../session/auth-storage";
+import { SessionManager } from "../session/session-manager";
 import type { LazyService } from "./lazy-service";
 import { createLazyService } from "./lazy-service";
 import { createOptionalRuntimeServices } from "./optional-runtime-services";
@@ -46,6 +51,171 @@ function markerMemoryService(markers: string[], startFailure?: Error): LazyServi
 }
 
 describe("legacy memory startup ordering", () => {
+	test("SDK startup applies the durable ownership profile without persisting a transition marker", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-startup-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({ "modelProfile.default": "codex-medium", "compaction.enabled": false });
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const result = await createAgentSession({
+				cwd: process.cwd(),
+				agentDir,
+				settings,
+				authStorage,
+				modelRegistry,
+				disableExtensionDiscovery: true,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				hasUI: false,
+			});
+			session = result.session;
+
+			expect(session.getActiveModelProfile()).toBe("codex-medium");
+			expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+			expect(readDurableModelProfileOwnership(settings)).toEqual({
+				schemaVersion: 1,
+				version: 0,
+				marker: { kind: "profile", profile: "codex-medium" },
+			});
+		} finally {
+			await session?.dispose();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK resume keeps a saved clear above a durable profile baseline", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-clear-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const settings = Settings.isolated({
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"compaction.enabled": false,
+		});
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!sonnet) throw new Error("Expected bundled Sonnet model");
+		let manager: SessionManager | undefined;
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const originalManager = SessionManager.create(agentDir, agentDir);
+			originalManager.appendModelChange(`${sonnet.provider}/${sonnet.id}`);
+			originalManager.appendModelProfileOwnershipMarker({ kind: "cleared" });
+			await originalManager.ensureOnDisk();
+			await originalManager.flush();
+			const sessionFile = originalManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted resume session");
+			await originalManager.close();
+			manager = await SessionManager.open(sessionFile);
+
+			const result = await createAgentSession({
+				cwd: process.cwd(),
+				agentDir,
+				settings,
+				authStorage,
+				modelRegistry,
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				hasUI: false,
+			});
+			session = result.session;
+
+			expect(session.model?.provider).toBe("anthropic");
+			expect(session.model?.id).toBe(sonnet.id);
+			expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
+			expect(session.getEffectiveModelProfileName()).toBeUndefined();
+			expect(settings.getGlobal("modelProfile.default")).toBe("codex-medium");
+			expect(readDurableModelProfileOwnership(settings).version).toBe(0);
+		} finally {
+			await session?.dispose();
+			if (!session) await manager?.close();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK resume preserves an explicit concrete model while applying durable role bindings", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-concrete-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const settings = Settings.isolated({
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"compaction.enabled": false,
+		});
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!sonnet) throw new Error("Expected bundled Sonnet model");
+		let manager: SessionManager | undefined;
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const originalManager = SessionManager.create(agentDir, agentDir);
+			originalManager.appendModelChange(`${sonnet.provider}/${sonnet.id}`);
+			originalManager.appendConfiguredModelChain({
+				role: "default",
+				entries: [`${sonnet.provider}/${sonnet.id}`],
+				origin: "model_selection",
+				explicitHead: true,
+			});
+			await originalManager.ensureOnDisk();
+			await originalManager.flush();
+			const sessionFile = originalManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted resume session");
+			await originalManager.close();
+			manager = await SessionManager.open(sessionFile);
+
+			const result = await createAgentSession({
+				cwd: process.cwd(),
+				agentDir,
+				settings,
+				authStorage,
+				modelRegistry,
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				hasUI: false,
+			});
+			session = result.session;
+
+			expect(session.model?.provider).toBe("anthropic");
+			expect(session.model?.id).toBe(sonnet.id);
+			expect(session.getActiveModelProfile()).toBe("codex-medium");
+			expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${sonnet.provider}/${sonnet.id}`],
+				origin: "model_selection",
+				explicitHead: true,
+			});
+		} finally {
+			await session?.dispose();
+			if (!session) await manager?.close();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("real createAgentSession prewarms memory at the legacy startup boundary", async () => {
 		const markers: string[] = [];
 		const settings = Settings.isolated({ "memory.backend": "off" });

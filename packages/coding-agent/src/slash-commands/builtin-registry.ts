@@ -1137,7 +1137,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						}
 					}
 
-					const materializedProfile = materializeActiveModelProfileAssignments({
+					const materializedProfile = await materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,
 						assignments,

@@ -79,12 +79,37 @@ describe("AgentSession profile resume defaults", () => {
 		const globalDefaultBefore = session.settings.getModelRole("default");
 
 		// Combo-profile activation applies the main model for this session only.
-		await session.setModelTemporary(profileMain, undefined, { persistAsSessionDefault: true });
+		await session.setModelTemporary(profileMain, undefined, {
+			persistAsSessionDefault: true,
+			cause: "profile-activation",
+		});
 
 		// The default that resume restores is now the profile's main model.
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-5");
 		// Global default setting is untouched (apply-for-this-session semantics).
 		expect(session.settings.getModelRole("default")).toBe(globalDefaultBefore);
+	});
+
+	it("keeps a concrete session model selection local without clearing profile ownership", async () => {
+		const { base, profileMain } = resolveModels();
+		session = makeSession(base);
+		await session.setModel(base);
+		session.settings.set("modelProfile.default", "codex-medium");
+		await session.commitModelProfileOwnershipMarker({ kind: "profile", profile: "codex-medium" });
+		session.setActiveModelProfile("codex-medium");
+		const ordinaryDefaultBefore = session.settings.getGlobal("modelRoles")?.default;
+
+		await session.setModelTemporary(profileMain, undefined, {
+			persistAsSessionDefault: true,
+			cause: "user-selection",
+		});
+
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-5");
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({ origin: "model_selection" });
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "profile", profile: "codex-medium" });
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.settings.getGlobal("modelProfile.default")).toBe("codex-medium");
+		expect(session.settings.getGlobal("modelRoles")?.default).toBe(ordinaryDefaultBefore);
 	});
 
 	it("keeps a transient switch as role=temporary so resume does not adopt it", async () => {

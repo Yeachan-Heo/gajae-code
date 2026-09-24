@@ -75,6 +75,7 @@ export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventT
 		case "subagent_steer_message":
 		case "notice":
 		case "model_fallback_switched":
+		case "profile_ownership_changed":
 		case "thinking_level_changed":
 		case "goal_updated":
 			return event.type;

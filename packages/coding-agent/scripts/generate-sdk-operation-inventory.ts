@@ -79,8 +79,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal rollback compensation, not a user-facing SDK control seam",
 	"agent_session:restoreModelSelectionForRollback":
 		"internal rollback compensation, not a user-facing SDK control seam",
-	"agent_session:materializeActiveDefaultModelProfileAssignment":
-		"internal extension selection materialization seam, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionCleanup":
 		"internal tool lifecycle cleanup registration, not a user-facing SDK control seam",
 	"agent_session:registerToolSessionTransitionCleanup":
@@ -215,8 +213,18 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal owner-recovery staged restore builder after durable claims/fencing, never a user-facing SDK operation",
 	"agent_session:setActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:clearSessionOnlyModelProfileState":
-		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
+	"agent_session:getModelProfileOwnershipMarker":
+		"internal persisted profile-ownership snapshot accessor, not a user-facing SDK operation",
+	"agent_session:getEffectiveModelProfileOwnershipMarker":
+		"internal ownership resolver accessor shared by startup and lifecycle transitions, not a user-facing SDK operation",
+	"agent_session:getEffectiveModelProfileName":
+		"internal ownership validation accessor that fails closed on deleted profiles, not a user-facing SDK operation",
+	"agent_session:commitModelProfileOwnershipMarker":
+		"internal session transcript persistence boundary for ownership transitions, not a user-facing SDK operation",
+	"agent_session:markModelProfileOwnershipFailed":
+		"internal fail-closed ownership state setter, not a user-facing SDK operation",
+	"agent_session:emitProfileOwnershipChanged":
+		"internal ownership lifecycle event emitter, not a user-facing SDK operation",
 	"agent_session:noteProfileInstalledOverrides":
 		"internal session-scoped profile lifecycle plumbing behind the reviewed model.set seam, not an independent public SDK operation",
 	"agent_session:clearProfileInstalledOverrides":

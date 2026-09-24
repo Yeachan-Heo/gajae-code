@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import { UnresolvedModelProfileOwnershipError } from "@gajae-code/coding-agent/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -25,6 +26,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		tempDir = TempDir.createSync("@pi-resume-model-behavior-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
@@ -57,6 +59,160 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		await targetSession.sessionManager.flush();
 		return sessionFile;
 	}
+
+	it("persists new and clear decisions, copies fork ownership, and emits one event per commit", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		await session.setModel(model);
+		await session.commitModelProfileOwnershipMarker({ kind: "profile", profile: "codex-medium" });
+		const events: Array<Extract<AgentSessionEvent, { type: "profile_ownership_changed" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "profile_ownership_changed") events.push(event);
+		});
+
+		const originalSessionId = session.sessionId;
+		expect(await session.newSession()).toBe(true);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "inherit" });
+		expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			source: "session",
+			oldMarker: { kind: "profile", profile: "codex-medium" },
+			newMarker: { kind: "inherit" },
+			oldSessionId: originalSessionId,
+			sessionId: session.sessionId,
+			outcome: "committed",
+		});
+
+		const inheritedSessionId = session.sessionId;
+		expect(await session.clearContext()).toBe(true);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
+		expect(session.getEffectiveModelProfileName()).toBeUndefined();
+		expect(settings.getGlobal("modelProfile.default")).toBe("codex-medium");
+		expect(events).toHaveLength(2);
+		expect(events[1]).toMatchObject({
+			source: "session",
+			oldMarker: { kind: "inherit" },
+			newMarker: { kind: "cleared" },
+			oldSessionId: inheritedSessionId,
+			sessionId: inheritedSessionId,
+			outcome: "committed",
+		});
+
+		const clearedSessionId = session.sessionId;
+		expect(await session.fork()).toBe(true);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
+		expect(events).toHaveLength(3);
+		expect(events[2]).toMatchObject({
+			source: "session",
+			oldMarker: { kind: "cleared" },
+			newMarker: { kind: "cleared" },
+			oldSessionId: clearedSessionId,
+			sessionId: session.sessionId,
+			outcome: "committed",
+		});
+		expect(session.sessionId).not.toBe(clearedSessionId);
+	});
+
+	it("fails closed on a deleted session profile without falling back to the durable profile", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({ "compaction.enabled": false, "modelProfile.default": "durable-profile" });
+		const manager = SessionManager.inMemory();
+		manager.appendModelProfileOwnershipMarker({ kind: "profile", profile: "deleted-profile" });
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: manager,
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(modelRegistry, "getModelProfiles").mockReturnValue(new Map());
+
+		await expect(session.prompt("This prompt must not be sent")).rejects.toBeInstanceOf(
+			UnresolvedModelProfileOwnershipError,
+		);
+		expect(session.agent.state.messages).toEqual([]);
+	});
+
+	it("preserves an unresolved profile marker on resume and emits no success transition", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: `${sonnet.provider}/${sonnet.id}` },
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.sessionManager.appendModelProfileOwnershipMarker({
+			kind: "profile",
+			profile: "deleted-profile",
+		});
+		await targetSession!.sessionManager.ensureOnDisk();
+		const events: Array<Extract<AgentSessionEvent, { type: "profile_ownership_changed" }>> = [];
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "profile_ownership_changed") events.push(event);
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "profile", profile: "deleted-profile" });
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			source: "recovery",
+			outcome: "failed",
+			newMarker: { kind: "profile", profile: "deleted-profile" },
+		});
+		await expect(session.prompt("This prompt must remain blocked")).rejects.toBeInstanceOf(
+			UnresolvedModelProfileOwnershipError,
+		);
+	});
+
+	it("restores the previous session marker when a context-clear marker cannot persist", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		await session.setModel(sonnet);
+		session.setActiveModelProfile("codex-medium");
+		await session.commitModelProfileOwnershipMarker({ kind: "profile", profile: "codex-medium" });
+		const previousSessionId = session.sessionId;
+		const previousEntryIds = session.sessionManager.getBranch().map(entry => entry.id);
+		const events: Array<Extract<AgentSessionEvent, { type: "profile_ownership_changed" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "profile_ownership_changed") events.push(event);
+		});
+		vi.spyOn(session.sessionManager, "appendModelProfileOwnershipMarker").mockImplementationOnce(() => {
+			throw new Error("marker persistence failed");
+		});
+
+		await expect(session.clearContext()).rejects.toThrow("marker persistence failed");
+		expect(session.sessionId).toBe(previousSessionId);
+		expect(session.sessionManager.getBranch().map(entry => entry.id)).toEqual(previousEntryIds);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "profile", profile: "codex-medium" });
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(settings.getGlobal("modelProfile.default")).toBe("codex-medium");
+		expect(events).toEqual([]);
+	});
 
 	it("keeps the session's saved model by default when the global default changes", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -113,12 +269,16 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		settings.override("modelRoles", { default: "anthropic/claude-opus-4-8" });
 		settings.set("session.resumeModelBehavior", "useCurrentDefault");
 		session.setActiveModelProfile("codex-medium");
+		await session.commitModelProfileOwnershipMarker({ kind: "profile", profile: "codex-medium" });
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "profile", profile: "codex-medium" });
+		expect(modelRegistry.getModelProfiles().has("codex-medium")).toBe(true);
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(opus.id);
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "profile", profile: "codex-medium" });
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
 	});
-	it("clears predecessor session-only profile roles and uninstalled durable markers before a cross-file current default", async () => {
+	it("loads the durable ownership profile after dropping a predecessor session override", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
 		const settings = Settings.isolated({
@@ -140,10 +300,35 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		session.noteProfileInstalledOverrides(["default"], ["executor"], sonnet);
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.provider).toBe("anthropic");
+		expect(session.getActiveModelProfile()).toBe("opus-codex");
+		expect(settings.getOverride("task.agentModelOverrides")).toBeDefined();
+	});
+
+	it("preserves a concrete session default while inheriting durable profile roles", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain("default", [`${sonnet.provider}/${sonnet.id}`], "model_selection");
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(sonnet.id);
-		expect(session.getActiveModelProfile()).toBeUndefined();
-		expect(settings.getOverride("modelRoles")).toEqual({ default: `${sonnet.provider}/${sonnet.id}` });
-		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			origin: "model_selection",
+		});
 	});
 
 	it("clears a saved profile marker when its runtime layer is removed during cross-file resume", async () => {
@@ -177,7 +362,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(settings.getOverride("task.agentModelOverrides")).toEqual({});
 	});
 
-	it("retains a matching durable profile's runtime role layer across a cross-file resume", async () => {
+	it("replaces predecessor session overrides with the matching durable profile layer on resume", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const opus = getBundledModel("anthropic", "claude-opus-4-8")!;
 		const settings = Settings.isolated({
@@ -201,8 +386,11 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.getActiveModelProfile()).toBe("opus-codex");
-		expect(settings.getOverride("modelRoles")).toEqual(modelRoles);
-		expect(settings.getOverride("task.agentModelOverrides")).toEqual(agentModelOverrides);
+		expect(settings.getOverride("modelRoles")).toEqual({ default: `${sonnet.provider}/${sonnet.id}` });
+		expect(settings.getOverride("task.agentModelOverrides")).toMatchObject({
+			executor: "openai-codex/gpt-5.6-terra:low",
+			planner: "anthropic/claude-sonnet-5",
+		});
 	});
 
 	it("restores predecessor profile state when target current-default resolution fails", async () => {
@@ -300,6 +488,10 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		const setConfiguredChain = vi.spyOn(session, "setConfiguredModelChain");
 		const ensureOnDisk = vi.spyOn(session.sessionManager, "ensureOnDisk");
 		const notice = vi.spyOn(session, "emitNotice");
+		const ownershipEvents: Array<Extract<AgentSessionEvent, { type: "profile_ownership_changed" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "profile_ownership_changed") ownershipEvents.push(event);
+		});
 
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(codex.id);
@@ -315,9 +507,17 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			identity: "codex-medium",
 		});
 		expect(setConfiguredChain).not.toHaveBeenCalled();
+		expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+		expect(ownershipEvents).toHaveLength(1);
+		expect(ownershipEvents[0]).toMatchObject({
+			source: "session",
+			oldMarker: { kind: "inherit" },
+			newMarker: { kind: "inherit" },
+			outcome: "committed",
+		});
 		expect(notice).toHaveBeenCalledWith(
 			"warning",
-			"Saved session model is no longer registered; restored the durable default preset instead.",
+			"Saved session model is no longer registered; restored the active ownership profile at runtime.",
 			"fallback",
 		);
 		const commitOrder = ensureOnDisk.mock.invocationCallOrder.at(-1);
@@ -390,12 +590,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			"Saved session model is no longer registered; restored the durable default preset instead.",
 			"fallback",
 		);
-		expect(notice).toHaveBeenCalledWith(
-			"error",
-			expect.stringContaining("durable default preset resolution failed"),
-			"fallback",
-		);
-		expect(notice).not.toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
+		expect(notice).toHaveBeenCalledWith("error", expect.stringContaining("missing-executor"), "fallback");
 	});
 
 	it("fails without rewriting the saved chain when the durable default is unavailable", async () => {

@@ -100,6 +100,18 @@ export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 		chainLength: 2,
 		attemptsUsed: 3,
 	}),
+	profile_ownership_changed: ev({
+		type: "profile_ownership_changed",
+		transitionId: "profile-transition-1",
+		source: "durable",
+		oldMarker: { kind: "inherit" },
+		newMarker: { kind: "profile", profile: "profile-a" },
+		oldSessionId: "session-old",
+		sessionId: "session-new",
+		observedDurableVersion: 3,
+		committedDurableVersion: 4,
+		outcome: "committed",
+	}),
 	thinking_level_changed: ev({ type: "thinking_level_changed", thinkingLevel: "high" }),
 	goal_updated: ev({ type: "goal_updated", goal: { objective: RAW_SECRET } }),
 };

@@ -4,6 +4,7 @@ import { type Model, THINKING_EFFORTS } from "@gajae-code/ai";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import { ROOT_THINKING_LEVELS } from "../src/cli/root-flags";
+import type { ModelProfileOwnershipMarker } from "../src/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { Settings } from "../src/config/settings";
 import {
@@ -68,6 +69,7 @@ function fakeRegistry(
 }
 
 function fakeSession(initial: Model | null = model("initial-provider", "initial")) {
+	let modelProfileOwnershipMarker: ModelProfileOwnershipMarker | undefined;
 	const session = {
 		model: initial ?? undefined,
 		thinkingLevel: undefined as ThinkingLevel | undefined,
@@ -91,8 +93,18 @@ function fakeSession(initial: Model | null = model("initial-provider", "initial"
 			session.setModelTemporaryCalls.push({ model: next, thinkingLevel, options });
 			session.model = next;
 			session.thinkingLevel = thinkingLevel;
+			if (options?.persistAsSessionDefault && options.cause !== "profile-activation") {
+				session.configuredModelChains.push({
+					role: "default",
+					entries: [`${next.provider}/${next.id}`],
+				});
+			}
 		},
 		getConfiguredModelChain: () => undefined,
+		getModelProfileOwnershipMarker: () => modelProfileOwnershipMarker,
+		commitModelProfileOwnershipMarker: async (marker: ModelProfileOwnershipMarker) => {
+			modelProfileOwnershipMarker = marker;
+		},
 		hasRecoveredDefaultFallbackChain: () => false,
 		setConfiguredModelChain(role: string, entries: readonly string[]) {
 			session.configuredModelChains.push({ role, entries });
@@ -329,7 +341,7 @@ test("explicit CLI --model rebases the resumed session default chain", async () 
 	expect(session.seedDefaultFallbackResolutionCalls).toEqual([{ activeIndex: 0, skips: [] }]);
 });
 
-test("startup model profiles apply the default profile before --mpreset", async () => {
+test("explicit --mpreset replaces the durable default profile for this session", async () => {
 	const settings = Settings.isolated({ "modelProfile.default": "default-profile" });
 	const session = fakeSession();
 	const registry = fakeRegistry([
@@ -358,7 +370,62 @@ test("startup model profiles apply the default profile before --mpreset", async 
 
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
-	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:high"]);
+	).toEqual(["cli-provider/explicit:high"]);
+});
+
+test("resumed CLI startup reconciles profile bindings without replaying activation", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "durable-profile" });
+	const registry = fakeRegistry([
+		{
+			name: "durable-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium", executor: "profile-provider/default" },
+			source: "user",
+		},
+	]);
+
+	await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: {},
+		isInteractive: false,
+		hasInteractiveTerminal: false,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+		hasExistingSession: true,
+	});
+
+	expect(session.setModelTemporaryCalls).toEqual([]);
+	expect(settings.getGlobal("modelProfile.default")).toBe("durable-profile");
+	expect(settings.getOverride("task.agentModelOverrides")).toEqual({ executor: "profile-provider/default" });
+});
+
+test("a saved session clear suppresses the durable startup profile", async () => {
+	const settings = Settings.isolated({ "modelProfile.default": "durable-profile" });
+	const session = fakeSession();
+	session.getModelProfileOwnershipMarker = () => ({ kind: "cleared" });
+	const registry = fakeRegistry([
+		{
+			name: "durable-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+	]);
+
+	await applyStartupModelProfiles({
+		session,
+		settings,
+		modelRegistry: registry as never,
+		parsedArgs: {},
+	});
+
+	expect(session.setModelTemporaryCalls).toEqual([]);
+	expect(settings.getGlobal("modelProfile.default")).toBe("durable-profile");
+	expect(registry.refreshCalls).toEqual([]);
 });
 
 test("interactive continuation activates --mpreset from cached models without blocking on online refresh", async () => {
@@ -392,7 +459,7 @@ test("interactive continuation activates --mpreset from cached models without bl
 	expect(session.model?.provider).toBe("profile-provider");
 	expect(session.model?.id).toBe("default");
 });
-test("interactive continuation applies cached default and --mpreset profiles before background refresh", async () => {
+test("interactive continuation applies the explicit cached --mpreset before background refresh", async () => {
 	const session = fakeSession();
 	const registry = fakeRegistry([
 		{
@@ -427,7 +494,7 @@ test("interactive continuation applies cached default and --mpreset profiles bef
 	expect(registry.refreshInBackgroundCalls).toEqual(["online-if-uncached"]);
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
-	).toEqual(["profile-provider/default:medium", "profile-provider/default:high"]);
+	).toEqual(["profile-provider/default:high"]);
 });
 
 test("lifecycle startup applies a cached default profile without blocking on online refresh", async () => {
@@ -676,7 +743,7 @@ test("noninteractive startup keeps the exit-on-missing-credential contract", asy
 		exitSpy.mockRestore();
 	}
 });
-test("noninteractive explicit --mpreset tolerates a failing persisted default profile", async () => {
+test("noninteractive explicit --mpreset replaces a failing persisted default profile", async () => {
 	const session = fakeSession();
 	const settings = Settings.isolated({ "modelProfile.default": "broken-default" });
 	const registry = {
@@ -715,8 +782,7 @@ test("noninteractive explicit --mpreset tolerates a failing persisted default pr
 
 		expect(exitSpy).not.toHaveBeenCalled();
 		const joined = stderr.join("");
-		expect(joined).toContain("Warning:");
-		expect(joined).toContain('Model profile "broken-default" requires credentials for: openai-codex');
+		expect(joined).not.toContain("broken-default");
 		expect(session.model?.provider).toBe("profile-provider");
 		expect(session.model?.id).toBe("default");
 	} finally {
@@ -833,11 +899,9 @@ test("input-free interactive startup reports a stale persisted default without c
 	});
 
 	expect(result.recoverableErrors).toHaveLength(1);
-	expect(result.recoverableErrors[0]).toContain("modelProfile.default is stale");
-	expect(result.recoverableErrors[0]).toContain('unknown model profile "deleted-profile"');
+	expect(result.recoverableErrors[0]).toContain("model-profile ownership references unknown profile");
+	expect(result.recoverableErrors[0]).toContain('unknown profile "deleted-profile"');
 	expect(result.recoverableErrors[0]).toContain("gjc config reset modelProfile.default");
-	expect(result.recoverableErrors[0]).toContain(".gjc/config.yml");
-	expect(result.recoverableErrors[0]).toContain(".gjc/settings.json");
 	expect(settings.get("modelProfile.default")).toBe("deleted-profile");
 	expect(session.setModelTemporaryCalls).toEqual([]);
 	expect(session.model).toBeUndefined();
@@ -885,7 +949,7 @@ test("bare resume picker can recover a stale default when opening an idle sessio
 	});
 
 	expect(result.recoverableErrors).toHaveLength(1);
-	expect(result.recoverableErrors[0]).toContain("modelProfile.default is stale");
+	expect(result.recoverableErrors[0]).toContain("model-profile ownership references unknown profile");
 	expect(registry.profileCatalogRefreshCalls).toEqual(["refreshModelPresetProfilesFromRegistry"]);
 });
 
@@ -988,7 +1052,7 @@ test("explicit --mpreset remains invalid even when a stale default is recoverabl
 	}
 });
 
-test("explicit --mpreset activates a healthy profile despite a stale default", async () => {
+test("explicit --mpreset replaces a stale default profile without replaying it", async () => {
 	const session = fakeSession();
 	const settings = Settings.isolated({ "modelProfile.default": "deleted-profile" });
 	const registry = fakeRegistry([
@@ -1011,7 +1075,7 @@ test("explicit --mpreset activates a healthy profile despite a stale default", a
 			modelRegistry: registry as never,
 			parsedArgs: { mpreset: "healthy-profile" },
 		});
-		expect(stderr.join("")).toContain("Warning: Configured modelProfile.default is stale");
+		expect(stderr.join("")).toBe("");
 		expect(session.model?.provider).toBe("profile-provider");
 		expect(session.model?.id).toBe("default");
 		expect(settings.get("modelProfile.default")).toBe("deleted-profile");
@@ -1036,7 +1100,7 @@ test("explicit --model skips a stale default and retains CLI precedence", async 
 			parsedArgs: { model: "cli-provider/explicit" },
 			startupModel: model("cli-provider", "explicit"),
 		});
-		expect(stderr.join("")).toContain("Warning: Configured modelProfile.default is stale");
+		expect(stderr.join("")).toContain("Warning: Configured model-profile ownership references unknown profile");
 		expect(session.model?.provider).toBe("cli-provider");
 		expect(session.model?.id).toBe("explicit");
 	} finally {
@@ -1193,7 +1257,7 @@ test.each([
 	}
 });
 
-test("recoverable blocked default still applies healthy --mpreset and explicit CLI override", async () => {
+test("explicit --mpreset bypasses a blocked durable default and preserves the CLI model", async () => {
 	const explicitModel = model("cli-provider", "explicit");
 	const session = fakeSession(explicitModel);
 	const settings = Settings.isolated({ "modelProfile.default": "blocked-default" });
@@ -1229,13 +1293,13 @@ test("recoverable blocked default still applies healthy --mpreset and explicit C
 		resumeAction: undefined,
 	});
 
-	expect(result.recoverableErrors).toHaveLength(1);
+	expect(result.recoverableErrors).toHaveLength(0);
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
 	).toEqual(["profile-provider/default:high", "cli-provider/explicit:low"]);
 });
 
-test("recoverable blocked --mpreset still reapplies explicit CLI override after a healthy default", async () => {
+test("blocked explicit --mpreset leaves only the explicit CLI model active", async () => {
 	const explicitModel = model("cli-provider", "explicit");
 	const session = fakeSession(explicitModel);
 	const settings = Settings.isolated({ "modelProfile.default": "healthy-default" });
@@ -1274,7 +1338,7 @@ test("recoverable blocked --mpreset still reapplies explicit CLI override after 
 	expect(result.recoverableErrors).toHaveLength(1);
 	expect(
 		session.setModelTemporaryCalls.map(call => `${call.model.provider}/${call.model.id}:${call.thinkingLevel}`),
-	).toEqual(["profile-provider/default:medium", "cli-provider/explicit:xhigh"]);
+	).toEqual(["cli-provider/explicit:xhigh"]);
 });
 
 test("thinking-only startup uses authoritative override semantics", async () => {

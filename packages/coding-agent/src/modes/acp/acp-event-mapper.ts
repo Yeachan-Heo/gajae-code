@@ -263,6 +263,22 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 					},
 				}),
 			];
+		case "profile_ownership_changed":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcModelProfileOwnershipChanged: true,
+						gjcModelProfileTransitionId: event.transitionId,
+						gjcModelProfileOwnershipSource: event.source,
+						gjcModelProfileOwnershipOutcome: event.outcome,
+						gjcModelProfileObservedDurableVersion: event.observedDurableVersion,
+						...(event.committedDurableVersion === undefined
+							? {}
+							: { gjcModelProfileCommittedDurableVersion: event.committedDurableVersion }),
+					},
+				}),
+			];
 		// These event types are intentionally not represented as ACP session updates.
 		case "agent_start":
 		case "agent_end":
