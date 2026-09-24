@@ -96,6 +96,7 @@ function assistantMessage(
  *  - first Esc (retryNow) skips the backoff; abortRetry cancels.
  */
 describe.serial("AgentSession resilient retry", () => {
+	const WATCHDOG_CASE_WALL_BUDGET_MS = 30_000;
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
@@ -2380,6 +2381,7 @@ describe.serial("AgentSession resilient retry", () => {
 		);
 	});
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
+		const startedAt = performance.now();
 		const coordinatorStateFiles = new Set<string>();
 		const coordinatorNamespaceLocks = new Set<string>();
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
@@ -2430,6 +2432,7 @@ describe.serial("AgentSession resilient retry", () => {
 		}
 		expect(coordinatorStateFiles).toHaveLength(3);
 		expect(coordinatorNamespaceLocks).toHaveLength(3);
+		expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
 	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -2983,6 +2986,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
 	}, 60_000);
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
+		const startedAt = performance.now();
 		const coordinatorStateFiles = new Set<string>();
 		const coordinatorNamespaceLocks = new Set<string>();
 		const nearMisses = [
@@ -3019,9 +3023,9 @@ describe.serial("AgentSession resilient retry", () => {
 		}
 		expect(coordinatorStateFiles).toHaveLength(5);
 		expect(coordinatorNamespaceLocks).toHaveLength(5);
-		// Five full session lifecycles, one per near-miss phrasing. The
-		// single-scenario sibling below costs ~15s on CI hardware, so this loop
-		// legitimately needs several times the 30s default it used to inherit.
+		expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
+		// The combined lifecycle loop must remain within the shard's 30s budget,
+		// well below the existing 120s per-test ceiling.
 	}, 150_000);
 
 	it("still fails closed on generic unknown errors under a bare default config", async () => {
