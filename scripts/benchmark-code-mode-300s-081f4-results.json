@@ -1,0 +1,716 @@
+{
+  "formatVersion": 1,
+  "benchmark": "issue-5792-code-mode-measurement",
+  "startedAt": "2026-09-24T04:32:11.727Z",
+  "finishedAt": "2026-09-24T06:19:04.175Z",
+  "workspaceSnapshot": {
+    "commit": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
+    "originDevAtMeasurementStart": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
+    "latestOriginDevValidated": "45163750bb772c0217e70cd94206a32a53a87d52",
+    "isolation": "clean origin/dev worktree; output outside search corpus"
+  },
+  "workingTree": ".",
+  "model": {
+    "requested": "openai/gpt-5.5",
+    "resolved": "openai/gpt-5.5",
+    "armA": "openai/gpt-5.5",
+    "armB": "openai/gpt-5.5"
+  },
+  "contract": {
+    "taskCount": 8,
+    "repetitionsPerTaskPerArm": 3,
+    "scheduledPairedRuns": 24,
+    "fixedScheduleSeed": 5792,
+    "maxAttemptsPerScheduledRun": 2,
+    "runTimeoutMs": 300000,
+    "handlerSetupTimeoutMs": 300000,
+    "setupCleanupTimeoutMs": 10000,
+    "runTimeoutScope": "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
+    "roundTripDefinition": "AgentSession turn_start events (one model request/response cycle per round trip).",
+    "assistantTurnDefinition": "Assistant-role turn_end events; turns-to-green stops at the first final answer that passes task-specific answer-term, JSON/evidence, and dependent-trace validation.",
+    "providerInputTokenDefinition": "SessionStats input + cacheRead + cacheWrite reported on assistant messages; null means no assistant usage was available.",
+    "percentReductionWhenBaselineIsZero": "0% if both arms used zero requests; -100% if B used requests and A used zero, a conservative undefined-baseline penalty.",
+    "percentReductionStorage": "Fractions (0.25 = 25%) in paired metrics.",
+    "decisionRule": "Pass iff median paired request reduction >= 1, median paired percent reduction >= 25%, task-clustered bootstrap 95% CI lower bound > 0, Arm B green rate >= 80%, and B green rate is no more than 10 percentage points below A.",
+    "bootstrap": {
+      "method": "resample whole task clusters with replacement; retain all three repetition pairs within each sampled task",
+      "iterations": 10000,
+      "seed": 11538935
+    }
+  },
+  "systemPrompt": "# Issue #5792 benchmark system prompt\n\nYou are conducting a read-only investigation of this checked-out GJC repository. Use only the read and search capabilities exposed in the current session. Do not edit files, run commands, invoke other tools, or rely on prior knowledge when the repository can establish the answer.\n\nComplete the task by making a strictly dependent chain of repository tool calls. Make one call at a time when ordinary read/search tools are available. When the single `exec` capability is available, put the entire ordered chain into one JSON plan. Start with the task's stated search. For every later call, use a path or query obtained from the immediately preceding tool result; do not guess a path or reuse a fixed query. Read the discovered source before selecting a distinctive identifier for the final search.\n\nWhen finished, return only the requested JSON object. Use short exact evidence snippets from tool results so the harness can validate that the answer is grounded. Do not claim evidence that was not returned by a tool.",
+  "tasks": [
+    {
+      "id": "CM01",
+      "title": "In-process benchmark client setup",
+      "prompt": "Investigate how the TypeScript edit benchmark constructs an in-process GJC agent session. Start with a repository-wide search for `createAgentSession` and do not set `paths`. From the returned matches, choose the source for the benchmark's in-process client, read the path returned by search, then use a distinctive session option or API identifier copied from that read as the query for a repository-wide search. Explain how model/auth/session setup and active tool selection are configured.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `createAgentSession`.\n2. Read the relevant source path returned by that search.\n3. Search for the copied identifier `modelPattern` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the discovered source path, a concrete session option, and the tool-selection behavior.\nRequired answer terms: `in-process-client.ts`, `modelPattern`, `authStorage`, `toolNames`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `createAgentSession`.",
+        "2. Read the relevant source path returned by that search.",
+        "3. Search for the copied identifier `modelPattern` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "createAgentSession",
+      "requiredFollowupSearchTerm": "modelPattern",
+      "requiredAnswerTerms": [
+        "in-process-client.ts",
+        "modelPattern",
+        "authStorage",
+        "toolNames"
+      ]
+    },
+    {
+      "id": "CM02",
+      "title": "Codex freeform tool capability",
+      "prompt": "Investigate the OpenAI Codex Responses provider's freeform custom-tool capability gate. Start with a repository-wide search for `supportsFreeformApplyPatchCodex` and do not set `paths`. Read the provider path returned by search, then search for a distinctive capability or grammar field copied from that read result. Explain which model capability is checked and where a custom tool's grammar is serialized.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `supportsFreeformApplyPatchCodex`.\n2. Read the provider source path returned by that search.\n3. Search for the copied identifier `applyPatchToolType` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the provider source path, the capability name, and the grammar serialization field.\nRequired answer terms: `openai-codex-responses.ts`, `applyPatchToolType`, `customFormat`, `syntax`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `supportsFreeformApplyPatchCodex`.",
+        "2. Read the provider source path returned by that search.",
+        "3. Search for the copied identifier `applyPatchToolType` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "supportsFreeformApplyPatchCodex",
+      "requiredFollowupSearchTerm": "applyPatchToolType",
+      "requiredAnswerTerms": [
+        "openai-codex-responses.ts",
+        "applyPatchToolType",
+        "customFormat",
+        "syntax"
+      ]
+    },
+    {
+      "id": "CM03",
+      "title": "Read tool argument schema",
+      "prompt": "Investigate the built-in read tool's input schema and truncation behavior. Start with a repository-wide search for `const readSchema` and do not set `paths`. Read the source path returned by search, then search for a distinctive schema field or truncation identifier copied from that read result. Explain the required path input and one supported truncation option or default.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `const readSchema`.\n2. Read a source path returned by that search.\n3. Search for the copied identifier `truncation` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the source path, the path argument, and the truncation detail.\nRequired answer terms: `read.ts`, `readSchema`, `path`, `truncation`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `const readSchema`.",
+        "2. Read a source path returned by that search.",
+        "3. Search for the copied identifier `truncation` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "const readSchema",
+      "requiredFollowupSearchTerm": "truncation",
+      "requiredAnswerTerms": [
+        "read.ts",
+        "readSchema",
+        "path",
+        "truncation"
+      ]
+    },
+    {
+      "id": "CM04",
+      "title": "Search result metadata",
+      "prompt": "Investigate the built-in search tool's result metadata. Start with a repository-wide search for `interface SearchToolDetails` and do not set `paths`. Read the source path returned by search, then search for a distinctive result-property identifier copied from that read result. Explain what file and match information is returned to callers.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `interface SearchToolDetails`.\n2. Read a source path returned by that search.\n3. Search for the copied identifier `fileMatches` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the source path, a file-list property, and a match-related property.\nRequired answer terms: `search.ts`, `files`, `fileMatches`, `matchCount`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `interface SearchToolDetails`.",
+        "2. Read a source path returned by that search.",
+        "3. Search for the copied identifier `fileMatches` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "interface SearchToolDetails",
+      "requiredFollowupSearchTerm": "fileMatches",
+      "requiredAnswerTerms": [
+        "search.ts",
+        "files",
+        "fileMatches",
+        "matchCount"
+      ]
+    },
+    {
+      "id": "CM05",
+      "title": "Session usage accounting",
+      "prompt": "Investigate how AgentSession computes session statistics. Start with a repository-wide search for `getSessionStats(): SessionStats` and do not set `paths`. Read the session implementation path returned by search, then search for a distinctive usage accumulator copied from that read result. Explain how input, cache-read, and cache-write usage is accumulated.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `getSessionStats(): SessionStats`.\n2. Read a session source path returned by that search.\n3. Search for the copied identifier `cacheRead` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the source path and usage-accounting fields.\nRequired answer terms: `agent-session.ts`, `assistantMessages`, `cacheRead`, `cacheWrite`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `getSessionStats(): SessionStats`.",
+        "2. Read a session source path returned by that search.",
+        "3. Search for the copied identifier `cacheRead` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "getSessionStats(): SessionStats",
+      "requiredFollowupSearchTerm": "cacheRead",
+      "requiredAnswerTerms": [
+        "agent-session.ts",
+        "assistantMessages",
+        "cacheRead",
+        "cacheWrite"
+      ]
+    },
+    {
+      "id": "CM06",
+      "title": "Model round-trip boundaries",
+      "prompt": "Investigate where the core agent loop emits model-turn start events. Start with a repository-wide search for `turn_start` and do not set `paths`. From the results choose the agent-loop source, read that returned path, then search for a distinctive event-stream identifier copied from that read result. Explain where initial and subsequent turn boundaries are emitted relative to the loop.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `turn_start`.\n2. Read a core agent-loop source path returned by that search.\n3. Search for the copied identifier `turn_end` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the source path and at least two relevant turn-boundary facts.\nRequired answer terms: `agent-loop.ts`, `turn_start`, `turn_end`, `runLoop`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `turn_start`.",
+        "2. Read a core agent-loop source path returned by that search.",
+        "3. Search for the copied identifier `turn_end` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "turn_start",
+      "requiredFollowupSearchTerm": "turn_end",
+      "requiredAnswerTerms": [
+        "agent-loop.ts",
+        "turn_start",
+        "turn_end",
+        "runLoop"
+      ]
+    },
+    {
+      "id": "CM07",
+      "title": "Custom tool wire name contract",
+      "prompt": "Investigate the AI tool type's `customWireName` contract. Start with a repository-wide search for `customWireName` and do not set `paths`. From the returned matches choose the AI tool type definition, read that path, then search for a distinctive tool-format or dispatch identifier copied from the read result. Explain how custom tool wire names differ from internal names and how dispatch can match them.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `customWireName`.\n2. Read the AI tool type source path returned by that search.\n3. Search for the copied identifier `customFormat` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the source path, the wire-name purpose, and the related format/dispatch contract.\nRequired answer terms: `packages/ai/src/types.ts`, `customWireName`, `customFormat`, `activeToolForCallName`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `customWireName`.",
+        "2. Read the AI tool type source path returned by that search.",
+        "3. Search for the copied identifier `customFormat` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "customWireName",
+      "requiredFollowupSearchTerm": "customFormat",
+      "requiredAnswerTerms": [
+        "packages/ai/src/types.ts",
+        "customWireName",
+        "customFormat",
+        "activeToolForCallName"
+      ]
+    },
+    {
+      "id": "CM08",
+      "title": "Root benchmark command conventions",
+      "prompt": "Investigate the root package's benchmark script conventions. Start with a repository-wide search for `bench:orchestration-tokens` and do not set `paths`. From the returned matches choose the root package manifest, read that path, then search for a distinctive benchmark script name copied from the manifest. Explain how the repository exposes benchmark commands and identify existing benchmark script values.\n\n## Required dependent-call contract\n1. Search the repository without a `paths` filter for `bench:orchestration-tokens`.\n2. Read the root package manifest path returned by that search.\n3. Search for the copied identifier `bench:composer-stability-v3` from the immediately preceding read, without a fixed path filter.\n\nReturn the shared JSON answer/evidence format. Evidence should establish the manifest path and at least two existing benchmark command names.\nRequired answer terms: `package.json`, `bench:orchestration-tokens`, `bench:edit`, `bench:composer-stability-v3`\n\nFollow the numbered dependency contract exactly. Use only the available read/search capability. Make one call at a time in Arm A; in Arm B, put the full ordered chain in one exec plan. Every call after the first must use path or query data from the immediately preceding result.\n\nReturn only a JSON object with exactly two keys: `answer` (a concise string) and `evidence` (an array of at least three short exact strings copied from your tool results). Every evidence string must be directly supported by a tool result.",
+      "dependencyRequirements": [
+        "1. Search the repository without a `paths` filter for `bench:orchestration-tokens`.",
+        "2. Read the root package manifest path returned by that search.",
+        "3. Search for the copied identifier `bench:composer-stability-v3` from the immediately preceding read, without a fixed path filter."
+      ],
+      "initialSearchQuery": "bench:orchestration-tokens",
+      "requiredFollowupSearchTerm": "bench:composer-stability-v3",
+      "requiredAnswerTerms": [
+        "package.json",
+        "bench:orchestration-tokens",
+        "bench:edit",
+        "bench:composer-stability-v3"
+      ]
+    }
+  ],
+  "schedule": [
+    {
+      "pairId": "CM01-R1",
+      "taskId": "CM01",
+      "repetition": 1,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM01-R2",
+      "taskId": "CM01",
+      "repetition": 2,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM01-R3",
+      "taskId": "CM01",
+      "repetition": 3,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM02-R1",
+      "taskId": "CM02",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM02-R2",
+      "taskId": "CM02",
+      "repetition": 2,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM02-R3",
+      "taskId": "CM02",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM03-R1",
+      "taskId": "CM03",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM03-R2",
+      "taskId": "CM03",
+      "repetition": 2,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM03-R3",
+      "taskId": "CM03",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM04-R1",
+      "taskId": "CM04",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM04-R2",
+      "taskId": "CM04",
+      "repetition": 2,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM04-R3",
+      "taskId": "CM04",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM05-R1",
+      "taskId": "CM05",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM05-R2",
+      "taskId": "CM05",
+      "repetition": 2,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM05-R3",
+      "taskId": "CM05",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM06-R1",
+      "taskId": "CM06",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM06-R2",
+      "taskId": "CM06",
+      "repetition": 2,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM06-R3",
+      "taskId": "CM06",
+      "repetition": 3,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM07-R1",
+      "taskId": "CM07",
+      "repetition": 1,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM07-R2",
+      "taskId": "CM07",
+      "repetition": 2,
+      "armOrder": [
+        "A",
+        "B"
+      ]
+    },
+    {
+      "pairId": "CM07-R3",
+      "taskId": "CM07",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM08-R1",
+      "taskId": "CM08",
+      "repetition": 1,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM08-R2",
+      "taskId": "CM08",
+      "repetition": 2,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    },
+    {
+      "pairId": "CM08-R3",
+      "taskId": "CM08",
+      "repetition": 3,
+      "armOrder": [
+        "B",
+        "A"
+      ]
+    }
+  ],
+  "perTask": [
+    {
+      "taskId": "CM01",
+      "title": "In-process benchmark client setup",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 18,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 429361,
+        "medianModelFacingToolCalls": 16,
+        "medianReadSearchHandlerCalls": 16,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 51,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 1266201,
+        "medianModelFacingToolCalls": 49,
+        "medianReadSearchHandlerCalls": 87,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -35,
+      "pairedMedianPercentReduction": -2.3333333333333335
+    },
+    {
+      "taskId": "CM02",
+      "title": "Codex freeform tool capability",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 10,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 85958,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 8,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 24,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 271060,
+        "medianModelFacingToolCalls": 22,
+        "medianReadSearchHandlerCalls": 30,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -14,
+      "pairedMedianPercentReduction": -1.4
+    },
+    {
+      "taskId": "CM03",
+      "title": "Read tool argument schema",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 46140,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 13,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 116347,
+        "medianModelFacingToolCalls": 11,
+        "medianReadSearchHandlerCalls": 24,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -5,
+      "pairedMedianPercentReduction": -0.625
+    },
+    {
+      "taskId": "CM04",
+      "title": "Search result metadata",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": 9,
+        "medianProviderInputTokens": 34836,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 1
+      },
+      "B": {
+        "medianModelRequests": 12,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 90103,
+        "medianModelFacingToolCalls": 10,
+        "medianReadSearchHandlerCalls": 18,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -4,
+      "pairedMedianPercentReduction": -0.5
+    },
+    {
+      "taskId": "CM05",
+      "title": "Session usage accounting",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 14,
+        "medianTurnsToGreen": 14,
+        "medianProviderInputTokens": 227712,
+        "medianModelFacingToolCalls": 12,
+        "medianReadSearchHandlerCalls": 12,
+        "greenRuns": 1
+      },
+      "B": {
+        "medianModelRequests": 18,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 268359,
+        "medianModelFacingToolCalls": 16,
+        "medianReadSearchHandlerCalls": 29,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -4,
+      "pairedMedianPercentReduction": -0.3076923076923077
+    },
+    {
+      "taskId": "CM06",
+      "title": "Model round-trip boundaries",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 74676,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 15,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 188282,
+        "medianModelFacingToolCalls": 13,
+        "medianReadSearchHandlerCalls": 24,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -7,
+      "pairedMedianPercentReduction": -0.875
+    },
+    {
+      "taskId": "CM07",
+      "title": "Custom tool wire name contract",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 8,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 87364,
+        "medianModelFacingToolCalls": 6,
+        "medianReadSearchHandlerCalls": 6,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 32,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 705538,
+        "medianModelFacingToolCalls": 30,
+        "medianReadSearchHandlerCalls": 49,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -24,
+      "pairedMedianPercentReduction": -3
+    },
+    {
+      "taskId": "CM08",
+      "title": "Root benchmark command conventions",
+      "scheduledPairs": 3,
+      "A": {
+        "medianModelRequests": 10,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 55232,
+        "medianModelFacingToolCalls": 8,
+        "medianReadSearchHandlerCalls": 8,
+        "greenRuns": 0
+      },
+      "B": {
+        "medianModelRequests": 15,
+        "medianTurnsToGreen": null,
+        "medianProviderInputTokens": 144651,
+        "medianModelFacingToolCalls": 13,
+        "medianReadSearchHandlerCalls": 31,
+        "greenRuns": 0
+      },
+      "pairedMedianRequestReduction": -5,
+      "pairedMedianPercentReduction": -0.5
+    }
+  ],
+  "runCounts": {
+    "scheduled": 48,
+    "green": 2,
+    "failed": 46,
+    "retries": 48,
+    "errors": 466
+  },
+  "runCountsByArm": {
+    "A": {
+      "scheduled": 24,
+      "green": 2,
+      "failed": 22,
+      "failureRate": 0.9166666666666666,
+      "retries": 24,
+      "retryRate": 1
+    },
+    "B": {
+      "scheduled": 24,
+      "green": 0,
+      "failed": 24,
+      "failureRate": 1,
+      "retries": 24,
+      "retryRate": 1
+    }
+  },
+  "decision": {
+    "medianPairedRequestReduction": -6.5,
+    "medianPairedPercentReduction": -0.8125,
+    "bootstrap95CI": {
+      "lower": -21,
+      "upper": -4
+    },
+    "armAGreenRate": 0.08333333333333333,
+    "armBGreenRate": 0,
+    "completionRateDrop": 0.08333333333333333,
+    "pass": false,
+    "medianPairedPercentReductionPercent": -81.25
+  },
+  "executionStatus": "complete",
+  "decisionEligible": true,
+  "validityStatus": "complete-decision-eligible",
+  "harnessCommit": "6dea8ae7eea4e06d6b9d2c975a15c958a717232e",
+  "harnessCommitPurpose": "This reachable rebased commit has the exact harness source blobs used for the initial 15 paired repetitions. Resume used the report-pinned snapshot validator recorded in 8620c22f315c151a10f130a54c296889ba3abdb0; only workspace selection/provenance changed, not task prompts, model, read/search handlers, schedule, deadline, metrics, or decision gate.",
+  "harnessSourceBlobs": {
+    "scripts/benchmark-code-mode.ts": "943ef6f52e76fd0566ad1bf1e308c14c16359237",
+    "scripts/benchmark-code-mode.test.ts": "ce32937dc8d757c7ca36b8a8c1b5c11092a133d1",
+    "scripts/benchmark-code-mode-tasks.md": "a8ca5e2af45a729e7de0975e879c49391a23fa18",
+    "scripts/benchmark-code-mode-prompts.md": "49042bc5998fba84ca65d20820251816ddd798f8",
+    "scripts/benchmark-code-mode-exec-description.md": "029e0046420204bfb83c8992c047e4a30d76d8d1"
+  },
+  "resumeValidationCommit": "8620c22f315c151a10f130a54c296889ba3abdb0",
+  "sourceRawSha256": "97eb4eb40c2f9395a44b31d8de3ab92a379c6b7c04fd73c288fac21cbd75de57",
+  "sourceRawBytes": 12494763,
+  "rawArtifactPath": "scripts/benchmark-code-mode-300s-081f4-runs.json.gz",
+  "detailedArtifact": "scripts/benchmark-code-mode-300s-081f4-runs.json.gz",
+  "armMetricsSummary": {
+    "A": {
+      "scheduledRuns": 24,
+      "greenRuns": 2,
+      "failedRuns": 22,
+      "retries": 24,
+      "modelRequestCountMedian": 9.0,
+      "assistantTurnsToGreenMedianAmongGreenRuns": 11.5,
+      "providerInputTokensMedianPerRun": 74735.0,
+      "providerInputTokensTotal": 3435223,
+      "modelFacingToolCallsMedian": 7.0,
+      "readSearchHandlerCallsMedian": 7.0,
+      "failureRate": 0.9166666666666666
+    },
+    "B": {
+      "scheduledRuns": 24,
+      "greenRuns": 0,
+      "failedRuns": 24,
+      "retries": 24,
+      "modelRequestCountMedian": 17.5,
+      "assistantTurnsToGreenMedianAmongGreenRuns": null,
+      "providerInputTokensMedianPerRun": 257368.0,
+      "providerInputTokensTotal": 10259137,
+      "modelFacingToolCallsMedian": 15.5,
+      "readSearchHandlerCallsMedian": 29.5,
+      "failureRate": 1.0
+    }
+  },
+  "recordedToolPathAudit": {
+    "workspaceCommit": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
+    "invocationsChecked": 1127,
+    "allowedInvocations": 1124,
+    "rejectedBeforeHandler": 3,
+    "rejectedReasons": {
+      "missing-in-root-target": 2,
+      "gitignore-false-rejected": 1
+    },
+    "escapingInvocations": 0,
+    "method": "Replayed the same canonical-path and symlink-aware guards over every recorded Arm A read/search input and Arm B exec step against the pinned clean worktree."
+  },
+  "timeoutAudit": {
+    "deadlineMs": 300000,
+    "attemptsPerArm": {
+      "A": 48,
+      "B": 48
+    },
+    "timeoutAttempts": {
+      "A": 0,
+      "B": 0
+    },
+    "maxAttemptSeconds": {
+      "A": 61.025,
+      "B": 245.153
+    }
+  },
+  "resumeAudit": {
+    "initialCheckpointPairsCompleted": 15,
+    "totalPairsCompleted": 24,
+    "taskSnapshotStayedAt": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
+    "originDevAtMeasurementStart": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
+    "latestOriginDevValidatedDuringResume": "45163750bb772c0217e70cd94206a32a53a87d52"
+  },
+  "validityReason": "All 24 randomized pairs (8 tasks x 3 repetitions) completed on one clean, read-only 081f4c66 task snapshot. Both arms used openai/gpt-5.5 and the symmetric 300000 ms full-attempt deadline. All 96 attempts finished below the deadline; neither arm was timeout-censored. The frozen gate fails: Arm B used more model requests, had no green runs, and the task-clustered interval is below zero. This decision applies only to the tested constrained exec consumer, not to a more expressive code-mode design.",
+  "limitations": [
+    "Results describe only this fixed eight-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
+    "Arm B invokes the same read/search handler objects directly without AgentToolContext or the ordinary agent-loop dispatcher; interpret outcomes as specific to this consumer prototype.",
+    "The reference grammar cannot combine a search-result path with its matched line selector. CM05 needs a targeted read beyond the default excerpt, so this limitation may contribute to Arm B failures; it is not evidence against every more expressive code-mode design.",
+    "The task corpus is the exact origin/dev snapshot at measurement start (081f4c6604fe74e3598ddbfc0d258f416b114c52); origin/dev later advanced to 45163750bb772c0217e70cd94206a32a53a87d52 while the experiment was running. All pairs remained pinned to the initial snapshot."
+  ]
+}
