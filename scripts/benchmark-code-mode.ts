@@ -1575,6 +1575,32 @@ async function gitText(cwd: string, ...args: string[]): Promise<string> {
 	return stdout.trim();
 }
 
+export async function assertTaskSnapshotMatchesOrigin(
+	repositoryRoot: string,
+	taskHead: string,
+	originDev: string,
+	resumeSnapshotCommit?: string,
+): Promise<void> {
+	if (resumeSnapshotCommit !== undefined) {
+		if (taskHead !== resumeSnapshotCommit) {
+			throw new Error(
+				`--task-repo must match the resumed report snapshot (${resumeSnapshotCommit}); got ${taskHead}.`,
+			);
+		}
+		if (taskHead !== originDev) {
+			try {
+				await gitText(repositoryRoot, "merge-base", "--is-ancestor", taskHead, originDev);
+			} catch {
+				throw new Error(
+					`The resumed task snapshot ${taskHead} is no longer an ancestor of origin/dev (${originDev}); refusing to resume.`,
+				);
+			}
+		}
+	} else if (taskHead !== originDev) {
+		throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
+	}
+}
+
 function isPathInside(parent: string, child: string): boolean {
 	const relative = path.relative(parent, child);
 	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
@@ -1726,24 +1752,7 @@ async function resolveTaskWorkspace(
 		gitText(root, "status", "--porcelain", "--untracked-files=all"),
 	]);
 	if ((await fs.realpath(gitRoot)) !== root) throw new Error("--task-repo must be the root of a Git checkout or worktree.");
-	if (resumeWorkspaceSnapshot) {
-		if (taskHead !== resumeWorkspaceSnapshot.commit) {
-			throw new Error(
-				`--task-repo must match the resumed report snapshot (${resumeWorkspaceSnapshot.commit}); got ${taskHead}.`,
-			);
-		}
-		if (taskHead !== originDev) {
-			try {
-				await gitText(REPO_ROOT, "merge-base", "--is-ancestor", taskHead, originDev);
-			} catch {
-				throw new Error(
-					`The resumed task snapshot ${taskHead} is no longer an ancestor of origin/dev (${originDev}); refusing to resume.`,
-				);
-			}
-		}
-	} else if (taskHead !== originDev) {
-		throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
-	}
+	await assertTaskSnapshotMatchesOrigin(REPO_ROOT, taskHead, originDev, resumeWorkspaceSnapshot?.commit);
 	if (status.length > 0) throw new Error("--task-repo must have a clean working tree before benchmark tasks begin.");
 	await assertTrackedSymlinksStayInsideWorkspace(root);
 	for (const sentinel of SEARCH_CORPUS_SENTINELS) {
