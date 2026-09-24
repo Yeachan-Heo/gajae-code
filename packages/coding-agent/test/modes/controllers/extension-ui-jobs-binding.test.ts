@@ -21,12 +21,19 @@ import type { AsyncJobSnapshot, AsyncJobSnapshotItem } from "../../../src/sessio
 
 type SnapshotSource = () => AsyncJobSnapshot | null;
 
+/** A session mock that owns its snapshot source, so a rebind cannot retroactively
+ * change what a previously bound session reports. */
+type SessionMock = { getAsyncJobSnapshot: () => AsyncJobSnapshot | null };
+
 type Fixture = {
 	controller: ExtensionUiController;
 	ctx: InteractiveModeContext;
 	getContextActions: () => ExtensionContextActions;
+	/** Replace the snapshot source of the CURRENT session only. */
 	setSnapshot: (source: SnapshotSource) => void;
+	/** Swap in a brand-new session with its own independent snapshot source. */
 	rebindSession: (source: SnapshotSource) => void;
+	currentSession: () => SessionMock;
 	snapshotCalls: () => number;
 };
 
@@ -83,7 +90,6 @@ function runningItem(id: string): AsyncJobSnapshotItem {
 
 function createFixture(): Fixture {
 	let contextActions: ExtensionContextActions | undefined;
-	let source: SnapshotSource = () => emptySnapshot();
 	let calls = 0;
 	const extensionRunner = {
 		initialize(
@@ -97,20 +103,28 @@ function createFixture(): Fixture {
 		onError: () => () => {},
 		emit: vi.fn(async () => undefined),
 	};
-	const makeSession = (): Record<string, unknown> => ({
-		extensionRunner,
-		isStreaming: false,
-		getAsyncJobSnapshot: (): AsyncJobSnapshot | null => {
-			calls += 1;
-			return source();
-		},
-		sendCustomMessage: vi.fn(async () => undefined),
-		sendUserMessage: vi.fn(async () => undefined),
-	});
+	let current: { source: SnapshotSource };
+	const makeSession = (initial: SnapshotSource): Record<string, unknown> => {
+		// Each session closes over its OWN holder. A later rebind installs a new
+		// holder, so a stale captured session keeps answering with its own source
+		// and an init-time capture defect cannot pass by accident.
+		const own = { source: initial };
+		current = own;
+		return {
+			extensionRunner,
+			isStreaming: false,
+			getAsyncJobSnapshot: (): AsyncJobSnapshot | null => {
+				calls += 1;
+				return own.source();
+			},
+			sendCustomMessage: vi.fn(async () => undefined),
+			sendUserMessage: vi.fn(async () => undefined),
+		};
+	};
 	const ctx = {
 		isBackgrounded: false,
 		isStopped: () => false,
-		session: makeSession(),
+		session: makeSession(() => emptySnapshot()),
 		sessionManager: {
 			getSessionId: () => "session-a",
 			getSessionName: () => "Session",
@@ -141,12 +155,12 @@ function createFixture(): Fixture {
 			return contextActions;
 		},
 		setSnapshot: next => {
-			source = next;
+			current.source = next;
 		},
 		rebindSession: next => {
-			source = next;
-			(ctx as unknown as { session: unknown }).session = makeSession();
+			(ctx as unknown as { session: unknown }).session = makeSession(next);
 		},
+		currentSession: () => ctx.session as unknown as SessionMock,
 		snapshotCalls: () => calls,
 	};
 }
@@ -190,16 +204,25 @@ describe("ExtensionUiController async-job binding", () => {
 			expect(getJobs?.()).toBe(second);
 		});
 
-		it(`follows session rebinding in ${name}`, async () => {
+		it(`follows session rebinding instead of a session captured at init time in ${name}`, async () => {
 			const fixture = createFixture();
+			const beforeRebind = emptySnapshot();
+			fixture.setSnapshot(() => beforeRebind);
 			await initialize(fixture);
 			const getJobs = fixture.getContextActions().getJobs;
+			const staleSession = fixture.currentSession();
+			expect(getJobs?.()).toBe(beforeRebind);
 
 			const rebound = emptySnapshot();
 			fixture.rebindSession(() => rebound);
 
+			// The replaced session keeps answering with its own snapshot, so a binding
+			// that captured `this.ctx.session` at initialization still returns the old
+			// object here and cannot pass this assertion.
+			expect(staleSession.getAsyncJobSnapshot()).toBe(beforeRebind);
+			expect(fixture.currentSession()).not.toBe(staleSession);
 			expect(getJobs?.()).toBe(rebound);
-			expect(fixture.ctx.session.getAsyncJobSnapshot()).toBe(rebound);
+			expect(getJobs?.()).not.toBe(beforeRebind);
 		});
 
 		it(`preserves a null manager-absent snapshot in ${name}`, async () => {
@@ -252,23 +275,29 @@ describe("ExtensionUiController jobs binding through the real extension runner",
 		return new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir.path(), sessionManager, modelRegistry);
 	}
 
-	async function bindRunner(source: SnapshotSource): Promise<ExtensionRunner> {
+	async function bindRunner(
+		source: SnapshotSource,
+		initialize: (fixture: Fixture) => Promise<void> | void = fixture =>
+			fixture.controller.initializeHookRunner({} as ExtensionUIContext, false),
+	): Promise<ExtensionRunner> {
 		const fixture = createFixture();
 		const runner = await createRunner();
 		(fixture.ctx.session as unknown as { extensionRunner: ExtensionRunner }).extensionRunner = runner;
 		fixture.setSnapshot(source);
-		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+		await initialize(fixture);
 		return runner;
 	}
 
-	it("publishes the session snapshot through the extension context and advertises the binding", async () => {
-		const snapshot = emptySnapshot();
-		const runner = await bindRunner(() => snapshot);
+	for (const [name, initialize] of initializers) {
+		it(`publishes the session snapshot through the extension context and advertises the binding in ${name}`, async () => {
+			const snapshot = emptySnapshot();
+			const runner = await bindRunner(() => snapshot, initialize);
 
-		const context = runner.createContext();
-		expect(context.getJobs()).toBe(snapshot);
-		expect(context.sdkBindings?.()).toContain("getJobs");
-	});
+			const context = runner.createContext();
+			expect(context.getJobs()).toBe(snapshot);
+			expect(context.sdkBindings?.()).toContain("getJobs");
+		});
+	}
 
 	it("answers Q25 from the bound session snapshot instead of resource_gone", async () => {
 		const delivery: AsyncJobDeliveryState = {
