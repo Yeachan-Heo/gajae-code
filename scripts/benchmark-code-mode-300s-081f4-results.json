@@ -706,10 +706,11 @@
     "originDevAtMeasurementStart": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
     "latestOriginDevValidatedDuringResume": "45163750bb772c0217e70cd94206a32a53a87d52"
   },
-  "validityReason": "All 24 randomized pairs (8 tasks x 3 repetitions) completed on one clean, read-only 081f4c66 task snapshot. Both arms used openai/gpt-5.5 and the symmetric 300000 ms full-attempt deadline. All 96 attempts finished below the deadline; neither arm was timeout-censored. The frozen gate fails: Arm B used more model requests, had no green runs, and the task-clustered interval is below zero.",
+  "validityReason": "All 24 randomized pairs (8 tasks x 3 repetitions) completed on one clean, read-only 081f4c66 task snapshot. Both arms used openai/gpt-5.5 and the symmetric 300000 ms full-attempt deadline. All 96 attempts finished below the deadline; neither arm was timeout-censored. The frozen gate fails: Arm B used more model requests, had no green runs, and the task-clustered interval is below zero. This decision applies only to the tested constrained exec consumer, not to a more expressive code-mode design.",
   "limitations": [
     "Results describe only this fixed eight-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
     "Arm B invokes the same read/search handler objects directly without AgentToolContext or the ordinary agent-loop dispatcher; interpret outcomes as specific to this consumer prototype.",
+    "The reference grammar cannot combine a search-result path with its matched line selector. CM05 needs a targeted read beyond the default excerpt, so this limitation may contribute to Arm B failures; it is not evidence against every more expressive code-mode design.",
     "The task corpus is the exact origin/dev snapshot at measurement start (081f4c6604fe74e3598ddbfc0d258f416b114c52); origin/dev later advanced to 45163750bb772c0217e70cd94206a32a53a87d52 while the experiment was running. All pairs remained pinned to the initial snapshot."
   ]
 }
