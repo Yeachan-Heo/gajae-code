@@ -24275,8 +24275,7 @@ export class AgentSession {
 		}
 		if (
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			!providerRetryCeilingReached
+			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
 			quotaCredentialMark = await this.#markFailedCredential({
 				...trigger,
@@ -24333,7 +24332,11 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (managedFallback && (quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate")) {
+		if (
+			managedFallback &&
+			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
+			!providerRetryCeilingReached
+		) {
 			// A credential retry is a separate dimension from model fallback
 			// attempts. Leave the controller on the current entry and refund its
 			// provisional request charge so every same-kind account is tried first.
