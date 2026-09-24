@@ -400,7 +400,11 @@ import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
+import {
+	formatNoCredentialOnboardingError,
+	formatNoModelOnboardingError,
+	NoModelSelectedError,
+} from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
@@ -13876,7 +13880,7 @@ export class AgentSession {
 
 			// Validate model
 			if (!this.model) {
-				throw new Error(formatNoModelOnboardingError());
+				throw new NoModelSelectedError();
 			}
 
 			// Validate API key

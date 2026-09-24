@@ -3,6 +3,7 @@ import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
+import { MODEL_NOT_SELECTED_CODE, MODEL_NOT_SELECTED_PUBLIC_MESSAGE } from "../../../setup/model-onboarding-guidance";
 import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
@@ -370,6 +371,11 @@ function errorResponse(id: string, row: Operation, error: unknown): ControlRespo
 		};
 		return failure(id, code, DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE, undefined, recovery);
 	}
+	// The missing-model preflight message carries local onboarding guidance
+	// (providers, commands, env vars, setup paths); publish the fixed safe text
+	// instead so the client still learns the actual, actionable state.
+	if (code === MODEL_NOT_SELECTED_CODE && row.errorCodes.includes(code))
+		return failure(id, code, MODEL_NOT_SELECTED_PUBLIC_MESSAGE);
 	if (code && (row.errorCodes.includes(code) || SHARED_ERROR_CODES.has(code)))
 		return failure(id, code, message, undefined, details);
 	if (code === "resource_gone" || /not found|gone/i.test(message)) return failure(id, "resource_gone", message);

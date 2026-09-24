@@ -263,11 +263,15 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
-		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
+		// C01/C05 submit a prompt and therefore run the prompt preflight, which
+		// refuses a session with no selected model before admission. The code is
+		// appended: ACP machine-only mapping reads errorCodes[0].
+		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed", "model_not_selected"],
 		C02: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
+		C05: ["invalid_request", "busy", "model_not_selected"],
 		C08: ["action_claimed", "terminal_uncertain"],
 		C13: ["invalid_request", "busy", "default_model_selection_recovery"],
 		C36: ["revision_conflict", "secret_input_forbidden"],
