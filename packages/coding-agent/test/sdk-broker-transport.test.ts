@@ -162,6 +162,65 @@ describe("SDK broker WebSocket transport", () => {
 			await broker.stop();
 		}
 	});
+	it("rejects control RPCs until retained publication readiness", async () => {
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-readiness-"));
+		const publicationWritten = Promise.withResolvers<void>();
+		const allowRetention = Promise.withResolvers<void>();
+		const broker = new Broker({
+			agentDir,
+			packageGeneration: "test",
+			startupAfterDiscoveryWriteTestHook: async () => {
+				publicationWritten.resolve();
+				await allowRetention.promise;
+			},
+		});
+		const starting = broker.start();
+		let ws: WebSocket | undefined;
+		try {
+			await publicationWritten.promise;
+			const discovery = broker.discovery;
+			expect(discovery).not.toBeNull();
+			expect(await Bun.file(path.join(agentDir, "sdk", "broker.json")).exists()).toBe(true);
+			expect(broker.ownsDiscovery).toBe(false);
+			ws = await connect(`${discovery!.url}/?token=${discovery!.token}`);
+			expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
+			const beforeReady = nextFrame(ws);
+			ws.send(
+				JSON.stringify({
+					type: "broker_request",
+					id: "shutdown-before-ready",
+					operation: "broker.shutdown",
+					input: {},
+				}),
+			);
+			expect(await beforeReady).toEqual({
+				type: "broker_response",
+				id: "shutdown-before-ready",
+				ok: false,
+				error: { code: "unavailable", message: "broker publication is unavailable" },
+			});
+			expect(broker.ownsDiscovery).toBe(false);
+
+			allowRetention.resolve();
+			await starting;
+			expect(broker.ownsDiscovery).toBe(true);
+			const afterReady = nextFrame(ws);
+			ws.send(
+				JSON.stringify({ type: "broker_request", id: "status-after-ready", operation: "broker.status", input: {} }),
+			);
+			expect(await afterReady).toMatchObject({
+				type: "broker_response",
+				id: "status-after-ready",
+				ok: true,
+			});
+		} finally {
+			allowRetention.resolve();
+			await starting.catch(() => {});
+			ws?.close();
+			await broker.stop().catch(() => {});
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
 	it("dispatches durable lifecycle lookup outcomes through the broker transport", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-"));
 		const broker = new Broker({ agentDir, packageGeneration: "test" });
