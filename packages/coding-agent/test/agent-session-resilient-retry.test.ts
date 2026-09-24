@@ -2727,7 +2727,7 @@ describe.serial("AgentSession resilient retry", () => {
 				expect(observedDeltas).toEqual(streamedDeltas);
 				expect(lastAssistant(session).content).toEqual([{ type: "text", text: "already visible" }]);
 			}
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -2873,7 +2873,7 @@ describe.serial("AgentSession resilient retry", () => {
 				content: [{ type: "text", text: "recovered" }],
 			});
 
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
