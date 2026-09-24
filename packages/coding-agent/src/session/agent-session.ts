@@ -3517,7 +3517,7 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
-	/** Same-kind credential rows already visited by managed quota/rate-limit retries in this prompt generation. */
+	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
 	/** Stored credential captured after a managed request resolves its API key, before failure handling mutates assignment. */
@@ -23610,7 +23610,7 @@ export class AgentSession {
 				const storageProvider = resolveOAuthStorageProvider(resolvedModel.provider);
 				const inventory = authStorage.listCredentialInventory(storageProvider);
 				candidateRows: for (const credentialKind of failedCredentialKinds) {
-					const triedRows = this.#managedFallbackTriedRows(resolvedModel.provider, credentialKind);
+					const triedRows = this.#managedFallbackTriedRows(resolvedModel, credentialKind);
 					for (const credential of inventory) {
 						if (
 							credential.provider !== storageProvider ||
@@ -23807,9 +23807,9 @@ export class AgentSession {
 		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 	}
 
-	#managedFallbackTriedRows(provider: string, credentialKind: string): Set<number> {
+	#managedFallbackTriedRows(model: Model, credentialKind: string): Set<number> {
 		this.#ensureManagedFallbackCredentialTrackingGeneration();
-		const key = JSON.stringify([resolveOAuthStorageProvider(provider), credentialKind]);
+		const key = JSON.stringify([resolveOAuthStorageProvider(model.provider), model.id, credentialKind]);
 		let rowIds = this.#managedFallbackTriedCredentialRows.get(key);
 		if (!rowIds) {
 			rowIds = new Set<number>();
@@ -23827,7 +23827,7 @@ export class AgentSession {
 			this.#managedFallbackQuotaFailedModelCredentialKinds.set(modelKey, credentialKinds);
 		}
 		credentialKinds.add(credentialKind);
-		if (rowId !== undefined) this.#managedFallbackTriedRows(model.provider, credentialKind).add(rowId);
+		if (rowId !== undefined) this.#managedFallbackTriedRows(model, credentialKind).add(rowId);
 	}
 
 	#captureManagedFallbackActiveCredential(model: Model): void {
@@ -23928,7 +23928,7 @@ export class AgentSession {
 			const trackedCredentialKind = credentialKind ?? beforeKind;
 			const triedRows =
 				trigger.trackSameTurnRows && trackedCredentialKind !== undefined
-					? this.#managedFallbackTriedRows(provider, trackedCredentialKind)
+					? this.#managedFallbackTriedRows(model, trackedCredentialKind)
 					: undefined;
 			if (trigger.trackSameTurnRows && trackedCredentialKind !== undefined) {
 				this.#trackManagedFallbackCredential(model, trackedCredentialKind, failedRowId);

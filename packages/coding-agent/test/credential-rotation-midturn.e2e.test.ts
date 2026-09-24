@@ -305,6 +305,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	addApiKeyDuringMark?: string;
 	addOAuthAccountAfterExhaustion?: string;
 	predecessorModel?: Model;
+	secondCodexModel?: Model;
 	modelProviderAlias?: boolean;
 	canonicalThenAlias?: boolean;
 	terminalCodexEntry?: boolean;
@@ -488,9 +489,11 @@ async function runManagedFallbackQuotaScenario(options: {
 			? options.terminalCodexEntry
 				? [selector(options.predecessorModel), selector(model)]
 				: [selector(options.predecessorModel), selector(model), selector(fallback)]
-			: options.canonicalThenAlias
-				? [selector(model), selector(aliasModel!), selector(fallback)]
-				: [selector(model), selector(fallback)];
+			: options.secondCodexModel
+				? [selector(model), selector(options.secondCodexModel), selector(fallback)]
+				: options.canonicalThenAlias
+					? [selector(model), selector(aliasModel!), selector(fallback)]
+					: [selector(model), selector(fallback)];
 		session.setConfiguredModelChain("default", entries, "test");
 		if (options.terminalCodexEntry) session.seedDefaultFallbackResolution(1, []);
 		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
@@ -584,6 +587,25 @@ describe("managed fallback quota credential rotation", () => {
 			models: [selector(model), selector(model)],
 			keys: ["TOKEN-a", "TOKEN-b"],
 			markCount: 1,
+		});
+	});
+
+	test("keeps same-provider row history independent across model IDs", async () => {
+		const modelA = getBundledModel(provider, "gpt-5.1-codex");
+		const modelB = getBundledModel(provider, "gpt-5.2-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!modelA || !modelB || !fallback)
+			throw new Error("Missing bundled multi-model managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			retryAfterMs: 0,
+			secondCodexModel: modelB,
+		});
+		expect(result).toEqual({
+			models: [selector(modelA), selector(modelA), selector(modelB), selector(modelB), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "TOKEN-b", "TOKEN-a", "fallback-test-key"],
+			markCount: 4,
 		});
 	});
 
