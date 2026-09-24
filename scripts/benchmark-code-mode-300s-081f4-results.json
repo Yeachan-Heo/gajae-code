@@ -630,8 +630,8 @@
   "executionStatus": "complete",
   "decisionEligible": true,
   "validityStatus": "complete-decision-eligible",
-  "harnessCommit": "e2e22e9a97026cfa54d2b116c2800c2ab62d618c",
-  "harnessCommitPurpose": "This reachable rebased commit has the exact harness source blobs used for the initial 15 paired repetitions. Resume used the report-pinned snapshot validator recorded in e8f6ccd0cb798ebfb6702b61c9a1c37b720827ef; only workspace selection/provenance changed, not task prompts, model, read/search handlers, schedule, deadline, metrics, or decision gate.",
+  "harnessCommit": "09b9d377834fbf75b121897ba8622457f37712b3",
+  "harnessCommitPurpose": "This reachable rebased commit has the exact harness source blobs used for the initial 15 paired repetitions. Resume used the report-pinned snapshot validator recorded in ecb2da5464c1e46af52eea355ddfb99c9f7052e0; only workspace selection/provenance changed, not task prompts, model, read/search handlers, schedule, deadline, metrics, or decision gate.",
   "harnessSourceBlobs": {
     "scripts/benchmark-code-mode.ts": "943ef6f52e76fd0566ad1bf1e308c14c16359237",
     "scripts/benchmark-code-mode.test.ts": "ce32937dc8d757c7ca36b8a8c1b5c11092a133d1",
@@ -639,7 +639,7 @@
     "scripts/benchmark-code-mode-prompts.md": "49042bc5998fba84ca65d20820251816ddd798f8",
     "scripts/benchmark-code-mode-exec-description.md": "029e0046420204bfb83c8992c047e4a30d76d8d1"
   },
-  "resumeValidationCommit": "e8f6ccd0cb798ebfb6702b61c9a1c37b720827ef",
+  "resumeValidationCommit": "ecb2da5464c1e46af52eea355ddfb99c9f7052e0",
   "sourceRawSha256": "97eb4eb40c2f9395a44b31d8de3ab92a379c6b7c04fd73c288fac21cbd75de57",
   "sourceRawBytes": 12494763,
   "rawArtifactPath": "scripts/benchmark-code-mode-300s-081f4-runs.json.gz",
