@@ -105,24 +105,23 @@ describe.serial("AgentSession resilient retry", () => {
 	let retryTestNamespaceLocks = new Set<string>();
 
 	function configureRetryTestSession(value: AgentSession): AgentSession {
+		value.setCoordinatorRuntimeStateFileForTests(
+			path.join(tempDir.path(), `session-${value.sessionManager.getSessionId()}`, "state", "runtime-state.json"),
+		);
+		const stateFile = value.getCoordinatorRuntimeStateFileForTests() ?? "";
+		expect(stateFile).not.toBe("");
+		const namespaceLock = path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
+		expect(retryTestStateFiles.has(stateFile)).toBe(false);
+		expect(retryTestNamespaceLocks.has(namespaceLock)).toBe(false);
+		retryTestStateFiles.add(stateFile);
+		retryTestNamespaceLocks.add(namespaceLock);
 		value.setDisposeTimeoutForTests(120_000);
 		value.trackCoordinatorRuntimeStatePersistenceFailuresForTests();
 		return value;
 	}
 
 	function createRetryTestSessionManager(): SessionManager {
-		const manager = SessionManager.inMemory(tempDir.path());
-		// A coordinator state-file pin is process-wide authority for one session.
-		// Put each in-memory session in a separate namespace too: the state sidecar
-		// transaction lock is parent-directory scoped, not state-file scoped.
-		const stateFile = path.join(tempDir.path(), `session-${manager.getSessionId()}`, "state", "runtime-state.json");
-		const namespaceLock = path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
-		expect(retryTestStateFiles.has(stateFile)).toBe(false);
-		expect(retryTestNamespaceLocks.has(namespaceLock)).toBe(false);
-		retryTestStateFiles.add(stateFile);
-		retryTestNamespaceLocks.add(namespaceLock);
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		return manager;
+		return SessionManager.inMemory(tempDir.path());
 	}
 
 	async function disposeAfterCoordinatorPersistence(value: AgentSession): Promise<void> {
@@ -2410,7 +2409,7 @@ describe.serial("AgentSession resilient retry", () => {
 					]),
 				),
 			});
-			const coordinatorStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? "";
+			const coordinatorStateFile = session.getCoordinatorRuntimeStateFileForTests() ?? "";
 			expect(coordinatorStateFile).not.toBe("");
 			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
 			coordinatorStateFiles.add(coordinatorStateFile);
@@ -3002,7 +3001,7 @@ describe.serial("AgentSession resilient retry", () => {
 				responses: [{ throw: errorMessage }, { content: ["should-not-reach"] }],
 				requestedModels,
 			});
-			const coordinatorStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] ?? "";
+			const coordinatorStateFile = session.getCoordinatorRuntimeStateFileForTests() ?? "";
 			expect(coordinatorStateFile).not.toBe("");
 			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
 			coordinatorStateFiles.add(coordinatorStateFile);
