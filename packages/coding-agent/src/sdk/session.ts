@@ -753,17 +753,7 @@ export async function discoverAuthStorage(
 			sourceLabel: `broker ${brokerConfig.url}`,
 			credentialRankingMode,
 		});
-		try {
-			await storage.reload();
-		} catch (error) {
-			try {
-				storage.close();
-			} catch {
-				// Preserve the initial reload failure.
-			}
-			throw error;
-		}
-		return storage;
+		return await reloadDiscoveredAuthStorage(storage);
 	}
 	const dbPath = getAgentDbPath(agentDir);
 	const storage = await AuthStorage.create(dbPath, {
@@ -771,13 +761,17 @@ export async function discoverAuthStorage(
 		sourceLabel: `local ${dbPath}`,
 		credentialRankingMode,
 	});
+	return await reloadDiscoveredAuthStorage(storage);
+}
+
+async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthStorage> {
 	try {
 		await storage.reload();
 	} catch (error) {
 		try {
 			storage.close();
-		} catch {
-			// Preserve the initial reload failure.
+		} catch (cleanupError) {
+			throw attachStartupCleanupDiagnostic(error, cleanupError);
 		}
 		throw error;
 	}
@@ -1396,6 +1390,33 @@ function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown
 	return new McpManagerCleanupDiagnosticError(primary, cleanup);
 }
 
+function attachStartupCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
+	const diagnostic = { code: "STARTUP_RESOURCE_CLEANUP_FAILED" as const, cause: cleanup };
+	if (primary && (typeof primary === "object" || typeof primary === "function")) {
+		try {
+			Object.defineProperty(primary, "startupCleanupDiagnostic", {
+				value: diagnostic,
+				enumerable: false,
+				configurable: true,
+			});
+			return primary;
+		} catch {
+			// Frozen errors retain their original message in this typed wrapper.
+		}
+	}
+	const wrapped = new AggregateError(
+		[primary, cleanup],
+		primary instanceof Error ? primary.message : String(primary),
+		{ cause: primary },
+	);
+	Object.defineProperty(wrapped, "startupCleanupDiagnostic", {
+		value: diagnostic,
+		enumerable: false,
+		configurable: true,
+	});
+	return wrapped;
+}
+
 function findExactMcpToolNameCollisions(
 	exactMcpToolNames: readonly string[],
 	catalogToolNames: Iterable<string>,
@@ -1552,6 +1573,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.settings === undefined
 			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
 			: Promise.resolve(options.settings);
+	type StartupValue<T> = { ok: true; value: T } | { ok: false; error: unknown };
+	const captureStartupValue = <T>(pending: Promise<T>): Promise<StartupValue<T>> =>
+		pending.then(
+			value => ({ ok: true as const, value }),
+			error => ({ ok: false as const, error }),
+		);
+	const settingsOutcome = captureStartupValue(settingsPromise);
 	const startupAuthConfigPromise = Promise.resolve(
 		hasInjectedAuth
 			? options.modelRegistryStartupMutation?.owner === "cli-root"
@@ -1559,6 +1587,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				: undefined
 			: (options.startupAuthConfig ?? resolveStartupAuthConfig(agentDir)),
 	);
+	const startupAuthConfigOutcome = captureStartupValue(startupAuthConfigPromise);
 	const authStoragePromise = options.modelRegistry
 		? Promise.resolve(options.modelRegistry.authStorage)
 		: options.authStorage
@@ -1566,17 +1595,96 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: startupAuthConfigPromise.then(startupAuthConfig =>
 					logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig)),
 				);
-	const [settingsResult, authStorageResult] = await Promise.allSettled([settingsPromise, authStoragePromise]);
-	if (settingsResult.status === "rejected") {
-		if (authStorageResult.status === "fulfilled" && ownsAuthStorage) {
+	const authStorageOutcome = captureStartupValue(authStoragePromise);
+	const discoveredAuthStorage = await authStorageOutcome;
+	if (!discoveredAuthStorage.ok) {
+		const loadedSettings = await settingsOutcome;
+		const cleanupErrors: unknown[] = [];
+		if (loadedSettings.ok && ownsScopedSettings) {
 			try {
-				authStorageResult.value.close();
+				await loadedSettings.value.close();
 			} catch (cleanupError) {
-				logger.warn("Failed to close auth storage after scoped settings load failure", { error: cleanupError });
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				releaseSettingsScope(loadedSettings.value);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
 			}
 		}
-		throw settingsResult.reason;
+		if (cleanupErrors.length > 0)
+			throw attachStartupCleanupDiagnostic(
+				discoveredAuthStorage.error,
+				new AggregateError(cleanupErrors, "Failed to release scoped settings after auth storage setup failure."),
+			);
+		throw discoveredAuthStorage.error;
 	}
+	const authStorage = discoveredAuthStorage.value;
+	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
+	let credentialDisabledTarget: ExtensionRunner | undefined;
+	let unsubscribeCredentialDisabled: (() => void) | undefined;
+	const releaseCredentialDisabledSubscription = (): void => {
+		const unsubscribe = unsubscribeCredentialDisabled;
+		unsubscribeCredentialDisabled = undefined;
+		unsubscribe?.();
+	};
+	const failInitialSetup = async (primary: unknown, scopedSettings?: Settings): Promise<never> => {
+		const cleanupErrors: unknown[] = [];
+		try {
+			releaseCredentialDisabledSubscription();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (scopedSettings && ownsScopedSettings) {
+			try {
+				await scopedSettings.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				releaseSettingsScope(scopedSettings);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (ownsAuthStorage) {
+			try {
+				authStorage.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw attachStartupCleanupDiagnostic(
+				primary,
+				new AggregateError(cleanupErrors, "Failed to release resources after initial session setup failure."),
+			);
+		throw primary;
+	};
+	// Subscribe before owned-registry construction as its first catalog pass may
+	// probe credentials. Preserve the listener cleanup contract if scoped settings
+	// loading fails after the storage has been acquired.
+	try {
+		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
+			if (credentialDisabledTarget) {
+				void credentialDisabledTarget.emitCredentialDisabled(event);
+			} else {
+				startupCredentialDisabledEvents.push(event);
+			}
+		});
+	} catch (error) {
+		const settingsAfterSubscriptionFailure = await settingsOutcome;
+		if (!settingsAfterSubscriptionFailure.ok)
+			return await failInitialSetup(
+				new AggregateError(
+					[error, settingsAfterSubscriptionFailure.error],
+					"Credential listener registration and scoped settings initialization both failed.",
+				),
+			);
+		return await failInitialSetup(error, settingsAfterSubscriptionFailure.value);
+	}
+	const settingsResult = await settingsOutcome;
+	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
 	const settings = settingsResult.value;
 	const closeOwnedSettings = async (): Promise<void> => {
 		if (!ownsScopedSettings) return;
@@ -1586,29 +1694,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			releaseSettingsScope(settings);
 		}
 	};
-	if (authStorageResult.status === "rejected") {
-		try {
-			await closeOwnedSettings();
-		} catch (cleanupError) {
-			logger.warn("Failed to close scoped settings after auth storage setup failure", { error: cleanupError });
-		}
-		throw authStorageResult.reason;
-	}
-	const startupAuthConfig = await startupAuthConfigPromise;
-	const authStorage = authStorageResult.value;
+	const startupAuthConfigResult = await startupAuthConfigOutcome;
+	if (!startupAuthConfigResult.ok) return await failInitialSetup(startupAuthConfigResult.error, settings);
+	const startupAuthConfig = startupAuthConfigResult.value;
 	let modelRegistry: ModelRegistry;
 	try {
 		modelRegistry =
 			options.modelRegistry ??
 			new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), settings, { agentDir });
 	} catch (error) {
-		if (ownsAuthStorage) authStorage.close();
-		try {
-			await closeOwnedSettings();
-		} catch (cleanupError) {
-			logger.warn("Failed to close scoped settings after model registry setup failure", { error: cleanupError });
-		}
-		throw error;
+		return await failInitialSetup(error, settings);
 	}
 	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 
@@ -1671,20 +1766,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
 	const closeOwnedAuthStorage = async (): Promise<void> => {
-		if (ownsModelRegistry) await modelRegistry.dispose();
-		if (!hasSession && credentialScopeLeased && credentialScopeId) {
-			authStorage.releaseCredentialScope(credentialScopeId);
-			credentialScopeLeased = false;
+		const cleanupErrors: unknown[] = [];
+		if (ownsModelRegistry) {
+			try {
+				await modelRegistry.dispose();
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
 		}
-		if (!ownsAuthStorage || authStorageClosed) return;
-		authStorageClosed = true;
-		authStorage.close();
-	};
-	let unsubscribeCredentialDisabled: (() => void) | undefined;
-	const releaseCredentialDisabledSubscription = (): void => {
-		const unsubscribe = unsubscribeCredentialDisabled;
-		unsubscribeCredentialDisabled = undefined;
-		unsubscribe?.();
+		if (!hasSession && credentialScopeLeased && credentialScopeId) {
+			try {
+				authStorage.releaseCredentialScope(credentialScopeId);
+				credentialScopeLeased = false;
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+		}
+		if (ownsAuthStorage && !authStorageClosed) {
+			authStorageClosed = true;
+			try {
+				authStorage.close();
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+		}
+		if (cleanupErrors.length === 1) throw cleanupErrors[0];
+		if (cleanupErrors.length > 1)
+			throw new AggregateError(cleanupErrors, "Failed to close owned model registry and auth storage.");
 	};
 	let inheritedMcpToolsPublisher: ((tools: readonly CustomTool[]) => void) | undefined;
 	let inheritedMcpToolsUnsubscribe: (() => void) | undefined;
@@ -1696,20 +1804,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	try {
-		// Subscribe before any getApiKey() call so startup model probes can't fire a
-		// credential_disabled event past us. An embedder's constructor handler makes the
-		// listener set non-empty from construction, which defeats AuthStorage's no-listener
-		// buffer — so we can't rely on it to catch startup events for the extension runner.
-		const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
-		let credentialDisabledTarget: ExtensionRunner | undefined;
-		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
-			if (credentialDisabledTarget) {
-				// Discard return: any handler error is routed through runner.onError listeners.
-				void credentialDisabledTarget.emitCredentialDisabled(event);
-			} else {
-				startupCredentialDisabledEvents.push(event);
-			}
-		});
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
@@ -5861,67 +5955,101 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
-		// Release the subscription if the throw happened after install but before the
-		// dispose-wrap took ownership.
-		stopInheritedMcpToolsSubscription();
-		releaseCredentialDisabledSubscription();
 		let cleanupDiagnostic: unknown;
-		try {
-			if (hasSession) {
+		let ownedMcpCleanupFailed = false;
+		let ownedMcpCleanupError: unknown;
+		const recordCleanupFailure = (cleanupError: unknown): void => {
+			cleanupDiagnostic =
+				cleanupDiagnostic === undefined
+					? cleanupError
+					: new AggregateError([cleanupDiagnostic, cleanupError], "Multiple startup cleanup operations failed.");
+		};
+		const attemptCleanup = async (
+			cleanup: () => void | Promise<void>,
+			onFailure?: (cleanupError: unknown) => void,
+		): Promise<void> => {
+			try {
+				await cleanup();
+			} catch (cleanupError) {
+				recordCleanupFailure(cleanupError);
+				onFailure?.(cleanupError);
+			}
+		};
+		// Release the subscription if the throw happened after install but before the
+		// dispose-wrap took ownership. Each independent cleanup still runs if another
+		// teardown reports an error, and every failure is retained for lifecycle proof.
+		await attemptCleanup(stopInheritedMcpToolsSubscription);
+		await attemptCleanup(releaseCredentialDisabledSubscription);
+		if (hasSession) {
+			await attemptCleanup(async () => {
 				try {
 					await session.dispose();
 				} catch (disposeError) {
-					if (!isSessionDisposalIncompleteError(disposeError)) {
-						throw disposeError;
-					}
+					if (!isSessionDisposalIncompleteError(disposeError)) throw disposeError;
 					// The first call is intentionally bounded for startup callers. Join the
 					// retained teardown before releasing the resources it still owns.
 					await session.awaitDisposeCompletion();
 				}
-			} else {
-				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
-				// Admission happens before session construction. Any later startup
-				// failure must eventually release THIS manager's endpoint mapping
-				// through disposal and restore the prior global only when this manager
-				// is still global: otherwise a retry under the same endpoint is falsely
-				// rejected and an orphan redirects global-manager consumers away from
-				// the live session (review thread P1).
-				if (asyncJobManagerOwned && asyncJobManager) {
-					if (asyncJobManagerAdmitted) {
-						if (AsyncJobManager.instance() === asyncJobManager) {
-							AsyncJobManager.setInstance(priorAsyncJobManager);
-						}
-					}
-					await asyncJobManager.dispose({ timeoutMs: 100 });
-				}
-				await cleanupOwnedMcpManager?.();
-				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
-					import("../eval/py/executor"),
-					import("../eval/js/context-manager"),
-				]);
-				await disposeKernelSessionsByOwner(evalKernelOwnerId);
-				await disposeVmContextsByOwner(evalKernelOwnerId);
-				await closeOwnedSettings();
-			}
-		} catch (cleanupError) {
-			cleanupDiagnostic = cleanupError;
-			logger.warn("Failed to clean up createAgentSession resources after startup error", {
-				error: safeErrorForLog(error),
-				cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
 			});
-		} finally {
-			if (processCwdClaimed) {
+		} else {
+			if (hasRegistered)
+				await attemptCleanup(() => {
+					agentRegistry.unregister(resolvedAgentId);
+				});
+			// Admission happens before session construction. Any later startup failure
+			// must release this manager's endpoint mapping; a failed restoration cannot
+			// prevent disposal of the owned manager or other startup resources.
+			if (asyncJobManagerOwned && asyncJobManager) {
+				const ownedAsyncJobManager = asyncJobManager;
+				if (asyncJobManagerAdmitted)
+					await attemptCleanup(() => {
+						if (AsyncJobManager.instance() === ownedAsyncJobManager)
+							AsyncJobManager.setInstance(priorAsyncJobManager);
+					});
+				await attemptCleanup(async () => {
+					await ownedAsyncJobManager.dispose({ timeoutMs: 100 });
+				});
+			}
+			if (cleanupOwnedMcpManager)
+				await attemptCleanup(cleanupOwnedMcpManager, cleanupError => {
+					ownedMcpCleanupFailed = true;
+					ownedMcpCleanupError = cleanupError;
+				});
+			const evalCleanup = Promise.all([import("../eval/py/executor"), import("../eval/js/context-manager")]);
+			let evalCleanupModules: Awaited<typeof evalCleanup> | undefined;
+			try {
+				evalCleanupModules = await evalCleanup;
+			} catch (cleanupError) {
+				recordCleanupFailure(cleanupError);
+			}
+			if (evalCleanupModules) {
+				const [kernelExecutor, contextManager] = evalCleanupModules;
+				await attemptCleanup(() => kernelExecutor.disposeKernelSessionsByOwner(evalKernelOwnerId));
+				await attemptCleanup(() => contextManager.disposeVmContextsByOwner(evalKernelOwnerId));
+			}
+			await attemptCleanup(closeOwnedSettings);
+		}
+		if (processCwdClaimed)
+			await attemptCleanup(() => {
 				SessionManager.releaseProcessCwdOwnership(sessionManager);
 				processCwdClaimed = false;
+			});
+		await attemptCleanup(releaseLocalProtocolOverride);
+		await attemptCleanup(closeOwnedAuthStorage);
+		if (cleanupDiagnostic !== undefined) {
+			logger.warn("Failed to clean up createAgentSession resources after startup error", {
+				error: safeErrorForLog(error),
+				cleanupDiagnostic: ownedMcpCleanupFailed
+					? safeCleanupDiagnosticForLog({ code: "MCP_MANAGER_CLEANUP_FAILED", cause: ownedMcpCleanupError })
+					: safeErrorForLog(cleanupDiagnostic),
+			});
+			if (ownedMcpCleanupFailed) {
+				const withMcpCleanupDiagnostic = attachMcpCleanupDiagnostic(error, ownedMcpCleanupError);
+				if (cleanupDiagnostic === ownedMcpCleanupError) throw withMcpCleanupDiagnostic;
+				throw attachStartupCleanupDiagnostic(withMcpCleanupDiagnostic, cleanupDiagnostic);
 			}
-			releaseLocalProtocolOverride();
-			try {
-				await closeOwnedAuthStorage();
-			} catch (authCleanupError) {
-				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
-			}
+			throw attachStartupCleanupDiagnostic(error, cleanupDiagnostic);
 		}
-		if (cleanupDiagnostic !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupDiagnostic);
 		throw error;
 	}
 }

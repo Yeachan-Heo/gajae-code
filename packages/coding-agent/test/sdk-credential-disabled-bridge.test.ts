@@ -413,15 +413,38 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not subscribe to caller-owned storage when scoped settings fail", async () => {
+	it("retains auth storage close failure after initial reload failure", async () => {
+		const dirs = makeDirs("reload-close-failure");
+		const reloadError = new Error("initial reload failed");
+		const closeError = new Error("owned auth storage close failed");
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw closeError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBe(reloadError);
+		if (!thrown || (typeof thrown !== "object" && typeof thrown !== "function"))
+			throw new Error("Expected the startup cleanup diagnostic on the reload error.");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
+	it("cleans an abandoned credential listener without closing caller-owned storage", async () => {
 		const dirs = makeDirs("settings-failure");
 		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const close = vi.spyOn(authStorage, "close");
 		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
-		let subscriptions = 0;
 		let unsubscriptions = 0;
 		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
-			subscriptions++;
 			const unsubscribe = originalSubscribe(listener);
 			return () => {
 				unsubscriptions++;
@@ -436,8 +459,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 
 		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
 
-		expect(subscriptions).toBe(0);
-		expect(unsubscriptions).toBe(0);
+		expect(unsubscriptions).toBe(1);
 		expect(close).not.toHaveBeenCalled();
 	});
 
@@ -462,6 +484,17 @@ describe("createAgentSession credential_disabled subscription", () => {
 				embedderEvents.push(event);
 			},
 		});
+		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let subscriptions = 0;
+		let unsubscriptions = 0;
+		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			subscriptions++;
+			const unsubscribe = originalSubscribe(listener);
+			return () => {
+				unsubscriptions++;
+				unsubscribe();
+			};
+		});
 
 		const throwingFactory: ExtensionFactory = () => {
 			throw new Error("simulated mid-startup failure");
@@ -476,6 +509,8 @@ describe("createAgentSession credential_disabled subscription", () => {
 		await expect(createAgentSession(baseOptions(dirs, authStorage, [throwingFactory]))).rejects.toThrow(
 			/simulated mid-startup failure/,
 		);
+		expect(subscriptions).toBe(2);
+		expect(unsubscriptions).toBe(2);
 
 		// Now fire a real disable. Only the embedder must observe it — no leftover listener
 		// from either failed startup attempt.
