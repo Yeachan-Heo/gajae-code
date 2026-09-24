@@ -1,4 +1,5 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -119,12 +120,16 @@ test("a lost-root exit logs and persists one structured fence reason", async () 
 	}
 });
 
-test("a signal stop retains the signal as its structured exit reason", async () => {
+test("a signal stop persists its reason without synchronous fsync", async () => {
 	const broker = await startBroker();
 	const info = vi.spyOn(logger, "info").mockImplementation(() => {});
+	const syncFsync = vi.spyOn(syncFs, "fsyncSync").mockImplementation(() => {
+		throw new Error("signal exit must not fsync synchronously");
+	});
 	try {
 		await broker.stop({ kind: "signal", signal: "SIGTERM" });
 
+		expect(syncFsync).not.toHaveBeenCalled();
 		const exitLogs = info.mock.calls.filter(([message]) => message === "sdk broker: exiting");
 		expect(exitLogs).toHaveLength(1);
 		expect(exitLogs[0]?.[1]).toMatchObject({
@@ -140,6 +145,7 @@ test("a signal stop retains the signal as its structured exit reason", async () 
 			signal: "SIGTERM",
 		});
 	} finally {
+		syncFsync.mockRestore();
 		info.mockRestore();
 	}
 });
