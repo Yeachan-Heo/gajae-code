@@ -2180,18 +2180,32 @@ async function writeLifecycleFailurePromotionFence(
 			throw new Error("Lifecycle failure receipt promotion fence changed during setup.");
 		await handle.close();
 		handle = undefined;
-		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion fencing.");
 		return { path: fencePath, identity };
 	} catch (error) {
+		const cleanupErrors: unknown[] = [];
 		if (handle && createdByUs && !identity) {
 			try {
 				identity = await captureOpenedLifecycleFileIdentity(handle);
-			} catch {
-				// Keep an unidentifiable fence in place so readers fail closed.
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
 			}
 		}
-		if (handle) await handle.close().catch(() => {});
-		if (createdByUs && identity) removeLifecyclePublicationFile(fencePath, identity, parent);
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (createdByUs) {
+			if (!identity) cleanupErrors.push(new Error("Lifecycle failure promotion fence identity is unavailable."));
+			else if (!removeLifecyclePublicationFile(fencePath, identity, parent))
+				cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError([error, ...cleanupErrors], "Lifecycle failure promotion fence cleanup failed."),
+			);
 		throw error;
 	}
 }

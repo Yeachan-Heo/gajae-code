@@ -732,7 +732,6 @@ export async function runSessionHost(
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
 		if (!directory) return;
-		mcpConfigDirectory = undefined;
 		try {
 			const identity = directory.directoryIdentity;
 			const parentIdentity = directory.parentIdentity;
@@ -760,7 +759,10 @@ export async function runSessionHost(
 			)
 				throw new Error("MCP temporary directory identity changed before cleanup.");
 			const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
-			if (removed.ok) return;
+			if (removed.ok) {
+				mcpConfigDirectory = undefined;
+				return;
+			}
 			if (
 				removed.code === "cleanup_pending" &&
 				removed.payloadDurable === true &&
@@ -813,6 +815,7 @@ export async function runSessionHost(
 					!retainedTreeIsScrubbed
 				)
 					throw new Error("MCP temporary directory retained unresolved cleanup authority.");
+				mcpConfigDirectory = undefined;
 				return;
 			}
 			throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
@@ -911,31 +914,43 @@ export async function runSessionHost(
 			await captureMcpConfigDirectory(ownedDirectory);
 			const resolvedMcpConfigDirectory = await fs.realpath(ownedDirectory.path);
 			mcpConfigPath = path.join(resolvedMcpConfigDirectory, "mcp.json");
-			await Bun.write(
-				mcpConfigPath,
-				JSON.stringify({
-					mcpServers: Object.fromEntries(
-						request.mcpServers.map(server => [
-							server.name,
-							"url" in server
-								? {
-										type: server.type,
-										url: server.url,
-										...(server.headers ? { headers: server.headers } : {}),
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									}
-								: {
-										type: server.type,
-										command: server.command,
-										args: server.args,
-										...(server.env ? { env: server.env } : {}),
-										noInheritEnv: true,
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									},
-						]),
-					),
-				}),
-			);
+			try {
+				await Bun.write(
+					mcpConfigPath,
+					JSON.stringify({
+						mcpServers: Object.fromEntries(
+							request.mcpServers.map(server => [
+								server.name,
+								"url" in server
+									? {
+											type: server.type,
+											url: server.url,
+											...(server.headers ? { headers: server.headers } : {}),
+											timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+										}
+									: {
+											type: server.type,
+											command: server.command,
+											args: server.args,
+											...(server.env ? { env: server.env } : {}),
+											noInheritEnv: true,
+											timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+										},
+							]),
+						),
+					}),
+				);
+			} catch (writeError) {
+				try {
+					await captureMcpConfigDirectory(ownedDirectory);
+				} catch (snapshotError) {
+					throw new AggregateError(
+						[writeError, snapshotError],
+						"MCP configuration write and partial-state cleanup snapshot both failed.",
+					);
+				}
+				throw writeError;
+			}
 			await captureMcpConfigDirectory(ownedDirectory);
 			throwIfStartupInterrupted();
 		}
