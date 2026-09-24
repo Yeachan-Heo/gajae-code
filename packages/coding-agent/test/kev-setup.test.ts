@@ -14,6 +14,7 @@ import {
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
 	kevControl,
+	LISTEN_FD_ENV,
 } from "../src/setup/kev-supervisor";
 
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
@@ -31,6 +32,8 @@ afterEach(async () => {
 	}
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
+
+const python = Bun.which("python3");
 
 /** Shared-checkout isolation: only this window may be bound by these tests. */
 const PORT_BASE = Number(process.env.PORT_BASE ?? 42040);
@@ -57,9 +60,47 @@ function loopbackPortIsFree(port: number): boolean {
 	}
 }
 
-function reservedLoopbackPort(): number | undefined {
-	for (let port = PORT_BASE; port < PORT_LIMIT; port++) if (loopbackPortIsFree(port)) return port;
-	return undefined;
+/**
+ * Can the supervisor itself bind this port?
+ *
+ * `Bun.listen` sets SO_REUSEADDR, so it reports a port left in TIME_WAIT by an
+ * earlier test as free — while the supervisor, which deliberately leaves
+ * SO_REUSEADDR at the OS default, refuses it. Probe with the same semantics the
+ * supervisor uses, or the choice is not a choice the supervisor can honour.
+ */
+function supervisorCanBind(port: number): boolean {
+	if (!python) return true;
+	const probe = Bun.spawnSync(
+		[
+			python,
+			"-c",
+			[
+				"import socket, sys",
+				"probe = socket.socket()",
+				"try:",
+				`    probe.bind(("127.0.0.1", ${port}))`,
+				"    probe.listen(1)",
+				"except OSError:",
+				"    sys.exit(1)",
+				"finally:",
+				"    probe.close()",
+			].join("\n"),
+		],
+		{ stdout: "ignore", stderr: "ignore" },
+	);
+	return probe.exitCode === 0;
+}
+
+/** Hand out a distinct, actually-bindable port per call. */
+let portCursor = 0;
+function reservedLoopbackPort(): number {
+	const window = PORT_LIMIT - PORT_BASE;
+	for (let attempt = 0; attempt < window; attempt++) {
+		const port = PORT_BASE + portCursor;
+		portCursor = (portCursor + 1) % window;
+		if (loopbackPortIsFree(port) && supervisorCanBind(port)) return port;
+	}
+	throw new Error("no free loopback port in the reserved window");
 }
 
 async function until(predicate: () => boolean | Promise<boolean>, attempts = 240): Promise<boolean> {
@@ -618,7 +659,6 @@ describe("Kev lifecycle lock", () => {
 	}, 20_000);
 });
 
-const python = Bun.which("python3");
 
 describe.skipIf(!python)("Kev supervisor process", () => {
 	/**
@@ -666,20 +706,21 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		await fs.chmod(base, 0o700);
 		const socketPath = path.join(base, "control.sock");
 		const port = reservedLoopbackPort();
-		expect(port).toBeDefined();
 		const token = "f".repeat(64);
 
-		const { caller, supervisorPid } = await runCaller(base, socketPath, port!, token, false);
-		// The supervisor is up and blocked on the commit line; it has started nothing.
+		const { caller, supervisorPid } = await runCaller(base, socketPath, port, token, false);
+		// The supervisor is up, holding the reserved port and blocked on the commit
+		// line. It has started nothing.
 		expect(await until(() => pathExists(socketPath))).toBe(true);
-		expect(loopbackPortIsFree(port!)).toBe(true);
+		expect(loopbackPortIsFree(port)).toBe(false);
 
 		nativeKill(caller.pid, "SIGKILL");
 		await caller.exited;
-		// Losing the caller closes stdin, so the supervisor exits without spawning.
+		// Losing the caller closes stdin, so the supervisor exits without spawning
+		// and releases everything it reserved.
 		expect(await until(() => processIsGone(supervisorPid))).toBe(true);
 		expect(await until(async () => !(await pathExists(socketPath)))).toBe(true);
-		expect(loopbackPortIsFree(port!)).toBe(true);
+		expect(await until(() => loopbackPortIsFree(port))).toBe(true);
 	}, 60_000);
 
 	test("the same caller that commits does start the service", async () => {
@@ -688,10 +729,9 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		await fs.chmod(base, 0o700);
 		const socketPath = path.join(base, "control.sock");
 		const port = reservedLoopbackPort();
-		expect(port).toBeDefined();
 		const token = "e".repeat(64);
 
-		const { supervisorPid } = await runCaller(base, socketPath, port!, token, true);
+		const { supervisorPid } = await runCaller(base, socketPath, port, token, true);
 		expect(await until(() => pathExists(socketPath))).toBe(true);
 		const started = await kevControl(socketPath, controlRequest("status", token));
 		expect(started).toMatchObject({ ok: true, state: "running" });
@@ -699,43 +739,122 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		expect(processIsGone(supervisorPid)).toBe(false);
 	}, 60_000);
 
-	test("a SIGKILLed supervisor takes its server down and frees the port", async () => {
-		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-crash-"));
-		roots.push(base);
-		await fs.chmod(base, 0o700);
+	/**
+	 * A stand-in for `kev.serve`: a runpy-able module that serves on the socket the
+	 * supervisor already bound, which is what the shim makes the real service do.
+	 */
+	const FAKE_SERVICE_MODULE = "gjckevfake";
+	async function writeSupervisedFixture(base: string): Promise<{ supervisorScript: string; shim: string }> {
 		const supervisorScript = path.join(base, "supervisor.py");
 		const shim = path.join(base, "kev-service.py");
 		await Bun.write(supervisorScript, KEV_SUPERVISOR_SOURCE);
 		await Bun.write(shim, KEV_SERVICE_SHIM_SOURCE);
+		await Bun.write(
+			path.join(base, `${FAKE_SERVICE_MODULE}.py`),
+			[
+				"import http.server, json, os, socket",
+				"",
+				"class Handler(http.server.BaseHTTPRequestHandler):",
+				"    def do_POST(self):",
+				"        body = self.rfile.read(int(self.headers['Content-Length']))",
+				"        payload = json.dumps({'path': self.path, 'echo': json.loads(body)}).encode()",
+				"        self.send_response(200)",
+				"        self.send_header('Content-Type', 'application/json')",
+				"        self.send_header('Content-Length', str(len(payload)))",
+				"        self.end_headers()",
+				"        self.wfile.write(payload)",
+				"    def log_message(self, *args):",
+				"        pass",
+				"",
+				`fd = int(os.environ['${LISTEN_FD_ENV}'])`,
+				"server = http.server.HTTPServer(('127.0.0.1', 0), Handler, bind_and_activate=False)",
+				"server.socket.close()",
+				"server.socket = socket.socket(fileno=fd)",
+				"server.server_address = server.socket.getsockname()",
+				"server.serve_forever()",
+			].join("\n"),
+		);
 		await fs.chmod(supervisorScript, 0o600);
 		await fs.chmod(shim, 0o600);
+		return { supervisorScript, shim };
+	}
+
+	function supervisedArgv(supervisorScript: string, shim: string, socketPath: string, port: number): string[] {
+		return [
+			python!,
+			supervisorScript,
+			"--socket",
+			socketPath,
+			"--port",
+			String(port),
+			"--",
+			python!,
+			shim,
+			"--",
+			FAKE_SERVICE_MODULE,
+		];
+	}
+
+	test("a port already held by an unrelated listener is refused, and no task text reaches it", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-occupied-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const { supervisorScript, shim } = await writeSupervisedFixture(base);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+
+		// Someone else takes the port first. The supervisor must refuse to manage a
+		// service it does not own, and must never forward anything to this listener.
+		const received: string[] = [];
+		const intruder = Bun.serve({
+			hostname: "127.0.0.1",
+			port,
+			fetch(incoming) {
+				received.push(new URL(incoming.url).pathname);
+				return new Response(JSON.stringify({ intruder: true }), {
+					headers: { "content-type": "application/json" },
+				});
+			},
+		});
+		try {
+			const token = "9".repeat(64);
+			const supervisor = Bun.spawn(supervisedArgv(supervisorScript, shim, socketPath, port), {
+				cwd: base,
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "pipe",
+			});
+			spawnedPids.push(supervisor.pid);
+			supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
+			supervisor.stdin.end();
+			expect(await supervisor.exited).not.toBe(0);
+			expect(await new Response(supervisor.stderr).text()).toContain("service port is occupied");
+			// No control socket means no channel at all, so even an authenticated
+			// infer has nowhere to go and the intruder is never addressed.
+			expect(await pathExists(socketPath)).toBe(false);
+			expect(await kevControl(socketPath, controlInferRequest(token, JSON.stringify({ probe: 1 })))).toBeUndefined();
+			expect(received).toEqual([]);
+		} finally {
+			intruder.stop(true);
+		}
+	}, 60_000);
+
+	test("a SIGKILLed supervisor takes its server down and frees the port", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-crash-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const { supervisorScript, shim } = await writeSupervisedFixture(base);
 		const socketPath = path.join(base, "control.sock");
 		expect(controlSocketPathIsBindable(socketPath)).toBe(true);
 		const port = reservedLoopbackPort();
-		expect(port).toBeDefined();
 
 		const token = "c".repeat(64);
-		// `http.server` stands in for `kev.serve`: a runpy-able module that holds a
-		// loopback port, started through the same shim the real service uses.
-		const supervisor = Bun.spawn(
-			[
-				python!,
-				supervisorScript,
-				"--socket",
-				socketPath,
-				"--port",
-				String(port),
-				"--",
-				python!,
-				shim,
-				"--",
-				"http.server",
-				String(port),
-				"--bind",
-				"127.0.0.1",
-			],
-			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
-		);
+		const supervisor = Bun.spawn(supervisedArgv(supervisorScript, shim, socketPath, port), {
+			cwd: base,
+			stdin: "pipe",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
 		spawnedPids.push(supervisor.pid);
 		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
 		supervisor.stdin.end();
@@ -745,55 +864,43 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		expect(started).toMatchObject({ ok: true, state: "running" });
 		const servicePid = started!.pid!;
 		spawnedPids.push(servicePid);
-		expect(await until(() => !loopbackPortIsFree(port!))).toBe(true);
+		expect(loopbackPortIsFree(port)).toBe(false);
 
 		// SIGKILL: the supervisor runs no shutdown code at all. Only the inherited
-		// pipe closing can tell the server that nothing is left to stop it.
+		// pipe closing can tell the server that nothing is left to stop it. The
+		// child holds its own copy of the listening socket, so the port stays taken
+		// until the watchdog actually ends it.
 		nativeKill(supervisor.pid, "SIGKILL");
 		await supervisor.exited;
 
 		expect(await until(() => processIsGone(servicePid))).toBe(true);
-		expect(await until(() => loopbackPortIsFree(port!))).toBe(true);
+		expect(await until(() => loopbackPortIsFree(port))).toBe(true);
 	}, 60_000);
 
 	test("forwards an authenticated inference to its own child and refuses an unauthenticated one", async () => {
 		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-infer-"));
 		roots.push(base);
 		await fs.chmod(base, 0o700);
-		const script = path.join(base, "supervisor.py");
-		await Bun.write(script, KEV_SUPERVISOR_SOURCE);
-		await fs.chmod(script, 0o600);
+		const { supervisorScript, shim } = await writeSupervisedFixture(base);
 		const socketPath = path.join(base, "control.sock");
 		const port = reservedLoopbackPort();
-		expect(port).toBeDefined();
 
 		const token = "d".repeat(64);
-		const echoServer = [
-			"import http.server, json",
-			"class Handler(http.server.BaseHTTPRequestHandler):",
-			"    def do_POST(self):",
-			"        body = self.rfile.read(int(self.headers['Content-Length']))",
-			"        payload = json.dumps({'path': self.path, 'echo': json.loads(body)}).encode()",
-			"        self.send_response(200)",
-			"        self.send_header('Content-Type', 'application/json')",
-			"        self.send_header('Content-Length', str(len(payload)))",
-			"        self.end_headers()",
-			"        self.wfile.write(payload)",
-			"    def log_message(self, *args):",
-			"        pass",
-			`http.server.HTTPServer(('127.0.0.1', ${port}), Handler).serve_forever()`,
-		].join("\n");
-		const supervisor = Bun.spawn(
-			[python!, script, "--socket", socketPath, "--port", String(port), "--", python!, "-c", echoServer],
-			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
-		);
+		// The stand-in service serves on the socket the supervisor bound, exactly as
+		// the shim makes the real service do.
+		const supervisor = Bun.spawn(supervisedArgv(supervisorScript, shim, socketPath, port), {
+			cwd: base,
+			stdin: "pipe",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
 		spawnedPids.push(supervisor.pid);
 		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
 		supervisor.stdin.end();
 		expect(await until(() => pathExists(socketPath))).toBe(true);
 		const started = await kevControl(socketPath, controlRequest("status", token));
 		spawnedPids.push(started!.pid!);
-		expect(await until(() => !loopbackPortIsFree(port!))).toBe(true);
+		expect(loopbackPortIsFree(port)).toBe(false);
 
 		const refused = await kevControl(socketPath, controlInferRequest("e".repeat(64), JSON.stringify({ probe: 1 })));
 		expect(refused).toEqual({ ok: false, error: "refused" });
@@ -825,7 +932,7 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 				"--socket",
 				socketPath,
 				"--port",
-				String(PORT_BASE),
+				String(reservedLoopbackPort()),
 				"--",
 				python!,
 				"-c",

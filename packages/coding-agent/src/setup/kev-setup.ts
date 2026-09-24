@@ -389,9 +389,10 @@ async function status(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	}
 	if (!owns(record, install, observed))
 		return { ok: false, state: "foreign", root, error: "Kev process ownership or incarnation does not match" };
-	// The supervisor does not hold the port; its child does. Ask the authenticated
-	// control channel which pid that is, so `listens` still proves the listener is
-	// ours rather than any process that happens to answer on the loopback port.
+	// The supervisor binds the port and passes the listening socket to its child,
+	// so both hold it. Ask the authenticated control channel which pid the child
+	// is, so `listens` names the process actually serving rather than assuming
+	// whoever answers on the loopback port is ours.
 	const reported = await (deps.control ?? kevControl)(controlSocket(root), controlRequest("status", record.token));
 	const servicePid = reported?.ok && reported.state === "running" ? reported.pid : undefined;
 	const ready =

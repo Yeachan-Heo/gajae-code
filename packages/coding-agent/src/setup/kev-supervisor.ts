@@ -18,6 +18,8 @@ export const SERVICE_SHIM_FILE = "kev-service.py";
 export const CONTROL_FILE = "control.sock";
 /** Names the inherited pipe the service watches; kept out of argv so ownership text stays fixed. */
 export const WATCH_FD_ENV = "GJC_KEV_WATCH_FD";
+/** Names the already-bound listening socket the service serves on; also kept out of argv. */
+export const LISTEN_FD_ENV = "GJC_KEV_LISTEN_FD";
 /** Second stdin line, written only once the ownership record is durable. */
 export const KEV_COMMIT_LINE = "start";
 /** macOS `sun_path` is 104 bytes including the terminator; bind must never silently truncate. */
@@ -136,13 +138,19 @@ write end of an inherited pipe, and the read below returns EOF.
 import os
 import runpy
 import signal
+import socket
 import sys
 import threading
 import time
 
 WATCH_FD_ENV = "${WATCH_FD_ENV}"
+LISTEN_FD_ENV = "${LISTEN_FD_ENV}"
 GRACE_SECONDS = 10.0
 EXIT_SUPERVISOR_LOST = 71
+# Binding arguments the supervisor's socket replaces. kev.serve passes host/port;
+# a caller could also pass fd/uds. All of them are dropped in favour of the
+# already-bound socket.
+BINDING_KWARGS = ("host", "port", "fd", "uds")
 
 
 def fail(message):
@@ -168,6 +176,44 @@ def shutdown_when_supervisor_is_lost(fd):
     os._exit(EXIT_SUPERVISOR_LOST)
 
 
+def serve_on_inherited_socket(fd):
+    """Make uvicorn.run() serve on the supervisor's socket instead of binding.
+
+    kev.serve ends in \`uvicorn.run(app, host=..., port=...)\`. Binding there would
+    reopen the very race the supervisor closed by binding first, so the call is
+    redirected onto the inherited descriptor. This is lazy and conditional: a
+    module that never calls uvicorn.run is untouched, and a missing uvicorn is
+    not an error for such a module.
+    """
+    try:
+        import uvicorn
+    except Exception:
+        return
+
+    original = uvicorn.run
+
+    def run(app, **kwargs):
+        settings = {key: value for key, value in kwargs.items() if key not in BINDING_KWARGS}
+        try:
+            config = uvicorn.Config(app, **settings)
+            server = uvicorn.Server(config)
+            listener = socket.socket(fileno=fd)
+        except Exception:
+            # Never silently fall back to binding: that would hand the port to
+            # whoever raced for it. Surface the failure instead.
+            raise
+        try:
+            server.run(sockets=[listener])
+        finally:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+    run.__wrapped__ = original
+    uvicorn.run = run
+
+
 def main(argv):
     if len(argv) < 2 or argv[0] != "--":
         fail("usage: kev-service.py -- <module> [args...]")
@@ -179,6 +225,10 @@ def main(argv):
         target=shutdown_when_supervisor_is_lost, args=(int(descriptor),), daemon=True
     )
     watcher.start()
+    listen_fd = os.environ.get(LISTEN_FD_ENV, "")
+    if not listen_fd.isdigit():
+        fail("supervisor listening descriptor was not provided")
+    serve_on_inherited_socket(int(listen_fd))
     sys.argv = [module] + list(argv[2:])
     runpy.run_module(module, run_name="__main__", alter_sys=True)
     return 0
@@ -222,8 +272,9 @@ TOKEN_LENGTH = 64
 # disk, so nothing this supervisor starts can outlive an unrecorded start.
 COMMIT_LINE = "${KEV_COMMIT_LINE}"
 INFER_TIMEOUT_SECONDS = 60.0
-# Fixed: callers choose neither host, port nor path, so this channel can only ever
-# reach the server this supervisor started.
+# Fixed: callers choose neither host, port nor path, and the destination socket
+# is one this process bound itself, so this channel can only ever reach the
+# server this supervisor started.
 SERVICE_PATH = "/v1/systemone"
 
 
@@ -240,7 +291,7 @@ def reply(connection, payload):
         pass
 
 
-def cleanup(listener, socket_path, watch_write=None):
+def cleanup(listener, socket_path, watch_write=None, service=None):
     try:
         listener.close()
     except OSError:
@@ -252,6 +303,11 @@ def cleanup(listener, socket_path, watch_write=None):
     if watch_write is not None:
         try:
             os.close(watch_write)
+        except OSError:
+            pass
+    if service is not None:
+        try:
+            service.close()
         except OSError:
             pass
 
@@ -279,12 +335,15 @@ def terminate(child):
         return None
 
 
-def infer(port, body):
-    # The destination is this supervisor's own child on loopback. Nothing in the
-    # request chooses it, so an unrelated listener that grabbed the port cannot
-    # be handed task text by a caller.
+def infer(port, body, service):
+    # The destination is the socket THIS process bound and still holds. That is
+    # what makes the loopback connection below provably the owned child rather
+    # than whatever else might have raced for the port: nothing else can hold
+    # this binding while it is open here, and the request chooses no address.
     if not isinstance(body, str) or len(body.encode("utf-8")) > MAX_REQUEST:
         return {"ok": False, "error": "invalid_request"}
+    if service is None or service.fileno() < 0:
+        return {"ok": False, "error": "not_owned"}
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=INFER_TIMEOUT_SECONDS)
     try:
         payload = body.encode("utf-8")
@@ -308,7 +367,7 @@ def infer(port, body):
             pass
 
 
-def serve(connection, child, token, port):
+def serve(connection, child, token, port, service):
     connection.settimeout(5.0)
     data = b""
     try:
@@ -339,7 +398,7 @@ def serve(connection, child, token, port):
         if child.poll() is not None:
             reply(connection, {"ok": False, "error": "exited"})
             return False
-        reply(connection, infer(port, request.get("body")))
+        reply(connection, infer(port, request.get("body"), service))
         return False
     if op != "stop":
         reply(connection, {"ok": False, "error": "unsupported"})
@@ -387,6 +446,20 @@ def main(argv):
     finally:
         os.umask(previous_umask)
 
+    # Take the service port here, before anything else can. The child serves on
+    # this exact socket, so "something answers on 127.0.0.1:<port>" stops being
+    # a guess: this process bound it and holds it for as long as it manages the
+    # service. SO_REUSEADDR is left at the OS default and SO_REUSEPORT is never
+    # set, so no second process can share the binding.
+    try:
+        service = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        service.bind(("127.0.0.1", port))
+        service.listen(128)
+        service.set_inheritable(True)
+    except OSError:
+        cleanup(listener, socket_path)
+        fail("service port is occupied; refusing to start")
+
     # Commit barrier. The caller writes this line only once the ownership record
     # is durable, and it holds the other end of this pipe. A caller that dies
     # first — SIGKILL included — closes stdin, the read below returns EOF, and
@@ -398,7 +471,7 @@ def main(argv):
     except OSError:
         pass
     if commit.strip() != COMMIT_LINE:
-        cleanup(listener, socket_path)
+        cleanup(listener, socket_path, service=service)
         return 0
 
     # The child inherits the read end and this process keeps the write end open
@@ -407,20 +480,28 @@ def main(argv):
     # it a SIGKILLed supervisor would leave the server running and unstoppable.
     watch_read, watch_write = os.pipe()
     os.set_inheritable(watch_read, True)
+    service_fd = service.fileno()
     child_environment = dict(os.environ)
     child_environment["${WATCH_FD_ENV}"] = str(watch_read)
+    # The child serves on the socket this process already bound rather than
+    # binding the port for itself, so there is no window in which anything else
+    # could take it. Both descriptors ride in the environment, not argv, so the
+    # ownership command text stays byte-identical.
+    child_environment["${LISTEN_FD_ENV}"] = str(service_fd)
     child = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         env=child_environment,
-        pass_fds=(watch_read,),
+        pass_fds=(watch_read, service_fd),
     )
     # Only the child needs the read end; only this process may hold the write end.
+    # The service socket stays open here too: holding it is what keeps the port
+    # from being handed to anyone else while this supervisor manages it.
     os.close(watch_read)
 
     def shutdown(_signum, _frame):
         terminate(child)
-        cleanup(listener, socket_path, watch_write)
+        cleanup(listener, socket_path, watch_write, service)
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, shutdown)
@@ -428,7 +509,7 @@ def main(argv):
 
     while True:
         if child.poll() is not None:
-            cleanup(listener, socket_path, watch_write)
+            cleanup(listener, socket_path, watch_write, service)
             return 0
         try:
             connection, _ = listener.accept()
@@ -439,8 +520,8 @@ def main(argv):
                 continue
             raise
         try:
-            if serve(connection, child, token, port):
-                cleanup(listener, socket_path, watch_write)
+            if serve(connection, child, token, port, service):
+                cleanup(listener, socket_path, watch_write, service)
                 return 0
         finally:
             try:
