@@ -1631,14 +1631,43 @@ export async function loadManagedEnrollmentIndex(agentDir: string): Promise<stri
 export async function loadManagedEnrollmentRecord(agentDir: string): Promise<ManagedEnrollmentRecord> {
 	const agent = await fs.realpath(agentDir);
 	const target = managedEnrollmentIndexPath(agent);
+	const enrollmentDirectory = path.dirname(target);
+	const emptyRecord: ManagedEnrollmentRecord = {
+		controlRoots: [],
+		establishedRoots: [],
+		publishingRoots: [],
+		nativeIdentities: [],
+		byRoot: {},
+	};
 	try {
-		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
-			cwd: agent,
-			privateDurable: { directory: path.dirname(target) },
-		});
+		// Do not acquire a lock for a missing directory: the generic lock helper
+		// creates its parent, which would poison a later guarded write's mode check.
+		const gjcStat = await fs.lstat(path.join(agent, ".gjc"));
+		if (!gjcStat.isDirectory() || gjcStat.isSymbolicLink())
+			throw new Error("managed enrollment parent is not a safe directory");
+		const enrollmentStat = await fs.lstat(enrollmentDirectory);
+		if (
+			!enrollmentStat.isDirectory() ||
+			enrollmentStat.isSymbolicLink() ||
+			!within(agent, await fs.realpath(enrollmentDirectory))
+		)
+			throw new Error("managed enrollment directory is not a safe directory");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT")
-			return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyRecord;
+		throw error;
+	}
+	try {
+		// Existing-only locking prevents a concurrent removal after lstat from
+		// recreating the enrollment directory. Linux also revalidates its private mode.
+		return await withWorkflowStateLock(
+			target,
+			() => loadEnrollmentIndexUnderLock(target),
+			process.platform === "linux"
+				? { cwd: agent, createMissingParents: false, privateDurable: { directory: enrollmentDirectory } }
+				: { cwd: agent, createMissingParents: false },
+		);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyRecord;
 		if (error instanceof Error && error.message === "corrupt managed enrollment index") throw error;
 		throw new Error("corrupt managed enrollment index");
 	}

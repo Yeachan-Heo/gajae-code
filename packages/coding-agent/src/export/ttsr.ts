@@ -505,6 +505,15 @@ export class TtsrManager {
 		this.#messageCount = Math.max(0, Math.floor(messageCount));
 	}
 
+	/** Replace persisted repeat state after a committed session identity transition. */
+	replacePersistedState(records: string[] | TtsrInjectionRecord[], messageCount: number): void {
+		if (this.#isDisabled()) return;
+		this.#buffers.clear();
+		this.#injectionRecords.clear();
+		this.#messageCount = Math.max(0, Math.floor(messageCount));
+		this.restoreInjected(records);
+	}
+
 	/** Get settings. */
 	getSettings(): Required<TtsrSettings> {
 		return this.#settings;

@@ -15,6 +15,7 @@ import {
 	rebuildActiveSnapshot,
 	removeActiveEntry,
 	setActiveStateCacheInvalidator,
+	withActiveStateScopeLock,
 	writeActiveEntry,
 } from "../gjc-runtime/state-writer";
 import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
@@ -667,19 +668,38 @@ async function mergeVisibleEntries(
 	cwd: string,
 	sessionState: SkillActiveState | null,
 	sessionId: string,
+	activeStateScopeLockHeld = false,
 ): Promise<SkillActiveEntry[]> {
 	// Use the raw (active + inactive) rows so a handoff demotion stays visible
 	// long enough to supersede a stale same-skill row before the active filter.
 	// Per-skill files in active/<skill>.json are authoritative and are merged
 	// after the derived snapshot cache, so a stale skill-active-state.json row
 	// cannot override the latest entry file.
-	const entries = [...rawActiveEntries(sessionState), ...(await readActiveEntries(cwd, { sessionId }))];
-	const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
-	const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
-	const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
-		.filter(entry => entry.active !== false)
-		.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
-	return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
+	const read = async () => {
+		const activeEntries = await readActiveEntries(cwd, { sessionId });
+		const hasAuthoritativeEntryDirectory = await hasAuthoritativeActiveEntryDirectory(cwd, sessionId);
+		const authoritativeSkills = new Set(activeEntries.map(entry => entry.skill));
+		const snapshotFallbackEntries = rawActiveEntries(sessionState).filter(
+			entry => !hasAuthoritativeEntryDirectory || authoritativeSkills.has(entry.skill),
+		);
+		const entries = [...snapshotFallbackEntries, ...activeEntries];
+		const merged = new Map(entries.map(entry => [entryKey(entry), entry]));
+		const canonicalRalplanPhase = await readModeStatePhase(cwd, sessionId, "ralplan");
+		const visibleEntries = dedupeVisibleBySkill([...merged.values()], sessionId)
+			.filter(entry => entry.active !== false)
+			.map(entry => withCanonicalRalplanPhase(entry, canonicalRalplanPhase));
+		return collapsePlanningPipeline(visibleEntries).toSorted(comparePipelineEntry);
+	};
+	return activeStateScopeLockHeld ? await read() : await withActiveStateScopeLock(cwd, { sessionId }, read);
+}
+
+async function hasAuthoritativeActiveEntryDirectory(cwd: string, sessionId: string): Promise<boolean> {
+	try {
+		return (await fs.stat(activeStateDir(cwd, sessionId))).isDirectory();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return false;
+	}
 }
 
 export type VisibleSkillActiveStateCacheTier = "security" | "hud";
@@ -791,12 +811,13 @@ async function readVisibleSkillActiveStateUncached(
 	const activeSkills = await mergeVisibleEntries(cwd, sessionState, resolvedSessionId);
 	if (activeSkills.length === 0) return null;
 	const primary = activeSkills[0];
+	const authoritativeEntries = await hasAuthoritativeActiveEntryDirectory(cwd, resolvedSessionId);
 	return {
 		...(sessionState ?? {}),
 		version: 1,
 		active: true,
-		skill: sessionState?.skill ?? primary?.skill ?? "",
-		phase: sessionState?.phase ?? primary?.phase ?? "",
+		skill: authoritativeEntries ? (primary?.skill ?? "") : (sessionState?.skill ?? primary?.skill ?? ""),
+		phase: authoritativeEntries ? (primary?.phase ?? "") : (sessionState?.phase ?? primary?.phase ?? ""),
 		session_id: resolvedSessionId,
 		active_skills: activeSkills,
 		active_subskills: activeSkills.flatMap(entry => entry.active_subskills ?? []),
@@ -850,18 +871,21 @@ async function persistActiveEntry(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
+	activeStateScopeLockHeld = false,
 ): Promise<GuardedWriteResult | undefined> {
 	if (entry.active === false) {
 		await removeActiveEntry(cwd, sessionScope, entry.skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-active-entry", sessionScope),
 			sourceRevision: entry.source_state_revision,
+			activeStateScopeLockHeld,
 		});
 		return undefined;
 	}
 	return await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 		cwd,
 		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+		activeStateScopeLockHeld,
 	});
 }
 
@@ -873,6 +897,7 @@ async function writeHandoffEntry(
 	await writeActiveEntry(cwd, sessionScope, entry.skill, entry, {
 		cwd,
 		audit: activeStateWriterAudit("write-active-entry", sessionScope),
+		activeStateScopeLockHeld: true,
 	});
 }
 
@@ -887,12 +912,14 @@ async function removeSupersededPlanningPipelineEntries(
 	cwd: string,
 	sessionScope: ActiveSessionScope | undefined,
 	entry: SkillActiveEntry,
+	activeStateScopeLockHeld = false,
 ): Promise<void> {
 	if (entry.active === false) return;
 	for (const skill of upstreamPlanningPipelineSkills(entry.skill)) {
 		await removeActiveEntry(cwd, sessionScope, skill, {
 			cwd,
 			audit: activeStateWriterAudit("remove-superseded-pipeline-entry", sessionScope),
+			activeStateScopeLockHeld,
 		});
 	}
 }
@@ -901,11 +928,12 @@ async function activeSubskillsForExistingEntry(
 	cwd: string,
 	sessionId: string | undefined,
 	skill: string,
+	activeStateScopeLockHeld = false,
 ): Promise<ActiveSubskillEntry[] | undefined> {
 	const resolvedSessionId = await resolveBoundarySessionId(cwd, sessionId);
 	const { sessionPath } = getSkillActiveStatePaths(cwd, resolvedSessionId);
 	const sessionState = await readRawActiveStateForHandoff(sessionPath, false);
-	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId)).find(
+	const existing = (await mergeVisibleEntries(cwd, sessionState, resolvedSessionId, activeStateScopeLockHeld)).find(
 		entry => entry.skill === skill,
 	);
 	return existing?.active_subskills;
@@ -915,13 +943,9 @@ export async function syncSkillActiveState(
 	options: SyncSkillActiveStateOptions,
 ): Promise<GuardedWriteResult | undefined> {
 	if (!options.sessionId) return undefined;
-	const preservedActiveSubskills =
-		options.active_subskills === undefined
-			? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill)
-			: undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
-	const entry: SkillActiveEntry = {
+	const entryBase: SkillActiveEntry = {
 		skill: options.skill,
 		phase: options.phase,
 		active: options.active,
@@ -935,22 +959,31 @@ export async function syncSkillActiveState(
 		...(options.handoff_at ? { handoff_at: options.handoff_at } : {}),
 		...(hud ? { hud } : {}),
 		...(options.receipt ? { receipt: options.receipt } : {}),
-		...(options.active_subskills !== undefined
-			? { active_subskills: options.active_subskills }
-			: preservedActiveSubskills
-				? { active_subskills: preservedActiveSubskills }
-				: {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
 	};
 	const sessionScope = { sessionId: options.sessionId };
-	await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry);
-	const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry);
-	try {
-		await rebuildActiveState(options.cwd, sessionScope);
-	} catch (error) {
-		if (!options.bestEffortSnapshot) throw error;
-	}
-	return entryWrite;
+	return withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+		const preservedActiveSubskills =
+			options.active_subskills === undefined
+				? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill, true)
+				: undefined;
+		const entry: SkillActiveEntry = {
+			...entryBase,
+			...(options.active_subskills !== undefined
+				? { active_subskills: options.active_subskills }
+				: preservedActiveSubskills
+					? { active_subskills: preservedActiveSubskills }
+					: {}),
+		};
+		await removeSupersededPlanningPipelineEntries(options.cwd, sessionScope, entry, true);
+		const entryWrite = await persistActiveEntry(options.cwd, sessionScope, entry, true);
+		try {
+			await rebuildActiveState(options.cwd, sessionScope);
+		} catch (error) {
+			if (!options.bestEffortSnapshot) throw error;
+		}
+		return entryWrite;
+	});
 }
 
 export interface ApplyHandoffOptions {
@@ -1003,11 +1036,17 @@ export async function applyHandoffToActiveState(options: ApplyHandoffOptions): P
 		return [...kept, mergedCaller, mergedCallee];
 	};
 	const writeEntries = async (sessionScope: ActiveSessionScope, prior: SkillActiveState | null): Promise<void> => {
-		const nextEntries = applyEntries(rawActiveEntries(prior));
-		for (const entry of nextEntries) {
-			await writeHandoffEntry(options.cwd, sessionScope, entry);
-		}
-		await rebuildActiveState(options.cwd, sessionScope);
+		await withActiveStateScopeLock(options.cwd, sessionScope, async () => {
+			const authoritativeEntries = await hasAuthoritativeActiveEntryDirectory(options.cwd, sessionId);
+			const priorEntries = authoritativeEntries
+				? await readActiveEntries(options.cwd, sessionScope)
+				: rawActiveEntries(prior);
+			const nextEntries = applyEntries(priorEntries);
+			for (const entry of nextEntries) {
+				await writeHandoffEntry(options.cwd, sessionScope, entry);
+			}
+			await rebuildActiveState(options.cwd, sessionScope);
+		});
 	};
 
 	const prior = await readState(sessionPath);
