@@ -131,3 +131,46 @@ describe.skipIf(process.platform === "win32")("state-writer private permissions"
 		}
 	});
 });
+
+describe("state-writer hard-link append confinement", () => {
+	it("rejects hard-linked JSONL targets without changing the external inode", async () => {
+		const root = await tempDir();
+		const externalPath = path.join(root, "external-ledger.jsonl");
+		const targetPath = path.join(root, ".gjc", "_session-hardlink", "logs", "events.jsonl");
+		await fs.mkdir(path.dirname(targetPath), { recursive: true });
+		await fs.writeFile(externalPath, "outside\n", { mode: 0o644 });
+		await fs.link(externalPath, targetPath);
+
+		await expect(
+			appendJsonl(".gjc/_session-hardlink/logs/events.jsonl", { event: "inside" }, { cwd: root }),
+		).rejects.toThrow("single-linked");
+		expect(await fs.readFile(externalPath, "utf8")).toBe("outside\n");
+		expect((await fs.stat(externalPath)).nlink).toBe(2);
+		if (process.platform !== "win32") expect(await modeOf(externalPath)).toBe(0o644);
+	});
+
+	it("rejects a hard-linked audit file before chmod or append", async () => {
+		const root = await tempDir();
+		const sessionId = "hardlink-audit";
+		const externalPath = path.join(root, "external-audit.jsonl");
+		const targetPath = auditPath(root, sessionId);
+		await fs.mkdir(path.dirname(targetPath), { recursive: true });
+		await fs.writeFile(externalPath, "outside audit\n", { mode: 0o644 });
+		await fs.link(externalPath, targetPath);
+
+		await expect(
+			appendAuditEntry(root, sessionId, {
+				ts: new Date().toISOString(),
+				category: "state",
+				verb: "write",
+				owner: "gjc-runtime",
+				mutation_id: "hardlink-audit",
+				forced: false,
+				paths: [targetPath],
+			}),
+		).rejects.toThrow("single-linked");
+		expect(await fs.readFile(externalPath, "utf8")).toBe("outside audit\n");
+		expect((await fs.stat(externalPath)).nlink).toBe(2);
+		if (process.platform !== "win32") expect(await modeOf(externalPath)).toBe(0o644);
+	});
+});
