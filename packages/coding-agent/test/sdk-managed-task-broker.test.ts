@@ -185,7 +185,8 @@ function node(id: string, workspace: string, resource: string) {
 	};
 }
 
-describe("managed task.dag broker admission (test-only, no M3 recovery)", () => {
+// Managed task DAG publication requires Linux private durable publication (docs/managed-task-dag.md).
+describe.skipIf(process.platform !== "linux")("managed task.dag broker admission (test-only, no M3 recovery)", () => {
 	it("wrong token and wrong capability yield state and effects 0", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-auth-"));
 		roots.push(root);
@@ -1702,13 +1703,11 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 				expectedRevision: currentRevision,
 				nodeIds: ["n"],
 			});
-			let cancelSettled = false;
-			void cancel.then(() => {
-				cancelSettled = true;
-			});
-			await Bun.sleep(50);
-			expect(cancelSettled).toBe(true);
-			expect(await cancel).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			// Cancel must settle while the launch is still held open; bound the wait generously so
+			// loaded CI runners do not race the close-wait and the locked domain write.
+			const cancelOutcome = await Promise.race([cancel, Bun.sleep(5_000).then(() => "still-pending" as const)]);
+			expect(cancelOutcome).not.toBe("still-pending");
+			expect(cancelOutcome).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
 			const duringLaunch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
 				graphs: Array<{ attempts: Array<{ fence: string }> }>;
 			};

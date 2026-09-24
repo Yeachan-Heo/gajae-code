@@ -1631,6 +1631,11 @@ export async function loadManagedEnrollmentIndex(agentDir: string): Promise<stri
 export async function loadManagedEnrollmentRecord(agentDir: string): Promise<ManagedEnrollmentRecord> {
 	const agent = await fs.realpath(agentDir);
 	const target = managedEnrollmentIndexPath(agent);
+	// Managed enrollment can only be published on Linux (private durable publication). Elsewhere
+	// an absent index is the only reachable state; do not let the Linux-only lock turn it into a
+	// startup failure for brokers that never used task.dag. A present index still fails closed.
+	if (process.platform !== "linux" && !(await Bun.file(target).exists()))
+		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 	try {
 		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
 			cwd: agent,
