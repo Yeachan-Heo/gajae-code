@@ -624,6 +624,25 @@ describe("SessionLifecycleService", () => {
 			ok: true,
 			result: { savedSessionOmission: omission },
 		});
+		const nonDirectoryCandidate = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSessionOmission: { ...omission, detailCode: "cwd_not_directory" },
+			},
+		});
+		expect(
+			await nonDirectoryCandidate.service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: true,
+			result: { savedSessionOmission: { ...omission, detailCode: "cwd_not_directory" } },
+		});
 
 		for (const savedSessionOmission of [
 			{ ...omission, detailCode: "/private/session.jsonl" },
