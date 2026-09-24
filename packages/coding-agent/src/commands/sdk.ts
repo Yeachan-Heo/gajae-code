@@ -932,12 +932,14 @@ export async function runSessionHost(
 			cleanupError === undefined
 				? baseFailure
 				: capability.normalizeFailure(baseFailure.phase, baseFailure.reason, cleanupError);
-		removeStartupSignalHandlers();
-
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(durableFailure, rollback.result);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw error;
 	}
 	if (!opened || !created) throw new Error("Lifecycle construction did not produce a result.");
@@ -950,11 +952,14 @@ export async function runSessionHost(
 		} catch (error) {
 			failure = capability.normalizeFailure(failure.phase, failure.reason, error);
 		}
-		removeStartupSignalHandlers();
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(durableFailure, rollback.result);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw failure;
 	}
 	if (created.capability !== capability || created.rollback !== rollback) {
@@ -966,9 +971,12 @@ export async function runSessionHost(
 					"failed",
 					"Lifecycle startup owner changed during construction.",
 				);
-		removeStartupSignalHandlers();
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(failure, rollback.result);
+		try {
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(failure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw failure;
 	}
 	const { parsed } = opened;
@@ -1160,15 +1168,20 @@ export async function runSessionHost(
 		process.once("SIGTERM", onReadySignal);
 		process.once("SIGINT", onReadySignal);
 	} catch (error) {
-		removeStartupSignalHandlers();
 		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
 		const failure =
 			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
 				? (error as SdkStartupFailure)
 				: capability.normalizeFailure("startup", "failed", error);
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		await failAfterRollback(durableFailure);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			await failAfterRollback(durableFailure);
+		} finally {
+			removeStartupSignalHandlers();
+			process.removeListener("SIGTERM", onReadySignal);
+			process.removeListener("SIGINT", onReadySignal);
+		}
 		throw error;
 	}
 	// Readiness is published; the session is live. Memory startup issues one LLM
