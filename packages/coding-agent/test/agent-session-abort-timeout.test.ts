@@ -192,6 +192,11 @@ describe("AgentSession abort timeout", () => {
 		expect(agent.resourceLedger.pending("captured-hanging")).toEqual([]);
 		expect(agent.resourceLedger.lookupDomain("captured-hanging")).toBeUndefined();
 		expect(successor.signal.aborted).toBe(false);
+		expect(await session.abortPromptAndWait("captured-hanging", { graceMs: 0 })).toEqual({ status: "settled" });
+		expect(await session.abortPromptAndWait("unknown-resource-run", { graceMs: 0 })).toMatchObject({
+			status: "unfenced",
+			reason: "unknown_run",
+		});
 
 		// A run that never sealed is not the recoverable late-settlement case.
 		// Preserve the hard quarantine while keeping its uncertainty visible.
