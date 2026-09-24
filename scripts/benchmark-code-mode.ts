@@ -1653,13 +1653,30 @@ async function resolveFuturePath(candidate: string): Promise<string> {
 	}
 }
 
+export async function assertOutputPathOutsideWorkspace(workspaceRoot: string, outputPath: string): Promise<void> {
+	const root = await fs.realpath(workspaceRoot);
+	const futurePath = await resolveFuturePath(outputPath);
+	if (isPathInside(root, futurePath)) throw new Error("--output must be outside the task repository search corpus.");
+	let outputStat: Awaited<ReturnType<typeof fs.lstat>> | undefined;
+	try {
+		outputStat = await fs.lstat(outputPath);
+	} catch (error) {
+		if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+	}
+	if (!outputStat) return;
+	if (outputStat.isSymbolicLink()) throw new Error("--output may not be a symlink.");
+	if (!outputStat.isFile() || outputStat.nlink > 1) {
+		throw new Error("--output must be a single-link regular file outside the task repository.");
+	}
+	if (isPathInside(root, await fs.realpath(outputPath))) {
+		throw new Error("--output resolves inside the task repository search corpus.");
+	}
+}
+
 async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace> {
 	const root = await fs.realpath(options.taskRepoPath);
 	if (root === REPO_ROOT) throw new Error("--task-repo must be a separate clean snapshot, never the harness checkout.");
-	if (isPathInside(root, options.outputPath)) throw new Error("--output must be outside the task repository search corpus.");
-	if (isPathInside(root, await resolveFuturePath(options.outputPath))) {
-		throw new Error("--output must not resolve through a symlink into the task repository search corpus.");
-	}
+	await assertOutputPathOutsideWorkspace(root, options.outputPath);
 	const [gitRoot, taskHead, originDev, status] = await Promise.all([
 		gitText(root, "rev-parse", "--show-toplevel"),
 		gitText(root, "rev-parse", "HEAD"),
