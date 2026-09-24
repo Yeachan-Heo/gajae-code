@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as z from "zod/v4";
 import {
 	MAX_PLAN_STEPS,
 	MIN_PLAN_STEPS,
+	assertRepositoryScopedArguments,
 	medianMetric,
 	type PairedRequestCount,
 	parseBenchmarkTasks,
@@ -163,6 +167,50 @@ describe("benchmark code-mode script plans", () => {
 			),
 		).toBe(true);
 		expect(usesPreviousResult("search", { pattern: "fixed", paths: ["src"] }, "An unrelated result.")).toBe(false);
+	});
+});
+
+describe("repository-scoped file handlers", () => {
+	test("allows in-tree reads/searches and rejects absolute, traversal, URL, ignored, and symlink escapes", async () => {
+		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-benchmark-scope-"));
+		const workspace = path.join(temporaryRoot, "repo");
+		const packages = path.join(workspace, "packages");
+		const insideFile = path.join(packages, "main.ts");
+		const externalFile = path.join(temporaryRoot, "secret.txt");
+		await fs.mkdir(packages, { recursive: true });
+		await fs.writeFile(insideFile, "export const safe = true;\n");
+		await fs.writeFile(externalFile, "not in the repo\n");
+		try {
+			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "packages/main.ts:1-2" })).resolves.toBeUndefined();
+			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: ["packages/**/*.ts"] })).resolves.toBeUndefined();
+			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: null })).resolves.toBeUndefined();
+			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "../secret.txt" })).rejects.toThrow(
+				/outside the task repository/,
+			);
+			await expect(assertRepositoryScopedArguments(workspace, "read", { path: externalFile })).rejects.toThrow(
+				/outside the task repository/,
+			);
+			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "https://example.com/secret" })).rejects.toThrow(
+				/local path inside the task repository/,
+			);
+			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: [externalFile] })).rejects.toThrow(
+				/outside the task repository/,
+			);
+			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", gitignore: false })).rejects.toThrow(
+				/may not disable gitignore/,
+			);
+			if (process.platform !== "win32") {
+				await fs.symlink(externalFile, path.join(workspace, "escape.ts"));
+				await expect(assertRepositoryScopedArguments(workspace, "read", { path: "escape.ts" })).rejects.toThrow(
+					/resolves through a symlink outside/,
+				);
+				await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: ["escape.ts"] })).rejects.toThrow(
+					/resolves through a symlink outside/,
+				);
+			}
+		} finally {
+			await fs.rm(temporaryRoot, { recursive: true, force: true });
+		}
 	});
 });
 
