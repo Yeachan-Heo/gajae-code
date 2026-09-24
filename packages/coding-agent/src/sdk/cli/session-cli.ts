@@ -4,7 +4,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
-import { PublicCommandFailure, type PublicEffectProof, type PublicFailureKind } from "../../cli/public-command-errors";
+import {
+	type PublicCommandDiagnosticCode,
+	PublicCommandFailure,
+	type PublicEffectProof,
+	type PublicFailureKind,
+} from "../../cli/public-command-errors";
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
@@ -242,8 +247,15 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
 		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+	// `operation_failed` cannot distinguish a conflict from any other failed operation, so
+	// the conflict survives as one fixed diagnostic. The broker message itself is never
+	// rendered: it may carry request keys, paths, or credentials, and its cause is not
+	// decidable from the code alone.
+	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =
+		outcome.error.code === "idempotency_conflict" ? ["lifecycle_idempotency_conflict"] : undefined;
 	return new PublicCommandFailure({
 		...failure.input,
+		...(diagnostics === undefined ? {} : { diagnostics }),
 		// Generic lifecycle codes cannot override the authoritative, conservative proof.
 		kind:
 			failure.input.kind === "usage" || failure.input.kind === "invalid_json"
