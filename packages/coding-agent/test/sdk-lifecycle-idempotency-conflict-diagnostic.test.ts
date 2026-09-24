@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	PUBLIC_COMMAND_DIAGNOSTICS,
 	type PublicCommandErrorEnvelope,
 	type RenderedPublicCommandFailure,
 	renderPublicCommandFailure,
 } from "../src/cli/public-command-errors";
-import { lifecyclePublicFailure } from "../src/sdk/cli/session-cli";
+import { lifecyclePublicFailure, runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import {
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,
@@ -175,8 +177,8 @@ describe("lifecycle idempotency conflict diagnostic", () => {
 	/**
 	 * Helper-level contract only. The session CLI returns a `session.lookup` outcome
 	 * directly and never routes it through `lifecyclePublicFailure`, so this pins the
-	 * projection helper for any future caller; it does not describe a live CLI route
-	 * and does not change the lookup contract.
+	 * projection helper for any future caller; the live route is covered separately
+	 * by the raw global lookup suite below.
 	 */
 	it("projects a conflicting lookup outcome without changing its public code (helper-only)", async () => {
 		const outcome = await lookupOutcome("idempotency_conflict");
@@ -284,4 +286,146 @@ describe("lifecycle idempotency conflict diagnostic", () => {
 		expect(result.envelope.error.outcomeCertainty).toBe("unknown");
 		expect(result.envelope.diagnostics).toBeUndefined();
 	});
+});
+
+/**
+ * Live route coverage for the raw global `session.lookup` output boundary.
+ *
+ * `SessionLifecycleService.lookup` preserves the broker's `error.message`, the CLI returns
+ * that outcome directly, and `stripSecretFields` only drops secret-shaped *keys* — never a
+ * message body — so this route also bypasses the public error envelope and its byte budget.
+ * These tests drive `runSdkSessionCli` itself over a real `SessionLifecycleService`, so a
+ * hostile broker message reaches the same code path an operator would hit.
+ */
+
+const AGENT_DIR = path.join(os.tmpdir(), "gjc-sdk-lookup-conflict-test-agent");
+const LOOKUP_REQUEST_KEY = "lookup-request";
+/** Oversized hostile text: multi-byte body well past the 8192-byte public output budget. */
+const OVERSIZED_BROKER_MESSAGE = `${"곰".repeat(4096)} token=sk-live-SECRET /Users/operator/.gjc`;
+
+function lookupService(response: unknown): SessionLifecycleService {
+	return new SessionLifecycleService(new FakeLifecycleClient(response));
+}
+
+function brokerFailure(code: string, message: string): unknown {
+	return { ok: false, error: { code, message } };
+}
+
+async function runLookupCli(
+	service: SessionLifecycleService,
+	input: Record<string, unknown> = { cwd: "/repo" },
+): Promise<{ output: unknown; exitCode: number | undefined }> {
+	const outputs: unknown[] = [];
+	let exitCode: number | undefined;
+	await runSdkSessionCli(
+		{
+			action: "raw",
+			rawAction: "global",
+			operation: "session.lookup",
+			idempotencyKey: LOOKUP_REQUEST_KEY,
+			jsonInput: JSON.stringify(input),
+			agentDir: AGENT_DIR,
+		},
+		value => outputs.push(value),
+		code => {
+			exitCode = code;
+		},
+		{ lifecycleService: service },
+	);
+	expect(outputs).toHaveLength(1);
+	return { output: outputs[0], exitCode };
+}
+
+describe("raw global session.lookup conflict output boundary", () => {
+	it("sanitizes a hostile broker conflict message on the live CLI route", async () => {
+		const { output, exitCode } = await runLookupCli(
+			lookupService(brokerFailure("idempotency_conflict", HOSTILE_BROKER_MESSAGE)),
+		);
+
+		expect(output).toEqual({
+			ok: false,
+			operation: "session.lookup",
+			status: "conflict",
+			request: { operation: "session.create", requestKey: LOOKUP_REQUEST_KEY },
+			certainty: "uncertain",
+			error: { code: "idempotency_conflict", message: CONFLICT_MESSAGE },
+		});
+		expect(exitCode).toBe(1);
+		const serialized = JSON.stringify(output);
+		for (const secret of ["sk-live-SECRET", "/Users/operator", "lifecycle-ledger.jsonl", "7ab", "token="])
+			expect(serialized).not.toContain(secret);
+	}, 20_000);
+
+	it("bounds an oversized multi-byte conflict message at the lookup boundary", async () => {
+		expect(Buffer.byteLength(OVERSIZED_BROKER_MESSAGE)).toBeGreaterThan(8192);
+		const { output, exitCode } = await runLookupCli(
+			lookupService(brokerFailure("idempotency_conflict", OVERSIZED_BROKER_MESSAGE)),
+		);
+
+		const serialized = JSON.stringify(output);
+		expect(Buffer.byteLength(serialized)).toBeLessThanOrEqual(8192);
+		expect(serialized).not.toContain("곰");
+		expect(serialized).not.toContain("sk-live-SECRET");
+		expect(output).toMatchObject({
+			status: "conflict",
+			certainty: "uncertain",
+			error: { code: "idempotency_conflict", message: CONFLICT_MESSAGE },
+		});
+		expect(exitCode).toBe(1);
+	}, 20_000);
+
+	/** Scope guard: only the exact conflict code is sanitized; nothing else changes. */
+	it("leaves a non-conflict lookup failure untouched", async () => {
+		const { output, exitCode } = await runLookupCli(
+			lookupService(brokerFailure("not_found", "lifecycle operation was not found")),
+		);
+
+		expect(output).toEqual({
+			ok: false,
+			operation: "session.lookup",
+			status: "not_found",
+			request: { operation: "session.create", requestKey: LOOKUP_REQUEST_KEY },
+			certainty: "uncertain",
+			error: { code: "not_found", message: "lifecycle operation was not found" },
+		});
+		expect(exitCode).toBe(1);
+	}, 20_000);
+
+	it("refuses near-miss and prototype-shaped conflict codes", async () => {
+		for (const hostile of [
+			"__proto__",
+			"constructor",
+			"prototype",
+			"IDEMPOTENCY_CONFLICT",
+			" idempotency_conflict",
+			"idempotency_conflict ",
+			"idempotency_conflict\n",
+		]) {
+			const { output, exitCode } = await runLookupCli(lookupService(brokerFailure(hostile, "broker detail")));
+
+			expect(output).toMatchObject({
+				ok: false,
+				operation: "session.lookup",
+				status: "terminal",
+				error: { code: hostile, message: "broker detail" },
+			});
+			expect(exitCode).toBe(1);
+		}
+		expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+	}, 20_000);
+
+	it("leaves a recovered lookup result unchanged", async () => {
+		const { output, exitCode } = await runLookupCli(
+			lookupService({ ok: true, result: { sessionId: "recovered-create", cwd: "/repo" } }),
+		);
+
+		expect(output).toEqual({
+			ok: true,
+			operation: "session.lookup",
+			status: "found",
+			request: { operation: "session.create", requestKey: LOOKUP_REQUEST_KEY },
+			result: { sessionId: "recovered-create", cwd: "/repo" },
+		});
+		expect(exitCode).toBeUndefined();
+	}, 20_000);
 });
