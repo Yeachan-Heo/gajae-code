@@ -840,16 +840,21 @@ jobs:
                  curl --silent --fail --max-time 30 "${registry}-/package/$(registry_path "$1")/dist-tags" 2>/dev/null \
                     | jq -r --arg tag "$2" '.[$tag] // empty' 2>/dev/null || true
               }
-              records="$RUNNER_TEMP/receipt-records.json"
-              echo '[]' > "$records"
-              order_file="$evidence_dir/gajae-release-publish-order-v1.json"
-              # The sealed plan publishes dependencies before dependents; it
-              # must cover exactly the expected package set.
-              if [ "$(jq -r '.order[]' "$order_file" | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
+              records_dir="$RUNNER_TEMP/receipt-records"
+              rm -rf "$records_dir" && mkdir -p "$records_dir"
+              order_file="$evidence_dir/gajae-release-publish-order-v2.json"
+              # The sealed plan groups packages into dependency waves: nothing in a
+              # wave depends on anything in the same or a later wave. It must cover
+              # exactly the expected package set, each package exactly once.
+              if [ "$(jq -r '.waves[][]' "$order_file" | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
                  echo "Publish order file does not cover exactly the expected package set" >&2
                  exit 1
               fi
-              for name in $(jq -r '.order[]' "$order_file"); do
+              # Publish one sealed package and wait until the registry exposes its
+              # integrity and dist-tag. Runs in a subshell per package, so `exit`
+              # fails only that package; the wave barrier below fails the job.
+              publish_one() {
+                 local name="$1" index="$2" record version sha expected_sri tarball published observed output raced tagged deadline
                  record="$(jq -c --arg name "$name" '.packages[] | select(.name == $name)' "$expected")"
                  if [ -z "$record" ]; then
                     echo "Publish order references unknown package $name" >&2
@@ -907,13 +912,39 @@ jobs:
                     fi
                     sleep 5
                  done
-                 jq --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
-                    '. += [{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}]' \
-                    "$records" > "$records.tmp"
-                 mv "$records.tmp" "$records"
+                 jq -n --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
+                    '{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}' \
+                    > "$records_dir/$(printf '%03d' "$index").json"
+              }
+              # npm takes minutes to accept each publish, so packages within a wave
+              # publish concurrently; a wave starts only after every package of the
+              # previous wave is visible, which keeps dependencies ahead of dependents.
+              index=0
+              wave_count="$(jq '.waves | length' "$order_file")"
+              for wave in $(seq 0 $((wave_count - 1))); do
+                 pids=()
+                 for name in $(jq -r --argjson wave "$wave" '.waves[$wave][]' "$order_file"); do
+                    ( publish_one "$name" "$index" ) &
+                    pids+=("$!")
+                    index=$((index + 1))
+                 done
+                 failed=0
+                 for pid in "${pids[@]}"; do
+                    wait "$pid" || failed=1
+                 done
+                 if [ "$failed" -ne 0 ]; then
+                    echo "Publish wave $wave failed; later waves were not started" >&2
+                    exit 1
+                 fi
               done
-              jq -n --arg version "$RELEASE_VERSION" --arg channel "$RELEASE_CHANNEL" --slurpfile packages "$records" \
-                 '{schema_version: 1, release_version: $version, release_channel: $channel, packages: $packages[0]}' \
+              if [ "$(jq -r '.name' "$records_dir"/*.json | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
+                 echo "Publish receipt records do not cover exactly the expected package set" >&2
+                 exit 1
+              fi
+              # Receipt records keep sealed plan order regardless of completion order.
+              jq -s --arg version "$RELEASE_VERSION" --arg channel "$RELEASE_CHANNEL" \
+                 '{schema_version: 1, release_version: $version, release_channel: $channel, packages: .}' \
+                 "$records_dir"/*.json \
                  > "$evidence_dir/gajae-release-oidc-publish-receipt-v1.json"
          - name: Persist OIDC publish receipt
            uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

@@ -8,6 +8,7 @@ import {
 	packages as publishPackages,
 	parseReleasePublishCli,
 	planExpectedEvidencePublication,
+	planExpectedEvidencePublicationWaves,
 	publishExpectedEvidencePackages,
 	validateNpmRegistryUrl,
 } from "./ci-release-publish";
@@ -196,22 +197,57 @@ describe("unscoped gajae-code package publication", () => {
 		}
 	});
 
-	test("seals the dependency-ordered plan into evidence and the fixed publish boundary consumes it", async () => {
-		// The OIDC publish job must publish in planExpectedEvidencePublication
-		// order, not evidence-array (name-sorted) order. The order is computed in
+	test("groups the plan into dependency waves that publish every dependency in an earlier wave", () => {
+		const records = canonicalEvidenceRecords();
+		const waves = planExpectedEvidencePublicationWaves(records);
+		const waveOf = new Map(waves.flatMap((wave, index) => wave.map(name => [name, index] as const)));
+
+		expect(waves.flat().sort()).toEqual(records.map(record => record.name).sort());
+		expect(new Set(waves.flat()).size).toBe(records.length);
+		for (const record of records) {
+			for (const dependencyName of Object.keys(record.internal_dependencies)) {
+				expect(waveOf.get(dependencyName)!).toBeLessThan(waveOf.get(record.name)!);
+			}
+		}
+		// Every wave after the first is necessary: each member depends on the wave right before it.
+		for (const [index, wave] of waves.entries()) {
+			if (index === 0) continue;
+			for (const name of wave) {
+				const record = records.find(candidate => candidate.name === name)!;
+				expect(Object.keys(record.internal_dependencies).some(dependency => waveOf.get(dependency) === index - 1)).toBe(true);
+			}
+		}
+		// The five platform binaries have no internal dependencies and share the first wave.
+		expect(waves[0]).toEqual(expect.arrayContaining([
+			"@gajae-code/natives-darwin-arm64",
+			"@gajae-code/natives-darwin-x64",
+			"@gajae-code/natives-linux-arm64",
+			"@gajae-code/natives-linux-x64",
+			"@gajae-code/natives-win32-x64",
+		]));
+		expect(waves.length).toBeLessThan(records.length);
+	});
+
+	test("seals the dependency wave plan into evidence and the fixed publish boundary consumes it", async () => {
+		// The OIDC publish job must publish in planExpectedEvidencePublicationWaves
+		// order, not evidence-array (name-sorted) order. The plan is computed in
 		// the credential-free prepare job and sealed as an artifact.
 		const script = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
-		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json"');
-		expect(script).toContain("planExpectedEvidencePublication(expected.packages)");
+		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v2.json"');
+		expect(script).toContain("planExpectedEvidencePublicationWaves(expected.packages)");
 
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const publish = workflowJob(workflow, "publish");
-		expect(publish).toContain("gajae-release-publish-order-v1.json");
-		expect(publish).toContain("for name in $(jq -r '.order[]'");
+		expect(publish).toContain("gajae-release-publish-order-v2.json");
+		expect(publish).toContain("'.waves[$wave][]'");
+		// A wave starts only after every package of the previous wave succeeded.
+		expect(publish).toContain('wait "$pid" || failed=1');
+		expect(publish).toContain("later waves were not started");
 		// No direct evidence-array iteration may remain in the boundary.
 		expect(publish).not.toContain(".packages[$index]");
-		// The boundary rejects a plan that does not cover exactly the expected set.
+		// The boundary rejects a plan or receipt that does not cover exactly the expected set.
 		expect(publish).toContain("does not cover exactly the expected package set");
+		expect(publish).toContain("Publish receipt records do not cover exactly the expected package set");
 	});
 
 	test("rejects duplicate, missing, and extra evidence records before publication", async () => {
