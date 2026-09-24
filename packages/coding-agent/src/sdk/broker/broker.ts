@@ -33,7 +33,6 @@ import {
 	type BrokerFenceReason,
 	type BrokerStopRequest,
 	writeBrokerExitRecord,
-	writeBrokerExitRecordSynchronously,
 } from "./broker-exit";
 import {
 	BROKER_HEARTBEAT_TTL_MS,
@@ -4245,8 +4244,6 @@ export class Broker {
 			writtenAt: Date.now(),
 		};
 		(mode === "lost-root" ? logger.warn : logger.info)("sdk broker: exiting", exitRecord);
-		const recordPersistedSynchronously =
-			reason === "signal" && writeBrokerExitRecordSynchronously(this.settings.agentDir, exitRecord);
 		this.#stopping = true;
 		this.#publicationState = "stopping";
 		// A lost-root broker has been fenced: it no longer owns the published root, and
@@ -4259,21 +4256,18 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
-			let recordPersisted = recordPersistedSynchronously;
-			if (!recordPersisted) {
-				const recordWrite = Promise.withResolvers<boolean>();
-				const recordWriteController = new AbortController();
-				const recordWriteTimer = setTimeout(() => {
-					recordWriteController.abort();
-					recordWrite.resolve(false);
-				}, BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
-				void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
-					() => recordWrite.resolve(true),
-					() => recordWrite.resolve(false),
-				);
-				recordPersisted = await recordWrite.promise;
-				clearTimeout(recordWriteTimer);
-			}
+			const recordWrite = Promise.withResolvers<boolean>();
+			const recordWriteController = new AbortController();
+			const recordWriteTimer = setTimeout(() => {
+				recordWriteController.abort();
+				recordWrite.resolve(false);
+			}, BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
+			void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
+				() => recordWrite.resolve(true),
+				() => recordWrite.resolve(false),
+			);
+			const recordPersisted = await recordWrite.promise;
+			clearTimeout(recordWriteTimer);
 			if (!recordPersisted) {
 				logger.error("sdk broker: failed to persist exit reason", {
 					reason: "exit-record-write-failed-or-timed-out",

@@ -20,7 +20,6 @@ import {
 	type BrokerStartupExitRecord,
 	type BrokerStartupExitWriteStatus,
 	writeBrokerStartupExitRecordBounded,
-	writeBrokerStartupExitRecordSynchronously,
 } from "../sdk/broker/broker-exit";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
 import {
@@ -1608,12 +1607,8 @@ export default class Sdk extends Command {
 					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
 					: `SDK broker startup interrupted by ${signal} before readiness.`;
 			writeStartupExitLog(exitRecord, message);
-			const recordWrittenSynchronously =
-				reason === "startup-signal" && writeBrokerStartupExitRecordSynchronously(agentDir, exitRecord);
 			startupExitTask = (async () => {
-				const exitRecordWrite = recordWrittenSynchronously
-					? { kind: "written" as const }
-					: await beginStartupExitRecordWrite(exitRecord);
+				const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
 				const exitRecordWritten = exitRecordWrite.kind === "written";
 				if (!exitRecordWritten)
 					logger.error("sdk broker: startup exit record write timed out", {
