@@ -228,4 +228,36 @@ describe("lifecycle session explicit model pin", () => {
 			await closed.promise;
 		}
 	}, 30_000);
+
+	test("loads scoped provider policy in the owned registry's first catalog pass", async () => {
+		const cwd = tempCwd();
+		const settings = Settings.isolated({ disabledProviders: ["cursor"] });
+		const setScopedSettings = vi.spyOn(ModelRegistry.prototype, "setScopedSettings");
+		let created: CreateLifecycleAgentSessionResult | undefined;
+		try {
+			created = await createLifecycleAgentSession({
+				cwd,
+				agentDir: cwd,
+				authStorage,
+				sessionManager: SessionManager.inMemory(cwd),
+				settings,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableLsp: false,
+				toolNames: [],
+			});
+			if ("failure" in created) throw new Error(`Lifecycle construction failed: ${created.failure.message}`);
+
+			expect(setScopedSettings).not.toHaveBeenCalled();
+			expect(created.session.modelRegistry.getAvailable().some(model => model.provider === "cursor")).toBe(false);
+			settings.set("disabledProviders", []);
+			expect(created.session.modelRegistry.getAvailable().some(model => model.provider === "cursor")).toBe(true);
+		} finally {
+			if (created && !("failure" in created)) await created.session.dispose();
+			setScopedSettings.mockRestore();
+		}
+	}, 30_000);
 });
