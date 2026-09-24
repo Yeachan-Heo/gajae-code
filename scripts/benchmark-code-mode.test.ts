@@ -196,6 +196,12 @@ describe("repository-scoped file handlers", () => {
 			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "packages/main.ts:1-2" })).resolves.toBeUndefined();
 			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: ["packages/**/*.ts"] })).resolves.toBeUndefined();
 			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: null })).resolves.toBeUndefined();
+			await expect(
+				assertRepositoryScopedArguments(workspace, "search", {
+					pattern: "secret",
+					paths: ["{../secret.txt,packages/**/*.ts}"],
+				}),
+			).rejects.toThrow(/does not allow brace-expanded path alternatives/);
 			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "../secret.txt" })).rejects.toThrow(
 				/outside the task repository/,
 			);
