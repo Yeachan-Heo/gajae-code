@@ -24167,7 +24167,10 @@ export class AgentSession {
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				let errorMessage = this.#fallbackExhaustionError(controller);
-				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+				if (
+					!providerRetryCeilingReached &&
+					(trigger.class === "quota" || trigger.class === "rate_limit")
+				) {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
 						const mark = quotaCredentialMark ?? (await this.#markFailedCredential(trigger));
 						if (mark === "exhausted") {
