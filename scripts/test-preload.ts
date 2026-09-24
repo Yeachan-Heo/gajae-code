@@ -41,9 +41,14 @@ try {
 }
 
 const testTempRoot = path.resolve(os.tmpdir());
+// Keep isolated fixture state only when explicitly requested for debugging.
+const keepIsolatedTempDirs = process.env.GJC_TEST_KEEP_TMP === "1";
 const isolatedTempDirs: Array<{ dir: string; prefix: string }> = [];
 
 function createIsolatedTempDir(prefix: string): string {
+	if (testTempRoot === path.parse(testTempRoot).root) {
+		throw new Error(`Cannot create isolated test temp directories directly under the filesystem root: ${testTempRoot}`);
+	}
 	const dir = path.join(testTempRoot, `${prefix}${crypto.randomUUID()}`);
 	const forgetOwnedRoot = registerOwnedDeletionRoot(dir);
 	try {
@@ -60,6 +65,8 @@ function createIsolatedTempDir(prefix: string): string {
 }
 
 export function cleanupIsolatedTempDirs(): void {
+	if (keepIsolatedTempDirs) return;
+
 	let cleanupError: unknown;
 	for (const isolatedTempDir of isolatedTempDirs) {
 		const { dir, prefix } = isolatedTempDir;

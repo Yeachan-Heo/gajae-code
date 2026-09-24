@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -138,8 +139,9 @@ test("test logger honors an explicitly owned sink under its HOME", async () => {
 
 test("test cleanup preserves an explicitly pinned temp-looking log sink", async () => {
 	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-prefix-home-"));
-	const owned = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-test-logs-"));
+	const owned = path.join(os.tmpdir(), `gjc-test-logs-${crypto.randomUUID()}`);
 	try {
+		await fs.mkdir(owned);
 		const env: Record<string, string | undefined> = {
 			...process.env,
 			HOME: home,
