@@ -659,7 +659,7 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 		).toBe(false);
 	});
 
-	it("rejects a child while admitting the supervisor and detached monitor", async () => {
+	it("admits a registered supervisor without a workload sibling and a detached monitor", async () => {
 		const request = {
 			schema_version: 1,
 			op: "observe_terminal",
@@ -707,7 +707,13 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 				{ ...request, reason: "owner_supervisor_signal" },
 				{ ...base, readChildren: async () => [42] },
 			),
-		).toBe(process.platform !== "linux");
+		).toBe(true);
+		expect(
+			await isTrustedLifecycleMutationCaller(
+				{ ...request, reason: "owner_supervisor_signal" },
+				{ ...base, readChildren: async () => [42], authorityPipeOwnedByParent: async () => false },
+			),
+		).toBe(false);
 		expect(
 			await isTrustedLifecycleMutationCaller(request, {
 				...base,

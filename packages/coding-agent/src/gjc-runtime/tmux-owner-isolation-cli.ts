@@ -288,6 +288,10 @@ export async function isTrustedLifecycleMutationCaller(
 
 		const callerStart = await probe.readStartTime(probe.callerPid);
 		if (!callerStart) return false;
+		// The parent-owned registration pipe authenticates the sole adapter before
+		// the workload starts and after it exits; terminal observation must not
+		// depend on a workload sibling still being present.
+		if (children.length === 1 && children[0] === probe.callerPid) return true;
 		for (const sibling of children) {
 			if (sibling === probe.callerPid) continue;
 			const siblingStart = await probe.readStartTime(sibling);
