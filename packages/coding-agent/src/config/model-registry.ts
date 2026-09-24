@@ -2560,12 +2560,20 @@ export class ModelRegistry {
 		for (const providerConfig of this.#discoveryManager.providers) {
 			if (providerId && providerConfig.provider !== providerId) continue;
 			let expectedProvenance: string | undefined;
+			let effectiveConfig: DiscoveryProviderConfig | undefined;
+			let expectedAuthGeneration: string | undefined;
+			let expectedEndpoint: string | undefined;
 			try {
-				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				const effectiveAuthGeneration =
+					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider);
+				const effectiveEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? "");
+				expectedAuthGeneration = effectiveAuthGeneration;
+				expectedEndpoint = effectiveEndpoint;
 				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
 					effectiveConfig,
-					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider),
-					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
+					effectiveAuthGeneration,
+					effectiveEndpoint,
 				);
 			} catch {
 				// A context that cannot be fully derived cannot vouch for a cache row.
@@ -2574,6 +2582,30 @@ export class ModelRegistry {
 			const models = publishDiscoveryState
 				? this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance)
 				: this.#readCachedDiscoverableModels(providerConfig, expectedProvenance);
+			if (publishDiscoveryState) {
+				const cache =
+					effectiveConfig !== undefined
+						? readModelCache<Api>(effectiveConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
+						: null;
+				if (
+					effectiveConfig !== undefined &&
+					expectedAuthGeneration !== undefined &&
+					expectedEndpoint !== undefined &&
+					expectedProvenance !== undefined &&
+					cache?.fresh === true &&
+					cache.authoritative === true &&
+					cache.dynamicModelIds !== undefined &&
+					cache.dynamicModelProvenance === expectedProvenance
+				) {
+					this.#configuredDiscoveryEvidence.set(effectiveConfig.provider, {
+						authGeneration: expectedAuthGeneration,
+						endpoint: expectedEndpoint,
+						modelIds: new Set(cache.dynamicModelIds),
+					});
+				} else {
+					this.#configuredDiscoveryEvidence.delete(providerConfig.provider);
+				}
+			}
 			// Cache rows persist sanitized transport metadata (no headers), so a
 			// rebooted registry re-derives the provider transport override from the
 			// same source the live publish path uses — mirroring the cached
@@ -3306,16 +3338,24 @@ export class ModelRegistry {
 			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
 				this.#effectiveDiscoveryProviderConfig(provider).baseUrl ?? "",
 			);
+			const authoritativeState =
+				state !== undefined &&
+				state.error === undefined &&
+				!state.stale &&
+				((state.status === "ok" && discovery.fetched) ||
+					state.status === "empty" ||
+					(state.status === "ok" && !discovery.fetched));
 			if (
 				evidence !== undefined &&
-				(state?.status === "ok" || state?.status === "empty") &&
-				discovery.fetched &&
+				authoritativeState &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
 			) {
 				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
 			} else if (
-				(state?.status !== "cached" && !(state?.status === "ok" && !discovery.fetched)) ||
+				(state?.status !== "cached" &&
+					state?.status !== "empty" &&
+					!(state?.status === "ok" && !discovery.fetched)) ||
 				state.error !== undefined ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint
