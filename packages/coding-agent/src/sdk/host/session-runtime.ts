@@ -4883,7 +4883,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (entry.kind !== "prompt") continue;
 					if (current.deadlineManager.isExpiring(entry.correlation))
 						current.deadlineManager.captureExpiringRun(entry.correlation);
-					else current.deadlineManager.onAccepted(entry.correlation);
+					else current.deadlineManager.onRunStarted(entry.correlation);
 				}
 			} else if (existingTokenBatch && current.openLifecycleBatches.includes(existingTokenBatch)) {
 				// A continuation within the same SDK-owned run carries the same token
