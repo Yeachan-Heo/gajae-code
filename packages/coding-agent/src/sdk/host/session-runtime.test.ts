@@ -6051,8 +6051,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 
 			const settled = await settledStatus(harness, "turn.prompt_status", correlation);
 			expect(settled).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				outcome: {
+					kind: "failed",
+					code: "prompt_deadline_exceeded",
+					provenance: "deadline",
+					phase: "post_start",
+				},
+				error: { code: "prompt_deadline_exceeded" },
 			});
 			expect(abortCalls).toEqual([{ handle: "deadline-terminal-run", scope: "owned", expectedEpoch: epoch }]);
 			const correlated = () =>
@@ -6060,8 +6066,8 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					const payload = frame.payload as { commandId?: string; turnId?: string } | undefined;
 					return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
 				});
-			// The deadline only publishes a failed pair when there is no correlated run
-			// to stop. Here the real terminal event is authoritative.
+			// The deadline remains a failure after the exact run is stopped; it must not
+			// turn its own cancellation into a successful prompt result.
 			const framesDeadline = Date.now() + 10_000;
 			while (Date.now() < framesDeadline && !correlated().some(frame => frame.kind === "agent_end"))
 				await Bun.sleep(5);
@@ -6069,8 +6075,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				expect.objectContaining({
 					payload: expect.objectContaining({
 						outcome: expect.objectContaining({
-							kind: "stopped",
-							reason: "cancelled",
+							kind: "failed",
+							code: "prompt_deadline_exceeded",
+							provenance: "deadline",
 						}),
 					}),
 				}),
@@ -6402,8 +6409,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			while (abortCalls.length === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toEqual([{ handle: "deadline-tool-run", scope: "owned", expectedEpoch: epoch }]);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
 			await harness.stop();
@@ -6494,8 +6502,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(await runGit(["show", "HEAD:work.ts"])).toBe("export const value = 'deadline';\n");
 			releaseTerminalWrite.resolve();
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 		} finally {
 			releaseTerminalWrite.resolve();
@@ -6563,8 +6572,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			// fails; the deadline must reconcile it once without appending a duplicate.
 			await Bun.sleep(150);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
@@ -6593,7 +6603,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				) ?? [];
 			expect(replayedEnds).toHaveLength(1);
 			expect(replayedEnds[0]?.payload).toMatchObject({
-				outcome: { kind: "stopped", reason: "cancelled" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 		} finally {
 			await harness?.stop();
@@ -6741,8 +6751,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			releaseClaim.resolve();
 			await startPromise;
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(abortCalls).toBe(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_start")).toHaveLength(1);
@@ -6913,8 +6924,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			promotedC?.({ startsOwnRun: true });
 			await harness.emit("agent_start");
 			expect(await settledStatus(harness, "turn.prompt_status", targetIds)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(abortCalls).toBe(1);
 			expect(correlatedFrames(harness, targetIds).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
@@ -7029,8 +7041,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			await harness.emit("agent_start");
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(stageFailures).toBe(1);
 			expect(abortCalls).toBe(1);
@@ -7043,12 +7056,11 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("a deferred terminal keeps a retry owner after the staging budget is exhausted", async () => {
+	test("a durable deadline claim can settle after deferred outcome staging fails", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-stage-recovery-owner-"));
 		const epoch = 107;
 		let harness: InvocationHarness | undefined;
 		let stageAttempts = 0;
-		let storageAvailable = false;
 		let abortCalls = 0;
 		try {
 			harness = await invocationHarness("deadline-stage-recovery-owner", cwd, {
@@ -7063,10 +7075,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				persistInterceptor: transition => {
 					if (transition.type !== "pending_terminal_outcome") return;
 					stageAttempts += 1;
-					if (stageAttempts <= 6 || !storageAvailable)
-						throw Object.assign(new Error("injected persistent pending terminal failure"), {
-							code: "io_error",
-						});
+					throw Object.assign(new Error("injected persistent pending terminal failure"), {
+						code: "io_error",
+					});
 				},
 				agentFailedWriteFailures: 0,
 				terminalAbortSeams: {
@@ -7088,21 +7099,16 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
 			await harness.emit("agent_start");
 			const stagingDeadline = Date.now() + 2_000;
-			while (stageAttempts < 6 && Date.now() < stagingDeadline) await Bun.sleep(10);
-			expect(stageAttempts).toBeGreaterThanOrEqual(6);
-			expect((await harness.query("turn.prompt_status", correlation)).result?.status).toBe("in_flight");
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
-
-			storageAvailable = true;
+			while (stageAttempts === 0 && Date.now() < stagingDeadline) await Bun.sleep(10);
+			expect(stageAttempts).toBeGreaterThan(0);
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
-			expect(stageAttempts).toBeGreaterThan(6);
-			expect(abortCalls).toBe(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
+			expect(abortCalls).toBe(1);
 		} finally {
 			await harness?.stop();
 			await Bun.sleep(10);
@@ -7296,8 +7302,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const idsFollowUp = { commandId: followUp.result?.commandId, turnId: followUp.result?.turnId };
 			expect((await harness.query("turn.prompt_status", idsFirst)).result?.status).toBe("in_flight");
 			expect(await settledStatus(harness, "turn.prompt_status", idsFollowUp)).toMatchObject({
-				status: "terminal_ok",
-				outcome: { kind: "stopped", reason: "cancelled" },
+				status: "failed",
+				error: { code: "prompt_deadline_exceeded" },
+				outcome: { kind: "failed", code: "prompt_deadline_exceeded", provenance: "deadline" },
 			});
 			expect(abortCalls).toBeGreaterThan(0);
 		} finally {

@@ -853,6 +853,7 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation,
 		outcome: InvocationOutcomeInput,
 		keepDeadlineRecoveryPending?: boolean,
+		preferDeadlineOutcome?: boolean,
 	): Promise<InvocationOutcome | undefined>;
 	claimPendingOutcome(
 		kind: InvocationKind,
@@ -1490,7 +1491,13 @@ export function createInvocationReconciliation(
 				});
 		},
 		hydrate,
-		async stagePendingTerminalOutcome(kind, correlation, outcome, keepDeadlineRecoveryPending = false) {
+		async stagePendingTerminalOutcome(
+			kind,
+			correlation,
+			outcome,
+			keepDeadlineRecoveryPending = false,
+			preferDeadlineOutcome = false,
+		) {
 			const recordKey = key(kind, correlation);
 			for (let attempt = 0; attempt < PENDING_TERMINAL_OUTCOME_RETRIES; attempt += 1) {
 				const record = records.get(recordKey);
@@ -1512,7 +1519,13 @@ export function createInvocationReconciliation(
 					);
 				} else if (prior !== undefined) {
 					const priorIsDeadlineFailure = prior.kind === "failed" && prior.provenance === "deadline";
-					if (!priorIsDeadlineFailure) {
+					const replaceDeadlineCancellation =
+						preferDeadlineOutcome &&
+						requested.kind === "failed" &&
+						requested.code === "prompt_deadline_exceeded" &&
+						prior.kind === "stopped" &&
+						prior.reason === "cancelled";
+					if (!priorIsDeadlineFailure && !replaceDeadlineCancellation) {
 						// A real, already-staged terminal intent is stronger than this
 						// publisher's duplicate event. Provider errors were handled above.
 						staged = prior;
@@ -4633,6 +4646,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		terminalPublication: Promise<boolean>;
 		eventCaptured: boolean;
 		eventPrepared: boolean;
+		deadlineAbortStarted: boolean;
 		eventCapture: Promise<void>;
 		resolveEventCapture: () => void;
 		observed?: boolean;
@@ -4654,6 +4668,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		observation.releaseTerminalRetention?.();
 		observation.releaseTerminalRetention = undefined;
 		if (deadlineTerminalizationObservations.get(key) === observation) deadlineTerminalizationObservations.delete(key);
+	};
+	const deadlineOutcomeAfterAbort = (
+		correlation: InvocationCorrelation,
+		outcome: InvocationOutcome | undefined,
+		hasActivity?: boolean,
+	): InvocationOutcome | undefined => {
+		const observation = deadlineTerminalizationObservations.get(lifecycleCorrelationKey(correlation));
+		if (!observation?.deadlineAbortStarted || outcome?.kind !== "stopped" || outcome.reason !== "cancelled")
+			return outcome;
+		return failedPromptOutcome({
+			code: "prompt_deadline_exceeded",
+			provenance: "deadline",
+			evidence: hasActivity === true ? { hasActivity: true } : {},
+		});
 	};
 	// Shared with the control surface: the SDK connection owning the currently
 	// active prompt/skill turn. Cleared at every agent_end (terminal lifecycle
@@ -5106,26 +5134,32 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						type === "agent_start" &&
 						invocation.kind === "prompt" &&
 						current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation);
-					const invocationTerminalOutcome = terminalOutcome;
+					const observation = deferDeadlineTerminal
+						? deadlineTerminalizationObservations.get(lifecycleCorrelationKey(invocation.correlation))
+						: undefined;
+					const invocationTerminalOutcome = deadlineOutcomeAfterAbort(
+						invocation.correlation,
+						terminalOutcome,
+						terminalHasActivity,
+					);
 					if (type === "agent_end" && invocation.kind === "prompt")
 						current.deadlineManager.noteTerminalTransition(
 							invocation.correlation,
 							unrecorded,
-							terminalContent !== undefined || terminalHasActivity || terminalOutcome !== undefined
+							terminalContent !== undefined || terminalHasActivity || invocationTerminalOutcome !== undefined
 								? ({
 										content: terminalContent,
 										hasActivity: terminalHasActivity,
-										...(terminalOutcome === undefined ? {} : { outcome: terminalOutcome }),
+										...(invocationTerminalOutcome === undefined
+											? {}
+											: { outcome: invocationTerminalOutcome }),
 									} satisfies PromptTerminalTransitionEvidence)
 								: undefined,
 							deferDeadlineTerminal,
 						);
 					if (type === "agent_end") {
 						let terminalKey: string | undefined;
-						let capturedOutcome = terminalOutcome;
-						const observation = deferDeadlineTerminal
-							? deadlineTerminalizationObservations.get(lifecycleCorrelationKey(invocation.correlation))
-							: undefined;
+						let capturedOutcome = invocationTerminalOutcome;
 						if (deferDeadlineTerminal) {
 							terminalKey = lifecycleCorrelationKey(invocation.correlation);
 							deferredTerminalOutcomeRequired.add(terminalKey);
@@ -5349,7 +5383,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					};
 					continue;
 				}
-				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
+				const outcome = deadlineOutcomeAfterAbort(
+					invocation.correlation,
+					terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome),
+					terminalHasActivity,
+				);
+				if (outcome === undefined) continue;
 				if (!claimTerminalBoundary(invocation.correlation)) {
 					terminalPublicationByCorrelation.set(
 						terminalKey,
@@ -5839,6 +5878,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					terminalPublication: terminalPublication.promise,
 					eventCaptured: false,
 					eventPrepared: false,
+					deadlineAbortStarted: false,
 					eventCapture: eventCapture.promise,
 					resolveEventCapture: () => eventCapture.resolve(),
 					releaseTerminalRetention: retainTerminalBoundaries([{ correlation }]),
@@ -5922,6 +5962,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				let proof: { status: string; terminalScope?: unknown } | undefined;
 				try {
 					steeringSnapshotToken = seams.captureTerminalAbortSteeringSnapshot?.();
+					observation.deadlineAbortStarted = true;
 					proof = await seams.abortPromptAndWaitWithTerminal(observation.handle, {
 						graceMs: 10_000,
 						terminal: {
@@ -5961,10 +6002,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			onDeadlinePublishTerminal: async (correlation, isCurrent) => {
 				const key = lifecycleCorrelationKey(correlation);
 				const observation = deadlineTerminalizationObservations.get(key);
+				const terminalOutcome = observation
+					? deadlineOutcomeAfterAbort(correlation, observation.terminalOutcome, observation.terminalHasActivity)
+					: undefined;
 				if (
 					!observation?.eventCaptured ||
 					!observation.eventPrepared ||
-					observation.terminalOutcome === undefined ||
+					terminalOutcome === undefined ||
 					!observation.publishTerminal
 				)
 					return false;
@@ -5974,13 +6018,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const staged = await reconciliation.stagePendingTerminalOutcome(
 						"prompt",
 						correlation,
-						observation.terminalOutcome,
+						terminalOutcome,
+						true,
+						observation.deadlineAbortStarted,
 					);
 					if (staged === undefined) return false;
 					observation.terminalOutcome = staged;
 					observation.clearUnrecordedFailure?.();
 					if (!isCurrent() || pendingTools(observation.handle).length > 0) return false;
-					return observation.publishTerminal(staged);
+					return observation.publishTerminal(staged) ? staged : false;
 				} catch {
 					return false;
 				}

@@ -1,3 +1,3 @@
 ### Fixed
 
-- SDK prompt deadlines no longer publish a terminal failure while a correlated turn or dispatched tool may still be running; verified runs stop with their terminal event, while unproven runs retain a recoverable in-flight status (#5869).
+- SDK prompt deadline expiry fences the exact accepted run and dispatched tools before publishing `prompt_deadline_exceeded`; when settlement is unproven, the prompt remains recoverable in flight with its pending outcome hidden (#5869).
