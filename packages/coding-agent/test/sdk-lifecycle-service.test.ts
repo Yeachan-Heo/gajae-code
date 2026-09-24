@@ -468,6 +468,34 @@ describe("SessionLifecycleService", () => {
 			error: { code: "malformed_response" },
 		});
 	});
+	it("traverses a cwd-filtered session list across cursor pages", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "first" }],
+					warnings: [],
+					continuationCursor: "page-2",
+				},
+			},
+			{ ok: true, result: { indexSeq: 7, sessions: [{ sessionId: "second" }], warnings: [] } },
+		);
+
+		expect(
+			await service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo" },
+			}),
+		).toMatchObject({
+			ok: true,
+			operation: "session.list",
+			result: { sessions: [{ sessionId: "first" }, { sessionId: "second" }] },
+		});
+		expect(client.calls.map(call => call.input)).toEqual([{ cwd: "/repo" }, { cursor: "page-2" }]);
+	});
 	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
 		const { service, client } = serviceWith();
 		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
