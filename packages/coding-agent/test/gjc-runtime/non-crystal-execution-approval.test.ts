@@ -457,6 +457,20 @@ describe("non-Crystal user-gated execution approval", () => {
 		});
 	});
 
+	it("validates fresh ordinary approval from the bounded tail of a large audit", async () => {
+		await withSession(async (cwd, manager, sessionId) => {
+			await publish(cwd, sessionId, "deep-interview");
+			const auditFile = auditPath(cwd, sessionId);
+			const filler = `${JSON.stringify({ category: "legacy", padding: "x".repeat(16 * 1024 * 1024) })}\n`;
+			await fs.writeFile(auditFile, filler, "utf8");
+
+			await ask(cwd, manager, "deep-interview", "approval-with-large-audit", false);
+			expect((await approval(cwd, sessionId, "deep-interview")).status).toBe("pending");
+			const consumed = await consume(cwd, sessionId);
+			expect(consumed.status, consumed.stderr).toBe(0);
+		});
+	});
+
 	it("ordinary interview refuses expired user consent without altering authority evidence", async () => {
 		await withSession(async (cwd, manager, sessionId) => {
 			await publish(cwd, sessionId, "deep-interview");

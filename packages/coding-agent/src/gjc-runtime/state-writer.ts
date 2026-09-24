@@ -266,16 +266,48 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 }
 
 async function appendPrivate(filePath: string, content: string): Promise<void> {
-	const flags =
-		nodeFs.constants.O_WRONLY |
-		nodeFs.constants.O_APPEND |
-		nodeFs.constants.O_CREAT |
-		(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0));
+	let initialStat: nodeFs.BigIntStats | undefined;
+	try {
+		initialStat = await fs.lstat(filePath, { bigint: true });
+	} catch (error) {
+		if (!isErrno(error, "ENOENT")) throw error;
+	}
+	if (initialStat && (!initialStat.isFile() || initialStat.isSymbolicLink() || initialStat.nlink !== 1n))
+		throw new Error("append target must be a regular single-linked file");
+	const flags = initialStat
+		? nodeFs.constants.O_WRONLY |
+			nodeFs.constants.O_APPEND |
+			(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
+		: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
+		const openedStat = await handle.stat({ bigint: true });
+		const pathStat = await fs.lstat(filePath, { bigint: true });
+		const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+			left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+		if (
+			!openedStat.isFile() ||
+			openedStat.isSymbolicLink() ||
+			openedStat.nlink !== 1n ||
+			pathStat.isSymbolicLink() ||
+			!pathStat.isFile() ||
+			pathStat.nlink !== 1n ||
+			(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
+			!sameObject(openedStat, pathStat)
+		)
+			throw new Error("append target must be a regular single-linked file");
 		await handle.chmod(PRIVATE_FILE_MODE);
 		await handle.writeFile(content, "utf-8");
+		const appendedStat = await handle.stat({ bigint: true });
+		const finalPathStat = await fs.lstat(filePath, { bigint: true });
+		if (
+			appendedStat.isSymbolicLink() ||
+			!sameObject(openedStat, appendedStat) ||
+			finalPathStat.isSymbolicLink() ||
+			!sameObject(appendedStat, finalPathStat)
+		)
+			throw new Error("append target identity changed during append");
 	} finally {
 		await handle?.close();
 	}
@@ -1603,7 +1635,8 @@ export async function appendAuditEntry(
 		let initialStat: nodeFs.BigIntStats | undefined;
 		try {
 			initialStat = await fs.lstat(filePath, { bigint: true });
-			if (initialStat.isSymbolicLink() || !initialStat.isFile()) throw new Error("audit path is not a regular file");
+			if (initialStat.isSymbolicLink() || !initialStat.isFile() || initialStat.nlink !== 1n)
+				throw new Error("audit path must be a regular single-linked file");
 		} catch (error) {
 			if (!isErrno(error, "ENOENT")) throw error;
 		}
@@ -1622,8 +1655,10 @@ export async function appendAuditEntry(
 			if (
 				openedStat.isSymbolicLink() ||
 				!openedStat.isFile() ||
+				openedStat.nlink !== 1n ||
 				pathStat.isSymbolicLink() ||
 				!pathStat.isFile() ||
+				pathStat.nlink !== 1n ||
 				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
 				!sameObject(openedStat, pathStat)
 			)
@@ -1635,7 +1670,7 @@ export async function appendAuditEntry(
 			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
 			await handle.sync();
 			const afterPathStat = await fs.lstat(filePath, { bigint: true });
-			if (afterPathStat.isSymbolicLink() || !sameObject(openedStat, afterPathStat))
+			if (afterPathStat.isSymbolicLink() || afterPathStat.nlink !== 1n || !sameObject(openedStat, afterPathStat))
 				throw new Error("audit path identity changed during append");
 		} finally {
 			await handle?.close();
