@@ -177,8 +177,9 @@ export class SdkStartupCapability {
 		return this.#cancelled;
 	}
 
-	cancel(): void {
+	cancel(failure?: SdkStartupFailure): void {
 		this.#cancelled = true;
+		if (failure) this.settleFailure(failure);
 	}
 
 	/**
