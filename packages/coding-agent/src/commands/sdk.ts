@@ -824,7 +824,9 @@ export async function runSessionHost(
 			throw error;
 		}
 	};
-	const captureMcpConfigDirectory = async (owned: OwnedMcpConfigDirectory): Promise<void> => {
+	const captureMcpConfigDirectoryIdentity = async (
+		owned: OwnedMcpConfigDirectory,
+	): Promise<{ directoryIdentity: { dev: bigint; ino: bigint } }> => {
 		const [directoryStat, parentStat] = await Promise.all([
 			fs.lstat(owned.path, { bigint: true }),
 			fs.lstat(path.dirname(owned.path), { bigint: true }),
@@ -843,16 +845,21 @@ export async function runSessionHost(
 				(parentStat.dev !== owned.parentIdentity.dev || parentStat.ino !== owned.parentIdentity.ino))
 		)
 			throw new Error("MCP temporary directory identity changed during setup.");
+		const directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+		owned.directoryIdentity = directoryIdentity;
+		owned.parentIdentity = { dev: parentStat.dev, ino: parentStat.ino };
+		return { directoryIdentity };
+	};
+	const captureMcpConfigDirectory = async (owned: OwnedMcpConfigDirectory): Promise<void> => {
+		const { directoryIdentity } = await captureMcpConfigDirectoryIdentity(owned);
 		const captured = snapshotDirectoryTree(owned.path);
 		if (
 			!captured.ok ||
 			!captured.snapshot ||
-			captured.snapshot.rootDev !== directoryStat.dev.toString() ||
-			captured.snapshot.rootIno !== directoryStat.ino.toString()
+			captured.snapshot.rootDev !== directoryIdentity.dev.toString() ||
+			captured.snapshot.rootIno !== directoryIdentity.ino.toString()
 		)
 			throw new Error(`MCP temporary directory snapshot failed: ${captured.code ?? "identity_mismatch"}.`);
-		owned.directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
-		owned.parentIdentity = { dev: parentStat.dev, ino: parentStat.ino };
 		owned.snapshot = captured.snapshot;
 	};
 	const disposeConstructedSession = async (session: AgentSession): Promise<void> => {
@@ -909,11 +916,25 @@ export async function runSessionHost(
 		if (!opened) throw new Error("Lifecycle session manager was not opened.");
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
-			const ownedDirectory = { path: await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")) };
+			const temporaryRoot = await fs.realpath(os.tmpdir());
+			const ownedDirectory = { path: await fs.mkdtemp(path.join(temporaryRoot, "gjc-acp-mcp-")) };
 			mcpConfigDirectory = ownedDirectory;
+			await captureMcpConfigDirectoryIdentity(ownedDirectory);
+			try {
+				ownedDirectory.path = await fs.realpath(ownedDirectory.path);
+			} catch (realpathError) {
+				try {
+					await captureMcpConfigDirectory(ownedDirectory);
+				} catch (snapshotError) {
+					throw new AggregateError(
+						[realpathError, snapshotError],
+						"MCP temporary directory resolution and cleanup snapshot both failed.",
+					);
+				}
+				throw realpathError;
+			}
 			await captureMcpConfigDirectory(ownedDirectory);
-			const resolvedMcpConfigDirectory = await fs.realpath(ownedDirectory.path);
-			mcpConfigPath = path.join(resolvedMcpConfigDirectory, "mcp.json");
+			mcpConfigPath = path.join(ownedDirectory.path, "mcp.json");
 			try {
 				await Bun.write(
 					mcpConfigPath,
