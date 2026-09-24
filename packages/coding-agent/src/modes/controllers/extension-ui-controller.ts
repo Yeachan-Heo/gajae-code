@@ -626,6 +626,10 @@ export class ExtensionUiController {
 			invokeSkill: (name, args, options) => this.ctx.session.invokeSkill(name, args, options),
 			setPlanMode: on => this.ctx.session.setSdkPlanMode(on),
 			operateGoal: (op, objective) => this.ctx.session.operateGoal(op, objective),
+			// Read the CURRENT session on every call: interactive contexts outlive a
+			// session rebind, and the snapshot must stay session-owned (owner-filtered)
+			// instead of reaching for the process-global manager (issue: jobs Q25).
+			getJobs: () => this.ctx.session.getAsyncJobSnapshot(),
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),
@@ -854,6 +858,8 @@ export class ExtensionUiController {
 				}
 				return false;
 			},
+			// Same session-owned binding as the hooks/custom-tools context above.
+			getJobs: () => this.ctx.session.getAsyncJobSnapshot(),
 			getSkillState: () =>
 				this.ctx.session.skills.map(skill => ({ name: skill.name, description: skill.description })),
 			getConfigItems: () => this.ctx.session.getSdkConfigItems(),

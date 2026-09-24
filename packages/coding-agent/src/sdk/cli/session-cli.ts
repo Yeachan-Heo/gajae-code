@@ -201,6 +201,10 @@ export function sdkPublicFailure(code: string, details?: unknown, proof?: Public
 		kind: Object.hasOwn(kinds, code) ? kinds[code]! : "operation_failed",
 		proof: code === "wait_timeout" ? "accepted" : proof,
 		references,
+		// A typed `resource_gone` keeps its public classification; the fixed
+		// diagnostic only separates absent resource state from an empty result.
+		// It asserts no cause and echoes no host-supplied text.
+		...(code === "resource_gone" ? { diagnostics: ["sdk_resource_gone" as const] } : {}),
 	});
 }
 

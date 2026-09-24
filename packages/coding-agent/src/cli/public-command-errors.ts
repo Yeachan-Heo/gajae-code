@@ -98,6 +98,8 @@ export type PublicEvidenceStatus =
 export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	macos_nofile_limit_low:
 		"The macOS open-file limit is below the recommended minimum; increase it before starting additional concurrent work.",
+	sdk_resource_gone:
+		"The requested resource is not available from this session endpoint; this reports absent resource state, not an empty result.",
 	router_cleanup_failed: "SDK session Router cleanup failed.",
 	broker_cleanup_failed: "SDK broker client cleanup failed.",
 	// The broker reports this code from several distinct causes, so the text names none
