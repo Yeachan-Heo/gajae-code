@@ -4,7 +4,27 @@
   "executionStatus": "complete",
   "decisionEligible": true,
   "validityStatus": "isolated decision-eligible rerun",
-  "harnessCommit": "54100eaef9904859006b7a40765b6c2d8f22a203",
+  "harnessCommit": "95eb9547969906f65c039d2178ae0157bdb5ed8f",
+  "harnessCommitPurpose": "reachable source-equivalent benchmark harness commit; the clean run occurred before history was rebased, and the source/task/prompt/description Git blobs listed below are identical to the recorded run inputs",
+  "harnessSourceBlobs": {
+    "scripts/benchmark-code-mode.ts": "8d1f522e7278a8aae29d3a01df4c7e5416ea4c1a",
+    "scripts/benchmark-code-mode.test.ts": "a342abb712bf23c89c48852e4f206155cd3c58c2",
+    "scripts/benchmark-code-mode-tasks.md": "a8ca5e2af45a729e7de0975e879c49391a23fa18",
+    "scripts/benchmark-code-mode-prompts.md": "49042bc5998fba84ca65d20820251816ddd798f8",
+    "scripts/benchmark-code-mode-exec-description.md": "029e0046420204bfb83c8992c047e4a30d76d8d1"
+  },
+  "recordedToolPathAudit": {
+    "workspaceCommit": "6a4de2c932e5079646e45066654fb9aae871c168",
+    "invocationsChecked": 465,
+    "escapingInvocations": 0,
+    "method": "Canonical repository-path and symlink-aware guard replayed against every recorded A read/search input and B plan-step input after the clean run."
+  },
+  "currentSecurityGuardSourceSha256": "6873a002c6e5f64af0825d4de4d67cc278c8c0e0a22c00aab09e1dd37b3aab5c",
+  "securityReviewFix": {
+    "commit": "b6c776c5c6c3ea2d2c4add2c988e238e8b09f3ec",
+    "sourceSha256": "6873a002c6e5f64af0825d4de4d67cc278c8c0e0a22c00aab09e1dd37b3aab5c",
+    "coverage": "Both benchmark arms use the symlink-aware repository-scoped read/search wrappers; external URLs, out-of-root paths, escaping tracked symlinks, and gitignore:false are rejected."
+  },
   "startedAt": "2026-09-23T22:05:23.652Z",
   "finishedAt": "2026-09-23T22:48:34.573Z",
   "workspaceSnapshot": {
