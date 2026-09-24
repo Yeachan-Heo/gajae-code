@@ -7621,17 +7621,32 @@ async function exactCleanupProof(
 	expected: EffectMarker | undefined,
 	evidence: { artifact: LifecycleFailureArtifact } | undefined,
 	proofBudget?: LifecycleProofBudget,
+	allowObservedWindowsReadyExit = false,
 ): Promise<LifecycleCleanupProof | undefined> {
 	const rollback = evidence?.artifact.rollback;
+	const durableRollbackComplete =
+		rollback?.fenced === true &&
+		rollback.runtimeRemoved &&
+		rollback.hostStopped &&
+		rollback.brokerRegistrationReleased;
+	// Windows deliberately keeps the failure receipt incomplete because its
+	// directory-entry publication cannot be flushed. A broker-observed
+	// ready-then-exit can still authorize the separate ledger-backed exact
+	// artifact cleanup below when process, endpoint, and registration absence
+	// are independently verified.
+	const observedWindowsReadyExit =
+		process.platform === "win32" &&
+		allowObservedWindowsReadyExit &&
+		rollback?.fenced === false &&
+		rollback.runtimeRemoved === false &&
+		rollback.hostStopped === false &&
+		rollback.brokerRegistrationReleased === false;
 	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 	if (
 		!root ||
 		!id ||
 		!expected ||
-		!rollback?.fenced ||
-		!rollback.runtimeRemoved ||
-		!rollback.hostStopped ||
-		!rollback.brokerRegistrationReleased ||
+		(!durableRollbackComplete && !observedWindowsReadyExit) ||
 		observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) !==
 			"exited"
 	)
@@ -7816,6 +7831,7 @@ export async function executeLifecycle(
 		expected,
 		evidence,
 		proofBudget,
+		!response.ok && response.error.code === "ready_then_exited",
 	);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
