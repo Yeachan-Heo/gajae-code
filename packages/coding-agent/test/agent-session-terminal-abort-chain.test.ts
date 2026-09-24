@@ -85,6 +85,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	let settingsRef: Settings;
 	let modelRegistryRef: ModelRegistry;
 	let extraManagers: Set<AsyncJobManager>;
+	const setScriptedResponses = (responses: MockResponse[]): void => {
+		scriptedResponses.splice(0, scriptedResponses.length, ...responses);
+	};
 
 	const trackExtraManager = (candidate: AsyncJobManager): AsyncJobManager => {
 		extraManagers.add(candidate);
@@ -171,9 +174,10 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		toolSession = ts;
 
 		scriptedResponses = [];
+		const mockResponses = scriptedResponses;
 
 		const mock = createMockModel({
-			handler: () => scriptedResponses.shift() ?? stopReply("done"),
+			handler: () => mockResponses.shift() ?? stopReply("done"),
 		});
 		mockModelRef = mock;
 
@@ -290,7 +294,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 	it("terminal abort registers the scope so the left-running owned job classifies as owned-completion", async () => {
 		const callId = "call_terminal_owned";
-		scriptedResponses = [bashCall("sleep 30", callId, true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", callId, true), stopReply("ok")]);
 
 		const promptPromise = session.prompt("run owned work").catch(() => {});
 		await waitFor(() => manager.getAllJobs().length > 0, "bash job registered");
@@ -346,7 +350,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
 		try {
 			AsyncJobManager.setInstance(foreign);
-			scriptedResponses = [bashCall("sleep 30", "call_endpoint_manager", true), stopReply("ok")];
+			setScriptedResponses([bashCall("sleep 30", "call_endpoint_manager", true), stopReply("ok")]);
 			const promptPromise = session.prompt("run owned work").catch(() => {});
 			await waitFor(() => manager.getAllJobs().length > 0, "job registered in the endpoint-owned manager");
 			expect(manager.getAllJobs().length).toBeGreaterThan(0);
@@ -474,7 +478,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// resolver before rejecting Bash.
 		try {
 			AsyncJobManager.setInstance(undefined);
-			scriptedResponses = [bashCall("sleep 30", "call_endpoint_after_global_dispose", true), stopReply("ok")];
+			setScriptedResponses([bashCall("sleep 30", "call_endpoint_after_global_dispose", true), stopReply("ok")]);
 			const promptPromise = session.prompt("run endpoint-owned async work").catch(() => {});
 			await waitFor(() => manager.getAllJobs().length > 0, "job registered after global manager was cleared");
 			expect(manager.getAllJobs().length).toBeGreaterThan(0);
@@ -486,7 +490,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 	it("owned scope registers a scope with owned-completion delivery disabled", async () => {
 		const callId = "call_terminal_owned_disabled";
-		scriptedResponses = [bashCall("sleep 30", callId, true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", callId, true), stopReply("ok")]);
 
 		const promptPromise = session.prompt("run capturable work").catch(() => {});
 		await waitFor(() => manager.getAllJobs().length > 0, "bash job registered");
@@ -511,7 +515,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 	it("terminal abort advances the epoch so a later turn's work never binds the aborted scope", async () => {
 		// Turn A spawns a job; terminal abort fences turn A's lineage+epoch.
-		scriptedResponses = [bashCall("sleep 30", "call-a", true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", "call-a", true), stopReply("ok")]);
 		const firstPrompt = session.prompt("first turn").catch(() => {});
 		await waitFor(() => manager.getAllJobs().length > 0, "first job registered");
 		await firstPrompt;
@@ -526,7 +530,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// advanced, so its lineage is distinct and the aborted scope must NOT
 		// claim it (AC 27/28 — the fence bounds only the aborted turn).
 		const jobCountBefore = manager.getAllJobs().length;
-		scriptedResponses = [bashCall("sleep 30", "call-b", true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", "call-b", true), stopReply("ok")]);
 		const secondPrompt = session.prompt("second turn").catch(() => {});
 		await waitFor(() => manager.getAllJobs().length > jobCountBefore, "second job registered");
 		await secondPrompt;
@@ -536,7 +540,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 	it("consecutive normal turns get distinct lineage epochs; owned abort of turn B never captures turn A's job", async () => {
 		// Turn A completes normally (no abort), leaving a registered job.
-		scriptedResponses = [bashCall("sleep 30", "call-distinct-a", true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", "call-distinct-a", true), stopReply("ok")]);
 		await session.prompt("first turn");
 		await waitFor(() => manager.getAllJobs().length >= 1, "first job registered");
 		const jobA = manager.getAllJobs()[0]!;
@@ -544,7 +548,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// Turn B also completes normally; the lineage epoch must NOT be reused,
 		// otherwise both turns share (lineageIdHash, epoch) and turn A's job
 		// would look owned by turn B (review thread P1).
-		scriptedResponses = [bashCall("sleep 30", "call-distinct-b", true), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", "call-distinct-b", true), stopReply("ok")]);
 		await session.prompt("second turn");
 		await waitFor(() => manager.getAllJobs().length >= 2, "second job registered");
 		const jobB = manager.getAllJobs().find(job => job.id !== jobA.id)!;
@@ -607,7 +611,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 20_000);
 
 	it("terminal abort + new prompt discards hidden next-turn successors before injection", async () => {
-		scriptedResponses = [stopReply("ok")];
+		setScriptedResponses([stopReply("ok")]);
 		await session.prompt("first turn");
 		// Queue WITHOUT scheduling a drain: the first turn has already ended, so
 		// a scheduled drain would fire before the abort lands (the session is
@@ -633,7 +637,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// A NEW prompt advances the generation: the explicit-prompt admission
 		// must discard the aborted turn's hidden successors before injection
 		// instead of adding them to this new turn (review thread P2).
-		scriptedResponses = [stopReply("ok")];
+		setScriptedResponses([stopReply("ok")]);
 		await session.prompt("new user turn");
 		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
 	}, 20_000);
@@ -643,7 +647,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// to mean anything: steering a finished turn is refused at admission (R1),
 		// which would make the empty-queue assertion below pass for the wrong
 		// reason. Park a tool so the turn is live, admit, then abort terminally.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("must not run")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("must not run")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const callsBeforeAbort = recordedProviderContexts().length;
@@ -681,7 +685,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// whose acceptance was already acknowledged, so the abort must preserve
 		// it instead of purging every steering message — clearing it would
 		// leave its reconciliation record accepted indefinitely.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const abortPromise = session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
@@ -705,7 +709,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// ADMISSION (before its durable marker transaction) — a steer admitted
 		// while the abort is in flight classifies as post-snapshot even though
 		// the later abortPromptAndWait purge has not run yet.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		session.captureTerminalAbortSteeringSnapshot();
@@ -726,7 +730,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// aborted attempt, which the terminal-abort contract requires to be
 		// blocked — the abort exits the loop and only rearms post-snapshot
 		// steers, so a stale steer would otherwise alter the next prompt.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("unused")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("unused")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.sendUserMessage("pre-abort steer", { deliverAs: "steer" });
@@ -745,7 +749,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// to steer, so the session routes the request as a follow-up owned by
 		// the next turn — never as steering the terminal-abort purge has to
 		// reason about.
-		scriptedResponses = [stopReply("ok"), stopReply("delivered")];
+		setScriptedResponses([stopReply("ok"), stopReply("delivered")]);
 		await session.prompt("first turn");
 		await session.sendUserMessage("post-turn steer", { deliverAs: "steer" });
 		expect(session.agent.hasQueuedSteering()).toBe(false);
@@ -759,7 +763,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// with their OWN admission's snapshot — a later admission capturing a
 		// higher sequence must not overwrite the earlier admission's snapshot
 		// and purge an already-accepted steer.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
@@ -797,7 +801,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// consumed at that run's terminal. Settling the OLDER (looser) admission
 		// last must not widen the newer one: only steering admitted after the
 		// highest snapshot survives.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("late steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("late steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId ?? "run";
@@ -840,7 +844,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// arriving afterwards must be classified by WHERE IT CAME FROM: genuine
 		// user input survives as its own root request, while a continuation the
 		// aborted turn's own machinery produced is dropped with its display chip.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("user steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("user steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId ?? "run";
@@ -916,7 +920,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// root request. Removing that request must remove its requirement too: a
 		// later turn-owned continuation must not inherit a fresh identity and
 		// escape the terminal fence.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("should not run")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("should not run")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId ?? "run";
@@ -961,7 +965,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// preserved post-snapshot external steer is re-routed (queue AND display)
 		// as a follow-up of the fresh turn, so the positional editing APIs never
 		// address a stale entry.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
@@ -995,7 +999,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// lineage — otherwise the scheduled continue runs under the aborted
 		// lineage+epoch, the terminal fence skips it as terminal_turn, and the
 		// preserved user follow-up stays stranded until unrelated activity.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle", 20_000);
 		// Queue the external follow-up while the turn is active (the idle
@@ -1020,7 +1024,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// becomes active, the settlement must purge with the ORIGINAL admission
 		// sequence — the session rebinds the captured token to the current turn
 		// instead of rejecting it as stale.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("ok")];
+		setScriptedResponses([bashCall("sleep 30", "call_hold_turn"), stopReply("ok")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle", 20_000);
 		const handle = session.agent.activeResourceRunId;
@@ -1053,7 +1057,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// never settles — its captured snapshot must be discarded, or a later
 		// real abort would consume the stale entry and treat steering admitted
 		// since the replay as post-abort.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
@@ -1085,14 +1089,17 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// The hidden-next-turn fence purge must not delete it solely by origin —
 		// it is a promised resume of the root worker (classified fresh), and
 		// dropping it also bypasses the registration-settlement path.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn")]);
 		let promptError: unknown;
 		const promptPromise = session.prompt("hold the turn").catch(error => {
 			promptError = error;
 		});
+		// Allow extra startup slack under the full suite; prompt failures still
+		// short-circuit this wait and are rethrown below.
 		await waitFor(
 			() => session.agent.activeResourceRunId !== undefined || promptError !== undefined,
 			"active run handle",
+			30_000,
 		);
 		if (promptError !== undefined) throw promptError;
 		// Terminal abort closes the current turn's continuation fence.
@@ -1154,7 +1161,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// A new explicit prompt drains the preserved completion: it is
 		// classified fresh, delivered (the mock answers), and its registration
 		// settles instead of bypassing the settlement path.
-		scriptedResponses = [stopReply("completion answered")];
+		setScriptedResponses([stopReply("completion answered")]);
 		await session.prompt("new user turn");
 		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
 		await waitFor(
@@ -1162,7 +1169,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			"owned completion registration settled after delivery",
 		);
 		await promptPromise;
-	}, 30_000);
+	}, 60_000);
 
 	it("rejects an owned completion replayed from another live endpoint", async () => {
 		const foreignManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: () => {} });
@@ -1215,7 +1222,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// callback for a run that did not consume it.
 		const promoted: string[] = [];
 		const removalDispositions: boolean[] = [];
-		scriptedResponses = [bashCall("sleep 2", "hold-removal"), stopReply("accepted")];
+		setScriptedResponses([bashCall("sleep 2", "hold-removal"), stopReply("accepted")]);
 		const promptPromise = session.prompt("hold removal window").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active removal window");
 		await session.sendUserMessage("removed steer", {
@@ -1260,7 +1267,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// getSteeringMessages, the ownership hook never fires, and the
 		// connection's later terminal abort is rejected as an owner mismatch.
 		let promoted = 0;
-		scriptedResponses = [
+		setScriptedResponses([
 			stopReply("turn one"),
 			// The second turn's model response never emits content: the abort
 			// interrupts the delay (delayMs honors the run's AbortSignal), and
@@ -1270,7 +1277,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			// queue again.
 			{ delayMs: 1_000, throw: "abort probe", content: [] },
 			stopReply("steer answered"),
-		];
+		]);
 		await session.prompt("first turn");
 		// A completed in-flight tool's result is the history tail a terminal
 		// abort leaves in production when the grace window lets the tool
@@ -1324,7 +1331,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// must stay associated with the requesting connection or a later
 		// terminal abort from that client is rejected as non-owner.
 		let promoted = 0;
-		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
+		setScriptedResponses([stopReply("ok"), stopReply("steer answered")]);
 		await session.prompt("first turn");
 		await session.waitForIdle();
 		// Queue the client steer while idle: the auto-continue promotes it into
@@ -1343,7 +1350,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
-		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
+		setScriptedResponses([stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")]);
 		await session.prompt("first turn");
 		await session.waitForIdle();
 		const staleToken = session.captureTerminalAbortSteeringSnapshot();
@@ -1372,7 +1379,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// independent next-root-turn request and must survive the abort
 		// (alongside authorized owned-completion envelopes), then be rearmed
 		// under a fresh lineage.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")];
+		setScriptedResponses([bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")]);
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.followUp("external follow-up");
@@ -1533,7 +1540,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		try {
 			AsyncJobManager.setInstance(foreign);
 			const bindEndpoint = chainSessionManager.getSessionId() ?? "local";
-			scriptedResponses = [bashCall("echo foreground-ok", "call_fg_endpoint", false), stopReply("done")];
+			setScriptedResponses([bashCall("echo foreground-ok", "call_fg_endpoint", false), stopReply("done")]);
 			const promptPromise = session.prompt("run foreground work").catch(() => {});
 			await promptPromise;
 			// The foreground job landed in the endpoint-owned manager and its
@@ -1587,7 +1594,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			const endpointId = toolSession.getSessionId?.() ?? undefined;
 			expect(endpointId).toBeDefined();
 			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(manager);
-			scriptedResponses = [bashCall("sleep 30", "call_jobtool", true), stopReply("job started")];
+			setScriptedResponses([bashCall("sleep 30", "call_jobtool", true), stopReply("job started")]);
 			const promptPromise = session.prompt("spawn job").catch(error => {
 				promptError = error;
 			});
