@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
-import { type AssistantMessage, Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import { type AssistantMessage, Effort, getBundledModel, type Model, writeModelCache } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -17,7 +18,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { runSubprocess, runSubprocessOnce } from "@gajae-code/coding-agent/task/executor";
 import type { TaskRoutingEvidence } from "@gajae-code/coding-agent/task/types";
-import { TempDir } from "@gajae-code/utils";
+import { getAgentDir, hookFetch, setAgentDir, TempDir } from "@gajae-code/utils";
 
 const selector = (model: Model) => `${model.provider}/${model.id}`;
 const discardedAttemptContent = "Discarded primary provisional content";
@@ -60,13 +61,32 @@ function successfulStream(model: Model): AssistantMessageEventStream {
 	});
 }
 
+function configuredDiscoveryProvenance(authEvidence: string, endpoint: string): string {
+	const context = JSON.stringify({
+		authEvidence,
+		endpoint,
+		headers: [],
+		discoveryType: "openai-models-list",
+		api: "openai-completions",
+		apiByModelPrefix: [],
+		modelsDevProvider: "",
+	});
+	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+}
+
 describe("task.agentModelOverrides fallback chain e2e", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let session: AgentSession | undefined;
+	let originalAgentDir: string;
+	let previousPresetRegistryDisabled: string | undefined;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@task-override-fallback-");
+		originalAgentDir = getAgentDir();
+		setAgentDir(tempDir.path());
+		previousPresetRegistryDisabled = Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = "true";
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -75,6 +95,9 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 	afterEach(async () => {
 		await session?.dispose();
 		authStorage.close();
+		setAgentDir(originalAgentDir);
+		if (previousPresetRegistryDisabled === undefined) delete Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED;
+		else Bun.env.GJC_MODEL_PRESET_REGISTRY_DISABLED = previousPresetRegistryDisabled;
 		tempDir.removeSync();
 		vi.restoreAllMocks();
 	});
@@ -194,6 +217,217 @@ describe("task.agentModelOverrides fallback chain e2e", () => {
 			expect(child.thinkingLevel).toBe(Effort.High);
 		} finally {
 			await child.dispose();
+		}
+	});
+
+	it("resolves an owned delegated registry from a pre-seeded LiteLLM cache without models-list I/O", async () => {
+		const modelId = "viant-gemini-3-8-flash";
+		const endpoint = "http://localhost:4000/v1";
+		const unrelatedEndpoint = "http://unrelated-provider.test/v1";
+		const modelsPath = path.join(tempDir.path(), "models.yml");
+		const cachedModel: Model<"openai-completions"> = {
+			id: modelId,
+			name: modelId,
+			api: "openai-completions",
+			provider: "litellm",
+			baseUrl: endpoint,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+		authStorage.setRuntimeApiKey("litellm", "delegated-litellm-key");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					litellm: {
+						baseUrl: endpoint,
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+					},
+					"unrelated-discovery": {
+						baseUrl: unrelatedEndpoint,
+						api: "openai-completions",
+						apiKey: "unrelated-discovery-key",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		const provenance = configuredDiscoveryProvenance(
+			authStorage.getProviderEvidenceGeneration("litellm", "delegated-litellm-key"),
+			endpoint,
+		);
+		writeModelCache(
+			"litellm",
+			Date.now(),
+			[cachedModel],
+			true,
+			"",
+			path.join(tempDir.path(), "models.db"),
+			[modelId],
+			provenance,
+		);
+
+		let modelsListRequests = 0;
+		let unrelatedModelsListRequests = 0;
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url === `${endpoint}/models`) {
+				modelsListRequests++;
+				throw new Error(`unexpected LiteLLM models-list request: ${url}`);
+			}
+			if (url === `${unrelatedEndpoint}/models`) {
+				unrelatedModelsListRequests++;
+				throw new Error(`unexpected unrelated models-list request: ${url}`);
+			}
+			throw new Error(`unexpected unrelated network request: ${url}`);
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const parentRegistry = new ModelRegistry(
+			authStorage,
+			path.join(tempDir.path(), "stale-parent-models.yml"),
+			settings,
+			{ automaticRefresh: false },
+		);
+		expect(modelsListRequests).toBe(0);
+		const accepted = await runSubprocessOnce({
+			cwd: tempDir.path(),
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "resolve cached delegated model",
+			index: 0,
+			id: "owned-litellm-cache",
+			modelOverride: `litellm/${modelId}`,
+			preflightProbe: true,
+			settings,
+			authStorage,
+			modelRegistry: parentRegistry,
+			agentDir: tempDir.path(),
+			enableLsp: false,
+		});
+
+		expect(accepted.preflightProbeAccepted).toBe(true);
+		expect(accepted.setupFailure).toBeUndefined();
+		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
+
+		const repeated = await runSubprocessOnce({
+			cwd: tempDir.path(),
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "resolve cached delegated model again",
+			index: 1,
+			id: "owned-litellm-cache-again",
+			modelOverride: `litellm/${modelId}`,
+			preflightProbe: true,
+			settings,
+			authStorage,
+			modelRegistry: parentRegistry,
+			agentDir: tempDir.path(),
+			enableLsp: false,
+		});
+
+		expect(repeated.preflightProbeAccepted).toBe(true);
+		expect(repeated.setupFailure).toBeUndefined();
+		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
+
+		const parent = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!parent) throw new Error("Expected bundled parent model");
+		const unknown = await runSubprocessOnce({
+			cwd: tempDir.path(),
+			agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+			task: "reject unknown cached delegated model",
+			index: 1,
+			id: "owned-litellm-unknown",
+			modelOverride: "litellm/unknown-cached-model",
+			parentActiveModelPattern: selector(parent),
+			preflightProbe: true,
+			settings,
+			authStorage,
+			modelRegistry: parentRegistry,
+			agentDir: tempDir.path(),
+			enableLsp: false,
+		});
+
+		expect(unknown.exitCode).toBe(1);
+		expect(unknown.preflightProbeAccepted).toBe(false);
+		expect(unknown.setupFailure?.summary).toMatch(/missing from the catalog|fail closed/i);
+		expect(unknown.setupFailure?.summary).toMatch(/do not fall back/i);
+		expect(modelsListRequests).toBe(0);
+		expect(unrelatedModelsListRequests).toBe(0);
+		await parentRegistry.dispose();
+	});
+
+	it("refreshes only the requested provider after a delegated cache miss", async () => {
+		const modelId = "freshly-discovered-lite-llm-model";
+		const endpoint = "http://localhost:4000/v1";
+		const unrelatedEndpoint = "http://unrelated-provider.test/v1";
+		const modelsPath = path.join(tempDir.path(), "models.yml");
+		authStorage.setRuntimeApiKey("litellm", "miss-litellm-key");
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					litellm: {
+						baseUrl: endpoint,
+						api: "openai-completions",
+						discovery: { type: "openai-models-list" },
+					},
+					"unrelated-discovery": {
+						baseUrl: unrelatedEndpoint,
+						api: "openai-completions",
+						apiKey: "unrelated-discovery-key",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+
+		let targetModelsListRequests = 0;
+		let unrelatedModelsListRequests = 0;
+		using _hook = hookFetch(input => {
+			const url = String(input);
+			if (url === `${endpoint}/models`) {
+				targetModelsListRequests++;
+				return Response.json({ data: [{ id: modelId }] });
+			}
+			if (url === `${unrelatedEndpoint}/models`) {
+				unrelatedModelsListRequests++;
+				throw new Error(`unexpected unrelated models-list request: ${url}`);
+			}
+			throw new Error(`unexpected unrelated network request: ${url}`);
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const parentRegistry = new ModelRegistry(
+			authStorage,
+			path.join(tempDir.path(), "stale-parent-models.yml"),
+			settings,
+			{ automaticRefresh: false },
+		);
+		try {
+			const accepted = await runSubprocessOnce({
+				cwd: tempDir.path(),
+				agent: { name: "task", description: "test", systemPrompt: "test", source: "bundled" },
+				task: "discover requested delegated provider after a cache miss",
+				index: 0,
+				id: "owned-litellm-cache-miss",
+				modelOverride: `litellm/${modelId}`,
+				preflightProbe: true,
+				settings,
+				authStorage,
+				modelRegistry: parentRegistry,
+				agentDir: tempDir.path(),
+				enableLsp: false,
+			});
+
+			expect(accepted.preflightProbeAccepted).toBe(true);
+			expect(accepted.setupFailure).toBeUndefined();
+			expect(targetModelsListRequests).toBe(1);
+			expect(unrelatedModelsListRequests).toBe(0);
+		} finally {
+			await parentRegistry.dispose();
 		}
 	});
 

@@ -1578,8 +1578,15 @@ export class AuthStorage {
 	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string, owner?: object): string {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		provider = storageProvider;
-		const evidenceApiKey = resolvedApiKey;
 		const configOverride = this.#configOverrideRegistration(storageProvider, owner);
+		const runtimeOverride = this.#runtimeOverrides.get(storageProvider);
+		const environmentOverride = runtimeOverride || configOverride?.apiKey ? undefined : getEnvApiKey(storageProvider);
+		// Discovery callers may fingerprint the provider before resolving its
+		// already-effective override or environment key, then pass that resolved
+		// key on the live path. Use the same effective key for the omitted form
+		// so both paths share one credential-sensitive generation.
+		const evidenceApiKey =
+			resolvedApiKey ?? (runtimeOverride || configOverride?.apiKey || environmentOverride || undefined);
 		const storedLiteral =
 			evidenceApiKey === undefined || this.#runtimeOverrides.has(storageProvider) || configOverride !== undefined
 				? undefined
@@ -1615,9 +1622,7 @@ export class AuthStorage {
 				credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > Date.now(),
 		);
 		const effectiveEnvKey =
-			this.#runtimeOverrides.get(provider) || configOverride?.apiKey || hasApiKey || hasUsableOAuth
-				? undefined
-				: getEnvApiKey(provider);
+			runtimeOverride || configOverride?.apiKey || hasApiKey || hasUsableOAuth ? undefined : getEnvApiKey(provider);
 		const storedApiKeyFingerprint = credentials
 			.filter(
 				(credential): credential is Extract<AuthCredential, { type: "api_key" }> => credential.type === "api_key",

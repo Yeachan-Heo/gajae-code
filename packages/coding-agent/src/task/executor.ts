@@ -37,6 +37,7 @@ import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	isExplicitProviderModelOverride,
+	refreshMissingQualifiedModelProviders,
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -1720,19 +1721,20 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			checkAbort();
 			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
+			const effectiveAgentDir = options.agentDir ?? settings.getAgentDir();
 			const registryAuthStorage =
 				options.authStorage ??
 				options.modelRegistry?.authStorage ??
-				(await awaitAbortable(discoverAuthStorage(settings.getAgentDir())));
+				(await awaitAbortable(discoverAuthStorage(effectiveAgentDir)));
 			if (options.modelRegistry === undefined && options.authStorage === undefined)
 				ownedAuthStorage = registryAuthStorage;
 			ownedModelRegistry = options.modelRegistry
 				? undefined
-				: new ModelRegistry(registryAuthStorage, path.join(settings.getAgentDir(), "models.yml"), settings, {
-						agentDir: settings.getAgentDir(),
+				: new ModelRegistry(registryAuthStorage, path.join(effectiveAgentDir, "models.yml"), settings, {
+						agentDir: effectiveAgentDir,
 						automaticRefresh: false,
 					});
-			const modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
+			let modelRegistry = options.modelRegistry ?? ownedModelRegistry!;
 			const authStorage = modelRegistry.authStorage;
 			if (options.authStorage && options.authStorage !== authStorage) {
 				throw new Error(
@@ -1755,17 +1757,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const canonicalChildScope = getSubagentCanonicalScope(options.parentSessionId, options.subagentId ?? id);
 
 			if (options.preflightProbe || options.preflightDurable) preflightOperation = "auth_resolve";
-			const {
-				model,
-				thinkingLevel: resolvedThinkingLevel,
-				explicitThinkingLevel,
-				authFallbackUsed: resolvedAuthFallbackUsed,
-				requestedModel,
-				fallbackReason,
-				activeIndex,
-				parentFallbackSelector,
-				skips,
-			} = await awaitAbortable(
+			const resolveConfiguredModel = () =>
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
 					options.preflightProbe || options.preflightDurable ? undefined : options.parentActiveModelPattern,
@@ -1777,8 +1769,44 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 						...(options.parentActiveModelProfile ? { aliasIntent: "preset-equivalent" } : {}),
 					},
 					canonicalChildScope,
-				),
-			);
+				);
+			let resolution = await awaitAbortable(resolveConfiguredModel());
+			if (
+				!resolution.model &&
+				registryFromParent &&
+				isExplicitProviderModelOverride(modelPatterns) &&
+				resolution.skips.some(skip => skip.reason === "unknown_model")
+			) {
+				ownedModelRegistry = new ModelRegistry(
+					registryAuthStorage,
+					path.join(effectiveAgentDir, "models.yml"),
+					settings,
+					{
+						agentDir: effectiveAgentDir,
+						automaticRefresh: false,
+					},
+				);
+				await awaitAbortable(
+					refreshMissingQualifiedModelProviders(
+						modelPatterns,
+						ownedModelRegistry,
+						options.parentCredentialSessionId ?? options.parentSessionId,
+					),
+				);
+				modelRegistry = ownedModelRegistry;
+				resolution = await awaitAbortable(resolveConfiguredModel());
+			}
+			const {
+				model,
+				thinkingLevel: resolvedThinkingLevel,
+				explicitThinkingLevel,
+				authFallbackUsed: resolvedAuthFallbackUsed,
+				requestedModel,
+				fallbackReason,
+				activeIndex,
+				parentFallbackSelector,
+				skips,
+			} = resolution;
 			if (!model && isExplicitProviderModelOverride(modelPatterns)) {
 				const skipReasons = [...new Set(skips.map(skip => skip.reason))];
 				if ((options.preflightProbe || options.preflightDurable) && skipReasons.includes("unauthenticated")) {
