@@ -113,6 +113,7 @@ export async function lifecycleArgs(
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
 const BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS = 1_000;
+const BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 async function writeBrokerStartupFailureMarkerBounded(
 	agentDir: string,
@@ -1572,7 +1573,9 @@ export default class Sdk extends Command {
 			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
 				agentDir,
 				record,
-				BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
+				record.reason === "startup-signal"
+					? BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS
+					: BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
 				beforeWriteForTest,
 			);
 			return startupExitWrite;
