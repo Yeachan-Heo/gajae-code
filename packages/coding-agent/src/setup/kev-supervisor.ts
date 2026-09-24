@@ -28,6 +28,8 @@ export const CONTROL_SOCKET_PATH_MAX = 103;
 const CONTROL_TIMEOUT_MS = 20_000;
 /** Inference replies are the largest thing this channel carries; matches the provider's body cap. */
 const CONTROL_REPLY_MAX = 64 * 1024;
+/** A liveness connect is local and immediate; anything slower is treated as absent. */
+const CONTROL_ALIVE_TIMEOUT_MS = 500;
 
 export const controlReplySchema = z
 	.object({
@@ -115,6 +117,31 @@ export function kevControl(
 		});
 		socket.on("error", () => finish(undefined));
 		socket.on("close", () => finish(undefined));
+	});
+}
+
+/**
+ * Is a supervisor still listening on this control socket?
+ *
+ * Connect and close. No token is sent and no request is written: this answers
+ * "is something there", which is the only question a caller with no service
+ * record is entitled to ask. A missing socket file, a refused connection, or a
+ * silent one all mean no.
+ */
+export function kevControlAlive(socketPath: string, timeoutMs = CONTROL_ALIVE_TIMEOUT_MS): Promise<boolean> {
+	return new Promise(resolve => {
+		let settled = false;
+		const socket = net.createConnection({ path: socketPath });
+		const finish = (alive: boolean) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			resolve(alive);
+		};
+		socket.setTimeout(timeoutMs, () => finish(false));
+		socket.on("connect", () => finish(true));
+		socket.on("error", () => finish(false));
+		socket.on("close", () => finish(false));
 	});
 }
 

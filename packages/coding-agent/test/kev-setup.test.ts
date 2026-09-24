@@ -9,6 +9,7 @@ import {
 	controlInferRequest,
 	controlRequest,
 	controlSocketPathIsBindable,
+	isConfirmedStop,
 	KEV_COMMIT_LINE,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
@@ -232,6 +233,7 @@ async function fixture() {
 			if (supervisor.pid !== undefined) processes.delete(supervisor.pid);
 			return { ok: true, exit: 0 };
 		},
+		controlAlive: async () => supervisor.running,
 		portAvailable: () => true,
 		listens: () => true,
 		health: async () => true,
@@ -521,6 +523,23 @@ describe("Kev lifecycle", () => {
 		expect(f.commits).toEqual([]);
 		expect(f.killedHandles).toEqual([42]);
 		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(false);
+	});
+
+	test("a missing service record with a live control socket is orphaned, not stopped", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		// The record is gone but the supervisor still answers. Without the token
+		// nothing here can stop it, so calling it stopped would lose a live server.
+		await fs.rm(path.join(f.root, "server.json"));
+		expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ ok: false, state: "orphaned" });
+		const stopped = await runKevSetup("stop", {}, f.deps);
+		expect(stopped.ok).toBe(false);
+		expect(stopped.state).not.toBe("stopped");
+		// Once the supervisor is gone a leftover socket file is not a service.
+		f.supervisor.running = false;
+		expect(await runKevSetup("status", {}, f.deps)).toMatchObject({ ok: true, state: "stopped" });
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: true, state: "stopped" });
 	});
 
 	test("reinstalling over a live service is refused even when install.json is gone", async () => {
@@ -859,6 +878,46 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		} finally {
 			intruder.stop(true);
 		}
+	}, 60_000);
+
+	test("a real supervisor with no service record is orphaned and is not reported stopped", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-record-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const { supervisorScript, shim } = await writeSupervisedFixture(base);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+
+		const token = "a".repeat(64);
+		const supervisor = Bun.spawn(supervisedArgv(supervisorScript, shim, socketPath, port), {
+			cwd: base,
+			stdin: "pipe",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		spawnedPids.push(supervisor.pid);
+		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
+		supervisor.stdin.end();
+		expect(await until(() => pathExists(socketPath))).toBe(true);
+		const started = await kevControl(socketPath, controlRequest("status", token));
+		expect(started).toMatchObject({ ok: true, state: "running" });
+		spawnedPids.push(started!.pid!);
+		expect(loopbackPortIsFree(port)).toBe(false);
+
+		// `base` stands in for an installation root whose server.json was lost while
+		// the supervisor kept running. `runKevSetup` reads that root for real; only
+		// the installation-shaped checks are faked.
+		const deps: KevSetupDeps = { stateDir: path.join(base, "state") };
+		expect(await runKevSetup("status", { root: base }, deps)).toMatchObject({ ok: false, state: "orphaned" });
+		const stopped = await runKevSetup("stop", { root: base }, deps);
+		expect(stopped.ok).toBe(false);
+		expect(stopped.state).not.toBe("stopped");
+
+		// The token this test kept is the only thing that can stop it.
+		expect(isConfirmedStop(await kevControl(socketPath, controlRequest("stop", token)))).toBe(true);
+		expect(await supervisor.exited).toBe(0);
+		expect(await until(() => loopbackPortIsFree(port))).toBe(true);
+		expect(await runKevSetup("status", { root: base }, deps)).toMatchObject({ state: "not-installed" });
 	}, 60_000);
 
 	test("a SIGKILLed supervisor takes its server down and frees the port", async () => {

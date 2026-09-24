@@ -10,6 +10,7 @@ import {
 	controlRequest,
 	controlSocketPathIsBindable,
 	isConfirmedStop,
+	kevControlAlive,
 	KEV_COMMIT_LINE,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
@@ -100,6 +101,8 @@ export interface KevSetupDeps {
 	health?: (port: number) => Promise<boolean>;
 	/** The only channel that may stop an owned server; there is deliberately no `kill` dependency. */
 	control?: (socketPath: string, message: string) => Promise<KevControlReply | undefined>;
+	/** Is a supervisor still answering on this control socket? Connect only; never authenticates. */
+	controlAlive?: (socketPath: string) => Promise<boolean>;
 	sleep?: (ms: number) => Promise<void>;
 	readyTimeoutMs?: number;
 	/** How long a stop waits for the recorded port to go quiet before failing closed. */
@@ -330,6 +333,7 @@ async function readService(root: string): Promise<{ record?: ServiceRecord; unsa
 		return { unsafe: true };
 	}
 }
+const controlAliveDefault = kevControlAlive;
 /** Is anything still listening on the recorded loopback port, whoever owns it now? */
 function portHasListener(port: number, deps: KevSetupDeps): boolean {
 	return !(deps.portAvailable ?? portAvailable)(port);
@@ -357,6 +361,21 @@ async function status(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 		install = undefined;
 	}
 	if (!record) {
+		// No record is not the same as no service. The supervisor holds the
+		// pre-bound listening socket for as long as it manages the server, so a
+		// control socket that still answers *is* the service still being present —
+		// and without the record there is no token, so nothing here can stop it.
+		if (await (deps.controlAlive ?? controlAliveDefault)(controlSocket(root))) {
+			return {
+				ok: false,
+				state: "orphaned",
+				root,
+				model: install?.model,
+				error:
+					"Kev has no service record but its supervisor still answers on the control socket; " +
+					"the stop token is gone, so stop it manually (kill the supervisor process) before starting again",
+			};
+		}
 		if (!install) return { ok: false, state: "not-installed", root };
 		return { ok: true, state: "stopped", root, model: install.model };
 	}
@@ -622,7 +641,10 @@ async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	const service = await readService(root);
 	if (service.unsafe) return { ok: false, state: "foreign", root, error: "Invalid or unsafe Kev ownership metadata" };
 	const record = service.record;
-	if (!record) return { ok: true, state: "stopped", root };
+	// With no record there is no token, so there is nothing to authenticate with.
+	// status() already decided whether a supervisor is nonetheless still answering;
+	// reporting `stopped` over that would hand back a success for a live service.
+	if (!record) return current.state === "orphaned" ? current : { ok: true, state: "stopped", root };
 	let install: Installation | undefined;
 	try {
 		install = await installed(root);
