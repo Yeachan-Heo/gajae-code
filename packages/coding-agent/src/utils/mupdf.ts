@@ -122,8 +122,15 @@ function formatMuPdfCauseChain(error: unknown): string {
 // internal inspection and operational debug logging. Conservatively redact the
 // rest of a path-bearing field so spaces in install paths cannot leak suffixes.
 export function sanitizeMuPdfDiagnostic(message: string): string {
-	return util
-		.stripVTControlCharacters(message)
-		.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "")
-		.replace(/[^\s"'`]*(?:[/\\]|%2f|%5c)[^"'`]*(?=["'`]|$)/gi, "[path redacted]");
+	return (
+		util
+			.stripVTControlCharacters(message)
+			.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, "")
+			// The prefix run is boundary anchored. Unbounded, `[^\s"'`]*` is re-tried at
+			// every offset of a long slash-free run before failing to find a separator,
+			// which is quadratic in the message length: 100 KB cost about 13s. A MuPDF
+			// diagnostic is derived from the document being converted, and
+			// `normalizeError` runs this once per link in the cause chain.
+			.replace(/(?<![^\s"'`])[^\s"'`]*(?:[/\\]|%2f|%5c)[^"'`]*(?=["'`]|$)/gi, "[path redacted]")
+	);
 }
