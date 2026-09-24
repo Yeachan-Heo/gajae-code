@@ -716,7 +716,10 @@ export class LifecycleLedger {
 	 * must reject rather than create a second admission. A fresh session.create
 	 * may ignore completed terminal legacy rows so old successful operations do
 	 * not block coordinator startup. Other operations retain the legacy fence
-	 * because target-bound legacy identities cannot prove key uniqueness.
+	 * because target-bound legacy identities cannot prove key uniqueness. For
+	 * target-bound terminal creates, the opaque legacy identity also cannot reveal
+	 * the original caller key, so this exception retires that legacy key history;
+	 * exact key-only legacy creates are still rejected by the earlier lookup.
 	 */
 	hasLegacyIdentity(
 		excludedIdentities?: ReadonlySet<string>,
