@@ -123,14 +123,17 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 		// deadline owner's handle has to be captured while the run is live.
 		let handle: string | undefined;
 		const finalFrames: string[] = [];
+		const eventRunningTools = new Set<string>();
 		live.subscribe(event => {
 			if (event.type === "agent_start") handle ??= agent.activeResourceRunId;
 			if (event.type === "agent_end" || event.type === "agent_failed") finalFrames.push(event.type);
+			if (event.type === "tool_execution_start") eventRunningTools.add(event.toolCallId);
+			if (event.type === "tool_execution_end") eventRunningTools.delete(event.toolCallId);
 		});
 		const prompt = live.prompt("mutate the artifact");
 		await toolRunning.promise;
 		if (!handle) throw new Error("Expected an execution handle while the run was live");
-		return { live, agent, prompt, handle, target, finalFrames, observations, state };
+		return { live, agent, prompt, handle, target, finalFrames, eventRunningTools, observations, state };
 	}
 
 	it("waits for a real mutating tool to finish, leaving no abort signal and no torn file", async () => {
@@ -225,6 +228,48 @@ describe("prompt deadline tool boundary on a live AgentSession", () => {
 			await turn.live.waitForIdle();
 			expect(turn.live.pendingToolExecutions(turn.handle)).toEqual([]);
 			expect(turn.finalFrames).toHaveLength(1);
+		} finally {
+			clearTimeout(safety);
+			release.resolve();
+			await turn.prompt.catch(() => undefined);
+		}
+	}, 30_000);
+
+	it("keeps the exact resource fence after grace and settles it when the tool promise ends", async () => {
+		const release = Promise.withResolvers<void>();
+		const turn = await startMutatingTurn(release.promise);
+		const safety = setTimeout(() => release.resolve(), 10_000);
+		safety.unref?.();
+		try {
+			expect(turn.live.pendingToolExecutions(turn.handle)).toEqual([TOOL_CALL_ID]);
+			expect(fs.readFileSync(turn.target, "utf8")).toBe("FIRST-HALF");
+
+			// This test tool intentionally keeps its execute promise alive after the
+			// abort signal. A terminal event and a zero event-derived active count
+			// must not erase the still-owned resource lease.
+			const proof = await turn.live.abortPromptAndWait(turn.handle, { graceMs: TEST_GRACE_MS });
+			expect(proof).toMatchObject({ status: "unfenced", reason: "resources_pending" });
+			expect(turn.state.toolSignal?.aborted).toBe(true);
+			expect(turn.live.pendingToolExecutions(turn.handle)).toEqual([TOOL_CALL_ID]);
+			expect(turn.agent.resourceLedger.pending(turn.handle).filter(entry => entry.kind === "tool")).toHaveLength(2);
+			expect(turn.finalFrames).toEqual(["agent_end"]);
+			expect(turn.eventRunningTools.size).toBe(0);
+			expect(turn.observations).toEqual([]);
+
+			// A later exact settlement of the outstanding tool task removes the
+			// sealed run's entries; it does not rewrite the already-published
+			// terminal or claim that the tool had stopped before this point.
+			release.resolve();
+			await waitUntil(() => turn.observations.length === 1, "late tool promise completion");
+			await turn.prompt.catch(() => undefined);
+			await turn.live.waitForIdle();
+			expect(turn.observations).toEqual([{ abortedMidWrite: true }]);
+			expect(await turn.agent.resourceLedger.waitForSettlement(turn.handle, { graceMs: 1_000 })).toEqual({
+				status: "settled",
+			});
+			expect(turn.agent.resourceLedger.pending(turn.handle)).toEqual([]);
+			expect(turn.live.pendingToolExecutions(turn.handle)).toEqual([]);
+			expect(turn.finalFrames).toEqual(["agent_end"]);
 		} finally {
 			clearTimeout(safety);
 			release.resolve();

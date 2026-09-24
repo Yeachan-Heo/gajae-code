@@ -114,7 +114,7 @@ describe("AgentSession abort timeout", () => {
 		expect(notices.some(message => message.includes("Abort cleanup timed out"))).toBe(true);
 	});
 
-	it("aborts and quarantines only the captured prompt domain while a successor remains live", async () => {
+	it("keeps a sealed resource run recoverable until its pending work settles", async () => {
 		tempDir = TempDir.createSync("@gjc-exact-prompt-abort-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -180,12 +180,18 @@ describe("AgentSession abort timeout", () => {
 		expect(successor.signal.aborted).toBe(false);
 		expect(await session.abortPromptAndWait("captured-hanging", { graceMs: 0 })).toMatchObject({
 			status: "unfenced",
-			reason: "quarantined",
+			reason: "resources_pending",
 			pending: [{ kind: "post_prompt", label: "hanging-child" }],
 		});
 
 		agent.resourceLedger.seal("successor-b");
 		hanging.resolve();
+		expect(await agent.resourceLedger.waitForSettlement("captured-hanging", { graceMs: 100 })).toEqual({
+			status: "settled",
+		});
+		expect(agent.resourceLedger.pending("captured-hanging")).toEqual([]);
+		expect(agent.resourceLedger.lookupDomain("captured-hanging")).toBeUndefined();
+		expect(successor.signal.aborted).toBe(false);
 	});
 
 	it("settles a never-resolving worker integration request after aborting it", async () => {
