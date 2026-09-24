@@ -113,15 +113,33 @@ const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
 	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
 ] as const;
 
-// The MiniMax thinking contract is enriched while bundled catalog entries are
-// loaded, so the catalog assertions must run when either the normalization
-// rules or their generated source data changes. Neither source file has a
-// basename-matched `*.test.ts` sibling for the canonical catalog contract.
-const AI_MODEL_CATALOG_OWNER_TESTS = [
-	"packages/ai/test/model-thinking.test.ts",
-	"packages/ai/test/minimax-thinking.test.ts",
-	"packages/ai/test/preset-catalog-models.test.ts",
-] as const;
+// These inputs produce, transform, or define the bundled model catalog. Partial
+// owner-test mapping misses catalog-wide contracts, so changes to these surfaces
+// run the full AI suite.
+const AI_MODEL_CATALOG_FULL_TEST_PATHS: ReadonlySet<string> = new Set([
+	"packages/ai/src/models.json",
+	"packages/ai/src/models.json.d.ts",
+	"packages/ai/src/models.ts",
+	"packages/ai/scripts/generate-models.ts",
+	"packages/ai/src/model-manager.ts",
+	"packages/ai/src/model-retirements.ts",
+	"packages/ai/src/model-thinking.ts",
+	"packages/ai/src/context-cap-policy.ts",
+	"packages/ai/src/model-pricing.ts",
+	"packages/ai/src/openai-completions-compat.ts",
+	"packages/ai/src/bedrock-claude-cache-policy.ts",
+	"packages/ai/src/providers/gitlab-duo.ts",
+	"packages/ai/src/providers/kiro-api-key.ts",
+	"packages/ai/src/providers/openai-codex/constants.ts",
+	"packages/ai/src/utils/discovery/antigravity.ts",
+	"packages/ai/src/utils/discovery/codex.ts",
+	"packages/ai/src/utils/tool-choice-capability.ts",
+]);
+const AI_PROVIDER_MODELS_PATH_PREFIX = "packages/ai/src/provider-models/";
+
+function isAiCatalogModelPath(changedPath: string): boolean {
+	return AI_MODEL_CATALOG_FULL_TEST_PATHS.has(changedPath) || changedPath.startsWith(AI_PROVIDER_MODELS_PATH_PREFIX);
+}
 
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
@@ -163,8 +181,6 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",
 	],
-	"packages/ai/src/model-thinking.ts": AI_MODEL_CATALOG_OWNER_TESTS,
-	"packages/ai/src/models.json": AI_MODEL_CATALOG_OWNER_TESTS,
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
@@ -1078,6 +1094,10 @@ export function planTargetedTasks(
 
 	for (const changedPath of relevant) {
 		if (isFullWorkspacePath(changedPath)) continue;
+		if (isAiCatalogModelPath(changedPath)) {
+			const aiPackage = packages.find(workspacePackage => workspacePackage.name === "@gajae-code/ai");
+			if (aiPackage) addPackageTestTasks(tasks, aiPackage);
+		}
 		if (isWorkflowPath(changedPath)) {
 			needYamlParse = true;
 			needCiSelftest = true;

@@ -1121,6 +1121,11 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/agent",
 		manifest: { name: "@gajae-code/agent-core", scripts: { check: "biome check .", test: "bun test" } },
 	};
+	const aiPackage: WorkspacePackage = {
+		name: "@gajae-code/ai",
+		dir: "packages/ai",
+		manifest: { name: "@gajae-code/ai", scripts: { check: "biome check .", test: "bun test" } },
+	};
 	const targetingPackages: WorkspacePackage[] = [agentCore, codingAgent];
 	const testFiles = [
 		"packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts",
@@ -1140,6 +1145,10 @@ describe("planTargetedTasks PR-mode targeting", () => {
 
 	function targeted(paths: readonly string[]) {
 		return planTargetedTasks(paths, targetingPackages, testFiles);
+	}
+
+	function targetedWithAiPackage(paths: readonly string[]) {
+		return planTargetedTasks(paths, [...targetingPackages, aiPackage], testFiles);
 	}
 
 	test("provider envelope changes select the safety-stop regression once without broad shards", () => {
@@ -1579,16 +1588,46 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("native-linux-x64");
 	});
 
-	test("AI model catalog sources select their bundled thinking contract tests", () => {
-		const expected = [
-			"test:packages/ai/test/model-thinking.test.ts",
-			"test:packages/ai/test/minimax-thinking.test.ts",
-			"test:packages/ai/test/preset-catalog-models.test.ts",
+	test("AI catalog data and generation inputs schedule the full package test task", () => {
+		const sources = [
+			"packages/ai/src/models.json",
+			"packages/ai/src/models.json.d.ts",
+			"packages/ai/src/models.ts",
+			"packages/ai/scripts/generate-models.ts",
+			"packages/ai/src/model-manager.ts",
+			"packages/ai/src/model-retirements.ts",
+			"packages/ai/src/model-thinking.ts",
+			"packages/ai/src/context-cap-policy.ts",
+			"packages/ai/src/model-pricing.ts",
+			"packages/ai/src/openai-completions-compat.ts",
+			"packages/ai/src/bedrock-claude-cache-policy.ts",
+			"packages/ai/src/provider-models/new-provider-catalog.ts",
+			"packages/ai/src/providers/gitlab-duo.ts",
+			"packages/ai/src/providers/kiro-api-key.ts",
+			"packages/ai/src/providers/openai-codex/constants.ts",
+			"packages/ai/src/utils/discovery/antigravity.ts",
+			"packages/ai/src/utils/discovery/codex.ts",
+			"packages/ai/src/utils/tool-choice-capability.ts",
 		];
-		for (const source of ["packages/ai/src/model-thinking.ts", "packages/ai/src/models.json"]) {
-			const keys = targeted([source]).map(task => task.key);
-			for (const testKey of expected) expect(keys).toContain(testKey);
+		for (const source of sources) {
+			const task = targetedWithAiPackage([source]).find(candidate => candidate.key === "test:@gajae-code/ai");
+			expect(task, source).toBeDefined();
+			expect(task?.command, source).toEqual([
+				"bun",
+				"scripts/run-bun-test-files.ts",
+				"--root=packages/ai",
+				"--timeout=30000",
+				"--file-timeout=300000",
+				"--concurrency=1",
+			]);
 		}
+	});
+
+	test("ordinary AI provider changes do not select the full package test task", () => {
+		const keys = targetedWithAiPackage(["packages/ai/src/providers/anthropic.ts"]).map(task => task.key);
+		expect(keys).not.toContain("test:@gajae-code/ai");
+		expect(keys).toContain("test:packages/ai/test/anthropic-truncated-toolcall.test.ts");
+		expect(keys).toContain("test:packages/ai/test/anthropic-stream-envelope.test.ts");
 	});
 
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run + workflow-permissions", () => {
