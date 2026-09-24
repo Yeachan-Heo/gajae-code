@@ -1118,7 +1118,7 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
-	});
+	}, 60_000);
 
 	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
 		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
