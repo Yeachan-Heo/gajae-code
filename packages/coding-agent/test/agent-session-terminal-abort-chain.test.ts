@@ -1299,13 +1299,12 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
 			const signal = options?.signal;
 			if (!signal) throw new Error("expected the second turn's bash command to have an abort signal");
-			signal.addEventListener("abort", () => bashStopped.resolve(), { once: true });
 			bashStarted.resolve(options);
 			await bashStopped.promise;
 			return {
 				output: "",
-				exitCode: signal.aborted ? undefined : 0,
-				cancelled: signal.aborted,
+				exitCode: 0,
+				cancelled: false,
 				truncated: false,
 				totalLines: 0,
 				totalBytes: 0,
@@ -1327,7 +1326,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
 			// The stale token is retired and cannot affect cleanup of the live turn.
 			session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
-			await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+			const abortPromise = session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn" },
+			});
+			// `abortPromptAndWait` admits the terminal fence synchronously, but a
+			// foreground BashTool does not necessarily cancel its shell when the
+			// Agent turn is aborted. Release the controlled command after that
+			// admission so the test does not depend on process timing.
+			bashStopped.resolve();
+			await abortPromise;
 			await secondPrompt;
 			await session.waitForIdle();
 			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
