@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import {
 	Agent,
+	type AgentTerminalOwnerContext,
 	type AgentTool,
 	createRunResourceLedger,
 	type RunSettlementProof,
@@ -323,6 +324,18 @@ function start(
 					ensureProviderDaemon,
 					controller,
 					terminalAbortSeams: {
+						getTerminalRunOwnerForEvent: event =>
+							(
+								ctx as {
+									getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+								}
+							).getTerminalRunOwnerForEvent?.(event),
+						getRunOwnerDomain: handle =>
+							(
+								ctx as {
+									getRunOwnerDomain?: (handle: string) => AgentTerminalOwnerContext["domain"] | undefined;
+								}
+							).getRunOwnerDomain?.(handle),
 						getTerminalTurnEpoch: () =>
 							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
 						cancelPendingPreflightForTerminalAbort: () =>
@@ -2654,6 +2667,11 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 		const sessionId = `sdk-unsettled-image-${settlement}-${Date.now()}`;
 		const live = { idle: true };
 		const base = context(cwd, sessionId, "main", live);
+		const ledger = createRunResourceLedger();
+		const originalDomain = ledger.open("live-image-run");
+		const successorDomain = ledger.open("successor-image-run");
+		if (!originalDomain || !successorDomain) throw new Error("Test run domains could not open.");
+		const trustedOwners = new WeakMap<object, AgentTerminalOwnerContext>();
 		let abortCalls = 0;
 		const sessionContext = {
 			...base,
@@ -2662,6 +2680,8 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 				getSessionFile: () => path.join(cwd, "session.jsonl"),
 			},
 			getActivePromptHandle: () => "live-image-run",
+			getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+			getTerminalRunOwnerForEvent: (event: object) => trustedOwners.get(event),
 			getTerminalTurnEpoch: () => 1,
 			abortPromptAndWait: async (handle: string) => {
 				expect(handle).toBe("live-image-run");
@@ -2820,14 +2840,14 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 				clock.mockRestore();
 			}
 			expect(reserved).toBe(1);
-			const ledger = createRunResourceLedger();
-			const successorDomain = ledger.open("successor-image-run");
-			if (!successorDomain) throw new Error("Successor run domain could not open.");
 			const successorEnd = { type: "agent_end" as const, messages: [] };
+			// An earlier extension may replace the public WeakMap context. The
+			// SDK must trust only AgentSession's independent event proof.
 			setAgentTerminalOwnerContext(successorEnd, {
-				resourceRunId: "successor-image-run",
-				domain: successorDomain,
+				resourceRunId: "live-image-run",
+				domain: originalDomain,
 			});
+			trustedOwners.set(successorEnd, { resourceRunId: "successor-image-run", domain: successorDomain });
 			await handlers.get("agent_end")?.(successorEnd, sessionContext);
 			expect(reserved).toBe(1);
 			// Fatal closure cleared the run's correlation; an uncorrelated end
@@ -2835,10 +2855,8 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 			await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
 			expect(reserved).toBe(1);
 			if (settlement === "throws") {
-				const originalDomain = ledger.open("live-image-run");
-				if (!originalDomain) throw new Error("Original run domain could not open.");
 				const originalEnd = { type: "agent_end" as const, messages: [] };
-				setAgentTerminalOwnerContext(originalEnd, {
+				trustedOwners.set(originalEnd, {
 					resourceRunId: "live-image-run",
 					domain: originalDomain,
 				});
@@ -2867,6 +2885,168 @@ test("unsettled fatal abort retains accepted images until session teardown", asy
 			redeemSpy.mockRestore();
 			warnSpy.mockRestore();
 		}
+	}
+}, 60_000);
+
+test("a diverted image prompt belongs to its consuming run, not a later pending correlation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-steered-image-owner-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-steered-image-owner-${Date.now()}`;
+	const live = { idle: true, handle: "original-run" };
+	const base = context(cwd, sessionId, "main", live);
+	const ledger = createRunResourceLedger();
+	const originalDomain = ledger.open("original-run");
+	const successorDomain = ledger.open("successor-run");
+	if (!originalDomain || !successorDomain) throw new Error("Test run domains could not open.");
+	const trustedOwners = new WeakMap<object, AgentTerminalOwnerContext>();
+	const sessionContext = {
+		...base,
+		sessionManager: {
+			...(base.sessionManager as Record<string, unknown>),
+			getSessionFile: () => path.join(cwd, "session.jsonl"),
+		},
+		getActivePromptHandle: () => live.handle,
+		getRunOwnerDomain: (handle: string) => ledger.lookupDomain(handle),
+		getTerminalRunOwnerForEvent: (event: object) => trustedOwners.get(event),
+		getTerminalTurnEpoch: () => 1,
+		abortPromptAndWait: async () => {
+			throw new Error("consuming run still holds image strings");
+		},
+	};
+	const accepted = Promise.withResolvers<void>();
+	const preflight = Promise.withResolvers<void>();
+	const consume = Promise.withResolvers<void>();
+	const consumed = Promise.withResolvers<void>();
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let reserved = 0;
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		const reservation = originalRedeem.call(this, owner, ids);
+		reserved++;
+		return {
+			images: reservation.images,
+			release: () => {
+				reserved--;
+				reservation.release();
+			},
+		};
+	});
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(
+			sessionContext,
+			{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+			async (_content, options) => {
+				accepted.resolve();
+				await preflight.promise;
+				await firePreflightAccept(options);
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
+				await consume.promise;
+				options?.onQueuedPromoted?.({ startsOwnRun: false });
+				consumed.resolve();
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+			socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+			await waitFor(
+				() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+				`${id} response`,
+			);
+			return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+		};
+		const bytes = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+		const begun = await control("steered-begin", "turn.image.begin", {
+			mimeType: "image/png",
+			byteLength: bytes.length,
+			sha256,
+		});
+		expect(begun).toMatchObject({ ok: true });
+		const imageId = (begun.result as { id: string }).id;
+		let sequence = 0;
+		for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+			expect(
+				await control(`steered-chunk-${sequence}`, "turn.image.append", {
+					id: imageId,
+					sequence: sequence++,
+					data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+				}),
+			).toMatchObject({ ok: true });
+		}
+		expect(await control("steered-finish", "turn.image.finish", { id: imageId })).toMatchObject({ ok: true });
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steered-prompt",
+				operation: "turn.prompt",
+				input: { text: "Image diverted during preflight", stagedImages: [{ id: imageId }] },
+			}),
+		);
+		await accepted.promise;
+		// A different run starts while preflight is awaiting AgentSession. The
+		// prompt is accepted only after this run has become busy, so it is queued.
+		live.idle = false;
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		preflight.resolve();
+		await waitFor(() => frames.some(frame => frame.id === "steered-prompt"), "steered prompt admission");
+		const ack = frames.find(frame => frame.id === "steered-prompt")!;
+		expect(ack).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(ack);
+		expect(reserved).toBe(1);
+		const originalEnd = { type: "agent_end" as const, messages: [] };
+		trustedOwners.set(originalEnd, { resourceRunId: "original-run", domain: originalDomain });
+		await handlers.get("agent_end")?.(originalEnd, sessionContext);
+		expect(reserved).toBe(1);
+		live.handle = "successor-run";
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === correlation.commandId)).toBe(
+			false,
+		);
+		consume.resolve();
+		await consumed.promise;
+		// The successor is the actual consuming run. A fatal transport response
+		// cannot release its accepted image until that exact run terminates.
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "steered-abort",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "steered-abort",
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+			"steered fatal closure",
+		);
+		expect(reserved).toBe(1);
+		const successorEnd = { type: "agent_end" as const, messages: [] };
+		trustedOwners.set(successorEnd, { resourceRunId: "successor-run", domain: successorDomain });
+		await handlers.get("agent_end")?.(successorEnd, sessionContext);
+		expect(reserved).toBe(0);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		preflight.resolve();
+		consume.resolve();
+		redeemSpy.mockRestore();
+		warnSpy.mockRestore();
 	}
 }, 60_000);
 
