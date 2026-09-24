@@ -427,11 +427,21 @@ async function installKev(
 ): Promise<KevStatus> {
 	if (!deps.run && (process.platform !== "darwin" || process.arch !== "arm64"))
 		throw new Error("This Kev setup supports Apple Silicon macOS");
-	const previous = await installed(root);
-	if (previous) {
-		const current = await status(root, deps);
-		if (!["stopped", "stale"].includes(current.state))
-			throw new Error("Stop the owned Kev server before reinstalling");
+	let previous: Installation | undefined;
+	try {
+		previous = await installed(root);
+	} catch {
+		previous = undefined;
+	}
+	// Ask before touching anything, and ask whether or not installation metadata
+	// loaded. Losing install.json does not stop a service: a record plus a live
+	// supervisor is still a running server, and `uv sync` under it would rewrite
+	// the environment the server is executing from.
+	const current = await status(root, deps);
+	if (!["not-installed", "stopped", "stale"].includes(current.state)) {
+		throw new Error(
+			`Refusing to install over a Kev service that is ${current.state}${current.error ? `: ${current.error}` : ""}. Stop it first with: gjc setup kev stop`,
+		);
 	}
 	const model = hubModel.parse(options.model ?? previous?.model ?? DEFAULT_KEV_MODEL);
 	for (const dir of ["home", "cache", "data", "python"]) await checkDirectory(path.join(root, dir), true);

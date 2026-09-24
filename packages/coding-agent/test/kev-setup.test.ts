@@ -523,6 +523,29 @@ describe("Kev lifecycle", () => {
 		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(false);
 	});
 
+	test("reinstalling over a live service is refused even when install.json is gone", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		await fs.rm(path.join(f.root, "install.json"));
+		f.calls.length = 0;
+		// Without install metadata the record plus a live supervisor is all that says
+		// a server is running. Reinstalling here would `uv sync` under it.
+		await expect(runKevSetup("install", { root: f.root }, f.deps)).rejects.toThrow("Refusing to install");
+		// Nothing was mutated: no uv, no git, no environment directories rewritten.
+		expect(f.calls).toEqual([]);
+	});
+
+	test("reinstalling proceeds once nothing is running", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
+		f.calls.length = 0;
+		expect(await runKevSetup("install", { root: f.root }, f.deps)).toMatchObject({ state: "stopped" });
+		expect(f.calls.some(call => call.argv[0] === "uv" && call.argv[1] === "sync")).toBe(true);
+	});
+
 	test("an unconfirmed child exit is never acknowledged as a stop", async () => {
 		// The port is free and the supervisor answered — but it never reaped its
 		// child, so nothing here has proven the service is gone.
