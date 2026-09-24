@@ -11,7 +11,7 @@ import {
 	GJC_TMUX_OWNER_GENERATION_STAGED_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
-} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+} from "../src/gjc-runtime/session-state-sidecar";
 
 describe("persistCoordinatorLaunchFailure", () => {
 	it("persists the exact managed owner generation without normalizing it", async () => {

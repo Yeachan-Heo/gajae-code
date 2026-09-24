@@ -63,9 +63,11 @@ import {
 	type OwnerGenerationBaseline,
 	type OwnerIsolationProbeSync,
 	planTmuxOwnerIsolationSync,
+	prepareStagedOwnerSupervisorSync,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
 	type TmuxServerProof,
+	waitForStagedOwnerSupervisorActive,
 } from "./tmux-owner-isolation";
 import { assertGjcTmuxStagedMutationAuthoritySync } from "./tmux-provider-context";
 import {
@@ -207,6 +209,8 @@ export interface TmuxLaunchPlan {
 	ownerPredecessor?: ManagedOwnerPredecessorEvidence;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
 	ownerGenerationBaseline?: OwnerGenerationBaseline;
+	/** True only after generation-scoped PREPARED proof was durably recorded. */
+	stagedOwnerSupervisor?: boolean;
 	/** One-shot coordinator signing bootstrap endpoint; key material never enters tmux argv or environment. */
 	coordinatorSidecarBootstrap?: { path: string; keyId: string };
 	coordinatorSidecarBootstrapClose?: () => void;
@@ -292,6 +296,7 @@ interface CommandResolutionContext {
 	tmuxExitMarkerPath?: string;
 	platform?: NodeJS.Platform;
 	managedOwnerSupervisor?: boolean;
+	stagedOwnerSupervisor?: boolean;
 }
 
 function parseLaunchPolicy(env: NodeJS.ProcessEnv): LaunchPolicy {
@@ -544,7 +549,7 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		? {
 				GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]),
 				[MANAGED_OWNER_SUPERVISED_ENV]: "1",
-				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+				...(context.stagedOwnerSupervisor ? { GJC_TMUX_OWNER_GENERATION_STAGED: "1" } : {}),
 			}
 		: {};
 	const invocationArgs = context.managedOwnerSupervisor
@@ -1263,6 +1268,7 @@ function rebuildManagedOwnerChildCommand(
 			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
 			platform: plan.platform,
 			managedOwnerSupervisor: plan.platform === "linux",
+			stagedOwnerSupervisor: plan.stagedOwnerSupervisor === true,
 		},
 		context.rawArgs,
 	);
@@ -1279,7 +1285,10 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	const generation = crypto.randomUUID();
 	const runId = crypto.randomUUID();
 	const incarnation = crypto.randomUUID();
+	const stagedOwnerSupervisor = plan.platform === "linux";
+	if (stagedOwnerSupervisor) prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
 	plan.ownerGenerationBaseline = baseline;
+	plan.stagedOwnerSupervisor = stagedOwnerSupervisor;
 	// Stage immutable identity in the child command. It becomes current only after
 	// immutable creation proof and ownership tagging complete.
 	plan.ownerGeneration = generation;
@@ -2265,7 +2274,7 @@ export async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Pro
 	try {
 		const stateDir = path.dirname(plan.sessionStateFile!);
 		resolveManagedOwnerPredecessorSync(stateDir, plan.sessionId!, plan.ownerGenerationBaseline!);
-		if (plan.platform === "linux" && !context.ownerIsolationProbe) {
+		if (plan.platform === "linux") {
 			const pane = spawnSync(
 				plan.tmuxCommand,
 				["display-message", "-p", "-t", plan.createdSessionId!, "-F", "#{pane_pid}"],
@@ -2294,7 +2303,20 @@ export async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Pro
 				native_session_id: plan.createdSessionId!,
 			});
 		}
-		replaceOwnerGenerationSync(stateDir, plan.sessionId!, plan.ownerGeneration!, plan.ownerGenerationBaseline!);
+		if (plan.stagedOwnerSupervisor)
+			await waitForStagedOwnerSupervisorActive(
+				stateDir,
+				plan.sessionId!,
+				plan.ownerGeneration!,
+				plan.ownerGenerationBaseline!,
+			);
+		replaceOwnerGenerationSync(
+			stateDir,
+			plan.sessionId!,
+			plan.ownerGeneration!,
+			plan.ownerGenerationBaseline!,
+			plan.stagedOwnerSupervisor ? { stagedSupervisor: true } : undefined,
+		);
 		providerAuthorityPublished = true;
 	} catch (error) {
 		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);

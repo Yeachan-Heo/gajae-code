@@ -4,6 +4,7 @@ import * as fsSync from "node:fs";
 
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
+import * as logger from "@gajae-code/utils/logger";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
@@ -71,11 +72,13 @@ import {
 	observeOwnerTerminal,
 	type PlanResponse,
 	planTmuxOwnerIsolationSync,
+	prepareStagedOwnerSupervisorSync,
 	readNoFollowJson,
 	replaceOwnerGenerationSync,
 	type TmuxOwnerIsolationExecutionDependencies,
 	type TmuxOwnerIsolationExecutionResult,
 	type TmuxServerProof,
+	waitForStagedOwnerSupervisorActiveSync,
 } from "./tmux-owner-isolation";
 import {
 	assertGjcTmuxStagedMutationAuthoritySync,
@@ -859,6 +862,7 @@ export function createGjcTmuxSession(
 	};
 
 	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	if (launch) prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
 	const ownerPlan = planTmuxOwnerIsolationSync(
 		{
 			schema_version: 1,
@@ -1005,8 +1009,15 @@ export function createGjcTmuxSession(
 				server_start_time: authorityServer.startTime,
 				native_session_id: nativeSessionId,
 			});
+			waitForStagedOwnerSupervisorActiveSync(stateDir, sessionId, generation, baseline);
 		}
-		replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline);
+		replaceOwnerGenerationSync(
+			stateDir,
+			sessionId,
+			generation,
+			baseline,
+			launch ? { stagedSupervisor: true } : undefined,
+		);
 	} catch (precommitError) {
 		try {
 			cleanupExactCreatedTmuxSession(
@@ -2020,19 +2031,29 @@ export async function forceCloseGjcTmuxSession(
 			},
 		},
 	);
-	if (await Bun.file(actualStateFile).exists())
-		await persistCoordinatorRuntimeStateFromOwnerVerdict(
-			actualStateFile,
-			{
-				generation: identity.generation,
-				stateDir: identity.stateDir,
-				socketKey: identity.socketKey,
-				operatorDispatchId: dispatchId,
-				operatorIntentId: ownerVerdict.intent_id,
-			},
-			ownerVerdict,
-			session.project,
-		);
+	try {
+		if (await Bun.file(actualStateFile).exists())
+			await persistCoordinatorRuntimeStateFromOwnerVerdict(
+				actualStateFile,
+				{
+					generation: identity.generation,
+					stateDir: identity.stateDir,
+					socketKey: identity.socketKey,
+					operatorDispatchId: dispatchId,
+					operatorIntentId: ownerVerdict.intent_id,
+				},
+				ownerVerdict,
+				session.project,
+			);
+	} catch (error) {
+		logger.warn("GJC tmux session closed but runtime-state projection failed", {
+			sessionName: session.name,
+			sessionId: identity.sessionId,
+			generation: identity.generation,
+			stateFile: actualStateFile,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 	return session;
 }
 

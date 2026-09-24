@@ -4,10 +4,14 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { probeLinuxProcPidSync, readLinuxProcStartTimeSync } from "../../src/gjc-runtime/linux-proc";
+import { publishManagedOwnerSupervisorAuthoritySync } from "../../src/gjc-runtime/managed-owner-supervisor";
 import {
 	__setIntentEvidenceReadHooksForTests,
 	__setOwnerGenerationAfterMarkerForTests,
 	type AttemptCapability,
+	activateStagedOwnerSupervisor,
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
 	captureOwnerGenerationBaselineSync,
@@ -21,12 +25,14 @@ import {
 	isTrustedTmuxOwnerIsolationArgv,
 	isValidOwnerVerdict,
 	lifecyclePaths,
+	type OwnerIntent,
 	observeOwnerTerminal,
 	ownerProcessStartTime,
 	type PlanRequest,
 	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
+	prepareStagedOwnerSupervisorSync,
 	readNoFollowJson,
 	readNoFollowJsonSync,
 	replaceOwnerGeneration,
@@ -51,6 +57,72 @@ const mainEntry = path.join(repoRoot, "packages", "coding-agent", "src", "main.t
 const ownerIsolationFlag = "--internal-tmux-owner-isolation";
 const invalidJsonLineResponse =
 	'{"schema_version":1,"ok":false,"code":"scope_unavailable","diagnostic":"invalid_json_line"}\n';
+
+function processStartTime(pid: number): string | null {
+	if (process.platform === "linux") return readLinuxProcStartTimeSync(pid);
+	return nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null;
+}
+
+async function waitForProcessStartTime(pid: number): Promise<string> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const startTime = processStartTime(pid);
+		if (startTime) return startTime;
+		await Bun.sleep(10);
+	}
+	throw new Error("test_process_identity_unavailable");
+}
+
+function publishStagedSupervisorAuthority(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	supervisorPid: number,
+	supervisorStartTime: string,
+): void {
+	const serverStartTime = processStartTime(process.pid);
+	if (!serverStartTime) throw new Error("test_process_identity_unavailable");
+	publishManagedOwnerSupervisorAuthoritySync({
+		schema_version: 1,
+		kind: "managed_owner_supervisor_authority",
+		state_dir: stateDir,
+		session_id: sessionId,
+		generation,
+		supervisor_pid: supervisorPid,
+		supervisor_start_time: supervisorStartTime,
+		server_pid: process.pid,
+		server_start_time: serverStartTime,
+		native_session_id: "$test",
+	});
+}
+
+async function startStagedSupervisor(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	options: { holdOpenAfterActivation?: boolean } = {},
+) {
+	const readyFile = path.join(stateDir, "supervisor-ready");
+	const activeFile = path.join(stateDir, "supervisor-active");
+	const ownerModule = new URL("../../src/gjc-runtime/tmux-owner-isolation.ts", import.meta.url).href;
+	const procModule = new URL("../../src/gjc-runtime/linux-proc.ts", import.meta.url).href;
+	const nativeModule = "@gajae-code/utils/native-process";
+	const keepOpen = options.holdOpenAfterActivation ? "setInterval(() => {}, 1000);" : "";
+	const script = `const { writeFileSync, existsSync } = await import("node:fs"); const owner = await import(${JSON.stringify(ownerModule)}); const proc = await import(${JSON.stringify(procModule)}); const native = await import(${JSON.stringify(nativeModule)}); writeFileSync(${JSON.stringify(readyFile)}, "ready\\n"); const deadline = Date.now() + 5000; const authority = ${JSON.stringify(path.join(lifecyclePaths(stateDir, sessionId, generation).root, `supervisor-authority-${generation}.json`))}; while (!existsSync(authority)) { if (Date.now() >= deadline) process.exit(4); await Bun.sleep(10); } const startTime = process.platform === "linux" ? await proc.readLinuxProcStartTime(process.pid) : native.nativeProcessBindings().Process.fromPid(process.pid)?.incarnation; if (!startTime) process.exit(5); await owner.activateStagedOwnerSupervisor({ stateDir: ${JSON.stringify(stateDir)}, sessionId: ${JSON.stringify(sessionId)}, generation: ${JSON.stringify(generation)}, supervisorPid: process.pid, supervisorStartTime: startTime }); writeFileSync(${JSON.stringify(activeFile)}, "active\\n"); ${keepOpen}`;
+	const worker = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "ignore" });
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (fsSync.existsSync(readyFile)) break;
+		await Bun.sleep(10);
+	}
+	if (!fsSync.existsSync(readyFile)) throw new Error("test_supervisor_ready_timeout");
+	const supervisorStartTime = await waitForProcessStartTime(worker.pid);
+	publishStagedSupervisorAuthority(stateDir, sessionId, generation, worker.pid, supervisorStartTime);
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (fsSync.existsSync(activeFile)) break;
+		await Bun.sleep(10);
+	}
+	if (!fsSync.existsSync(activeFile)) throw new Error("test_supervisor_active_timeout");
+	return worker;
+}
 
 it("accepts only the exact scoped bootstrap success receipt", () => {
 	expect(
@@ -1682,6 +1754,192 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 		}
 	});
 
+	it("rejects staged generation publication while supervisor evidence is PREPARED-only", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-staged-prepared-"));
+		const sessionId = "session";
+		const generation = "staged-generation";
+		try {
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			await expect(
+				replaceOwnerGeneration(state, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_evidence_missing");
+			prepareStagedOwnerSupervisorSync(state, sessionId, generation, baseline);
+			await expect(
+				replaceOwnerGeneration(state, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_not_active");
+			await expect(replaceOwnerGeneration(state, sessionId, generation, baseline)).rejects.toThrow(
+				"managed_owner_staged_supervisor_requires_staged_publication",
+			);
+			expect(() =>
+				replaceOwnerGenerationSync(state, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).toThrow("managed_owner_staged_supervisor_not_active");
+			expect(() => replaceOwnerGenerationSync(state, sessionId, generation, baseline)).toThrow(
+				"managed_owner_staged_supervisor_requires_staged_publication",
+			);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a dead ACTIVE staged supervisor without a terminal journal", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-staged-stale-"));
+		const sessionId = "session";
+		const generation = "staged-generation";
+		let supervisor: Bun.Subprocess | undefined;
+		try {
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			prepareStagedOwnerSupervisorSync(state, sessionId, generation, baseline);
+			supervisor = await startStagedSupervisor(state, sessionId, generation);
+			await supervisor.exited;
+			const paths = lifecyclePaths(state, sessionId, generation);
+			await expect(fs.access(paths.stagedTerminalFile)).rejects.toThrow();
+			await expect(
+				replaceOwnerGeneration(state, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_identity_not_live");
+		} finally {
+			supervisor?.kill();
+			if (supervisor) await supervisor.exited;
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("sync and async publishers accept ACTIVE proof for the live authorized supervisor", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-staged-live-sync-"));
+		const asyncState = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-staged-live-async-"));
+		const sessionId = "session";
+		const generation = "staged-generation";
+		try {
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			const asyncBaseline = captureOwnerGenerationBaselineSync(asyncState, sessionId);
+			prepareStagedOwnerSupervisorSync(state, sessionId, generation, baseline);
+			prepareStagedOwnerSupervisorSync(asyncState, sessionId, generation, asyncBaseline);
+			const supervisorStartTime = await waitForProcessStartTime(process.pid);
+			publishStagedSupervisorAuthority(state, sessionId, generation, process.pid, supervisorStartTime);
+			publishStagedSupervisorAuthority(asyncState, sessionId, generation, process.pid, supervisorStartTime);
+			await activateStagedOwnerSupervisor({
+				stateDir: state,
+				sessionId,
+				generation,
+				supervisorPid: process.pid,
+				supervisorStartTime,
+			});
+			await activateStagedOwnerSupervisor({
+				stateDir: asyncState,
+				sessionId,
+				generation,
+				supervisorPid: process.pid,
+				supervisorStartTime,
+			});
+			expect(() => replaceOwnerGenerationSync(state, sessionId, generation, baseline)).toThrow(
+				"managed_owner_staged_supervisor_requires_staged_publication",
+			);
+			await expect(replaceOwnerGeneration(asyncState, sessionId, generation, asyncBaseline)).rejects.toThrow(
+				"managed_owner_staged_supervisor_requires_staged_publication",
+			);
+			expect(
+				await Bun.file(lifecyclePaths(state, sessionId, generation).stagedSupervisorActiveFile).json(),
+			).toMatchObject({
+				state: "ACTIVE",
+				supervisor_pid: process.pid,
+				supervisor_authority: { supervisor_pid: process.pid, session_id: sessionId, generation },
+			});
+			expect(replaceOwnerGenerationSync(state, sessionId, generation, baseline, { stagedSupervisor: true })).toBe(
+				generation,
+			);
+			expect(
+				await replaceOwnerGeneration(asyncState, sessionId, generation, asyncBaseline, { stagedSupervisor: true }),
+			).toBe(generation);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+			await fs.rm(asyncState, { recursive: true, force: true });
+		}
+	});
+
+	it("revalidates staged supervisor liveness after marker publication", async () => {
+		if (process.platform !== "linux") return;
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-staged-publication-liveness-"));
+		const sessionId = "session";
+		const generation = "staged-generation";
+		let supervisor: Bun.Subprocess | undefined;
+		try {
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			prepareStagedOwnerSupervisorSync(state, sessionId, generation, baseline);
+			supervisor = await startStagedSupervisor(state, sessionId, generation, { holdOpenAfterActivation: true });
+			const paths = lifecyclePaths(state, sessionId, generation);
+			__setOwnerGenerationAfterMarkerForTests(() => {
+				if (!supervisor) throw new Error("staged_supervisor_missing");
+				supervisor.kill("SIGKILL");
+				const deadline = Date.now() + 2_000;
+				while (Date.now() < deadline) {
+					const identity = probeLinuxProcPidSync(supervisor.pid);
+					if (identity.kind !== "live" || identity.state === "Z" || identity.state === "X") return;
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+				}
+				throw new Error("staged_supervisor_termination_timeout");
+			});
+
+			await expect(
+				replaceOwnerGeneration(state, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_identity_not_live");
+			expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ state: "absent" });
+			expect(await Bun.file(paths.generationMarkerFile).exists()).toBe(true);
+			expect(await Bun.file(paths.generationFile).exists()).toBe(false);
+		} finally {
+			__setOwnerGenerationAfterMarkerForTests(undefined);
+			supervisor?.kill("SIGKILL");
+			if (supervisor) await supervisor.exited;
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("serializes PREPARED creation behind a generation publisher holding the lifecycle lock", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-stage-prepare-lock-"));
+		const sessionId = "session";
+		const generation = "published-first";
+		const startedFile = path.join(state, "prepare-attempt-started");
+		let preparer: ReturnType<typeof Bun.spawn> | undefined;
+		let stageAppearedWhilePublisherHeldLock = false;
+		try {
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			const paths = lifecyclePaths(state, sessionId, generation);
+			const moduleUrl = new URL("../../src/gjc-runtime/tmux-owner-isolation.ts", import.meta.url).href;
+			const script = `const { writeFileSync } = await import("node:fs"); const api = await import(${JSON.stringify(moduleUrl)}); const expected = JSON.parse(process.env.GJC_TEST_BASELINE); writeFileSync(process.env.GJC_TEST_STARTED, "started\\n"); try { api.prepareStagedOwnerSupervisorSync(process.env.GJC_TEST_STATE_DIR, process.env.GJC_TEST_SESSION_ID, process.env.GJC_TEST_GENERATION, expected); process.exitCode = 19; } catch (error) { process.exitCode = error instanceof Error && error.message === "managed_owner_staged_supervisor_baseline_mismatch" ? 0 : 20; }`;
+			__setOwnerGenerationAfterMarkerForTests(() => {
+				preparer = Bun.spawn([process.execPath, "-e", script], {
+					stdout: "ignore",
+					stderr: "ignore",
+					env: {
+						...process.env,
+						GJC_TEST_BASELINE: JSON.stringify(baseline),
+						GJC_TEST_STARTED: startedFile,
+						GJC_TEST_STATE_DIR: state,
+						GJC_TEST_SESSION_ID: sessionId,
+						GJC_TEST_GENERATION: generation,
+					},
+				});
+				const deadline = Date.now() + 5_000;
+				while (!fsSync.existsSync(startedFile)) {
+					if (Date.now() >= deadline) throw new Error("staged_prepare_test_worker_start_timeout");
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+				}
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+				stageAppearedWhilePublisherHeldLock = fsSync.existsSync(paths.stagedSupervisorPreparedFile);
+			});
+			expect(replaceOwnerGenerationSync(state, sessionId, generation, baseline)).toBe(generation);
+			if (!preparer) throw new Error("staged_prepare_test_worker_missing");
+			expect(await preparer.exited).toBe(0);
+			expect(stageAppearedWhilePublisherHeldLock).toBe(false);
+			await expect(
+				fs.access(lifecyclePaths(state, sessionId, generation).stagedSupervisorPreparedFile),
+			).rejects.toThrow();
+		} finally {
+			__setOwnerGenerationAfterMarkerForTests(undefined);
+			preparer?.kill();
+			if (preparer) await preparer.exited;
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects stale generations before creating a SIGTERM intent", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
 		await replaceOwnerGeneration(state, "session", "current");
@@ -2240,6 +2498,37 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 		}
 	});
 
+	it("does not publish asynchronously into a replacement lifecycle root", async () => {
+		if (process.platform === "win32") return;
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-generation-async-root-publication-"));
+		const sessionId = "session";
+		const generation = "generation";
+		let displacedRoot = "";
+		try {
+			const absent = captureOwnerGenerationBaselineSync(state, sessionId);
+			await replaceOwnerGeneration(state, sessionId, generation, absent);
+			const baseline = captureOwnerGenerationBaselineSync(state, sessionId);
+			const paths = lifecyclePaths(state, sessionId, generation);
+			displacedRoot = `${paths.root}.original`;
+			__setOwnerGenerationAfterMarkerForTests(() => {
+				fsSync.renameSync(paths.root, displacedRoot);
+				fsSync.mkdirSync(paths.root);
+				fsSync.copyFileSync(path.join(displacedRoot, "generation.json"), paths.generationFile);
+			});
+			await expect(replaceOwnerGeneration(state, sessionId, "successor", baseline)).rejects.toThrow(
+				"baseline_generation_changed",
+			);
+			expect(JSON.parse(await fs.readFile(paths.generationFile, "utf8"))).toMatchObject({ generation });
+		} finally {
+			__setOwnerGenerationAfterMarkerForTests(undefined);
+			if (displacedRoot && fsSync.existsSync(displacedRoot)) {
+				fsSync.rmSync(lifecyclePaths(state, sessionId, generation).root, { recursive: true, force: true });
+				fsSync.renameSync(displacedRoot, lifecyclePaths(state, sessionId, generation).root);
+			}
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("binds a generation-free baseline to its existing lifecycle root", () => {
 		const state = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-generation-empty-root-"));
 		const sessionId = "session";
@@ -2433,32 +2722,39 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 			});
 		}
 
-		it("does not retry after dispatch until the original observer reconciles it", async () => {
+		it("resumes exact cleanup after a late verdict without redispatching", async () => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatched-"));
 			try {
 				await replaceOwnerGeneration(state, "session", "generation");
 				const input = intentInput(new Date(Date.now() + 600_000).toISOString());
-				await expect(
-					closeExactTmuxOwner(
-						{
-							stateDir: state,
-							sessionId: "session",
-							generation: "generation",
-							serverKey: "socket",
-							pid: process.pid,
-							startTime: "start",
-							dispatchId: input.dispatch_id,
-							createdAt: input.created_at,
-							expiresAt: input.expires_at,
-						},
-						{
-							readStartTime: async () => "start",
-							sendSigterm: async () => undefined,
-							waitForVerdict: async () => null,
-							cleanupSession: async () => undefined,
-						},
-					),
-				).rejects.toThrow("owner_term_verdict_timeout");
+				const request = {
+					stateDir: state,
+					sessionId: "session",
+					generation: "generation",
+					serverKey: "socket",
+					pid: process.pid,
+					startTime: "start",
+					dispatchId: input.dispatch_id,
+					createdAt: input.created_at,
+					expiresAt: input.expires_at,
+				};
+				let signals = 0;
+				let waits = 0;
+				let cleanups = 0;
+				const dependencies = {
+					readStartTime: async () => "start",
+					sendSigterm: async () => {
+						signals += 1;
+					},
+					waitForVerdict: async () => {
+						waits += 1;
+						return null;
+					},
+					cleanupSession: async () => {
+						cleanups += 1;
+					},
+				};
+				await expect(closeExactTmuxOwner(request, dependencies)).rejects.toThrow("owner_term_verdict_timeout");
 				const paths = lifecyclePaths(state, "session", "generation");
 				const dispatched = JSON.parse(await Bun.file(`${paths.intentFile}.dispatched`).text()) as {
 					intent_id: string;
@@ -2466,6 +2762,18 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 				};
 				const dispatchedIntentId = dispatched.intent_id;
 				expect(dispatched).toMatchObject({ intent_id: expect.any(String), dispatch_id: input.dispatch_id });
+				await expect(
+					closeExactTmuxOwner(request, {
+						...dependencies,
+						waitForVerdict: async () => {
+							waits += 1;
+							return null;
+						},
+					}),
+				).rejects.toThrow("owner_intent_replay");
+				expect(signals).toBe(1);
+				expect(waits).toBe(1);
+				expect(cleanups).toBe(0);
 				await expect(createOwnerIntent(state, input)).rejects.toThrow("owner_intent_replay");
 				const observation = {
 					schema_version: 1,
@@ -2487,8 +2795,182 @@ int main(int argc, char **argv) { int capability[2]; if (argc != 2 || pipe(capab
 				expect(observed.classification).toBe("expected_operator_shutdown");
 				expect(await Bun.file(paths.intentFile).exists()).toBe(false);
 				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+				const recovered = await closeExactTmuxOwner(
+					{ ...request, dispatchId: "new-close-attempt" },
+					{
+						readStartTime: async () => {
+							throw new Error("recovery_must_not_recheck_pid");
+						},
+						sendSigterm: async () => {
+							signals += 1;
+						},
+						waitForVerdict: async () => {
+							waits += 1;
+							return null;
+						},
+						cleanupSession: async () => {
+							cleanups += 1;
+						},
+					},
+				);
+				expect(recovered).toEqual(observed);
+				expect(signals).toBe(1);
+				expect(waits).toBe(1);
+				expect(cleanups).toBe(1);
+				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("recovers an exact durable verdict while the blocking marker is still dispatched", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatched-verdict-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const input = intentInput(futureDeadline());
+				const request = {
+					stateDir: state,
+					sessionId: "session",
+					generation: "generation",
+					serverKey: "socket",
+					pid: process.pid,
+					startTime: "start",
+					dispatchId: input.dispatch_id,
+					createdAt: input.created_at,
+					expiresAt: input.expires_at,
+				};
+				let signals = 0;
+				let cleanups = 0;
+				await expect(
+					closeExactTmuxOwner(request, {
+						readStartTime: async () => "start",
+						sendSigterm: async () => {
+							signals += 1;
+						},
+						waitForVerdict: async () => null,
+						cleanupSession: async () => undefined,
+					}),
+				).rejects.toThrow("owner_term_verdict_timeout");
+				const paths = lifecyclePaths(state, "session", "generation");
+				const intent = JSON.parse(await Bun.file(`${paths.intentFile}.dispatched`).text()) as { intent_id: string };
+				const verdict = {
+					schema_version: 1,
+					generation: "generation",
+					session_id: "session",
+					server_key: "socket",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: 0,
+					result: "owner_term_then_session_cleanup",
+					observer: "sidecar",
+					classification: "expected_operator_shutdown",
+					reason: "test",
+					intent_id: intent.intent_id,
+					dedupe_key: "owner-loss:session:generation",
+				} as const;
+				await fs.writeFile(paths.verdictFile, `${JSON.stringify(verdict)}\n`);
+				const recovered = await closeExactTmuxOwner(
+					{ ...request, dispatchId: "new-close-attempt" },
+					{
+						readStartTime: async () => {
+							throw new Error("recovery_must_not_recheck_pid");
+						},
+						sendSigterm: async () => {
+							signals += 1;
+						},
+						waitForVerdict: async () => null,
+						cleanupSession: async () => {
+							cleanups += 1;
+						},
+					},
+				);
+				expect(recovered).toEqual(verdict);
+				expect(signals).toBe(1);
+				expect(cleanups).toBe(1);
+				expect(await Bun.file(`${paths.intentFile}.dispatched`).exists()).toBe(false);
+				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects malformed or foreign verdict bindings during dispatched cleanup recovery", async () => {
+			for (const foreign of ["server", "intent", "expired", "malformed"] as const) {
+				const state = await fs.mkdtemp(path.join(os.tmpdir(), `gjc-owner-intent-foreign-${foreign}-`));
+				try {
+					await replaceOwnerGeneration(state, "session", "generation");
+					const input = intentInput(futureDeadline());
+					const request = {
+						stateDir: state,
+						sessionId: "session",
+						generation: "generation",
+						serverKey: "socket",
+						pid: process.pid,
+						startTime: "start",
+						dispatchId: input.dispatch_id,
+						createdAt: input.created_at,
+						expiresAt: input.expires_at,
+					};
+					let signals = 0;
+					let cleanups = 0;
+					await expect(
+						closeExactTmuxOwner(request, {
+							readStartTime: async () => "start",
+							sendSigterm: async () => {
+								signals += 1;
+							},
+							waitForVerdict: async () => null,
+							cleanupSession: async () => undefined,
+						}),
+					).rejects.toThrow("owner_term_verdict_timeout");
+					const paths = lifecyclePaths(state, "session", "generation");
+					let intent = JSON.parse(await Bun.file(`${paths.intentFile}.dispatched`).text()) as OwnerIntent;
+					if (foreign === "expired") {
+						intent = { ...intent, expires_at: new Date(Date.now() - 1_000).toISOString() };
+						await fs.writeFile(`${paths.intentFile}.dispatched`, `${JSON.stringify(intent)}\n`);
+					}
+					const foreignVerdict = {
+						schema_version: 1,
+						generation: "generation",
+						session_id: "session",
+						server_key: "socket",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: 0,
+						result: "owner_term_then_session_cleanup",
+						observer: "sidecar",
+						classification: "expected_operator_shutdown",
+						reason: "test",
+						intent_id: foreign === "intent" ? "foreign-intent" : intent.intent_id,
+						dedupe_key: "owner-loss:session:generation",
+					};
+					await fs.writeFile(
+						paths.verdictFile,
+						foreign === "malformed" ? "{malformed verdict\n" : `${JSON.stringify(foreignVerdict)}\n`,
+					);
+					const recoveryRequest =
+						foreign === "server"
+							? { ...request, serverKey: "foreign-server" }
+							: { ...request, dispatchId: "new-close-attempt" };
+					await expect(
+						closeExactTmuxOwner(recoveryRequest, {
+							readStartTime: async () => "start",
+							sendSigterm: async () => {
+								signals += 1;
+							},
+							waitForVerdict: async () => null,
+							cleanupSession: async () => {
+								cleanups += 1;
+							},
+						}),
+					).rejects.toThrow("owner_intent_replay");
+					expect(signals).toBe(1);
+					expect(cleanups).toBe(0);
+					expect(await Bun.file(`${paths.intentFile}.dispatched`).exists()).toBe(true);
+					expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(false);
+				} finally {
+					await fs.rm(state, { recursive: true, force: true });
+				}
 			}
 		});
 

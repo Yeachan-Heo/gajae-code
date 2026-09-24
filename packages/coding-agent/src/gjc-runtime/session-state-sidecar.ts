@@ -3429,9 +3429,14 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	options: PersistCoordinatorRuntimeStateFromPostmortemOptions = {},
 ): Promise<void> {
 	const stateFile = options.stateFile ?? runtimeStateFileForContext(context);
-	if (!stateFile) return;
+	const ownerTerminalVerdictProvided =
+		options.ownerTerminalVerdict !== undefined && options.ownerTerminalVerdict !== null;
+	if (!stateFile && !ownerTerminalVerdictProvided) return;
 	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
 		context = await contextWithManagedOwnerGeneration(context);
+	if (ownerTerminalVerdictProvided)
+		await validateOwnerVerdictContext(context.ownerTerminal, context.sessionId, options.ownerTerminalVerdict);
+	if (!stateFile) return;
 	const ownerTerminalVerdict =
 		options.ownerTerminalVerdict !== undefined
 			? options.ownerTerminalVerdict
@@ -3555,15 +3560,7 @@ export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
 	fallbackCwd?: string,
 ): Promise<void> {
 	const previous = readPreviousPayload(stateFile);
-	if (
-		!isValidOwnerVerdict(verdict) ||
-		previous.session_id !== verdict.session_id ||
-		ownerTerminal.generation !== verdict.generation ||
-		ownerTerminal.socketKey !== verdict.server_key ||
-		(ownerTerminal.operatorIntentId != null && ownerTerminal.operatorIntentId !== verdict.intent_id) ||
-		!(await ownerIntentMatchesVerdictContext(ownerTerminal, verdict))
-	)
-		throw new Error("owner_verdict_context_mismatch");
+	await validateOwnerVerdictContext(ownerTerminal, previous.session_id, verdict);
 	const cwd =
 		typeof previous.cwd === "string" && previous.cwd.trim()
 			? previous.cwd
@@ -3581,6 +3578,24 @@ export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
 		},
 		{ stateFile, ownerTerminalVerdict: verdict },
 	);
+}
+
+async function validateOwnerVerdictContext(
+	ownerTerminal: OwnerTerminalContext | null | undefined,
+	expectedSessionId: unknown,
+	verdict: unknown,
+): Promise<void> {
+	if (
+		!ownerTerminal ||
+		!isValidOwnerVerdict(verdict) ||
+		typeof expectedSessionId !== "string" ||
+		verdict.session_id !== expectedSessionId ||
+		ownerTerminal.generation !== verdict.generation ||
+		ownerTerminal.socketKey !== verdict.server_key ||
+		(ownerTerminal.operatorIntentId != null && ownerTerminal.operatorIntentId !== verdict.intent_id) ||
+		!(await ownerIntentMatchesVerdictContext(ownerTerminal, verdict))
+	)
+		throw new Error("owner_verdict_context_mismatch");
 }
 
 async function ownerIntentMatchesVerdictContext(

@@ -6,8 +6,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { FileLockTestHooks, processStartTime } from "../src/config/file-lock";
 import { loadInstallationHostId } from "../src/config/machine-identity";
+import { readLinuxProcStartTimeSync } from "../src/gjc-runtime/linux-proc";
+import { publishManagedOwnerSupervisorAuthoritySync } from "../src/gjc-runtime/managed-owner-supervisor";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import {
@@ -44,9 +47,12 @@ import {
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
 import {
+	activateStagedOwnerSupervisor,
+	captureOwnerGenerationBaseline,
 	createOwnerIntent,
 	lifecyclePaths,
 	observeOwnerTerminal,
+	prepareStagedOwnerSupervisorSync,
 	replaceOwnerGeneration,
 } from "../src/gjc-runtime/tmux-owner-isolation";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
@@ -2537,6 +2543,111 @@ describe("coordinator runtime state sidecar", () => {
 		}
 	});
 
+	it("keeps staged supervisor lifecycle events unowned until PREPARED and ACTIVE evidence is published", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-supervisor-event.json");
+		const sessionId = "staged-supervisor-event";
+		const generation = "77777777-7777-4777-8777-777777777777";
+		const serverKey = "tmux";
+		const paths = lifecyclePaths(root, sessionId, generation);
+		const keys = [
+			GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+			GJC_COORDINATOR_SESSION_ID_ENV,
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_GENERATION_STAGED_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+			"GJC_TMUX_LAUNCHED",
+			"GJC_MANAGED_OWNER_SUPERVISED",
+		] as const;
+		const previous = new Map(keys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = generation;
+			process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] = "1";
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = root;
+			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = serverKey;
+			process.env.GJC_TMUX_LAUNCHED = "1";
+			process.env.GJC_MANAGED_OWNER_SUPERVISED = "1";
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					state: "running",
+					cwd: root,
+					workdir: root,
+					session_file: null,
+				}),
+			);
+
+			const baseline = await captureOwnerGenerationBaseline(root, sessionId);
+			expect(baseline.state).toBe("absent");
+			const prepared = prepareStagedOwnerSupervisorSync(root, sessionId, generation, baseline);
+			const supervisorStartTime =
+				process.platform === "linux"
+					? readLinuxProcStartTimeSync(process.pid)
+					: (nativeProcessBindings().Process.fromPid(process.pid)?.incarnation ?? null);
+			if (!supervisorStartTime) throw new Error("test_supervisor_process_identity_unavailable");
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: root,
+				session_id: sessionId,
+				generation,
+				supervisor_pid: process.pid,
+				supervisor_start_time: supervisorStartTime,
+				server_pid: process.pid,
+				server_start_time: supervisorStartTime,
+				native_session_id: "$test",
+			});
+			const active = await activateStagedOwnerSupervisor({
+				stateDir: root,
+				sessionId,
+				generation,
+				supervisorPid: process.pid,
+				supervisorStartTime,
+			});
+			expect(prepared).toMatchObject({ state: "PREPARED", session_id: sessionId, generation, baseline });
+			expect(active).toMatchObject({
+				state: "ACTIVE",
+				session_id: sessionId,
+				generation,
+				baseline,
+				supervisor_pid: process.pid,
+				supervisor_start_time: supervisorStartTime,
+				supervisor_authority: { supervisor_pid: process.pid, server_pid: process.pid },
+			});
+			expect(await readJson(paths.stagedSupervisorPreparedFile)).toMatchObject({ state: "PREPARED", generation });
+			expect(await readJson(paths.stagedSupervisorActiveFile)).toMatchObject({ state: "ACTIVE", generation });
+
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "agent_start" },
+				{ sessionId, cwd: root, sessionFile: null },
+			);
+			const stagedPayload = await readPayload(stateFile);
+			expect(stagedPayload).toMatchObject({ event: "agent_start", source: "agent_session_event", state: "running" });
+			expect(stagedPayload.owner_generation).toBeUndefined();
+			expect(await Bun.file(paths.generationFile).exists()).toBe(false);
+			expect(await Bun.file(paths.generationMarkerFile).exists()).toBe(false);
+
+			await replaceOwnerGeneration(root, sessionId, generation, baseline, { stagedSupervisor: true });
+			expect(await readJson(paths.generationFile)).toMatchObject({ generation, session_id: sessionId });
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId, cwd: root, sessionFile: null },
+			);
+			expect(await readPayload(stateFile)).toMatchObject({ event: "turn_start", owner_generation: generation });
+		} finally {
+			for (const key of keys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("promotes a published staged owner while holding the generation lock", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "staged-race.json");
@@ -2813,7 +2924,7 @@ describe("coordinator runtime state sidecar", () => {
 	});
 	it("persists only an owner verdict bound to the runtime session and close dispatch", async () => {
 		let serial = 0;
-		const prepare = async () => {
+		const prepareContext = async () => {
 			serial += 1;
 			const root = await tempRoot();
 			const stateFile = path.join(root, "state.json");
@@ -2841,22 +2952,6 @@ describe("coordinator runtime state sidecar", () => {
 				session_file: null,
 			});
 			await Bun.write(stateFile, prior);
-			const verdict = await observeOwnerTerminal({
-				schema_version: 1,
-				op: "observe_terminal",
-				session_id: sessionId,
-				owner_generation: generation,
-				state_dir: root,
-				socket_key: serverKey,
-				observer: "raw_monitor",
-				observed_at: new Date(now).toISOString(),
-				signal: "SIGTERM",
-				exit_code: null,
-				exit_kind: "exit",
-				reason: "test",
-				operator_dispatch_id: dispatchId,
-				operator_intent_id: ownerIntent.intent_id,
-			});
 			return {
 				root,
 				stateFile,
@@ -2865,7 +2960,6 @@ describe("coordinator runtime state sidecar", () => {
 				serverKey,
 				dispatchId,
 				ownerIntent,
-				verdict,
 				prior,
 				context: {
 					generation,
@@ -2875,6 +2969,26 @@ describe("coordinator runtime state sidecar", () => {
 					operatorIntentId: ownerIntent.intent_id,
 				},
 			};
+		};
+		const prepare = async () => {
+			const sample = await prepareContext();
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sample.sessionId,
+				owner_generation: sample.generation,
+				state_dir: sample.root,
+				socket_key: sample.serverKey,
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "exit",
+				reason: "test",
+				operator_dispatch_id: sample.dispatchId,
+				operator_intent_id: sample.ownerIntent.intent_id,
+			});
+			return { ...sample, verdict };
 		};
 
 		const matching = await prepare();
@@ -2888,30 +3002,126 @@ describe("coordinator runtime state sidecar", () => {
 			},
 		});
 
-		for (const mismatch of ["session", "generation", "server", "dispatch"] as const) {
+		for (const mismatch of ["session", "generation", "server", "dispatch", "intent"] as const) {
 			const sample = await prepare();
-			const verdict =
-				mismatch === "session"
-					? {
-							...sample.verdict,
-							session_id: "foreign-session",
-							dedupe_key: `owner-loss:foreign-session:${sample.generation}`,
-						}
-					: mismatch === "generation"
-						? {
-								...sample.verdict,
-								generation: "foreign-generation",
-								dedupe_key: `owner-loss:${sample.sessionId}:foreign-generation`,
-							}
-						: mismatch === "server"
-							? { ...sample.verdict, server_key: "foreign-server" }
-							: sample.verdict;
+			let verdict = sample.verdict;
+			if (mismatch === "session")
+				verdict = {
+					...sample.verdict,
+					session_id: "foreign-session",
+					dedupe_key: `owner-loss:foreign-session:${sample.generation}`,
+				};
+			else if (mismatch === "generation")
+				verdict = {
+					...sample.verdict,
+					generation: "foreign-generation",
+					dedupe_key: `owner-loss:${sample.sessionId}:foreign-generation`,
+				};
+			else if (mismatch === "server") verdict = { ...sample.verdict, server_key: "foreign-server" };
+			else if (mismatch === "intent") verdict = { ...sample.verdict, intent_id: "foreign-intent" };
 			const context =
 				mismatch === "dispatch" ? { ...sample.context, operatorDispatchId: "foreign-dispatch" } : sample.context;
 			await expect(
-				persistCoordinatorRuntimeStateFromOwnerVerdict(sample.stateFile, context, verdict),
+				persistCoordinatorRuntimeStateFromPostmortem(
+					postmortem.Reason.SIGTERM,
+					{
+						sessionId: sample.sessionId,
+						cwd: sample.root,
+						sessionFile: null,
+						ownerTerminal: { ...context, generationPublished: true },
+					},
+					{ stateFile: sample.stateFile, ownerTerminalVerdict: verdict },
+				),
 			).rejects.toThrow("owner_verdict_context_mismatch");
 			expect(await Bun.file(sample.stateFile).text()).toBe(sample.prior);
+		}
+
+		const noStateFile = await prepare();
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(
+				postmortem.Reason.SIGTERM,
+				{
+					sessionId: noStateFile.sessionId,
+					cwd: noStateFile.root,
+					sessionFile: null,
+					stateFile: null,
+					ownerTerminal: { ...noStateFile.context, generationPublished: true },
+				},
+				{
+					ownerTerminalVerdict: {
+						...noStateFile.verdict,
+						session_id: "foreign-session",
+						dedupe_key: `owner-loss:foreign-session:${noStateFile.generation}`,
+					},
+				},
+			),
+		).rejects.toThrow("owner_verdict_context_mismatch");
+		expect(await Bun.file(noStateFile.stateFile).text()).toBe(noStateFile.prior);
+
+		const originalManagedOwnerSupervised = process.env.GJC_MANAGED_OWNER_SUPERVISED;
+		const originalTmuxLaunched = process.env.GJC_TMUX_LAUNCHED;
+		delete process.env.GJC_MANAGED_OWNER_SUPERVISED;
+		delete process.env.GJC_TMUX_LAUNCHED;
+		try {
+			for (const verdictMode of ["omitted", "undefined"] as const) {
+				const sample = await prepareContext();
+				const options =
+					verdictMode === "omitted"
+						? { stateFile: sample.stateFile }
+						: { stateFile: sample.stateFile, ownerTerminalVerdict: undefined };
+				await persistCoordinatorRuntimeStateFromPostmortem(
+					postmortem.Reason.SIGTERM,
+					{
+						sessionId: sample.sessionId,
+						cwd: sample.root,
+						sessionFile: null,
+						ownerTerminal: { ...sample.context, generationPublished: true },
+					},
+					options,
+				);
+				expect(await readPayload(sample.stateFile)).toMatchObject({
+					state: "completed",
+					reason: "expected_operator_shutdown",
+					owner_terminal: {
+						generation: sample.generation,
+						socket_key: sample.serverKey,
+						intent_id: sample.ownerIntent.intent_id,
+					},
+				});
+				const observed = await readJson(
+					lifecyclePaths(sample.root, sample.sessionId, sample.generation).verdictFile,
+				);
+				expect(observed).toMatchObject({
+					classification: "expected_operator_shutdown",
+					intent_id: sample.ownerIntent.intent_id,
+				});
+			}
+
+			const absent = await prepareContext();
+			await persistCoordinatorRuntimeStateFromPostmortem(
+				postmortem.Reason.SIGTERM,
+				{
+					sessionId: absent.sessionId,
+					cwd: absent.root,
+					sessionFile: null,
+					ownerTerminal: { ...absent.context, generationPublished: true },
+				},
+				{ stateFile: absent.stateFile, ownerTerminalVerdict: null },
+			);
+			expect(await readPayload(absent.stateFile)).toMatchObject({
+				state: "errored",
+				reason: "owner_verdict_unavailable",
+				error: { code: "owner_verdict_unavailable", recoverable: true },
+				recovery: { action: "recover_or_resume_session" },
+			});
+			expect(
+				await Bun.file(lifecyclePaths(absent.root, absent.sessionId, absent.generation).verdictFile).exists(),
+			).toBe(false);
+		} finally {
+			if (originalManagedOwnerSupervised === undefined) delete process.env.GJC_MANAGED_OWNER_SUPERVISED;
+			else process.env.GJC_MANAGED_OWNER_SUPERVISED = originalManagedOwnerSupervised;
+			if (originalTmuxLaunched === undefined) delete process.env.GJC_TMUX_LAUNCHED;
+			else process.env.GJC_TMUX_LAUNCHED = originalTmuxLaunched;
 		}
 
 		const unbound = await prepare();
@@ -2923,7 +3133,158 @@ describe("coordinator runtime state sidecar", () => {
 			),
 		).rejects.toThrow("owner_verdict_context_mismatch");
 		expect(await Bun.file(unbound.stateFile).text()).toBe(unbound.prior);
+
+		const malformed = await prepare();
+		const malformedVerdict = {
+			...malformed.verdict,
+			classification: "forged",
+		} as unknown as typeof malformed.verdict;
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(
+				postmortem.Reason.SIGTERM,
+				{
+					sessionId: malformed.sessionId,
+					cwd: malformed.root,
+					sessionFile: null,
+					ownerTerminal: { ...malformed.context, generationPublished: true },
+				},
+				{ stateFile: malformed.stateFile, ownerTerminalVerdict: malformedVerdict },
+			),
+		).rejects.toThrow("owner_verdict_context_mismatch");
+		expect(await Bun.file(malformed.stateFile).text()).toBe(malformed.prior);
 	});
+
+	it("defers supervised SIGTERM finalization until the exact operator verdict is published", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "supervised-postmortem.json");
+		const sessionId = "supervised-postmortem";
+		const generation = "88888888-8888-4888-8888-888888888888";
+		const serverKey = "supervised-owner";
+		const dispatchId = "supervised-dispatch";
+		const paths = lifecyclePaths(root, sessionId, generation);
+		const keys = [
+			GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+			GJC_COORDINATOR_SESSION_ID_ENV,
+			"GJC_TMUX_LAUNCHED",
+			"GJC_MANAGED_OWNER_SUPERVISED",
+		] as const;
+		const previous = new Map(keys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			process.env.GJC_TMUX_LAUNCHED = "1";
+			process.env.GJC_MANAGED_OWNER_SUPERVISED = "1";
+			await replaceOwnerGeneration(root, sessionId, generation);
+			const now = Date.now();
+			const intent = await createOwnerIntent(root, {
+				generation,
+				session_id: sessionId,
+				server_key: serverKey,
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: dispatchId,
+				created_at: new Date(now - 1_000).toISOString(),
+				expires_at: new Date(now + 60_000).toISOString(),
+			});
+			const prior = JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				owner_generation: generation,
+			});
+			await Bun.write(stateFile, prior);
+			const childContext = {
+				sessionId,
+				cwd: root,
+				sessionFile: null,
+				ownerTerminal: { generation, stateDir: root, socketKey: serverKey, generationPublished: true },
+			};
+
+			expect(await readJson(paths.intentFile)).toMatchObject({
+				state: "pending",
+				generation,
+				session_id: sessionId,
+				server_key: serverKey,
+				dispatch_id: dispatchId,
+				intent_id: intent.intent_id,
+			});
+			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, childContext);
+			expect(await Bun.file(stateFile).text()).toBe(prior);
+			expect(await readJson(paths.intentFile)).toMatchObject({
+				state: "pending",
+				generation,
+				session_id: sessionId,
+				server_key: serverKey,
+				intent_id: intent.intent_id,
+			});
+			expect(await Bun.file(paths.verdictFile).exists()).toBe(false);
+			expect(await Bun.file(paths.verdictAliasFile).exists()).toBe(false);
+
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: root,
+				socket_key: serverKey,
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: "SIGTERM",
+				exit_code: null,
+				exit_kind: "exit",
+				reason: "test",
+				operator_dispatch_id: dispatchId,
+				operator_intent_id: intent.intent_id,
+			});
+			expect(verdict).toMatchObject({
+				generation,
+				session_id: sessionId,
+				server_key: serverKey,
+				classification: "expected_operator_shutdown",
+				intent_id: intent.intent_id,
+			});
+			await persistCoordinatorRuntimeStateFromOwnerVerdict(
+				stateFile,
+				{
+					generation,
+					stateDir: root,
+					socketKey: serverKey,
+					operatorDispatchId: dispatchId,
+					operatorIntentId: intent.intent_id,
+				},
+				verdict,
+			);
+
+			expect(await readJson(paths.verdictFile)).toEqual(verdict as unknown as Record<string, unknown>);
+			expect(await readPayload(stateFile)).toMatchObject({
+				session_id: sessionId,
+				owner_generation: generation,
+				state: "completed",
+				source: "process_postmortem",
+				event: "owner_terminal",
+				reason: "expected_operator_shutdown",
+				owner_terminal: {
+					generation,
+					socket_key: serverKey,
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+					classification: "expected_operator_shutdown",
+					observer: "raw_monitor",
+					intent_id: intent.intent_id,
+					dedupe_key: verdict.dedupe_key,
+				},
+			});
+		} finally {
+			for (const key of keys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("fails closed with public-safe recovery for invalid metadata and unavailable owner ownership", async () => {
 		const root = await tempRoot();
 		const sessionId = "owner-fail-closed";

@@ -3,7 +3,6 @@ import { Agent, type AgentMessage, isNonDispatchedToolEvent, markNonDispatchedTo
 import type { Message, Model, SimpleStreamOptions } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { __sessionStateSidecarPerfCounters } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	__agentSessionPerfCounters,
 	AgentSession,
@@ -11,6 +10,7 @@ import {
 	WorkerIntegrationRequestScheduler,
 } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { __sessionStateSidecarPerfCounters } from "../src/gjc-runtime/session-state-sidecar";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 

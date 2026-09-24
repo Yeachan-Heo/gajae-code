@@ -14,7 +14,8 @@ import * as path from "node:path";
 
 import { openPortableRecoveryFsRoot, type PortableRecoveryFsRoot } from "@gajae-code/natives";
 import { isCompiledBinary } from "@gajae-code/utils/env";
-import { parseLinuxProcStartTime } from "./linux-proc";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { parseLinuxProcStartTime, probeLinuxProcPidSync } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { assertSafePathComponent } from "./session-layout";
 import { assertSafeGjcTmuxSessionName } from "./tmux-common";
@@ -1244,6 +1245,39 @@ export interface StagedOwnerTerminalJournal {
 	exit_code: number | null;
 	reason: string;
 }
+export interface StagedOwnerSupervisorPreparedRecord {
+	schema_version: 1;
+	kind: "staged_owner_supervisor";
+	state: "PREPARED";
+	session_id: string;
+	generation: string;
+	baseline: OwnerGenerationBaseline;
+	root_dev: string;
+	root_ino: string;
+	prepared_at: string;
+}
+export interface StagedOwnerSupervisorAuthorityRecord {
+	schema_version: 1;
+	kind: "managed_owner_supervisor_authority";
+	session_id: string;
+	generation: string;
+	supervisor_pid: number;
+	supervisor_start_time: string;
+	supervisor_is_parent?: true;
+	server_pid: number;
+	server_start_time: string;
+	native_session_id: string;
+}
+export interface StagedOwnerSupervisorActiveRecord extends Omit<StagedOwnerSupervisorPreparedRecord, "state"> {
+	/** Supervisor is armed and waiting; untrusted child work is not yet started. */
+	state: "ACTIVE";
+	activated_at: string;
+	supervisor_pid: number;
+	supervisor_start_time: string;
+	/** Exact parent-published pane/server authority to which the supervisor is bound. */
+	supervisor_authority: StagedOwnerSupervisorAuthorityRecord;
+}
+export type StagedOwnerSupervisorRecord = StagedOwnerSupervisorPreparedRecord | StagedOwnerSupervisorActiveRecord;
 export interface OwnerVerdict {
 	schema_version: 1;
 	generation: string;
@@ -1307,6 +1341,8 @@ export interface LifecyclePaths {
 	lockDatabaseFile: string;
 	journalFile: string;
 	stagedTerminalFile: string;
+	stagedSupervisorPreparedFile: string;
+	stagedSupervisorActiveFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	try {
@@ -1330,6 +1366,11 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		lockDatabaseFile: path.join(root, "owner-locks.sqlite"),
 		journalFile: path.join(root, `verdict-${generation}.journal`),
 		stagedTerminalFile: path.join(root, `staged-terminal-${encodeURIComponent(generation)}.json`),
+		stagedSupervisorPreparedFile: path.join(
+			root,
+			`staged-supervisor-${encodeURIComponent(generation)}.prepared.json`,
+		),
+		stagedSupervisorActiveFile: path.join(root, `staged-supervisor-${encodeURIComponent(generation)}.active.json`),
 	};
 }
 
@@ -1356,28 +1397,79 @@ export async function replaceOwnerGeneration(
 	sessionId: string,
 	generation: string = crypto.randomUUID(),
 	expectedBaseline?: OwnerGenerationBaseline,
+	options: { stagedSupervisor?: boolean } = {},
 ): Promise<string> {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const token = await acquireOwnerGenerationLock(paths, sessionId);
 	if (!token) throw new Error("generation_lock_contended");
+	let authority: PortableRecoveryFsRoot | undefined;
 	try {
-		assertNoStagedOwnerTerminal(paths);
-		const previous = await captureOwnerGenerationBaseline(stateDir, sessionId);
+		try {
+			authority = openPortableRecoveryFsRoot(paths.root);
+		} catch (error) {
+			if (options.stagedSupervisor === true)
+				throw new Error("managed_owner_staged_supervisor_evidence_untrusted", { cause: error });
+		}
+		assertNoStagedOwnerTerminal(paths, authority);
+		const previous = authority
+			? ownerGenerationBaselineFromAuthority(authority, sessionId)
+			: await captureOwnerGenerationBaseline(stateDir, sessionId);
 		if (expectedBaseline && !ownerGenerationBaselineMatchesExpected(previous, expectedBaseline))
 			throw new Error("generation_baseline_changed");
+		validateStagedOwnerSupervisorForPublication(
+			paths,
+			sessionId,
+			expectedBaseline,
+			previous,
+			options.stagedSupervisor === true,
+			authority,
+		);
 		const published = {
 			schema_version: 1 as const,
 			generation,
 			session_id: sessionId,
 			published_at: new Date().toISOString(),
 		};
-		await publishImmutableGenerationMarker(paths.generationMarkerFile, published);
-		if (previous.state === "current" && previous.generation !== generation)
-			await ensureGenerationMarker(
-				lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile,
-				generationPublicationRecord(previous),
+		if (authority) {
+			publishImmutableGenerationMarkerWithAuthority(authority, path.basename(paths.generationMarkerFile), published);
+			if (previous.state === "current" && previous.generation !== generation)
+				ensureGenerationMarkerWithAuthority(
+					authority,
+					path.basename(lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile),
+					generationPublicationRecord(previous),
+				);
+		} else {
+			await publishImmutableGenerationMarker(paths.generationMarkerFile, published);
+			if (previous.state === "current" && previous.generation !== generation)
+				await ensureGenerationMarker(
+					lifecyclePaths(stateDir, sessionId, previous.generation).generationMarkerFile,
+					generationPublicationRecord(previous),
+				);
+		}
+		ownerGenerationAfterMarkerForTests?.();
+		if (authority) {
+			const beforeInstall = ownerGenerationBaselineFromAuthority(authority, sessionId);
+			if (!ownerGenerationBaselineMatchesExpected(beforeInstall, previous))
+				throw new Error("generation_baseline_changed");
+			validateStagedOwnerSupervisorForPublication(
+				paths,
+				sessionId,
+				expectedBaseline,
+				beforeInstall,
+				options.stagedSupervisor === true,
+				authority,
 			);
-		await atomicWrite(paths.generationFile, published);
+			const installed = authority.replace("generation.json", Buffer.from(`${JSON.stringify(published)}\n`));
+			if (!installed.ok)
+				throw new Error(
+					installed.code === "committed_unverified"
+						? "generation_publication_uncertain"
+						: "generation_publication_failed",
+				);
+			assertPortableRecoveryFsRootStillVisible(authority, paths.root);
+		} else {
+			await atomicWrite(paths.generationFile, published);
+		}
 		if (previous.state === "current" && previous.generation !== generation) {
 			const prior = lifecyclePaths(stateDir, sessionId, previous.generation);
 			const intent = await readJson<OwnerIntent>(prior.intentFile);
@@ -1386,6 +1478,7 @@ export async function replaceOwnerGeneration(
 		}
 		return generation;
 	} finally {
+		authority?.close();
 		await releaseVerdictLock(token);
 	}
 }
@@ -1425,8 +1518,10 @@ export async function withOwnerGenerationLifecycleLock<T>(
 
 /** Refuses to publish a generation whose staged supervisor already recorded a terminal exit. */
 
-export function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
-	const journal = readNoFollowJsonSync(paths.stagedTerminalFile);
+export function assertNoStagedOwnerTerminal(paths: LifecyclePaths, authority?: PortableRecoveryFsRoot): void {
+	const journal = authority
+		? readStagedSupervisorRecordWithAuthority(authority, path.basename(paths.stagedTerminalFile))
+		: readNoFollowJsonSync(paths.stagedTerminalFile);
 	if (journal === null) return;
 	if (!isValidStagedOwnerTerminalJournal(journal, { generation: paths.generation }))
 		throw new Error("managed_owner_staged_terminal_evidence_untrusted");
@@ -1516,6 +1611,634 @@ function ownerGenerationBaselineMatchesExpected(
 	)
 		return true;
 	return sameOwnerGenerationBaseline(current, expected);
+}
+
+function isValidStagedOwnerSupervisorPreparedRecord(
+	value: unknown,
+	identity: { generation: string; sessionId: string },
+): value is StagedOwnerSupervisorPreparedRecord {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, [
+			"schema_version",
+			"kind",
+			"state",
+			"session_id",
+			"generation",
+			"baseline",
+			"root_dev",
+			"root_ino",
+			"prepared_at",
+		]) &&
+		value.schema_version === 1 &&
+		value.kind === "staged_owner_supervisor" &&
+		value.state === "PREPARED" &&
+		value.generation === identity.generation &&
+		value.session_id === identity.sessionId &&
+		isOwnerGenerationBaseline(value.baseline) &&
+		(value.baseline.state === "absent" || value.baseline.session_id === identity.sessionId) &&
+		nonEmpty(value.root_dev) &&
+		nonEmpty(value.root_ino) &&
+		(value.baseline.root_dev === undefined || value.baseline.root_dev === value.root_dev) &&
+		(value.baseline.root_ino === undefined || value.baseline.root_ino === value.root_ino) &&
+		isCanonicalUtcTimestamp(value.prepared_at) &&
+		Date.parse(value.prepared_at) <= Date.now()
+	);
+}
+
+function isValidStagedOwnerSupervisorActiveRecord(
+	value: unknown,
+	identity: { generation: string; sessionId: string },
+): value is StagedOwnerSupervisorActiveRecord {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, [
+			"schema_version",
+			"kind",
+			"state",
+			"session_id",
+			"generation",
+			"baseline",
+			"root_dev",
+			"root_ino",
+			"prepared_at",
+			"activated_at",
+			"supervisor_pid",
+			"supervisor_start_time",
+			"supervisor_authority",
+		]) &&
+		value.schema_version === 1 &&
+		value.kind === "staged_owner_supervisor" &&
+		value.state === "ACTIVE" &&
+		value.generation === identity.generation &&
+		value.session_id === identity.sessionId &&
+		isOwnerGenerationBaseline(value.baseline) &&
+		(value.baseline.state === "absent" || value.baseline.session_id === identity.sessionId) &&
+		nonEmpty(value.root_dev) &&
+		nonEmpty(value.root_ino) &&
+		(value.baseline.root_dev === undefined || value.baseline.root_dev === value.root_dev) &&
+		(value.baseline.root_ino === undefined || value.baseline.root_ino === value.root_ino) &&
+		isCanonicalUtcTimestamp(value.prepared_at) &&
+		Date.parse(value.prepared_at) <= Date.now() &&
+		isCanonicalUtcTimestamp(value.activated_at) &&
+		Date.parse(value.activated_at) <= Date.now() &&
+		Date.parse(value.activated_at) >= Date.parse(value.prepared_at) &&
+		nonEmpty(value.supervisor_start_time) &&
+		Number.isSafeInteger(value.supervisor_pid) &&
+		(value.supervisor_pid as number) > 0 &&
+		isStagedOwnerSupervisorAuthorityRecord(value.supervisor_authority, identity) &&
+		stagedSupervisorAuthorityBindsActiveIdentity(value.supervisor_authority, {
+			supervisorPid: value.supervisor_pid as number,
+			supervisorStartTime: value.supervisor_start_time,
+		})
+	);
+}
+
+function isStagedOwnerSupervisorAuthorityRecord(
+	value: unknown,
+	identity: { generation: string; sessionId: string },
+): value is StagedOwnerSupervisorAuthorityRecord {
+	if (!isRecord(value)) return false;
+	const baseKeys = [
+		"schema_version",
+		"kind",
+		"session_id",
+		"generation",
+		"supervisor_pid",
+		"supervisor_start_time",
+		"server_pid",
+		"server_start_time",
+		"native_session_id",
+	];
+	const validKeys = hasExactKeys(value, baseKeys) || hasExactKeys(value, [...baseKeys, "supervisor_is_parent"]);
+	return (
+		validKeys &&
+		value.schema_version === 1 &&
+		value.kind === "managed_owner_supervisor_authority" &&
+		value.session_id === identity.sessionId &&
+		value.generation === identity.generation &&
+		Number.isSafeInteger(value.supervisor_pid) &&
+		(value.supervisor_pid as number) > 0 &&
+		nonEmpty(value.supervisor_start_time) &&
+		(value.supervisor_is_parent === undefined || value.supervisor_is_parent === true) &&
+		Number.isSafeInteger(value.server_pid) &&
+		(value.server_pid as number) > 0 &&
+		nonEmpty(value.server_start_time) &&
+		nonEmpty(value.native_session_id)
+	);
+}
+
+function stagedSupervisorAuthorityBindsActiveIdentity(
+	authority: StagedOwnerSupervisorAuthorityRecord,
+	active: { supervisorPid: number; supervisorStartTime: string },
+): boolean {
+	if (authority.supervisor_pid === active.supervisorPid)
+		return authority.supervisor_start_time === active.supervisorStartTime;
+	if (!authority.supervisor_is_parent || process.platform !== "win32") return false;
+	const supervisor = nativeProcessBindings().Process.fromPid(active.supervisorPid);
+	const parent = nativeProcessBindings().Process.fromPid(authority.supervisor_pid);
+	return supervisor?.ppid === authority.supervisor_pid && parent?.incarnation === authority.supervisor_start_time;
+}
+
+function readStagedSupervisorRecordWithAuthority(authority: PortableRecoveryFsRoot, name: string): unknown | null {
+	const first = authority.read(name, TMUX_OWNER_ISOLATION_MAX_LINE_BYTES);
+	if (first.code === "not_found") return null;
+	const second = authority.read(name, TMUX_OWNER_ISOLATION_MAX_LINE_BYTES);
+	if (
+		!first.ok ||
+		!first.data ||
+		!first.identity ||
+		!second.ok ||
+		!second.data ||
+		!second.identity ||
+		first.identity.dev !== second.identity.dev ||
+		first.identity.ino !== second.identity.ino
+	)
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	const firstBytes = Buffer.from(first.data);
+	const secondBytes = Buffer.from(second.data);
+	if (
+		firstBytes.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES ||
+		Buffer.compare(firstBytes, secondBytes) !== 0 ||
+		!firstBytes.toString("utf8").endsWith("\n") ||
+		firstBytes.indexOf(0x0a) !== firstBytes.byteLength - 1
+	)
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	try {
+		return JSON.parse(firstBytes.toString("utf8")) as unknown;
+	} catch {
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	}
+}
+
+function assertStagedSupervisorRootBinding(
+	authority: PortableRecoveryFsRoot,
+	paths: LifecyclePaths,
+	prepared: StagedOwnerSupervisorPreparedRecord,
+): void {
+	const identity = authority.identity();
+	let visibleRoot: fsSync.Stats;
+	try {
+		visibleRoot = fsSync.lstatSync(paths.root);
+	} catch {
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	}
+	if (
+		!identity.ok ||
+		!identity.identity ||
+		identity.identity.dev !== prepared.root_dev ||
+		identity.identity.ino !== prepared.root_ino ||
+		!visibleRoot.isDirectory() ||
+		visibleRoot.isSymbolicLink() ||
+		visibleRoot.dev.toString() !== prepared.root_dev ||
+		visibleRoot.ino.toString() !== prepared.root_ino
+	)
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+}
+
+function readStagedOwnerSupervisorPair(
+	authority: PortableRecoveryFsRoot,
+	paths: LifecyclePaths,
+	sessionId: string,
+): { prepared: StagedOwnerSupervisorPreparedRecord; active: StagedOwnerSupervisorActiveRecord | null } | null {
+	const preparedValue = readStagedSupervisorRecordWithAuthority(
+		authority,
+		path.basename(paths.stagedSupervisorPreparedFile),
+	);
+	const activeValue = readStagedSupervisorRecordWithAuthority(
+		authority,
+		path.basename(paths.stagedSupervisorActiveFile),
+	);
+	if (preparedValue === null && activeValue === null) return null;
+	const identity = { generation: paths.generation, sessionId };
+	if (!isValidStagedOwnerSupervisorPreparedRecord(preparedValue, identity))
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	if (activeValue === null) {
+		assertStagedSupervisorRootBinding(authority, paths, preparedValue);
+		return { prepared: preparedValue, active: null };
+	}
+	if (!isValidStagedOwnerSupervisorActiveRecord(activeValue, identity))
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	if (
+		activeValue.prepared_at !== preparedValue.prepared_at ||
+		!sameOwnerGenerationBaseline(activeValue.baseline, preparedValue.baseline) ||
+		activeValue.root_dev !== preparedValue.root_dev ||
+		activeValue.root_ino !== preparedValue.root_ino
+	)
+		throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+	assertStagedSupervisorRootBinding(authority, paths, preparedValue);
+	return { prepared: preparedValue, active: activeValue };
+}
+
+function readStagedOwnerSupervisorAuthority(
+	authority: PortableRecoveryFsRoot,
+	paths: LifecyclePaths,
+	sessionId: string,
+): StagedOwnerSupervisorAuthorityRecord {
+	const value = readStagedSupervisorRecordWithAuthority(authority, `supervisor-authority-${paths.generation}.json`);
+	if (!isStagedOwnerSupervisorAuthorityRecord(value, { generation: paths.generation, sessionId }))
+		throw new Error("managed_owner_staged_supervisor_authority_untrusted");
+	return value;
+}
+
+function sameStagedOwnerSupervisorAuthority(
+	left: StagedOwnerSupervisorAuthorityRecord,
+	right: StagedOwnerSupervisorAuthorityRecord,
+): boolean {
+	return (
+		left.schema_version === right.schema_version &&
+		left.kind === right.kind &&
+		left.session_id === right.session_id &&
+		left.generation === right.generation &&
+		left.supervisor_pid === right.supervisor_pid &&
+		left.supervisor_start_time === right.supervisor_start_time &&
+		left.supervisor_is_parent === right.supervisor_is_parent &&
+		left.server_pid === right.server_pid &&
+		left.server_start_time === right.server_start_time &&
+		left.native_session_id === right.native_session_id
+	);
+}
+
+function isStagedSupervisorProcessIdentityLive(pid: number, startTime: string): boolean {
+	if (!Number.isSafeInteger(pid) || pid <= 0 || !nonEmpty(startTime)) return false;
+	if (process.platform === "linux") {
+		const processIdentity = probeLinuxProcPidSync(pid);
+		return (
+			processIdentity.kind === "live" &&
+			processIdentity.state !== "Z" &&
+			processIdentity.state !== "X" &&
+			processIdentity.startTime === startTime
+		);
+	}
+	return nativeProcessBindings().Process.fromPid(pid)?.incarnation === startTime;
+}
+
+function assertStagedOwnerSupervisorActive(
+	paths: LifecyclePaths,
+	sessionId: string,
+	expectedBaseline: OwnerGenerationBaseline,
+	currentBaseline: OwnerGenerationBaseline,
+	authority: PortableRecoveryFsRoot,
+	requireStage: boolean,
+): void {
+	const pair = readStagedOwnerSupervisorPair(authority, paths, sessionId);
+	if (!pair) {
+		if (requireStage) throw new Error("managed_owner_staged_supervisor_evidence_missing");
+		return;
+	}
+	if (
+		!sameOwnerGenerationBaseline(pair.prepared.baseline, expectedBaseline) ||
+		!ownerGenerationBaselineMatchesExpected(currentBaseline, expectedBaseline) ||
+		currentBaseline.root_dev !== pair.prepared.root_dev ||
+		currentBaseline.root_ino !== pair.prepared.root_ino
+	)
+		throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+	if (!pair.active) throw new Error("managed_owner_staged_supervisor_not_active");
+	const supervisorAuthority = readStagedOwnerSupervisorAuthority(authority, paths, sessionId);
+	if (!sameStagedOwnerSupervisorAuthority(pair.active.supervisor_authority, supervisorAuthority))
+		throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+	if (
+		!stagedSupervisorAuthorityBindsActiveIdentity(supervisorAuthority, {
+			supervisorPid: pair.active.supervisor_pid,
+			supervisorStartTime: pair.active.supervisor_start_time,
+		})
+	)
+		throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+	if (!isStagedSupervisorProcessIdentityLive(pair.active.supervisor_pid, pair.active.supervisor_start_time))
+		throw new Error("managed_owner_staged_supervisor_identity_not_live");
+}
+
+function stagedSupervisorEvidenceMayExist(paths: LifecyclePaths): boolean {
+	for (const file of [paths.stagedSupervisorPreparedFile, paths.stagedSupervisorActiveFile]) {
+		try {
+			fsSync.lstatSync(file);
+			return true;
+		} catch (error) {
+			if (!isCode(error, "ENOENT")) throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+		}
+	}
+	return false;
+}
+
+function validateStagedOwnerSupervisorForPublication(
+	paths: LifecyclePaths,
+	sessionId: string,
+	expectedBaseline: OwnerGenerationBaseline | undefined,
+	currentBaseline: OwnerGenerationBaseline,
+	requireStage: boolean,
+	pinnedAuthority?: PortableRecoveryFsRoot,
+): void {
+	if (!requireStage) {
+		if (stagedSupervisorEvidenceMayExist(paths))
+			throw new Error("managed_owner_staged_supervisor_requires_staged_publication");
+		return;
+	}
+	if (!expectedBaseline) throw new Error("managed_owner_staged_supervisor_baseline_missing");
+	let authority = pinnedAuthority;
+	let ownsAuthority = false;
+	if (!authority) {
+		try {
+			authority = openPortableRecoveryFsRoot(paths.root);
+			ownsAuthority = true;
+		} catch {
+			throw new Error("managed_owner_staged_supervisor_evidence_untrusted");
+		}
+	}
+	try {
+		assertStagedOwnerSupervisorActive(paths, sessionId, expectedBaseline, currentBaseline, authority, requireStage);
+	} finally {
+		if (ownsAuthority) authority.close();
+	}
+}
+
+/** @internal Persist PREPARED evidence before a staged tmux `new-session` is issued. */
+export function prepareStagedOwnerSupervisorSync(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	expectedBaseline: OwnerGenerationBaseline,
+): StagedOwnerSupervisorPreparedRecord {
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	if (!isOwnerGenerationBaseline(expectedBaseline))
+		throw new Error("managed_owner_staged_supervisor_baseline_invalid");
+	const db = acquireSqliteLockSync(paths, GENERATION_LOCK_WAIT_TIMEOUT_MS);
+	if (!db) throw new Error("generation_lock_contended");
+	let authority: PortableRecoveryFsRoot | undefined;
+	let committed = false;
+	try {
+		const previous = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+		if (!ownerGenerationBaselineMatchesExpected(previous, expectedBaseline))
+			throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+		fsSync.mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		authority = openPortableRecoveryFsRoot(paths.root);
+		const current = ownerGenerationBaselineFromAuthority(authority, sessionId);
+		const identity = authority.identity();
+		if (
+			!ownerGenerationBaselineMatchesExpected(current, expectedBaseline) ||
+			!identity.ok ||
+			!identity.identity ||
+			current.root_dev !== identity.identity.dev ||
+			current.root_ino !== identity.identity.ino
+		)
+			throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+		assertNoStagedOwnerTerminal(paths);
+		if (readStagedOwnerSupervisorPair(authority, paths, sessionId))
+			throw new Error("managed_owner_staged_supervisor_prepare_replay");
+		const record: StagedOwnerSupervisorPreparedRecord = {
+			schema_version: 1,
+			kind: "staged_owner_supervisor",
+			state: "PREPARED",
+			session_id: sessionId,
+			generation,
+			baseline: expectedBaseline,
+			root_dev: identity.identity.dev,
+			root_ino: identity.identity.ino,
+			prepared_at: new Date().toISOString(),
+		};
+		const written = authority.writeExclusive(
+			path.basename(paths.stagedSupervisorPreparedFile),
+			Buffer.from(`${JSON.stringify(record)}\n`),
+		);
+		if (!written.ok)
+			throw new Error(
+				written.code === "already_exists"
+					? "managed_owner_staged_supervisor_prepare_replay"
+					: "managed_owner_staged_supervisor_prepare_failed",
+			);
+		db.exec("COMMIT");
+		committed = true;
+		return record;
+	} finally {
+		if (!committed) {
+			try {
+				db.exec("ROLLBACK");
+			} catch {}
+		}
+		try {
+			authority?.close();
+		} finally {
+			db.close();
+		}
+	}
+}
+
+/** @internal Refuse to spawn a staged child unless its immutable PREPARED evidence is already durable. */
+export function assertStagedOwnerSupervisorPrepared(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+): StagedOwnerSupervisorPreparedRecord {
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	assertNoStagedOwnerTerminal(paths);
+	let authority: PortableRecoveryFsRoot;
+	try {
+		authority = openPortableRecoveryFsRoot(paths.root);
+	} catch {
+		throw new Error("managed_owner_staged_supervisor_prepare_missing");
+	}
+	try {
+		const pair = readStagedOwnerSupervisorPair(authority, paths, sessionId);
+		if (!pair || pair.active) throw new Error("managed_owner_staged_supervisor_prepare_missing");
+		const current = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+		if (
+			!ownerGenerationBaselineMatchesExpected(current, pair.prepared.baseline) ||
+			current.root_dev !== pair.prepared.root_dev ||
+			current.root_ino !== pair.prepared.root_ino
+		)
+			throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+		return pair.prepared;
+	} finally {
+		authority.close();
+	}
+}
+
+/** @internal Synchronously wait for ACTIVE without taking the lifecycle lock. */
+export function waitForStagedOwnerSupervisorActiveSync(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	expectedBaseline: OwnerGenerationBaseline,
+	options: { timeoutMs?: number; pollMs?: number } = {},
+): StagedOwnerSupervisorActiveRecord {
+	const timeoutMs = Math.max(0, options.timeoutMs ?? 7_000);
+	const pollMs = Math.max(1, options.pollMs ?? 20);
+	const deadline = Date.now() + timeoutMs;
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	const waitCell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	while (true) {
+		let authority: PortableRecoveryFsRoot;
+		try {
+			authority = openPortableRecoveryFsRoot(paths.root);
+		} catch {
+			throw new Error("managed_owner_staged_supervisor_prepare_missing");
+		}
+		let active: StagedOwnerSupervisorActiveRecord | null = null;
+		try {
+			const pair = readStagedOwnerSupervisorPair(authority, paths, sessionId);
+			if (!pair) throw new Error("managed_owner_staged_supervisor_prepare_missing");
+			const current = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+			if (
+				!sameOwnerGenerationBaseline(pair.prepared.baseline, expectedBaseline) ||
+				!ownerGenerationBaselineMatchesExpected(current, expectedBaseline) ||
+				current.root_dev !== pair.prepared.root_dev ||
+				current.root_ino !== pair.prepared.root_ino
+			)
+				throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+			active = pair.active;
+			if (active) {
+				const supervisorAuthority = readStagedOwnerSupervisorAuthority(authority, paths, sessionId);
+				if (!sameStagedOwnerSupervisorAuthority(active.supervisor_authority, supervisorAuthority))
+					throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+				if (
+					!stagedSupervisorAuthorityBindsActiveIdentity(supervisorAuthority, {
+						supervisorPid: active.supervisor_pid,
+						supervisorStartTime: active.supervisor_start_time,
+					})
+				)
+					throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+				if (!isStagedSupervisorProcessIdentityLive(active.supervisor_pid, active.supervisor_start_time))
+					throw new Error("managed_owner_staged_supervisor_identity_not_live");
+			}
+		} finally {
+			authority.close();
+		}
+		if (active) return active;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) throw new Error("managed_owner_staged_supervisor_active_timeout");
+		Atomics.wait(waitCell, 0, 0, Math.min(pollMs, remaining));
+	}
+}
+
+/** @internal */
+export async function activateStagedOwnerSupervisor(input: {
+	stateDir: string;
+	sessionId: string;
+	generation: string;
+	supervisorPid: number;
+	supervisorStartTime: string;
+}): Promise<StagedOwnerSupervisorActiveRecord> {
+	if (
+		input.supervisorPid !== process.pid ||
+		!isStagedSupervisorProcessIdentityLive(input.supervisorPid, input.supervisorStartTime)
+	)
+		throw new Error("managed_owner_staged_supervisor_identity_untrusted");
+	const paths = lifecyclePaths(input.stateDir, input.sessionId, input.generation);
+	let activeRecord: StagedOwnerSupervisorActiveRecord | undefined;
+	await withOwnerGenerationLifecycleLock(input.stateDir, input.sessionId, input.generation, async () => {
+		const authority = openPortableRecoveryFsRoot(paths.root);
+		try {
+			const pair = readStagedOwnerSupervisorPair(authority, paths, input.sessionId);
+			if (!pair || pair.active) throw new Error("managed_owner_staged_supervisor_prepare_missing");
+			const currentBaseline = await captureOwnerGenerationBaseline(input.stateDir, input.sessionId);
+			if (
+				!ownerGenerationBaselineMatchesExpected(currentBaseline, pair.prepared.baseline) ||
+				currentBaseline.root_dev !== pair.prepared.root_dev ||
+				currentBaseline.root_ino !== pair.prepared.root_ino
+			)
+				throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+			const supervisorAuthority = readStagedOwnerSupervisorAuthority(authority, paths, input.sessionId);
+			if (!stagedSupervisorAuthorityBindsActiveIdentity(supervisorAuthority, input))
+				throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+			const record: StagedOwnerSupervisorActiveRecord = {
+				...pair.prepared,
+				state: "ACTIVE",
+				activated_at: new Date().toISOString(),
+				supervisor_pid: input.supervisorPid,
+				supervisor_start_time: input.supervisorStartTime,
+				supervisor_authority: supervisorAuthority,
+			};
+			const written = authority.writeExclusive(
+				path.basename(paths.stagedSupervisorActiveFile),
+				Buffer.from(`${JSON.stringify(record)}\n`),
+			);
+			if (!written.ok)
+				throw new Error(
+					written.code === "already_exists"
+						? "managed_owner_staged_supervisor_active_replay"
+						: "managed_owner_staged_supervisor_active_write_failed",
+				);
+			activeRecord = record;
+		} finally {
+			authority.close();
+		}
+	});
+	if (!activeRecord) throw new Error("managed_owner_staged_supervisor_active_write_failed");
+	return activeRecord;
+}
+
+/** @internal Inspect/wait for ACTIVE without holding the lifecycle lock; publishers revalidate under lock. */
+export async function waitForStagedOwnerSupervisorActive(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	expectedBaseline: OwnerGenerationBaseline,
+	options: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<StagedOwnerSupervisorActiveRecord> {
+	const timeoutMs = Math.max(0, options.timeoutMs ?? 7_000);
+	const pollMs = Math.max(1, options.pollMs ?? 20);
+	const deadline = performance.now() + timeoutMs;
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	while (true) {
+		let authority: PortableRecoveryFsRoot;
+		try {
+			authority = openPortableRecoveryFsRoot(paths.root);
+		} catch {
+			throw new Error("managed_owner_staged_supervisor_prepare_missing");
+		}
+		let active: StagedOwnerSupervisorActiveRecord | null = null;
+		try {
+			const pair = readStagedOwnerSupervisorPair(authority, paths, sessionId);
+			if (!pair) throw new Error("managed_owner_staged_supervisor_prepare_missing");
+			const current = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+			if (
+				!sameOwnerGenerationBaseline(pair.prepared.baseline, expectedBaseline) ||
+				!ownerGenerationBaselineMatchesExpected(current, expectedBaseline) ||
+				current.root_dev !== pair.prepared.root_dev ||
+				current.root_ino !== pair.prepared.root_ino
+			)
+				throw new Error("managed_owner_staged_supervisor_baseline_mismatch");
+			active = pair.active;
+			if (active) {
+				const supervisorAuthority = readStagedOwnerSupervisorAuthority(authority, paths, sessionId);
+				if (!sameStagedOwnerSupervisorAuthority(active.supervisor_authority, supervisorAuthority))
+					throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+				if (
+					!stagedSupervisorAuthorityBindsActiveIdentity(supervisorAuthority, {
+						supervisorPid: active.supervisor_pid,
+						supervisorStartTime: active.supervisor_start_time,
+					})
+				)
+					throw new Error("managed_owner_staged_supervisor_authority_mismatch");
+				if (!isStagedSupervisorProcessIdentityLive(active.supervisor_pid, active.supervisor_start_time))
+					throw new Error("managed_owner_staged_supervisor_identity_not_live");
+			}
+		} finally {
+			authority.close();
+		}
+		if (active) return active;
+		if (performance.now() >= deadline) throw new Error("managed_owner_staged_supervisor_active_timeout");
+		await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - performance.now())));
+	}
+}
+
+/** @internal Validate stage proof under the lifecycle lock; publishers repeat this check atomically. */
+export async function assertStagedOwnerSupervisorPublicationReady(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	expectedBaseline: OwnerGenerationBaseline,
+): Promise<void> {
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
+	await withOwnerGenerationLifecycleLock(stateDir, sessionId, generation, async () => {
+		assertNoStagedOwnerTerminal(paths);
+		const authority = openPortableRecoveryFsRoot(paths.root);
+		try {
+			const current = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			assertStagedOwnerSupervisorActive(paths, sessionId, expectedBaseline, current, authority, true);
+		} finally {
+			authority.close();
+		}
+	});
 }
 
 export interface ManagedOwnerPredecessorEvidence {
@@ -1895,12 +2618,32 @@ function ensureGenerationMarkerWithAuthority(
 	}
 }
 
+function assertPortableRecoveryFsRootStillVisible(authority: PortableRecoveryFsRoot, rootPath: string): void {
+	const retainedIdentity = authority.identity();
+	let visibleRoot: fsSync.Stats;
+	try {
+		visibleRoot = fsSync.lstatSync(rootPath);
+	} catch {
+		throw new Error("baseline_generation_changed");
+	}
+	if (
+		!retainedIdentity.ok ||
+		!retainedIdentity.identity ||
+		!visibleRoot.isDirectory() ||
+		visibleRoot.isSymbolicLink() ||
+		retainedIdentity.identity.dev !== visibleRoot.dev.toString() ||
+		retainedIdentity.identity.ino !== visibleRoot.ino.toString()
+	)
+		throw new Error("baseline_generation_changed");
+}
+
 /** Synchronous publication for managed launch paths, serialized by a SQLite write transaction. */
 export function replaceOwnerGenerationSync(
 	stateDir: string,
 	sessionId: string,
 	generation: string,
 	expectedBaseline: OwnerGenerationBaseline,
+	options: { stagedSupervisor?: boolean } = {},
 ): string {
 	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const db = acquireSqliteLockSync(paths, 7_000);
@@ -1909,12 +2652,20 @@ export function replaceOwnerGenerationSync(
 	let authority: PortableRecoveryFsRoot | undefined;
 	try {
 		authority = openPortableRecoveryFsRoot(paths.root);
-		assertNoStagedOwnerTerminal(paths);
+		assertNoStagedOwnerTerminal(paths, authority);
 		const previous = authority
 			? ownerGenerationBaselineFromAuthority(authority, sessionId)
 			: captureOwnerGenerationBaselineSync(stateDir, sessionId);
 		if (!ownerGenerationBaselineMatchesExpected(previous, expectedBaseline))
 			throw new Error("baseline_generation_changed");
+		validateStagedOwnerSupervisorForPublication(
+			paths,
+			sessionId,
+			expectedBaseline,
+			previous,
+			options.stagedSupervisor === true,
+			authority,
+		);
 		const published = {
 			schema_version: 1 as const,
 			generation,
@@ -1930,17 +2681,25 @@ export function replaceOwnerGenerationSync(
 					generationPublicationRecord(previous),
 				);
 			ownerGenerationAfterMarkerForTests?.();
-			const installed = authority.replace("generation.json", Buffer.from(`${JSON.stringify(published)}\n`));
-			if (!installed.ok) throw new Error("generation_publication_failed");
-			const retainedIdentity = authority.identity();
-			const visibleIdentity = fsSync.statSync(paths.root);
-			if (
-				!retainedIdentity.ok ||
-				!retainedIdentity.identity ||
-				retainedIdentity.identity.dev !== visibleIdentity.dev.toString() ||
-				retainedIdentity.identity.ino !== visibleIdentity.ino.toString()
-			)
+			const beforeInstall = ownerGenerationBaselineFromAuthority(authority, sessionId);
+			if (!ownerGenerationBaselineMatchesExpected(beforeInstall, previous))
 				throw new Error("baseline_generation_changed");
+			validateStagedOwnerSupervisorForPublication(
+				paths,
+				sessionId,
+				expectedBaseline,
+				beforeInstall,
+				options.stagedSupervisor === true,
+				authority,
+			);
+			const installed = authority.replace("generation.json", Buffer.from(`${JSON.stringify(published)}\n`));
+			if (!installed.ok)
+				throw new Error(
+					installed.code === "committed_unverified"
+						? "generation_publication_uncertain"
+						: "generation_publication_failed",
+				);
+			assertPortableRecoveryFsRootStillVisible(authority, paths.root);
 		} else {
 			publishImmutableGenerationMarkerSync(paths.generationMarkerFile, published);
 			if (previous.state === "current" && previous.generation !== generation)
@@ -1998,16 +2757,16 @@ export function publishOwnerGenerationSync(request: PublishGenerationRequest): P
  *
  * `.consumed` proves the close actually reached its verdict, `.invalidated` marks a
  * generation that was superseded by a replacement owner, and `.dispatched` records a
- * delivered SIGTERM whose verdict timed out. None may be retried because doing so would
- * supersede an authorization that may still be consumed by a late observer.
+ * delivered SIGTERM whose verdict timed out. None may authorize a new signal or intent;
+ * `.dispatched` and `.consumed` can only resume cleanup from the exact durable verdict.
  */
 const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated", ".dispatched", ".dispatching"] as const;
 
 /**
  * Prior-intent markers that record an attempt which provably did NOT consume the session:
  * `.cancelled` is written when the generation moved or the SIGTERM dispatch threw, and
- * `.expired` when the intent lapsed before dispatch. A `.dispatched` marker is written when
- * SIGTERM was delivered but no matching verdict arrived before the close caller's deadline.
+ * `.expired` when the intent lapsed before dispatch. Unlike these retryable markers,
+ * `.dispatched` remains blocking after SIGTERM is delivered without a timely verdict.
  *
  * The intent path is keyed on the owner generation, and that generation does not rotate while
  * the tmux session lives. Treating these as replay therefore wedged the session permanently:
@@ -2955,6 +3714,68 @@ async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, gen
 	return isValidGenerationRecord(record, sessionId, generation);
 }
 
+/** Resume cleanup only for the exact blocking intent whose durable verdict already exists. */
+async function recoverExactDispatchedOwnerClose(
+	request: ExactOwnerCloseRequest,
+	paths: LifecyclePaths,
+): Promise<OwnerVerdict | null> {
+	const dispatchedFile = `${paths.intentFile}.dispatched`;
+	const consumedFile = `${paths.intentFile}.consumed`;
+	const hasDispatched = await intentMarkerExists(dispatchedFile);
+	const hasConsumed = await intentMarkerExists(consumedFile);
+	if (!hasDispatched && !hasConsumed) return null;
+	if (hasDispatched && hasConsumed) throw new Error("owner_intent_replay");
+
+	const intent = await readOwnerIntentStrict(hasDispatched ? dispatchedFile : consumedFile);
+	if (
+		!intent ||
+		intent.session_id !== request.sessionId ||
+		intent.generation !== request.generation ||
+		intent.server_key !== request.serverKey
+	)
+		throw new Error("owner_intent_replay");
+	if (
+		!(await hasExactOwnerIntentBinding({
+			stateDir: request.stateDir,
+			sessionId: request.sessionId,
+			generation: request.generation,
+			serverKey: request.serverKey,
+			dispatchId: intent.dispatch_id,
+			intentId: intent.intent_id,
+		}))
+	)
+		throw new Error("owner_intent_replay");
+	if ((await intentMarkerExists(paths.intentFile)) || (await intentMarkerExists(`${paths.intentFile}.dispatching`)))
+		throw new Error("owner_intent_replay");
+	if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
+		throw new Error("owner_generation_mismatch");
+
+	let persistedVerdict: unknown;
+	try {
+		persistedVerdict = await readNoFollowJson(paths.verdictFile);
+	} catch {
+		return null;
+	}
+	if (
+		!isValidOwnerVerdict(persistedVerdict) ||
+		persistedVerdict.session_id !== intent.session_id ||
+		persistedVerdict.generation !== intent.generation ||
+		persistedVerdict.server_key !== intent.server_key ||
+		persistedVerdict.intent_id !== intent.intent_id ||
+		persistedVerdict.signal !== intent.expected_terminal.signal ||
+		persistedVerdict.result !== intent.expected_terminal.result ||
+		persistedVerdict.classification !== "expected_operator_shutdown" ||
+		Date.parse(persistedVerdict.observed_at) < Date.parse(intent.created_at) ||
+		Date.parse(persistedVerdict.observed_at) >= Date.parse(intent.expires_at)
+	)
+		return null;
+
+	// Keep the old authorization blocking and auditable while converging a dispatched
+	// marker to the consumed state before retrying its idempotent compatibility cleanup.
+	await reconcileConsumedIntent(paths, intent.intent_id);
+	return persistedVerdict;
+}
+
 export function isValidGenerationRecord(value: unknown, sessionId: string, generation: string): boolean {
 	return (
 		isRecord(value) &&
@@ -2978,6 +3799,12 @@ export async function closeExactTmuxOwner(
 	let intent: OwnerIntent;
 	let dispatched = false;
 	try {
+		const recoveredVerdict = await recoverExactDispatchedOwnerClose(request, paths);
+		if (recoveredVerdict) {
+			await releaseVerdictLock(generationLockToken);
+			await deps.cleanupSession();
+			return recoveredVerdict;
+		}
 		if ((await deps.readStartTime(request.pid)) !== request.startTime) throw new Error("owner_pid_identity_mismatch");
 		if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 			throw new Error("owner_generation_mismatch");

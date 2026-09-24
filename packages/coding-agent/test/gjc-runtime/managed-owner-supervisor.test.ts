@@ -3,24 +3,30 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { readLinuxProcStartTimeSync } from "../../src/gjc-runtime/linux-proc";
 import {
 	assertManagedOwnerGenerationPublished,
 	managedOwnerSupervisorIdentityMatches,
 	publishManagedOwnerSupervisorAuthoritySync,
-} from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
+} from "../../src/gjc-runtime/managed-owner-supervisor";
 import {
 	__setManagedOwnerEvidenceAfterFirstReadForTests,
 	__setManagedOwnerEvidenceAfterRootPinnedForTests,
 	captureOwnerGenerationBaseline,
+	captureOwnerGenerationBaselineSync,
 	closeExactTmuxOwner,
 	createOwnerIntent,
 	isOwnerGenerationBaselineCurrentSync,
 	lifecyclePaths,
 	type OwnerIntent,
 	type OwnerVerdict,
+	prepareStagedOwnerSupervisorSync,
+	readNoFollowJsonSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	resolveManagedOwnerPredecessorSync,
+	waitForStagedOwnerSupervisorActive,
 } from "../../src/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -45,6 +51,7 @@ function startSupervisor(
 		signalDuringNativeReferenceReadReadyMarker?: string;
 		generation?: string;
 		internalEntry?: boolean;
+		relayClockFile?: string;
 	} = {},
 ) {
 	const forcedMissingPidRead = options.forceMissingChildStartMarker
@@ -58,9 +65,12 @@ function startSupervisor(
 		? `if (pidReads === 2) { ${options.signalDuringNativeReferenceReadReadyMarker ? `const readyDeadline = Date.now() + 5_000; while (!existsSync(${JSON.stringify(options.signalDuringNativeReferenceReadReadyMarker)})) { if (Date.now() >= readyDeadline) throw new Error("managed_owner_test_child_ready_timeout"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1); }` : ""} appendFileSync(${JSON.stringify(options.signalDuringNativeReferenceReadMarker)}, "native-reference-read\\n"); process.nextTick(() => process.kill(process.pid, "SIGTERM")); }`
 		: "";
 	const pidReadHooks = [forcedMissingPidRead, signalDuringNativeReferenceRead].filter(Boolean).join(" ");
+	const relayClockSetup = options.relayClockFile
+		? `const { existsSync: relayClockExists, readFileSync: relayClockReadFile } = await import("node:fs"); const realDateNow = Date.now.bind(Date); Date.now = () => relayClockExists(${JSON.stringify(options.relayClockFile)}) ? Number(relayClockReadFile(${JSON.stringify(options.relayClockFile)}, "utf8")) : realDateNow();`
+		: "";
 	const script = pidReadHooks
-		? `const { appendFileSync, existsSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${pidReadHooks} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""}); } finally { Bun.spawn = originalSpawn; }`
-		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor(${options.internalEntry ? "{ requireAuthority: true }" : ""});`;
+		? `${relayClockSetup}const { appendFileSync, existsSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${pidReadHooks} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
+		: `${relayClockSetup}const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor();`;
 	return Bun.spawn({
 		cmd: [process.execPath, "-e", script, ...(options.internalEntry ? ["--internal-managed-owner-supervisor"] : [])],
 		cwd: repoRoot,
@@ -78,6 +88,69 @@ function startSupervisor(
 		},
 	});
 }
+
+function ensureTestGenerationCurrent(stateDir: string, sessionId: string, generation: string): void {
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	if (baseline.state === "current" && baseline.generation === generation) return;
+	replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline);
+}
+
+async function processStartTime(pid: number): Promise<string> {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const startTime =
+			process.platform === "linux"
+				? readLinuxProcStartTimeSync(pid)
+				: (nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null);
+		if (startTime) return startTime;
+		await Bun.sleep(10);
+	}
+	throw new Error("test_process_identity_unavailable");
+}
+
+async function publishTestSupervisorAuthority(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	supervisorPid: number,
+): Promise<void> {
+	const [supervisorStartTime, serverStartTime] = await Promise.all([
+		processStartTime(supervisorPid),
+		processStartTime(process.pid),
+	]);
+	publishManagedOwnerSupervisorAuthoritySync({
+		schema_version: 1,
+		kind: "managed_owner_supervisor_authority",
+		state_dir: stateDir,
+		session_id: sessionId,
+		generation,
+		supervisor_pid: supervisorPid,
+		supervisor_start_time: supervisorStartTime,
+		server_pid: process.pid,
+		server_start_time: serverStartTime,
+		native_session_id: "$test",
+	});
+}
+
+async function startAuthorizedSupervisor(
+	stateDir: string,
+	command: string[],
+	env: Record<string, string> = {},
+	options: NonNullable<Parameters<typeof startSupervisor>[3]> = {},
+) {
+	const sessionId = env.GJC_COORDINATOR_SESSION_ID ?? "session-2681";
+	const generation = env.GJC_TMUX_OWNER_GENERATION ?? options.generation ?? "generation-2681";
+	ensureTestGenerationCurrent(stateDir, sessionId, generation);
+	const supervisor = startSupervisor(stateDir, command, { GJC_TMUX_COMMAND: "tmux", ...env }, options);
+	try {
+		await publishTestSupervisorAuthority(stateDir, sessionId, generation, supervisor.pid);
+	} catch (error) {
+		supervisor.kill("SIGKILL");
+		await supervisor.exited;
+		throw error;
+	}
+	return supervisor;
+}
+
 async function runSupervisor(
 	stateDir: string,
 	command: string[],
@@ -91,7 +164,34 @@ async function runSupervisor(
 		generation?: string;
 	} = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const child = startSupervisor(stateDir, command, env, options);
+	const staged = env.GJC_TMUX_OWNER_GENERATION_STAGED === "1";
+	const sessionId = env.GJC_COORDINATOR_SESSION_ID ?? "session-2681";
+	const generation = env.GJC_TMUX_OWNER_GENERATION ?? options.generation ?? "generation-2681";
+	const paths = staged ? lifecyclePaths(stateDir, sessionId, generation) : undefined;
+	const persistedStage =
+		paths && fsSync.existsSync(paths.stagedSupervisorPreparedFile)
+			? (readNoFollowJsonSync(paths.stagedSupervisorPreparedFile) as {
+					baseline?: ReturnType<typeof captureOwnerGenerationBaselineSync>;
+				} | null)
+			: null;
+	const baseline = staged
+		? (persistedStage?.baseline ?? captureOwnerGenerationBaselineSync(stateDir, sessionId))
+		: undefined;
+	if (staged && baseline && paths && !persistedStage)
+		prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
+	const child = staged
+		? startSupervisor(
+				stateDir,
+				command,
+				{ GJC_TMUX_COMMAND: "tmux", GJC_TMUX_OWNER_SERVER_KEY: "tmux", ...env },
+				options,
+			)
+		: await startAuthorizedSupervisor(stateDir, command, env, options);
+	if (staged && baseline) {
+		await publishTestSupervisorAuthority(stateDir, sessionId, generation, child.pid);
+		await waitForStagedOwnerSupervisorActive(stateDir, sessionId, generation, baseline);
+		replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline, { stagedSupervisor: true });
+	}
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
@@ -392,6 +492,25 @@ describe("managed owner supervisor", () => {
 		}
 	});
 
+	it("does not run a supplied child from an unauthenticated direct programmatic entry", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-no-authority-"));
+		const marker = path.join(stateDir, "unauthenticated-child-ran");
+		try {
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+			const supervisor = startSupervisor(
+				stateDir,
+				[process.execPath, "-e", `await Bun.write(${JSON.stringify(marker)}, "ran")`],
+				{ GJC_TMUX_COMMAND: "tmux", GJC_TMUX_OWNER_SERVER_KEY: "tmux" },
+			);
+			const [stderr, exitCode] = await Promise.all([new Response(supervisor.stderr).text(), supervisor.exited]);
+			expect(exitCode).not.toBe(0);
+			expect(stderr).toContain("managed_owner_supervisor_authority_unavailable");
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	}, 10_000);
+
 	it("records one exact durable SIGABRT receipt and exits with the abort status", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {
@@ -475,49 +594,186 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
-	it("journals a staged terminal and refuses generation publication", async () => {
+	it("publishes generation before executing a staged supervisor child", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const childMarker = path.join(stateDir, "child-ran-after-publication");
 		try {
-			const result = await runSupervisor(stateDir, [process.execPath, "-e", "process.exit(23)"], {
-				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
-			});
-			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
-			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
-			expect(await Bun.file(paths.stagedTerminalFile).json()).toMatchObject({
-				kind: "staged_owner_terminal",
-				generation: "generation-2681",
-				session_id: "session-2681",
-				exit_code: 23,
-			});
-			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-2681")).rejects.toThrow(
-				"managed_owner_staged_terminal_before_publication",
+			const result = await runSupervisor(
+				stateDir,
+				[
+					process.execPath,
+					"-e",
+					`const fs = await import("node:fs"); const generation = JSON.parse(fs.readFileSync(${JSON.stringify(lifecyclePaths(stateDir, "session-2681", "generation-2681").generationFile)}, "utf8")); if (generation.generation !== "generation-2681") process.exit(31); if (process.env.GJC_TMUX_OWNER_GENERATION_STAGED) process.exit(32); fs.writeFileSync(${JSON.stringify(childMarker)}, "ran\\n"); process.exit(23);`,
+				],
+				{
+					GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+				},
 			);
-			expect(await replaceOwnerGeneration(stateDir, "session-2681", "generation-2682")).toBe("generation-2682");
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(23);
+			expect(fsSync.existsSync(childMarker)).toBe(true);
+			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+			expect(fsSync.existsSync(paths.stagedSupervisorActiveFile)).toBe(true);
+			expect(fsSync.existsSync(paths.verdictFile)).toBe(true);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
-	it("journals a staged terminal when an older owner generation is current", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+	it("rejects publication after a supervisor exits while ACTIVE and before child release", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-stage-supervisor-exit-"));
 		try {
-			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2680");
-			const result = await runSupervisor(
-				stateDir,
-				[process.execPath, "-e", "process.exit(23)"],
-				{ GJC_TMUX_OWNER_GENERATION_STAGED: "1" },
-				{ generation: "generation-2681" },
-			);
-			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
-			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
-			expect(await Bun.file(paths.stagedTerminalFile).json()).toMatchObject({
-				kind: "staged_owner_terminal",
-				generation: "generation-2681",
-				exit_code: 23,
+			const sessionId = "session-2681";
+			const generation = "generation-2681";
+			const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+			prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", "process.exit(19)"], {
+				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+				GJC_TMUX_COMMAND: "tmux",
+				GJC_TMUX_OWNER_SERVER_KEY: "tmux",
 			});
-			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-2681")).rejects.toThrow(
-				"managed_owner_staged_terminal_before_publication",
-			);
+			let supervisorStartTime: string | null = null;
+			for (let attempt = 0; attempt < 100 && !supervisorStartTime; attempt += 1) {
+				supervisorStartTime =
+					process.platform === "linux"
+						? readLinuxProcStartTimeSync(supervisor.pid)
+						: (nativeProcessBindings().Process.fromPid(supervisor.pid)?.incarnation ?? null);
+				if (!supervisorStartTime) await Bun.sleep(10);
+			}
+			const serverStartTime =
+				process.platform === "linux"
+					? readLinuxProcStartTimeSync(process.pid)
+					: (nativeProcessBindings().Process.fromPid(process.pid)?.incarnation ?? null);
+			if (!supervisorStartTime || !serverStartTime) throw new Error("test_process_identity_unavailable");
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: stateDir,
+				session_id: sessionId,
+				generation,
+				supervisor_pid: supervisor.pid,
+				supervisor_start_time: supervisorStartTime,
+				server_pid: process.pid,
+				server_start_time: serverStartTime,
+				native_session_id: "$test",
+			});
+			await waitForFile(paths.stagedSupervisorActiveFile);
+			expect(fsSync.existsSync(path.join(stateDir, "child-ran"))).toBe(false);
+			supervisor.kill("SIGKILL");
+			await supervisor.exited;
+			expect(await Bun.file(paths.stagedSupervisorPreparedFile).json()).toMatchObject({ state: "PREPARED" });
+			expect(await Bun.file(paths.stagedSupervisorActiveFile).json()).toMatchObject({
+				state: "ACTIVE",
+				session_id: sessionId,
+				generation,
+			});
+			await expect(fs.access(paths.stagedTerminalFile)).rejects.toThrow();
+			await expect(
+				replaceOwnerGeneration(stateDir, sessionId, generation, baseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_identity_not_live");
 		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("retains supervisor proof when post-publication terminal journaling fails", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-terminal-journal-failure-"));
+		const releaseMarker = path.join(stateDir, "release-child");
+		const childReadyMarker = path.join(stateDir, "child-ready");
+		let supervisor: ReturnType<typeof startSupervisor> | undefined;
+		let supervisorResult: Promise<{ exitCode: number; stdout: string; stderr: string }> | undefined;
+		let childReleased = false;
+		try {
+			const sessionId = "session-2681";
+			const generation = "generation-2681";
+			const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+			prepareStagedOwnerSupervisorSync(stateDir, sessionId, generation, baseline);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			const runningSupervisor = startSupervisor(
+				stateDir,
+				[
+					process.execPath,
+					"-e",
+					`const { existsSync, writeFileSync } = await import("node:fs"); writeFileSync(${JSON.stringify(childReadyMarker)}, "ready\\n"); const deadline = Date.now() + 10000; while (!existsSync(${JSON.stringify(releaseMarker)})) { if (Date.now() >= deadline) process.exit(24); await Bun.sleep(10); } process.exit(23);`,
+				],
+				{
+					GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_TMUX_OWNER_SERVER_KEY: "tmux",
+				},
+			);
+			supervisor = runningSupervisor;
+			supervisorResult = Promise.all([
+				new Response(runningSupervisor.stdout).text(),
+				new Response(runningSupervisor.stderr).text(),
+				runningSupervisor.exited,
+			]).then(([stdout, stderr, exitCode]) => ({ exitCode, stdout, stderr }));
+			let supervisorStartTime: string | null = null;
+			for (let attempt = 0; attempt < 100 && !supervisorStartTime; attempt += 1) {
+				supervisorStartTime =
+					process.platform === "linux"
+						? readLinuxProcStartTimeSync(runningSupervisor.pid)
+						: (nativeProcessBindings().Process.fromPid(runningSupervisor.pid)?.incarnation ?? null);
+				if (!supervisorStartTime) await Bun.sleep(10);
+			}
+			const serverStartTime =
+				process.platform === "linux"
+					? readLinuxProcStartTimeSync(process.pid)
+					: (nativeProcessBindings().Process.fromPid(process.pid)?.incarnation ?? null);
+			if (!supervisorStartTime || !serverStartTime) throw new Error("test_process_identity_unavailable");
+			publishManagedOwnerSupervisorAuthoritySync({
+				schema_version: 1,
+				kind: "managed_owner_supervisor_authority",
+				state_dir: stateDir,
+				session_id: sessionId,
+				generation,
+				supervisor_pid: runningSupervisor.pid,
+				supervisor_start_time: supervisorStartTime,
+				server_pid: process.pid,
+				server_start_time: serverStartTime,
+				native_session_id: "$test",
+			});
+			await waitForFile(paths.stagedSupervisorActiveFile);
+			expect(fsSync.existsSync(childReadyMarker)).toBe(false);
+			replaceOwnerGenerationSync(stateDir, sessionId, generation, baseline, { stagedSupervisor: true });
+			await waitForFile(childReadyMarker);
+			expect(captureOwnerGenerationBaselineSync(stateDir, sessionId)).toMatchObject({
+				state: "current",
+				generation,
+			});
+			await fs.mkdir(paths.stagedTerminalFile);
+			await replaceOwnerGeneration(stateDir, sessionId, "generation-2682");
+			await fs.writeFile(releaseMarker, "release\n");
+			childReleased = true;
+			const result = await supervisorResult;
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			expect(fsSync.statSync(paths.stagedTerminalFile).isDirectory()).toBe(true);
+			expect(await fs.readdir(paths.stagedTerminalFile)).toEqual([]);
+			expect(await Bun.file(paths.stagedSupervisorPreparedFile).json()).toMatchObject({ state: "PREPARED" });
+			expect(await Bun.file(paths.stagedSupervisorActiveFile).json()).toMatchObject({
+				state: "ACTIVE",
+				supervisor_authority: { generation, session_id: sessionId },
+			});
+			expect(await Bun.file(paths.verdictFile).exists()).toBe(false);
+			await fs.rm(paths.stagedTerminalFile, { recursive: true });
+			const currentBaseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+			expect(currentBaseline).toMatchObject({ state: "current", generation: "generation-2682" });
+			await expect(replaceOwnerGeneration(stateDir, sessionId, generation, currentBaseline)).rejects.toThrow(
+				"managed_owner_staged_supervisor_requires_staged_publication",
+			);
+			await expect(
+				replaceOwnerGeneration(stateDir, sessionId, generation, currentBaseline, { stagedSupervisor: true }),
+			).rejects.toThrow("managed_owner_staged_supervisor_baseline_mismatch");
+			expect(captureOwnerGenerationBaselineSync(stateDir, sessionId)).toMatchObject({
+				state: "current",
+				generation: "generation-2682",
+			});
+		} finally {
+			if (supervisor && supervisorResult) {
+				if (!childReleased) {
+					await fs.writeFile(releaseMarker, "release\n").catch(() => undefined);
+					supervisor.kill("SIGKILL");
+				}
+				await supervisorResult;
+			}
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
@@ -675,12 +931,25 @@ describe("managed owner supervisor", () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		const sessionId = "session-2681";
 		const generation = "generation-2681";
+		const stateFile = path.join(stateDir, "coordinator-runtime-state.json");
 		const forwardedSignal = path.join(stateDir, "forwarded-sigterm.marker");
 		const provenanceRead = path.join(stateDir, "native-reference-read.marker");
 		const childReady = path.join(stateDir, "child-ready.marker");
 		try {
 			await replaceOwnerGeneration(stateDir, sessionId, generation);
-			await createOwnerIntent(stateDir, {
+			await fs.writeFile(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					state: "running",
+					cwd: stateDir,
+					workdir: stateDir,
+					session_file: null,
+				}),
+			);
+			const dispatchId = "provenance-reread-dispatch";
+			const intent = await createOwnerIntent(stateDir, {
 				generation,
 				session_id: sessionId,
 				server_key: "server-key",
@@ -688,7 +957,7 @@ describe("managed owner supervisor", () => {
 					signal: "SIGTERM",
 					result: "owner_term_then_session_cleanup",
 				},
-				dispatch_id: "provenance-reread-dispatch",
+				dispatch_id: dispatchId,
 				created_at: new Date(Date.now() - 1_000).toISOString(),
 				expires_at: new Date(Date.now() + 60_000).toISOString(),
 			});
@@ -702,7 +971,11 @@ setInterval(() => {}, 1_000);`;
 			const result = await runSupervisor(
 				stateDir,
 				[process.execPath, "-e", childScript],
-				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+				{
+					GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					GJC_MANAGED_OWNER_SUPERVISED: "1",
+				},
 				{
 					signalDuringNativeReferenceReadMarker: provenanceRead,
 					signalDuringNativeReferenceReadReadyMarker: childReady,
@@ -716,8 +989,24 @@ setInterval(() => {}, 1_000);`;
 				signal: "SIGTERM",
 				result: "owner_term_then_session_cleanup",
 				classification: "expected_operator_shutdown",
+				intent_id: intent.intent_id,
 			});
 			expect(verdict.intent_id).toBeString();
+			expect(JSON.parse(await fs.readFile(stateFile, "utf8"))).toMatchObject({
+				session_id: sessionId,
+				state: "completed",
+				owner_terminal: {
+					generation,
+					socket_key: "server-key",
+					classification: "expected_operator_shutdown",
+					intent_id: intent.intent_id,
+				},
+			});
+			expect(
+				JSON.parse(
+					await fs.readFile(`${lifecyclePaths(stateDir, sessionId, generation).intentFile}.consumed`, "utf8"),
+				),
+			).toMatchObject({ dispatch_id: dispatchId, intent_id: intent.intent_id });
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
@@ -962,7 +1251,7 @@ process.on("SIGTERM", () => {
 });
 await writeFile(process.env.READY_FILE!, "ready");
 setInterval(() => {}, 1_000);`;
-			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+			const supervisor = await startAuthorizedSupervisor(stateDir, [process.execPath, "-e", childScript], {
 				READY_FILE: readyFile,
 				CLEANUP_FILE: cleanupFile,
 			});
@@ -994,7 +1283,7 @@ process.on("SIGTERM", () => {
 });
 writeFileSync(process.env.READY_FILE!, "ready");
 setInterval(() => {}, 1_000);`;
-			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+			const supervisor = await startAuthorizedSupervisor(stateDir, [process.execPath, "-e", childScript], {
 				READY_FILE: readyFile,
 				SIGNAL_FILE: signalFile,
 				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
@@ -1059,7 +1348,7 @@ process.on("SIGTERM", () => {
 });
 writeFileSync(process.env.READY_FILE!, "ready");
 setInterval(() => {}, 1_000);`;
-			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+			const supervisor = await startAuthorizedSupervisor(stateDir, [process.execPath, "-e", childScript], {
 				READY_FILE: readyFile,
 				SIGNAL_FILE: signalFile,
 				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
@@ -1079,6 +1368,69 @@ setInterval(() => {}, 1_000);`;
 			await expect(
 				fs.access(`${lifecyclePaths(stateDir, sessionId, generation).intentFile}.consumed`),
 			).resolves.toBeNull();
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("uses the same pre-delivery timestamp to validate a near-expiry relay", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-relay-expiry-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const readyFile = path.join(stateDir, "child-ready");
+		const signalFile = path.join(stateDir, "child-signals");
+		const relayClockFile = path.join(stateDir, "relay-clock");
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const expiresAtMs = Date.now() + 1_000;
+			const expiresAt = new Date(expiresAtMs).toISOString();
+			await createOwnerIntent(stateDir, {
+				generation,
+				session_id: sessionId,
+				server_key: "server-key",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "near-expiry-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: expiresAt,
+			});
+			const childScript = `import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => {
+	writeFileSync(process.env.SIGNAL_FILE!, "SIGTERM\\n");
+	process.exit(0);
+});
+writeFileSync(process.env.READY_FILE!, "ready\\n");
+setInterval(() => {}, 1_000);`;
+			const supervisor = await startAuthorizedSupervisor(
+				stateDir,
+				[process.execPath, "-e", childScript],
+				{
+					READY_FILE: readyFile,
+					SIGNAL_FILE: signalFile,
+					GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+				},
+				{ relayClockFile },
+			);
+			await waitForFile(readyFile);
+			const expiryDeadline = Date.now() + 3_000;
+			while (Date.now() < expiresAtMs && Date.now() < expiryDeadline) await Bun.sleep(5);
+			if (Date.now() < expiresAtMs) throw new Error("test_intent_expiry_not_reached");
+			await fs.writeFile(relayClockFile, String(expiresAtMs - 1));
+			process.kill(supervisor.pid, "SIGTERM");
+			const [stderr, exitCode] = await Promise.all([new Response(supervisor.stderr).text(), supervisor.exited]);
+			expect(exitCode, stderr).toBe(0);
+			expect(await fs.readFile(signalFile, "utf8")).toBe("SIGTERM\n");
+			const verdict = JSON.parse(
+				await fs.readFile(lifecyclePaths(stateDir, sessionId, generation).verdictFile, "utf8"),
+			) as OwnerVerdict;
+			expect(verdict).toMatchObject({
+				classification: "expected_operator_shutdown",
+				result: "owner_term_then_session_cleanup",
+				intent_id: expect.any(String),
+				observed_at: new Date(expiresAtMs - 1).toISOString(),
+			});
+			expect(Date.parse(verdict.observed_at)).toBeLessThan(Date.parse(expiresAt));
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
@@ -1106,7 +1458,7 @@ setInterval(() => {}, 1_000);`;
 			const childScript = `import { chmod, writeFile } from "node:fs/promises"; import { lifecyclePaths } from ${JSON.stringify(
 				path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"),
 			)}; process.on("SIGTERM", async () => { await chmod(lifecyclePaths(process.env.GJC_TMUX_OWNER_STATE_DIR!, process.env.GJC_COORDINATOR_SESSION_ID!, process.env.GJC_TMUX_OWNER_GENERATION!).root, 0o500); process.exit(0); }); await writeFile(process.env.READY_FILE!, "ready"); setInterval(() => {}, 1_000);`;
-			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+			const supervisor = await startAuthorizedSupervisor(stateDir, [process.execPath, "-e", childScript], {
 				READY_FILE: readyFile,
 				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
 			});

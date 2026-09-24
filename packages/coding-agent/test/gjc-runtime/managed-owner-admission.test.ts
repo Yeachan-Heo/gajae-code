@@ -79,16 +79,20 @@ async function writeBinding(root: string, token: string, patch: Record<string, u
 }
 
 describe("managed owner admission", () => {
-	it("exposes no predecessor recovery mutators and excludes owner admission as a package subpath", async () => {
+	it("keeps internal owner-control APIs unavailable as package subpaths", async () => {
 		expect(managedOwnerAdmission).not.toHaveProperty("admitManagedOwnerPredecessorBeforeLaunch");
 		expect(managedOwnerAdmission).not.toHaveProperty("completeManagedOwnerRecovery");
 		const specifiers = [
 			"@gajae-code/coding-agent/gjc-runtime/managed-owner-admission",
 			"@gajae-code/coding-agent/gjc-runtime/managed-owner-admission.js",
+			"@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor",
+			"@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor.js",
 			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation",
 			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation.js",
 			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli",
 			"@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli.js",
+			"@gajae-code/coding-agent/gjc-runtime/session-state-sidecar",
+			"@gajae-code/coding-agent/gjc-runtime/session-state-sidecar.js",
 		];
 		const source = `for (const specifier of ${JSON.stringify(specifiers)}) { try { require.resolve(specifier); process.exitCode = 1; break; } catch (error) { if (!(error && typeof error === "object" && "code" in error && error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED")) { process.exitCode = 2; break; } } }`;
 		const child = Bun.spawnSync(["node", "-e", source], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
@@ -100,10 +104,14 @@ describe("managed owner admission", () => {
 		};
 		expect(packageManifest.exports["./gjc-runtime/managed-owner-admission"]).toBeNull();
 		expect(packageManifest.exports["./gjc-runtime/managed-owner-admission.js"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/managed-owner-supervisor"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/managed-owner-supervisor.js"]).toBeNull();
 		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation"]).toBeNull();
 		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation.js"]).toBeNull();
 		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation-cli"]).toBeNull();
 		expect(packageManifest.exports["./gjc-runtime/tmux-owner-isolation-cli.js"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/session-state-sidecar"]).toBeNull();
+		expect(packageManifest.exports["./gjc-runtime/session-state-sidecar.js"]).toBeNull();
 	});
 
 	it("treats a coordinator session ID alone as fresh while rejecting partial owner metadata", async () => {

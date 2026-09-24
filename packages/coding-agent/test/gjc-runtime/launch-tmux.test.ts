@@ -26,12 +26,6 @@ import {
 	sessionStateDir,
 	sessionUltragoalDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import {
-	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
-	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
-	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
-	persistCoordinatorRuntimeStateFromPostmortem,
-} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import { __setTmuxProviderAuthorityPlatformForTests } from "@gajae-code/coding-agent/gjc-runtime/tmux-provider-context";
 import {
 	__setCreateOwnerIsolationForTests,
@@ -40,6 +34,12 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
+import {
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
+	persistCoordinatorRuntimeStateFromPostmortem,
+} from "../../src/gjc-runtime/session-state-sidecar";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -80,6 +80,33 @@ const launchTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-launch-tests-"
 let launchStateSequence = 0;
 const NATIVE_SESSION_ID = "$0";
 const nativeTmux = process.platform === "win32" ? null : Bun.which("tmux");
+type StagedSupervisorWorker = ReturnType<typeof Bun.spawn>;
+
+function startStagedSupervisorWorker(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	activate: boolean,
+): StagedSupervisorWorker {
+	const ownerModule = new URL("../../src/gjc-runtime/tmux-owner-isolation.ts", import.meta.url).href;
+	const procModule = new URL("../../src/gjc-runtime/linux-proc.ts", import.meta.url).href;
+	const script = `const { existsSync } = await import("node:fs"); const owner = await import(${JSON.stringify(ownerModule)}); const proc = await import(${JSON.stringify(procModule)}); const activate = ${String(activate)}; const stateDir = process.env.GJC_TEST_STATE_DIR; const sessionId = process.env.GJC_TEST_SESSION_ID; const generation = process.env.GJC_TEST_GENERATION; const paths = owner.lifecyclePaths(stateDir, sessionId, generation); const authority = paths.root + "/supervisor-authority-" + generation + ".json"; let child; process.on("SIGTERM", () => child ? child.kill("SIGTERM") : process.exit(0)); if (!activate) { const keepAlive = setInterval(() => {}, 1000); await new Promise(() => {}); clearInterval(keepAlive); } const deadline = Date.now() + 7000; while (!existsSync(authority)) { if (Date.now() >= deadline) process.exit(4); await Bun.sleep(10); } const startTime = await proc.readLinuxProcStartTime(process.pid); if (!startTime) process.exit(5); await owner.activateStagedOwnerSupervisor({ stateDir, sessionId, generation, supervisorPid: process.pid, supervisorStartTime: startTime }); while (Date.now() < deadline) { const baseline = owner.captureOwnerGenerationBaselineSync(stateDir, sessionId); if (baseline.state === "current" && baseline.generation === generation) break; await Bun.sleep(10); } const published = owner.captureOwnerGenerationBaselineSync(stateDir, sessionId); if (published.state !== "current" || published.generation !== generation) process.exit(6); child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); await child.exited;`;
+	return Bun.spawn([process.execPath, "-e", script], {
+		stdout: "ignore",
+		stderr: "ignore",
+		env: {
+			...process.env,
+			GJC_TEST_STATE_DIR: stateDir,
+			GJC_TEST_SESSION_ID: sessionId,
+			GJC_TEST_GENERATION: generation,
+		},
+	});
+}
+
+async function stopStagedSupervisorWorkers(workers: StagedSupervisorWorker[]): Promise<void> {
+	for (const worker of workers) worker.kill("SIGTERM");
+	await Promise.all(workers.map(worker => worker.exited));
+}
 
 function safeAbsentOwnerIsolationProbe(
 	platform: NodeJS.Platform = "linux",
@@ -122,11 +149,33 @@ function launchContext(context: TmuxLaunchContext): TmuxLaunchContext {
 	};
 }
 
-async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Promise<boolean> {
+async function launchDefaultTmuxIfNeeded(
+	context: TmuxLaunchContext,
+	stagedSupervisorMode: "active" | "no-active" = "active",
+): Promise<boolean> {
 	let createdSessionName = context.env?.GJC_TMUX_SESSION;
 	const suppliedSpawnSync = context.spawnSync;
+	const invokeSpawnSync =
+		suppliedSpawnSync ??
+		((command: string, spawnArgs: string[], options: TmuxSpawnOptions) => {
+			const result = Bun.spawnSync({
+				cmd: [command, ...spawnArgs],
+				cwd: options.cwd,
+				env: options.env,
+				stdin: options.stdinLine ? Buffer.from(options.stdinLine) : options.stdin,
+				stdout: options.stdout,
+				stderr: options.stderr,
+			});
+			return {
+				exitCode: result.exitCode,
+				stdout: Buffer.from(result.stdout ?? []).toString("utf8"),
+				stderr: Buffer.from(result.stderr ?? []).toString("utf8"),
+			};
+		});
 	const psmuxMetadata = new Map<string, string>();
-	return await launchDefaultTmuxIfNeededRaw(
+	const stagedWorkers = new Map<string, StagedSupervisorWorker>();
+	const stagedWorkerProcesses: StagedSupervisorWorker[] = [];
+	const launch = launchDefaultTmuxIfNeededRaw(
 		launchContext({
 			...context,
 			providerAuthorityResolver:
@@ -146,62 +195,142 @@ async function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): Promise<bo
 			providerAuthorityPersist: context.providerAuthorityPersist ?? (() => {}),
 			providerAuthorityStagedAssert: context.providerAuthorityStagedAssert ?? (() => {}),
 			providerAuthorityAssert: context.providerAuthorityAssert ?? (() => {}),
-			spawnSync: suppliedSpawnSync
-				? (command, spawnArgs, options) => {
-						const commandArgs =
-							spawnArgs[0] === "-L" && spawnArgs[1]?.startsWith("gjc-test-") ? spawnArgs.slice(2) : spawnArgs;
-						if (command === "systemd-run" && options.stdinLine) {
-							try {
-								createdSessionName = (JSON.parse(options.stdinLine) as { attempt?: { session_name?: string } })
-									.attempt?.session_name;
-							} catch {}
-						}
-						if (commandArgs[0] === "new-session") {
-							const nameIndex = commandArgs.indexOf("-s");
-							createdSessionName = commandArgs[nameIndex + 1] ?? createdSessionName;
-						}
-						const result = suppliedSpawnSync(command, commandArgs, options);
-						if (commandArgs[0] === "set-option") {
-							const option = commandArgs.at(-2);
-							const value = commandArgs.at(-1);
-							if (option?.startsWith("@gjc-") && value) psmuxMetadata.set(option, value);
-						}
-						if (
-							commandArgs[0] === "display-message" &&
-							commandArgs.at(-1) === "#{session_name}" &&
-							result.exitCode === 0 &&
-							!result.stdout?.trim()
-						)
-							return { ...result, stdout: createdSessionName ?? "gajae_code" };
-						if (
-							commandArgs[0] === "display-message" &&
-							commandArgs.at(-1)?.startsWith("#{@gjc-") &&
-							result.exitCode === 0 &&
-							!result.stdout?.trim()
-						) {
-							const option = commandArgs.at(-1)!.slice(2, -1);
-							return { ...result, stdout: psmuxMetadata.get(option) ?? "" };
-						}
-						const targetIndex = commandArgs.indexOf("-t");
-						const nativeSessionId = targetIndex >= 0 ? commandArgs[targetIndex + 1] : NATIVE_SESSION_ID;
-						if (
-							commandArgs[0] === "display-message" &&
-							commandArgs.at(-1) === "#{session_id}\t#{session_name}" &&
-							result.exitCode === 0 &&
-							(result.stdout?.trim() === nativeSessionId || !result.stdout?.trim())
-						)
-							return { ...result, stdout: `${nativeSessionId}\t${createdSessionName ?? "gajae_code"}` };
-						if (
-							commandArgs[0] === "if-shell" &&
-							result.exitCode === 0 &&
-							result.stdout?.trim() !== "__gjc_tmux_guarded_cleanup_refused__"
-						)
-							return { ...result, stdout: "__gjc_tmux_guarded_cleanup_ok__" };
-						return result;
+			spawnSync: (command, spawnArgs, options) => {
+				const commandArgs =
+					spawnArgs[0] === "-L" && spawnArgs[1]?.startsWith("gjc-test-") ? spawnArgs.slice(2) : spawnArgs;
+				if (command === "systemd-run" && options.stdinLine) {
+					let request: {
+						session_id?: string;
+						owner_generation?: string;
+						state_dir?: string;
+						attempt?: { session_name?: string };
+						tmux_argv?: string[];
+					};
+					try {
+						request = JSON.parse(options.stdinLine) as {
+							session_id?: string;
+							owner_generation?: string;
+							state_dir?: string;
+							attempt?: { session_name?: string };
+							tmux_argv?: string[];
+						};
+					} catch {
+						request = {};
 					}
-				: undefined,
+					createdSessionName = request.attempt?.session_name;
+					if (
+						process.platform === "linux" &&
+						request.state_dir &&
+						request.session_id &&
+						request.owner_generation &&
+						!fs.existsSync(
+							lifecyclePaths(request.state_dir, request.session_id, request.owner_generation)
+								.stagedSupervisorPreparedFile,
+						)
+					)
+						throw new Error("test_staged_launch_scoped_spawned_without_prepared_record");
+					if (
+						process.platform === "linux" &&
+						request.state_dir &&
+						request.session_id &&
+						request.owner_generation &&
+						request.tmux_argv?.at(-1)?.includes("GJC_TMUX_OWNER_GENERATION_STAGED='1'") &&
+						!stagedWorkers.has(request.owner_generation)
+					) {
+						const worker = startStagedSupervisorWorker(
+							request.state_dir,
+							request.session_id,
+							request.owner_generation,
+							stagedSupervisorMode === "active",
+						);
+						stagedWorkers.set(request.owner_generation, worker);
+						stagedWorkerProcesses.push(worker);
+					}
+				}
+				if (commandArgs[0] === "new-session") {
+					const nameIndex = commandArgs.indexOf("-s");
+					createdSessionName = commandArgs[nameIndex + 1] ?? createdSessionName;
+					const innerCommand = commandArgs.at(-1) ?? "";
+					if (process.platform === "linux" && innerCommand.includes("GJC_TMUX_OWNER_GENERATION_STAGED='1'")) {
+						const envValue = (name: string): string => {
+							const match = new RegExp(`${name}='([^']+)'`).exec(innerCommand);
+							if (!match?.[1]) throw new Error(`test_staged_launch_identity_missing:${name}`);
+							return match[1];
+						};
+						const stateDir = envValue("GJC_TMUX_OWNER_STATE_DIR");
+						const sessionId = envValue("GJC_COORDINATOR_SESSION_ID");
+						const generation = envValue("GJC_TMUX_OWNER_GENERATION");
+						const paths = lifecyclePaths(stateDir, sessionId, generation);
+						if (!fs.existsSync(paths.stagedSupervisorPreparedFile))
+							throw new Error("test_staged_launch_spawned_without_prepared_record");
+						const worker = startStagedSupervisorWorker(
+							stateDir,
+							sessionId,
+							generation,
+							stagedSupervisorMode === "active",
+						);
+						stagedWorkers.set(generation, worker);
+						stagedWorkerProcesses.push(worker);
+					}
+				}
+				const result = invokeSpawnSync(command, commandArgs, options);
+				if (
+					process.platform === "linux" &&
+					commandArgs[0] === "display-message" &&
+					commandArgs.at(-1) === "#{pane_pid}"
+				) {
+					const worker = [...stagedWorkers.values()].at(-1);
+					if (worker) return { ...result, stdout: `${worker.pid}\n` };
+				}
+				if (process.platform === "linux" && commandArgs[0] === "list-panes") {
+					const worker = [...stagedWorkers.values()].at(-1);
+					if (worker) return { ...result, stdout: `${worker.pid}\n` };
+				}
+				if (commandArgs[0] === "set-option") {
+					const option = commandArgs.at(-2);
+					const value = commandArgs.at(-1);
+					if (option?.startsWith("@gjc-") && value) psmuxMetadata.set(option, value);
+				}
+				if (
+					commandArgs[0] === "display-message" &&
+					commandArgs.at(-1) === "#{session_name}" &&
+					result.exitCode === 0 &&
+					!result.stdout?.trim()
+				)
+					return { ...result, stdout: createdSessionName ?? "gajae_code" };
+				if (
+					commandArgs[0] === "display-message" &&
+					commandArgs.at(-1)?.startsWith("#{@gjc-") &&
+					result.exitCode === 0 &&
+					!result.stdout?.trim()
+				) {
+					const option = commandArgs.at(-1)!.slice(2, -1);
+					return { ...result, stdout: psmuxMetadata.get(option) ?? "" };
+				}
+				const targetIndex = commandArgs.indexOf("-t");
+				const nativeSessionId = targetIndex >= 0 ? commandArgs[targetIndex + 1] : NATIVE_SESSION_ID;
+				if (
+					commandArgs[0] === "display-message" &&
+					commandArgs.at(-1) === "#{session_id}\t#{session_name}" &&
+					result.exitCode === 0 &&
+					(result.stdout?.trim() === nativeSessionId || !result.stdout?.trim())
+				)
+					return { ...result, stdout: `${nativeSessionId}\t${createdSessionName ?? "gajae_code"}` };
+				if (
+					commandArgs[0] === "if-shell" &&
+					result.exitCode === 0 &&
+					result.stdout?.trim() !== "__gjc_tmux_guarded_cleanup_refused__"
+				)
+					return { ...result, stdout: "__gjc_tmux_guarded_cleanup_ok__" };
+				return result;
+			},
 		}),
 	);
+	try {
+		return await launch;
+	} finally {
+		await stopStagedSupervisorWorkers(stagedWorkerProcesses);
+	}
 }
 
 function spawnResult(exitCode: number, stdout: string, stderr = ""): SpawnSyncResult {
@@ -267,6 +396,109 @@ describe("default GJC tmux launch", () => {
 		expect(buildGjcTmuxWindowTitle("/repo", null)).toBe("GJC-repo");
 		expect(buildGjcTmuxWindowTitle("/repo", "")).toBe("GJC-repo");
 	});
+
+	it("persists PREPARED before new-session and publishes only after ACTIVE proof", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-launch-staged-active-"));
+		const sessionId = "staged-launch-session";
+		const stateFile = path.join(stateDir, "runtime-state.json");
+		let generation = "";
+		let preparedBeforeSpawn = false;
+		try {
+			expect(
+				await launchDefaultTmuxIfNeeded({
+					parsed: args({ messages: ["hello"], tmux: true }),
+					rawArgs: ["--tmux", "hello"],
+					cwd: stateDir,
+					env: {
+						GJC_COORDINATOR_SESSION_ID: sessionId,
+						GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					},
+					argv: ["bun", "packages/coding-agent/src/cli.ts"],
+					execPath: "/bin/bun",
+					platform: "linux",
+					tty: interactiveTty,
+					tmuxAvailable: true,
+					existingBranchSessionName: null,
+					spawnSync: (_command, spawnArgs) => {
+						if (spawnArgs[0] === "new-session") {
+							const innerCommand = spawnArgs.at(-1) ?? "";
+							generation = /GJC_TMUX_OWNER_GENERATION='([^']+)'/.exec(innerCommand)?.[1] ?? "";
+							if (!generation) throw new Error("staged_launch_generation_missing");
+							preparedBeforeSpawn = fs.existsSync(
+								lifecyclePaths(stateDir, sessionId, generation).stagedSupervisorPreparedFile,
+							);
+						}
+						return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+					},
+				}),
+			).toBe(true);
+			expect(preparedBeforeSpawn).toBe(true);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			expect(await Bun.file(paths.stagedSupervisorPreparedFile).json()).toMatchObject({
+				state: "PREPARED",
+				generation,
+				session_id: sessionId,
+			});
+			expect(await Bun.file(paths.stagedSupervisorActiveFile).json()).toMatchObject({
+				state: "ACTIVE",
+				generation,
+				session_id: sessionId,
+			});
+			expect(captureOwnerGenerationBaselineSync(stateDir, sessionId)).toMatchObject({
+				state: "current",
+				generation,
+				session_id: sessionId,
+			});
+		} finally {
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves a staged launch unpublished when ACTIVE evidence times out", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-launch-staged-timeout-"));
+		const sessionId = "staged-timeout-session";
+		const stateFile = path.join(stateDir, "runtime-state.json");
+		let generation = "";
+		const diagnostics: string[] = [];
+		try {
+			await expect(
+				launchDefaultTmuxIfNeeded(
+					{
+						parsed: args({ messages: ["hello"], tmux: true }),
+						rawArgs: ["--tmux", "hello"],
+						cwd: stateDir,
+						env: {
+							GJC_COORDINATOR_SESSION_ID: sessionId,
+							GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+						},
+						argv: ["bun", "packages/coding-agent/src/cli.ts"],
+						execPath: "/bin/bun",
+						platform: "linux",
+						tty: interactiveTty,
+						tmuxAvailable: true,
+						existingBranchSessionName: null,
+						diagnosticWriter: message => diagnostics.push(message),
+						spawnSync: (_command, spawnArgs) => {
+							if (spawnArgs[0] === "new-session")
+								generation = /GJC_TMUX_OWNER_GENERATION='([^']+)'/.exec(spawnArgs.at(-1) ?? "")?.[1] ?? "";
+							return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+						},
+					},
+					"no-active",
+				),
+			).resolves.toBe(true);
+			expect(generation).not.toBe("");
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			expect(fs.existsSync(paths.stagedSupervisorPreparedFile)).toBe(true);
+			expect(fs.existsSync(paths.stagedSupervisorActiveFile)).toBe(false);
+			expect(fs.existsSync(paths.generationFile)).toBe(false);
+			expect(diagnostics.join("\n")).toContain("managed_owner_staged_supervisor_active_timeout");
+		} finally {
+			fs.rmSync(stateDir, { recursive: true, force: true });
+		}
+	}, 10_000);
 
 	it("replaces colon-bearing tmux window title segments", () => {
 		expect(buildGjcTmuxWindowTitle("/repo:backend", "main")).toBe("GJC-repo-backend-main");
@@ -2801,11 +3033,11 @@ it("pipes default control-command stderr while preserving interactive attach std
 			return spawnResult(0, "$0");
 		}
 		if (command[1] === "attach-session")
-			return spawnResult(1, "", "\u001b]52;c;synthetic-private-text\u0007attach failed");
+			return spawnResult(1, "", "\u001b]52;c;synthetic-private-text\u0007Input/output error");
 		if (command.at(-1) === "#{session_id}\t#{session_name}") return spawnResult(0, `$0\t${createdSessionName}`);
 		return spawnResult(0, "");
 	});
-	const handled = await launchDefaultTmuxIfNeededRaw({
+	const handled = await launchDefaultTmuxIfNeeded({
 		parsed: args({ messages: ["hello"], tmux: true }),
 		rawArgs: ["--tmux", "hello"],
 		cwd: launchTestRoot,
@@ -2821,6 +3053,21 @@ it("pipes default control-command stderr while preserving interactive attach std
 		existingBranchSessionName: null,
 		ownerIsolationProbe: safeAbsentOwnerIsolationProbe(),
 		diagnosticWriter: message => diagnostics.push(message),
+		spawnSync: (command, spawnArgs, options) => {
+			const result = Bun.spawnSync({
+				cmd: [command, ...spawnArgs],
+				cwd: options.cwd,
+				env: options.env,
+				stdin: options.stdinLine ? Buffer.from(options.stdinLine) : options.stdin,
+				stdout: options.stdout,
+				stderr: options.stderr,
+			});
+			return {
+				exitCode: result.exitCode,
+				stdout: Buffer.from(result.stdout ?? []).toString("utf8"),
+				stderr: Buffer.from(result.stderr ?? []).toString("utf8"),
+			};
+		},
 	});
 	expect(handled).toBe(true);
 	expect(
@@ -3831,6 +4078,7 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_GENERATION='${generation.generation}'`);
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
+			expect(innerCommand).toContain("GJC_TMUX_COMMAND='tmux'");
 			expect(innerCommand).not.toContain("managed-private-pkcs8-der-base64");
 			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
 			expect(innerCommand).toMatch(

@@ -123,7 +123,7 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv.length === 1 && argv[0] === MANAGED_OWNER_SUPERVISOR_ARG) {
 		const { runManagedOwnerSupervisor } = await import("./gjc-runtime/managed-owner-supervisor");
-		await runManagedOwnerSupervisor({ requireAuthority: true });
+		await runManagedOwnerSupervisor();
 		return;
 	}
 	if (process.env[MANAGED_OWNER_CHILD_TOKEN_ENV] !== undefined) {

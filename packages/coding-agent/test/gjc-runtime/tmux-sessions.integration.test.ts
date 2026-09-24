@@ -4,7 +4,6 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { publishManagedOwnerSupervisorAuthoritySync } from "@gajae-code/coding-agent/gjc-runtime/managed-owner-supervisor";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxProfileCommands,
@@ -15,6 +14,7 @@ import {
 	readTmuxSessionTagsForGc,
 	statusGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
+import { publishManagedOwnerSupervisorAuthoritySync } from "../../src/gjc-runtime/managed-owner-supervisor";
 import { replaceOwnerGeneration } from "../../src/gjc-runtime/tmux-owner-isolation";
 
 const tmux = Bun.which("tmux");
@@ -211,6 +211,7 @@ try {
 			server_start_time: serverStartTime,
 			native_session_id: nativeSessionId,
 		});
+		await replaceOwnerGeneration(stateDir, sessionId, generation);
 		for (let attempt = 0; attempt < 150 && !fsSync.existsSync(childReadyFile); attempt += 1) await Bun.sleep(20);
 		if (!fsSync.existsSync(childReadyFile)) {
 			const errorFile = path.join(stateDir, "supervisor-error");
@@ -231,7 +232,6 @@ try {
 			socketKey: sessionName,
 		});
 		const target = buildGjcTmuxExactOptionTarget(sessionName, { env });
-		await replaceOwnerGeneration(stateDir, sessionId, generation);
 		for (const command of buildGjcTmuxProfileCommands(
 			target,
 			env,
