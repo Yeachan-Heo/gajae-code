@@ -280,7 +280,7 @@ export function createFixture(
 						return;
 					}
 					if (frame.type !== "control_request") return;
-					if (frame.operation === "turn.prompt") {
+					if (frame.operation === "turn.prompt" || frame.operation === "skill.invoke") {
 						promptSocket = socket;
 						promptNumber++;
 						const input = frame.input as Record<string, unknown> | undefined;
@@ -307,7 +307,7 @@ export function createFixture(
 							id: frame.id,
 							ok: true,
 							result:
-								frame.operation === "turn.prompt"
+								frame.operation === "turn.prompt" || frame.operation === "skill.invoke"
 									? { ...correlation, accepted: true }
 									: frame.operation === "turn.abort"
 										? (abortAcknowledgement ??
@@ -326,7 +326,10 @@ export function createFixture(
 										: {},
 						}),
 					);
-					if (frame.operation === "turn.prompt" && !options.deferPromptAcknowledgement) {
+					if (
+						(frame.operation === "turn.prompt" || frame.operation === "skill.invoke") &&
+						!options.deferPromptAcknowledgement
+					) {
 						// The host starts the turn; the client observes the working phase.
 						socket.send(JSON.stringify({ type: "agent_start", sessionId, ...correlation }));
 					}
@@ -1746,6 +1749,79 @@ test("pre-ack clientRef recovery maps terminal end_turn without receipt to promp
 	}
 });
 
+test("uncertain skill invocation uses kind-specific clientRef recovery and retains its owner", async () => {
+	const fixture = await createFixture({ deferPromptAcknowledgement: true });
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
+		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
+			operation: "turn.abort",
+		}),
+	);
+	const originalQuery = AcpSdkAdapter.prototype.query;
+	let clientRef = "";
+	const query = vi.spyOn(AcpSdkAdapter.prototype, "query").mockImplementation(function (
+		this: AcpSdkAdapter,
+		queryName,
+		input,
+		cursor,
+	) {
+		if (queryName === "turn.result")
+			return Promise.resolve({
+				kind: "skill",
+				status: "in_flight",
+				receiptState: "absent",
+				clientRef,
+				commandId: "cancel-settlement-command-1",
+				turnId: "cancel-settlement-turn-1",
+			});
+		return originalQuery.call(this, queryName, input, cursor);
+	});
+	try {
+		const pending = prompt(fixture, "/skill:fixture-skill run").then(
+			result => ({ result }),
+			(error: unknown) => ({ error: error as { code?: string } }),
+		);
+		await bounded(fixture.promptDelivered, "skill invocation dispatch");
+		await waitFor(() => fixture.hasPendingPromptAcknowledgement(), "deferred skill invocation ACK");
+		clientRef = fixture.promptClientRef();
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId }).then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		expect(await bounded(cancellation, "skill clientRef recovery")).toEqual({
+			rejected: expect.objectContaining({ code: "terminal_uncertain" }),
+		});
+		expect(await bounded(pending, "uncertain skill result")).toEqual({
+			error: expect.objectContaining({ code: "terminal_uncertain" }),
+		});
+		expect(query).toHaveBeenCalledWith("turn.result", { kind: "skill", clientRef });
+		expect(query).toHaveBeenCalledTimes(1);
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.rejectPendingPromptAcknowledgement();
+		const blocked = await prompt(fixture, "skill owner must remain fenced").then(
+			() => undefined,
+			(error: unknown) => error as { code?: string },
+		);
+		expect(blocked).toMatchObject({ code: "conflict" });
+		expect(fixture.promptDeliveryCount()).toBe(1);
+
+		const idleBeforeLateSkillTerminal = idleWithGjcRunningFalse(fixture.updates);
+		fixture.sendStopped("end_turn");
+		await waitFor(
+			() => idleWithGjcRunningFalse(fixture.updates) > idleBeforeLateSkillTerminal,
+			"idle after exact skill terminal",
+		);
+		const next = prompt(fixture, "prompt after skill terminal proof");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "successor terminal")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		cancel.mockRestore();
+		query.mockRestore();
+		fixture.dispose();
+	}
+});
+
 test("uncertain abort before prompt acknowledgement keeps a provisional owner if clientRef lookup fails", async () => {
 	const fixture = await createFixture({ deferPromptAcknowledgement: true });
 	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
@@ -2841,6 +2917,8 @@ test("session retirement makes an overflow follow-up response stale for a recrea
 const overflowFollowUpCases: Array<{
 	name: string;
 	result?: Record<string, unknown>;
+	envelope?: Record<string, unknown>;
+	clientRef?: string;
 	rejects?: boolean;
 	terminal: boolean;
 }> = [
@@ -2880,6 +2958,57 @@ const overflowFollowUpCases: Array<{
 		},
 		terminal: true,
 	},
+	{
+		name: "wrong invocation kind",
+		result: {
+			kind: "skill",
+			status: "terminal_ok",
+			receiptState: "present",
+			commandId: "cancel-settlement-command-1",
+			turnId: "cancel-settlement-turn-1",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		},
+		terminal: false,
+	},
+	{
+		name: "wrong session",
+		result: {
+			kind: "prompt",
+			status: "terminal_ok",
+			receiptState: "present",
+			sessionId: "foreign-session",
+			commandId: "cancel-settlement-command-1",
+			turnId: "cancel-settlement-turn-1",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		},
+		terminal: false,
+	},
+	{
+		name: "wrong client reference",
+		clientRef: "foreign-client-ref",
+		result: {
+			kind: "prompt",
+			status: "terminal_ok",
+			receiptState: "present",
+			commandId: "cancel-settlement-command-1",
+			turnId: "cancel-settlement-turn-1",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		},
+		terminal: false,
+	},
+	{
+		name: "conflicting envelope and result identities",
+		envelope: { kind: "prompt", commandId: "foreign-command", turnId: "cancel-settlement-turn-1" },
+		result: {
+			kind: "prompt",
+			status: "terminal_ok",
+			receiptState: "present",
+			commandId: "cancel-settlement-command-1",
+			turnId: "cancel-settlement-turn-1",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		},
+		terminal: false,
+	},
 ];
 
 for (const followUpCase of overflowFollowUpCases) {
@@ -2903,7 +3032,15 @@ for (const followUpCase of overflowFollowUpCases) {
 			resultCalls++;
 			if (resultCalls === 1) return Promise.reject(new Error("clientRef lookup unavailable"));
 			if (followUpCase.rejects) return Promise.reject(new Error("exact follow-up unavailable"));
-			return Promise.resolve({ ...followUpCase.result, clientRef });
+			if (followUpCase.envelope)
+				return Promise.resolve({
+					...followUpCase.envelope,
+					result: { ...followUpCase.result, clientRef: followUpCase.clientRef ?? clientRef },
+				});
+			return Promise.resolve({
+				...followUpCase.result,
+				clientRef: followUpCase.clientRef ?? clientRef,
+			});
 		});
 		try {
 			const pending = prompt(fixture, `overflow follow-up ${followUpCase.name}`).then(

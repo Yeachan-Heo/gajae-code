@@ -16773,6 +16773,16 @@ export class AgentSession {
 					...(registeredScope ? { terminalScope: registeredScope } : {}),
 				};
 			}
+			const retainedProof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+			if (
+				retainedProof.status === "settled" ||
+				(retainedProof.status === "unfenced" && retainedProof.reason !== "unknown_run")
+			) {
+				return {
+					...retainedProof,
+					...(registeredScope ? { terminalScope: registeredScope } : {}),
+				};
+			}
 			return {
 				status: "unfenced",
 				reason: "unknown_run",
@@ -16782,9 +16792,17 @@ export class AgentSession {
 		}
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
 		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
-		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
+		if (proof.status === "unfenced" && proof.reason !== "resources_pending") {
+			this.agent.resourceLedger.quarantine(handle);
+		}
 		// The run's agent_end (if any) consumed the disposition; a settled or
-		// already-ended run must not leave it for an unrelated later exit.
+		// already-ended run must not leave it for an unrelated later exit. A
+		// `resources_pending` proof is different: the run is already sealed, and
+		// the ledger still owns exact promises for the outstanding resources.
+		// Keep that sealed accounting live so a later resolution of those exact
+		// tracked promises can remove its entries; this ledger proof does not
+		// establish that an OS process or remote tool stopped. Quarantining here
+		// would freeze a stale tombstone even after every tracked promise completed.
 		this.#disownedSteeringDisposition = undefined;
 		// Rearm surviving owned-completion follow-ups once the abort has
 		// settled: the aborted loop exits before polling the follow-up queue,
