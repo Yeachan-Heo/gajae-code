@@ -11,3 +11,4 @@
 - Headless workflow-gate Ask calls now honor the configured answer deadline, so unanswered gates abort the turn instead of hanging indefinitely (#5451).
 - Ordinary approval audit validation reads a bounded tail so append-only growth does not permanently block consent (#5451).
 - JSONL and audit appenders refuse hard-linked files before changing permissions or writing, while concurrent first-time JSONL appends retry exclusive-create races without dropping records (#5451).
+- Deep Interview consumes transcript bytes from the descriptor validated against managed-session identity, and project-local `.gjc` paths are no longer accepted as transcripts by container name alone (#5451).

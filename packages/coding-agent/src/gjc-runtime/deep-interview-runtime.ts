@@ -3,7 +3,11 @@ import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
-import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
+import {
+	type LogicalSessionCandidate,
+	listManagedSessionCandidates,
+	resolveManagedSessionScope,
+} from "../sdk/session-directory";
 import { type FileEntry, parseSessionEntries, RESUME_TRANSCRIPT_MAX_BYTES } from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
@@ -192,6 +196,10 @@ const CRYSTAL_INDEX_RECOVERY_BYTES = CRYSTAL_MAX_INDEX_BYTES + 64 * 1024;
 const CRYSTAL_MAX_ARTIFACT_BYTES = MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH * 4 + 4096;
 const READ_NOFOLLOW_FLAGS =
 	fs.constants.O_RDONLY | (typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
+const MANAGED_TRANSCRIPT_OPEN_FLAGS =
+	fs.constants.O_RDONLY |
+	(typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0) |
+	(typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0);
 
 interface CrystalIndexRow {
 	slug: string;
@@ -293,6 +301,141 @@ function sameExpectedFileIdentity(
 function isPathWithin(root: string, target: string): boolean {
 	const relative = path.relative(path.resolve(root), path.resolve(target));
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+interface ManagedTranscriptDirectoryIdentity {
+	dev: bigint;
+	ino: bigint;
+}
+
+async function captureManagedTranscriptDirectoryIdentity(
+	directoryPath: string,
+): Promise<ManagedTranscriptDirectoryIdentity | undefined> {
+	const canonicalPath = path.resolve(directoryPath);
+	let initial: BigIntStats;
+	try {
+		initial = await fs.lstat(canonicalPath, { bigint: true });
+	} catch (error) {
+		if (isErrnoCode(error, "ENOENT")) return undefined;
+		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
+	}
+	if (!initial.isDirectory() || initial.isSymbolicLink())
+		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
+	try {
+		const resolved = await fs.realpath(canonicalPath);
+		const final = await fs.lstat(canonicalPath, { bigint: true });
+		if (
+			resolved !== canonicalPath ||
+			!final.isDirectory() ||
+			final.isSymbolicLink() ||
+			final.dev !== initial.dev ||
+			final.ino !== initial.ino
+		)
+			throw new DeepInterviewCommandError(2, "managed session transcript scope changed during inventory");
+	} catch (error) {
+		if (error instanceof DeepInterviewCommandError) throw error;
+		throw new DeepInterviewCommandError(2, "managed session transcript scope changed during inventory");
+	}
+	return { dev: initial.dev, ino: initial.ino };
+}
+
+async function assertManagedTranscriptDirectoryIdentity(
+	directoryPath: string,
+	expected: ManagedTranscriptDirectoryIdentity,
+): Promise<void> {
+	const canonicalPath = path.resolve(directoryPath);
+	try {
+		const initial = await fs.lstat(canonicalPath, { bigint: true });
+		if (
+			!initial.isDirectory() ||
+			initial.isSymbolicLink() ||
+			initial.dev !== expected.dev ||
+			initial.ino !== expected.ino ||
+			(await fs.realpath(canonicalPath)) !== canonicalPath
+		)
+			throw new DeepInterviewCommandError(2, "live session transcript changed after authorization");
+		const final = await fs.lstat(canonicalPath, { bigint: true });
+		if (!final.isDirectory() || final.isSymbolicLink() || final.dev !== expected.dev || final.ino !== expected.ino)
+			throw new DeepInterviewCommandError(2, "live session transcript changed after authorization");
+	} catch (error) {
+		if (error instanceof DeepInterviewCommandError) throw error;
+		throw new DeepInterviewCommandError(2, "live session transcript changed after authorization");
+	}
+}
+
+async function readManagedTranscriptCandidateBytes(
+	candidate: LogicalSessionCandidate,
+	managedDirectoryPath: string,
+	managedDirectoryIdentity: ManagedTranscriptDirectoryIdentity | undefined,
+): Promise<Buffer> {
+	const filePath = path.resolve(candidate.path);
+	const expectedPath = path.resolve(candidate.identity.canonicalPath);
+	const managedDirectory = path.resolve(managedDirectoryPath);
+	const label = "live session transcript";
+	if (
+		managedDirectoryIdentity === undefined ||
+		expectedPath !== filePath ||
+		expectedPath === managedDirectory ||
+		!isPathWithin(managedDirectory, expectedPath)
+	)
+		throw new DeepInterviewCommandError(2, `${label} is outside the validated managed session scope`);
+
+	const expectedIdentity: ExpectedFileIdentity = {
+		dev: candidate.identity.dev,
+		ino: candidate.identity.ino,
+		size: candidate.identity.size,
+		mtimeNs: candidate.identity.mtimeNs,
+		sha256: candidate.identity.sha256,
+		...(candidate.identity.ctimeNs === undefined ? {} : { ctimeNs: candidate.identity.ctimeNs }),
+		...(candidate.identity.nlink === undefined ? {} : { nlink: candidate.identity.nlink }),
+	};
+	let handle: fs.FileHandle | undefined;
+	try {
+		await assertManagedTranscriptDirectoryIdentity(managedDirectory, managedDirectoryIdentity);
+		const before = await fs.lstat(filePath, { bigint: true });
+		if (!before.isFile() || before.isSymbolicLink() || !sameExpectedFileIdentity(before, expectedIdentity))
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+
+		handle = await fs.open(filePath, MANAGED_TRANSCRIPT_OPEN_FLAGS);
+		await assertManagedTranscriptDirectoryIdentity(managedDirectory, managedDirectoryIdentity);
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile() || !sameExpectedFileIdentity(opened, expectedIdentity))
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+		if (opened.size > BigInt(RESUME_TRANSCRIPT_MAX_BYTES))
+			throw new DeepInterviewCommandError(2, `${label} exceeds the bounded read limit`);
+		const openedPath = await fs.realpath(filePath);
+		if (openedPath !== expectedPath || !isPathWithin(managedDirectory, openedPath))
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+
+		const bytes = Buffer.alloc(Number(opened.size));
+		let offset = 0;
+		while (offset < bytes.length) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+			if (bytesRead <= 0) throw new DeepInterviewCommandError(2, `${label} changed during bounded read`);
+			offset += bytesRead;
+		}
+		const final = await handle.stat({ bigint: true });
+		await assertManagedTranscriptDirectoryIdentity(managedDirectory, managedDirectoryIdentity);
+		const finalPathStat = await fs.lstat(filePath, { bigint: true });
+		const finalPath = await fs.realpath(filePath);
+		if (
+			!final.isFile() ||
+			!sameExpectedFileIdentity(final, expectedIdentity) ||
+			!finalPathStat.isFile() ||
+			finalPathStat.isSymbolicLink() ||
+			!sameExpectedFileIdentity(finalPathStat, expectedIdentity) ||
+			finalPath !== expectedPath ||
+			!isPathWithin(managedDirectory, finalPath) ||
+			createHash("sha256").update(bytes).digest("hex") !== expectedIdentity.sha256
+		)
+			throw new DeepInterviewCommandError(2, `${label} changed after authorization`);
+		return bytes;
+	} catch (error) {
+		if (error instanceof DeepInterviewCommandError) throw error;
+		throw new DeepInterviewCommandError(2, `failed to read ${label}`);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
 }
 
 async function readBoundedFileBytes(
@@ -749,52 +892,51 @@ export async function authoritativeConversationSnapshot(
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a canonical transcript file");
 		}
 	}
-	const canonicalCandidates = new Set<string>();
-	const managedCandidates = new Set<string>();
-	const managedIdentities = new Map<string, ExpectedFileIdentity>();
-	const lexicalCandidates = new Set<string>();
+	const managedCandidates = new Map<string, LogicalSessionCandidate>();
 	const managedScope = await resolveManagedSessionScope({ cwd });
 	if (managedScope.kind === "error")
 		throw new DeepInterviewCommandError(2, "managed session transcript scope is unavailable");
-	if (managedScope.kind === "resolved") {
-		const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
-		if (managedListing.kind === "error")
-			throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
-		for (const candidate of managedListing.owned) {
-			const resolved = path.resolve(candidate.path);
-			managedCandidates.add(resolved);
-			managedIdentities.set(resolved, candidate.identity);
-			lexicalCandidates.add(resolved);
-		}
+	const managedDirectoryIdentity = await captureManagedTranscriptDirectoryIdentity(managedScope.scope.sessionsRoot);
+	const managedListing = await listManagedSessionCandidates({ scope: managedScope.scope });
+	if (managedListing.kind === "error")
+		throw new DeepInterviewCommandError(2, "managed session transcript listing is unavailable");
+	if (managedDirectoryIdentity !== undefined) {
+		await assertManagedTranscriptDirectoryIdentity(managedListing.scope.sessionsRoot, managedDirectoryIdentity);
+	} else if (managedListing.owned.length > 0) {
+		throw new DeepInterviewCommandError(2, "managed session transcript scope changed during inventory");
 	}
+	for (const candidate of managedListing.owned) {
+		managedCandidates.set(path.resolve(candidate.path), candidate);
+	}
+	let transcriptBytes: Buffer | undefined;
 	// The native command accepts an explicit workspace cwd, which may differ from
 	// process.cwd(). Resolve relative managed transcript paths against that same
 	// so transcript identity and content cannot drift with process launch location.
 	if (sessionFile) {
-		if (!managedCandidates.has(sessionFile))
+		const candidate = managedCandidates.get(sessionFile);
+		if (!candidate)
 			throw new DeepInterviewCommandError(
 				2,
 				`GJC_SESSION_FILE points to an unmanaged transcript (${sessionFile}); use the managed session directory instead`,
 			);
+		transcriptBytes = await readManagedTranscriptCandidateBytes(
+			candidate,
+			managedListing.scope.sessionsRoot,
+			managedDirectoryIdentity,
+		);
 	} else {
-		if (lexicalCandidates.size > 1000)
+		if (managedCandidates.size > 1000)
 			throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded candidate limit");
-		for (const candidate of [...lexicalCandidates].sort()) {
+		const sortedCandidates = [...managedCandidates.entries()].sort(([left], [right]) =>
+			left < right ? -1 : left > right ? 1 : 0,
+		);
+		for (const [candidatePath, candidate] of sortedCandidates) {
 			try {
-				const stat = await fs.lstat(candidate);
-				if (!stat.isFile() || stat.isSymbolicLink()) continue;
-				const realPath = await fs.realpath(candidate);
-				if (realPath !== candidate) continue;
-				canonicalCandidates.add(realPath);
-			} catch {}
-		}
-		for (const candidate of [...canonicalCandidates].sort()) {
-			try {
-				const bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
-					allowMissing: true,
-					expectedIdentity: managedIdentities.get(candidate),
-				});
-				if (!bytes) continue;
+				const bytes = await readManagedTranscriptCandidateBytes(
+					candidate,
+					managedListing.scope.sessionsRoot,
+					managedDirectoryIdentity,
+				);
 				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
 					string,
 					unknown
@@ -804,19 +946,17 @@ export async function authoritativeConversationSnapshot(
 					typeof header.cwd === "string" &&
 					path.resolve(header.cwd) === path.resolve(cwd)
 				) {
-					sessionFile = candidate;
+					sessionFile = candidatePath;
+					transcriptBytes = bytes;
 					break;
 				}
 			} catch {}
 		}
 	}
-	if (!sessionFile)
+	if (!sessionFile || transcriptBytes === undefined)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
-		const bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript", {
-			expectedIdentity: managedIdentities.get(sessionFile),
-		});
-		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
+		const bytes = transcriptBytes;
 		const text = boundedUtf8(bytes, "live session transcript");
 		const records: unknown[] = [];
 		for (const line of text.split(/\r?\n/)) {
