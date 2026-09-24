@@ -2826,6 +2826,11 @@ describe("SDK broker identity and discovery", () => {
 				error: { code: "spawn_failed" },
 			});
 			expect(launchAttempts).toBe(1);
+			await expect(changedBroker.handleRequest("session.create", priorInput, changedKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(1);
 		} finally {
 			setLifecycleCommandResolverForTest(changedBroker, undefined);
 			await changedBroker.stop();
