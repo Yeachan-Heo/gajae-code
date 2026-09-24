@@ -51,7 +51,7 @@ export type ListManagedSessionCandidatesResult =
 			scope: ManagedSessionScope;
 			owned: readonly LogicalSessionCandidate[];
 			foreignCount: number;
-			invalid: readonly { code: string }[];
+			invalid: readonly { code: string; sessionId?: string }[];
 	  }
 	| { kind: "error"; code: "scan_failed" | "unsafe_root" | "invalid_candidate"; message: string };
 

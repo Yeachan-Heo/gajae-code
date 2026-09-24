@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
@@ -6,6 +7,8 @@ import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
+import { ManagedSessionScopeTestHooks } from "../src/session/internal/managed-session-scope";
+import { SessionManager } from "../src/session/session-manager";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
@@ -20,6 +23,8 @@ const event = (
 	pid: process.pid,
 	...(endpointMtimeMs === undefined ? {} : { endpointMtimeMs }),
 });
+
+afterEach(() => setSystemTime());
 
 test("broker preserves host registration endpoint metadata across heartbeats", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-host-"));
@@ -80,6 +85,32 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 		};
 		expect(firstPage.sessions).toMatchObject([{ sessionId: "one" }, { sessionId: "two" }]);
 		expect(firstPage.continuationCursor).toEqual(expect.any(String));
+		expect(await broker.handleRequest("session.list", { cwd: "", resolveSessionId: "two" })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "cwd must be a non-empty string" },
+		});
+		expect(await broker.handleRequest("session.list", { cwd: 5, resolveSessionId: "two" })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "cwd must be a non-empty string" },
+		});
+		expect(
+			await broker.handleRequest("session.list", {
+				scope: { invalid: true },
+				resolveSessionId: "two",
+			}),
+		).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "scope cannot be combined with cwd or resolveSessionId" },
+		});
+		expect(
+			await broker.handleRequest("session.list", {
+				cursor: firstPage.continuationCursor,
+				resolveSessionId: "three",
+			}),
+		).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "cursor cannot be combined with cwd or resolveSessionId" },
+		});
 
 		await busIndex.append(event("host_registered", "four", stateRoot));
 		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), '{"version":999}\n');
@@ -120,6 +151,173 @@ test("broker session.list keeps cursor warnings snapshot-stable", async () => {
 	} finally {
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker session.list retries one changed snapshot and diagnoses persistent transcript writes", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-saved-session-race-"));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	await fs.mkdir(cwd, { recursive: true });
+	const savedSession = SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
+	await savedSession.ensureOnDisk();
+	const sessionId = savedSession.getSessionId();
+	const sessionPath = savedSession.getSessionFile();
+	if (!sessionPath) throw new Error("Expected saved session path.");
+	const header = JSON.parse((await fs.readFile(sessionPath, "utf8")).split("\n", 1)[0] ?? "null") as {
+		type?: string;
+		id?: string;
+		cwd?: string;
+	};
+	expect(header).toMatchObject({ type: "session", id: sessionId, cwd });
+
+	setSystemTime(new Date("2026-09-24T00:00:00.000Z"));
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	let mutationsRemaining = 1;
+	let mutationCount = 0;
+	let failRetryScan = false;
+	try {
+		const index = await new SessionIndex(agentDir).open();
+		const locator = { cwd, worktreeRoot: null, stateRoot };
+		await index.append({ ...event("host_registered", sessionId, stateRoot), locator });
+		await index.append({ ...event("host_unregistered", sessionId, stateRoot), locator });
+
+		// Inject the host's final transcript append at the precise point between
+		// the no-follow preflight read and the independent identity-checked read.
+		// The injected clock and synchronous hook make this deterministic; no
+		// sleeps, polling, or wall-clock race are involved.
+		ManagedSessionScopeTestHooks.afterCandidatePreflight = candidate => {
+			if (candidate.sessionId !== sessionId) return;
+			if (failRetryScan && mutationCount === 1) throw new Error("fixture-retry-scan-secret");
+			if (mutationsRemaining === 0) return;
+			mutationsRemaining -= 1;
+			mutationCount += 1;
+			syncFs.appendFileSync(
+				sessionPath,
+				`${JSON.stringify({
+					type: "message",
+					id: `final-transcript-write-${mutationCount}`,
+					message: { role: "user", content: "final write", timestamp: 1 },
+				})}\n`,
+			);
+		};
+		const retried = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(mutationCount).toBe(1);
+		expect(retried).toMatchObject({
+			ok: true,
+			result: { sessions: [expect.objectContaining({ sessionId })], savedSession: { id: sessionId } },
+		});
+		if (retried.ok) expect(retried.result).not.toHaveProperty("savedSessionOmission");
+		expect(JSON.stringify(retried)).not.toContain("final write");
+
+		mutationCount = 0;
+		mutationsRemaining = 2;
+		const stillChanging = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(mutationCount).toBe(2);
+		expect(stillChanging).toMatchObject({
+			ok: true,
+			result: {
+				sessions: [expect.objectContaining({ sessionId })],
+				savedSessionOmission: {
+					sessionId,
+					reason: "candidate_invalid",
+					detailCode: "source_changed",
+				},
+			},
+		});
+		if (stillChanging.ok) expect(stillChanging.result).not.toHaveProperty("savedSession");
+		expect(JSON.stringify(stillChanging)).not.toContain(sessionPath);
+		expect(JSON.stringify(stillChanging)).not.toContain("final write");
+
+		mutationCount = 0;
+		mutationsRemaining = 1;
+		failRetryScan = true;
+		const retryScanFailed = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(mutationCount).toBe(1);
+		expect(retryScanFailed).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId,
+					reason: "candidate_scan_failed",
+					detailCode: "scan_failed",
+				},
+			},
+		});
+		expect(JSON.stringify(retryScanFailed)).not.toContain("fixture-retry-scan-secret");
+		failRetryScan = false;
+
+		ManagedSessionScopeTestHooks.afterCandidatePreflight = () => {
+			throw new Error("fixture-scan-secret");
+		};
+		const scanFailed = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(scanFailed).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId,
+					reason: "candidate_scan_failed",
+					detailCode: "scan_failed",
+				},
+			},
+		});
+		expect(JSON.stringify(scanFailed)).not.toContain("fixture-scan-secret");
+		ManagedSessionScopeTestHooks.afterCandidatePreflight = undefined;
+
+		const missingWorkspace = await broker.handleRequest("session.list", {
+			cwd: path.join(root, "missing-workspace"),
+			resolveSessionId: sessionId,
+		});
+		expect(missingWorkspace).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId,
+					reason: "scope_unavailable",
+					detailCode: "cwd_missing",
+				},
+			},
+		});
+
+		const sessionsRoot = path.dirname(path.dirname(sessionPath));
+		const legacyDirectory = path.join(
+			sessionsRoot,
+			`--${path
+				.resolve(cwd)
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-")}--`,
+		);
+		await fs.mkdir(legacyDirectory, { recursive: true });
+		const duplicatePath = path.join(legacyDirectory, `${sessionId}.jsonl`);
+		await fs.copyFile(sessionPath, duplicatePath);
+		const ambiguous = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(ambiguous).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: {
+					sessionId,
+					reason: "candidate_ambiguous",
+					candidateCount: 2,
+				},
+			},
+		});
+		expect(JSON.stringify(ambiguous)).not.toContain(sessionPath);
+
+		await fs.rm(sessionPath);
+		await fs.rm(duplicatePath);
+		const notFound = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+		expect(notFound).toMatchObject({
+			ok: true,
+			result: {
+				savedSessionOmission: { sessionId, reason: "candidate_not_found" },
+			},
+		});
+	} finally {
+		ManagedSessionScopeTestHooks.afterCandidatePreflight = undefined;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });
 
