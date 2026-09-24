@@ -31,6 +31,7 @@ import {
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
+	readSessionLifecycleFailure,
 	reapDeadLifecycleMarkers,
 	reapDeadSessionRegistrations,
 	type SessionLifecycleLaunchRequest,
@@ -52,12 +53,23 @@ import { createSdkMcpServer } from "../src/sdk/mcp";
 import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
-import type { AgentSession } from "../src/session/agent-session";
+import { type AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 const spawned: Array<ReturnType<typeof Bun.spawn>> = [];
 const brokerDirs: string[] = [];
+const lifecycleDirectoryDurabilityAvailable = process.platform !== "win32";
+
+function expectedDurableRollbackReceipt(endpointGeneration: number | null) {
+	return {
+		endpointGeneration,
+		fenced: lifecycleDirectoryDurabilityAvailable,
+		runtimeRemoved: lifecycleDirectoryDurabilityAvailable,
+		hostStopped: lifecycleDirectoryDurabilityAvailable,
+		brokerRegistrationReleased: lifecycleDirectoryDurabilityAvailable,
+	};
+}
 
 afterEach(async () => {
 	for (const process of spawned.splice(0)) {
@@ -752,13 +764,7 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 			await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`), "utf8"),
 		) as { rollback: Record<string, unknown>; reason: string };
 		expect(artifact.reason).toBe("pending");
-		expect(artifact.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(artifact.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
 		names.forEach((name, index) => {
 			const value = previous[index];
@@ -768,6 +774,136 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("session host joins and cleans a session completing after readiness cutoff", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-construction-cutoff-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "construction-cutoff";
+	const effectMarker = "construction-cutoff-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let nowMs = 1_000;
+	let cutoffArmed = false;
+	let cutoffArmedAtConstruction = false;
+	let signalCoveredAtConstruction = false;
+	let sessionDisposed = false;
+	let managerClosedBeforeReceipt = false;
+	const deadlineSignal = Promise.withResolvers<void>();
+	const disposalJoinStarted = Promise.withResolvers<void>();
+	const disposalJoinRelease = Promise.withResolvers<void>();
+	const initialSigtermListeners = process.listenerCount("SIGTERM");
+	let sessionManager: SessionManager | undefined;
+	let restoreCloseSpy: (() => void) | undefined;
+	let host: Promise<void> | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		};
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+		const parsed = await lifecycleArgs(request, root, agentDir);
+		sessionManager = SessionManager.inMemory(root);
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const closeSpy = vi.spyOn(sessionManager, "close").mockImplementation(async () => {
+			managerClosedBeforeReceipt = true;
+			expect(sessionDisposed).toBe(true);
+			expect(await Bun.file(failurePath).exists()).toBe(false);
+		});
+		restoreCloseSpy = () => closeSpy.mockRestore();
+		const lateSession = {
+			dispose: async () => {
+				expect(await Bun.file(failurePath).exists()).toBe(false);
+				throw new SessionDisposalIncompleteError("controlled incomplete late disposal");
+			},
+			awaitDisposeCompletion: async () => {
+				disposalJoinStarted.resolve();
+				await disposalJoinRelease.promise;
+				sessionDisposed = true;
+			},
+		} as unknown as AgentSession;
+		const pendingHost = runSessionHost({
+			cwd: root,
+			now: () => nowMs,
+			sleep: async ms => {
+				if (ms <= 0) return;
+				cutoffArmed = true;
+				await deadlineSignal.promise;
+			},
+			processIncarnation: () => "test-incarnation",
+			openLifecycleSessionManager: async () => ({ parsed, sessionManager }),
+			createLifecycleAgentSession: async (_options, owner) => {
+				if (!owner) throw new Error("Expected lifecycle startup owner.");
+				cutoffArmedAtConstruction = cutoffArmed;
+				signalCoveredAtConstruction = process.listenerCount("SIGTERM") > initialSigtermListeners;
+				// Inject the reporter's 734 ms overrun past the eight-second semantic cutoff.
+				nowMs = deadlines.semanticReadyDeadlineAt + 734;
+				deadlineSignal.resolve();
+				return {
+					session: lateSession,
+					startDeferredMemoryBackend: async () => {},
+					capability: owner.capability,
+					rollback: owner.rollback,
+				};
+			},
+		});
+		host = pendingHost;
+		const joinOutcome = await Promise.race([
+			disposalJoinStarted.promise.then(() => "join" as const),
+			pendingHost.then(
+				() => "host-settled" as const,
+				() => "host-settled" as const,
+			),
+		]);
+		expect(joinOutcome).toBe("join");
+		expect(sessionDisposed).toBe(false);
+		expect(managerClosedBeforeReceipt).toBe(false);
+		expect(await Bun.file(failurePath).exists()).toBe(false);
+		disposalJoinRelease.resolve();
+		await expect(host).rejects.toMatchObject({ phase: "startup", reason: "pending" });
+		expect(cutoffArmedAtConstruction).toBe(true);
+		expect(signalCoveredAtConstruction).toBe(true);
+		expect(sessionDisposed).toBe(true);
+		expect(managerClosedBeforeReceipt).toBe(true);
+		const failure = JSON.parse(
+			await fs.readFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`), "utf8"),
+		) as { rollback: Record<string, unknown>; reason: string };
+		expect(failure.reason).toBe("pending");
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
+	} finally {
+		disposalJoinRelease.resolve();
+		await host?.catch(() => {});
+		restoreCloseSpy?.();
+		await sessionManager?.close().catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
 
 test("session host publishes SIGTERM failure without waiting for hung construction", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-hung-construction-"));
@@ -800,22 +936,13 @@ test("session host publishes SIGTERM failure without waiting for hung constructi
 		process.env.GJC_STATE_ROOT = stateRoot;
 		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
 		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
-		const request: SessionLifecycleLaunchRequest = {
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
 			operation: "session.create",
 			sessionId,
 			cwd: root,
 			stateRoot,
 			effectMarker,
 			...deadlines,
-		};
-		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
-		const parsed = await lifecycleArgs(request, root, agentDir);
-		sessionManager = SessionManager.inMemory(root);
-		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
-		const closeSpy = vi.spyOn(sessionManager, "close").mockImplementation(async () => {
-			managerClosedBeforeReceipt = true;
-			expect(sessionDisposed).toBe(true);
-			expect(await Bun.file(failurePath).exists()).toBe(false);
 		});
 		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
 		startup = runSessionHost({
@@ -969,13 +1096,7 @@ test("session host publishes SIGTERM failure without waiting for hung readiness 
 		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
 			rollback: Record<string, unknown>;
 		};
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		releaseLateReadiness.resolve();
@@ -1201,13 +1322,7 @@ test("session host keeps startup signal ownership until rollback disposal and re
 		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
 			rollback: Record<string, unknown>;
 		};
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 		expect(process.listeners("SIGTERM")).not.toContain(startupSignal);
 	} finally {
 		disposeRelease.resolve();
@@ -1329,13 +1444,7 @@ test("profile-stage cutoff joins late work before session rollback evidence", as
 		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
 			rollback: Record<string, unknown>;
 		};
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
 		cutoff.resolve();
 		profileRelease.resolve();
@@ -1459,13 +1568,7 @@ test("extension-stage cutoff joins initialization before rollback evidence", asy
 		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
 			rollback: Record<string, unknown>;
 		};
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
 		cutoff.resolve();
 		extensionRelease.resolve();
@@ -1556,13 +1659,7 @@ test("session host closes a late manager before writing rollback evidence", asyn
 			reason: string;
 		};
 		expect(failure.reason).toBe("pending");
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
 		restoreCloseSpy?.();
 		await sessionManager?.close().catch(() => {});
@@ -1629,6 +1726,9 @@ test("session host keeps absence unproven when manager or MCP cleanup fails", as
 			managerCloseAttempted = true;
 			expect(mcpDirectory).toBeDefined();
 			expect(await Bun.file(mcpDirectory!).exists()).toBe(false);
+			if (process.platform === "win32")
+				await expect(fs.stat(`${mcpDirectory}.removing`)).rejects.toMatchObject({ code: "ENOENT" });
+			else expect(await fs.readFile(`${mcpDirectory}.removing/mcp.json`)).toEqual(Buffer.alloc(0));
 			expect(await Bun.file(failurePath).exists()).toBe(false);
 			throw new Error("controlled manager close failure");
 		});
@@ -1647,6 +1747,15 @@ test("session host keeps absence unproven when manager or MCP cleanup fails", as
 					if (!options?.mcpConfigPath) throw new Error("Expected temporary MCP config.");
 					mcpDirectory = path.dirname(options.mcpConfigPath);
 					expect(await Bun.file(options.mcpConfigPath).exists()).toBe(true);
+					const parent = await fs.lstat(path.dirname(mcpDirectory), { bigint: true }).then(stat => ({
+						dev: stat.dev,
+						ino: stat.ino,
+					}));
+					const snapshot = native.snapshotDirectoryTree(mcpDirectory);
+					if (!snapshot.ok || !snapshot.snapshot) throw new Error("Expected an owned MCP directory snapshot.");
+					const detached = native.exactRemoveDirectoryTree(mcpDirectory, snapshot.snapshot, parent, true);
+					expect(detached).toMatchObject({ ok: true, detachedPath: `${mcpDirectory}.removing` });
+					expect(await fs.readFile(`${mcpDirectory}.removing/mcp.json`, "utf8")).toContain('"fixture"');
 					return {
 						capability: owner.capability,
 						rollback: owner.rollback,
@@ -1675,6 +1784,113 @@ test("session host keeps absence unproven when manager or MCP cleanup fails", as
 		});
 	} finally {
 		restoreCloseSpy?.();
+		await sessionManager?.close().catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("session host keeps rollback unproven when MCP data moves beyond its exact replay path", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-mcp-retained-authority-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "mcp-retained-authority";
+	const effectMarker = "mcp-retained-authority-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let sessionManager: SessionManager | undefined;
+	let movedDirectory: string | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			mcpServers: [
+				{
+					type: "http",
+					name: "fixture",
+					url: "https://example.invalid/mcp",
+					headers: { authorization: "fixture" },
+				},
+			],
+			...deadlines,
+		};
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+		const parsed = await lifecycleArgs(request, root, agentDir);
+		sessionManager = SessionManager.inMemory(root);
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		await expect(
+			runSessionHost({
+				cwd: root,
+				now: () => 1_000,
+				sleep: async ms => {
+					if (ms > 0) await new Promise<void>(() => {});
+				},
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner) throw new Error("Expected lifecycle startup owner.");
+					if (!options?.mcpConfigPath) throw new Error("Expected temporary MCP config.");
+					const directory = path.dirname(options.mcpConfigPath);
+					const parent = await fs.lstat(path.dirname(directory), { bigint: true });
+					const snapshot = native.snapshotDirectoryTree(directory);
+					if (!snapshot.ok || !snapshot.snapshot) throw new Error("Expected an owned MCP directory snapshot.");
+					const detached = native.exactRemoveDirectoryTree(
+						directory,
+						snapshot.snapshot,
+						{ dev: parent.dev, ino: parent.ino },
+						true,
+					);
+					if (!detached.ok || !detached.detachedPath)
+						throw new Error("Expected to detach the MCP tree without deleting its contents.");
+					movedDirectory = `${directory}.moved`;
+					renameSync(detached.detachedPath, movedDirectory);
+					expect(await fs.readFile(path.join(movedDirectory, "mcp.json"), "utf8")).toContain(
+						'"authorization":"fixture"',
+					);
+					return {
+						capability: owner.capability,
+						rollback: owner.rollback,
+						failure: owner.capability.normalizeFailure("registration", "failed", "controlled MCP relocation"),
+						cleanupComplete: true,
+					};
+				},
+			}),
+		).rejects.toThrow();
+
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as { rollback: Record<string, unknown> };
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+		expect(await fs.readFile(path.join(movedDirectory!, "mcp.json"), "utf8")).toContain('"authorization":"fixture"');
+	} finally {
 		await sessionManager?.close().catch(() => {});
 		names.forEach((name, index) => {
 			const value = previous[index];
@@ -1769,13 +1985,7 @@ test("session host removes the raw MCP temp directory when realpath fails", asyn
 			message: string;
 		};
 		expect(failure.message).toContain("controlled MCP realpath failure");
-		expect(failure.rollback).toEqual({
-			endpointGeneration: null,
-			fenced: true,
-			runtimeRemoved: true,
-			hostStopped: true,
-			brokerRegistrationReleased: true,
-		});
+		expect(failure.rollback).toEqual(expectedDurableRollbackReceipt(null));
 	} finally {
 		restoreRealpathSpy?.();
 		restoreCloseSpy?.();
@@ -2180,36 +2390,394 @@ for (const failurePoint of ["write", "sync", "close", "remove"] as const) {
 	});
 }
 
-test("failure receipt is revoked when its directory durability barrier fails", async () => {
-	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-sync-"));
-	const directory = path.join(root, "sdk");
-	const sessionId = "receipt-sync-failure";
-	const effectMarker = "receipt-sync-failure-marker";
-	const failurePath = path.join(directory, `${sessionId}.lifecycle.failure.${effectMarker}.json`);
-	const originalOpen = fs.open.bind(fs);
-	let directorySyncInjected = false;
-	let restoreOpenSpy: (() => void) | undefined;
-	let restoreSyncSpy: (() => void) | undefined;
+test("failed atomic readiness replacement removes only its empty placeholder", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ready-replace-failure-"));
+	const sessionId = "ready-replace-failure";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	const originalExactReplace = native.exactReplacePath.bind(native);
+	let restoreReplaceSpy: (() => void) | undefined;
 	try {
-		const openImplementation = async (target: unknown, flags: unknown, mode?: unknown): Promise<fs.FileHandle> => {
-			const handle = await originalOpen(target as string, flags as number, mode as number | undefined);
-			if (!directorySyncInjected && typeof target === "string" && path.resolve(target) === path.resolve(directory)) {
-				directorySyncInjected = true;
-				const syncSpy = vi
-					.spyOn(handle, "sync")
-					.mockRejectedValueOnce(new Error("controlled directory sync failure"));
-				restoreSyncSpy = () => syncSpy.mockRestore();
-			}
-			return handle;
-		};
-		const openSpy = vi.spyOn(fs, "open").mockImplementation(openImplementation as unknown as typeof fs.open);
-		restoreOpenSpy = () => openSpy.mockRestore();
-		await expect(
-			writeSessionLifecycleFailure(
+		const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+			if (path.resolve(destination) === path.resolve(readyPath))
+				return { ok: false, code: "controlled readiness replacement failure" };
+			return originalExactReplace(source, destination, from, to);
+		});
+		restoreReplaceSpy = () => replaceSpy.mockRestore();
+		await expect(writeSessionLifecycleReady(root, sessionId, "ready-replace-failure-marker")).rejects.toThrow(
+			"controlled readiness replacement failure",
+		);
+		expect(await Bun.file(readyPath).exists()).toBe(false);
+		expect((await fs.readdir(path.join(root, "sdk"))).filter(name => name.endsWith(".tmp"))).toEqual([]);
+	} finally {
+		restoreReplaceSpy?.();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test.skipIf(process.platform === "win32")(
+	"failure receipt is revoked when its directory durability barrier fails",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-sync-"));
+		const directory = path.join(root, "sdk");
+		const sessionId = "receipt-sync-failure";
+		const effectMarker = "receipt-sync-failure-marker";
+		const failurePath = path.join(directory, `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const originalOpen = fs.open.bind(fs);
+		let directorySyncInjected = false;
+		let restoreOpenSpy: (() => void) | undefined;
+		let restoreSyncSpy: (() => void) | undefined;
+		try {
+			const openImplementation = async (target: unknown, flags: unknown, mode?: unknown): Promise<fs.FileHandle> => {
+				const handle = await originalOpen(target as string, flags as number, mode as number | undefined);
+				if (
+					!directorySyncInjected &&
+					typeof target === "string" &&
+					path.resolve(target) === path.resolve(directory)
+				) {
+					directorySyncInjected = true;
+					const syncSpy = vi
+						.spyOn(handle, "sync")
+						.mockRejectedValueOnce(new Error("controlled directory sync failure"));
+					restoreSyncSpy = () => syncSpy.mockRestore();
+				}
+				return handle;
+			};
+			const openSpy = vi.spyOn(fs, "open").mockImplementation(openImplementation as unknown as typeof fs.open);
+			restoreOpenSpy = () => openSpy.mockRestore();
+			await expect(
+				writeSessionLifecycleFailure(
+					root,
+					sessionId,
+					effectMarker,
+					{ phase: "startup", reason: "pending", message: "controlled directory sync failure" },
+					{
+						endpointGeneration: null,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+				),
+			).rejects.toThrow("controlled directory sync failure");
+			expect(directorySyncInjected).toBe(true);
+			expect(await Bun.file(failurePath).exists()).toBe(false);
+		} finally {
+			restoreSyncSpy?.();
+			restoreOpenSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"post-promotion durability failure downgrades a complete rollback receipt",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-post-sync-"));
+		const directory = path.join(root, "sdk");
+		const sessionId = "receipt-post-sync-failure";
+		const effectMarker = "receipt-post-sync-failure-marker";
+		const failurePath = path.join(directory, `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const originalOpen = fs.open.bind(fs);
+		let directorySyncCalls = 0;
+		let sawAllTrueReceiptBeforeFailure = false;
+		const restoreSyncSpies: Array<() => void> = [];
+		let restoreOpenSpy: (() => void) | undefined;
+		try {
+			const openImplementation = async (target: unknown, flags: unknown, mode?: unknown): Promise<fs.FileHandle> => {
+				const handle = await originalOpen(target as string, flags as number, mode as number | undefined);
+				if (typeof target !== "string" || path.resolve(target) !== path.resolve(directory)) return handle;
+				directorySyncCalls++;
+				if (directorySyncCalls === 3) {
+					const syncSpy = vi.spyOn(handle, "sync").mockImplementationOnce(async () => {
+						const promoted = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+							rollback: {
+								fenced: boolean;
+								runtimeRemoved: boolean;
+								hostStopped: boolean;
+								brokerRegistrationReleased: boolean;
+							};
+						};
+						sawAllTrueReceiptBeforeFailure =
+							promoted.rollback.fenced &&
+							promoted.rollback.runtimeRemoved &&
+							promoted.rollback.hostStopped &&
+							promoted.rollback.brokerRegistrationReleased;
+						throw new Error("controlled post-promotion directory sync failure");
+					});
+					restoreSyncSpies.push(() => syncSpy.mockRestore());
+				}
+				return handle;
+			};
+			const openSpy = vi.spyOn(fs, "open").mockImplementation(openImplementation as unknown as typeof fs.open);
+			restoreOpenSpy = () => openSpy.mockRestore();
+			await expect(
+				writeSessionLifecycleFailure(
+					root,
+					sessionId,
+					effectMarker,
+					{ phase: "startup", reason: "pending", message: "controlled post-promotion directory sync failure" },
+					{
+						endpointGeneration: 5,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+				),
+			).rejects.toThrow("controlled post-promotion directory sync failure");
+			expect(sawAllTrueReceiptBeforeFailure).toBe(true);
+			expect(directorySyncCalls).toBeGreaterThanOrEqual(6);
+			const remaining = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+				rollback: {
+					endpointGeneration: number | null;
+					fenced: boolean;
+					runtimeRemoved: boolean;
+					hostStopped: boolean;
+					brokerRegistrationReleased: boolean;
+				};
+			};
+			expect(remaining.rollback).toEqual({
+				endpointGeneration: 5,
+				fenced: false,
+				runtimeRemoved: false,
+				hostStopped: false,
+				brokerRegistrationReleased: false,
+			});
+		} finally {
+			for (const restore of restoreSyncSpies) restore();
+			restoreOpenSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"failed complete rollback promotion leaves no all-true failure receipt",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-promotion-"));
+		const sessionId = "receipt-promotion-failure";
+		const effectMarker = "receipt-promotion-failure-marker";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const originalExactReplace = native.exactReplacePath.bind(native);
+		const originalExactUnlink = native.exactUnlinkDirect.bind(native);
+		let restoreReplaceSpy: (() => void) | undefined;
+		let restoreUnlinkSpy: (() => void) | undefined;
+		try {
+			const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+				if (path.resolve(destination) === path.resolve(failurePath))
+					return { ok: false, code: "controlled receipt promotion failure" };
+				return originalExactReplace(source, destination, from, to);
+			});
+			restoreReplaceSpy = () => replaceSpy.mockRestore();
+			const unlinkSpy = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((target, identity) => {
+				if (path.resolve(target) === path.resolve(failurePath))
+					return { ok: false, code: "controlled receipt revoke failure" };
+				return originalExactUnlink(target, identity);
+			});
+			restoreUnlinkSpy = () => unlinkSpy.mockRestore();
+
+			await expect(
+				writeSessionLifecycleFailure(
+					root,
+					sessionId,
+					effectMarker,
+					{ phase: "startup", reason: "pending", message: "controlled receipt promotion failure" },
+					{
+						endpointGeneration: 4,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+				),
+			).rejects.toThrow();
+
+			const remaining = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+				rollback: {
+					endpointGeneration: number | null;
+					fenced: boolean;
+					runtimeRemoved: boolean;
+					hostStopped: boolean;
+					brokerRegistrationReleased: boolean;
+				};
+			};
+			expect(remaining.rollback).toEqual({
+				endpointGeneration: 4,
+				fenced: false,
+				runtimeRemoved: false,
+				hostStopped: false,
+				brokerRegistrationReleased: false,
+			});
+		} finally {
+			restoreUnlinkSpy?.();
+			restoreReplaceSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"post-exchange durability failure keeps all-true receipt fenced from readers",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-exchange-failure-"));
+		const sessionId = "receipt-exchange-failure";
+		const effectMarker = "receipt-exchange-failure-marker";
+		const incarnation = "receipt-exchange-failure-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+		const originalExactReplace = native.exactReplacePath.bind(native);
+		const originalExactUnlink = native.exactUnlinkDirect.bind(native);
+		let replacementCalls = 0;
+		let restoreReplaceSpy: (() => void) | undefined;
+		let restoreUnlinkSpy: (() => void) | undefined;
+		try {
+			const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+				if (path.resolve(destination) !== path.resolve(failurePath))
+					return originalExactReplace(source, destination, from, to);
+				replacementCalls++;
+				if (replacementCalls === 1) {
+					const replaced = originalExactReplace(source, destination, from, to);
+					if (replaced.ok) return { ok: false, code: "controlled post-exchange durability failure" };
+					return replaced;
+				}
+				return { ok: false, code: "controlled downgrade failure" };
+			});
+			restoreReplaceSpy = () => replaceSpy.mockRestore();
+			const unlinkSpy = vi.spyOn(native, "exactUnlinkDirect").mockImplementation((target, identity) => {
+				if (path.resolve(target) === path.resolve(failurePath))
+					return { ok: false, code: "controlled receipt revoke failure" };
+				return originalExactUnlink(target, identity);
+			});
+			restoreUnlinkSpy = () => unlinkSpy.mockRestore();
+
+			await expect(
+				writeSessionLifecycleFailure(
+					root,
+					sessionId,
+					effectMarker,
+					{ phase: "startup", reason: "pending", message: "controlled post-exchange durability failure" },
+					{
+						endpointGeneration: 6,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+					undefined,
+					incarnation,
+					process.pid,
+				),
+			).rejects.toThrow();
+
+			expect(replacementCalls).toBeGreaterThanOrEqual(2);
+			expect(await Bun.file(promotionFencePath).exists()).toBe(true);
+			const remaining = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+				rollback: {
+					endpointGeneration: number | null;
+					fenced: boolean;
+					runtimeRemoved: boolean;
+					hostStopped: boolean;
+					brokerRegistrationReleased: boolean;
+				};
+			};
+			expect(remaining.rollback).toEqual({
+				endpointGeneration: 6,
+				fenced: true,
+				runtimeRemoved: true,
+				hostStopped: true,
+				brokerRegistrationReleased: true,
+			});
+			expect(
+				await readSessionLifecycleFailure(root, sessionId, {
+					pid: process.pid,
+					effectMarker,
+					incarnation,
+				}),
+			).toBeUndefined();
+		} finally {
+			restoreUnlinkSpy?.();
+			restoreReplaceSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"failure reader rejects a receipt when its parent changes before fence inspection",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-parent-race-"));
+		const directory = path.join(root, "sdk");
+		const displaced = path.join(root, "sdk-displaced");
+		const sessionId = "receipt-parent-race";
+		const effectMarker = "receipt-parent-race-marker";
+		const incarnation = "receipt-parent-race-incarnation";
+		const failurePath = path.join(directory, `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+		const originalLstatSync = syncFs.lstatSync;
+		let parentReplaced = false;
+		let restoreLstatSpy: (() => void) | undefined;
+		try {
+			await writeSessionLifecycleFailure(
 				root,
 				sessionId,
 				effectMarker,
-				{ phase: "startup", reason: "pending", message: "controlled directory sync failure" },
+				{ phase: "startup", reason: "pending", message: "parent identity race fixture" },
+				{
+					endpointGeneration: 7,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				undefined,
+				incarnation,
+				process.pid,
+			);
+			await fs.writeFile(promotionFencePath, "pending promotion fixture");
+			const lstatSpy = vi.spyOn(syncFs, "lstatSync").mockImplementation(((target, options) => {
+				if (
+					!parentReplaced &&
+					typeof target === "string" &&
+					path.resolve(target) === path.resolve(promotionFencePath)
+				) {
+					parentReplaced = true;
+					syncFs.renameSync(directory, displaced);
+					syncFs.mkdirSync(directory, { mode: 0o700 });
+				}
+				return originalLstatSync(target, options as never);
+			}) as typeof syncFs.lstatSync);
+			restoreLstatSpy = () => lstatSpy.mockRestore();
+
+			expect(
+				await readSessionLifecycleFailure(root, sessionId, {
+					pid: process.pid,
+					effectMarker,
+					incarnation,
+				}),
+			).toBeUndefined();
+			expect(parentReplaced).toBe(true);
+			expect(await Bun.file(path.join(displaced, path.basename(failurePath))).exists()).toBe(true);
+		} finally {
+			restoreLstatSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform !== "win32")(
+	"Windows keeps complete rollback receipts untrusted without directory durability",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-windows-"));
+		const sessionId = "receipt-windows-durability";
+		const effectMarker = "receipt-windows-durability-marker";
+		const incarnation = "receipt-windows-durability-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		try {
+			await writeSessionLifecycleFailure(
+				root,
+				sessionId,
+				effectMarker,
+				{ phase: "startup", reason: "pending", message: "windows durability boundary" },
 				{
 					endpointGeneration: null,
 					fenced: true,
@@ -2217,16 +2785,38 @@ test("failure receipt is revoked when its directory durability barrier fails", a
 					hostStopped: true,
 					brokerRegistrationReleased: true,
 				},
-			),
-		).rejects.toThrow("controlled directory sync failure");
-		expect(directorySyncInjected).toBe(true);
-		expect(await Bun.file(failurePath).exists()).toBe(false);
-	} finally {
-		restoreSyncSpy?.();
-		restoreOpenSpy?.();
-		await fs.rm(root, { recursive: true, force: true });
-	}
-});
+				undefined,
+				incarnation,
+				process.pid,
+			);
+			const staged = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+				rollback: Record<string, unknown>;
+				[key: string]: unknown;
+			};
+			expect(staged.rollback).toEqual(expectedDurableRollbackReceipt(null));
+			expect(
+				await readSessionLifecycleFailure(root, sessionId, { pid: process.pid, effectMarker, incarnation }),
+			).toMatchObject({ rollback: expectedDurableRollbackReceipt(null) });
+
+			const legacyComplete = {
+				...staged,
+				rollback: {
+					...staged.rollback,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+			};
+			await fs.writeFile(failurePath, JSON.stringify(legacyComplete));
+			expect(
+				await readSessionLifecycleFailure(root, sessionId, { pid: process.pid, effectMarker, incarnation }),
+			).toBeUndefined();
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
 
 test("session host opts cached default profiles into lifecycle startup only", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-cached-default-"));
@@ -2447,6 +3037,7 @@ test("startup failure artifacts reject symlink and oversize collisions while acc
 			{ phase: "startup", reason: "failed", message: "owned startup failure" },
 			rollback,
 		);
+		expect(await Bun.file(`${artifactPath}.promoting`).exists()).toBe(false);
 
 		const original = await fs.readFile(artifactPath);
 		await writeSessionLifecycleFailure(
@@ -2458,6 +3049,7 @@ test("startup failure artifacts reject symlink and oversize collisions while acc
 		);
 
 		expect(await fs.readFile(artifactPath)).toEqual(original);
+		expect(await Bun.file(`${artifactPath}.promoting`).exists()).toBe(false);
 		expect((await fs.stat(artifactPath)).mode & 0o777).toBe(0o600);
 
 		await fs.rm(artifactPath);
