@@ -20,7 +20,12 @@ export type CreateLifecycleAgentSessionResult =
 			 */
 			startDeferredMemoryBackend: () => Promise<void>;
 	  }
-	| { capability: SdkStartupCapability; rollback: SdkStartupRollbackTracker; failure: SdkStartupFailure };
+	| {
+			capability: SdkStartupCapability;
+			rollback: SdkStartupRollbackTracker;
+			failure: SdkStartupFailure;
+			cleanupComplete: boolean;
+	  };
 
 /**
  * Options accepted by lifecycle-only session construction.
@@ -73,6 +78,15 @@ async function disposePartialSession(session: AgentSession): Promise<void> {
 	}
 }
 
+function hasConstructionCleanupDiagnostic(error: unknown): boolean {
+	if (error === null || (typeof error !== "object" && typeof error !== "function")) return false;
+	try {
+		return "cleanupDiagnostic" in error;
+	} catch {
+		return true;
+	}
+}
+
 /** Internal lifecycle-only session construction with an owner-bound SDK startup result. */
 export async function createLifecycleAgentSession(
 	options: CreateLifecycleAgentSessionOptions = {},
@@ -82,13 +96,14 @@ export async function createLifecycleAgentSession(
 	const capability =
 		owner?.capability ??
 		new SdkStartupCapability(rollback, options.readiness ?? "immediate", options.lifecycleRequestId);
+	let cleanupComplete = true;
 	try {
 		if (capability.cancelled) {
 			const failure =
 				capability.result?.status === "failed"
 					? capability.result.failure
 					: capability.normalizeFailure("startup", "pending");
-			return { capability, rollback, failure };
+			return { capability, rollback, failure, cleanupComplete };
 		}
 		const {
 			modelId,
@@ -116,12 +131,17 @@ export async function createLifecycleAgentSession(
 		};
 		const result = await createAgentSession(internalOptions);
 		if (capability.cancelled) {
-			await disposePartialSession(result.session);
+			try {
+				await disposePartialSession(result.session);
+			} catch (error) {
+				cleanupComplete = false;
+				throw error;
+			}
 			const failure =
 				capability.result?.status === "failed"
 					? capability.result.failure
 					: capability.normalizeFailure("startup", "pending");
-			return { capability, rollback, failure };
+			return { capability, rollback, failure, cleanupComplete };
 		}
 		// Explicit model pin (#4707) is a guarantee, not a preference. The
 		// coordinator validated the selector against its own registry; this child
@@ -138,7 +158,12 @@ export async function createLifecycleAgentSession(
 			const expected = parseModelString(modelId);
 			const expectedSelector = expected ? `${expected.provider}/${expected.id}` : modelId;
 			if (!activeSelector || activeSelector.toLowerCase() !== expectedSelector.toLowerCase()) {
-				await disposePartialSession(result.session);
+				try {
+					await disposePartialSession(result.session);
+				} catch (error) {
+					cleanupComplete = false;
+					throw error;
+				}
 				throw new Error(
 					`Model "${modelId}" not found. Use --list-models to see available models.${
 						activeSelector ? ` Session resolved ${activeSelector} instead.` : ""
@@ -148,8 +173,15 @@ export async function createLifecycleAgentSession(
 		}
 		if (!result.session.extensionRunner)
 			capability.settleFailure(capability.normalizeFailure("registration", "runner_absent"));
-		if (!result.startDeferredMemoryBackend)
+		if (!result.startDeferredMemoryBackend) {
+			try {
+				await disposePartialSession(result.session);
+			} catch (error) {
+				cleanupComplete = false;
+				throw error;
+			}
 			throw new Error("Lifecycle session construction did not return a deferred memory backend starter.");
+		}
 		return {
 			session: result.session,
 			capability,
@@ -157,9 +189,10 @@ export async function createLifecycleAgentSession(
 			startDeferredMemoryBackend: result.startDeferredMemoryBackend,
 		};
 	} catch (error) {
+		if (hasConstructionCleanupDiagnostic(error)) cleanupComplete = false;
 		const settled = capability.settleFailure(capability.normalizeFailure("registration", "failed", error));
 		const failure =
 			settled.status === "failed" ? settled.failure : capability.normalizeFailure("registration", "failed", error);
-		return { capability, rollback, failure };
+		return { capability, rollback, failure, cleanupComplete };
 	}
 }

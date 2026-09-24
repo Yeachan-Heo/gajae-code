@@ -7,7 +7,14 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
-import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLiveness } from "../src/commands/sdk";
+import type { Args as ParsedArgs } from "../src/cli/args";
+import {
+	lifecycleArgs,
+	openLifecycleSessionManager,
+	runSessionHost,
+	watchSessionHostBrokerLiveness,
+} from "../src/commands/sdk";
+import { Settings } from "../src/config/settings";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { Broker, type BrokerCleanupEvidence, type BrokerResponse } from "../src/sdk/broker/broker";
@@ -25,6 +32,7 @@ import {
 	processIncarnation,
 	reapDeadLifecycleMarkers,
 	reapDeadSessionRegistrations,
+	type SessionLifecycleLaunchRequest,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
 	setLifecycleTimingForTest,
@@ -1095,6 +1103,396 @@ test("session host preserves pre-session absence when theme initialization is in
 		await fixture.restore();
 	}
 }, 10_000);
+
+test("session host closes a late manager before writing rollback evidence", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-late-manager-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "late-manager";
+	const effectMarker = "late-manager-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let nowMs = 1_000;
+	let managerClosedBeforeReceipt = false;
+	const deadlineSignal = Promise.withResolvers<void>();
+	const openStarted = Promise.withResolvers<void>();
+	const lateOpen = Promise.withResolvers<{ parsed: ParsedArgs; sessionManager: SessionManager }>();
+	let sessionManager: SessionManager | undefined;
+	let restoreCloseSpy: (() => void) | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		};
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+		const parsed = await lifecycleArgs(request, root, agentDir);
+		sessionManager = SessionManager.inMemory(root);
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const closeSpy = vi.spyOn(sessionManager, "close").mockImplementation(async () => {
+			managerClosedBeforeReceipt = true;
+			expect(await Bun.file(failurePath).exists()).toBe(false);
+		});
+		restoreCloseSpy = () => closeSpy.mockRestore();
+		const host = runSessionHost({
+			cwd: root,
+			now: () => nowMs,
+			sleep: async ms => {
+				if (ms > 0) await deadlineSignal.promise;
+			},
+			processIncarnation: () => "test-incarnation",
+			openLifecycleSessionManager: async () => {
+				openStarted.resolve();
+				return await lateOpen.promise;
+			},
+		});
+		await openStarted.promise;
+		nowMs = deadlines.semanticReadyDeadlineAt + 1;
+		deadlineSignal.resolve();
+		lateOpen.resolve({ parsed, sessionManager });
+		await expect(host).rejects.toMatchObject({ phase: "startup", reason: "pending" });
+		expect(managerClosedBeforeReceipt).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+			reason: string;
+		};
+		expect(failure.reason).toBe("pending");
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: true,
+			runtimeRemoved: true,
+			hostStopped: true,
+			brokerRegistrationReleased: true,
+		});
+	} finally {
+		restoreCloseSpy?.();
+		await sessionManager?.close().catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("session host keeps absence unproven when manager or MCP cleanup fails", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-manager-cleanup-failure-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "manager-cleanup-failure";
+	const effectMarker = "manager-cleanup-failure-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let sessionManager: SessionManager | undefined;
+	let mcpDirectory: string | undefined;
+	let managerCloseAttempted = false;
+	let restoreCloseSpy: (() => void) | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			mcpServers: [
+				{
+					type: "http",
+					name: "fixture",
+					url: "https://example.invalid/mcp",
+					headers: { authorization: "fixture" },
+				},
+			],
+			...deadlines,
+		};
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+		const parsed = await lifecycleArgs(request, root, agentDir);
+		sessionManager = SessionManager.inMemory(root);
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const closeSpy = vi.spyOn(sessionManager, "close").mockImplementation(async () => {
+			managerCloseAttempted = true;
+			expect(mcpDirectory).toBeDefined();
+			expect(await Bun.file(mcpDirectory!).exists()).toBe(false);
+			expect(await Bun.file(failurePath).exists()).toBe(false);
+			throw new Error("controlled manager close failure");
+		});
+		restoreCloseSpy = () => closeSpy.mockRestore();
+		await expect(
+			runSessionHost({
+				cwd: root,
+				now: () => 1_000,
+				sleep: async ms => {
+					if (ms > 0) await new Promise<void>(() => {});
+				},
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager }),
+				createLifecycleAgentSession: async (options, owner) => {
+					if (!owner) throw new Error("Expected lifecycle startup owner.");
+					if (!options?.mcpConfigPath) throw new Error("Expected temporary MCP config.");
+					mcpDirectory = path.dirname(options.mcpConfigPath);
+					expect(await Bun.file(options.mcpConfigPath).exists()).toBe(true);
+					return {
+						capability: owner.capability,
+						rollback: owner.rollback,
+						failure: owner.capability.normalizeFailure(
+							"registration",
+							"failed",
+							"controlled construction failure",
+						),
+						cleanupComplete: true,
+					};
+				},
+			}),
+		).rejects.toMatchObject({ phase: "registration", reason: "failed" });
+		expect(managerCloseAttempted).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+			reason: string;
+		};
+		expect(failure.reason).toBe("failed");
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+	} finally {
+		restoreCloseSpy?.();
+		await sessionManager?.close().catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("session manager open preserves failed manager-close evidence", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-open-cleanup-failure-"));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	await fs.mkdir(cwd, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true });
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const request: SessionLifecycleLaunchRequest = {
+		operation: "session.create",
+		sessionId: "open-cleanup-failure",
+		cwd,
+		stateRoot,
+		...deadlines,
+	};
+	const settings = Settings.isolated();
+	const settingsClose = vi.spyOn(settings, "close").mockRejectedValue(new Error("settings close failed"));
+	const settingsLoad = vi.spyOn(Settings, "loadForScope").mockResolvedValue(settings);
+	let manager: SessionManager | undefined;
+	const managerClose = vi.spyOn(SessionManager.prototype, "close").mockImplementation(async function (
+		this: SessionManager,
+	) {
+		manager = this;
+		throw new Error("session manager close failed");
+	});
+	try {
+		await expect(openLifecycleSessionManager(request, cwd, agentDir)).rejects.toMatchObject({
+			name: "LifecycleSessionManagerCleanupError",
+			message: "Lifecycle session manager cleanup could not be proven.",
+		});
+		expect(managerClose).toHaveBeenCalledTimes(1);
+	} finally {
+		managerClose.mockRestore();
+		settingsLoad.mockRestore();
+		settingsClose.mockRestore();
+		await manager?.close().catch(() => {});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("session host does not claim absence when factory cleanup is incomplete", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-factory-cleanup-incomplete-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "factory-cleanup-incomplete";
+	const effectMarker = "factory-cleanup-incomplete-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let sessionManager: SessionManager | undefined;
+	let managerClosed = false;
+	let restoreCloseSpy: (() => void) | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		};
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+		const parsed = await lifecycleArgs(request, root, agentDir);
+		sessionManager = SessionManager.inMemory(root);
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const closeSpy = vi.spyOn(sessionManager, "close").mockImplementation(async () => {
+			managerClosed = true;
+		});
+		restoreCloseSpy = () => closeSpy.mockRestore();
+		await expect(
+			runSessionHost({
+				cwd: root,
+				now: () => 1_000,
+				sleep: async ms => {
+					if (ms > 0) await new Promise<void>(() => {});
+				},
+				processIncarnation: () => "test-incarnation",
+				openLifecycleSessionManager: async () => ({ parsed, sessionManager }),
+				createLifecycleAgentSession: async (_options, owner) => {
+					if (!owner) throw new Error("Expected lifecycle startup owner.");
+					return {
+						capability: owner.capability,
+						rollback: owner.rollback,
+						failure: owner.capability.normalizeFailure("startup", "pending"),
+						cleanupComplete: false,
+					};
+				},
+			}),
+		).rejects.toMatchObject({ phase: "startup", reason: "pending" });
+		expect(managerClosed).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as { rollback: Record<string, unknown> };
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+	} finally {
+		restoreCloseSpy?.();
+		await sessionManager?.close().catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("session manager open preserves close failure when scoped settings also fail", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-session-manager-open-cleanup-"));
+	const cwd = path.join(root, "workspace");
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "open-cleanup-failure";
+	const deadlines = deriveLifecycleDeadlines(Date.now(), 10_000);
+	const previousInMemorySession = process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+	let manager: SessionManager | undefined;
+	const settings = Settings.isolated();
+	const settingsClose = vi.spyOn(settings, "close").mockRejectedValue(new Error("settings close failed"));
+	const settingsLoad = vi.spyOn(Settings, "loadForScope").mockResolvedValue(settings);
+	const managerClose = vi.spyOn(SessionManager.prototype, "close").mockImplementation(async function (
+		this: SessionManager,
+	) {
+		manager = this;
+		throw new Error("session manager close failed");
+	});
+	try {
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		const request: SessionLifecycleLaunchRequest = {
+			operation: "session.create",
+			sessionId,
+			cwd,
+			stateRoot,
+			...deadlines,
+		};
+		await expect(openLifecycleSessionManager(request, cwd, agentDir)).rejects.toMatchObject({
+			name: "LifecycleSessionManagerCleanupError",
+			message: "Lifecycle session manager cleanup could not be proven.",
+		});
+		expect(managerClose).toHaveBeenCalledTimes(1);
+	} finally {
+		managerClose.mockRestore();
+		settingsLoad.mockRestore();
+		settingsClose.mockRestore();
+		await manager?.close().catch(() => {});
+		if (previousInMemorySession === undefined) delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		else process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = previousInMemorySession;
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("ready marker is revoked when owner cancellation wins after atomic publication", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-ready-revoke-"));
+	const sessionId = "ready-revoke";
+	let checks = 0;
+	try {
+		await expect(
+			writeSessionLifecycleReady(root, sessionId, "ready-revoke-marker", () => ++checks === 1),
+		).rejects.toThrow("cutoff");
+		expect(checks).toBe(2);
+		await expect(fs.stat(path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 
 test("session host opts cached default profiles into lifecycle startup only", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-cached-default-"));
