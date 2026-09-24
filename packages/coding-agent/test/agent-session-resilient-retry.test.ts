@@ -9,7 +9,10 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
-import { GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import {
+	__sessionStateSidecarTestHooks,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -24,6 +27,7 @@ import {
 
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+const ORIGINAL_BEFORE_PERSIST_FROM_EVENT = __sessionStateSidecarTestHooks.beforePersistFromEvent;
 
 setDefaultTimeout(120_000);
 
@@ -99,6 +103,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 	function configureRetryTestSession(value: AgentSession): AgentSession {
 		value.setDisposeTimeoutForTests(120_000);
+		value.trackCoordinatorRuntimeStatePersistenceFailuresForTests();
 		return value;
 	}
 
@@ -137,6 +142,7 @@ describe.serial("AgentSession resilient retry", () => {
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
 		vi.restoreAllMocks();
 		Date.now = REAL_DATE_NOW;
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = ORIGINAL_BEFORE_PERSIST_FROM_EVENT;
 		const currentSession = session;
 		const currentAuthStorage = authStorage;
 		const currentTempDir = tempDir;
@@ -2331,6 +2337,24 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	}, 300000);
+	it("reports coordinator sidecar failures through the retry-test persistence drain", async () => {
+		const failure = new Error("injected coordinator sidecar failure");
+		let injected = false;
+		session = buildBareRetrySession({ responses: [{ content: ["completed"] }] });
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = eventType => {
+			if (injected || eventType !== "agent_start") return;
+			injected = true;
+			throw failure;
+		};
+
+		await session.prompt("surface sidecar persistence failure");
+		await session.waitForIdle();
+
+		expect(injected).toBe(true);
+		await expect(session.awaitCoordinatorRuntimeStatePersistenceForTests()).rejects.toThrow(
+			"Coordinator runtime-state persistence failed during test",
+		);
+	});
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		const coordinatorStateFiles = new Set<string>();
 		const coordinatorNamespaceLocks = new Set<string>();
