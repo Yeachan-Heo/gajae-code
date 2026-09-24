@@ -49,6 +49,7 @@ type Fixture = {
 	sendIdle(): void;
 	dispose(): void;
 	queryCalls: string[];
+	brokerCalls: string[];
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -107,6 +108,7 @@ export function createFixture(
 		const sessionId = "cancel-settlement-session";
 		const updates: SessionNotification[] = [];
 		const queryCalls: string[] = [];
+		const brokerCalls: string[] = [];
 		const delivered = Promise.withResolvers<void>();
 		const abortDelivered = Promise.withResolvers<void>();
 		const abort = new AbortController();
@@ -222,6 +224,7 @@ export function createFixture(
 						return;
 					}
 					if (frame.type === "broker_request") {
+						brokerCalls.push(String(frame.operation));
 						const input = frame.input as Record<string, unknown> | undefined;
 						const resolvingSavedSession =
 							frame.operation === "session.list" && input?.resolveSessionId === sessionId;
@@ -439,6 +442,7 @@ export function createFixture(
 			},
 			sendIdle,
 			queryCalls,
+			brokerCalls,
 			sendTerminal,
 			dispose: () => {
 				releaseHang.resolve();
@@ -1326,13 +1330,24 @@ test("uncertain abort keeps its unresolved owner fenced through session reattach
 			queryName => queryName === "runtime.capabilities",
 		).length;
 		fixture.signalTransportFailure(new SdkClientError("reconnect_exhausted", "fixture reconnect exhausted"));
-		await waitFor(
-			() =>
-				fixture.queryCalls.filter(queryName => queryName === "runtime.capabilities").length >
-				capabilityQueriesBeforeReattach,
-			"replacement session attachment capability query",
-			60_000,
-		);
+		try {
+			await waitFor(
+				() =>
+					fixture.queryCalls.filter(queryName => queryName === "runtime.capabilities").length >
+					capabilityQueriesBeforeReattach,
+				"replacement session attachment capability query",
+				5_000,
+			);
+		} catch (error) {
+			const updates = fixture.updates.map(notification => {
+				const update = notification.update as { sessionUpdate?: string; _meta?: Record<string, unknown> };
+				return { sessionUpdate: update.sessionUpdate, _meta: update._meta };
+			});
+			throw new Error(
+				`Reattachment did not issue runtime.capabilities; broker=${JSON.stringify(fixture.brokerCalls)} queries=${JSON.stringify(fixture.queryCalls)} updates=${JSON.stringify(updates)}`,
+				{ cause: error },
+			);
+		}
 		const workingUpdatesBeforeReattach = fixture.updates.filter(
 			update =>
 				update.update.sessionUpdate === "session_info_update" &&
@@ -1730,6 +1745,65 @@ test("uncertain abort before prompt acknowledgement promotes clientRef recovery 
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "successor prompt completion")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		cancel.mockRestore();
+		query.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("pre-ack clientRef recovery maps terminal end_turn without receipt to prompt_failed", async () => {
+	const fixture = await createFixture({ deferPromptAcknowledgement: true });
+	const cancel = vi.spyOn(AcpSdkAdapter.prototype, "cancel").mockRejectedValue(
+		new SdkClientError("uncertain_after_send", "SDK abort response was lost after dispatch.", {
+			operation: "turn.abort",
+		}),
+	);
+	const originalQuery = AcpSdkAdapter.prototype.query;
+	let clientRef = "";
+	const query = vi.spyOn(AcpSdkAdapter.prototype, "query").mockImplementation(function (
+		this: AcpSdkAdapter,
+		queryName,
+		input,
+		cursor,
+	) {
+		if (queryName === "turn.result")
+			return Promise.resolve({
+				kind: "prompt",
+				status: "terminal_ok",
+				receiptState: "missing",
+				clientRef,
+				commandId: "cancel-settlement-command-1",
+				turnId: "cancel-settlement-turn-1",
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			});
+		return originalQuery.call(this, queryName, input, cursor);
+	});
+	try {
+		const pending = prompt(fixture, "pre-ack missing-receipt terminal").then(
+			result => ({ result }),
+			(error: unknown) => ({ error: error as { code?: string } }),
+		);
+		await bounded(fixture.promptDelivered, "prompt dispatch");
+		await waitFor(() => fixture.hasPendingPromptAcknowledgement(), "deferred prompt ACK");
+		clientRef = fixture.promptClientRef();
+		const cancellation = fixture.agent.cancel({ sessionId: fixture.sessionId }).then(
+			() => ({ resolved: true }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		expect(await bounded(cancellation, "clientRef missing-receipt recovery")).toEqual({ resolved: true });
+		expect(await bounded(pending, "pre-ack prompt failure")).toEqual({
+			error: expect.objectContaining({ code: "prompt_failed" }),
+		});
+		expect(query).toHaveBeenCalledWith("turn.result", { kind: "prompt", clientRef });
+		expect(query).toHaveBeenCalledTimes(1);
+		expect(cancel).toHaveBeenCalledTimes(1);
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.rejectPendingPromptAcknowledgement();
+		const next = prompt(fixture, "prompt after pre-ack missing-receipt failure");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "successor prompt delivery");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "successor terminal")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		cancel.mockRestore();
 		query.mockRestore();
