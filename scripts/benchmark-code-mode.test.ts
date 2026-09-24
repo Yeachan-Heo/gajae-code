@@ -6,6 +6,7 @@ import * as z from "zod/v4";
 import {
 	MAX_PLAN_STEPS,
 	MIN_PLAN_STEPS,
+	assertTaskSnapshotMatchesOrigin,
 	assertOutputPathOutsideWorkspace,
 	assertRepositoryScopedArguments,
 	medianMetric,
@@ -226,6 +227,60 @@ describe("repository-scoped file handlers", () => {
 					/resolves through a symlink outside/,
 				);
 			}
+		} finally {
+			await fs.rm(temporaryRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("pinned task snapshot resume", () => {
+	test("allows only an exact recorded snapshot that is current or an ancestor of origin/dev", async () => {
+		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-benchmark-resume-"));
+		const repository = path.join(temporaryRoot, "repo");
+		const unrelatedRepository = path.join(temporaryRoot, "unrelated");
+		const runGit = async (cwd: string, ...args: string[]): Promise<string> => {
+			const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			if (exitCode !== 0) throw new Error(stderr);
+			return stdout.trim();
+		};
+		try {
+			await fs.mkdir(repository, { recursive: true });
+			await fs.mkdir(unrelatedRepository, { recursive: true });
+			await runGit(repository, "init", "--initial-branch=main");
+			await runGit(repository, "config", "user.name", "GJC Test");
+			await runGit(repository, "config", "user.email", "gjc-test@example.invalid");
+			await fs.writeFile(path.join(repository, "snapshot.txt"), "initial\n");
+			await runGit(repository, "add", "snapshot.txt");
+			await runGit(repository, "commit", "-m", "initial snapshot");
+			const recordedSnapshot = await runGit(repository, "rev-parse", "HEAD");
+			await fs.writeFile(path.join(repository, "snapshot.txt"), "advanced\n");
+			await runGit(repository, "commit", "-am", "advance dev");
+			const currentDev = await runGit(repository, "rev-parse", "HEAD");
+
+			await assertTaskSnapshotMatchesOrigin(repository, currentDev, currentDev);
+			await expect(
+				assertTaskSnapshotMatchesOrigin(repository, recordedSnapshot, currentDev),
+			).rejects.toThrow(/exact clean snapshot of origin\/dev/);
+			await assertTaskSnapshotMatchesOrigin(repository, recordedSnapshot, currentDev, recordedSnapshot);
+			await expect(
+				assertTaskSnapshotMatchesOrigin(repository, currentDev, currentDev, recordedSnapshot),
+			).rejects.toThrow(/match the resumed report snapshot/);
+
+			await runGit(unrelatedRepository, "init", "--initial-branch=main");
+			await runGit(unrelatedRepository, "config", "user.name", "GJC Test");
+			await runGit(unrelatedRepository, "config", "user.email", "gjc-test@example.invalid");
+			await fs.writeFile(path.join(unrelatedRepository, "other.txt"), "unrelated\n");
+			await runGit(unrelatedRepository, "add", "other.txt");
+			await runGit(unrelatedRepository, "commit", "-m", "unrelated snapshot");
+			const unrelatedCommit = await runGit(unrelatedRepository, "rev-parse", "HEAD");
+			await expect(
+				assertTaskSnapshotMatchesOrigin(repository, unrelatedCommit, currentDev, unrelatedCommit),
+			).rejects.toThrow(/no longer an ancestor of origin\/dev/);
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
 		}
