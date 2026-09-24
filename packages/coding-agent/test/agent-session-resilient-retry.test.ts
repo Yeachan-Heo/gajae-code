@@ -2380,6 +2380,55 @@ describe.serial("AgentSession resilient retry", () => {
 			"Coordinator runtime-state persistence failed during test",
 		);
 	});
+	it("keeps a delayed session writer on its own marker after another session is configured", async () => {
+		const startedAt = performance.now();
+		let agentStartEvent: AgentSessionEvent | undefined;
+		const firstSession = buildBareRetrySession({ responses: [{ content: ["first session"] }] });
+		session = firstSession;
+		firstSession.subscribe(event => {
+			if (event.type === "agent_start") agentStartEvent = event;
+		});
+
+		await firstSession.prompt("create first session marker");
+		await firstSession.waitForIdle();
+		await firstSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+
+		const firstStateFile = firstSession.getCoordinatorRuntimeStateFileForTests();
+		expect(firstStateFile).toBeDefined();
+		if (!firstStateFile) throw new Error("Expected first test marker path");
+		const secondSession = buildBareRetrySession({ responses: [{ content: ["second session"] }] });
+		try {
+			const secondStateFile = secondSession.getCoordinatorRuntimeStateFileForTests();
+			expect(secondStateFile).toBeDefined();
+			if (!secondStateFile) throw new Error("Expected second test marker path");
+			expect(secondStateFile).not.toBe(firstStateFile);
+			const secondNamespaceLock = path.resolve(path.dirname(secondStateFile), "..", "locks", "mutation.lock");
+			const firstNamespaceLock = path.resolve(path.dirname(firstStateFile), "..", "locks", "mutation.lock");
+			expect(secondNamespaceLock).not.toBe(firstNamespaceLock);
+
+			await secondSession.prompt("create second session marker");
+			await secondSession.waitForIdle();
+			await secondSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+			const secondMarkerBefore = await Bun.file(secondStateFile).text();
+
+			// Simulate a later session retargeting the old process-wide pin. Session A's
+			// already-captured sidecar work must still use its instance-bound marker.
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = secondStateFile;
+			const event = agentStartEvent;
+			if (!event) throw new Error("Expected agent_start event for the first session");
+			await firstSession.queueCoordinatorRuntimeStatePersistForTests(event, Promise.resolve());
+			await firstSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+
+			expect(firstSession.getCoordinatorRuntimeStateFileForTests()).toBe(firstStateFile);
+			expect(await Bun.file(secondStateFile).text()).toBe(secondMarkerBefore);
+			expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
+		} finally {
+			await disposeAfterCoordinatorPersistence(secondSession);
+		}
+
+		await disposeAfterCoordinatorPersistence(firstSession);
+		session = undefined;
+	});
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		const startedAt = performance.now();
 		const coordinatorStateFiles = new Set<string>();
