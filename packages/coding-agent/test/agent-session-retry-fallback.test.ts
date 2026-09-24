@@ -906,7 +906,7 @@ describe("AgentSession retry fallback", () => {
 		expect(refreshSpy).toHaveBeenCalledTimes(2);
 	});
 
-	it("advances managed fallback without mutating credentials after a reached ceiling", async () => {
+	it("records quota at the ceiling while advancing managed fallback", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
@@ -975,7 +975,7 @@ describe("AgentSession retry fallback", () => {
 		expect(primaryCalls).toBe(1);
 		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
 		expect(requestedAnthropicKeys).toHaveLength(1);
-		expect(await modelRegistry.getApiKeyForProvider("anthropic", poolSessionId)).toBe(requestedAnthropicKeys[0]);
+		expect(await modelRegistry.getApiKeyForProvider("anthropic", poolSessionId)).toBe("account-b-key");
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
