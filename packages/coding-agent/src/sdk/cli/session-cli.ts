@@ -912,30 +912,32 @@ export async function resolveSessionListSelection(
 /**
  * Per-call ceiling on scope-exclusion warnings.
  *
- * One warning per excluded non-Git session can make the list response grow with the number of
+ * One warning per excluded session workspace can make the list response grow with the number of
  * sessions on the machine. The signal a caller needs is "some workspaces were excluded and how
  * many", so a bounded sample plus exact totals carries it without unbounded warning output.
  */
 export const SESSION_LIST_WARNING_LIMIT = 10;
 
 /** Collapses the tail of a warning list into one exact-count summary. */
-function boundWarnings(warnings: readonly string[], describeOmitted: (omitted: number) => string): string[] {
-	if (warnings.length <= SESSION_LIST_WARNING_LIMIT) return [...warnings];
-	return [
-		...warnings.slice(0, SESSION_LIST_WARNING_LIMIT),
-		describeOmitted(warnings.length - SESSION_LIST_WARNING_LIMIT),
-	];
+function boundWarnings(
+	warnings: readonly string[],
+	totalCount: number,
+	describeOmitted: (omitted: number) => string,
+): string[] {
+	if (totalCount <= SESSION_LIST_WARNING_LIMIT) return [...warnings];
+	const samples = warnings.slice(0, SESSION_LIST_WARNING_LIMIT - 1);
+	return [...samples, describeOmitted(totalCount - samples.length)];
+}
+
+function scopeWarningSummary(omitted: number, totalCount: number, scope: SdkSessionListScope): string {
+	return `${omitted} further session workspace${omitted === 1 ? "" : "s"} ${
+		omitted === 1 ? "was" : "were"
+	} excluded by scope ${scope}; ${totalCount} excluded in total.`;
 }
 
 /** Bounds the excluded-workspace warnings produced by one scope filter. */
-function boundScopeWarnings(warnings: readonly string[], scope: SdkSessionListScope): string[] {
-	return boundWarnings(
-		warnings,
-		omitted =>
-			`${omitted} further session workspace${omitted === 1 ? "" : "s"} outside Git ${
-				omitted === 1 ? "was" : "were"
-			} excluded by scope ${scope}; ${warnings.length} excluded in total.`,
-	);
+function boundScopeWarnings(warnings: readonly string[], totalCount: number, scope: SdkSessionListScope): string[] {
+	return boundWarnings(warnings, totalCount, omitted => scopeWarningSummary(omitted, totalCount, scope));
 }
 
 /**
@@ -948,13 +950,23 @@ export async function filterSessionRowsByScope(
 	rows: readonly SdkSessionRowV1[],
 	scope: SdkSessionListScope,
 	selection: SdkSessionListSelection,
-): Promise<{ sessions: SdkSessionRowV1[]; warnings: string[]; warningEntries: string[] }> {
-	if (scope === "all") return { sessions: [...rows], warnings: [], warningEntries: [] };
-	const warnings: string[] = [];
+): Promise<{
+	sessions: SdkSessionRowV1[];
+	warnings: string[];
+	warningEntries: string[];
+	warningCount: number;
+}> {
+	if (scope === "all") return { sessions: [...rows], warnings: [], warningEntries: [], warningCount: 0 };
+	const warningEntries: string[] = [];
+	let warningCount = 0;
+	const addWarning = (warning: string) => {
+		warningCount++;
+		if (warningEntries.length < SESSION_LIST_WARNING_LIMIT) warningEntries.push(warning);
+	};
 	const sessions: SdkSessionRowV1[] = [];
 	for (const row of rows) {
 		if (row.locator.cwd === "unknown") {
-			warnings.push(`Session ${row.sessionId} workspace is unavailable; excluded by scope ${scope}.`);
+			addWarning(`Session ${row.sessionId} workspace is unavailable; excluded by scope ${scope}.`);
 			continue;
 		}
 		const identity = await workspaceIdentity(row.locator.cwd);
@@ -965,21 +977,39 @@ export async function filterSessionRowsByScope(
 		else keep = identity.commonDir !== null && identity.commonDir === selection.selection.commonDir;
 		if (keep) sessions.push(row);
 		else if (identity.repoRoot === null && identity.commonDir === null)
-			warnings.push(
+			addWarning(
 				`Session ${row.sessionId} workspace "${row.locator.cwd}" is outside Git; excluded by scope ${scope}.`,
 			);
 	}
-	return { sessions, warnings: boundScopeWarnings(warnings, scope), warningEntries: warnings };
+	const samples =
+		warningCount > SESSION_LIST_WARNING_LIMIT
+			? warningEntries.slice(0, SESSION_LIST_WARNING_LIMIT - 1)
+			: warningEntries;
+	return {
+		sessions,
+		warnings: boundScopeWarnings(samples, warningCount, scope),
+		warningEntries: samples,
+		warningCount,
+	};
 }
 
+type WarningSource = {
+	entries: readonly string[];
+	totalCount?: number;
+	describeOmitted: (omitted: number) => string;
+};
+
 /** Bounds all warning sources together while retaining each source's exact omitted count. */
-export function boundWarningSources(
-	sources: readonly { entries: readonly string[]; describeOmitted: (omitted: number) => string }[],
-): string[] {
-	const totalEntries = sources.reduce((total, source) => total + source.entries.length, 0);
-	if (totalEntries <= SESSION_LIST_WARNING_LIMIT) return sources.flatMap(source => source.entries);
+export function boundWarningSources(sources: readonly WarningSource[]): string[] {
+	const sourceCount = (source: WarningSource) => source.totalCount ?? source.entries.length;
+	const totalEntries = sources.reduce((total, source) => total + sourceCount(source), 0);
+	if (
+		totalEntries <= SESSION_LIST_WARNING_LIMIT &&
+		sources.every(source => sourceCount(source) === source.entries.length)
+	)
+		return sources.flatMap(source => source.entries);
 	const omitted = sources
-		.map(source => ({ source, count: source.entries.length }))
+		.map(source => ({ source, count: sourceCount(source) }))
 		.filter(item => item.count > 0)
 		.map(item => ({ ...item }));
 	const retainedCounts = new Map<(typeof sources)[number], number>();
@@ -997,14 +1027,12 @@ export function boundWarningSources(
 		retainedCounts.set(retainedSource, (retainedCounts.get(retainedSource) ?? 0) - 1);
 	}
 	const samples = sources.flatMap(source => source.entries.slice(0, retainedCounts.get(source) ?? 0));
-	return [
-		...samples,
-		...omitted
-			.filter(item => summarySources().includes(item))
-			.map(item => ({ item, count: item.count - (retainedCounts.get(item.source) ?? 0) }))
-			.filter(({ count }) => count > 0)
-			.map(({ item, count }) => item.source.describeOmitted(count)),
-	];
+	const summaries = omitted
+		.filter(item => summarySources().includes(item))
+		.map(item => ({ item, count: item.count - (retainedCounts.get(item.source) ?? 0) }))
+		.filter(({ count }) => count > 0)
+		.map(({ item, count }) => item.source.describeOmitted(count));
+	return [...samples, ...(summaries.length > SESSION_LIST_WARNING_LIMIT ? [summaries.join(" ")] : summaries)];
 }
 
 async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unknown> {
@@ -1029,10 +1057,8 @@ async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unkno
 				},
 				{
 					entries: filtered.warningEntries,
-					describeOmitted: omitted =>
-						`${omitted} further session workspace${omitted === 1 ? "" : "s"} outside Git ${
-							omitted === 1 ? "was" : "were"
-						} excluded by scope ${scope}; ${filtered.warningEntries.length} excluded in total.`,
+					totalCount: filtered.warningCount,
+					describeOmitted: omitted => scopeWarningSummary(omitted, filtered.warningCount, scope),
 				},
 			]),
 		},

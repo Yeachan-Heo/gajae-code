@@ -223,7 +223,7 @@ describe("sdk session list scope filtering", () => {
 });
 
 describe("scope exclusion warnings are bounded", () => {
-	/** Non-Git workspaces are what produce exclusion warnings. */
+	/** Builds excluded non-Git rows for scope-warning cases. */
 	async function nonGitRows(count: number, prefix: string): Promise<SdkSessionRowV1[]> {
 		const rows: SdkSessionRowV1[] = [];
 		for (let index = 0; index < count; index++) {
@@ -243,6 +243,8 @@ describe("scope exclusion warnings are bounded", () => {
 
 		expect(filtered.sessions).toEqual([]);
 		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(filtered.warningEntries).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(filtered.warningCount).toBe(SESSION_LIST_WARNING_LIMIT);
 		// No summary line is added when nothing was omitted.
 		expect(filtered.warnings.every(warning => warning.startsWith("Session "))).toBe(true);
 	});
@@ -256,27 +258,36 @@ describe("scope exclusion warnings are bounded", () => {
 		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
 
 		// Bounded regardless of how many sessions exist on the machine.
-		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT + 1);
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(filtered.warningEntries).toHaveLength(SESSION_LIST_WARNING_LIMIT - 1);
+		expect(filtered.warningCount).toBe(excluded);
 		const summary = filtered.warnings.at(-1) ?? "";
-		expect(summary).toBe(
-			`7 further session workspaces outside Git were excluded by scope repo; ${excluded} excluded in total.`,
-		);
+		expect(summary).toBe(`8 further session workspaces were excluded by scope repo; ${excluded} excluded in total.`);
 		// The retained sample is still individual, credential-free exclusion text.
-		for (const warning of filtered.warnings.slice(0, SESSION_LIST_WARNING_LIMIT)) {
+		for (const warning of filtered.warnings.slice(0, SESSION_LIST_WARNING_LIMIT - 1)) {
 			expect(warning).toContain("is outside Git; excluded by scope repo.");
 		}
 	});
 
-	test("uses singular wording when exactly one warning is omitted", async () => {
-		const repo = await makeRepo("warn-one-over");
+	test("uses reason-neutral wording for summaries across unavailable and non-Git rows", async () => {
+		const repo = await makeRepo("warn-mixed-reasons");
 		const selection = await resolveSessionListSelection("repo", repo);
-		const rows = await nonGitRows(SESSION_LIST_WARNING_LIMIT + 1, "oneover");
+		const unknownRows = Array.from({ length: 6 }, (_, index) => row(`s-unknown-${index}`, "unknown"));
+		const outsideGitRows = await nonGitRows(6, "mixed-reasons");
+		const rows = [...unknownRows, ...outsideGitRows];
 
 		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
 
-		expect(filtered.warnings.at(-1)).toBe(
-			`1 further session workspace outside Git was excluded by scope repo; ${SESSION_LIST_WARNING_LIMIT + 1} excluded in total.`,
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(filtered.warningEntries).toHaveLength(SESSION_LIST_WARNING_LIMIT - 1);
+		expect(filtered.warningCount).toBe(rows.length);
+		expect(filtered.warningEntries.some(warning => warning.includes("workspace is unavailable"))).toBe(true);
+		expect(filtered.warningEntries.some(warning => warning.includes("is outside Git"))).toBe(true);
+		const summary = filtered.warnings.at(-1) ?? "";
+		expect(summary).toBe(
+			`3 further session workspaces were excluded by scope repo; ${rows.length} excluded in total.`,
 		);
+		expect(summary).not.toContain("outside Git");
 	});
 
 	test("scope all filters nothing and therefore warns about nothing", async () => {
@@ -290,9 +301,8 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(filtered.warnings).toEqual([]);
 	});
 
-	// Regression: bounding the concatenated array a second time counted the inner summary as a
-	// warning, reported the collapsed length as the total, and could truncate the inner summary
-	// away entirely — destroying the exact excluded count it exists to carry.
+	// A bounded sample is smaller than the actual number of excluded workspaces; keep that exact
+	// count available independently so downstream aggregation cannot mistake the sample length for it.
 	test("keeps the scope summary and its exact total when many warnings are excluded", async () => {
 		const repo = await makeRepo("warn-exact-total");
 		const selection = await resolveSessionListSelection("repo", repo);
@@ -301,11 +311,12 @@ describe("scope exclusion warnings are bounded", () => {
 
 		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
 
-		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT + 1);
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(filtered.warningEntries).toHaveLength(SESSION_LIST_WARNING_LIMIT - 1);
 		const summary = filtered.warnings.at(-1) ?? "";
 		// The stated total must be the real number excluded, never the collapsed length.
 		expect(summary).toContain(`${excluded} excluded in total.`);
-		expect(summary).not.toContain(`${SESSION_LIST_WARNING_LIMIT + 1} excluded in total.`);
+		expect(summary).not.toContain(`${SESSION_LIST_WARNING_LIMIT} excluded in total.`);
 	});
 
 	test("counts source summaries inside the global warning cap", () => {
@@ -370,6 +381,34 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(warnings).not.toContain("0 omitted");
 	});
 
+	test("preserves exact counts when globally bounding sampled scope warnings", () => {
+		const warnings = boundWarningSources([
+			{ entries: ["broker warning"], describeOmitted: count => `${count} broker warnings omitted` },
+			{
+				entries: Array.from({ length: SESSION_LIST_WARNING_LIMIT - 1 }, (_, index) => `scope-${index}`),
+				totalCount: 20,
+				describeOmitted: count =>
+					`${count} further session workspaces were excluded by scope repo; 20 excluded in total.`,
+			},
+		]);
+
+		expect(warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(warnings.at(-1)).toBe("12 further session workspaces were excluded by scope repo; 20 excluded in total.");
+	});
+
+	test("keeps helper results bounded when many sources each need a summary", () => {
+		const warnings = boundWarningSources(
+			Array.from({ length: SESSION_LIST_WARNING_LIMIT + 1 }, (_, index) => ({
+				entries: [],
+				totalCount: 1,
+				describeOmitted: count => `source-${index}: ${count} omitted`,
+			})),
+		);
+
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("source-10: 1 omitted");
+	});
+
 	test("allows an unfiltered all-scope listing outside Git", async () => {
 		const result = await resolveSessionListSelection("all", path.join(tempRoot, "not-a-repository"));
 		expect(result.descriptor).toEqual({ scope: "all", path: path.join(tempRoot, "not-a-repository") });
@@ -405,5 +444,6 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(filtered.sessions).toEqual([]);
 		expect(filtered.warnings).toEqual(["Session unknown-row workspace is unavailable; excluded by scope cwd."]);
 		expect(filtered.warningEntries).toEqual(["Session unknown-row workspace is unavailable; excluded by scope cwd."]);
+		expect(filtered.warningCount).toBe(1);
 	});
 });
