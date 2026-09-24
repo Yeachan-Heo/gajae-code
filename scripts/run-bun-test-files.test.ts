@@ -194,6 +194,45 @@ describe("fresh-process test harness contracts", () => {
 		).toBe(0);
 	});
 
+	test("GJC_TEST_KEEP_TMP preserves isolated state inside the fresh-process sandbox", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-keep-sandbox-"));
+		tempDirs.push(root);
+		await fs.mkdir(path.join(root, "tests"), { recursive: true });
+		await Bun.write(path.join(root, "tests", "fixture.test.ts"), "test('fixture', () => {});\n");
+		let sandbox: string | undefined;
+		let retainedState: string | undefined;
+		const runner: TestProcessRunner = async spec => {
+			sandbox = spec.sandbox;
+			expect(spec.env.GJC_TEST_KEEP_TMP).toBe("1");
+			const isolatedAgentDir = path.join(spec.env.TMPDIR!, "gjc-test-agent-debug");
+			await fs.mkdir(isolatedAgentDir);
+			retainedState = path.join(isolatedAgentDir, "state.json");
+			await Bun.write(retainedState, "fixture state");
+			return { exitCode: 1, timedOut: false };
+		};
+		const priorKeepTmp = process.env.GJC_TEST_KEEP_TMP;
+		process.env.GJC_TEST_KEEP_TMP = "1";
+		let exitCode = 0;
+		try {
+			try {
+				exitCode = await runHarness(
+					{ root: "tests", testTimeoutMs: 30_000, fileTimeoutMs: 30_000, concurrency: 1 },
+					runner,
+					root,
+				);
+			} finally {
+				if (priorKeepTmp === undefined) delete process.env.GJC_TEST_KEEP_TMP;
+				else process.env.GJC_TEST_KEEP_TMP = priorKeepTmp;
+			}
+			expect(exitCode).toBe(1);
+			expect(sandbox).toBeDefined();
+			expect(retainedState).toBeDefined();
+			expect(await Bun.file(retainedState!).text()).toBe("fixture state");
+		} finally {
+			if (sandbox) await fs.rm(sandbox, { recursive: true, force: true });
+		}
+	});
+
 	test("the two exact shard-6 regression files receive distinct process specs", async () => {
 		const root = path.join(import.meta.dir, "..");
 		const files = [
