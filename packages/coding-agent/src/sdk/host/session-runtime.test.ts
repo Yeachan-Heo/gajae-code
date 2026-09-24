@@ -6123,6 +6123,49 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			return payload?.commandId === correlation.commandId && payload?.turnId === correlation.turnId;
 		});
 
+	test("prompt agent_end waits for durable reconciliation before publication", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-prompt-terminal-durable-first-"));
+		let terminalWriteAttempts = 0;
+		let storageAvailable = false;
+		let harness: InvocationHarness | undefined;
+		try {
+			harness = await invocationHarness("prompt-terminal-durable-first", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 60_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type !== "agent_end" || storageAvailable) return;
+					terminalWriteAttempts += 1;
+					throw Object.assign(new Error("injected terminal persistence failure"), { code: "io_error" });
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "durable before terminal" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(terminalWriteAttempts).toBeGreaterThan(0);
+			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+
+			storageAvailable = true;
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "done" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "end_turn" },
+			});
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+		} finally {
+			await harness?.stop();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a prompt deadline stays nonterminal when its dispatched tool cannot be fenced", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-deadline-tool-boundary-"));
 		const activeTools = new Set(["sdk-only-mutating-tool"]);
@@ -6499,6 +6542,10 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			while (!terminalWriteStarted && Date.now() < terminalWriteDeadline) await Bun.sleep(10);
 			expect(terminalWriteStarted).toBe(true);
 			expect(statusBeforeFlush).toBe("in_flight");
+			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({
+				status: "in_flight",
+			});
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
 			expect(await runGit(["show", "HEAD:work.ts"])).toBe("export const value = 'deadline';\n");
 			releaseTerminalWrite.resolve();
 			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({

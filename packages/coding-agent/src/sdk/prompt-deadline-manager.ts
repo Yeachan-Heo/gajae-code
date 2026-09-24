@@ -248,7 +248,8 @@ export class PromptDeadlineManager {
 		this.#captureDeadlineStart(key, correlation);
 		if (
 			this.#pendingTerminalTransitions.has(key) &&
-			(!this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineTerminalizationConfirmed.has(key))
+			((!this.#deadlineDeferredTerminalTransitions.has(key) && !this.#deadlineStartCleanup.has(key)) ||
+				this.#deadlineTerminalizationConfirmed.has(key))
 		) {
 			const failureReason = this.#pendingTerminalFailureReasons.get(key);
 			try {
@@ -387,7 +388,10 @@ export class PromptDeadlineManager {
 					return;
 				}
 			}
-			if (this.#deadlineDeferredTerminalTransitions.has(key) && this.#onDeadlinePublishTerminal !== undefined) {
+			if (
+				(this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineStartCleanup.has(key)) &&
+				this.#onDeadlinePublishTerminal !== undefined
+			) {
 				let publishedOutcome: SdkPromptTerminalOutcome | false = false;
 				try {
 					publishedOutcome = await this.#onDeadlinePublishTerminal(correlation, () => {
@@ -691,8 +695,7 @@ export class PromptDeadlineManager {
 		}
 		this.#pendingTerminalTransitions.add(key);
 		if (deferUntilDeadlineSettlement) this.#deadlineDeferredTerminalTransitions.add(key);
-		else {
-			this.#deadlineDeferredTerminalTransitions.delete(key);
+		else if (!this.#deadlineDeferredTerminalTransitions.has(key)) {
 			this.#deadlineTerminalizationConfirmed.delete(key);
 		}
 		if (evidence !== undefined) this.#pendingTerminalEvidence.set(key, evidence);
@@ -772,7 +775,9 @@ export class PromptDeadlineManager {
 	shouldDeferTerminalTransition(correlation: InvocationCorrelation): boolean {
 		const key = leaseKey(correlation);
 		return (
-			this.#uncertaintyRecoveryPending.has(key) || (this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
+			this.#deadlineDeferredTerminalTransitions.has(key) ||
+			this.#uncertaintyRecoveryPending.has(key) ||
+			(this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
 		);
 	}
 
