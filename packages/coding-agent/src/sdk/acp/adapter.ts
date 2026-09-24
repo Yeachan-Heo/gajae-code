@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { type SdkClient, SdkClientError } from "../client";
+import { type SdkClient, SdkClientError, type SdkDispatchContext } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
@@ -403,7 +403,7 @@ export class AcpSdkAdapter {
 		if (this.#client) await this.#client.close();
 	}
 
-	async prompt(params: JsonObject | string): Promise<unknown> {
+	async prompt(params: JsonObject | string, beforeDispatch?: (context: SdkDispatchContext) => void): Promise<unknown> {
 		const rawText =
 			typeof params === "string"
 				? params
@@ -419,11 +419,15 @@ export class AcpSdkAdapter {
 				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
-		return await this.#requestSession({
-			type: "control_request",
-			operation: "turn.prompt",
-			input: { ...(typeof params === "object" ? params : {}), text },
-		});
+		return await this.#requestSession(
+			{
+				type: "control_request",
+				operation: "turn.prompt",
+				input: { ...(typeof params === "object" ? params : {}), text },
+			},
+			false,
+			beforeDispatch === undefined ? undefined : { beforeDispatch },
+		);
 	}
 	/** Machine-origin upload controls; never route these through the public control() disposition. */
 	async uploadImageBegin(input: {
@@ -535,7 +539,11 @@ export class AcpSdkAdapter {
 		return envelope?.result ?? response;
 	}
 
-	async #requestSession(frame: JsonObject, raw = false, options?: { timeoutMs: number }): Promise<unknown> {
+	async #requestSession(
+		frame: JsonObject,
+		raw = false,
+		options?: { timeoutMs?: number; beforeDispatch?: (context: SdkDispatchContext) => void },
+	): Promise<unknown> {
 		const router = this.#router;
 		if (!router)
 			throw new AcpSdkAdapterError(

@@ -304,7 +304,7 @@ function controlErrors(id: string): string[] {
 		C52: ["not_foldable", "already_backgrounded", "no_active_bash"],
 		C54: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C55: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
-		C56: ["invalid_input", "resource_gone", "operation_prohibited"],
+		C56: ["invalid_input", "busy", "resource_gone", "operation_prohibited"],
 		C57: ["invalid_input", "resource_gone", "operation_prohibited"],
 	};
 	return errors[id] ?? ["invalid_request", "busy"];

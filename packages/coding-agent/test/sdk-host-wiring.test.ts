@@ -2491,6 +2491,144 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 	}
 });
 
+test("queued image controls cannot recreate leases after their connection closes", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-disconnect-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-image-disconnect-${Date.now()}`;
+	const sent: CapturedSendCall[] = [];
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(sessionContext, undefined, (...args) => captureInternalSend(sent, args[0], args[1]));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const stalled = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const originalDisconnect = PromptImageUploadStore.prototype.disconnect;
+	const originalBegin = PromptImageUploadStore.prototype.begin;
+	const beginOutcomes: Array<{ owner: string | undefined; code: string; live: boolean | undefined }> = [];
+	const beginSpy = spyOn(PromptImageUploadStore.prototype, "begin").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		value,
+	) {
+		const live = owner
+			? (this as unknown as { isConnectionOpen?: (id: string) => boolean }).isConnectionOpen?.(owner)
+			: undefined;
+		try {
+			const result = originalBegin.call(this, owner, value);
+			beginOutcomes.push({ owner, code: "ok", live });
+			return result;
+		} catch (error) {
+			beginOutcomes.push({ owner, code: (error as { code?: string }).code ?? "internal", live });
+			throw error;
+		}
+	});
+	const appendSpy = spyOn(PromptImageUploadStore.prototype, "append");
+	const disconnectSpy = spyOn(PromptImageUploadStore.prototype, "disconnect").mockImplementation(function (
+		this: PromptImageUploadStore,
+		connectionId,
+	) {
+		originalDisconnect.call(this, connectionId);
+	});
+	const originalFinish = PromptImageUploadStore.prototype.finish;
+	let firstFinish = true;
+	const finishSpy = spyOn(PromptImageUploadStore.prototype, "finish").mockImplementation(async function (
+		this: PromptImageUploadStore,
+		owner,
+		value,
+	) {
+		if (!firstFinish) return originalFinish.call(this, owner, value);
+		firstFinish = false;
+		stalled.resolve();
+		await release.promise;
+		return { id: (value as { id: string }).id, byteLength: 1, sha256: "0".repeat(64), mimeType: "image/png" };
+	});
+	try {
+		const open = async (): Promise<{ socket: WebSocket; frames: Record<string, unknown>[] }> => {
+			const frames: Record<string, unknown>[] = [];
+			const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+			sockets.push(socket);
+			socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+			await new Promise<void>((resolve, reject) => {
+				socket.addEventListener("open", () => resolve(), { once: true });
+				socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+			});
+			return { socket, frames };
+		};
+		const disconnected = await open();
+		const healthy = await open();
+		await waitFor(() => disconnected.frames.some(frame => frame.type === "hello"), "disconnected connection ID");
+		await waitFor(() => healthy.frames.some(frame => frame.type === "hello"), "healthy connection ID");
+		const disconnectedId = disconnected.frames.find(frame => frame.type === "hello")!.connectionId;
+		const healthyId = healthy.frames.find(frame => frame.type === "hello")!.connectionId;
+		expect(disconnectedId).not.toBe(healthyId);
+		const callsFrom = (spy: { mock: { calls: readonly (readonly unknown[])[] } }, owner: unknown) =>
+			spy.mock.calls.filter(([connectionId]) => connectionId === owner).length;
+		const send = (socket: WebSocket, id: string, operation: string, input: Record<string, unknown>) =>
+			socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+		const descriptor = { mimeType: "image/png", byteLength: 1, sha256: "0".repeat(64) };
+		send(disconnected.socket, "initial", "turn.image.begin", descriptor);
+		await waitFor(() => disconnected.frames.some(frame => frame.id === "initial"), "initial image lease");
+		const initial = disconnected.frames.find(frame => frame.id === "initial") as { result: { id: string } };
+		send(disconnected.socket, "held-finish", "turn.image.finish", { id: initial.result.id });
+		await stalled.promise;
+		// These frames enter the ordered dispatcher while finish holds its queue.
+		send(disconnected.socket, "queued-append", "turn.image.append", {
+			id: initial.result.id,
+			sequence: 0,
+			data: "AA==",
+		});
+		send(disconnected.socket, "queued-finish", "turn.image.finish", { id: initial.result.id });
+		send(disconnected.socket, "queued-begin", "turn.image.begin", descriptor);
+		disconnected.socket.send(JSON.stringify({ type: "query_request", id: "received", query: "not.real" }));
+		await waitFor(() => disconnected.frames.some(frame => frame.id === "received"), "queued frames received");
+		// The query is a same-socket receipt barrier, not part of the ordered control chain.
+		// The held finish must still keep every later image operation from executing.
+		expect(callsFrom(beginSpy, disconnectedId)).toBe(1);
+		expect(callsFrom(appendSpy, disconnectedId)).toBe(0);
+		expect(callsFrom(finishSpy, disconnectedId)).toBe(1);
+		send(healthy.socket, "live-prompt", "turn.prompt", { text: "Keep this prompt" });
+		const closed = new Promise<void>(resolve =>
+			disconnected.socket.addEventListener("close", () => resolve(), { once: true }),
+		);
+		disconnected.socket.close();
+		await closed;
+		await waitFor(() => callsFrom(disconnectSpy, disconnectedId) === 1, "image lease disconnect sweep");
+		expect(callsFrom(beginSpy, disconnectedId)).toBe(1);
+		expect(callsFrom(appendSpy, disconnectedId)).toBe(0);
+		release.resolve();
+		await waitFor(() => healthy.frames.some(frame => frame.id === "live-prompt"), "queued live prompt");
+		expect(healthy.frames.find(frame => frame.id === "live-prompt")).toMatchObject({ ok: true });
+		expect(sent).toHaveLength(1);
+		const disconnectedBegins = beginOutcomes.filter(outcome => outcome.owner === disconnectedId);
+		expect(disconnectedBegins.map(outcome => ({ code: outcome.code, live: outcome.live }))).toEqual([
+			{ code: "ok", live: true },
+			{ code: "resource_gone", live: false },
+		]);
+		send(healthy.socket, "live-begin", "turn.image.begin", descriptor);
+		await waitFor(() => healthy.frames.some(frame => frame.id === "live-begin"), "live image control");
+		expect(healthy.frames.find(frame => frame.id === "live-begin")).toMatchObject({ ok: true });
+		expect(callsFrom(beginSpy, healthyId)).toBe(1);
+		expect(beginOutcomes.filter(outcome => outcome.owner === healthyId).map(outcome => outcome.code)).toEqual(["ok"]);
+		// All 16 upload slots remain available: the queued begin cannot leave a
+		// lease behind after the disconnect sweep, even without a response socket.
+		for (let index = 1; index < 16; index++) {
+			const id = `live-begin-${index}`;
+			send(healthy.socket, id, "turn.image.begin", descriptor);
+			await waitFor(() => healthy.frames.some(frame => frame.id === id), `${id} image control`);
+			expect(healthy.frames.find(frame => frame.id === id)).toMatchObject({ ok: true });
+		}
+		expect(callsFrom(beginSpy, healthyId)).toBe(16);
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	} finally {
+		release.resolve();
+		finishSpy.mockRestore();
+		disconnectSpy.mockRestore();
+		appendSpy.mockRestore();
+		beginSpy.mockRestore();
+	}
+});
+
 test("SDK host correlates follow-up acknowledgements with the later agent start", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-follow-up-correlation-"));
 	dirs.push(cwd);

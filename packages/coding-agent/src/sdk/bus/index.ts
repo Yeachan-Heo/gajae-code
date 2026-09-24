@@ -4876,7 +4876,13 @@ export function createNotificationsExtension(
 			return failLifecycleStartup("failed", "Lifecycle SDK startup requires an agent directory.");
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
-		const imageUploads = new PromptImageUploadStore();
+		// Image controls may leave the ordered queue after their socket closes.
+		// Resolve liveness at execution against the host's connection incarnation;
+		// this map is initialized before any frame can invoke the callback.
+		const imageUploads = new PromptImageUploadStore(connectionId => {
+			const incarnation = hostConnectionIncarnations.get(connectionId);
+			return incarnation !== undefined && !incarnation.closed;
+		});
 		const acceptedImages = new Map<string, () => void>();
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
@@ -8018,8 +8024,15 @@ export function createNotificationsExtension(
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
+					// The native callback supplies the authenticated socket identity. A
+					// control may be the first frame, before capability negotiation or replay.
+					// Admit that live socket once; a closed incarnation cannot be revived.
+					if (!liveHostConnection(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
 					if (typedFrame.type === "event_replay") {
-						if (liveHostConnection(inbound.connectionId)) hostAttachedConnections.add(inbound.connectionId);
+						hostAttachedConnections.add(inbound.connectionId);
 					}
 					if (typedFrame.type === "ephemeral_turn" || typedFrame.type === "ephemeral_turn_cancel") return;
 					inboundSdkFrame?.(inbound.connectionId, typedFrame);
@@ -8070,8 +8083,8 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
-				imageUploads.disconnect(connectionId);
 				closeHostConnection(connectionId);
+				imageUploads.disconnect(connectionId);
 				connectionCloseHandler?.(connectionId);
 				void controlSurface
 					.cancelPendingPreflightsForConnection(connectionId)

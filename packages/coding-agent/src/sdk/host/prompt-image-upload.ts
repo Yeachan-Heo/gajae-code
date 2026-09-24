@@ -31,7 +31,7 @@ type Upload = {
 	sequence: number;
 	finishing: boolean;
 	finished: boolean;
-	timer: ReturnType<typeof setTimeout>;
+	timer: NodeJS.Timeout;
 };
 
 function invalid(message: string): never {
@@ -59,9 +59,13 @@ export class PromptImageUploadStore {
 	#uploadBytes = 0;
 	#acceptedBytes = 0;
 
+	/** The host supplies live socket membership; direct stores may operate without a transport. */
+	constructor(private readonly isConnectionOpen?: (connectionId: string) => boolean) {}
+
 	begin(connectionId: string | undefined, value: unknown): { id: string; nextSequence: 0 } {
 		this.#assertOpen();
 		const owner = ownerId(connectionId);
+		this.#assertConnected(owner);
 		const input = object(value, ["mimeType", "byteLength", "sha256"]);
 		if (
 			typeof input.mimeType !== "string" ||
@@ -203,6 +207,7 @@ export class PromptImageUploadStore {
 	redeem(connectionId: string | undefined, value: unknown): { images: ImageContent[]; release: () => void } {
 		this.#assertOpen();
 		const owner = ownerId(connectionId);
+		this.#assertConnected(owner);
 		if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IMAGES)
 			invalid("stagedImages must contain 1–16 image IDs.");
 		const seen = new Set<string>();
@@ -261,6 +266,7 @@ export class PromptImageUploadStore {
 	#owned(connectionId: string | undefined, value: unknown): Upload {
 		this.#assertOpen();
 		const owner = ownerId(connectionId);
+		this.#assertConnected(owner);
 		if (typeof value !== "string" || !value) invalid("Image upload ID is required.");
 		const upload = this.#uploads.get(value);
 		if (!upload || upload.owner !== owner)
@@ -269,6 +275,10 @@ export class PromptImageUploadStore {
 	}
 	#assertOpen(): void {
 		if (this.#closed) throw new TypedControlError("resource_gone", "Image upload session is closed.");
+	}
+	#assertConnected(owner: string): void {
+		if (this.isConnectionOpen && !this.isConnectionOpen(owner))
+			throw new TypedControlError("resource_gone", "Image upload connection is closed.");
 	}
 	#remove(id: string): void {
 		const upload = this.#uploads.get(id);
