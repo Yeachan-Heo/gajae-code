@@ -1240,6 +1240,7 @@ interface SessionRuntime {
 	isPromptRunOwner: (correlation: { commandId: string; turnId: string }, owner: AgentTerminalOwnerContext) => boolean;
 	retireJoinedPromptOwners: () => void;
 	imageUploads: PromptImageUploadStore;
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -6180,7 +6181,6 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
-			releaseAcceptedImage(correlation);
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (submission.workLease) {
@@ -8224,6 +8224,7 @@ export function createNotificationsExtension(
 			},
 			retireJoinedPromptOwners,
 			imageUploads,
+			releaseAcceptedImage,
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
@@ -10139,6 +10140,11 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
+		void rt.host
+			.reportActivity("idle")
+			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
+		// Clear the streaming flag for SDK consumers even when notifications are off.
+		rt.busy = false;
 		// The Agent's terminal owner is independent of delivery correlation. Never
 		// borrow a successor's run handle to settle a predecessor's SDK prompts.
 		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
@@ -10154,10 +10160,10 @@ export function createNotificationsExtension(
 		)
 			correlations.unshift(rootCorrelation);
 		for (const correlation of correlations) {
-			// This attributed agent_end is an execution boundary even when the
-			// subsequent durable terminal claim fails. A fatal transport closure
-			// clears attribution, so an unrelated later agent_end cannot settle a
-			// predecessor's prompt correlation.
+			// Release staged-image capacity only at this attributed execution boundary.
+			// A fatal transport closure without a matching end event remains reserved
+			// until teardown, rather than letting an unrelated run release it.
+			rt.releaseAcceptedImage(correlation);
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
