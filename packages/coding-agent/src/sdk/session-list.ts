@@ -1,5 +1,52 @@
 export type SessionListPageRecord = Record<string, unknown>;
 
+export type SessionListSavedSessionOmissionReason =
+	| "scope_unavailable"
+	| "candidate_scan_failed"
+	| "candidate_not_found"
+	| "candidate_ambiguous"
+	| "candidate_invalid"
+	| "identity_incomplete";
+
+export const SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES = [
+	"cwd_missing",
+	"cwd_not_directory",
+	"identity_unavailable",
+	"network_unsupported",
+	"sessions_root_unavailable",
+	"binding_conflict",
+	"binding_invalid",
+	"migration_busy",
+	"atomic_unavailable",
+	"invalid_request",
+	"durability_failed",
+	"durability_not_provable",
+	"capacity_exceeded",
+	"scan_failed",
+	"unsafe_root",
+	"invalid_candidate",
+	"invalid_header",
+	"unreadable_candidate",
+	"source_changed",
+	"cwd_not_found",
+	"cwd_not_utf8",
+	"cwd_network_unsupported",
+	"cwd_identity_unavailable",
+	"cwd_io_error",
+] as const;
+
+export type SessionListSavedSessionOmissionDetailCode =
+	(typeof SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES)[number];
+
+/** Path-free diagnostic for a requested managed transcript that could not be selected safely. */
+export interface SessionListSavedSessionOmission {
+	readonly sessionId: string;
+	readonly reason: SessionListSavedSessionOmissionReason;
+	readonly detailCode?: SessionListSavedSessionOmissionDetailCode;
+	readonly candidateCount?: number;
+	readonly missingIdentityFields?: readonly ("nlink" | "ctimeNs")[];
+}
+
 export type SessionListTraversalErrorKind = "malformed_page" | "repeated_cursor" | "page_budget_exceeded";
 
 export class SessionListTraversalError extends Error {
