@@ -110,6 +110,7 @@ describe.serial("AgentSession resilient retry", () => {
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(
 			tempDir.path(),
 			`session-${manager.getSessionId()}`,
+			"state",
 			"runtime-state.json",
 		);
 		return manager;
@@ -2332,6 +2333,7 @@ describe.serial("AgentSession resilient retry", () => {
 	}, 300000);
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
 		const coordinatorStateFiles = new Set<string>();
+		const coordinatorNamespaceLocks = new Set<string>();
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
 			let hookCalls = 0;
 			const requestedModels: string[] = [];
@@ -2362,6 +2364,9 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(coordinatorStateFile).not.toBe("");
 			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
 			coordinatorStateFiles.add(coordinatorStateFile);
+			const namespaceLock = path.resolve(path.dirname(coordinatorStateFile), "..", "locks", "mutation.lock");
+			expect(coordinatorNamespaceLocks.has(namespaceLock)).toBe(false);
+			coordinatorNamespaceLocks.add(namespaceLock);
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
@@ -2376,6 +2381,7 @@ describe.serial("AgentSession resilient retry", () => {
 			session = undefined;
 		}
 		expect(coordinatorStateFiles).toHaveLength(3);
+		expect(coordinatorNamespaceLocks).toHaveLength(3);
 	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -2930,6 +2936,7 @@ describe.serial("AgentSession resilient retry", () => {
 	}, 60_000);
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
 		const coordinatorStateFiles = new Set<string>();
+		const coordinatorNamespaceLocks = new Set<string>();
 		const nearMisses = [
 			"stream timed out while waiting for the first event",
 			"Provider stream timed out while waiting for first event",
@@ -2947,6 +2954,9 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(coordinatorStateFile).not.toBe("");
 			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
 			coordinatorStateFiles.add(coordinatorStateFile);
+			const namespaceLock = path.resolve(path.dirname(coordinatorStateFile), "..", "locks", "mutation.lock");
+			expect(coordinatorNamespaceLocks.has(namespaceLock)).toBe(false);
+			coordinatorNamespaceLocks.add(namespaceLock);
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
@@ -2960,6 +2970,7 @@ describe.serial("AgentSession resilient retry", () => {
 			session = undefined;
 		}
 		expect(coordinatorStateFiles).toHaveLength(5);
+		expect(coordinatorNamespaceLocks).toHaveLength(5);
 		// Five full session lifecycles, one per near-miss phrasing. The
 		// single-scenario sibling below costs ~15s on CI hardware, so this loop
 		// legitimately needs several times the 30s default it used to inherit.
