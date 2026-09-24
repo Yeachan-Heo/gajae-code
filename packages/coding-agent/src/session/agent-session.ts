@@ -3633,6 +3633,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#coordinatorRuntimeStateFileOverrideForTests: string | undefined = undefined;
 	#unregisterBeforeMoveListener?: () => void;
 	#unregisterMoveAbortListener?: () => void;
 	#unregisterMovePublicationListener?: () => void;
@@ -6979,6 +6980,9 @@ export class AgentSession {
 	 */
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
+		if (this.#coordinatorRuntimeStateFileOverrideForTests) {
+			return this.#coordinatorRuntimeStateFileOverrideForTests;
+		}
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
 		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
@@ -10155,6 +10159,20 @@ export class AgentSession {
 	setDisposeTimeoutForTests(timeoutMs: number): void {
 		if (this.#disposeRunPromise) throw new Error("Cannot change the disposal timeout after disposal has started.");
 		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
+	}
+
+	/** Bind coordinator runtime-state persistence to this session in tests. */
+	setCoordinatorRuntimeStateFileForTests(stateFile: string): void {
+		if (!path.isAbsolute(stateFile)) {
+			throw new Error("Coordinator runtime-state test path must be absolute.");
+		}
+		this.#coordinatorRuntimeStateFileOverrideForTests = path.resolve(stateFile);
+		this.#registerRuntimeStateFinalizer();
+	}
+
+	/** Read the test-only coordinator runtime-state path bound to this session. */
+	getCoordinatorRuntimeStateFileForTests(): string | undefined {
+		return this.#coordinatorRuntimeStateFileOverrideForTests;
 	}
 
 	trackPostPromptTaskForTests(task: Promise<void>): void {
