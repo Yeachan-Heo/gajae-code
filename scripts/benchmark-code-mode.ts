@@ -47,6 +47,8 @@ const SEARCH_CORPUS_SENTINELS = [
 	"scripts/benchmark-code-mode-exploratory-runs.json.gz",
 	"scripts/benchmark-code-mode-timeout-censored-results.json",
 	"scripts/benchmark-code-mode-timeout-censored-runs.json.gz",
+	"scripts/benchmark-code-mode-300s-081f4-results.json",
+	"scripts/benchmark-code-mode-300s-081f4-runs.json.gz",
 ] as const;
 const SYSTEM_PROMPT = benchmarkCodeModePrompts.trim();
 const RUN_RETRY_REASON = "The preceding attempt did not reach a validated final answer.";
@@ -1558,6 +1560,8 @@ async function initializeInfrastructure(modelSelector: string): Promise<{
 interface TaskWorkspace {
 	root: string;
 	commit: string;
+	originDevAtMeasurementStart: string;
+	originDevAtValidation: string;
 }
 
 async function gitText(cwd: string, ...args: string[]): Promise<string> {
@@ -1678,7 +1682,40 @@ export async function assertOutputPathOutsideWorkspace(workspaceRoot: string, ou
 	}
 }
 
-async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace> {
+async function readResumeWorkspaceSnapshot(
+	options: CliOptions,
+): Promise<{ commit: string; originDevAtMeasurementStart: string } | undefined> {
+	if (!options.resume) return undefined;
+	let report: unknown;
+	try {
+		report = JSON.parse(await fs.readFile(options.outputPath, "utf8"));
+	} catch (error) {
+		throw new Error(`Cannot resume benchmark report: ${safeError(error)}`);
+	}
+	if (
+		!isRecord(report) ||
+		report.formatVersion !== 1 ||
+		report.benchmark !== "issue-5792-code-mode-measurement" ||
+		report.executionStatus !== "running" ||
+		!isRecord(report.workspaceSnapshot)
+	) {
+		throw new Error("Resume report has no incomplete benchmark workspace snapshot.");
+	}
+	const commit = report.workspaceSnapshot.commit;
+	if (typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) {
+		throw new Error("Resume report has an invalid task workspace commit.");
+	}
+	const originDevAtMeasurementStart = report.workspaceSnapshot.originDevAtMeasurementStart ?? commit;
+	if (typeof originDevAtMeasurementStart !== "string" || !/^[0-9a-f]{40}$/.test(originDevAtMeasurementStart)) {
+		throw new Error("Resume report has an invalid origin/dev measurement-start commit.");
+	}
+	return { commit, originDevAtMeasurementStart };
+}
+
+async function resolveTaskWorkspace(
+	options: CliOptions,
+	resumeWorkspaceSnapshot?: { commit: string; originDevAtMeasurementStart: string },
+): Promise<TaskWorkspace> {
 	const root = await fs.realpath(options.taskRepoPath);
 	if (root === REPO_ROOT) throw new Error("--task-repo must be a separate clean snapshot, never the harness checkout.");
 	await assertOutputPathOutsideWorkspace(root, options.outputPath);
@@ -1689,7 +1726,24 @@ async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace>
 		gitText(root, "status", "--porcelain", "--untracked-files=all"),
 	]);
 	if ((await fs.realpath(gitRoot)) !== root) throw new Error("--task-repo must be the root of a Git checkout or worktree.");
-	if (taskHead !== originDev) throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
+	if (resumeWorkspaceSnapshot) {
+		if (taskHead !== resumeWorkspaceSnapshot.commit) {
+			throw new Error(
+				`--task-repo must match the resumed report snapshot (${resumeWorkspaceSnapshot.commit}); got ${taskHead}.`,
+			);
+		}
+		if (taskHead !== originDev) {
+			try {
+				await gitText(REPO_ROOT, "merge-base", "--is-ancestor", taskHead, originDev);
+			} catch {
+				throw new Error(
+					`The resumed task snapshot ${taskHead} is no longer an ancestor of origin/dev (${originDev}); refusing to resume.`,
+				);
+			}
+		}
+	} else if (taskHead !== originDev) {
+		throw new Error(`--task-repo must be an exact clean snapshot of origin/dev (${originDev}); got ${taskHead}.`);
+	}
 	if (status.length > 0) throw new Error("--task-repo must have a clean working tree before benchmark tasks begin.");
 	await assertTrackedSymlinksStayInsideWorkspace(root);
 	for (const sentinel of SEARCH_CORPUS_SENTINELS) {
@@ -1702,7 +1756,12 @@ async function resolveTaskWorkspace(options: CliOptions): Promise<TaskWorkspace>
 		}
 		if (exists) throw new Error(`Task corpus contains benchmark artifact ${sentinel}; refusing a contaminated run.`);
 	}
-	return { root, commit: taskHead };
+	return {
+		root,
+		commit: taskHead,
+		originDevAtMeasurementStart: resumeWorkspaceSnapshot?.originDevAtMeasurementStart ?? originDev,
+		originDevAtValidation: originDev,
+	};
 }
 
 async function runBenchmark(
@@ -1813,7 +1872,12 @@ async function runBenchmark(
 			executionStatus,
 			startedAt,
 			updatedAt: new Date().toISOString(),
-			workspaceSnapshot: { commit: taskWorkspace.commit, isolation: "clean origin/dev worktree; output outside search corpus" },
+			workspaceSnapshot: {
+				commit: taskWorkspace.commit,
+				originDevAtMeasurementStart: taskWorkspace.originDevAtMeasurementStart,
+				latestOriginDevValidated: taskWorkspace.originDevAtValidation,
+				isolation: "clean origin/dev worktree; output outside search corpus",
+			},
 			completedPairs: pairs.filter(pair => pair.A !== undefined && pair.B !== undefined).length,
 			model: { requested: options.model, resolved: resolvedModel, armA: resolvedModel, armB: resolvedModel },
 			contract: {
@@ -1974,7 +2038,12 @@ async function runBenchmark(
 		benchmark: "issue-5792-code-mode-measurement",
 		startedAt,
 		finishedAt: new Date().toISOString(),
-		workspaceSnapshot: { commit: taskWorkspace.commit, isolation: "clean origin/dev worktree; output outside search corpus" },
+		workspaceSnapshot: {
+			commit: taskWorkspace.commit,
+			originDevAtMeasurementStart: taskWorkspace.originDevAtMeasurementStart,
+			latestOriginDevValidated: taskWorkspace.originDevAtValidation,
+			isolation: "clean origin/dev worktree; output outside search corpus",
+		},
 		workingTree: ".",
 		model: { requested: options.model, resolved: resolvedModel, armA: resolvedModel, armB: resolvedModel },
 		contract: {
@@ -2039,7 +2108,10 @@ async function runBenchmark(
 
 async function main(): Promise<void> {
 	const options = parseCliOptions(process.argv.slice(2));
-	const taskWorkspace = await resolveTaskWorkspace(options);
+	const taskRepoRoot = await fs.realpath(options.taskRepoPath);
+	await assertOutputPathOutsideWorkspace(taskRepoRoot, options.outputPath);
+	const resumeWorkspaceSnapshot = await readResumeWorkspaceSnapshot(options);
+	const taskWorkspace = await resolveTaskWorkspace(options, resumeWorkspaceSnapshot);
 	await fs.mkdir(path.dirname(options.outputPath), { recursive: true });
 	if (!options.resume) {
 		const preflight = JSON.stringify(

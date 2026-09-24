@@ -311,7 +311,7 @@
     }
   ],
   "sourceRawSha256": "baf78f4bbdfb4d27da49d538a735a96b402635a5b6e8cf38bb28e9382156ea5c",
-  "rawArtifactPath": "scripts/benchmark-code-mode-runs.json.gz",
+  "rawArtifactPath": "scripts/benchmark-code-mode-timeout-censored-runs.json.gz",
   "limitations": [
     "Results describe only this fixed 8-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
     "Attempt deadlines cover session creation and agent/tool execution; handler-session setup and cleanup use separately bounded timeouts.",
