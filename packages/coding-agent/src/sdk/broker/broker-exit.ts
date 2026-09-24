@@ -291,7 +291,12 @@ async function runBrokerExitWriterWorker(
 	}
 }
 
-async function writeAtomicExitRecord(destination: string, record: object, signal?: AbortSignal): Promise<void> {
+async function writeAtomicExitRecord(
+	destination: string,
+	record: object,
+	signal: AbortSignal | undefined,
+	createDirectory: boolean,
+): Promise<void> {
 	const requestedGeneration = (record as { writtenAt?: unknown }).writtenAt;
 	if (!Number.isSafeInteger(requestedGeneration) || (requestedGeneration as number) <= 0)
 		throw new Error("SDK broker exit record generation is invalid.");
@@ -313,7 +318,7 @@ async function writeAtomicExitRecord(destination: string, record: object, signal
 	const directory = path.dirname(destination);
 	const temporary = `${destination}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	throwIfAborted();
-	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	if (createDirectory) await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	let workerDispatched = false;
 	try {
 		throwIfAborted();
@@ -345,7 +350,7 @@ export async function writeBrokerExitRecord(
 	record: BrokerExitRecord,
 	signal?: AbortSignal,
 ): Promise<void> {
-	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record, signal);
+	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record, signal, false);
 }
 /** Read the bounded previous-exit record; malformed or absent files are ignored. */
 export async function readBrokerExitRecord(agentDir: string): Promise<BrokerExitRecord | undefined> {
@@ -374,7 +379,7 @@ export async function writeBrokerStartupExitRecordBounded(
 	}, timeoutMs);
 	void (async () => {
 		await beforeWriteForTest?.();
-		await writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record, abortController.signal);
+		await writeAtomicExitRecord(brokerStartupExitRecordPath(agentDir), record, abortController.signal, true);
 	})().then(
 		() => settled.resolve({ kind: "written" }),
 		error => {
