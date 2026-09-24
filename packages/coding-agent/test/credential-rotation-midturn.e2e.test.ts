@@ -297,6 +297,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	predecessorModel?: Model;
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
+	unresolvablePeerDuringMark?: boolean;
 }): Promise<{ models: string[]; keys: string[]; markCount: number; activeIndex?: number }> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
 	let session: AgentSession | undefined;
@@ -328,6 +329,8 @@ async function runManagedFallbackQuotaScenario(options: {
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
 	const initialModel = options.predecessorModel ?? model;
 	let restoreUnknownRowId: (() => void) | undefined;
+	let restorePeerResolver: (() => void) | undefined;
+	const unresolvablePeerIds = new Set<number>();
 	let unknownRowIdInjected = false;
 	try {
 		await storage.set(provider, [
@@ -359,6 +362,16 @@ async function runManagedFallbackQuotaScenario(options: {
 		if (options.runtimeApiKey !== undefined) storage.setRuntimeApiKey(provider, options.runtimeApiKey);
 		storage.setRuntimeApiKey("openai", "fallback-test-key");
 		const registry = new ModelRegistry(storage, path.join(root, "models.yml"));
+		if (options.unresolvablePeerDuringMark) {
+			const getApiKeyBeforeMock = registry.getApiKey.bind(registry);
+			const getApiKeySpy = vi.spyOn(registry, "getApiKey");
+			getApiKeySpy.mockImplementation(async (requestedModel, sessionId, getApiKeyOptions) => {
+				const selector = getApiKeyOptions?.credentialSelector;
+				if (selector?.kind === "id" && unresolvablePeerIds.has(Number(selector.value))) return undefined;
+				return getApiKeyBeforeMock(requestedModel, sessionId, getApiKeyOptions);
+			});
+			restorePeerResolver = () => getApiKeySpy.mockRestore();
+		}
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"fallback.maxAttempts": options.maxAttempts ?? 3,
@@ -410,7 +423,11 @@ async function runManagedFallbackQuotaScenario(options: {
 		session.setConfiguredModelChain("default", entries, "test");
 		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
 		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
-		if (options.removeFailedCredentialDuringMark || options.addApiKeyDuringMark !== undefined) {
+		if (
+			options.removeFailedCredentialDuringMark ||
+			options.addApiKeyDuringMark !== undefined ||
+			options.unresolvablePeerDuringMark
+		) {
 			let removedFailedCredential = false;
 			let addedApiKey = false;
 			markUsageLimitReached.mockImplementation(async (markProvider, markSessionId, markOptions) => {
@@ -436,7 +453,11 @@ async function runManagedFallbackQuotaScenario(options: {
 					storage.upsertCredential(markProvider, { type: "api_key", key: options.addApiKeyDuringMark });
 					addedApiKey = true;
 				}
-				return pendingMark;
+				const markResult = await pendingMark;
+				if (options.unresolvablePeerDuringMark) {
+					for (const peerId of markResult.remainingCredentialIds) unresolvablePeerIds.add(peerId);
+				}
+				return markResult;
 			});
 		}
 		await session.prompt("recover from a Codex quota error");
@@ -451,6 +472,7 @@ async function runManagedFallbackQuotaScenario(options: {
 		};
 	} finally {
 		restoreUnknownRowId?.();
+		restorePeerResolver?.();
 		await session?.dispose();
 		storage.close();
 		await fs.rm(root, { recursive: true, force: true });
@@ -496,6 +518,23 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.models).toEqual([selector(model), selector(model)]);
 		expect(result.keys).toHaveLength(2);
 		expect(new Set(result.keys).size).toBe(2);
+		expect(result.markCount).toBe(1);
+	});
+
+	test("does not accept an unresolved stored API-key peer as a rotation", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: [],
+			quotaKeys: [],
+			storedApiKeys: ["stored-codex-key-a", "stored-codex-key-b"],
+			failFirstProviderDispatch: true,
+			unresolvablePeerDuringMark: true,
+		});
+		expect(result.models).toEqual([selector(model), selector(fallback)]);
+		expect(["stored-codex-key-a", "stored-codex-key-b"]).toContain(result.keys[0]);
+		expect(result.keys.at(-1)).toBe("fallback-test-key");
 		expect(result.markCount).toBe(1);
 	});
 
