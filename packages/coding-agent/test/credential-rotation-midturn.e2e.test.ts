@@ -303,6 +303,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	storedApiKeys?: readonly string[];
 	runtimeApiKey?: string;
 	addApiKeyDuringMark?: string;
+	addOAuthAccountAfterExhaustion?: string;
 	predecessorModel?: Model;
 	modelProviderAlias?: boolean;
 	canonicalThenAlias?: boolean;
@@ -503,10 +504,12 @@ async function runManagedFallbackQuotaScenario(options: {
 		if (
 			options.removeFailedCredentialDuringMark ||
 			options.addApiKeyDuringMark !== undefined ||
+			options.addOAuthAccountAfterExhaustion !== undefined ||
 			options.unresolvablePeerDuringMark
 		) {
 			let removedFailedCredential = false;
 			let addedApiKey = false;
+			let addedOAuthAccount = false;
 			markUsageLimitReached.mockImplementation(async (markProvider, markSessionId, markOptions) => {
 				const pendingMark = markBeforeRemoval(markProvider, markSessionId, markOptions);
 				if (options.removeFailedCredentialDuringMark && !removedFailedCredential) {
@@ -531,6 +534,21 @@ async function runManagedFallbackQuotaScenario(options: {
 					addedApiKey = true;
 				}
 				const markResult = await pendingMark;
+				if (
+					options.addOAuthAccountAfterExhaustion !== undefined &&
+					markUsageLimitReached.mock.calls.length >= options.accounts.length &&
+					!addedOAuthAccount
+				) {
+					const accountId = options.addOAuthAccountAfterExhaustion;
+					storage.upsertCredential(provider, {
+						type: "oauth",
+						access: `TOKEN-${accountId}`,
+						refresh: `refresh-${accountId}`,
+						expires: Date.now() + 3_600_000,
+						accountId,
+					});
+					addedOAuthAccount = true;
+				}
 				if (options.unresolvablePeerDuringMark) {
 					for (const peerId of markResult.remainingCredentialIds) unresolvablePeerIds.add(peerId);
 				}
@@ -587,7 +605,7 @@ describe("managed fallback quota credential rotation", () => {
 		});
 	});
 
-	test("shares tried OAuth rows across canonical and device-alias chain entries", async () => {
+	test("does not redispatch tried OAuth rows through canonical and device-alias chain entries", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
@@ -599,14 +617,46 @@ describe("managed fallback quota credential rotation", () => {
 			canonicalThenAlias: true,
 		});
 		expect(result.dispatchGuardExceeded).toBe(false);
-		expect(result.models).toEqual([
-			selector(model),
-			selector(model),
-			`${providerAlias}/${model.id}`,
-			selector(fallback),
-		]);
-		expect(result.keys).toEqual(["TOKEN-a", "TOKEN-b", "TOKEN-b", "fallback-test-key"]);
-		expect(result.markCount).toBe(3);
+		expect(result.models).toEqual([selector(model), selector(model), selector(fallback)]);
+		expect(result.keys).toEqual(["TOKEN-a", "TOKEN-b", "fallback-test-key"]);
+		expect(result.markCount).toBe(2);
+	});
+
+	test("keeps a new same-kind row eligible at a canonical-to-alias duplicate", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled managed-fallback fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			addOAuthAccountAfterExhaustion: "c",
+			retryAfterMs: 0,
+			dispatchGuardLimit: 6,
+			canonicalThenAlias: true,
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), `${providerAlias}/${model.id}`],
+			keys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+			markCount: 2,
+			dispatchGuardExceeded: false,
+		});
+	});
+
+	test("does not bypass a provider retry ceiling through a canonical-to-alias duplicate", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			providerRetryMaxAttempts: 1,
+			retryAfterMs: 0,
+			dispatchGuardLimit: 4,
+			canonicalThenAlias: true,
+		});
+		expect(result.dispatchGuardExceeded).toBe(false);
+		expect(result.models).toEqual([selector(model), selector(fallback)]);
+		expect(result.keys).toEqual(["TOKEN-a", "fallback-test-key"]);
+		expect(result.markCount).toBe(0);
 	});
 
 	test("stays within the failed credential kind when another kind is also stored", async () => {
