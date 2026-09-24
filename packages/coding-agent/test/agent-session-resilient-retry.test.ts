@@ -100,6 +100,8 @@ describe.serial("AgentSession resilient retry", () => {
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
+	let retryTestStateFiles = new Set<string>();
+	let retryTestNamespaceLocks = new Set<string>();
 
 	function configureRetryTestSession(value: AgentSession): AgentSession {
 		value.setDisposeTimeoutForTests(120_000);
@@ -112,12 +114,13 @@ describe.serial("AgentSession resilient retry", () => {
 		// A coordinator state-file pin is process-wide authority for one session.
 		// Put each in-memory session in a separate namespace too: the state sidecar
 		// transaction lock is parent-directory scoped, not state-file scoped.
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(
-			tempDir.path(),
-			`session-${manager.getSessionId()}`,
-			"state",
-			"runtime-state.json",
-		);
+		const stateFile = path.join(tempDir.path(), `session-${manager.getSessionId()}`, "state", "runtime-state.json");
+		const namespaceLock = path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
+		expect(retryTestStateFiles.has(stateFile)).toBe(false);
+		expect(retryTestNamespaceLocks.has(namespaceLock)).toBe(false);
+		retryTestStateFiles.add(stateFile);
+		retryTestNamespaceLocks.add(namespaceLock);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		return manager;
 	}
 
@@ -131,6 +134,8 @@ describe.serial("AgentSession resilient retry", () => {
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-resilient-retry-");
+		retryTestStateFiles = new Set<string>();
+		retryTestNamespaceLocks = new Set<string>();
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(tempDir.path(), "runtime-state.json");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
@@ -1111,7 +1116,9 @@ describe.serial("AgentSession resilient retry", () => {
 			model: alibabaModel.id,
 			errorMessage: timeoutMessage,
 		});
-	}, 60_000);
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
+	});
 
 	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
 		const responsesModel = getBundledModel("alibaba-token-plan", "qwen3.8-max-preview");
@@ -2150,6 +2157,8 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(progressModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
 	});
 	it("retries a typed clean first-event timeout without manual attempt-scope seeding", async () => {
 		const requestedModels: string[] = [];
