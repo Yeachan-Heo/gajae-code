@@ -201,6 +201,7 @@ test("an aborted exit-record write cannot publish after its caller gives up", as
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exit-abort-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
+	await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true });
 	const controller = new AbortController();
 	const write = writeBrokerExitRecord(
 		agentDir,
@@ -222,6 +223,18 @@ test("an aborted exit-record write cannot publish after its caller gives up", as
 	await expect(write).rejects.toThrow("write was aborted");
 	expect(await readBrokerExitRecord(agentDir)).toBeUndefined();
 	expect(await Bun.file(path.join(agentDir, "sdk", "broker.exit.json")).exists()).toBe(false);
+});
+
+test("an active exit-record write does not recreate a removed SDK root", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-exit-removed-root-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	const sdkDir = path.join(agentDir, "sdk");
+	await fs.mkdir(sdkDir, { recursive: true });
+	await fs.rm(sdkDir, { recursive: true });
+
+	await expect(writeBrokerExitRecord(agentDir, exitRecord(Date.now()))).rejects.toMatchObject({ code: "ENOENT" });
+	await expect(fs.stat(sdkDir)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 test("a stalled exit commit stays cancellable and cannot displace a newer record", async () => {
