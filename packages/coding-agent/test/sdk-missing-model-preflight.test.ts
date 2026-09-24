@@ -134,7 +134,10 @@ describe("SDK turn.prompt missing-model preflight diagnostic", () => {
 		expect(response.ok).toBe(false);
 		expect(response.error?.code).toBe(EXPECTED_CODE);
 		expect(response.error?.message).toBe(EXPECTED_MESSAGE);
-		// Pre-acceptance rejection: no result, so no correlation was ever issued.
+		// Pre-acceptance rejection: no result, so no correlation, commandId, turnId or
+		// clientRef is published to the client. The production submit path does mint a
+		// correlation internally before the preflight; this asserts non-publication and
+		// non-acceptance, not the absence of any internal correlation.
 		expect(response.result).toBeUndefined();
 		assertNothingAdmitted(harness, accepted);
 	});
