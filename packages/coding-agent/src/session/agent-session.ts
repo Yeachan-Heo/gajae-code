@@ -4138,6 +4138,9 @@ export class AgentSession {
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
 		const queued = this.#coordinatorPersistQueue.then(run, run);
+		void queued.catch(error => {
+			this.#coordinatorPersistFailuresForTests?.push(error);
+		});
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
 	}
@@ -7048,7 +7051,6 @@ export class AgentSession {
 					await Bun.sleep(COORDINATOR_PERSIST_RETRY_DELAY_MS);
 					continue;
 				}
-				this.#coordinatorPersistFailuresForTests?.push(error);
 				this.#warnPersistFailure(
 					"Failed to persist coordinator runtime state",
 					error,
@@ -7057,6 +7059,7 @@ export class AgentSession {
 					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
 				);
 				if (propagateFailure) throw error;
+				this.#coordinatorPersistFailuresForTests?.push(error);
 				return;
 			}
 		}
