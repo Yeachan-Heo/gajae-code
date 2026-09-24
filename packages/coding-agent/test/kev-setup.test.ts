@@ -880,6 +880,54 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 		}
 	}, 60_000);
 
+	test("the shipped shim redirects uvicorn.run onto the supervisor listener", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-uvicorn-shim-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const { supervisorScript, shim } = await writeSupervisedFixture(base);
+		const marker = path.join(base, "uvicorn-marker.json");
+		await Bun.write(
+			path.join(base, "uvicorn.py"),
+			[
+				"import json, os",
+				"class Config:",
+				"    def __init__(self, app, **kwargs): self.app, self.kwargs = app, kwargs",
+				"class Server:",
+				"    def __init__(self, config): self.config = config",
+				"    def run(self, sockets):",
+				`        with open(os.environ['MARKER'], 'w') as f: json.dump({'count': len(sockets), 'fd': sockets[0].fileno(), 'port': sockets[0].getsockname()[1], 'kwargs': self.config.kwargs}, f)`,
+				"def run(app, **kwargs): Server(Config(app, **kwargs)).run([])",
+			].join("\n"),
+		);
+		await Bun.write(
+			path.join(base, `${FAKE_SERVICE_MODULE}.py`),
+			["import uvicorn", "app = object()", "uvicorn.run(app, host='127.0.0.1', port=9999)"].join("\n"),
+		);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+		const supervisor = Bun.spawn(supervisedArgv(supervisorScript, shim, socketPath, port), {
+			cwd: base,
+			env: { ...process.env, MARKER: marker, PYTHONPATH: base },
+			stdin: "pipe",
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		spawnedPids.push(supervisor.pid);
+		supervisor.stdin.write(`u${"1".repeat(63)}\n${KEV_COMMIT_LINE}\n`);
+		supervisor.stdin.end();
+		expect(await supervisor.exited).toBe(0);
+		const result = JSON.parse(await Bun.file(marker).text()) as {
+			count: number;
+			fd: number;
+			port: number;
+			kwargs: Record<string, unknown>;
+		};
+		expect(result.count).toBe(1);
+		expect(result.port).toBe(port);
+		expect(result.fd).toBeGreaterThanOrEqual(0);
+		expect(result.kwargs).toEqual({});
+	}, 60_000);
+
 	test("a real supervisor with no service record is orphaned and is not reported stopped", async () => {
 		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-record-"));
 		roots.push(base);
