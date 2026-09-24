@@ -1086,8 +1086,15 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// it is a promised resume of the root worker (classified fresh), and
 		// dropping it also bypasses the registration-settlement path.
 		scriptedResponses = [bashCall("sleep 2", "call_hold_turn")];
-		const promptPromise = session.prompt("hold the turn").catch(() => {});
-		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		let promptError: unknown;
+		const promptPromise = session.prompt("hold the turn").catch(error => {
+			promptError = error;
+		});
+		await waitFor(
+			() => session.agent.activeResourceRunId !== undefined || promptError !== undefined,
+			"active run handle",
+		);
+		if (promptError !== undefined) throw promptError;
 		// Terminal abort closes the current turn's continuation fence.
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
 			graceMs: TEST_ABORT_GRACE_MS,
@@ -1552,22 +1559,57 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// Reproduction of the review-thread P1 scenario: JobTool.execute and
 		// #snapshotJobs must resolve the session's endpoint manager — a
 		// non-global session A otherwise inspects session B's manager and
-		// cannot manage the job A just launched.
+		// cannot manage a job owned by session A. Keep manager selection and
+		// registration real, but gate the child execution instead of spawning a
+		// real shell process under shard load.
 		const foreign = trackExtraManager(new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} }));
+		const stopBash = Promise.withResolvers<void>();
+		let bashExecutionStarted = false;
+		let promptError: unknown;
+		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			if (!options?.signal) throw new Error("expected endpoint-owned bash cancellation signal");
+			options.signal.addEventListener("abort", () => stopBash.resolve(), { once: true });
+			bashExecutionStarted = true;
+			await stopBash.promise;
+			return {
+				output: "job-output\n",
+				exitCode: undefined,
+				cancelled: options.signal.aborted,
+				truncated: false,
+				totalLines: 1,
+				totalBytes: 12,
+				outputLines: 1,
+				outputBytes: 12,
+			};
+		});
 		try {
 			AsyncJobManager.setInstance(foreign);
-			scriptedResponses = [bashCall("sleep 30", "call_jobtool", true), stopReply("ok")];
-			const promptPromise = session.prompt("spawn job").catch(() => {});
-			await waitFor(() => manager.getAllJobs().length > 0, "job registered");
+			const endpointId = toolSession.getSessionId?.() ?? undefined;
+			expect(endpointId).toBeDefined();
+			expect(AsyncJobManager.forEndpoint(endpointId)).toBe(manager);
+			scriptedResponses = [bashCall("sleep 30", "call_jobtool", true), stopReply("job started")];
+			const promptPromise = session.prompt("spawn job").catch(error => {
+				promptError = error;
+			});
+			await waitFor(
+				() => manager.getAllJobs().length > 0 || foreign.getAllJobs().length > 0 || promptError !== undefined,
+				"endpoint background job registered",
+			);
+			if (promptError !== undefined) throw promptError;
+			await waitFor(() => bashExecutionStarted, "BashTool reached background execution");
 			await promptPromise;
+			const jobId = manager.getAllJobs()[0]?.id;
+			if (!jobId) throw new Error("expected the endpoint-owned manager to contain the Bash job");
+			expect(foreign.getAllJobs()).toHaveLength(0);
 			const jobTool = new JobTool(toolSession);
-			const job = manager.getAllJobs()[0]!;
 			const listResult = await jobTool.execute("job-call", { list: true });
-			expect(listResult.details?.jobs.some(snapshot => snapshot.id === job.id)).toBe(true);
-			const cancelResult = await jobTool.execute("job-call", { cancel: [job.id] });
+			expect(listResult.details?.jobs.some(snapshot => snapshot.id === jobId)).toBe(true);
+			const cancelResult = await jobTool.execute("job-call", { cancel: [jobId] });
 			expect(cancelResult.details?.cancelled?.[0]?.status).toBe("cancelled");
-			await waitFor(() => manager.getJob(job.id)?.status !== "running", "endpoint job cancelled", 5_000);
+			await waitFor(() => manager.getJob(jobId)?.status !== "running", "endpoint job cancelled", 5_000);
 		} finally {
+			stopBash.resolve();
+			executeBashSpy.mockRestore();
 			AsyncJobManager.setInstance(manager);
 		}
 	}, 20_000);
