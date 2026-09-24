@@ -350,6 +350,17 @@ export declare class NotificationServer {
 }
 
 export declare class PortableRecoveryFsRoot {
+  /**
+   * Creates a new file without replacing an existing entry and returns the
+   * identity of the inode written.
+   *
+   * The identity check establishes that the requested name referred to that
+   * inode at the publication point; this authority does not lock out
+   * non-cooperating writers from the directory. Callers that require stable
+   * name-to-inode binding must keep the root exclusively writable by trusted
+   * publishers during the operation and revalidate the returned identity
+   * before later path-based use.
+   */
   writeExclusive(relativeName: string, data: Uint8Array): RecoveryFsResult
   replace(relativeName: string, data: Uint8Array): RecoveryFsResult
   identity(): RecoveryFsResult

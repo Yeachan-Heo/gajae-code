@@ -1351,9 +1351,40 @@ fn portable_write_exclusive_unix(
 	}
 }
 
+#[cfg(any(unix, windows))]
+fn portable_replace_after_commit(
+	result: Result<RecoveryFsResult, &'static str>,
+) -> RecoveryFsResult {
+	match result {
+		Ok(result) => result,
+		Err(_) => RecoveryFsResult::failure("committed_unverified"),
+	}
+}
+
+#[cfg(any(windows, all(test, target_os = "linux")))]
+fn portable_cleanup_result(
+	cleanup: std::io::Result<()>,
+	initiating_code: &'static str,
+) -> RecoveryFsResult {
+	if cleanup.is_err() {
+		RecoveryFsResult::failure("cleanup_failed")
+	} else {
+		RecoveryFsResult::failure(initiating_code)
+	}
+}
+
 #[napi]
 impl PortableRecoveryFsRoot {
 	#[napi]
+	/// Creates a new file without replacing an existing entry and returns the
+	/// identity of the inode written.
+	///
+	/// The identity check establishes that the requested name referred to that
+	/// inode at the publication point; this authority does not lock out
+	/// non-cooperating writers from the directory. Callers that require stable
+	/// name-to-inode binding must keep the root exclusively writable by trusted
+	/// publishers during the operation and revalidate the returned identity
+	/// before later path-based use.
 	pub fn write_exclusive(&self, relative_name: String, data: Uint8Array) -> RecoveryFsResult {
 		#[cfg(unix)]
 		{
@@ -1400,8 +1431,7 @@ impl PortableRecoveryFsRoot {
 			};
 			if file.write_all(data.as_ref()).is_err() || file.sync_all().is_err() {
 				drop(file);
-				let _ = std::fs::remove_file(path);
-				return RecoveryFsResult::failure("io_error");
+				return portable_cleanup_result(std::fs::remove_file(path), "io_error");
 			}
 			match windows_file_identity(&file) {
 				Ok(identity) if identity.nlink == "1" => RecoveryFsResult {
@@ -1412,10 +1442,7 @@ impl PortableRecoveryFsRoot {
 				},
 				_ => {
 					drop(file);
-					if std::fs::remove_file(path).is_err() {
-						return RecoveryFsResult::failure("cleanup_failed");
-					}
-					RecoveryFsResult::failure("identity_mismatch")
+					portable_cleanup_result(std::fs::remove_file(path), "identity_mismatch")
 				},
 			}
 		}
@@ -1502,40 +1529,42 @@ impl PortableRecoveryFsRoot {
 				unsafe { libc::unlinkat(root.as_raw_fd(), temporary_name.as_ptr(), 0) };
 				return RecoveryFsResult::failure("io_error");
 			}
-			if root.sync_all().is_err() {
-				return RecoveryFsResult::failure("fsync_failed");
-			}
-			// SAFETY: root and name are live; successful ownership transfers to File.
-			let installed_fd = unsafe {
-				libc::openat(
-					root.as_raw_fd(),
-					name.as_ptr(),
-					libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-				)
-			};
-			if installed_fd < 0 {
-				return RecoveryFsResult::failure("identity_mismatch");
-			}
-			// SAFETY: installed_fd is newly owned after successful openat.
-			let mut installed = unsafe { std::fs::File::from_raw_fd(installed_fd) };
-			let installed_result = match portable_regular_result(&installed) {
-				Ok(result) => result,
-				Err(code) => return RecoveryFsResult::failure(code),
-			};
-			let Some(installed_identity) = installed_result.identity.as_ref() else {
-				return RecoveryFsResult::failure("identity_mismatch");
-			};
-			if installed_identity.dev != staged_identity.dev
-				|| installed_identity.ino != staged_identity.ino
-			{
-				return RecoveryFsResult::failure("identity_mismatch");
-			}
-			let mut installed_data = Vec::with_capacity(data.len());
-			if installed.read_to_end(&mut installed_data).is_err() || installed_data != data.as_ref() {
-				return RecoveryFsResult::failure("changed_file");
-			}
-			drop(file);
-			installed_result
+			let result = (|| {
+				if root.sync_all().is_err() {
+					return Err("fsync_failed");
+				}
+				// SAFETY: root and name are live; successful ownership transfers to File.
+				let installed_fd = unsafe {
+					libc::openat(
+						root.as_raw_fd(),
+						name.as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+					)
+				};
+				if installed_fd < 0 {
+					return Err("identity_mismatch");
+				}
+				// SAFETY: installed_fd is newly owned after successful openat.
+				let mut installed = unsafe { std::fs::File::from_raw_fd(installed_fd) };
+				let installed_result = portable_regular_result(&installed)?;
+				let Some(installed_identity) = installed_result.identity.as_ref() else {
+					return Err("identity_mismatch");
+				};
+				if installed_identity.dev != staged_identity.dev
+					|| installed_identity.ino != staged_identity.ino
+				{
+					return Err("identity_mismatch");
+				}
+				let mut installed_data = Vec::with_capacity(data.len());
+				if installed.read_to_end(&mut installed_data).is_err()
+					|| installed_data != data.as_ref()
+				{
+					return Err("changed_file");
+				}
+				drop(file);
+				Ok(installed_result)
+			})();
+			portable_replace_after_commit(result)
 		}
 		#[cfg(windows)]
 		{
@@ -1580,15 +1609,16 @@ impl PortableRecoveryFsRoot {
 			};
 			if file.write_all(data.as_ref()).is_err() || file.sync_all().is_err() {
 				drop(file);
-				let _ = std::fs::remove_file(temporary_path);
-				return RecoveryFsResult::failure("io_error");
+				return portable_cleanup_result(std::fs::remove_file(&temporary_path), "io_error");
 			}
 			let staged_identity = match windows_file_identity(&file) {
 				Ok(identity) if identity.nlink == "1" => identity,
 				_ => {
 					drop(file);
-					let _ = std::fs::remove_file(temporary_path);
-					return RecoveryFsResult::failure("identity_mismatch");
+					return portable_cleanup_result(
+						std::fs::remove_file(&temporary_path),
+						"identity_mismatch",
+					);
 				},
 			};
 			let source: Vec<u16> = temporary_path
@@ -1609,37 +1639,38 @@ impl PortableRecoveryFsRoot {
 				)
 			} == 0
 			{
-				let _ = std::fs::remove_file(temporary_path);
-				return RecoveryFsResult::failure("io_error");
+				return portable_cleanup_result(std::fs::remove_file(&temporary_path), "io_error");
 			}
-			let mut installed = match std::fs::OpenOptions::new()
-				.read(true)
-				.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-				.open(destination_path)
-			{
-				Ok(file) => file,
-				Err(_) => return RecoveryFsResult::failure("identity_mismatch"),
-			};
-			let installed_identity = match windows_file_identity(&installed) {
-				Ok(identity) if identity.nlink == "1" => identity,
-				_ => return RecoveryFsResult::failure("identity_mismatch"),
-			};
-			if installed_identity.dev != staged_identity.dev
-				|| installed_identity.ino != staged_identity.ino
-			{
-				return RecoveryFsResult::failure("identity_mismatch");
-			}
-			let mut installed_data = Vec::with_capacity(data.len());
-			if installed.read_to_end(&mut installed_data).is_err() || installed_data != data.as_ref() {
-				return RecoveryFsResult::failure("changed_file");
-			}
-			drop(file);
-			RecoveryFsResult {
-				ok:       true,
-				code:     None,
-				identity: Some(installed_identity),
-				data:     None,
-			}
+			let result = (|| {
+				let mut installed = std::fs::OpenOptions::new()
+					.read(true)
+					.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+					.open(destination_path)
+					.map_err(|_| "identity_mismatch")?;
+				let installed_identity = match windows_file_identity(&installed) {
+					Ok(identity) if identity.nlink == "1" => identity,
+					_ => return Err("identity_mismatch"),
+				};
+				if installed_identity.dev != staged_identity.dev
+					|| installed_identity.ino != staged_identity.ino
+				{
+					return Err("identity_mismatch");
+				}
+				let mut installed_data = Vec::with_capacity(data.len());
+				if installed.read_to_end(&mut installed_data).is_err()
+					|| installed_data != data.as_ref()
+				{
+					return Err("changed_file");
+				}
+				drop(file);
+				Ok(RecoveryFsResult {
+					ok:       true,
+					code:     None,
+					identity: Some(installed_identity),
+					data:     None,
+				})
+			})();
+			portable_replace_after_commit(result)
 		}
 		#[cfg(not(any(unix, windows)))]
 		{
@@ -3693,7 +3724,11 @@ fn statat(parent: &File, name: &CString) -> Result<libc::stat, &'static str> {
 		libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
 	} != 0
 	{
-		return Err("not_found");
+		return Err(if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+			"not_found"
+		} else {
+			"io_error"
+		});
 	}
 	if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
 		return Err("reparse_point");
@@ -3714,7 +3749,11 @@ fn open_existing(root: &File, relative_path: &str, writable: bool) -> Result<Fil
 		libc::fstatat(parent.as_raw_fd(), name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
 	} != 0
 	{
-		return Err("not_found");
+		return Err(if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+			"not_found"
+		} else {
+			"io_error"
+		});
 	}
 	if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
 		return Err("reparse_point");
@@ -4795,11 +4834,36 @@ fn remove_reaper_marker(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReaperCandidateResult {
 	Deleted(u64),
 	BudgetLimited,
 	Preserved,
 	Failed,
+}
+
+#[cfg(target_os = "linux")]
+fn reaper_stat_failure(error: &'static str) -> ReaperCandidateResult {
+	match error {
+		"not_found" | "reparse_point" => ReaperCandidateResult::Preserved,
+		_ => ReaperCandidateResult::Failed,
+	}
+}
+
+#[cfg(target_os = "linux")]
+const fn reaper_open_failure(errno: Option<i32>) -> ReaperCandidateResult {
+	match errno {
+		Some(libc::ENOENT | libc::ELOOP) => ReaperCandidateResult::Preserved,
+		_ => ReaperCandidateResult::Failed,
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn reaper_descriptor_failure(error: &'static str) -> ReaperCandidateResult {
+	match error {
+		"io_error" | "acl_denied" | "acl_io_error" | "acl_unknown" => ReaperCandidateResult::Failed,
+		_ => ReaperCandidateResult::Preserved,
+	}
 }
 
 #[cfg(target_os = "linux")]
@@ -4818,8 +4882,9 @@ fn reap_managed_recovery_candidate(
 	if candidate.kind == ManagedRecoveryKind::Replace && !process_is_dead(candidate) {
 		return ReaperCandidateResult::Preserved;
 	}
-	let Ok(named_before) = statat(recovery, name) else {
-		return ReaperCandidateResult::Preserved;
+	let named_before = match statat(recovery, name) {
+		Ok(named_before) => named_before,
+		Err(error) => return reaper_stat_failure(error),
 	};
 	if !reaper_owner_file_stat(&named_before) {
 		return ReaperCandidateResult::Preserved;
@@ -4835,15 +4900,18 @@ fn reap_managed_recovery_candidate(
 		)
 	};
 	if fd < 0 {
-		return ReaperCandidateResult::Preserved;
+		return reaper_open_failure(std::io::Error::last_os_error().raw_os_error());
 	}
 	// SAFETY: successful openat returned a uniquely owned descriptor.
 	let file = unsafe { File::from_raw_fd(fd) };
-	let Ok(opened_identity) = regular_identity(&file) else {
-		return ReaperCandidateResult::Preserved;
+	let opened_identity = match regular_identity(&file) {
+		Ok(identity) => identity,
+		Err(error) => return reaper_descriptor_failure(error),
 	};
-	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err()
-		|| !stat_matches_regular_identity(&named_before, &opened_identity)
+	if let Err(error) = crate::path_identity::platform::verify_created_owner_only_file(&file) {
+		return reaper_descriptor_failure(error);
+	}
+	if !stat_matches_regular_identity(&named_before, &opened_identity)
 		|| !reaper_owner_file_stat(&named_before)
 	{
 		return ReaperCandidateResult::Preserved;
@@ -4875,17 +4943,19 @@ fn reap_managed_recovery_candidate(
 	}
 	let final_identity = match regular_identity(&file) {
 		Ok(identity) if identity == opened_identity => identity,
-		_ => return ReaperCandidateResult::Preserved,
+		Ok(_) => return ReaperCandidateResult::Preserved,
+		Err(error) => return reaper_descriptor_failure(error),
 	};
-	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
-		return ReaperCandidateResult::Preserved;
+	if let Err(error) = crate::path_identity::platform::verify_created_owner_only_file(&file) {
+		return reaper_descriptor_failure(error);
 	}
 	drop(file);
 	// NFS silly-renames an unlinked file while it is still open. Drop the checked
 	// descriptor before unlinking, then recheck the descriptor-relative name as
 	// close to unlinkat as possible.
-	let Ok(named_before_quarantine) = statat(recovery, name) else {
-		return ReaperCandidateResult::Preserved;
+	let named_before_quarantine = match statat(recovery, name) {
+		Ok(named) => named,
+		Err(error) => return reaper_stat_failure(error),
 	};
 	if !stat_matches_regular_identity(&named_before_quarantine, &final_identity)
 		|| !reaper_owner_file_stat(&named_before_quarantine)
@@ -4926,8 +4996,9 @@ fn reap_managed_recovery_candidate(
 	if recovery.sync_all().is_err() {
 		return ReaperCandidateResult::Failed;
 	}
-	let Ok(moved_stat) = statat(recovery, &quarantine) else {
-		return ReaperCandidateResult::Failed;
+	let moved_stat = match statat(recovery, &quarantine) {
+		Ok(stat) => stat,
+		Err(error) => return reaper_stat_failure(error),
 	};
 	if !stat_matches_regular_identity_after_rename(&moved_stat, &final_identity)
 		|| !reaper_owner_file_stat(&moved_stat)
@@ -4937,8 +5008,9 @@ fn reap_managed_recovery_candidate(
 		let _ = rename_file_no_replace(recovery, &quarantine, recovery, name, || {});
 		return ReaperCandidateResult::Preserved;
 	}
-	let Ok(final_named_stat) = statat(recovery, &quarantine) else {
-		return ReaperCandidateResult::Failed;
+	let final_named_stat = match statat(recovery, &quarantine) {
+		Ok(stat) => stat,
+		Err(error) => return reaper_stat_failure(error),
 	};
 	if !stat_matches_regular_identity_after_rename(&final_named_stat, &final_identity)
 		|| !reaper_owner_file_stat(&final_named_stat)
@@ -6331,6 +6403,95 @@ mod tests {
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
 		assert_eq!(fs::read(&target).expect("read replacement"), b"replacement");
 		assert_eq!(fs::read(&displaced).expect("read original inode"), b"original");
+	}
+
+	#[test]
+	fn portable_replace_reports_committed_but_unverified_after_rename() {
+		for cause in ["fsync_failed", "identity_mismatch", "changed_file"] {
+			let result = portable_replace_after_commit(Err(cause));
+			assert_eq!(result.code.as_deref(), Some("committed_unverified"));
+		}
+	}
+
+	#[test]
+	fn portable_replace_precommit_failure_keeps_its_uncommitted_status() {
+		let temporary = TempDir::new();
+		fs::create_dir(temporary.0.join("destination")).expect("seed directory destination");
+		let root = PortableRecoveryFsRoot { root: std::sync::Mutex::new(Some(temporary.root())) };
+
+		let result =
+			root.replace("destination".to_owned(), Uint8Array::from(b"replacement".to_vec()));
+
+		assert_eq!(result.code.as_deref(), Some("io_error"));
+		assert!(temporary.0.join("destination").is_dir());
+	}
+
+	#[test]
+	fn portable_cleanup_failure_does_not_hide_cleanup_status_or_initiating_error() {
+		assert_eq!(
+			portable_cleanup_result(Ok(()), "identity_mismatch")
+				.code
+				.as_deref(),
+			Some("identity_mismatch"),
+		);
+		assert_eq!(
+			portable_cleanup_result(Err(std::io::Error::from_raw_os_error(libc::EACCES)), "io_error",)
+				.code
+				.as_deref(),
+			Some("cleanup_failed"),
+		);
+	}
+
+	#[test]
+	fn reaper_distinguishes_absence_from_stat_and_open_failures() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let missing_name = CString::new("missing").expect("missing entry name");
+		assert!(matches!(statat(&root, &missing_name), Err("not_found")));
+		assert_eq!(reaper_stat_failure("not_found"), ReaperCandidateResult::Preserved);
+		assert_eq!(reaper_stat_failure("reparse_point"), ReaperCandidateResult::Preserved);
+		assert_eq!(reaper_stat_failure("io_error"), ReaperCandidateResult::Failed);
+
+		let regular_path = temporary.0.join("regular");
+		fs::write(&regular_path, b"file descriptor is not a directory")
+			.expect("seed non-directory descriptor");
+		let not_a_directory = File::open(&regular_path).expect("open regular file");
+		assert!(matches!(statat(&not_a_directory, &missing_name), Err("io_error")));
+
+		let symlink_path = temporary.0.join("symlink");
+		std::os::unix::fs::symlink(&regular_path, &symlink_path).expect("create symlink");
+		let symlink_name = CString::new("symlink").expect("symlink name");
+		assert!(matches!(statat(&root, &symlink_name), Err("reparse_point")));
+
+		assert_eq!(reaper_open_failure(Some(libc::ENOENT)), ReaperCandidateResult::Preserved);
+		assert_eq!(reaper_open_failure(Some(libc::ELOOP)), ReaperCandidateResult::Preserved);
+		assert_eq!(reaper_open_failure(Some(libc::EACCES)), ReaperCandidateResult::Failed);
+
+		let candidate = ManagedRecoveryName {
+			pid:             1,
+			publisher:       None,
+			kind:            ManagedRecoveryKind::Remove,
+			created_at_secs: Some(0),
+		};
+		assert_eq!(
+			reap_managed_recovery_candidate(&root, &missing_name, candidate, 0, 0, &mut |_| false,),
+			ReaperCandidateResult::Preserved,
+		);
+		assert_eq!(
+			reap_managed_recovery_candidate(&root, &symlink_name, candidate, 0, 0, &mut |_| false,),
+			ReaperCandidateResult::Preserved,
+		);
+		assert_eq!(
+			reap_managed_recovery_candidate(
+				&not_a_directory,
+				&missing_name,
+				candidate,
+				0,
+				0,
+				&mut |_| false,
+			),
+			ReaperCandidateResult::Failed,
+		);
 	}
 
 	fn managed_file(root: &File, path: &str, contents: &[u8]) -> RecoveryFsIdentity {
