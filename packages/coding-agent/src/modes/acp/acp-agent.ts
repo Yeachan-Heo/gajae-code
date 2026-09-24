@@ -92,6 +92,8 @@ const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
+/** Bounded valid terminal candidates retained while an uncertain prompt has only clientRef identity. */
+const PROVISIONAL_ABORT_TERMINAL_CANDIDATE_RETENTION = 16;
 /**
  * A cancelled prompt must still settle. The SDK acknowledges `turn.abort` before the
  * aborted run publishes its normalized terminal, and agent-owned async work that
@@ -225,6 +227,15 @@ interface PromptWaiter {
 }
 
 type PromptCorrelation = { commandId?: string; turnId?: string };
+type UncertainAbortOwner = {
+	kind: PromptWaiter["invocationKind"];
+	clientRef: string;
+	correlation?: { commandId: string; turnId: string };
+};
+type UncertainPromptRecoveryResult =
+	| { kind: "terminal" }
+	| { kind: "uncertain"; error: AcpSdkAdapterError }
+	| { kind: "ownership_lost" };
 type PromptPhaseOwner = PromptWaiter | "background" | undefined;
 
 type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
@@ -263,6 +274,9 @@ type SessionRecord = {
 	activePrompt?: PromptWaiter;
 	/** One bounded read-only recovery owner for this attachment and waiter. */
 	statusRecovery?: PromptWaiter;
+	statusRecoveryTask?: Promise<UncertainPromptRecoveryResult>;
+	/** An uncertain abort's exact late terminal is required before a successor may start. */
+	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
 	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
@@ -607,6 +621,14 @@ function sdkFrameCorrelation(frame: JsonObject, event?: JsonObject): PromptCorre
 	return strictCorrelationFrom(frame, event);
 }
 
+function sdkFrameBelongsToSession(frame: JsonObject, event: JsonObject | undefined, sessionId: string): boolean {
+	return (
+		frame.routerSessionId === sessionId &&
+		(frame.sessionId === undefined || frame.sessionId === sessionId) &&
+		(event?.sessionId === undefined || event.sessionId === sessionId)
+	);
+}
+
 /**
  * Conflicting envelope/event identities own no prompt and therefore cannot
  * refresh a watchdog or publish into either turn.
@@ -618,7 +640,7 @@ function watchdogCorrelationFrom(frame: JsonObject, event?: JsonObject): PromptC
 function logDroppedPromptTerminal(
 	sessionId: string,
 	event: JsonObject,
-	reason: "incomplete_correlation" | "correlation_mismatch",
+	reason: "incomplete_correlation" | "correlation_mismatch" | "session_mismatch",
 	actual: PromptCorrelation,
 	expected?: PromptCorrelation,
 ): void {
@@ -1048,18 +1070,20 @@ const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
 	"reverse_request_cancelled",
 ]);
 
-function acpFrameFromRouted(frame: SessionRouterFrame): JsonObject {
+function acpFrameFromRouted(frame: SessionRouterFrame, attachmentSessionId: string): JsonObject {
 	if (
 		frame.body.type === "activity" ||
 		frame.body.type === "agent_start" ||
 		frame.body.type === "agent_end" ||
 		frame.body.type === "agent_failed"
 	)
-		return frame.body;
-	if (typeof frame.body.type === "string" && ROUTER_PASSTHROUGH_FRAME_TYPES.has(frame.body.type)) return frame.body;
+		return { ...frame.body, routerSessionId: attachmentSessionId };
+	if (typeof frame.body.type === "string" && ROUTER_PASSTHROUGH_FRAME_TYPES.has(frame.body.type))
+		return { ...frame.body, routerSessionId: attachmentSessionId };
 	const connectionId = typeof frame.body.connectionId === "string" ? frame.body.connectionId : undefined;
 	return {
 		type: "event",
+		routerSessionId: attachmentSessionId,
 		...(frame.name === undefined ? {} : { kind: frame.name }),
 		...(frame.sessionId === undefined ? {} : { sessionId: frame.sessionId }),
 		...(frame.commandId === undefined ? {} : { commandId: frame.commandId }),
@@ -1617,6 +1641,8 @@ export class AcpAgent implements Agent {
 	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
 	#routerStartPromise: Promise<void> | undefined;
 	readonly #sessions = new Map<string, SessionRecord>();
+	/** Exact abort owners survive SessionRecord replacement until terminal proof or retirement. */
+	readonly #uncertainAbortOwners = new Map<string, UncertainAbortOwner>();
 	/** Retain settled prompt identities across automatic transport reattachment. */
 	readonly #retiredPromptCorrelations = new Map<string, PromptCorrelation[]>();
 	/** Prevent a successor admission while a retired prompt can still reveal its identity. */
@@ -1689,7 +1715,7 @@ export class AcpAgent implements Agent {
 					await adapter.attachmentReady(attachment);
 				},
 				onFrame: (attachment, frame) => {
-					const acpFrame = acpFrameFromRouted(frame);
+					const acpFrame = acpFrameFromRouted(frame, attachment.sessionId);
 					const adapter =
 						this.#sessions.get(attachment.sessionId)?.adapter ??
 						this.#pendingRouterAdapters.get(attachment.sessionId);
@@ -1934,6 +1960,7 @@ export class AcpAgent implements Agent {
 					{ sessionId: params.sessionId },
 					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 				);
+				this.#uncertainAbortOwners.delete(params.sessionId);
 				return {};
 			}
 			this.#beginTeardown(params.sessionId);
@@ -1965,6 +1992,7 @@ export class AcpAgent implements Agent {
 							this.#knownSessionMetadata.delete(params.sessionId);
 							this.#retiredPromptCorrelations.delete(params.sessionId);
 							this.#retiredPromptAcknowledgements.delete(params.sessionId);
+							this.#uncertainAbortOwners.delete(params.sessionId);
 							return {};
 						}
 						throw error;
@@ -1976,6 +2004,7 @@ export class AcpAgent implements Agent {
 					{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
 					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 				);
+				this.#uncertainAbortOwners.delete(params.sessionId);
 				this.#knownSessionCwds.delete(params.sessionId);
 				this.#ownedSessionIds.delete(params.sessionId);
 				this.#knownSessionMcpServers.delete(params.sessionId);
@@ -2204,6 +2233,11 @@ export class AcpAgent implements Agent {
 		if (record.pendingFirstPromptRetry && record.pendingFirstPromptRetry !== retryReservation)
 			throw new AcpSdkAdapterError("conflict", "ACP session is retrying its first prompt.");
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
+		if (record.uncertainAbortOwner)
+			throw new AcpSdkAdapterError(
+				"conflict",
+				"ACP session is still awaiting the uncertainly aborted turn's terminal.",
+			);
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
 		if (this.#retiredPromptAcknowledgements.has(params.sessionId))
 			throw new AcpSdkAdapterError(
@@ -2419,7 +2453,67 @@ export class AcpAgent implements Agent {
 				record.adapter !== promptAdapter ||
 				record.activePrompt !== waiter
 			) {
+				const current = this.#sessions.get(params.sessionId);
+				const provisionalOwner = current?.uncertainAbortOwner;
+				if (
+					provisionalOwner?.kind === waiter.invocationKind &&
+					provisionalOwner.clientRef === waiter.clientRef &&
+					provisionalOwner.correlation === undefined &&
+					this.#hasRetiredPromptCorrelation(params.sessionId, record, acknowledgementCorrelation)
+				) {
+					// A stale ACK cannot bind a provisional abort owner. Keep the fence
+					// until this session is retired or new exact evidence is available.
+					waiter.deferredFrames.length = 0;
+					return await response;
+				}
+				this.#bindUncertainAbortOwner(params.sessionId, waiter, acknowledgementCorrelation);
 				this.#rememberSettledPromptCorrelation(params.sessionId, record, acknowledgementCorrelation);
+				const retainedOwner = current?.uncertainAbortOwner;
+				if (
+					current &&
+					retainedOwner?.kind === waiter.invocationKind &&
+					retainedOwner.clientRef === waiter.clientRef &&
+					retainedOwner.correlation &&
+					correlationsExactlyMatch(retainedOwner.correlation, acknowledgementCorrelation)
+				) {
+					await current.frameTail;
+					const deferredFrames = waiter.deferredFrames.splice(0);
+					let reconciledDeferredTerminal = false;
+					for (const deferred of deferredFrames) {
+						const deferredEvent = receivedSdkEvent(deferred.frame)?.event;
+						if (!deferredEvent) continue;
+						const deferredOutcome = terminalOutcome(deferredEvent);
+						const validDeferredTerminal =
+							(deferredEvent.type === "agent_end" && deferredOutcome !== undefined) ||
+							(deferredEvent.type === "agent_failed" && deferredOutcome?.kind === "failed");
+						const deferredCorrelation = sdkFrameCorrelation(deferred.frame, deferredEvent);
+						if (
+							!validDeferredTerminal ||
+							!sdkFrameBelongsToSession(deferred.frame, deferredEvent, params.sessionId) ||
+							!deferredCorrelation ||
+							!hasCompleteCorrelation(deferredCorrelation) ||
+							!correlationsExactlyMatch(deferredCorrelation, acknowledgementCorrelation)
+						)
+							continue;
+						waiter.terminalReserved = true;
+						await this.#handleSdkFrame(
+							params.sessionId,
+							current.adapter,
+							deferred.frame,
+							current.publicationGeneration,
+						);
+						reconciledDeferredTerminal = true;
+						break;
+					}
+					if (!reconciledDeferredTerminal)
+						void this.#recoverUncertainAbortAfterLateAcknowledgement(
+							params.sessionId,
+							current.adapter,
+							retainedOwner,
+						);
+				} else {
+					waiter.deferredFrames.length = 0;
+				}
 				return await response;
 			}
 			if (this.#hasRetiredPromptCorrelation(params.sessionId, record, acknowledgementCorrelation)) {
@@ -2447,6 +2541,7 @@ export class AcpAgent implements Agent {
 			waiter.boundary = record.inboundSequence;
 			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
+			this.#bindUncertainAbortOwner(params.sessionId, waiter, acknowledgementCorrelation);
 			if (promptWaiterRetired(record, waiter)) {
 				this.#rememberSettledPromptCorrelation(params.sessionId, record, acknowledgementCorrelation);
 				return await response;
@@ -2680,6 +2775,49 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
+			let cancellationError = error;
+			const abortDetails = error instanceof SdkClientError ? object(error.details) : undefined;
+			if (
+				error instanceof SdkClientError &&
+				error.code === "uncertain_after_send" &&
+				abortDetails?.operation === "turn.abort" &&
+				waiter &&
+				record.activePrompt === waiter &&
+				waiter.dispatched &&
+				!waiter.settled
+			) {
+				if (waiter.terminalReserved) {
+					waiter.cancelAttemptResolve?.(true);
+					return;
+				}
+				this.#retainUncertainAbortOwner(params.sessionId, record, waiter);
+				let recovery = record.statusRecovery === waiter ? record.statusRecoveryTask : undefined;
+				if (!recovery && this.#startUncertainPromptRecovery(params.sessionId, record, waiter))
+					recovery = record.statusRecoveryTask;
+				if (recovery) {
+					const recoveryResult = await recovery;
+					if (
+						recoveryResult.kind === "terminal" ||
+						(recoveryResult.kind === "ownership_lost" && waiter.terminalReserved)
+					) {
+						record.cancelRequested = false;
+						waiter.cancelAttemptResolve?.(true);
+						return;
+					}
+					cancellationError =
+						recoveryResult.kind === "uncertain"
+							? recoveryResult.error
+							: new AcpSdkAdapterError(
+									"terminal_uncertain",
+									"ACP abort recovery lost ownership before exact terminal evidence was resolved. No mutation was replayed.",
+								);
+				} else {
+					cancellationError = new AcpSdkAdapterError(
+						"terminal_uncertain",
+						"ACP abort could not retain recovery ownership. No mutation was replayed.",
+					);
+				}
+			}
 			// With no active prompt the cancel intent normally clears — except when a first-turn
 			// retry is reserved across its backoff gap. That reservation owner has not yet observed
 			// the cancel; clearing it here would let the retry resubmit a turn the client cancelled
@@ -2704,7 +2842,7 @@ export class AcpAgent implements Agent {
 				waiter.cancelAttempt = undefined;
 				waiter.cancelAttemptResolve = undefined;
 			}
-			throw error;
+			throw cancellationError;
 		} finally {
 			if (waiter) {
 				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
@@ -2735,6 +2873,22 @@ export class AcpAgent implements Agent {
 		if (!waiter.cancelAcknowledged) return;
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		if (waiter.terminalReserved) return;
+		// An overlapping acknowledged cancel does not supersede the earlier
+		// uncertain abort's bounded terminal lookup. Let that exact read either
+		// prove a terminal or retire the waiter as still uncertain before grace
+		// settlement can discard its foreground recovery owner.
+		if (record.statusRecovery === waiter && this.#ownsUncertainAbort(record, waiter)) return;
+		const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
+		if (uncertainAbortOwner && this.#ownsUncertainAbort(record, waiter)) {
+			record.uncertainAbortOwner = uncertainAbortOwner;
+			const ownerCorrelation = uncertainAbortOwner.correlation;
+			if (
+				ownerCorrelation &&
+				!record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, ownerCorrelation))
+			)
+				record.backgroundCorrelations.push(ownerCorrelation);
+			record.backgroundBusy = true;
+		}
 		record.activePrompt = undefined;
 		if (!record.backgroundBusy) record.busy = false;
 		clearPromptWatchdog(waiter);
@@ -3001,11 +3155,7 @@ export class AcpAgent implements Agent {
 		this.#pendingRouterFrames.set(id, bufferedFrames);
 		try {
 			await this.#ensureRouterReady();
-			const attachment = lifecycleResult
-				? await this.#router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd })
-				: this.#router.attachment(id);
-			if (!attachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
+			if (lifecycleResult) await this.#router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd });
 			let currentAttachment = this.#router.attachment(id);
 			for (let attempt = 0; !currentAttachment && attempt < 40; attempt++) {
 				await Bun.sleep(50);
@@ -3013,7 +3163,7 @@ export class AcpAgent implements Agent {
 				currentAttachment = this.#router.attachment(id);
 			}
 			if (!currentAttachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
+				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
 			adapter = new AcpSdkAdapter({
 				router: this.#router,
 				attachment: currentAttachment,
@@ -3054,6 +3204,7 @@ export class AcpAgent implements Agent {
 			const exactAttachment = this.#router.attachment(id) ?? currentAttachment;
 			if (!exactAttachment.isCurrent())
 				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
+			const retainedAbortOwner = this.#uncertainAbortOwners.get(id);
 			const record: SessionRecord = {
 				cwd,
 				adapter,
@@ -3067,11 +3218,12 @@ export class AcpAgent implements Agent {
 				settledPromptCorrelations: this.#retiredPromptCorrelations.get(id) ?? [],
 				inboundSequence: 0,
 				connectionId: adapter.connectionId,
-				busy: false,
-				backgroundBusy: false,
+				busy: retainedAbortOwner !== undefined,
+				backgroundBusy: retainedAbortOwner !== undefined,
 				backgroundAnonymousCount: 0,
-				backgroundCorrelations: [],
+				backgroundCorrelations: retainedAbortOwner?.correlation ? [retainedAbortOwner.correlation] : [],
 				toolArgs: new Map(),
+				uncertainAbortOwner: retainedAbortOwner,
 			};
 			// Preserve first-turn state across reattachment (issue #5574). The startup-readiness
 			// retry only guards a session's very first logical prompt; a fresh record built on
@@ -3108,9 +3260,11 @@ export class AcpAgent implements Agent {
 				try {
 					await this.#teardownSession(id, "attachment failed", false);
 				} finally {
-					this.#knownSessionCwds.delete(id);
+					if (!this.#uncertainAbortOwners.has(id)) {
+						this.#knownSessionCwds.delete(id);
+						this.#knownSessionMcpServers.delete(id);
+					}
 					this.#ownedSessionIds.delete(id);
-					this.#knownSessionMcpServers.delete(id);
 				}
 			} else if (adapter) {
 				try {
@@ -3162,6 +3316,181 @@ export class AcpAgent implements Agent {
 		if (this.#retiredPromptAcknowledgements.get(id) === waiter) this.#retiredPromptAcknowledgements.delete(id);
 	}
 
+	#retainUncertainAbortOwner(id: string, record: SessionRecord, waiter: PromptWaiter): void {
+		let owner: UncertainAbortOwner = {
+			kind: waiter.invocationKind,
+			clientRef: waiter.clientRef,
+		};
+		if (hasCompleteCorrelation(waiter.correlation))
+			owner = {
+				...owner,
+				correlation: { commandId: waiter.correlation.commandId, turnId: waiter.correlation.turnId },
+			};
+		const retained = this.#uncertainAbortOwners.get(id);
+		if (
+			retained &&
+			(retained.kind !== owner.kind ||
+				retained.clientRef !== owner.clientRef ||
+				(retained.correlation !== undefined &&
+					owner.correlation !== undefined &&
+					!correlationsExactlyMatch(retained.correlation, owner.correlation)))
+		) {
+			record.uncertainAbortOwner = retained;
+			return;
+		}
+		if (retained?.correlation && !owner.correlation) owner = retained;
+		this.#uncertainAbortOwners.set(id, owner);
+		record.uncertainAbortOwner = owner;
+	}
+
+	#bindUncertainAbortOwner(id: string, waiter: PromptWaiter, correlation: PromptCorrelation): void {
+		if (!hasCompleteCorrelation(correlation)) return;
+		const retained = this.#uncertainAbortOwners.get(id);
+		if (!retained || retained.kind !== waiter.invocationKind || retained.clientRef !== waiter.clientRef) return;
+		if (retained.correlation && !correlationsExactlyMatch(retained.correlation, correlation)) return;
+		const boundCorrelation = { commandId: correlation.commandId, turnId: correlation.turnId };
+		const owner: UncertainAbortOwner = {
+			kind: retained.kind,
+			clientRef: retained.clientRef,
+			correlation: boundCorrelation,
+		};
+		this.#uncertainAbortOwners.set(id, owner);
+		const current = this.#sessions.get(id);
+		if (!current) return;
+		current.uncertainAbortOwner = owner;
+		if (current.activePrompt !== waiter || waiter.settled) {
+			if (!current.backgroundCorrelations.some(background => correlationsExactlyMatch(background, correlation)))
+				current.backgroundCorrelations.push(boundCorrelation);
+			current.backgroundBusy = true;
+			current.busy = true;
+		}
+	}
+
+	async #recoverUncertainAbortAfterLateAcknowledgement(
+		id: string,
+		adapter: AcpSdkAdapter,
+		owner: UncertainAbortOwner,
+	): Promise<void> {
+		const correlation = owner.correlation;
+		if (!correlation) return;
+		let timer: NodeJS.Timeout | undefined;
+		let timedOut = false;
+		try {
+			const deadline = Promise.withResolvers<never>();
+			timer = setTimeout(() => {
+				timedOut = true;
+				deadline.reject(new Error("status query timeout"));
+			}, 5_000);
+			const response = object(
+				await Promise.race([
+					adapter.query("turn.result", {
+						kind: owner.kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+					}),
+					deadline.promise,
+				]),
+			);
+			const status = object(response?.result) ?? response;
+			const reportedCorrelation = strictCorrelationFrom(response, status);
+			const outcome = status ? terminalOutcome(status) : undefined;
+			const failure = object(status?.error);
+			const conflictingIdentity = [response, status].some(
+				value =>
+					(value?.kind !== undefined && value.kind !== owner.kind) ||
+					(value?.sessionId !== undefined && value.sessionId !== id) ||
+					(value?.clientRef !== undefined && value.clientRef !== owner.clientRef),
+			);
+			const failedReceipt =
+				status?.status === "failed" &&
+				((outcome?.kind === "failed" &&
+					(status.receiptState === "present" ||
+						status.receiptState === "missing" ||
+						status.receiptState === "unknown")) ||
+					(outcome === undefined &&
+						(status.receiptState === "present" ||
+							status.receiptState === "missing" ||
+							status.receiptState === "unknown") &&
+						typeof failure?.code === "string" &&
+						/^[a-zA-Z0-9_.-]{1,64}$/.test(failure.code) &&
+						typeof failure.message === "string" &&
+						failure.message.trim().length > 0 &&
+						failure.message.length <= 512));
+			const terminal =
+				(status?.status === "terminal_ok" &&
+					outcome?.kind === "stopped" &&
+					(status.receiptState === "present" || status.receiptState === "missing")) ||
+				failedReceipt;
+			// The original prompt has already settled as terminal_uncertain on this
+			// detached follow-up path. Missing receipt remains a failure classification;
+			// this proof retires only the session ownership fence, never the old result
+			// as a successful stop reason.
+			if (
+				!terminal ||
+				conflictingIdentity ||
+				status?.kind !== owner.kind ||
+				!reportedCorrelation ||
+				!hasCompleteCorrelation(reportedCorrelation) ||
+				!correlationsExactlyMatch(correlation, reportedCorrelation)
+			)
+				return;
+			const record = this.#sessions.get(id);
+			const retained = this.#uncertainAbortOwners.get(id);
+			if (
+				!record ||
+				record.adapter !== adapter ||
+				retained?.kind !== owner.kind ||
+				retained.clientRef !== owner.clientRef ||
+				!retained.correlation ||
+				!correlationsExactlyMatch(retained.correlation, correlation)
+			)
+				return;
+			this.#clearUncertainAbortOwner(id, record, owner.kind, correlation);
+			record.backgroundCorrelations = record.backgroundCorrelations.filter(
+				background => !correlationsExactlyMatch(background, correlation),
+			);
+			record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
+			record.busy = record.backgroundBusy;
+			void this.#publishPromptPhaseIdle(id, adapter);
+		} catch {
+			logger.warn("acp_uncertain_abort_late_ack_lookup_unresolved", {
+				sessionId: id,
+				reason: timedOut ? "timeout" : "unavailable",
+			});
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	#clearUncertainAbortOwner(
+		id: string,
+		record: SessionRecord,
+		kind: PromptWaiter["invocationKind"],
+		correlation: PromptCorrelation,
+	): void {
+		const owner = this.#uncertainAbortOwners.get(id);
+		if (owner?.kind === kind && owner.correlation && correlationsExactlyMatch(owner.correlation, correlation))
+			this.#uncertainAbortOwners.delete(id);
+		const recordOwner = record.uncertainAbortOwner;
+		if (
+			recordOwner?.kind === kind &&
+			recordOwner.correlation &&
+			correlationsExactlyMatch(recordOwner.correlation, correlation)
+		)
+			record.uncertainAbortOwner = undefined;
+	}
+
+	#ownsUncertainAbort(record: SessionRecord, waiter: PromptWaiter): boolean {
+		const owner = record.uncertainAbortOwner;
+		return (
+			owner?.kind === waiter.invocationKind &&
+			owner.clientRef === waiter.clientRef &&
+			(!owner.correlation ||
+				!hasCompleteCorrelation(waiter.correlation) ||
+				correlationsExactlyMatch(owner.correlation, waiter.correlation))
+		);
+	}
+
 	#advanceTerminalGeneration(record: SessionRecord): void {
 		record.publicationGeneration++;
 	}
@@ -3170,9 +3499,17 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
 		if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+			const details = object(error.details);
+			const abortWaiter = record.activePrompt;
+			if (details?.operation === "turn.abort" && abortWaiter?.dispatched && !abortWaiter.settled) {
+				if (abortWaiter.terminalReserved) return;
+				this.#retainUncertainAbortOwner(id, record, abortWaiter);
+				if (record.statusRecovery !== abortWaiter) this.#startUncertainPromptRecovery(id, record, abortWaiter);
+				return;
+			}
 			// Provider-registration requests share this transport error. Recover only when the
-			// prompt's own dispatched acknowledgement is still pending; an acknowledged turn
-			// must continue until its terminal frame arrives.
+			// prompt's own dispatched acknowledgement is still pending; ordinary acknowledged
+			// turns continue until their terminal frame arrives.
 			const waiter = record.activePrompt;
 			if (waiter?.dispatched && waiter.acknowledgementPending && !waiter.acknowledged)
 				this.#startUncertainPromptRecovery(id, record, waiter);
@@ -3193,6 +3530,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 		const waiter = record.activePrompt;
+		if (waiter?.terminalReserved && this.#ownsUncertainAbort(record, waiter)) return;
 		if (waiter?.dispatched) {
 			// A prior uncertainty notification already owns recovery for this waiter. Keep
 			// the in-flight lookup alive; only declined, non-recovering waiters fall through
@@ -3215,7 +3553,14 @@ export class AcpAgent implements Agent {
 			return false;
 		record.statusRecovery = waiter;
 		clearPromptWatchdog(waiter);
-		void this.#recoverUncertainPrompt(id, record, record.adapter, waiter);
+		const recovery = this.#recoverUncertainPrompt(id, record, record.adapter, waiter);
+		record.statusRecoveryTask = recovery;
+		const clearRecovery = (): void => {
+			if (record.statusRecovery !== waiter) return;
+			record.statusRecovery = undefined;
+			record.statusRecoveryTask = undefined;
+		};
+		void recovery.then(clearRecovery, clearRecovery);
 		return true;
 	}
 
@@ -3224,7 +3569,7 @@ export class AcpAgent implements Agent {
 		record: SessionRecord,
 		adapter: AcpSdkAdapter,
 		waiter: PromptWaiter,
-	): Promise<void> {
+	): Promise<UncertainPromptRecoveryResult> {
 		const ownsRecovery = (): boolean =>
 			this.#sessions.get(id) === record &&
 			record.adapter === adapter &&
@@ -3262,7 +3607,7 @@ export class AcpAgent implements Agent {
 				}
 			};
 			await Promise.race([refreshAttachment(), deadline.promise]);
-			if (!ownsRecovery()) return;
+			if (!ownsRecovery()) return { kind: "ownership_lost" };
 			// Bound observation only: the mutation and the read are never replayed or aborted.
 			const response = object(
 				await Promise.race([
@@ -3273,7 +3618,7 @@ export class AcpAgent implements Agent {
 					deadline.promise,
 				]),
 			);
-			if (!ownsRecovery()) return;
+			if (!ownsRecovery()) return { kind: "ownership_lost" };
 			const status = object(response?.result) ?? response;
 			const correlation = strictCorrelationFrom(response, status);
 			const outcome = status ? terminalOutcome(status) : undefined;
@@ -3314,10 +3659,35 @@ export class AcpAgent implements Agent {
 			) {
 				waiter.correlation = correlation;
 				waiter.acknowledged = true;
+				this.#bindUncertainAbortOwner(id, waiter, correlation);
+				this.#clearUncertainAbortOwner(id, record, waiter.invocationKind, correlation);
 				record.busy = record.backgroundBusy;
 				this.#advanceTerminalGeneration(record);
 				void this.#rejectPrompt(record, id, waiter, new AcpSdkAdapterError(failure.code, failure.message));
-				return;
+				return { kind: "terminal" };
+			} else if (
+				this.#ownsUncertainAbort(record, waiter) &&
+				status.status === "terminal_ok" &&
+				outcome?.kind === "stopped" &&
+				outcome.reason === "end_turn" &&
+				status.receiptState === "missing"
+			) {
+				waiter.correlation = correlation;
+				waiter.acknowledged = true;
+				this.#bindUncertainAbortOwner(id, waiter, correlation);
+				this.#clearUncertainAbortOwner(id, record, waiter.invocationKind, correlation);
+				record.busy = record.backgroundBusy;
+				this.#advanceTerminalGeneration(record);
+				void this.#rejectPrompt(
+					record,
+					id,
+					waiter,
+					new AcpSdkAdapterError(
+						"prompt_failed",
+						"Runtime completed without reportable final response text or artifact_path.",
+					),
+				);
+				return { kind: "terminal" };
 			} else if (
 				(status.status === "terminal_ok" &&
 					outcome?.kind === "stopped" &&
@@ -3331,6 +3701,8 @@ export class AcpAgent implements Agent {
 			) {
 				waiter.correlation = correlation;
 				waiter.acknowledged = true;
+				this.#bindUncertainAbortOwner(id, waiter, correlation);
+				this.#clearUncertainAbortOwner(id, record, waiter.invocationKind, correlation);
 				record.busy = record.backgroundBusy;
 				this.#advanceTerminalGeneration(record);
 				const settledOutcome =
@@ -3357,8 +3729,43 @@ export class AcpAgent implements Agent {
 					waiter,
 					publicationBarrier,
 				);
-				return;
+				return { kind: "terminal" };
 			} else {
+				if (!acknowledgedAtLookup) {
+					waiter.correlation = correlation;
+					waiter.acknowledged = true;
+					this.#bindUncertainAbortOwner(id, waiter, correlation);
+					const deferred = waiter.deferredFrames.find(({ frame }) => {
+						const candidate = receivedSdkEvent(frame)?.event;
+						if (!candidate) return false;
+						const candidateOutcome = terminalOutcome(candidate);
+						const validTerminal =
+							(candidate.type === "agent_end" && candidateOutcome !== undefined) ||
+							(candidate.type === "agent_failed" && candidateOutcome?.kind === "failed");
+						const candidateCorrelation = sdkFrameCorrelation(frame, candidate);
+						return (
+							validTerminal &&
+							sdkFrameBelongsToSession(frame, candidate, id) &&
+							candidateCorrelation !== undefined &&
+							correlationsExactlyMatch(candidateCorrelation, correlation)
+						);
+					});
+					if (deferred) {
+						waiter.deferredFrames.length = 0;
+						waiter.terminalReserved = true;
+						clearPromptWatchdog(waiter);
+						await record.frameTail;
+						if (
+							this.#sessions.get(id) !== record ||
+							record.adapter !== adapter ||
+							record.activePrompt !== waiter ||
+							waiter.settled
+						)
+							return { kind: "ownership_lost" };
+						await this.#handleSdkFrame(id, adapter, deferred.frame, record.publicationGeneration);
+						return { kind: "terminal" };
+					}
+				}
 				detail = "status has no usable retained terminal outcome and receipt";
 			}
 		} catch {
@@ -3366,15 +3773,30 @@ export class AcpAgent implements Agent {
 		} finally {
 			if (timer !== undefined) clearTimeout(timer);
 		}
-		if (!ownsRecovery()) return;
-		await this.#failSession(
-			id,
-			adapter,
-			new AcpSdkAdapterError(
-				"terminal_uncertain",
-				`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
-			),
+		if (!ownsRecovery()) return { kind: "ownership_lost" };
+		const uncertain = new AcpSdkAdapterError(
+			"terminal_uncertain",
+			`ACP prompt outcome remains uncertain: ${detail}. No mutation was replayed. Inspect turn.result for kind=${waiter.invocationKind}, clientRef=${waiter.clientRef}, commandId=${waiter.correlation.commandId ?? "unknown"}, turnId=${waiter.correlation.turnId ?? "unknown"} before submitting more work.`,
 		);
+		const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
+		if (uncertainAbortOwner?.kind === waiter.invocationKind && uncertainAbortOwner.clientRef === waiter.clientRef) {
+			record.uncertainAbortOwner = uncertainAbortOwner;
+			const ownerCorrelation = uncertainAbortOwner.correlation;
+			if (
+				ownerCorrelation &&
+				!record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, ownerCorrelation))
+			)
+				record.backgroundCorrelations.push(ownerCorrelation);
+			record.backgroundBusy = true;
+			record.busy = true;
+			record.cancelRequested = false;
+			record.statusRecovery = undefined;
+			record.statusRecoveryTask = undefined;
+			await this.#rejectPrompt(record, id, waiter, uncertain);
+			return { kind: "uncertain", error: uncertain };
+		}
+		await this.#failSession(id, adapter, uncertain);
+		return { kind: "uncertain", error: uncertain };
 	}
 
 	async #recoverSessionAfterTransportFailureAsync(
@@ -3520,7 +3942,10 @@ export class AcpAgent implements Agent {
 					.join("; ");
 				throw aggregateAcpFailure("terminal_uncertain", `ACP session cleanup is uncertain: ${detail}`, failures);
 			}
-			if (closeRemote) this.#pendingCloseIdempotencyKeys.delete(id);
+			if (closeRemote) {
+				this.#pendingCloseIdempotencyKeys.delete(id);
+				this.#uncertainAbortOwners.delete(id);
+			}
 		} finally {
 			this.#finishTeardown(id);
 		}
@@ -3693,6 +4118,7 @@ export class AcpAgent implements Agent {
 		const waiter = record.activePrompt;
 		if (!waiter || waiter.settled || waiter.terminalReserved) return;
 		const event = receivedSdkEvent(frame)?.event;
+		if (event && !sdkFrameBelongsToSession(frame, event, id)) return;
 		const correlation = watchdogCorrelationFrom(frame, event);
 		if (!waiter.acknowledged) {
 			if (hasCorrelation(correlation)) waiter.deferredActivityFrames.push(frame);
@@ -3787,6 +4213,20 @@ export class AcpAgent implements Agent {
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		const received = receivedSdkEvent(frame);
+		const ingressEvent = received?.event;
+		if (!sdkFrameBelongsToSession(frame, ingressEvent, id)) {
+			if (ingressEvent?.type === "agent_end" || ingressEvent?.type === "agent_failed")
+				logDroppedPromptTerminal(
+					id,
+					ingressEvent,
+					"session_mismatch",
+					sdkFrameCorrelation(frame, ingressEvent) ?? {},
+					record.activePrompt?.correlation,
+				);
+			else logger.warn(`ACP session ${id} dropped an event from a foreign session identity.`);
+			return;
+		}
 		if (frame.type !== "hello" && frame.type !== "server_hello" && typeof frame.connectionId === "string")
 			record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
@@ -3794,8 +4234,6 @@ export class AcpAgent implements Agent {
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
 		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
-		const received = receivedSdkEvent(frame);
-		const ingressEvent = received?.event;
 		const ingressOutcome =
 			ingressEvent?.type === "agent_end" || ingressEvent?.type === "agent_failed"
 				? terminalOutcome(ingressEvent)
@@ -3846,6 +4284,7 @@ export class AcpAgent implements Agent {
 						return;
 					}
 					if (waiter.terminalReserved) return;
+					if (record.statusRecovery === waiter && this.#ownsUncertainAbort(record, waiter)) return;
 					if (record.statusRecovery === waiter || (waiter.dispatched && !waiter.acknowledged)) {
 						await this.#failSession(
 							id,
@@ -3900,14 +4339,75 @@ export class AcpAgent implements Agent {
 		const ownsBackgroundTerminal =
 			ownedBackgroundCorrelation !== undefined ||
 			(!hasCorrelation(correlation) && record.backgroundAnonymousCount > 0);
+		const provisionalAbortOwner = this.#uncertainAbortOwners.get(id);
+		const retiredPromptAcknowledgement = this.#retiredPromptAcknowledgements.get(id);
+		const validTerminalProof =
+			(event.type === "agent_end" && outcome !== undefined) ||
+			(event.type === "agent_failed" && outcome?.kind === "failed");
+		if (isTerminal && !sdkFrameBelongsToSession(frame, event, id)) {
+			logDroppedPromptTerminal(id, event, "session_mismatch", correlation, activePrompt?.correlation);
+			return;
+		}
+		if (
+			isTerminal &&
+			!activePrompt &&
+			provisionalAbortOwner &&
+			!provisionalAbortOwner.correlation &&
+			retiredPromptAcknowledgement?.settled &&
+			retiredPromptAcknowledgement.acknowledgementPending &&
+			!retiredPromptAcknowledgement.acknowledged &&
+			provisionalAbortOwner.kind === retiredPromptAcknowledgement.invocationKind &&
+			provisionalAbortOwner.clientRef === retiredPromptAcknowledgement.clientRef &&
+			validTerminalProof &&
+			hasCompleteCorrelation(correlation) &&
+			sdkFrameBelongsToSession(frame, event, id) &&
+			!this.#hasRetiredPromptCorrelation(id, record, correlation)
+		) {
+			// Query-by-clientRef has not yet yielded the command/turn identity. Retain
+			// a bounded set of distinct candidates without publishing them until the
+			// delayed prompt acknowledgement proves which exact correlation belongs.
+			const duplicateCandidate = retiredPromptAcknowledgement.deferredFrames.some(({ frame: candidateFrame }) => {
+				const candidateEvent = receivedSdkEvent(candidateFrame)?.event;
+				const candidateCorrelation = candidateEvent
+					? sdkFrameCorrelation(candidateFrame, candidateEvent)
+					: undefined;
+				return candidateCorrelation !== undefined && correlationsExactlyMatch(candidateCorrelation, correlation);
+			});
+			if (
+				!duplicateCandidate &&
+				retiredPromptAcknowledgement.deferredFrames.length < PROVISIONAL_ABORT_TERMINAL_CANDIDATE_RETENTION
+			)
+				retiredPromptAcknowledgement.deferredFrames.push({ frame, publicationGeneration });
+			return;
+		}
 		if (isTerminal) {
 			if (!activePrompt) {
-				if (!record.backgroundBusy || !ownsBackgroundTerminal || settledCorrelation) return;
+				if (
+					!record.backgroundBusy ||
+					!ownsBackgroundTerminal ||
+					(settledCorrelation && !ownedBackgroundCorrelation)
+				)
+					return;
+				const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
+				if (
+					uncertainAbortOwner?.correlation &&
+					ownedBackgroundCorrelation &&
+					correlationsExactlyMatch(uncertainAbortOwner.correlation, ownedBackgroundCorrelation) &&
+					!validTerminalProof
+				)
+					return;
 				if (ownedBackgroundCorrelation)
 					record.backgroundCorrelations = record.backgroundCorrelations.filter(
 						owner => !correlationsExactlyMatch(owner, ownedBackgroundCorrelation),
 					);
 				else record.backgroundAnonymousCount--;
+				if (
+					uncertainAbortOwner?.correlation &&
+					ownedBackgroundCorrelation &&
+					validTerminalProof &&
+					correlationsExactlyMatch(uncertainAbortOwner.correlation, ownedBackgroundCorrelation)
+				)
+					this.#clearUncertainAbortOwner(id, record, uncertainAbortOwner.kind, ownedBackgroundCorrelation);
 				record.backgroundBusy = record.backgroundAnonymousCount > 0 || record.backgroundCorrelations.length > 0;
 				record.busy = record.backgroundBusy;
 				await this.#publishPromptPhase(id, record.adapter, undefined);
@@ -3956,6 +4456,18 @@ export class AcpAgent implements Agent {
 			this.#advanceTerminalGeneration(record);
 			publicationGeneration = record.publicationGeneration;
 			if (!outcome) {
+				const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
+				if (
+					uncertainAbortOwner?.kind === activePrompt.invocationKind &&
+					uncertainAbortOwner.correlation &&
+					correlationsExactlyMatch(uncertainAbortOwner.correlation, correlation)
+				) {
+					record.uncertainAbortOwner = uncertainAbortOwner;
+					if (!record.backgroundCorrelations.some(owner => correlationsExactlyMatch(owner, correlation)))
+						record.backgroundCorrelations.push(uncertainAbortOwner.correlation);
+					record.backgroundBusy = true;
+					record.busy = true;
+				}
 				await this.#rejectPrompt(
 					record,
 					id,
@@ -3964,6 +4476,13 @@ export class AcpAgent implements Agent {
 				);
 				return;
 			}
+			const uncertainAbortOwner = this.#uncertainAbortOwners.get(id);
+			if (
+				uncertainAbortOwner?.kind === activePrompt.invocationKind &&
+				uncertainAbortOwner.correlation &&
+				correlationsExactlyMatch(uncertainAbortOwner.correlation, correlation)
+			)
+				this.#clearUncertainAbortOwner(id, record, uncertainAbortOwner.kind, correlation);
 			// When a client cancel has been requested, a trailing stopped terminal may
 			// still carry the normal `end_turn` reason (the model finished its response as
 			// the cancel arrived mid-stream, or the cancel was processed before the prompt
@@ -4238,7 +4757,32 @@ export class AcpAgent implements Agent {
 		clearPromptWatchdog(waiter);
 		waiter.settled = true;
 		this.#fenceRetiredPromptAcknowledgement(id, waiter);
+		const abortOwner = this.#uncertainAbortOwners.get(id);
+		const preserveAbortTerminal =
+			abortOwner?.kind === waiter.invocationKind &&
+			abortOwner.clientRef === waiter.clientRef &&
+			abortOwner.correlation === undefined &&
+			waiter.acknowledgementPending &&
+			!waiter.acknowledged;
+		const candidateTerminal = preserveAbortTerminal
+			? waiter.deferredFrames.find(({ frame }) => {
+					const candidate = receivedSdkEvent(frame)?.event;
+					if (!candidate) return false;
+					const candidateOutcome = terminalOutcome(candidate);
+					const validTerminal =
+						(candidate.type === "agent_end" && candidateOutcome !== undefined) ||
+						(candidate.type === "agent_failed" && candidateOutcome?.kind === "failed");
+					const candidateCorrelation = sdkFrameCorrelation(frame, candidate);
+					return (
+						validTerminal &&
+						sdkFrameBelongsToSession(frame, candidate, id) &&
+						hasCompleteCorrelation(candidateCorrelation ?? {}) &&
+						!this.#hasRetiredPromptCorrelation(id, record, candidateCorrelation ?? {})
+					);
+				})
+			: undefined;
 		waiter.deferredFrames.length = 0;
+		if (candidateTerminal) waiter.deferredFrames.push(candidateTerminal);
 		waiter.deferredActivityFrames.length = 0;
 		waiter.terminal = undefined;
 		this.#rememberSettledPromptCorrelation(id, record, waiter.correlation);
