@@ -338,6 +338,9 @@ type SdkPromptTerminalOutcome =
 			code: "prompt_failed" | "prompt_deadline_exceeded";
 			message: string;
 			provenance: "agent_failed" | "deadline";
+		phase: "submission" | "post_start";
+		category: "provider_transport" | "provider_rejected" | "agent_runtime" | "deadline" | "unknown";
+		providerCode?: string;
 	  };
 ```
 
@@ -377,7 +380,7 @@ Correlated `agent_end` and `agent_failed` frames carry the same finalized
 `outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
 not infer terminality from stream activity or an earlier pending claim.
 
-Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
+Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. An ordinary non-terminal prompt record at restart finalizes its pending outcome and receipt state. A prompt with the explicit `deadlineRecoveryPending` marker is the exception: it remains `accepted` or `in_flight`, and its staged pending outcome is not exposed by Q26 while the SDK retains a durable recovery owner. A process restart does not recreate a missing exact-run/tool observation, so the pending outcome stays private until a real terminal event or new settlement evidence arrives. If ownership or settlement remains uncertain, the record stays nonterminal and recoverable instead of being converted into a synthetic deadline failure. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
