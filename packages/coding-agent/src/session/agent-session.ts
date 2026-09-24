@@ -16789,9 +16789,10 @@ export class AgentSession {
 		// already-ended run must not leave it for an unrelated later exit. A
 		// `resources_pending` proof is different: the run is already sealed, and
 		// the ledger still owns exact promises for the outstanding resources.
-		// Keep that sealed accounting live so a later physical settlement can
-		// remove its entries; quarantining here would freeze a stale tombstone
-		// even after every tracked tool promise completed.
+		// Keep that sealed accounting live so a later resolution of those exact
+		// tracked promises can remove its entries; this ledger proof does not
+		// establish that an OS process or remote tool stopped. Quarantining here
+		// would freeze a stale tombstone even after every tracked promise completed.
 		this.#disownedSteeringDisposition = undefined;
 		// Rearm surviving owned-completion follow-ups once the abort has
 		// settled: the aborted loop exits before polling the follow-up queue,
