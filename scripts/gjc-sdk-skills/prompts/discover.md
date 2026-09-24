@@ -68,5 +68,5 @@ before decoding UTF-8/JSON. A fragment is not executable; text help's escaped
 JSON display literals are not shell argv.
 ## Broker-bound references
 
-- [SDK session CLI](../../../docs/sdk-session-cli.md)
+- SDK session CLI: `docs/sdk-session-cli.md` in the gajae-code repository
 - Canonical templates: `gjc-sdk-author/templates/direct-sdk.ts` and `direct-sdk.py`
