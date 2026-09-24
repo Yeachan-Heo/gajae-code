@@ -377,11 +377,17 @@ describe("picker star persistence", () => {
 		expect(await Bun.file(file).text()).toBe(before + competingPatch);
 	});
 
-	it("supports project-local candidates without managed-directory migration", async () => {
+	it("requires explicit directory authority for project-local transcript candidates", async () => {
 		const projectDir = path.join(cwd, ".gjc", "sessions");
 		await fs.mkdir(projectDir, { recursive: true });
 		const { candidate, file } = await fixture({ dir: projectDir, capable: false });
-		await SessionManager.setSessionStarredForPicker(candidate, true);
+		await expect(SessionManager.setSessionStarredForPicker(candidate, true)).rejects.toThrow(
+			"authorized managed candidate",
+		);
+		expect(await starred(file)).toBe(false);
+
+		// An explicitly configured session directory remains an authorized path.
+		await SessionManager.setSessionStarredForPicker(candidate, true, projectDir);
 		expect(await starred(file)).toBe(true);
 		expect(await Bun.file(path.join(root, "sessions")).exists()).toBe(false);
 	});

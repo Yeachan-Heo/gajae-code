@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -2855,6 +2855,104 @@ describe("deep-interview crystallize contract", () => {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
 			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses one opened descriptor for managed transcript discovery instead of reopening a replaceable path", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-transcript-reopen-"));
+		const sessionId = "crystallize-transcript-reopen";
+		const sessionFile = managedSessionPath(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		const authorizedText = `${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+			type: "message",
+			message: { role: "user", content: "Authorized transcript content" },
+		})}\n`;
+		const attackerText = `${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+			type: "message",
+			message: { role: "user", content: "Attacker-controlled transcript content" },
+		})}\n`;
+		try {
+			await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+			await fs.writeFile(sessionFile, authorizedText);
+			delete process.env.GJC_SESSION_FILE;
+			const realOpen = fs.open.bind(fs);
+			let candidateOpens = 0;
+			const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+				if (path.resolve(String(target)) === path.resolve(sessionFile)) {
+					candidateOpens++;
+					if (candidateOpens === 2) {
+						await fs.rename(sessionFile, `${sessionFile}.authorized`);
+						await fs.writeFile(sessionFile, attackerText);
+					}
+				}
+				return realOpen(target, flags, mode);
+			});
+			try {
+				const snapshot = await authoritativeConversationSnapshot(root, sessionId);
+				expect(candidateOpens).toBe(1);
+				expect(snapshot.messages).toEqual([{ index: 0, role: "user", content: "Authorized transcript content" }]);
+				expect(snapshot.messages.some(message => message.content.includes("Attacker-controlled"))).toBe(false);
+			} finally {
+				openSpy.mockRestore();
+			}
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects file replacement and parent redirection after managed transcript inventory", async () => {
+		for (const attack of ["file-replacement", "parent-redirection"] as const) {
+			const root = await fs.mkdtemp(path.join(process.cwd(), `.tmp-crystallize-transcript-${attack}-`));
+			const sessionId = `crystallize-transcript-${attack}`;
+			const sessionFile = managedSessionPath(root, "conversation.jsonl");
+			const sessionDirectory = path.dirname(sessionFile);
+			const attackerDirectory = path.join(path.dirname(sessionDirectory), `attacker-${attack}`);
+			const movedDirectory = `${sessionDirectory}.authorized`;
+			const previousSessionFile = process.env.GJC_SESSION_FILE;
+			const authorizedText = `${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+				type: "message",
+				message: { role: "user", content: "Authorized transcript content" },
+			})}\n`;
+			const attackerText = `${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+				type: "message",
+				message: { role: "user", content: "Attacker-controlled transcript content" },
+			})}\n`;
+			try {
+				await fs.mkdir(sessionDirectory, { recursive: true });
+				await fs.mkdir(attackerDirectory, { recursive: true });
+				await fs.writeFile(sessionFile, authorizedText);
+				await fs.writeFile(path.join(attackerDirectory, path.basename(sessionFile)), attackerText);
+				process.env.GJC_SESSION_FILE = sessionFile;
+				const realOpen = fs.open.bind(fs);
+				let replaced = false;
+				const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+					if (!replaced && path.resolve(String(target)) === path.resolve(sessionFile)) {
+						replaced = true;
+						if (attack === "file-replacement") {
+							await fs.rename(sessionFile, `${sessionFile}.authorized`);
+							await fs.writeFile(sessionFile, attackerText);
+						} else {
+							await fs.rename(sessionDirectory, movedDirectory);
+							await fs.symlink(attackerDirectory, sessionDirectory, "dir");
+						}
+					}
+					return realOpen(target, flags, mode);
+				});
+				try {
+					await expect(authoritativeConversationSnapshot(root, sessionId)).rejects.toThrow(
+						/changed after authorization/,
+					);
+					expect(replaced).toBe(true);
+				} finally {
+					openSpy.mockRestore();
+				}
+			} finally {
+				if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+				else process.env.GJC_SESSION_FILE = previousSessionFile;
+				await fs.rm(root, { recursive: true, force: true });
+			}
 		}
 	});
 
