@@ -536,7 +536,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(testCase.errorMessage);
 			expect(last.content).toEqual([{ type: "text", text: testCase.partialContent }]);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -661,7 +661,7 @@ describe.serial("AgentSession resilient retry", () => {
 			const last = lastAssistant(session);
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(refusal);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -703,7 +703,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 			expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
 			expect(lastAssistant(session).stopReason).toBe("stop");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	}, 30_000);
@@ -857,7 +857,7 @@ describe.serial("AgentSession resilient retry", () => {
 			"HTTP 400: request timed out during validation",
 		] as const) {
 			if (session) {
-				await session.dispose();
+				await disposeAfterCoordinatorPersistence(session);
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: errorMessage }] });
@@ -927,7 +927,7 @@ describe.serial("AgentSession resilient retry", () => {
 			[503, "HTTP 503 service unavailable"],
 		] as const) {
 			if (session) {
-				await session.dispose();
+				await disposeAfterCoordinatorPersistence(session);
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: message }, { content: [`recovered ${status}`] }] });
@@ -1344,7 +1344,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -1416,7 +1416,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -1437,7 +1437,8 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(progressEvents.retryStartEvents).toHaveLength(0);
 		expect(progressModels).toHaveLength(1);
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
 
 		const disabledModels: string[] = [];
 		session = buildStatusErrorSession({
@@ -1828,7 +1829,7 @@ describe.serial("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(progressModels).toHaveLength(1);
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 
 		const disabledModels: string[] = [];
