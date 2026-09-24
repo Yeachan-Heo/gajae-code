@@ -259,6 +259,9 @@ describe("SDK operation inventory", () => {
 				"agent_session:estimateMidRunContextTokensForTests",
 				"agent_session:activeMidRunBarrierCountForTests",
 				"agent_session:activeMidRunMaintenanceCountForTests",
+				"agent_session:trackCoordinatorRuntimeStatePersistenceFailuresForTests",
+				"agent_session:setCoordinatorRuntimeStateFileForTests",
+				"agent_session:getCoordinatorRuntimeStateFileForTests",
 			]),
 		);
 		expect(pendingReviewErrors(sourceIds.map(sourceId => ({ sourceId })))).toEqual([]);
