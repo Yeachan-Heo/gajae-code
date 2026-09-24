@@ -288,8 +288,10 @@ async function runManagedFallbackQuotaScenario(options: {
 	quotaKeys: readonly string[];
 	maxAttempts?: number;
 	providerRetryMaxAttempts?: number;
+	failFirstProviderDispatch?: boolean;
 	trigger?: "quota" | "rate_limit";
 	preblockedAccounts?: readonly string[];
+	storedApiKeys?: readonly string[];
 	runtimeApiKey?: string;
 	addApiKeyDuringMark?: string;
 	predecessorModel?: Model;
@@ -336,6 +338,7 @@ async function runManagedFallbackQuotaScenario(options: {
 				expires: Date.now() + 3_600_000,
 				accountId,
 			})),
+			...(options.storedApiKeys ?? []).map(key => ({ type: "api_key" as const, key })),
 		]);
 		for (const accountId of options.preblockedAccounts ?? []) {
 			const preblockedSessionId = `preblocked-${accountId}`;
@@ -351,7 +354,8 @@ async function runManagedFallbackQuotaScenario(options: {
 			if (markResult.remainingCredentialIds.length === 0)
 				throw new Error(`Could not preblock ${accountId} OAuth row`);
 		}
-		storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
+		if (options.accounts.length > 0)
+			storage.setRuntimePreferredCredentialSelector(provider, { kind: "account", value: "a" });
 		if (options.runtimeApiKey !== undefined) storage.setRuntimeApiKey(provider, options.runtimeApiKey);
 		storage.setRuntimeApiKey("openai", "fallback-test-key");
 		const registry = new ModelRegistry(storage, path.join(root, "models.yml"));
@@ -364,6 +368,7 @@ async function runManagedFallbackQuotaScenario(options: {
 		const calls: Array<{ model: string; key: string }> = [];
 		const quotaKeys = new Set(options.quotaKeys);
 		const success = createMockModel({ responses: [{ content: ["accepted"] }] });
+		let firstProviderDispatchQuotaInjected = false;
 		const agent = new Agent({
 			initialState: { model: initialModel, systemPrompt: ["Synthetic test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
@@ -374,6 +379,14 @@ async function runManagedFallbackQuotaScenario(options: {
 			streamFn: (requestedModel, context, streamOptions) => {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
+				if (
+					requestedModel.provider === provider &&
+					options.failFirstProviderDispatch &&
+					!firstProviderDispatchQuotaInjected
+				) {
+					quotaKeys.add(key);
+					firstProviderDispatchQuotaInjected = true;
+				}
 				if (requestedModel.provider === provider && quotaKeys.has(key)) {
 					if (options.unknownRowIdBeforeMark && !unknownRowIdInjected) {
 						const rowIdSpy = vi.spyOn(storage, "getSessionCredentialRowId").mockReturnValueOnce(undefined);
@@ -469,6 +482,21 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "TOKEN-b"],
 			markCount: 1,
 		});
+	});
+
+	test("rotates through API-key rows as the same credential kind", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!model) throw new Error("Missing bundled Codex fixture model");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: [],
+			quotaKeys: [],
+			storedApiKeys: ["stored-codex-key-a", "stored-codex-key-b"],
+			failFirstProviderDispatch: true,
+		});
+		expect(result.models).toEqual([selector(model), selector(model)]);
+		expect(result.keys).toHaveLength(2);
+		expect(new Set(result.keys).size).toBe(2);
+		expect(result.markCount).toBe(1);
 	});
 
 	test("retries managed fallback when row identity is unknown but a peer remains", async () => {
