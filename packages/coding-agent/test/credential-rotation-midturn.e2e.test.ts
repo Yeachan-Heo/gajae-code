@@ -26,6 +26,7 @@ function usageLimitStream(
 	model: Model,
 	trigger: "quota" | "rate_limit" | "credential",
 	retryMaxAttempts?: number,
+	retryAfterMs?: number,
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	const message: AssistantMessage = {
@@ -55,6 +56,7 @@ function usageLimitStream(
 				? {
 						kind: "transport",
 						providerCode: "usage_limit_reached",
+						...(retryAfterMs === undefined ? {} : { headers: { "retry-after-ms": String(retryAfterMs) } }),
 						...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
 					}
 				: trigger === "credential"
@@ -70,10 +72,13 @@ function usageLimitStream(
 							kind: "transport",
 							status: 429,
 							providerCode: "rate_limit_exceeded",
+							...(retryAfterMs === undefined ? {} : { headers: { "retry-after-ms": String(retryAfterMs) } }),
 							...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
 						},
 	};
-	expect(classifyFallbackTrigger(message.transportFailure).class).toBe(trigger);
+	const classifiedTrigger = classifyFallbackTrigger(message.transportFailure);
+	expect(classifiedTrigger.class).toBe(trigger);
+	if (retryAfterMs !== undefined) expect(classifiedTrigger.retryAfterMs).toBe(retryAfterMs);
 	queueMicrotask(() => {
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
@@ -289,6 +294,8 @@ async function runManagedFallbackQuotaScenario(options: {
 	quotaKeys: readonly string[];
 	maxAttempts?: number;
 	providerRetryMaxAttempts?: number;
+	retryAfterMs?: number;
+	dispatchGuardLimit?: number;
 	failFirstProviderDispatch?: boolean;
 	trigger?: "quota" | "rate_limit" | "credential";
 	preblockedAccounts?: readonly string[];
@@ -300,7 +307,13 @@ async function runManagedFallbackQuotaScenario(options: {
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
 	unresolvablePeerDuringMark?: boolean;
-}): Promise<{ models: string[]; keys: string[]; markCount: number; activeIndex?: number }> {
+}): Promise<{
+	models: string[];
+	keys: string[];
+	markCount: number;
+	activeIndex?: number;
+	dispatchGuardExceeded?: boolean;
+}> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fallback-quota-"));
 	let session: AgentSession | undefined;
 	const usageProvider: UsageProvider = {
@@ -384,6 +397,8 @@ async function runManagedFallbackQuotaScenario(options: {
 		const quotaKeys = new Set(options.quotaKeys);
 		const success = createMockModel({ responses: [{ content: ["accepted"] }] });
 		let firstProviderDispatchQuotaInjected = false;
+		let providerDispatchCount = 0;
+		let dispatchGuardExceeded = false;
 		const agent = new Agent({
 			initialState: { model: initialModel, systemPrompt: ["Synthetic test"], tools: [], messages: [] },
 			convertToLlm: identityConverter,
@@ -394,6 +409,13 @@ async function runManagedFallbackQuotaScenario(options: {
 			streamFn: (requestedModel, context, streamOptions) => {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
+				if (requestedModel.provider === provider) {
+					providerDispatchCount++;
+					if (options.dispatchGuardLimit !== undefined && providerDispatchCount > options.dispatchGuardLimit) {
+						dispatchGuardExceeded = true;
+						return success.stream(requestedModel, context, streamOptions);
+					}
+				}
 				if (
 					requestedModel.provider === provider &&
 					options.failFirstProviderDispatch &&
@@ -408,7 +430,12 @@ async function runManagedFallbackQuotaScenario(options: {
 						restoreUnknownRowId = () => rowIdSpy.mockRestore();
 						unknownRowIdInjected = true;
 					}
-					return usageLimitStream(requestedModel, options.trigger ?? "quota", options.providerRetryMaxAttempts);
+					return usageLimitStream(
+						requestedModel,
+						options.trigger ?? "quota",
+						options.providerRetryMaxAttempts,
+						options.retryAfterMs,
+					);
 				}
 				return success.stream(requestedModel, context, streamOptions);
 			},
@@ -471,6 +498,7 @@ async function runManagedFallbackQuotaScenario(options: {
 			models: calls.map(call => call.model),
 			keys: calls.map(call => call.key),
 			markCount: markUsageLimitReached.mock.calls.length,
+			...(options.dispatchGuardLimit === undefined ? {} : { dispatchGuardExceeded }),
 			...(options.predecessorModel
 				? { activeIndex: session.getDefaultFallbackRuntimeState().controller.activeIndex }
 				: {}),
@@ -650,6 +678,28 @@ describe("managed fallback quota credential rotation", () => {
 			markCount: 2,
 		});
 	});
+
+	for (const trigger of ["quota", "rate_limit"] as const) {
+		test(`does not revisit same-kind credentials after zero Retry-After ${trigger} failures`, async () => {
+			const model = getBundledModel(provider, "gpt-5.1-codex");
+			const fallback = getBundledModel("openai", "gpt-4o-mini");
+			if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+			const result = await runManagedFallbackQuotaScenario({
+				accounts: ["a", "b", "c"],
+				quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+				trigger,
+				retryAfterMs: 0,
+				dispatchGuardLimit: 6,
+			});
+			expect(result.dispatchGuardExceeded).toBe(false);
+			expect(result.models).toEqual([selector(model), selector(model), selector(model), selector(fallback)]);
+			expect(result.keys[0]).toBe("TOKEN-a");
+			expect(result.keys.slice(0, 3).sort()).toEqual(["TOKEN-a", "TOKEN-b", "TOKEN-c"]);
+			expect(new Set(result.keys.slice(0, 3)).size).toBe(3);
+			expect(result.keys.at(-1)).toBe("fallback-test-key");
+			expect(result.markCount).toBe(3);
+		});
+	}
 
 	test("tries every Codex credential even when the credential pool exceeds the model retry budget", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
