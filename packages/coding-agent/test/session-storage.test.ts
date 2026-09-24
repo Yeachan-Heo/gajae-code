@@ -5,6 +5,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	captureManagedFileNoFollow,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
@@ -339,6 +340,54 @@ describe("native publish outcome classification", () => {
 				},
 			}).reason,
 		).toBe("unknown");
+	});
+});
+
+describe.skipIf(process.platform !== "linux")("managed recovery authority warnings", () => {
+	it("warns about an unavailable recovery directory before child retention throws", () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-reaper-warning-"));
+		const root = managedDirectoryRoot(tempDir);
+		const rootAuthority = native.openRecoveryFsRoot(root.canonicalPath);
+		const events: string[] = [];
+		const metrics = {
+			ok: false,
+			code: "recovery_directory_unavailable",
+			scannedEntries: "0",
+			reapedFiles: "0",
+			reapedBytes: "0",
+			preservedEntries: "0",
+			failures: "0",
+			scanLimited: false,
+			totalReapedFiles: "0",
+			totalReapedBytes: "0",
+			totalFailures: "0",
+		} satisfies native.RecoveryFsReaperMetrics;
+		const openSpy = vi.spyOn(native, "openRecoveryFsRoot").mockReturnValue(rootAuthority);
+		const metricsSpy = vi.spyOn(rootAuthority, "recoveryReaperMetrics").mockImplementation(() => {
+			events.push("metrics");
+			return metrics;
+		});
+		const retainSpy = vi.spyOn(rootAuthority, "retainManagedDirectory").mockImplementation(() => {
+			events.push("retain");
+			throw new Error("unsafe recovery directory");
+		});
+		const warningSpy = vi.spyOn(logger, "warn").mockImplementation(message => {
+			if (message === "Managed recovery sidecar reaping") events.push("warn");
+		});
+		try {
+			expect(() => retainManagedDirectoryAuthority(root, tempDir)).toThrow("unsafe recovery directory");
+			expect(events).toEqual(["metrics", "warn", "retain"]);
+			expect(warningSpy).toHaveBeenCalledWith(
+				"Managed recovery sidecar reaping",
+				expect.objectContaining({ ok: false, code: "recovery_directory_unavailable" }),
+			);
+			expect(openSpy).toHaveBeenCalledTimes(1);
+			expect(metricsSpy).toHaveBeenCalledTimes(1);
+			expect(retainSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.restoreAllMocks();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });
 

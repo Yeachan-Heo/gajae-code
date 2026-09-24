@@ -442,6 +442,12 @@ export declare class RecoveryFsRoot {
   /** Return the stable identity of the retained root descriptor. */
   identity(): RecoveryFsResult
   /**
+   * Return the latest bounded managed-recovery sweep metrics and lifetime
+   * removal counters. The per-root sweep remains throttled to once per
+   * minute.
+   */
+  recoveryReaperMetrics(): RecoveryFsReaperMetrics
+  /**
    * Derive a retained child-directory capability from this root and exact
    * identity evidence.
    */
@@ -2325,6 +2331,24 @@ export interface RecoveryFsPublishSyncFailure {
   parentRole: string
   osCode?: number
   kind: string
+}
+
+/**
+ * Bounded managed-recovery reaper counters. Large counters are decimal strings
+ * so JavaScript callers do not lose precision above `Number.MAX_SAFE_INTEGER`.
+ */
+export interface RecoveryFsReaperMetrics {
+  ok: boolean
+  code?: string
+  scannedEntries: string
+  reapedFiles: string
+  reapedBytes: string
+  preservedEntries: string
+  failures: string
+  scanLimited: boolean
+  totalReapedFiles: string
+  totalReapedBytes: string
+  totalFailures: string
 }
 
 export interface RecoveryFsResult {
