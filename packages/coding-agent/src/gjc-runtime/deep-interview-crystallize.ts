@@ -611,8 +611,14 @@ function isUnsafeConfirmedStatement(profile: CrystalSemanticProfile): boolean {
 function isContextFreeAcknowledgement(value: string): boolean {
 	const normalized = value
 		.normalize("NFC")
+		.replace(/[’']/gu, "")
 		.replace(/[\p{P}\s]+/gu, " ")
-		.trim();
+		.trim()
+		.replace(/\bthats\b/giu, "that is");
+	const affirmativeContext =
+		/^(?:yes|yep|yeah|yup|sure|okay|ok|absolutely|certainly|definitely|of course) (?:that (?:is|was) )?(?:exactly )?(?:correct|right|true|accurate|what i mean|what i meant)$/iu.test(
+			normalized,
+		);
 	const agreementOnly =
 		/^(?:(?:i|we|you|they|he|she)\s+)?(?:do\s+)?(?:(?:fully|completely|totally|strongly|absolutely|certainly|definitely)\s+)?agree(?:d)?(?:\s+(?:fully|completely|totally|strongly|absolutely|certainly|definitely))?$/iu.test(
 			normalized,
@@ -622,6 +628,7 @@ function isContextFreeAcknowledgement(value: string): boolean {
 		);
 	return (
 		agreementOnly ||
+		affirmativeContext ||
 		/^(?:yes|no|yep|yeah|yup|sure|okay|ok|affirmative|true|false|correct|incorrect|agreed|absolutely|done|finished|confirmed|confirm|acknowledged|understood|got\s+it|sounds\s+good|looks\s+good|great|fine|thanks|thank\s+you|네|예|맞아|맞습니다|是|对|對|はい|ええ)$/iu.test(
 			normalized,
 		) ||
