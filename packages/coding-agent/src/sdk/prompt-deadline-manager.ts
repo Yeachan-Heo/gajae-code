@@ -560,6 +560,7 @@ export class PromptDeadlineManager {
 						leaseMs: Math.max(1, lease.leaseMs),
 						maxMs: Math.max(lease.maxMs - (this.#now() - lease.acceptedAt), 1),
 					});
+					this.#uncertaintyRecoveryPending.add(key);
 					this.#leases.set(key, reanchored);
 					this.#expiring.delete(key);
 					this.#expiryRetries.delete(key);
@@ -617,6 +618,21 @@ export class PromptDeadlineManager {
 		this.#uncertaintyRetries.delete(key);
 		this.#uncertaintyRecoveryPending.delete(key);
 		this.#schedule(key);
+	}
+
+	/** A new exact agent_start retires an uncertainty-only fence, never captured terminal intent. */
+	onRunStarted(correlation: InvocationCorrelation): void {
+		const key = leaseKey(correlation);
+		this.onAccepted(correlation);
+		if (
+			this.#uncertaintyRecoveryPending.has(key) &&
+			!this.#pendingTerminalTransitions.has(key) &&
+			!this.#deadlineDeferredTerminalTransitions.has(key)
+		) {
+			this.#uncertaintyRecoveryPending.delete(key);
+			this.#uncertaintyRetries.delete(key);
+			this.#schedule(key);
+		}
 	}
 
 	/** Re-arm a durable uncertainty-recovery record after process startup without
@@ -752,7 +768,9 @@ export class PromptDeadlineManager {
 	/** Whether a deadline has captured exact active-run terminal evidence for this prompt. */
 	shouldDeferTerminalTransition(correlation: InvocationCorrelation): boolean {
 		const key = leaseKey(correlation);
-		return this.#expiring.has(key) && this.#deadlineStartCleanup.has(key);
+		return (
+			this.#uncertaintyRecoveryPending.has(key) || (this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
+		);
 	}
 
 	/** Whether bounded uncertainty writes exhausted with recovery ownership retained. */

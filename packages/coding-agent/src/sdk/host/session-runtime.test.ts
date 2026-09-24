@@ -6242,14 +6242,18 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("an unprovable prompt deadline waits for the real terminal boundary", async () => {
-		// If an active run cannot be tied to the expiring correlation, the deadline
-		// must preserve uncertainty rather than publish a synthetic failure. A real
-		// agent_end still supplies the sole correlated terminal boundary.
+	test("an unproven real end stays private until exact settlement evidence exists", async () => {
+		// A matching lifecycle end still cannot settle a recovered deadline record
+		// when the exact run/tool observation is unavailable.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-unprovable-"));
+		const sessionId = "deadline-unprovable";
+		const sessionFile = path.join(cwd, "session.json");
+		await Bun.write(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId });
 		let abortCalls = 0;
+		let harness: InvocationHarness | undefined;
 		try {
-			const harness = await invocationHarness("deadline-unprovable", cwd, {
+			harness = await invocationHarness(sessionId, cwd, {
 				settings: {
 					get: (key: string) =>
 						key === "sdk.promptDeadlineMs" ? 100 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
@@ -6259,6 +6263,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					await neverSettlingPromise();
 				},
 				terminalAbortSeams: {
+					getReconciliationStore: () => store,
 					getTerminalTurnEpoch: () => 17,
 					getActivePromptHandle: () => "unobservable-tool-run",
 					abortPromptAndWaitWithTerminal: async () => {
@@ -6282,13 +6287,24 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
 			await harness.emit("agent_end", { stopReason: "cancelled" });
-			const settled = await settledStatus(harness, "turn.prompt_status", correlation);
-			expect(settled).toMatchObject({ status: "failed", error: { code: "provider_unavailable" } });
-			await Bun.sleep(25);
-			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			await Bun.sleep(100);
+			expect(await harness.query("turn.prompt_status", correlation)).toMatchObject({
+				result: { status: "in_flight" },
+			});
+			expect((await harness.query("turn.prompt_status", correlation)).result).not.toHaveProperty("outcome");
+			expect((await harness.query("turn.prompt_status", correlation)).result).not.toHaveProperty("pendingOutcome");
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			const durable = store.snapshot().find(record => record.commandId === correlation.commandId) as
+				| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown; deadlineRecoveryPending?: boolean })
+				| undefined;
+			expect(durable).toMatchObject({
+				status: "in_flight",
+				deadlineRecoveryPending: true,
+				pendingOutcome: { kind: "failed", providerCode: "provider_unavailable" },
+			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
-			await harness.stop();
 		} finally {
+			await harness?.stop();
 			await Bun.sleep(10);
 			await rm(cwd, { recursive: true, force: true });
 		}
