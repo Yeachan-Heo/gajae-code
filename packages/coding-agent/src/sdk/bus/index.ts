@@ -1241,7 +1241,7 @@ interface SessionRuntime {
 	retireJoinedPromptOwners: () => void;
 	imageUploads: PromptImageUploadStore;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
-	releaseAcceptedImagesForRun: (handle: string) => void;
+	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -4936,19 +4936,19 @@ export function createNotificationsExtension(
 			return incarnation !== undefined && !incarnation.closed;
 		});
 		const acceptedImages = new Map<string, () => void>();
-		const acceptedImageRunHandles = new Map<string, string>();
+		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext>();
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
 			acceptedImages.get(key)?.();
 			acceptedImages.delete(key);
-			acceptedImageRunHandles.delete(key);
+			acceptedImageRunOwners.delete(key);
 		};
-		const releaseAcceptedImagesForRun = (handle: string) => {
-			for (const [key, owner] of acceptedImageRunHandles) {
-				if (owner !== handle) continue;
+		const releaseAcceptedImagesForRun = (terminalOwner: AgentTerminalOwnerContext) => {
+			for (const [key, owner] of acceptedImageRunOwners) {
+				if (owner.resourceRunId !== terminalOwner.resourceRunId || owner.domain !== terminalOwner.domain) continue;
 				acceptedImages.get(key)?.();
 				acceptedImages.delete(key);
-				acceptedImageRunHandles.delete(key);
+				acceptedImageRunOwners.delete(key);
 			}
 		};
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
@@ -6263,14 +6263,17 @@ export function createNotificationsExtension(
 				}
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
-				if (handle && acceptedImages.has(key)) acceptedImageRunHandles.set(key, handle);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain && acceptedImages.has(key))
+					acceptedImageRunOwners.set(key, { resourceRunId: handle, domain });
 			}
 		};
 		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
 			// A follow-up's private token can only be adopted by its exact future run.
-			// Implicit steering has no such future-run authority and must leave pending.
-			if (!submission?.sdkRunToken) removePendingPromptCorrelation(correlation);
+			// Implicit steering and image admissions must leave the active run's pending queue.
+			if (!submission?.sdkRunToken || acceptedImages.has(key)) removePendingPromptCorrelation(correlation);
 			if (!submission || submission.terminal) return;
 			submission.deadlineSuspended = true;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
@@ -8241,7 +8244,7 @@ export function createNotificationsExtension(
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
-				acceptedImageRunHandles.clear();
+				acceptedImageRunOwners.clear();
 			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
@@ -10162,7 +10165,7 @@ export function createNotificationsExtension(
 		// The Agent's terminal owner is independent of delivery correlation. Never
 		// borrow a successor's run handle to settle a predecessor's SDK prompts.
 		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
-		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner.resourceRunId);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner);
 		const rootCorrelation = rt.activePromptCorrelation;
 		const correlations = terminalOwner ? rt.getJoinedPromptCorrelations(terminalOwner) : [];
 		if (
