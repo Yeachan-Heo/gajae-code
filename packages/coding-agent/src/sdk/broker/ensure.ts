@@ -81,6 +81,21 @@ const SPAWN_LOCK_WAIT_MS = STALE_BROKER_RETIREMENT_TIMEOUT_MS + DISCOVERY_TIMEOU
 const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
+const BROKER_SESSION_ENV_NAMES = new Set([
+	"GJC_SESSION_ID",
+	"GJC_SESSION_CWD",
+	"GJC_TMUX_SESSION",
+	"GJC_TMUX_ACTIVE_SESSION",
+	"GJC_TMUX_LAUNCHED",
+	"TMUX",
+	"TMUX_PANE",
+]);
+const BROKER_SESSION_ENV_PREFIXES = [
+	"GJC_COORDINATOR_SESSION_",
+	"GJC_COORDINATOR_SIDECAR_",
+	"GJC_TMUX_OWNER_",
+	"GJC_MANAGED_OWNER_",
+] as const;
 
 export interface BrokerStartupLockTestHooks {
 	onAcquired?: () => void;
@@ -462,6 +477,14 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 	// it and pass it on to every substrate child it later launches, so it is
 	// stripped at the lifecycle boundary exactly as lifecycle children strip it.
 	delete environment.GJC_MASTER_CAPABILITY;
+	// The broker outlives the TUI session that happened to start it. Never let
+	// that session's identity or coordinator/tmux ownership markers flow through
+	// the broker's process.env into unrelated session hosts. Keep user tmux
+	// configuration (for example GJC_TMUX_COMMAND and GJC_TMUX_PROFILE) intact.
+	for (const name of Object.keys(environment)) {
+		if (BROKER_SESSION_ENV_NAMES.has(name) || BROKER_SESSION_ENV_PREFIXES.some(prefix => name.startsWith(prefix)))
+			delete environment[name];
+	}
 	if (command.kind === "bun-source") {
 		delete environment.PI_COMPILED;
 		delete environment.GJC_COMPILED;

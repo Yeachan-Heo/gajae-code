@@ -711,13 +711,18 @@ export class LifecycleLedger {
 		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
 	}
 	/**
-	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * Live or uncertain legacy rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
-	 * must reject rather than create a second admission.
+	 * must reject rather than create a second admission. Successful and failed
+	 * terminal rows have no outstanding effect and do not fence unrelated work.
 	 */
 	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>): boolean {
 		return [...this.#byIdentity.values()].some(
-			entry => entry.operationKey === undefined && !excludedIdentities?.has(entry.identity),
+			entry =>
+				entry.operationKey === undefined &&
+				entry.state !== "terminal_ok" &&
+				entry.state !== "terminal_error" &&
+				!excludedIdentities?.has(entry.identity),
 		);
 	}
 	async migrateIdentity(
