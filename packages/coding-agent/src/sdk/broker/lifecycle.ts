@@ -1782,6 +1782,9 @@ export async function writeSessionLifecycleReady(
 	const native = nativeLifecycle();
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const parent = lifecycleParentIdentity(directory);
+	if (!parent) throw new Error("Lifecycle readiness directory identity is unavailable.");
+	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
 	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
 	const readyPath = lifecycleReadyPath(root, id);
 	let handle: fs.FileHandle | undefined;
