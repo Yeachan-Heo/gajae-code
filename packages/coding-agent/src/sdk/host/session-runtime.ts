@@ -5099,7 +5099,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					const preserveDeadlineRecovery =
 						type === "agent_start" &&
 						invocation.kind === "prompt" &&
-						current.deadlineManager.isExpiring(invocation.correlation);
+						current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation);
 					const invocationTerminalOutcome = terminalOutcome;
 					if (type === "agent_end" && invocation.kind === "prompt")
 						current.deadlineManager.noteTerminalTransition(

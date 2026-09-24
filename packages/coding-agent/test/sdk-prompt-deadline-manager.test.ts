@@ -262,6 +262,28 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
+	test("a recovered run start keeps a captured terminal intent deferred", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-recovered-terminal", turnId: "turn-recovered-terminal" };
+		const acceptedAt = Date.now();
+		manager.recoverPending(correlation, acceptedAt, acceptedAt + 60_000);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			true,
+		);
+		manager.onRunStarted(correlation);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
 	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.noteTransitionFailures = 1;
