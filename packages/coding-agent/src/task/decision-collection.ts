@@ -387,12 +387,41 @@ function retentionPolicy(options?: TaskDecisionStoreOptions): RetentionPolicy {
 /**
  * Trim the store to the retention policy. Runs inside the append transaction so
  * the file can never grow past the bound between a write and a later sweep.
+ *
+ * Retention works on whole decisions, never on individual rows. A half-pruned
+ * decision is worse than no decision: an export would show a `model` or
+ * `outcome` with no `begin` to say what was asked, and a late observation whose
+ * `begin` was pruned away is silently refused.
+ *
+ * Only a decision that has already recorded its outcome is a candidate. One
+ * still being written — by this call or by a concurrent task — would otherwise
+ * lose its `begin` and then append `model`/`outcome` rows that no longer belong
+ * to anything.
  */
-function pruneEvents(db: Database, policy: RetentionPolicy): void {
-	db.prepare("DELETE FROM events WHERE created_at_ms < ?").run(Date.now() - policy.retentionDays * DAY_MS);
-	db.prepare("DELETE FROM events WHERE rowid NOT IN (SELECT rowid FROM events ORDER BY rowid DESC LIMIT ?)").run(
-		policy.maxEvents,
-	);
+function pruneEvents(db: Database, policy: RetentionPolicy, currentDecisionId: string): void {
+	const retirable = `SELECT decision_id, COUNT(*) AS events, MAX(rowid) AS last_row, MAX(created_at_ms) AS last_seen,
+			MAX(event_type = 'outcome') AS finished
+		FROM events GROUP BY decision_id`;
+	// Age out a decision only once its whole group is older than the window.
+	db.prepare(
+		`DELETE FROM events WHERE decision_id IN (
+			SELECT decision_id FROM (${retirable})
+			WHERE finished = 1 AND decision_id <> ? AND last_seen < ?
+		)`,
+	).run(currentDecisionId, Date.now() - policy.retentionDays * DAY_MS);
+	// Then drop whole groups, least-recently-active first, until the total fits.
+	// The running total covers every group, so the bound is on the whole store,
+	// but only finished groups other than the current one may actually go.
+	db.prepare(
+		`DELETE FROM events WHERE decision_id IN (
+			SELECT decision_id FROM (
+				SELECT decision_id, finished,
+					SUM(events) OVER (ORDER BY last_row DESC ROWS UNBOUNDED PRECEDING) AS cumulative
+				FROM (${retirable})
+			)
+			WHERE cumulative > ? AND finished = 1 AND decision_id <> ?
+		)`,
+	).run(policy.maxEvents, currentDecisionId);
 }
 
 function appendEvent(
@@ -419,7 +448,7 @@ function appendEvent(
 		db.prepare(
 			"INSERT INTO events(event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		).run(randomUUID(), decisionId, installationId, sequence, eventType, mode, Date.now(), JSON.stringify(validated));
-		pruneEvents(db, policy);
+		pruneEvents(db, policy, decisionId);
 		db.run("COMMIT");
 	} catch (error) {
 		db.run("ROLLBACK");
@@ -540,7 +569,7 @@ export async function beginTaskDecision(
 								Date.now(),
 								JSON.stringify(payload),
 							);
-						pruneEvents(separate.db, policy);
+						pruneEvents(separate.db, policy, decisionId);
 						separate.db.run("COMMIT");
 					} catch (error) {
 						try {
@@ -617,8 +646,16 @@ export async function* streamTaskDecisionEvents(
 	}
 	const pageSize = boundedInt(options?.pageSize, DEFAULT_EXPORT_PAGE, 1, MAX_EXPORT_PAGE);
 	const db = new Database(file, { readonly: true, strict: true });
+	// One read transaction spans every page. A rowid cursor alone would not make
+	// the export consistent: retention deletes whole decisions between pages, so
+	// without a snapshot a reader could emit a `begin` and then never reach the
+	// matching `outcome`. The first SELECT establishes the snapshot; everything
+	// after it sees the store as it was then.
+	let snapshot = false;
 	try {
 		db.run(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+		db.run("BEGIN");
+		snapshot = true;
 		const version = db.prepare("SELECT value FROM collection_meta WHERE key = 'schema_version'").get() as
 			| { value?: string }
 			| undefined;
@@ -626,8 +663,6 @@ export async function* streamTaskDecisionEvents(
 		const page = db.prepare(
 			"SELECT rowid AS row_id, event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json FROM events WHERE rowid > ? ORDER BY rowid ASC LIMIT ?",
 		);
-		// A rowid cursor, not OFFSET: pages cannot skip or repeat a row if the
-		// writer prunes between reads.
 		let cursor = 0;
 		for (;;) {
 			const rows = page.all(cursor, pageSize) as Array<Record<string, unknown>>;
@@ -637,6 +672,15 @@ export async function* streamTaskDecisionEvents(
 			if (rows.length < pageSize) return;
 		}
 	} finally {
+		// Runs on early return, on throw, and when a consumer abandons the
+		// generator, so a reader never leaves a transaction open on the store.
+		if (snapshot) {
+			try {
+				db.run("ROLLBACK");
+			} catch {
+				// A read-only transaction has nothing to undo; closing is enough.
+			}
+		}
 		db.close();
 	}
 }

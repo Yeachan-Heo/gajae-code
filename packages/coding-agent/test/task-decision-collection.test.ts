@@ -281,7 +281,7 @@ describe("task decision collection", () => {
 		expect(events.map(event => event.task_id ?? event.status)).toEqual(["task-2", "completed"]);
 	});
 
-	test("retention keeps at most the configured number of events, dropping the oldest", async () => {
+	test("retention drops whole decisions, never leaving a partial one", async () => {
 		const root = await createRoot();
 		const store = { rootDir: root, mode: "metadata" as const, maxEvents: 4 };
 		for (let index = 0; index < 4; index++) {
@@ -291,10 +291,71 @@ describe("task decision collection", () => {
 		}
 		// Twelve events were written; the bound is four, applied on every append.
 		const events = await exportTaskDecisionEvents({ rootDir: root });
-		expect(events).toHaveLength(4);
-		expect(events.map(event => event.event_type)).toEqual(["outcome", "begin", "model", "outcome"]);
-		expect(events.at(-1)?.status).toBe("completed");
+		expect(events.length).toBeLessThanOrEqual(4);
+		expect(events.length).toBeGreaterThan(0);
+		// Every surviving decision is complete: a `model` or `outcome` without its
+		// `begin` would be a record of a task nobody can interpret.
+		const groups = new Map<string, string[]>();
+		for (const event of events) {
+			groups.set(event.decision_id, [...(groups.get(event.decision_id) ?? []), String(event.event_type)]);
+		}
+		for (const types of groups.values()) expect(types).toEqual(["begin", "model", "outcome"]);
 		expect(JSON.stringify(events)).not.toContain("model-0");
+	});
+
+	test("a decision still being written survives the retention boundary intact", async () => {
+		const root = await createRoot();
+		const store = { rootDir: root, mode: "metadata" as const, maxEvents: 3 };
+		const active = await beginTaskDecision(
+			{ ...input, taskId: "active", decisionId: "44444444-4444-4444-8444-444444444444" },
+			store,
+		);
+		expect(active).toBeDefined();
+		// Other decisions push the store well past the bound while `active` is open.
+		for (let index = 0; index < 4; index++) {
+			const other = await beginTaskDecision({ ...input, taskId: `filler-${index}` }, store);
+			await other?.finish({ status: "completed" });
+		}
+		await active?.recordModel({ actualModel: "active-model" });
+		await active?.finish({ status: "completed" });
+		await active?.recordDecision({
+			observation_id: "55555555-5555-4555-8555-555555555555",
+			provider: "kev",
+			mode: "shadow",
+			requested_model: "kev-latest",
+			candidate_tiers: ["fast"],
+			recommended_tier: "fast",
+			probabilities: { fast: 1 },
+			confidence: 1,
+			latency_ms: 5,
+		});
+		const events = await exportTaskDecisionEvents({ rootDir: root });
+		const mine = events.filter(event => event.decision_id === "44444444-4444-4444-8444-444444444444");
+		expect(mine.map(event => event.event_type)).toEqual(["begin", "model", "outcome", "decision"]);
+	});
+
+	test("an export is a snapshot: pruning between pages cannot truncate it", async () => {
+		const root = await createRoot();
+		const store = { rootDir: root, mode: "metadata" as const };
+		for (let index = 0; index < 4; index++) {
+			const recorder = await beginTaskDecision({ ...input, taskId: `seed-${index}` }, store);
+			await recorder?.finish({ status: "completed" });
+		}
+		const before = await exportTaskDecisionEvents({ rootDir: root });
+		expect(before).toHaveLength(8);
+
+		const seen: string[] = [];
+		const stream = streamTaskDecisionEvents({ rootDir: root, pageSize: 2 });
+		// Consume the first page only, then let a writer prune rows this stream has
+		// not read yet. The snapshot must still deliver the store as it was.
+		seen.push(String((await stream.next()).value?.event_id));
+		seen.push(String((await stream.next()).value?.event_id));
+		const pruner = await beginTaskDecision({ ...input, taskId: "pruner" }, { ...store, maxEvents: 2 });
+		await pruner?.finish({ status: "completed" });
+		for await (const event of stream) seen.push(String(event.event_id));
+
+		expect(seen).toEqual(before.map(event => String(event.event_id)));
+		expect((await exportTaskDecisionEvents({ rootDir: root })).length).toBeLessThan(before.length);
 	});
 
 	test("export pages through a store larger than one page, in order and without gaps", async () => {
