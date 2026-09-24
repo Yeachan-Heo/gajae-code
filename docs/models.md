@@ -223,7 +223,9 @@ For future routing evaluation, opt in before starting GJC:
 GJC_TASK_COLLECTION=metadata bun run dev
 ```
 
-Opting in does not mean unbounded storage. Every append prunes the local store to `task.decision.collectionRetentionDays` (default 30, 1–365) and `task.decision.collectionMaxEvents` (default 50000, 1000–1000000, oldest dropped first), and export streams the store a page at a time rather than loading it whole.
+Opting in does not mean unbounded storage. Every append prunes the local store to `task.decision.collectionRetentionDays` (default 30, 1–365) and `task.decision.collectionMaxEvents` (default 50000, oldest whole decisions dropped first), and export streams the store a page at a time rather than loading it whole.
+
+Individual values are bounded too. Identifier-shaped fields (role, task and session ids, hashes, model names, efforts, tiers, codes) are capped at 256 characters, a requested model chain at 16 selectors, diagnostic evidence at 1024 characters, and assignment/context at the 4096 limit above; oversized values are stored truncated rather than discarding the event, and any single event is capped at 16 KiB. Outbound Kev and Jev requests are capped at 16 KiB of serialized body, with the role truncated to 256 bytes and each tier description to 512 bytes; a request that still exceeds the cap is refused (`request_too_large`) and **nothing is sent**.
 
 Collection alone is local only and disabled by default. It does not call Kev, change model/effort selection, inject hints, train models, or upload data. Opt in explicitly with `task.decision.collection` (`off`, `metadata`, or `content`) or `GJC_TASK_COLLECTION`. Decision enablement is separate and never enables persistence by itself. Explicit `off` or unsupported values and `GJC_DISABLE_TELEMETRY=1` prevent persistence. Use a trusted shell/user environment; a repository `.env` cannot opt you in.
 

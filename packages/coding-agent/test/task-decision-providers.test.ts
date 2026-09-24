@@ -3,7 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { KevControlReply } from "../src/setup/kev-supervisor";
-import type { DecisionErrorCode, DecisionProbabilities, DecisionRequest } from "../src/task/decision-model";
+import {
+	type DecisionErrorCode,
+	type DecisionProbabilities,
+	type DecisionRequest,
+	MAX_CANDIDATE_BYTES,
+	MAX_REQUEST_BYTES,
+	MAX_ROLE_BYTES,
+} from "../src/task/decision-model";
 import { JevDecisionProvider, KevDecisionProvider } from "../src/task/decision-providers";
 
 const request: DecisionRequest = {
@@ -113,6 +120,68 @@ describe("task decision providers", () => {
 			intruder.stop(true);
 			await fs.rm(root, { recursive: true, force: true });
 		}
+	});
+
+	test("an oversized role and candidates are truncated and the body stays under the cap", async () => {
+		const bodies: string[] = [];
+		const provider = new JevDecisionProvider({
+			authStorage: { getApiKey: async () => "key" },
+			fetchFn: async (_url, init) => {
+				bodies.push(String(init.body));
+				return json(answer());
+			},
+		});
+		const outcome = await provider.decide({
+			role: "r".repeat(100_000),
+			assignment: "a".repeat(100_000),
+			candidates: {
+				fast: "f".repeat(100_000),
+				balanced: "b".repeat(100_000),
+				strong: "s".repeat(100_000),
+			},
+		});
+		expect(outcome.result?.choice).toBe("balanced");
+		expect(bodies).toHaveLength(1);
+		const sent = JSON.parse(String(bodies[0])) as {
+			state: { role: string; assignment: string };
+			questions: { route: { criteria: Record<string, string> } };
+		};
+		expect(new TextEncoder().encode(String(bodies[0])).byteLength).toBeLessThanOrEqual(MAX_REQUEST_BYTES);
+		expect(new TextEncoder().encode(sent.state.role).byteLength).toBeLessThanOrEqual(MAX_ROLE_BYTES);
+		expect(sent.state.role.length).toBeLessThan(100_000);
+		for (const description of Object.values(sent.questions.route.criteria)) {
+			expect(new TextEncoder().encode(description).byteLength).toBeLessThanOrEqual(MAX_CANDIDATE_BYTES);
+		}
+	});
+
+	test("a request over the cap is refused without reaching the network", async () => {
+		let calls = 0;
+		const provider = new JevDecisionProvider({
+			authStorage: { getApiKey: async () => "key" },
+			// The bounded fields alone cannot exceed the real cap, so the cap is
+			// lowered to exercise the refusal rather than fabricating a huge field.
+			maxRequestBytes: 64,
+			fetchFn: async () => {
+				calls++;
+				return json(answer());
+			},
+		});
+		expect((await provider.decide(request)).error?.code).toBe("request_too_large");
+		expect(calls).toBe(0);
+	});
+
+	test("an oversized local request never reaches the supervisor", async () => {
+		const calls: ControlCall[] = [];
+		const provider = new KevDecisionProvider({
+			maxRequestBytes: 64,
+			resolveChannel: async () => ({ socket: SOCKET, token: TOKEN, port: 8009 }),
+			control: async (socket, message) => {
+				calls.push({ socket, request: JSON.parse(message.trim()) as Record<string, unknown> });
+				return okReply(answer());
+			},
+		});
+		expect((await provider.decide(request)).error?.code).toBe("request_too_large");
+		expect(calls).toEqual([]);
 	});
 
 	test("a supervisor that refuses or has lost its child yields no tier", async () => {

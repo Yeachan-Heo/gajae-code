@@ -114,38 +114,53 @@ const DAY_MS = 86_400_000;
 const DEFAULT_EXPORT_PAGE = 1000;
 const MAX_EXPORT_PAGE = 10_000;
 const MAX_CONTENT = 4096;
+/** Identifier-shaped fields: ids, hashes, versions, model names, efforts, tiers, codes. */
+const MAX_SHORT = 256;
+/** Diagnostic prose recorded alongside an outcome. */
+const MAX_EVIDENCE = 1024;
+/** A requested model chain is a route, not a corpus. */
+const MAX_SELECTORS = 16;
+/**
+ * Ceiling on one serialized event. The per-field bounds already cap what a
+ * caller supplies; this is the backstop that keeps a single row from dominating
+ * a store whose total size the operator bounded by event count.
+ */
+const MAX_EVENT_BYTES = 16 * 1024;
 const BUSY_TIMEOUT_MS = 2000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const count = z.number().finite().nonnegative();
-const text = z.string();
+/** Identifiers, hashes, versions, model names, tiers and codes are all short by nature. */
+const short = z.string().max(MAX_SHORT);
+/** Diagnostic prose: longer than an identifier, still far from unbounded. */
+const evidence = z.string().max(MAX_EVIDENCE);
 const beginPayloadSchema = z
 	.object({
-		gjc_version: text,
-		role: text,
-		task_id: text,
-		session_id_hash: text,
+		gjc_version: short,
+		role: short,
+		task_id: short,
+		session_id_hash: short,
 		run_mode: z.enum(["initial", "resume", "message"]),
-		requested_tier: text.optional(),
-		requested_selectors: z.array(text).optional(),
-		requested_effort: text.optional(),
-		repo_cwd_hash: text,
-		assignment_hash: text,
-		context_hash: text.optional(),
+		requested_tier: short.optional(),
+		requested_selectors: z.array(short).max(MAX_SELECTORS).optional(),
+		requested_effort: short.optional(),
+		repo_cwd_hash: short,
+		assignment_hash: short,
+		context_hash: short.optional(),
 		assignment_count: count.optional(),
 		context_count: count.optional(),
-		assignment: text.max(MAX_CONTENT).optional(),
-		context: text.max(MAX_CONTENT).optional(),
+		assignment: z.string().max(MAX_CONTENT).optional(),
+		context: z.string().max(MAX_CONTENT).optional(),
 		assignment_truncated: z.boolean().optional(),
 		context_truncated: z.boolean().optional(),
 	})
 	.strict();
 const modelPayloadSchema = z
 	.object({
-		requestedModel: text.optional(),
-		actualModel: text,
-		effectiveEffort: text.optional(),
-		providerReportedModel: text.optional(),
-		provider: text.optional(),
+		requestedModel: short.optional(),
+		actualModel: short,
+		effectiveEffort: short.optional(),
+		providerReportedModel: short.optional(),
+		provider: short.optional(),
 	})
 	.strict();
 const outcomePayloadSchema = z
@@ -165,10 +180,10 @@ const outcomePayloadSchema = z
 			.optional(),
 		costUsd: count.optional(),
 		usageCostComplete: z.boolean().optional(),
-		abortReason: text.optional(),
-		routingTerminalCode: text.optional(),
-		providerEvidence: text.optional(),
-		fallbackEvidence: text.optional(),
+		abortReason: evidence.optional(),
+		routingTerminalCode: evidence.optional(),
+		providerEvidence: evidence.optional(),
+		fallbackEvidence: evidence.optional(),
 	})
 	.strict();
 const decisionObservationSchema = z
@@ -424,6 +439,60 @@ function pruneEvents(db: Database, policy: RetentionPolicy, currentDecisionId: s
 	).run(policy.maxEvents, currentDecisionId);
 }
 
+/** Field bounds by event type, mirroring the schema each payload is parsed against. */
+const FIELD_BOUNDS: Readonly<Record<TaskDecisionEvent["event_type"], Readonly<Record<string, number>>>> = {
+	begin: {
+		gjc_version: MAX_SHORT,
+		role: MAX_SHORT,
+		task_id: MAX_SHORT,
+		session_id_hash: MAX_SHORT,
+		requested_tier: MAX_SHORT,
+		requested_effort: MAX_SHORT,
+		repo_cwd_hash: MAX_SHORT,
+		assignment_hash: MAX_SHORT,
+		context_hash: MAX_SHORT,
+		assignment: MAX_CONTENT,
+		context: MAX_CONTENT,
+	},
+	model: {
+		requestedModel: MAX_SHORT,
+		actualModel: MAX_SHORT,
+		effectiveEffort: MAX_SHORT,
+		providerReportedModel: MAX_SHORT,
+		provider: MAX_SHORT,
+	},
+	outcome: {
+		abortReason: MAX_EVIDENCE,
+		routingTerminalCode: MAX_EVIDENCE,
+		providerEvidence: MAX_EVIDENCE,
+		fallbackEvidence: MAX_EVIDENCE,
+	},
+	decision: {},
+};
+
+/**
+ * Trim a payload to the schema bounds before it is parsed.
+ *
+ * The schemas reject oversized strings, and rejection here would drop the whole
+ * event — losing a record of work that did happen. Truncating keeps the event
+ * and loses only the tail of one field.
+ */
+function boundPayload(eventType: TaskDecisionEvent["event_type"], payload: Record<string, unknown>) {
+	const bounds = FIELD_BOUNDS[eventType];
+	const bounded: Record<string, unknown> = { ...payload };
+	for (const [field, limit] of Object.entries(bounds)) {
+		const value = bounded[field];
+		if (typeof value === "string" && value.length > limit) bounded[field] = value.slice(0, limit);
+	}
+	const selectors = bounded.requested_selectors;
+	if (Array.isArray(selectors)) {
+		bounded.requested_selectors = selectors
+			.slice(0, MAX_SELECTORS)
+			.map(entry => (typeof entry === "string" && entry.length > MAX_SHORT ? entry.slice(0, MAX_SHORT) : entry));
+	}
+	return bounded;
+}
+
 function appendEvent(
 	db: Database,
 	installationId: string,
@@ -441,13 +510,19 @@ function appendEvent(
 				: eventType === "outcome"
 					? outcomePayloadSchema
 					: decisionPayloadSchema;
-	const validated = schema.parse(payload);
+	const validated = schema.parse(boundPayload(eventType, payload));
+	const serialized = JSON.stringify(validated);
+	// Backstop for anything the field bounds did not cover. Collection is best
+	// effort and every caller already catches, so refusing one oversized event is
+	// preferable to letting it through the size budget the operator configured.
+	if (new TextEncoder().encode(serialized).byteLength > MAX_EVENT_BYTES)
+		throw new Error("task decision event exceeds the per-event byte bound");
 	db.run("BEGIN IMMEDIATE");
 	try {
 		const sequence = nextSequence(db, decisionId);
 		db.prepare(
 			"INSERT INTO events(event_id, decision_id, installation_id, sequence, event_type, mode, created_at_ms, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		).run(randomUUID(), decisionId, installationId, sequence, eventType, mode, Date.now(), JSON.stringify(validated));
+		).run(randomUUID(), decisionId, installationId, sequence, eventType, mode, Date.now(), serialized);
 		pruneEvents(db, policy, decisionId);
 		db.run("COMMIT");
 	} catch (error) {

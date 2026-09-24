@@ -9,6 +9,7 @@ import {
 	type DecisionProvider,
 	type DecisionProviderConfig,
 	type DecisionRequest,
+	MAX_REQUEST_BYTES,
 	normalizeDecisionRequest,
 	validateDecisionResultDetailed,
 } from "./decision-model";
@@ -18,6 +19,8 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 type DecisionAuthStorage = Pick<AuthStorage, "getApiKey">;
 type DecisionFetch = (url: string, init: RequestInit) => Promise<Response>;
 type ProviderOptions = DecisionProviderConfig & {
+	/** Overridable only so a test can force the cap; production uses MAX_REQUEST_BYTES. */
+	readonly maxRequestBytes?: number;
 	readonly fetchFn?: DecisionFetch;
 	readonly authStorage?: DecisionAuthStorage;
 	readonly endpoint: string;
@@ -28,6 +31,8 @@ type KevControlFn = (socketPath: string, message: string, timeoutMs: number) => 
 export type KevDecisionProviderOptions = {
 	readonly model?: string;
 	readonly timeoutMs?: number;
+	/** Overridable only so a test can force the cap; production uses MAX_REQUEST_BYTES. */
+	readonly maxRequestBytes?: number;
 	/** Kev installation root; defaults to the remembered one. */
 	readonly root?: string;
 	readonly resolveChannel?: (root?: string) => Promise<KevServiceChannel | undefined>;
@@ -35,6 +40,8 @@ export type KevDecisionProviderOptions = {
 };
 export type JevDecisionProviderOptions = {
 	readonly timeoutMs?: number;
+	/** Overridable only so a test can force the cap; production uses MAX_REQUEST_BYTES. */
+	readonly maxRequestBytes?: number;
 	readonly credentialSessionId?: string;
 	readonly fetchFn?: DecisionFetch;
 	readonly authStorage: DecisionAuthStorage;
@@ -130,6 +137,18 @@ function makeBody(request: DecisionRequest, model: string): Record<string, unkno
 	};
 }
 
+/**
+ * Serialize the request body once and refuse it if it exceeds the cap.
+ *
+ * Per-field truncation bounds what the caller supplies, but the prompt and the
+ * model alias also ride along, so the assembled body is checked as a whole.
+ * `undefined` means the body is too large and nothing may be sent.
+ */
+function serializeBoundedBody(request: DecisionRequest, model: string, maxBytes: number): string | undefined {
+	const serialized = JSON.stringify(makeBody(request, model));
+	return new TextEncoder().encode(serialized).byteLength > maxBytes ? undefined : serialized;
+}
+
 function httpFailure(status: number): DecisionOutcome {
 	if (status === 401) return failure("auth_401");
 	if (status === 403) return failure("auth_403");
@@ -175,11 +194,15 @@ async function decide(
 			return failure(parentSignal?.aborted ? "aborted" : "timeout");
 		if (options.authStorage && !key) return failure("credential_unavailable");
 		if (options.authStorage && !validBearer(key!)) return failure("credential_unavailable");
+		// Checked before the request leaves the process: this endpoint is remote
+		// and billable, so an oversized body is refused rather than sent.
+		const body = serializeBoundedBody(request, options.model, options.maxRequestBytes ?? MAX_REQUEST_BYTES);
+		if (body === undefined) return failure("request_too_large");
 		const pendingResponse = (options.fetchFn ?? fetch)(options.endpoint, {
 			method: "POST",
 			redirect: "error",
 			headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
-			body: JSON.stringify(makeBody(request, options.model)),
+			body,
 			signal: current.signal,
 		});
 		void pendingResponse.then(
@@ -226,12 +249,14 @@ async function decide(
 export class KevDecisionProvider implements DecisionProvider {
 	readonly #model: string;
 	readonly #timeoutMs: number;
+	readonly #maxRequestBytes: number;
 	readonly #root?: string;
 	readonly #resolveChannel: (root?: string) => Promise<KevServiceChannel | undefined>;
 	readonly #control: KevControlFn;
 	constructor(options: KevDecisionProviderOptions = {}) {
 		this.#model = options.model ?? "kev-latest";
 		this.#timeoutMs = boundedTimeout(options.timeoutMs);
+		this.#maxRequestBytes = options.maxRequestBytes ?? MAX_REQUEST_BYTES;
 		this.#root = options.root;
 		this.#resolveChannel = options.resolveChannel ?? (root => resolveKevServiceChannel({ root }));
 		this.#control = options.control ?? kevControl;
@@ -247,7 +272,8 @@ export class KevDecisionProvider implements DecisionProvider {
 			if (!channel) return failure("unavailable");
 			if (current.signal.aborted || performance.now() >= current.deadline)
 				return failure(options?.signal?.aborted ? "aborted" : "timeout");
-			const body = JSON.stringify(makeBody(normalized, this.#model));
+			const body = serializeBoundedBody(normalized, this.#model, this.#maxRequestBytes);
+			if (body === undefined) return failure("request_too_large");
 			const reply = await raceDeadline(
 				this.#control(channel.socket, controlInferRequest(channel.token, body), this.#timeoutMs),
 				current,
@@ -275,6 +301,7 @@ export class JevDecisionProvider implements DecisionProvider {
 			endpoint: "https://api.typesafe.ai/v1/systemone",
 			model: "jev-latest",
 			timeoutMs: boundedTimeout(options.timeoutMs),
+			maxRequestBytes: options.maxRequestBytes,
 			credentialSessionId: options.credentialSessionId,
 			authStorage: options.authStorage,
 			fetchFn: options.fetchFn,

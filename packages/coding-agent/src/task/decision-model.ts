@@ -39,6 +39,7 @@ export type DecisionErrorCode =
 	| "invalid_candidate"
 	| "invalid_probability"
 	| "invalid_response"
+	| "request_too_large"
 	| "unavailable"
 	| "transport_error";
 export interface DecisionError {
@@ -57,6 +58,18 @@ export interface DecisionProviderConfig {
 
 const MARKER = "…[truncated]";
 const MAX_BYTES = 4096;
+/** A role is an agent name, not free text. */
+export const MAX_ROLE_BYTES = 256;
+/** A tier candidate is a short description of when that tier applies. */
+export const MAX_CANDIDATE_BYTES = 512;
+/**
+ * Ceiling on the whole serialized request.
+ *
+ * Bounding each field is not the same as bounding the request: the prompt, the
+ * model alias and three candidates are all caller-influenced, and a provider —
+ * remote and billable in Jev's case — must never be handed an unbounded body.
+ */
+export const MAX_REQUEST_BYTES = 16 * 1024;
 
 export function truncateUtf8(value: string, maxBytes = MAX_BYTES): string {
 	if (maxBytes <= 0) return "";
@@ -83,10 +96,11 @@ export function normalizeDecisionRequest(request: DecisionRequest): DecisionRequ
 	const candidates: Partial<Record<DecisionTier, string>> = {};
 	for (const tier of DECISION_TIERS) {
 		const description = request.candidates?.[tier];
-		if (typeof description === "string" && description.length > 0) candidates[tier] = description;
+		if (typeof description === "string" && description.length > 0)
+			candidates[tier] = truncateUtf8(description, MAX_CANDIDATE_BYTES);
 	}
 	return Object.freeze({
-		role: String(request.role),
+		role: truncateUtf8(String(request.role), MAX_ROLE_BYTES),
 		assignment: truncateUtf8(request.assignment),
 		candidates: Object.freeze(candidates),
 	});

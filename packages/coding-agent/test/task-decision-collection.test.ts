@@ -381,6 +381,48 @@ describe("task decision collection", () => {
 		expect(firstThree).toEqual(whole.slice(0, 3).map(event => String(event.event_id)));
 	});
 
+	test("oversized stored fields are truncated rather than dropping the event", async () => {
+		const root = await createRoot();
+		const store = { rootDir: root, mode: "metadata" as const };
+		const recorder = await beginTaskDecision(
+			{
+				...input,
+				role: "r".repeat(100_000),
+				requestedSelectors: Array.from({ length: 1000 }, (_, index) => `provider/model-${index}`),
+			},
+			store,
+		);
+		expect(recorder).toBeDefined();
+		await recorder?.finish({
+			status: "completed",
+			providerEvidence: "p".repeat(100_000),
+			fallbackEvidence: "f".repeat(100_000),
+			abortReason: "a".repeat(100_000),
+		});
+		const events = await exportTaskDecisionEvents({ rootDir: root, includeContent: true });
+		// The events survived: losing the record of work that happened would be a
+		// worse outcome than losing the tail of one oversized field.
+		expect(events.map(event => event.event_type)).toEqual(["begin", "outcome"]);
+		const begin = events[0]!;
+		expect(String(begin.role).length).toBe(256);
+		expect((begin.requested_selectors as string[]).length).toBe(16);
+		const outcome = events[1]!;
+		for (const field of ["providerEvidence", "fallbackEvidence", "abortReason"]) {
+			expect(String(outcome[field]).length).toBe(1024);
+		}
+		// Every stored row also fits the per-event ceiling.
+		const db = new Database(path.join(root, "task-decisions.db"), { readonly: true });
+		try {
+			const rows = db.query<{ payload_json: string }, []>("SELECT payload_json FROM events").all();
+			expect(rows.length).toBe(2);
+			for (const row of rows) {
+				expect(new TextEncoder().encode(row.payload_json).byteLength).toBeLessThanOrEqual(16 * 1024);
+			}
+		} finally {
+			db.close();
+		}
+	});
+
 	test("exporting an absent store does not create it", async () => {
 		const root = path.join(await createRoot(), "absent");
 		expect(await exportTaskDecisionEvents({ rootDir: root })).toEqual([]);
