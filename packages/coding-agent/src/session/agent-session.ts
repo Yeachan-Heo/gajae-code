@@ -16773,6 +16773,16 @@ export class AgentSession {
 					...(registeredScope ? { terminalScope: registeredScope } : {}),
 				};
 			}
+			const retainedProof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+			if (
+				retainedProof.status === "settled" ||
+				(retainedProof.status === "unfenced" && retainedProof.reason !== "unknown_run")
+			) {
+				return {
+					...retainedProof,
+					...(registeredScope ? { terminalScope: registeredScope } : {}),
+				};
+			}
 			return {
 				status: "unfenced",
 				reason: "unknown_run",
