@@ -64,6 +64,7 @@ function usageLimitStream(
 							providerCode: "invalid_request_error",
 							credentialModelUnavailable: true,
 							headers: { "retry-after": "3600" },
+							...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
 						}
 					: {
 							kind: "transport",
@@ -289,7 +290,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	maxAttempts?: number;
 	providerRetryMaxAttempts?: number;
 	failFirstProviderDispatch?: boolean;
-	trigger?: "quota" | "rate_limit";
+	trigger?: "quota" | "rate_limit" | "credential";
 	preblockedAccounts?: readonly string[];
 	storedApiKeys?: readonly string[];
 	runtimeApiKey?: string;
@@ -676,6 +677,23 @@ describe("managed fallback quota credential rotation", () => {
 		expect(["TOKEN-b", "TOKEN-c"]).toContain(result.keys[1]);
 		expect(result.keys.at(-1)).toBe("fallback-test-key");
 		expect(result.markCount).toBe(1);
+	});
+
+	test("does not restore a model-unavailable rotation past the provider retry ceiling", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b", "c"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+			trigger: "credential",
+			providerRetryMaxAttempts: 2,
+		});
+		expect(result).toEqual({
+			models: [selector(model), selector(model), selector(fallback)],
+			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
+			markCount: 1,
+		});
 	});
 
 	test("keeps the active non-head fallback entry when quota rotation retries it", async () => {
