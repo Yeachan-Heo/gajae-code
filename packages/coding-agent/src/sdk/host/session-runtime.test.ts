@@ -25,6 +25,7 @@ import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
 	createSdkSurfaceFactory,
+	RetainedTerminalBoundaryRegistry,
 	type SdkOnlyInvocationRecord,
 	type SdkOnlyReconciliationStore,
 	type SdkOnlyTerminalAbortSeams,
@@ -36,6 +37,31 @@ import type { SdkFrame } from "./types";
 import { SdkTransportLifecycleError } from "./websocket-transport";
 
 setDefaultTimeout(30_000);
+
+test("retained terminal claims survive more than 1024 later boundaries", () => {
+	const claims = new RetainedTerminalBoundaryRegistry();
+	const target = "publishable-target";
+	const laterBoundaries = Array.from({ length: 1_024 }, (_, index) => `later-${index}`);
+	const release = claims.retain([target, ...laterBoundaries]);
+	try {
+		expect(claims.claim(target)).toBe(true);
+		claims.setPublicationResult(target, true);
+		for (const key of laterBoundaries) {
+			expect(claims.claim(key)).toBe(true);
+			claims.setPublicationResult(key, true);
+		}
+		expect(claims.size).toBe(1_025);
+		expect(claims.hasClaimed(target)).toBe(true);
+		expect(claims.publicationResult(target)).toBe(true);
+		expect(claims.claim(target)).toBe(false);
+	} finally {
+		release();
+	}
+
+	expect(claims.claim("after-release")).toBe(true);
+	expect(claims.hasClaimed(target)).toBe(false);
+	expect(claims.publicationResult(target)).toBeUndefined();
+});
 
 test("runtime capabilities preserve explicit primary control surface", () => {
 	const policy = createSdkSurfacePolicy({ bindings: [], workflowGateAvailable: false });
@@ -737,6 +763,48 @@ test("uncertain recovery retains a staged stopped intent for restart", async () 
 		});
 	} finally {
 		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("Q26 keeps deadline restart uncertainty nonterminal and hides pending outcome", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-q26-deadline-recovery-"));
+	const sessionId = "q26-deadline-recovery";
+	let harness: InvocationHarness | undefined;
+	try {
+		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const reconciliation = createInvocationReconciliation({ store });
+		const correlation = { commandId: "q26-deadline-command", turnId: "q26-deadline-turn" };
+		await reconciliation.hydrate();
+		await reconciliation.noteAccepted("prompt", correlation, "q26-deadline-ref");
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+		await reconciliation.claimPendingOutcome("prompt", correlation, {
+			kind: "failed",
+			code: "prompt_deadline_exceeded",
+			message: "Prompt deadline exceeded.",
+			provenance: "deadline",
+		});
+		await reconciliation.stagePendingTerminalOutcome("prompt", correlation, {
+			kind: "stopped",
+			reason: "cancelled",
+			provenance: "client_cancel",
+		});
+		await reconciliation.markUncertain("prompt", correlation, undefined, Date.now() + 60_000);
+
+		harness = await invocationHarness(sessionId, cwd, {
+			settings: {
+				get: (key: string) =>
+					key === "sdk.promptDeadlineMs" ? 60_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+			} as unknown as Settings,
+			terminalAbortSeams: { getReconciliationStore: () => store },
+		});
+		const result = await harness.query("turn.prompt_status", correlation);
+		expect(result.result?.status).toBe("in_flight");
+		expect(result.result).not.toHaveProperty("outcome");
+		expect(result.result).not.toHaveProperty("pendingOutcome");
+	} finally {
+		await harness?.stop();
+		await rm(cwd, { recursive: true, force: true });
 	}
 });
 
@@ -6073,6 +6141,92 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("a captured cancelled end stays private and recoverable while tools are unproven", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-captured-uncertain-"));
+		const sessionId = "deadline-captured-uncertain";
+		const sessionFile = path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`);
+		await Bun.write(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		const activeTools = new Set(["unfenced-tool"]);
+		let boundaryWaitStarted = false;
+		let abortCalls = 0;
+		let harness: InvocationHarness | undefined;
+		try {
+			harness = await invocationHarness(sessionId, cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 150 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				terminalAbortSeams: {
+					getReconciliationStore: () => store,
+					getTerminalTurnEpoch: () => 109,
+					getActivePromptHandle: () => "deadline-captured-uncertain-run",
+					pendingToolExecutions: () => {
+						if (activeTools.size > 0) boundaryWaitStarted = true;
+						return [...activeTools];
+					},
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						return { status: "unfenced" };
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "capture uncertain end" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("tool_execution_start", {
+				type: "tool_execution_start",
+				toolCallId: "unfenced-tool",
+				toolName: "apply_patch",
+				args: {},
+			});
+			const waitDeadline = Date.now() + 2_000;
+			while (!boundaryWaitStarted && Date.now() < waitDeadline) await Bun.sleep(10);
+			expect(boundaryWaitStarted).toBe(true);
+			await harness.emit("agent_end", { stopReason: "cancelled" });
+			await Bun.sleep(5_200);
+			expect(abortCalls).toBe(0);
+			expect((await harness.query("turn.prompt_status", correlation)).result).toMatchObject({ status: "in_flight" });
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
+			const durable = store.snapshot().find(record => record.commandId === correlation.commandId) as
+				| (SdkOnlyInvocationRecord & { pendingOutcome?: unknown; deadlineRecoveryPending?: boolean })
+				| undefined;
+			expect(durable).toMatchObject({
+				status: "in_flight",
+				deadlineRecoveryPending: true,
+				pendingOutcome: { kind: "stopped", reason: "cancelled" },
+			});
+			const reopened = createInvocationReconciliation({
+				store: createReconciliationStore({ sessionFile, sessionId }),
+			});
+			await reopened.hydrate();
+			expect(reopened.lookup("prompt", correlation)).toMatchObject({ status: "in_flight" });
+			const recoveryRows = reopened.listDeadlineRecoveryPendingPrompts();
+			expect(recoveryRows).toHaveLength(1);
+			expect(recoveryRows[0]).toMatchObject({
+				correlation,
+				pendingOutcome: { kind: "stopped", reason: "cancelled" },
+			});
+
+			activeTools.clear();
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("an unprovable prompt deadline waits for the real terminal boundary", async () => {
 		// If an active run cannot be tied to the expiring correlation, the deadline
 		// must preserve uncertainty rather than publish a synthetic failure. A real
@@ -6289,7 +6443,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("a lost deadline stop boundary leaves reconciliation recoverable", async () => {
+	test("a broadcast failure keeps the deadline boundary replayable and reconciled", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-stop-publication-loss-"));
 		const epoch = 53;
 		let harness: InvocationHarness | undefined;
@@ -6341,13 +6495,45 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const abortDeadline = Date.now() + 2_000;
 			while (abortCalls === 0 && Date.now() < abortDeadline) await Bun.sleep(10);
 			expect(abortCalls).toBe(1);
+			const publicationDeadline = Date.now() + 2_000;
+			while (!publicationFailed && Date.now() < publicationDeadline) await Bun.sleep(10);
 			expect(publicationFailed).toBe(true);
-			// Let the bounded lease retry its deferred terminal transition. It must
-			// remain recoverable because no correlated end reached the client.
+			// The ring append is authoritative even when this immediate broadcast
+			// fails; the deadline must reconcile it once without appending a duplicate.
 			await Bun.sleep(150);
-			expect((await harness.query("turn.prompt_status", correlation)).result?.status).toBe("in_flight");
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			await harness.requestOnSession("deadline-stop-publication-loss", {
+				type: "event_replay",
+				sinceGeneration: 0,
+				sinceSeq: 0,
+			});
+			const replay = harness
+				.sent("deadline-stop-publication-loss")
+				.filter(frame => frame.type === "event_replay_result")
+				.at(-1) as
+				| {
+						events?: Array<{
+							kind?: unknown;
+							payload?: { commandId?: string; turnId?: string; outcome?: unknown };
+						}>;
+				  }
+				| undefined;
+			const replayedEnds =
+				replay?.events?.filter(
+					frame =>
+						frame.kind === "agent_end" &&
+						frame.payload?.commandId === correlation.commandId &&
+						frame.payload?.turnId === correlation.turnId,
+				) ?? [];
+			expect(replayedEnds).toHaveLength(1);
+			expect(replayedEnds[0]?.payload).toMatchObject({
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
 		} finally {
 			await harness?.stop();
 			await Bun.sleep(10);
@@ -6695,6 +6881,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					await options?.onPreflightAcceptCommit?.();
 					await neverSettlingPromise();
 				},
+				agentFailedWriteFailures: 2,
 				terminalAbortSeams: {
 					getTerminalTurnEpoch: () => epoch,
 					getActivePromptHandle: () => "deadline-provider-cancelled-run",
@@ -6785,6 +6972,73 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				outcome: { kind: "stopped", reason: "cancelled" },
 			});
 			expect(stageFailures).toBe(1);
+			expect(abortCalls).toBe(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
+		} finally {
+			await harness?.stop();
+			await Bun.sleep(10);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("a deferred terminal keeps a retry owner after the staging budget is exhausted", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-deadline-stage-recovery-owner-"));
+		const epoch = 107;
+		let harness: InvocationHarness | undefined;
+		let stageAttempts = 0;
+		let storageAvailable = false;
+		let abortCalls = 0;
+		try {
+			harness = await invocationHarness("deadline-stage-recovery-owner", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 100 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type !== "pending_terminal_outcome") return;
+					stageAttempts += 1;
+					if (stageAttempts <= 6 || !storageAvailable)
+						throw Object.assign(new Error("injected persistent pending terminal failure"), {
+							code: "io_error",
+						});
+				},
+				agentFailedWriteFailures: 0,
+				terminalAbortSeams: {
+					getTerminalTurnEpoch: () => epoch,
+					getActivePromptHandle: () => "deadline-stage-recovery-run",
+					pendingToolExecutions: () => [],
+					abortPromptAndWaitWithTerminal: async () => {
+						abortCalls += 1;
+						await harness?.emit("agent_end", { stopReason: "cancelled" });
+						return {
+							status: "settled",
+							terminalScope: { abortedAttemptEpoch: epoch, lineageIdHash: "deadline-stage-recovery-lineage" },
+						};
+					},
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "recover terminal staging" });
+			expect(accepted.ok).toBe(true);
+			const correlation = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			const stagingDeadline = Date.now() + 2_000;
+			while (stageAttempts < 6 && Date.now() < stagingDeadline) await Bun.sleep(10);
+			expect(stageAttempts).toBeGreaterThanOrEqual(6);
+			expect((await harness.query("turn.prompt_status", correlation)).result?.status).toBe("in_flight");
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toEqual([]);
+			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toEqual([]);
+
+			storageAvailable = true;
+			expect(await settledStatus(harness, "turn.prompt_status", correlation)).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled" },
+			});
+			expect(stageAttempts).toBeGreaterThan(6);
 			expect(abortCalls).toBe(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_end")).toHaveLength(1);
 			expect(correlatedFrames(harness, correlation).filter(frame => frame.kind === "agent_failed")).toHaveLength(0);
