@@ -10,6 +10,7 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { applyStartupModelProfiles } from "../src/main";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../src/sdk/lifecycle-session";
 import { SdkStartupCapability, SdkStartupRollbackTracker } from "../src/sdk/startup-capability";
+import { AgentSession, SessionDisposalIncompleteError } from "../src/session/agent-session";
 
 /**
  * The coordinator model pin (#4707) validates a selector against its own
@@ -91,8 +92,70 @@ describe("lifecycle session explicit model pin", () => {
 		capability.cancel(failure);
 
 		const created = await createLifecycleAgentSession({}, { capability, rollback });
-		expect(created).toEqual({ capability, rollback, failure });
+		expect(created).toEqual({ capability, rollback, failure, cleanupComplete: true });
 	});
+
+	test("reports incomplete owner cancellation when late session disposal fails", async () => {
+		const cwd = tempCwd();
+		const settingsReady = Promise.withResolvers<void>();
+		const settingsRelease = Promise.withResolvers<Settings>();
+		const originalLoadSettings = Settings.loadForScope.bind(Settings);
+		const loadSettings = vi.spyOn(Settings, "loadForScope").mockImplementation(async options => {
+			if (options.cwd === cwd && options.agentDir === cwd) {
+				settingsReady.resolve();
+				return await settingsRelease.promise;
+			}
+			return await originalLoadSettings(options);
+		});
+		const rollback = new SdkStartupRollbackTracker();
+		const capability = new SdkStartupCapability(rollback, "immediate", "late-disposal-failure");
+		const cancellation = capability.normalizeFailure("startup", "pending");
+		const sessionManager = SessionManager.inMemory(cwd);
+		let partiallyDisposed: AgentSession | undefined;
+		const dispose = vi.spyOn(AgentSession.prototype, "dispose").mockImplementation(async function (
+			this: AgentSession,
+		) {
+			partiallyDisposed = this;
+			throw new SessionDisposalIncompleteError("controlled session disposal failure");
+		});
+		const awaitDisposeCompletion = vi
+			.spyOn(AgentSession.prototype, "awaitDisposeCompletion")
+			.mockRejectedValue(new Error("controlled cleanup join failure"));
+		let created: CreateLifecycleAgentSessionResult | undefined;
+		try {
+			const constructing = createLifecycleAgentSession(
+				{
+					cwd,
+					agentDir: cwd,
+					authStorage,
+					sessionManager,
+					disableExtensionDiscovery: true,
+					skills: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableLsp: false,
+					toolNames: [],
+				},
+				{ capability, rollback },
+			);
+			await settingsReady.promise;
+			capability.cancel(cancellation);
+			settingsRelease.resolve(Settings.isolated());
+			created = await constructing;
+			if (!("failure" in created)) throw new Error("Cancelled lifecycle construction returned a live session.");
+			expect(created.failure).toEqual(cancellation);
+			expect(created.cleanupComplete).toBe(false);
+			expect(created.capability).toBe(capability);
+			expect(created.rollback).toBe(rollback);
+		} finally {
+			awaitDisposeCompletion.mockRestore();
+			dispose.mockRestore();
+			loadSettings.mockRestore();
+			if (partiallyDisposed) await partiallyDisposed.dispose();
+			await sessionManager.close();
+		}
+	}, 30_000);
 
 	test("keeps the pin as the effective model after default-profile and mpreset processing", async () => {
 		const cwd = tempCwd();
