@@ -623,10 +623,12 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 	);
 	// The fixed publish boundary iterates the sealed plan, so dependency order
 	// (e.g. @gajae-code/ai before @gajae-code/agent-core) must be computed here.
-	const publicationOrder = planExpectedEvidencePublication(expected.packages).map(record => record.name);
+	// Each wave holds packages that do not depend on one another; the boundary
+	// publishes a wave concurrently and only starts the next once it is visible.
+	const publicationWaves = planExpectedEvidencePublicationWaves(expected.packages);
 	await writeImmutableBytes(
 		path.join(evidenceDirectory, PUBLISH_ORDER_FILE),
-		canonicalJsonBytes({ schema_version: 1, order: publicationOrder }),
+		canonicalJsonBytes({ schema_version: 2, waves: publicationWaves }),
 	);
 	console.log(JSON.stringify({
 		ok: true,
@@ -663,7 +665,7 @@ async function readRegistryDocument(packageName: string, versionOrTag: string): 
 }
 export const CHANNEL_BEFORE_EVIDENCE_FILE = "gajae-release-channel-before-v1.json";
 /** Dependency-ordered publication plan sealed by release_prepare; the fixed boundary publishes in exactly this order. */
-export const PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json";
+export const PUBLISH_ORDER_FILE = "gajae-release-publish-order-v2.json";
 /** Written by the fixed (no-repo-code) OIDC publish boundary; finalize requires it. */
 export const PUBLISH_RECEIPT_FILE = "gajae-release-oidc-publish-receipt-v1.json";
 
@@ -1138,6 +1140,27 @@ export function planExpectedEvidencePublication(records: readonly PackageEvidenc
 		throw new Error(`Expected evidence internal dependency graph contains a cycle: ${cycle}`);
 	}
 	return ordered;
+}
+
+/**
+ * Group the dependency-ordered plan into waves: every package lands in the first wave
+ * after all of its internal dependencies, so packages inside one wave never depend on
+ * each other and may be published concurrently while dependencies still publish first.
+ * npm takes minutes to accept each publish, so waves bound wall time by graph depth
+ * instead of package count. Within a wave, declaration order is preserved.
+ */
+export function planExpectedEvidencePublicationWaves(records: readonly PackageEvidenceRecord[]): string[][] {
+	const waveByName = new Map<string, number>();
+	const waves: string[][] = [];
+	for (const record of planExpectedEvidencePublication(records)) {
+		let wave = 0;
+		for (const dependencyName of Object.keys(record.internal_dependencies)) {
+			wave = Math.max(wave, waveByName.get(dependencyName)! + 1);
+		}
+		waveByName.set(record.name, wave);
+		(waves[wave] ??= []).push(record.name);
+	}
+	return waves;
 }
 
 export async function publishExpectedEvidencePackages<T>(
