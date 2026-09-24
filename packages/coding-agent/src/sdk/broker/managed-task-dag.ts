@@ -1633,9 +1633,9 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	const target = managedEnrollmentIndexPath(agent);
 	// Managed enrollment can only be published on Linux (private durable publication). Elsewhere
 	// an absent index is the only reachable state; do not let the Linux-only lock turn it into a
-	// startup failure for brokers that never used task.dag. Only a proven ENOENT is absent: any
-	// other entry (directory, dangling symlink, unreadable path) still fails closed below.
-	if (process.platform !== "linux" && (await isAbsentPath(target)))
+	// startup failure for brokers that never used task.dag. Only a proven ENOENT beneath real
+	// directories is absent: any symlink, non-directory ancestor, or non-file leaf fails closed below.
+	if (process.platform !== "linux" && (await isAbsentBeneathRealDirectories(agent, target)))
 		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 	try {
 		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
@@ -1650,13 +1650,23 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	}
 }
 
-async function isAbsentPath(target: string): Promise<boolean> {
-	try {
-		await fs.lstat(target);
-		return false;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ENOENT";
+/**
+ * True only when some component of `target` below `root` is missing and every component before it
+ * is a real directory (not a symlink). lstat never follows the component it inspects, so walking
+ * one component at a time keeps a symlinked ancestor from masking a present or corrupt namespace.
+ */
+async function isAbsentBeneathRealDirectories(root: string, target: string): Promise<boolean> {
+	let current = root;
+	for (const part of path.relative(root, target).split(path.sep)) {
+		current = path.join(current, part);
+		try {
+			const stat = await fs.lstat(current);
+			if (current === target || !stat.isDirectory()) return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT";
+		}
 	}
+	return false;
 }
 
 export async function recordManagedEnrollment(

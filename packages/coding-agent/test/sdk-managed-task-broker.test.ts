@@ -1955,6 +1955,16 @@ describe.skipIf(process.platform === "linux")("managed enrollment off Linux", ()
 		await fs.rm(target, { recursive: true });
 		await fs.symlink(path.join(agentDir, "missing"), target);
 		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		// A symlinked ancestor (dangling or redirected) must not read as an absent index either.
+		const namespace = path.dirname(target);
+		await fs.rm(namespace, { recursive: true });
+		await fs.symlink(path.join(agentDir, "missing-namespace"), namespace);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		await fs.rm(namespace);
+		const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-elsewhere-"));
+		roots.push(elsewhere);
+		await fs.symlink(elsewhere, namespace);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
 	});
 
 	it("starts a broker that never used task.dag", async () => {
