@@ -753,17 +753,7 @@ export async function discoverAuthStorage(
 			sourceLabel: `broker ${brokerConfig.url}`,
 			credentialRankingMode,
 		});
-		try {
-			await storage.reload();
-		} catch (error) {
-			try {
-				storage.close();
-			} catch {
-				// Preserve the initial reload failure.
-			}
-			throw error;
-		}
-		return storage;
+		return await reloadDiscoveredAuthStorage(storage);
 	}
 	const dbPath = getAgentDbPath(agentDir);
 	const storage = await AuthStorage.create(dbPath, {
@@ -771,13 +761,17 @@ export async function discoverAuthStorage(
 		sourceLabel: `local ${dbPath}`,
 		credentialRankingMode,
 	});
+	return await reloadDiscoveredAuthStorage(storage);
+}
+
+async function reloadDiscoveredAuthStorage(storage: AuthStorage): Promise<AuthStorage> {
 	try {
 		await storage.reload();
 	} catch (error) {
 		try {
 			storage.close();
-		} catch {
-			// Preserve the initial reload failure.
+		} catch (cleanupError) {
+			throw attachStartupCleanupDiagnostic(error, cleanupError);
 		}
 		throw error;
 	}
@@ -1667,6 +1661,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		throw primary;
 	};
+	const settingsResult = await settingsOutcome;
+	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
+	const settings = settingsResult.value;
+	const closeOwnedSettings = async (): Promise<void> => {
+		if (!ownsScopedSettings) return;
+		try {
+			await settings.close();
+		} finally {
+			releaseSettingsScope(settings);
+		}
+	};
 	// Subscribe before owned-registry construction as its first catalog pass may
 	// probe credentials. Embedder handlers disable AuthStorage's no-listener
 	// buffer, so the SDK listener must already be present before any startup probe.
@@ -1679,20 +1684,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 	} catch (error) {
-		const loadedSettings = await settingsOutcome;
-		return await failInitialSetup(error, loadedSettings.ok ? loadedSettings.value : undefined);
+		return await failInitialSetup(error, settings);
 	}
-	const settingsResult = await settingsOutcome;
-	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
-	const settings = settingsResult.value;
-	const closeOwnedSettings = async (): Promise<void> => {
-		if (!ownsScopedSettings) return;
-		try {
-			await settings.close();
-		} finally {
-			releaseSettingsScope(settings);
-		}
-	};
 	const startupAuthConfigResult = await startupAuthConfigOutcome;
 	if (!startupAuthConfigResult.ok) return await failInitialSetup(startupAuthConfigResult.error, settings);
 	const startupAuthConfig = startupAuthConfigResult.value;
