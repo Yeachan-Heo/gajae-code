@@ -4,7 +4,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { getAgentDir, logger, sanitizeDisplayLine } from "@gajae-code/utils";
-import { PublicCommandFailure, type PublicEffectProof, type PublicFailureKind } from "../../cli/public-command-errors";
+import {
+	PUBLIC_COMMAND_DIAGNOSTICS,
+	type PublicCommandDiagnosticCode,
+	PublicCommandFailure,
+	type PublicEffectProof,
+	type PublicFailureKind,
+} from "../../cli/public-command-errors";
 import type { EvidenceReference } from "../../cli/public-command-evidence";
 import { repo as resolveGitRepository } from "../../utils/git";
 import { ensureBroker } from "../broker/ensure";
@@ -20,6 +26,7 @@ import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
+	SessionLifecycleLookupOutcome,
 	SessionLifecycleMutationRequest,
 	SessionLifecycleOperation,
 	SessionLifecycleResult,
@@ -242,8 +249,15 @@ export function lifecyclePublicFailure(outcome: Extract<SessionLifecycleResult, 
 	// The service emits retryable protocol_error only when requestSent is explicitly false.
 	const proof: PublicEffectProof =
 		outcome.certainty === "retryable" && outcome.error.code === "protocol_error" ? "pre-send" : "unknown";
+	// `operation_failed` cannot distinguish a conflict from any other failed operation, so
+	// the conflict survives as one fixed diagnostic. The broker message itself is never
+	// rendered: it may carry request keys, paths, or credentials, and its cause is not
+	// decidable from the code alone.
+	const diagnostics: readonly PublicCommandDiagnosticCode[] | undefined =
+		outcome.error.code === "idempotency_conflict" ? ["lifecycle_idempotency_conflict"] : undefined;
 	return new PublicCommandFailure({
 		...failure.input,
+		...(diagnostics === undefined ? {} : { diagnostics }),
 		// Generic lifecycle codes cannot override the authoritative, conservative proof.
 		kind:
 			failure.input.kind === "usage" || failure.input.kind === "invalid_json"
@@ -2274,6 +2288,22 @@ function sessionCloseRequestKey(
 	return `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.close:${sessionId}:${authority.endpointGeneration}:${authority.endpointIncarnation}`;
 }
 
+/**
+ * The lookup route returns its structured outcome directly: it never passes through the
+ * public error envelope (nor its 8192-byte budget), and `stripSecretFields` only drops
+ * secret-shaped field *names*, not a broker-controlled `message` body. A conflict message
+ * can carry request keys, paths, or credentials, so exactly that code carries the same
+ * fixed, cause-neutral text as the public diagnostic. Every other code — including unknown,
+ * near-miss, and prototype-shaped ones — is left undiagnosed and unchanged.
+ */
+function sanitizedLookupOutcome(outcome: SessionLifecycleLookupOutcome): SessionLifecycleLookupOutcome {
+	if (outcome.ok || outcome.error.code !== "idempotency_conflict") return outcome;
+	return {
+		...outcome,
+		error: { ...outcome.error, message: PUBLIC_COMMAND_DIAGNOSTICS.lifecycle_idempotency_conflict },
+	};
+}
+
 async function runRawGlobal(
 	agentDir: string,
 	operation: string,
@@ -2307,13 +2337,15 @@ async function runRawGlobal(
 		if (!args.idempotencyKey)
 			throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for session lookup.", 2);
 		const lifecycle = lifecycleOverride ?? createBrokerSessionLifecycleService(agentDir);
-		return await lifecycle.lookup({
-			actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
-			capability: "session.lookup",
-			operation: "session.create",
-			requestKey: args.idempotencyKey,
-			target: input,
-		});
+		return sanitizedLookupOutcome(
+			await lifecycle.lookup({
+				actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
+				capability: "session.lookup",
+				operation: "session.create",
+				requestKey: args.idempotencyKey,
+				target: input,
+			}),
+		);
 	}
 	if (!isLifecycleOperation(operation))
 		throw new SdkSessionCliError("unknown_operation", `Unknown global operation: ${operation}`, 1);
@@ -2510,7 +2542,7 @@ export async function runSdkSessionCli(
 		const secretError = validateAdapterSecretFields(operation, input);
 		if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
 		if (kind === "global") {
-			const result = await runRawGlobal(agentDir, operation, input, args);
+			const result = await runRawGlobal(agentDir, operation, input, args, deps.lifecycleService);
 			writeOutput(stripSecretFields(result));
 			if (isRecord(result) && result.ok === false) setExitCode(1);
 			return;
