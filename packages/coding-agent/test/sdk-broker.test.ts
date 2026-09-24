@@ -253,9 +253,15 @@ it("never lets the master capability cross into a cold-started broker", () => {
 	const environment = brokerSpawnEnvironmentForTest(command, {
 		PATH: process.env.PATH,
 		GJC_MASTER_CAPABILITY: "must-not-cross-the-lifecycle-boundary",
+		GJC_MASTER_OWNER_SESSION_ID: "must-not-cross-the-owner-session-boundary",
+		gJc_Master_Capability: "mixed-capability",
+		gJc_Master_Owner_Session_Id: "mixed-owner-session",
 		OWNED_SENTINEL: "kept",
 	});
 	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
+	expect(environment.GJC_MASTER_OWNER_SESSION_ID).toBeUndefined();
+	expect(environment.gJc_Master_Capability).toBeUndefined();
+	expect(environment.gJc_Master_Owner_Session_Id).toBeUndefined();
 	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
 });
@@ -383,6 +389,10 @@ it("strips inherited session markers from compiled broker environments", () => {
 			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
 			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
 			GJC_STATE_ROOT: "/tui/.gjc/state",
+			GJC_MASTER_CAPABILITY: "compiled-master-capability",
+			GJC_MASTER_OWNER_SESSION_ID: "compiled-master-owner",
+			gJc_Master_Capability: "compiled-mixed-capability",
+			gJc_Master_Owner_Session_Id: "compiled-mixed-owner",
 			GJC_TMUX_COMMAND: "custom-tmux",
 			GJC_TMUX_SESSION: "user-configured-tmux",
 			GJC_TMUX_PROFILE: "1",
@@ -417,6 +427,10 @@ it("strips inherited session markers from compiled broker environments", () => {
 		"GJC_LIFECYCLE_REQUEST_ID",
 		"GJC_SDK_LIFECYCLE_REQUEST",
 		"GJC_STATE_ROOT",
+		"GJC_MASTER_CAPABILITY",
+		"GJC_MASTER_OWNER_SESSION_ID",
+		"gJc_Master_Capability",
+		"gJc_Master_Owner_Session_Id",
 	])
 		expect(environment[name]).toBeUndefined();
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");

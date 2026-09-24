@@ -94,6 +94,8 @@ const BROKER_SESSION_ENV_NAMES = new Set([
 	"GJC_LIFECYCLE_REQUEST_ID",
 	"GJC_SDK_LIFECYCLE_REQUEST",
 	"GJC_STATE_ROOT",
+	"GJC_MASTER_CAPABILITY",
+	"GJC_MASTER_OWNER_SESSION_ID",
 ]);
 const BROKER_SESSION_ENV_PRESERVED_NAMES = new Set([
 	"GJC_SESSION_CONTEXT_BUDGET_BYTES",
@@ -483,11 +485,8 @@ function registerBrokerOwner(
 function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const environment = { ...(override ?? command.env) };
 	delete environment.BUN_OPTIONS;
-	// The master capability is a transient in-memory dispatch input. A broker
-	// cold-started from the master's own Bash environment would otherwise inherit
-	// it and pass it on to every substrate child it later launches, so it is
-	// stripped at the lifecycle boundary exactly as lifecycle children strip it.
-	delete environment.GJC_MASTER_CAPABILITY;
+	// Master capability and owner-session markers are matched by the normalized
+	// identity-name set below, including differently-cased Windows environment keys.
 	// The broker outlives the TUI session that happened to start it. Never let
 	// that session's identity or coordinator/tmux ownership markers flow through
 	// the broker's process.env into unrelated session hosts. Keep user tmux
