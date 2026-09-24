@@ -185,7 +185,8 @@ function node(id: string, workspace: string, resource: string) {
 	};
 }
 
-describe("managed task.dag broker admission (test-only, no M3 recovery)", () => {
+// Managed task DAG publication requires Linux private durable publication (docs/managed-task-dag.md).
+describe.skipIf(process.platform !== "linux")("managed task.dag broker admission (test-only, no M3 recovery)", () => {
 	it("wrong token and wrong capability yield state and effects 0", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-auth-"));
 		roots.push(root);
@@ -1702,13 +1703,11 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 				expectedRevision: currentRevision,
 				nodeIds: ["n"],
 			});
-			let cancelSettled = false;
-			void cancel.then(() => {
-				cancelSettled = true;
-			});
-			await Bun.sleep(50);
-			expect(cancelSettled).toBe(true);
-			expect(await cancel).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			// Cancel must settle while the launch is still held open; bound the wait generously so
+			// loaded CI runners do not race the close-wait and the locked domain write.
+			const cancelOutcome = await Promise.race([cancel, Bun.sleep(5_000).then(() => "still-pending" as const)]);
+			expect(cancelOutcome).not.toBe("still-pending");
+			expect(cancelOutcome).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
 			const duringLaunch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
 				graphs: Array<{ attempts: Array<{ fence: string }> }>;
 			};
@@ -1934,6 +1933,47 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			launchRelease.resolve();
 			ws.close();
 			wsStatus.close();
+			await broker.stop();
+		}
+	});
+});
+
+describe.skipIf(process.platform === "linux")("managed enrollment off Linux", () => {
+	it("reads an absent index as empty but fails closed on a non-file index entry", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-"));
+		roots.push(agentDir);
+		expect(await loadManagedEnrollmentRecord(agentDir)).toEqual({
+			controlRoots: [],
+			establishedRoots: [],
+			publishingRoots: [],
+			nativeIdentities: [],
+			byRoot: {},
+		});
+		const target = managedEnrollmentIndexPath(await fs.realpath(agentDir));
+		await fs.mkdir(target, { recursive: true });
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		await fs.rm(target, { recursive: true });
+		await fs.symlink(path.join(agentDir, "missing"), target);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		// A symlinked ancestor (dangling or redirected) must not read as an absent index either.
+		const namespace = path.dirname(target);
+		await fs.rm(namespace, { recursive: true });
+		await fs.symlink(path.join(agentDir, "missing-namespace"), namespace);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		await fs.rm(namespace);
+		const elsewhere = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-elsewhere-"));
+		roots.push(elsewhere);
+		await fs.symlink(elsewhere, namespace);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+	});
+
+	it("starts a broker that never used task.dag", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-broker-"));
+		roots.push(agentDir);
+		const broker = new Broker({ agentDir: path.join(agentDir, "agent"), packageGeneration: "test" });
+		try {
+			expect((await broker.start()).url).toStartWith("ws");
+		} finally {
 			await broker.stop();
 		}
 	});
