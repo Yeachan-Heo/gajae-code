@@ -309,7 +309,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	canonicalThenAlias?: boolean;
 	terminalCodexEntry?: boolean;
 	removeFailedCredentialDuringMark?: boolean;
-	unknownRowIdBeforeMark?: boolean;
+	unknownFailedRowIdFromMark?: boolean;
 	unresolvablePeerDuringMark?: boolean;
 }): Promise<{
 	models: string[];
@@ -349,7 +349,6 @@ async function runManagedFallbackQuotaScenario(options: {
 	let aliasModel: Model | undefined;
 	const fallback = getBundledModel("openai", "gpt-4o-mini");
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
-	let restoreUnknownRowId: (() => void) | undefined;
 	let restorePeerResolver: (() => void) | undefined;
 	const unresolvablePeerIds = new Set<number>();
 	let unknownRowIdInjected = false;
@@ -469,11 +468,6 @@ async function runManagedFallbackQuotaScenario(options: {
 					firstProviderDispatchQuotaInjected = true;
 				}
 				if (isCredentialProvider(requestedModel.provider) && quotaKeys.has(key)) {
-					if (options.unknownRowIdBeforeMark && !unknownRowIdInjected) {
-						const rowIdSpy = vi.spyOn(storage, "getSessionCredentialRowId").mockReturnValueOnce(undefined);
-						restoreUnknownRowId = () => rowIdSpy.mockRestore();
-						unknownRowIdInjected = true;
-					}
 					return usageLimitStream(
 						requestedModel,
 						options.trigger ?? "quota",
@@ -505,6 +499,7 @@ async function runManagedFallbackQuotaScenario(options: {
 			options.removeFailedCredentialDuringMark ||
 			options.addApiKeyDuringMark !== undefined ||
 			options.addOAuthAccountAfterExhaustion !== undefined ||
+			options.unknownFailedRowIdFromMark ||
 			options.unresolvablePeerDuringMark
 		) {
 			let removedFailedCredential = false;
@@ -534,6 +529,11 @@ async function runManagedFallbackQuotaScenario(options: {
 					addedApiKey = true;
 				}
 				const markResult = await pendingMark;
+				const reportedMarkResult =
+					options.unknownFailedRowIdFromMark && !unknownRowIdInjected && markResult.state === "marked"
+						? { ...markResult, failedRowId: Number.MAX_SAFE_INTEGER }
+						: markResult;
+				if (options.unknownFailedRowIdFromMark) unknownRowIdInjected = true;
 				if (
 					options.addOAuthAccountAfterExhaustion !== undefined &&
 					markUsageLimitReached.mock.calls.length >= options.accounts.length &&
@@ -550,9 +550,9 @@ async function runManagedFallbackQuotaScenario(options: {
 					addedOAuthAccount = true;
 				}
 				if (options.unresolvablePeerDuringMark) {
-					for (const peerId of markResult.remainingCredentialIds) unresolvablePeerIds.add(peerId);
+					for (const peerId of reportedMarkResult.remainingCredentialIds) unresolvablePeerIds.add(peerId);
 				}
-				return markResult;
+				return reportedMarkResult;
 			});
 		}
 		await session.prompt("recover from a Codex quota error");
@@ -567,7 +567,6 @@ async function runManagedFallbackQuotaScenario(options: {
 				: {}),
 		};
 	} finally {
-		restoreUnknownRowId?.();
 		restorePeerResolver?.();
 		await session?.dispose();
 		registeredRegistry?.clearSourceRegistrations(aliasSourceId);
@@ -724,14 +723,14 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.markCount).toBe(1);
 	});
 
-	test("retries managed fallback when row identity is unknown but a peer remains", async () => {
+	test("retries from request-bound identity when the mark reports an unknown row ID", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!model) throw new Error("Missing bundled Codex fixture model");
 		const result = await runManagedFallbackQuotaScenario({
 			accounts: ["a", "b"],
 			quotaKeys: ["TOKEN-a"],
 			maxAttempts: 1,
-			unknownRowIdBeforeMark: true,
+			unknownFailedRowIdFromMark: true,
 		});
 		expect(result).toEqual({
 			models: [selector(model), selector(model)],
@@ -785,7 +784,7 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.markCount).toBe(1);
 	});
 
-	test("finds a same-kind peer when row identity is unknown and the failed row vanishes", async () => {
+	test("finds a peer when the failed row vanishes with unknown mark identity", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!model) throw new Error("Missing bundled Codex fixture model");
 		const result = await runManagedFallbackQuotaScenario({
@@ -793,7 +792,7 @@ describe("managed fallback quota credential rotation", () => {
 			quotaKeys: ["TOKEN-a"],
 			maxAttempts: 1,
 			removeFailedCredentialDuringMark: true,
-			unknownRowIdBeforeMark: true,
+			unknownFailedRowIdFromMark: true,
 		});
 		expect(result.models).toEqual([selector(model), selector(model)]);
 		expect(result.keys[0]).toBe("TOKEN-a");
