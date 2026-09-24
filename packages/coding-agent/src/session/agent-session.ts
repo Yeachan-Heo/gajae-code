@@ -5430,6 +5430,7 @@ export class AgentSession {
 				const shouldCapture =
 					model !== undefined &&
 					modelKey !== undefined &&
+					controller !== undefined &&
 					controller.chain.entries.length > 1;
 				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
 				if (
