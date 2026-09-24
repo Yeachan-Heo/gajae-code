@@ -56,6 +56,18 @@ export function controlInferRequest(token: string, body: string): string {
 	return `${JSON.stringify({ op: "infer", token, body })}\n`;
 }
 
+/**
+ * Did the supervisor actually reap the service?
+ *
+ * Only a numeric exit status says so. `ok` alone does not: the supervisor
+ * replies `exit_unconfirmed` when its own `wait()` timed out, and a caller that
+ * treated that as success would retire the ownership record while the service
+ * may still be holding its port.
+ */
+export function isConfirmedStop(reply: KevControlReply | undefined): boolean {
+	return reply?.ok === true && typeof reply.exit === "number";
+}
+
 export function controlSocketPathIsBindable(socketPath: string): boolean {
 	return Buffer.byteLength(socketPath, "utf8") <= CONTROL_SOCKET_PATH_MAX;
 }
@@ -328,6 +340,13 @@ def serve(connection, child, token, port):
         reply(connection, {"ok": False, "error": "unsupported"})
         return False
     code = terminate(child)
+    if not isinstance(code, int):
+        # wait() never returned a status, so this process cannot say the child is
+        # gone. Keep the handle, the control socket and the watch pipe alive so a
+        # later stop can retry; acknowledging here would retire the record while
+        # something may still be holding the port.
+        reply(connection, {"ok": False, "error": "exit_unconfirmed"})
+        return False
     reply(connection, {"ok": True, "exit": code})
     return True
 

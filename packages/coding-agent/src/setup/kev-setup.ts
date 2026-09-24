@@ -9,6 +9,7 @@ import {
 	CONTROL_FILE,
 	controlRequest,
 	controlSocketPathIsBindable,
+	isConfirmedStop,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
@@ -580,6 +581,13 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 		if (!published) child.kill();
 	}
 }
+/** Why a stop was not acknowledged. Ownership is retained in every one of these cases. */
+function unconfirmedStopReason(reply: KevControlReply | undefined): string {
+	const retained = "ownership retained and nothing was signaled";
+	if (reply === undefined) return `Kev supervisor did not answer its control socket; ${retained}`;
+	if (!reply.ok) return `Kev supervisor refused the stop (${reply.error ?? "unknown"}); ${retained}`;
+	return `Kev supervisor did not confirm that the service exited; ${retained}`;
+}
 async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 	const current = await status(root, deps);
 	if (current.state === "foreign") return current;
@@ -607,16 +615,11 @@ async function stopKev(root: string, deps: KevSetupDeps): Promise<KevStatus> {
 		// supervisor signals a child handle it holds — so a pid recycled between the
 		// check and the stop is never signaled, because no pid is ever signaled here.
 		const reply = await (deps.control ?? kevControl)(controlSocket(root), controlRequest("stop", record.token));
-		if (!reply?.ok && (deps.inspect ?? inspectDefault)(record.pid)) {
-			return {
-				ok: false,
-				state: "stopping",
-				...retained,
-				error:
-					reply === undefined
-						? "Kev supervisor did not answer its control socket; ownership retained and nothing was signaled"
-						: `Kev supervisor refused the stop (${reply.error ?? "unknown"}); ownership retained and nothing was signaled`,
-			};
+		// Only a numeric exit status is a stop. A supervisor that answered without
+		// reaping its child has not proven anything went away, so the record stays
+		// and a later stop retries against the same channel.
+		if (!isConfirmedStop(reply) && (deps.inspect ?? inspectDefault)(record.pid)) {
+			return { ok: false, state: "stopping", ...retained, error: unconfirmedStopReason(reply) };
 		}
 	}
 	// The supervisor is gone — confirmed, already absent, or exited mid-stop. The

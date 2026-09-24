@@ -440,6 +440,27 @@ describe("Kev lifecycle", () => {
 		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 	});
 
+	test("an unconfirmed child exit is never acknowledged as a stop", async () => {
+		// The port is free and the supervisor answered — but it never reaped its
+		// child, so nothing here has proven the service is gone.
+		for (const reply of [
+			{ ok: true, exit: null },
+			{ ok: false, error: "exit_unconfirmed" },
+		] as const) {
+			const f = await fixture();
+			await runKevSetup("install", { root: f.root }, f.deps);
+			await runKevSetup("start", {}, f.deps);
+			f.deps.control = async (socketPath, message) => {
+				const request = JSON.parse(message.trim()) as Record<string, unknown>;
+				f.control.push({ socket: socketPath, request });
+				if (request.op === "status") return { ok: true, pid: f.supervisor.servicePid, state: "running" };
+				return reply;
+			};
+			expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ ok: false, state: "stopping" });
+			expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(true);
+		}
+	});
+
 	test("retains ownership when the supervisor does not answer its control socket", async () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);
