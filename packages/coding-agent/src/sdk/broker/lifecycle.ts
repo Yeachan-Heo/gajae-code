@@ -1766,33 +1766,21 @@ export class LifecycleReadinessCleanupError extends Error {
 	}
 }
 
-function removeOwnedLifecycleReadyMarker(root: string, id: string, effectMarker: string, incarnation: string): boolean {
-	const directory = path.join(root, "sdk");
+function removeOwnedLifecycleReadyMarker(
+	root: string,
+	id: string,
+	identity: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint },
+	parent: { dev: bigint; ino: bigint },
+): boolean {
 	const readyPath = lifecycleReadyPath(root, id);
-	let ready: LifecycleFileCapture | undefined;
 	try {
-		ready = captureLifecycleFile(readyPath, true, true);
-	} catch {
-		return false;
-	}
-	if (!ready) return !fsSync.existsSync(readyPath);
-	try {
-		const marker = parseLifecycleJson(ready.bytes);
-		if (
-			!isExactEffectMarker(marker) ||
-			marker.pid !== process.pid ||
-			marker.effectMarker !== effectMarker ||
-			marker.incarnation !== incarnation
-		)
-			return false;
-		const parent = lifecycleParentIdentity(directory);
-		if (!parent) return false;
-		return nativeLifecycle().exactUnlinkDirect(readyPath, {
-			...ready.identity,
-			parentDev: BigInt(parent.dev),
-			parentIno: BigInt(parent.ino),
+		const result = nativeLifecycle().exactUnlinkDirect(readyPath, {
+			...identity,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
 			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
-		}).ok;
+		});
+		return result.ok || result.code === "not_found";
 	} catch {
 		return false;
 	}
@@ -1809,20 +1797,40 @@ export async function writeSessionLifecycleReady(
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const parent = lifecycleParentIdentity(directory);
+	if (!parent) throw new Error("Lifecycle readiness directory identity is unavailable.");
+	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
 	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
-	const handle = await fs.open(
-		temporary,
-		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
-		0o600,
-	);
-	try {
-		await handle.writeFile(canonicalJson({ pid: process.pid, effectMarker, incarnation }));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
+	const contents = canonicalJson({ pid: process.pid, effectMarker, incarnation });
+	// Retain the exact temporary inode through publication; revocation must not
+	// re-capture a replacement at the canonical path and mistake it for ours.
+	let publicationIdentity:
+		| { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; sha256: string; nlink: bigint }
+		| undefined;
+	let handle: fs.FileHandle | undefined;
 	let published = false;
 	try {
+		handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			0o600,
+		);
+		await handle.writeFile(contents);
+		await handle.sync();
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile() || stat.nlink !== 1n)
+			throw new Error("Lifecycle readiness temporary file identity is invalid.");
+		publicationIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(contents).digest("hex"),
+			nlink: stat.nlink,
+		};
+		await handle.close();
+		handle = undefined;
+		if (!publicationIdentity) throw new Error("Lifecycle readiness temporary file identity is unavailable.");
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
 		fsSync.renameSync(temporary, lifecycleReadyPath(root, id));
 		published = true;
@@ -1830,11 +1838,27 @@ export async function writeSessionLifecycleReady(
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
 		onPublished?.();
 	} catch (error) {
-		if (published && !removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation))
-			throw new LifecycleReadinessCleanupError(error);
+		const cleanupErrors: unknown[] = [];
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (published) {
+			if (!publicationIdentity || !removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity))
+				cleanupErrors.push(new Error("The exact lifecycle ready marker could not be revoked."));
+		} else {
+			try {
+				await fs.rm(temporary, { force: true });
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleReadinessCleanupError(new AggregateError([error, ...cleanupErrors]));
 		throw error;
-	} finally {
-		await fs.rm(temporary, { force: true });
 	}
 }
 

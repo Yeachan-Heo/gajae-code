@@ -779,8 +779,9 @@ export async function runSessionHost(
 		if (!opened) throw new Error("Lifecycle session manager was not opened.");
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
-			mcpConfigDirectory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")));
-			mcpConfigPath = path.join(mcpConfigDirectory, "mcp.json");
+			mcpConfigDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-"));
+			const resolvedMcpConfigDirectory = await fs.realpath(mcpConfigDirectory);
+			mcpConfigPath = path.join(resolvedMcpConfigDirectory, "mcp.json");
 			await Bun.write(
 				mcpConfigPath,
 				JSON.stringify({
@@ -862,11 +863,14 @@ export async function runSessionHost(
 			cleanupError === undefined
 				? baseFailure
 				: capability.normalizeFailure(baseFailure.phase, baseFailure.reason, cleanupError);
-		removeStartupSignalHandlers();
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(durableFailure, rollback.result);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw error;
 	}
 	if (!opened || !created) throw new Error("Lifecycle construction did not produce a result.");
@@ -879,11 +883,14 @@ export async function runSessionHost(
 		} catch (error) {
 			failure = capability.normalizeFailure(failure.phase, failure.reason, error);
 		}
-		removeStartupSignalHandlers();
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(durableFailure, rollback.result);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw failure;
 	}
 	if (created.capability !== capability || created.rollback !== rollback) {
@@ -895,9 +902,12 @@ export async function runSessionHost(
 					"failed",
 					"Lifecycle startup owner changed during construction.",
 				);
-		removeStartupSignalHandlers();
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(failure, rollback.result);
+		try {
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(failure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
 		throw failure;
 	}
 	const { parsed } = opened;
@@ -1002,38 +1012,32 @@ export async function runSessionHost(
 
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
-		await beforeCutoff(
-			() =>
-				process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
-					? new Promise<void>(() => {})
-					: applyModelProfiles({
-							session,
-							settings: session.settings,
-							modelRegistry: session.modelRegistry,
-							parsedArgs: parsed,
-							startupThinkingLevel,
-							preferCachedModels: true,
-							preferCachedDefaultProfile: true,
-						}),
-			undefined,
-			false,
+		await beforeCutoff(() =>
+			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
+				? new Promise<void>(() => {})
+				: applyModelProfiles({
+						session,
+						settings: session.settings,
+						modelRegistry: session.modelRegistry,
+						parsedArgs: parsed,
+						startupThinkingLevel,
+						preferCachedModels: true,
+						preferCachedDefaultProfile: true,
+					}),
 		);
-		await beforeCutoff(
-			() =>
-				initializeExtensions(session, {
-					reportSendError: () => {},
-					reportRuntimeError: () => {},
-					onShutdown: stop,
-				}),
-			undefined,
-			false,
+		await beforeCutoff(() =>
+			initializeExtensions(session, {
+				reportSendError: () => {},
+				reportRuntimeError: () => {},
+				onShutdown: stop,
+			}),
 		);
 		throwIfStartupInterrupted();
 		if (session.sessionManager.getSessionId() !== request.sessionId)
 			throw new Error(
 				`Lifecycle session id mismatch: expected ${request.sessionId}, got ${session.sessionManager.getSessionId()}.`,
 			);
-		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise, undefined, false);
+		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise);
 		if (startup.status !== "started") throw startup.failure;
 		throwIfStartupInterrupted();
 		if (process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION === cwd)
@@ -1048,23 +1052,28 @@ export async function runSessionHost(
 				effectMarker,
 				() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
 				() => {
-					startupComplete = true;
-					removeStartupSignalHandlers();
 					process.once("SIGTERM", onReadySignal);
 					process.once("SIGINT", onReadySignal);
+					removeStartupSignalHandlers();
+					startupComplete = true;
 				},
 			),
 		);
 	} catch (error) {
-		removeStartupSignalHandlers();
 		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
 		const failure =
 			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
 				? (error as SdkStartupFailure)
 				: capability.normalizeFailure("startup", "failed", error);
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		await failAfterRollback(durableFailure);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			await failAfterRollback(durableFailure);
+		} finally {
+			removeStartupSignalHandlers();
+			process.removeListener("SIGTERM", onReadySignal);
+			process.removeListener("SIGINT", onReadySignal);
+		}
 		throw error;
 	}
 	// Readiness is published; the session is live. Memory startup issues one LLM
