@@ -3636,6 +3636,25 @@ export const SETTINGS_SCHEMA = {
 				"Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 		},
 	},
+	"task.delegationHint.mode": {
+		type: "enum",
+		values: ["off", "hint"] as const,
+		default: "off",
+		ui: {
+			tab: "tasks",
+			label: "Delegation Decision Hint",
+			description:
+				"Opt in to transient local-only Kev advice after observable edit activity. Notices never alter prompts, task arguments, or saved sessions.",
+			options: [
+				{ value: "off", label: "Off", description: "Do not request decision hints (default)" },
+				{
+					value: "hint",
+					label: "Hint",
+					description: "Show ephemeral user-facing advice from the local Kev service",
+				},
+			],
+		},
+	},
 
 	"task.simple": {
 		type: "enum",
