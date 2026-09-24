@@ -514,8 +514,8 @@ describe("Kev lifecycle", () => {
 	test("a start that cannot publish its record never releases the supervisor", async () => {
 		const f = await fixture();
 		await runKevSetup("install", { root: f.root }, f.deps);
-		// Publication fails: server.json's parent is replaced by a file, so the
-		// atomic write cannot land.
+		// The spawned process identity never resolves, so start fails before it can
+		// publish a record.
 		f.deps.inspect = () => undefined;
 		await expect(runKevSetup("start", {}, f.deps)).rejects.toThrow("process identity");
 		expect(f.commits).toEqual([]);
@@ -658,7 +658,6 @@ describe("Kev lifecycle lock", () => {
 		}
 	}, 20_000);
 });
-
 
 describe.skipIf(!python)("Kev supervisor process", () => {
 	/**
