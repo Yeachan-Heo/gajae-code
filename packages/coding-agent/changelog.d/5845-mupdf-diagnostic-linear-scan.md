@@ -1,0 +1,3 @@
+### Fixed
+
+- PDF conversion diagnostics are sanitized in linear time. The path-redaction rule in `sanitizeMuPdfDiagnostic` restarted its prefix run at every offset of a long separator-free message before failing to find a `/`, `\`, `%2f`, or `%5c`, which is quadratic in the message length: 12.5k/25k/50k/100k characters cost 207ms/832ms/3.3s/13.3s. A MuPDF diagnostic is derived from the document being converted, and `normalizeError` applies this once per link in the error's cause chain, so a malformed PDF read through the `read` tool could stall the conversion. The prefix run is now boundary anchored; redaction output is unchanged.

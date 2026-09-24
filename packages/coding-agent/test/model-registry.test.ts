@@ -303,6 +303,19 @@ describe("ModelRegistry", () => {
 		});
 	}
 
+	function configuredDiscoveryProvenance(authEvidence: string, endpoint: string, api: Api): string {
+		const context = JSON.stringify({
+			authEvidence,
+			endpoint,
+			headers: [],
+			discoveryType: "openai-models-list",
+			api,
+			apiByModelPrefix: [],
+			modelsDevProvider: "",
+		});
+		return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+	}
+
 	function mockOllamaDiscovery(modelNames: string[]) {
 		return hookFetch(input => {
 			const url = String(input);
@@ -7067,6 +7080,197 @@ describe("ModelRegistry", () => {
 
 			await authStorage.set("tracked-provider", []);
 			expect(trackedRows()).toEqual([]);
+		});
+
+		test("publishes fresh authoritative LiteLLM cache evidence without a models-list request", async () => {
+			const modelId = "viant-gemini-3-8-flash";
+			const endpoint = "http://localhost:4000/v1";
+			const cachedModel: Model<"openai-completions"> = {
+				id: modelId,
+				name: modelId,
+				api: "openai-completions",
+				provider: "litellm",
+				baseUrl: endpoint,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			authStorage.setRuntimeApiKey("litellm", "cached-litellm-key");
+			writeRawModelsJson({
+				litellm: {
+					baseUrl: endpoint,
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration("litellm", "cached-litellm-key"),
+				endpoint,
+				"openai-completions",
+			);
+			writeModelCache("litellm", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+
+			let modelsListRequests = 0;
+			using _hook = hookFetch(input => {
+				modelsListRequests++;
+				throw new Error(`unexpected models-list request: ${String(input)}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id),
+			).toContain(modelId);
+			await registry.refreshProvider("litellm", "online-if-uncached");
+
+			expect(modelsListRequests).toBe(0);
+			expect(registry.getProviderDiscoveryState("litellm")).toMatchObject({
+				status: "ok",
+				stale: false,
+				fetchedAt: expect.any(Number),
+				models: [modelId],
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "litellm")
+					.map(model => model.id),
+			).toContain(modelId);
+			await registry.dispose();
+		});
+
+		test("retains fresh authoritative empty discovery evidence after online-if-uncached refresh", async () => {
+			const provider = "openai";
+			const endpoint = "http://127.0.0.1:1234/v1";
+			authStorage.setRuntimeApiKey(provider, "empty-openai-discovery-key");
+			writeRawModelsJson({
+				openai: {
+					baseUrl: endpoint,
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration(provider, "empty-openai-discovery-key"),
+				endpoint,
+				"openai-responses",
+			);
+			writeModelCache(provider, Date.now(), [], true, "", cacheDbPath, [], provenance);
+
+			const bundledModel = getBundledModels(provider)[0];
+			if (!bundledModel) throw new Error("Expected a bundled OpenAI model");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			const hasAvailableOpenAiModel = () =>
+				registry.getAvailable().some(model => model.provider === provider && model.id === bundledModel.id);
+			expect(hasAvailableOpenAiModel()).toBe(false);
+
+			let modelsListRequests = 0;
+			using _hook = hookFetch(() => {
+				modelsListRequests++;
+				throw new Error("fresh authoritative empty cache must not make a models-list request");
+			});
+			await registry.refreshProvider(provider, "online-if-uncached");
+
+			expect(modelsListRequests).toBe(0);
+			expect(registry.getProviderDiscoveryState(provider)).toMatchObject({
+				status: "empty",
+				stale: false,
+				models: [],
+				fetchedAt: expect.any(Number),
+			});
+			expect(hasAvailableOpenAiModel()).toBe(false);
+			await registry.dispose();
+		});
+
+		test("does not mutate configured discovery evidence during stored-credential cache validation", async () => {
+			const modelId = "stored-litellm-model";
+			const endpoint = "http://localhost:4000/v1";
+			const cachedModel: Model<"openai-completions"> = {
+				id: modelId,
+				name: modelId,
+				api: "openai-completions",
+				provider: "stored-discovery",
+				baseUrl: endpoint,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 8192,
+			};
+			await authStorage.set("stored-discovery", [{ type: "api_key", key: "stored-discovery-key" }]);
+			writeRawModelsJson({
+				"stored-discovery": {
+					baseUrl: endpoint,
+					api: "openai-completions",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const provenance = configuredDiscoveryProvenance(
+				authStorage.getProviderEvidenceGeneration("stored-discovery", "stored-discovery-key"),
+				endpoint,
+				"openai-completions",
+			);
+			writeModelCache("stored-discovery", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, Settings.isolated(), {
+				automaticRefresh: false,
+			});
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).not.toContain(modelId);
+			{
+				using _cacheHook = hookFetch(input => {
+					throw new Error(`unexpected cache-validation request: ${String(input)}`);
+				});
+				await registry.refreshProvider("stored-discovery", "online-if-uncached");
+			}
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).toContain(modelId);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([
+				{ provider: "stored-discovery", connectionKind: "credential" },
+			]);
+
+			using _hook = hookFetch(() => {
+				throw new Error("configured discovery unavailable");
+			});
+			await registry.refreshProvider("stored-discovery", "online");
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "stored-discovery")
+					.map(model => model.id),
+			).toContain(modelId);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([]);
+
+			// Restore the valid row after the failed online probe. The model remains
+			// in the merged catalog, but this exact credential-scoped read is
+			// observational and must not restore configured discovery authority.
+			writeModelCache("stored-discovery", Date.now(), [cachedModel], true, "", cacheDbPath, [modelId], provenance);
+			const credential = authStorage
+				.exportSnapshot()
+				.credentials.find(entry => entry.provider === "stored-discovery");
+			expect(credential).toBeDefined();
+			expect(
+				registry.validateModelForStoredLiteralCredential("stored-discovery", modelId, {
+					kind: "id",
+					value: String(credential!.id),
+				}),
+			).toBe(true);
+			expect(activeRowsFor(registry, ["stored-discovery"])).toEqual([]);
+			await registry.dispose();
 		});
 
 		test("does not advertise a fresh configured-discovery cache reused without a probe", async () => {

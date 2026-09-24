@@ -3,18 +3,20 @@ import { claudeOpusGeneration, VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS } from "
 import { getBundledModels, getBundledProviders } from "../src/models";
 
 /**
- * Every reviewed Claude Opus generation is vision-capable. Some upstream
- * catalogs omit image input (e.g. kilo/venice "-fast" entries);
- * generate-models.ts corrects these via applyClaudeOpusVisionCorrections so
- * capability advertising stays consistent across providers.
+ * Claude Opus generations are vision-capable on providers whose transports
+ * preserve image input. Some upstream catalogs omit it (e.g. kilo/venice
+ * "-fast" entries), so generate-models.ts corrects those rows. Kiro's API-key
+ * serializer drops images; its Opus 5.5 row intentionally remains text-only
+ * and is covered by kiro-api-key.test.ts.
  */
-function bundledOpusModels(): { qualifiedId: string; generation: number; hasImage: boolean }[] {
-	const models: { qualifiedId: string; generation: number; hasImage: boolean }[] = [];
+function bundledOpusModels(): { provider: string; qualifiedId: string; generation: number; hasImage: boolean }[] {
+	const models: { provider: string; qualifiedId: string; generation: number; hasImage: boolean }[] = [];
 	for (const provider of getBundledProviders()) {
 		for (const model of getBundledModels(provider as Parameters<typeof getBundledModels>[0])) {
 			const generation = claudeOpusGeneration(model.id);
 			if (generation === undefined) continue;
 			models.push({
+				provider,
 				qualifiedId: `${provider}/${model.id}`,
 				generation,
 				hasImage: model.input.includes("image"),
@@ -45,9 +47,14 @@ describe("Claude Opus vision capability", () => {
 	});
 
 	for (const generation of VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS) {
-		it(`advertises image input for every bundled claude-opus-${generation} variant`, () => {
+		it(`advertises image input for every image-capable claude-opus-${generation} provider`, () => {
 			const offenders = bundledOpusModels()
-				.filter(model => model.generation === generation && !model.hasImage)
+				.filter(
+					model =>
+						model.generation === generation &&
+						!(model.provider === "kiro" && generation === 5.5) &&
+						!model.hasImage,
+				)
 				.map(model => model.qualifiedId);
 			expect(offenders).toEqual([]);
 		});
