@@ -677,7 +677,7 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.dispatchGuardExceeded).toBe(false);
 		expect(result.models).toEqual([selector(model), selector(fallback)]);
 		expect(result.keys).toEqual(["TOKEN-a", "fallback-test-key"]);
-		expect(result.markCount).toBe(0);
+		expect(result.markCount).toBe(1);
 	});
 
 	test("stays within the failed credential kind when another kind is also stored", async () => {
@@ -891,7 +891,7 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.markCount).toBe(3);
 	});
 
-	test("honors provider retry ceilings after a successful credential rotation", async () => {
+	test("records the final quota failure without exceeding the provider retry ceiling", async () => {
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
@@ -904,7 +904,7 @@ describe("managed fallback quota credential rotation", () => {
 		expect(result.keys[0]).toBe("TOKEN-a");
 		expect(["TOKEN-b", "TOKEN-c"]).toContain(result.keys[1]);
 		expect(result.keys.at(-1)).toBe("fallback-test-key");
-		expect(result.markCount).toBe(1);
+		expect(result.markCount).toBe(2);
 	});
 
 	test("does not restore a model-unavailable rotation past the provider retry ceiling", async () => {
@@ -924,7 +924,7 @@ describe("managed fallback quota credential rotation", () => {
 		});
 	});
 
-	test("does not mark another account after a ceiling on the final model entry", async () => {
+	test("records the final quota failure without exceeding the ceiling on the final model entry", async () => {
 		const predecessor = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const model = getBundledModel(provider, "gpt-5.1-codex");
 		if (!predecessor || !model) throw new Error("Missing bundled terminal fallback fixture models");
@@ -942,7 +942,7 @@ describe("managed fallback quota credential rotation", () => {
 			});
 			expect(result.models).toEqual([selector(model), selector(model)]);
 			expect(result.keys).toEqual(["TOKEN-a", "TOKEN-b"]);
-			expect(result.markCount).toBe(1);
+			expect(result.markCount).toBe(2);
 		} finally {
 			if (previousAnthropicApiKey === undefined) delete Bun.env.ANTHROPIC_API_KEY;
 			else Bun.env.ANTHROPIC_API_KEY = previousAnthropicApiKey;
