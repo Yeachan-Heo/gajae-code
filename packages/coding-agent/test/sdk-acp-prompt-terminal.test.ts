@@ -3825,9 +3825,11 @@ for (const lateAck of ["identical", "mismatching"] as const) {
 		const promptSpy = vi.spyOn(AcpSdkAdapter.prototype, "prompt").mockImplementation(async function (
 			this: AcpSdkAdapter,
 			input,
+			beforeDispatch,
+			onDispatch,
 		) {
 			const first = ++calls === 1;
-			const acknowledgement = await originalPrompt.call(this, input);
+			const acknowledgement = await originalPrompt.call(this, input, beforeDispatch, onDispatch);
 			if (first) firstAck.resolve();
 			return acknowledgement;
 		});
