@@ -696,6 +696,7 @@ const savedSessionCandidateDetailCodes = new Set([
 	"unreadable_candidate",
 	"source_changed",
 	"cwd_not_found",
+	"cwd_not_directory",
 	"cwd_not_utf8",
 	"cwd_network_unsupported",
 	"cwd_identity_unavailable",
