@@ -241,6 +241,24 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(state.status).toBe("uncertain");
 		expect(state.uncertainCalls).toBeGreaterThan(0);
 		expect(manager.has(correlation)).toBe(true);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("a recovered deadline prompt defers terminal frames without restored run evidence", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-recovered-uncertain", turnId: "turn-recovered-uncertain" };
+		const acceptedAt = Date.now();
+		manager.recoverPending(correlation, acceptedAt, acceptedAt + 60_000);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.onRunStarted(correlation);
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(false);
 		manager.clearAll();
 	});
 
