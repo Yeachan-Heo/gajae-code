@@ -3974,6 +3974,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
 							terminalAbortSeams: {
+								getTerminalRunOwnerForEvent: event => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getTerminalRunOwnerForEvent(event);
+								},
+								getRunOwnerDomain: handle => {
+									if (!session) throw new Error("Terminal owner session is not initialized.");
+									return session.getRunOwnerDomain(handle);
+								},
 								getTerminalTurnEpoch: () => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.getTerminalTurnEpoch();

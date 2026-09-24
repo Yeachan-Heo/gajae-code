@@ -28,8 +28,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import {
-	getAgentTerminalOwnerContext,
+	type AgentTerminalOwnerContext,
 	isNonDispatchedToolEvent,
+	type RunCancellationDomain,
 	type RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -1233,7 +1234,7 @@ interface SessionRuntime {
 	host: SessionSdkHost;
 	imageUploads: PromptImageUploadStore;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
-	releaseAcceptedImagesForRun: (handle: string) => void;
+	releaseAcceptedImagesForRun: (owner: AgentTerminalOwnerContext) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -2627,6 +2628,12 @@ function sdkControlSurface(
 		error: unknown,
 	) => void | Promise<void> = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
+	onPromptDiverted: (correlation: { commandId: string; turnId: string }) => void,
+	onPromptPromoted: (
+		correlation: { commandId: string; turnId: string },
+		promotion: { startsOwnRun?: boolean; removed?: boolean },
+		handle: string | undefined,
+	) => void,
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
 	admitPrompt: (clientRef?: string) => void,
@@ -3057,9 +3064,13 @@ function sdkControlSurface(
 					onPreflightAccepted,
 					onQueuedPromoted: promotion => {
 						admission.hooks.onQueuedPromoted(promotion);
+						onPromptPromoted(correlation, promotion, ctx.getActivePromptHandle());
 						if (promotion.removed) releaseAcceptedImage(correlation);
 					},
-					onDispatchDisposition: admission.hooks.onDispatchDisposition,
+					onDispatchDisposition: disposition => {
+						admission.hooks.onDispatchDisposition(disposition);
+						if (!disposition.startsOwnRun) onPromptDiverted(correlation);
+					},
 					preflightSignal: preflightController.signal,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
@@ -4326,6 +4337,8 @@ export function createNotificationsExtension(
 		 * preflight outside the durable admission path (review thread P2).
 		 */
 		terminalAbortSeams?: {
+			getTerminalRunOwnerForEvent?: (event: object) => AgentTerminalOwnerContext | undefined;
+			getRunOwnerDomain?: (handle: string) => RunCancellationDomain | undefined;
 			getTerminalTurnEpoch: () => number | undefined;
 			cancelPendingPreflightForTerminalAbort: () => void;
 			captureTerminalAbortSteeringSnapshot?: () => void;
@@ -4891,19 +4904,19 @@ export function createNotificationsExtension(
 			return incarnation !== undefined && !incarnation.closed;
 		});
 		const acceptedImages = new Map<string, () => void>();
-		const acceptedImageRunHandles = new Map<string, string>();
+		const acceptedImageRunOwners = new Map<string, AgentTerminalOwnerContext>();
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
 			acceptedImages.get(key)?.();
 			acceptedImages.delete(key);
-			acceptedImageRunHandles.delete(key);
+			acceptedImageRunOwners.delete(key);
 		};
-		const releaseAcceptedImagesForRun = (handle: string) => {
-			for (const [key, owner] of acceptedImageRunHandles) {
-				if (owner !== handle) continue;
+		const releaseAcceptedImagesForRun = (terminalOwner: AgentTerminalOwnerContext) => {
+			for (const [key, owner] of acceptedImageRunOwners) {
+				if (owner.resourceRunId !== terminalOwner.resourceRunId || owner.domain !== terminalOwner.domain) continue;
 				acceptedImages.get(key)?.();
 				acceptedImages.delete(key);
-				acceptedImageRunHandles.delete(key);
+				acceptedImageRunOwners.delete(key);
 			}
 		};
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
@@ -5917,8 +5930,24 @@ export function createNotificationsExtension(
 			if (submission) {
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
-				if (handle && acceptedImages.has(key)) acceptedImageRunHandles.set(key, handle);
+				const domain = handle ? terminalAbortSeams?.getRunOwnerDomain?.(handle) : undefined;
+				if (handle && domain && acceptedImages.has(key))
+					acceptedImageRunOwners.set(key, { resourceRunId: handle, domain });
 			}
+		};
+		const onPromptDiverted = (correlation: { commandId: string; turnId: string }) => {
+			if (acceptedImages.has(promptSubmissionKey(correlation))) removePendingPromptCorrelation(correlation);
+		};
+		const onPromptPromoted = (
+			correlation: { commandId: string; turnId: string },
+			promotion: { startsOwnRun?: boolean; removed?: boolean },
+			handle: string | undefined,
+		) => {
+			if (!acceptedImages.has(promptSubmissionKey(correlation))) return;
+			removePendingPromptCorrelation(correlation);
+			if (promotion.removed) return;
+			if (promotion.startsOwnRun === true) pendingPromptCorrelations.push(correlation);
+			else bindPromptExecutionHandle(correlation, handle);
 		};
 		const terminalizePrompt = async (
 			correlation: { commandId: string; turnId: string },
@@ -6342,6 +6371,8 @@ export function createNotificationsExtension(
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
+			onPromptDiverted,
+			onPromptPromoted,
 			() => runtime?.stopping !== true,
 			trackGateResolution,
 			admitPromptSubmission,
@@ -7794,7 +7825,7 @@ export function createNotificationsExtension(
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
-				acceptedImageRunHandles.clear();
+				acceptedImageRunOwners.clear();
 			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
@@ -9712,8 +9743,8 @@ export function createNotificationsExtension(
 		// The Agent's terminal owner is independent of delivery correlation: a
 		// failed transport may have cleared the latter while the original run
 		// still owned image strings. Never borrow a successor's run handle.
-		const terminalOwner = getAgentTerminalOwnerContext(event);
-		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner.resourceRunId);
+		const terminalOwner = terminalAbortSeams?.getTerminalRunOwnerForEvent?.(event);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner);
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
 			// This attributed agent_end is an execution boundary even when the

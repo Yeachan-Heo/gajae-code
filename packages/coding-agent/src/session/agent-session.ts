@@ -31,6 +31,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentTerminalOwnerContext,
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
@@ -48,7 +49,6 @@ import {
 	type RunResourceProducerLease,
 	type RunSettlementProof,
 	resolveTelemetry,
-	setAgentTerminalOwnerContext,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -6859,6 +6859,8 @@ export class AgentSession {
 		object,
 		{ scope?: AttemptScope; sdkRunToken?: string; persistGeneration: number; persistBarrier?: Promise<void> }
 	>();
+	/** Extension handlers cannot mutate or replace the Agent-claimed run owner. */
+	#terminalOwnerByExtensionEvent = new WeakMap<object, AgentTerminalOwnerContext>();
 
 	/**
 	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
@@ -9872,11 +9874,11 @@ export class AgentSession {
 					maintenanceOutcome: event.maintenanceOutcome,
 					...(sdkRunToken ? { sdkRunToken } : {}),
 				};
-				// The run handle is not an extension wire field. Preserve its Agent-owned
-				// side channel across the session-to-extension event projection so a
-				// fatal delivery can later release only its own accepted images.
+				// Keep the Agent-claimed owner OUTSIDE the public extension event and
+				// its replaceable side channel. Only the owning session may attest
+				// this exact projected event to the SDK bus.
 				const terminalOwner = getAgentTerminalOwnerContext(event);
-				if (terminalOwner) setAgentTerminalOwnerContext(extensionEvent, terminalOwner);
+				if (terminalOwner) this.#terminalOwnerByExtensionEvent.set(extensionEvent, terminalOwner);
 				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "turn_start") {
 				const hookEvent: TurnStartEvent = {
@@ -16745,6 +16747,12 @@ export class AgentSession {
 		const lineageIdHash = this.#turnLineageIdHash;
 		if (!lineageIdHash) return undefined;
 		return this.#promptGeneration;
+	}
+	getTerminalRunOwnerForEvent(event: object): AgentTerminalOwnerContext | undefined {
+		return this.#terminalOwnerByExtensionEvent.get(event);
+	}
+	getRunOwnerDomain(handle: string): RunCancellationDomain | undefined {
+		return this.agent.resourceLedger.lookupDomain(handle);
 	}
 	/**
 	 * Logical endpoint used to key owned-registration lineage bindings.
