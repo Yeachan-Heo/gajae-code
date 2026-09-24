@@ -22,6 +22,11 @@ import {
 	resolveManagedSessionScope,
 } from "../session-directory";
 import {
+	SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES,
+	type SessionListSavedSessionOmission,
+	type SessionListSavedSessionOmissionDetailCode,
+} from "../session-list";
+import {
 	BROKER_HEARTBEAT_TTL_MS,
 	type BrokerDiscovery,
 	type BrokerPublicationObservation,
@@ -550,6 +555,10 @@ function sessionListLimit(input: Record<string, unknown>): number | BrokerRespon
 	return limit;
 }
 
+function savedSessionOmissionDetailCode(code: string): SessionListSavedSessionOmissionDetailCode | undefined {
+	return SESSION_LIST_SAVED_SESSION_OMISSION_DETAIL_CODES.find(candidate => candidate === code);
+}
+
 function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
 }
@@ -750,8 +759,15 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 		const resolved = input.resolveSessionId;
 		if (resolved !== undefined && (typeof resolved !== "string" || !isCanonicalSessionId(resolved)))
 			return error("invalid_input", "resolveSessionId must be a canonical safe identifier");
+		const cwd = input.cwd;
+		if (cwd !== undefined && (typeof cwd !== "string" || cwd.length === 0))
+			return error("invalid_input", "cwd must be a non-empty string");
 		if (input.cursor !== undefined && (typeof input.cursor !== "string" || input.cursor.length === 0))
 			return error("invalid_input", "cursor must be a non-empty opaque string");
+		if (input.cursor !== undefined && (cwd !== undefined || resolved !== undefined))
+			return error("invalid_input", "cursor cannot be combined with cwd or resolveSessionId");
+		if (input.scope !== undefined && (cwd !== undefined || resolved !== undefined))
+			return error("invalid_input", "scope cannot be combined with cwd or resolveSessionId");
 		const limit = sessionListLimit(input);
 		if (isBrokerResponse(limit)) return limit;
 		if (input.scope !== undefined && !scopeRequestV1(input.scope) && input.cursor === undefined)
@@ -4625,38 +4641,88 @@ export class Broker {
 			const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
 			if (resolveSessionId && cwd) {
 				const scope = await resolveManagedSessionScope({ cwd, agentDir: this.settings.agentDir });
-				const listed =
+				let listed =
 					scope.kind === "resolved" ? await listManagedSessionCandidates({ scope: scope.scope }) : undefined;
+				if (
+					scope.kind === "resolved" &&
+					listed?.kind === "complete" &&
+					listed.invalid.some(
+						candidate => candidate.sessionId === resolveSessionId && candidate.code === "source_changed",
+					)
+				)
+					// A writer can finish after the preflight read but before the independent
+					// identity-bound inspection. Retry one complete scan, rerunning every
+					// scope, no-follow, uniqueness, and identity check against fresh state.
+					listed = await listManagedSessionCandidates({ scope: scope.scope });
 				const matches =
 					listed?.kind === "complete"
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
-				const savedSession =
-					match &&
-					match.sessionId === resolveSessionId &&
-					match.identity.nlink !== undefined &&
-					match.identity.ctimeNs !== undefined
-						? {
-								id: match.sessionId,
-								path: match.path,
-								identity: {
-									dev: match.identity.dev.toString(),
-									ino: match.identity.ino.toString(),
-									nlink: match.identity.nlink.toString(),
-									size: match.identity.size,
-									mtimeMs: match.identity.mtimeMs,
-									mtimeNs: match.identity.mtimeNs.toString(),
-									ctimeNs: match.identity.ctimeNs.toString(),
-									sha256: match.identity.sha256,
-								},
-							}
-						: undefined;
+				let savedSession: Record<string, unknown> | undefined;
+				let savedSessionOmission: SessionListSavedSessionOmission | undefined;
+				if (scope.kind !== "resolved") {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "scope_unavailable",
+						detailCode: scope.code,
+					};
+				} else if (listed?.kind !== "complete") {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_scan_failed",
+						...(listed === undefined ? {} : { detailCode: listed.code }),
+					};
+				} else if (matches.length === 0) {
+					const invalid = listed.invalid.find(candidate => candidate.sessionId === resolveSessionId);
+					const detailCode = invalid === undefined ? undefined : savedSessionOmissionDetailCode(invalid.code);
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: invalid ? "candidate_invalid" : "candidate_not_found",
+						...(detailCode === undefined ? {} : { detailCode }),
+					};
+				} else if (matches.length > 1) {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_ambiguous",
+						candidateCount: matches.length,
+					};
+				} else if (match) {
+					const missingIdentityFields: ("nlink" | "ctimeNs")[] = [];
+					const { nlink, ctimeNs } = match.identity;
+					if (nlink === undefined) missingIdentityFields.push("nlink");
+					if (ctimeNs === undefined) missingIdentityFields.push("ctimeNs");
+					if (missingIdentityFields.length > 0) {
+						savedSessionOmission = {
+							sessionId: resolveSessionId,
+							reason: "identity_incomplete",
+							missingIdentityFields,
+						};
+					} else if (match.sessionId === resolveSessionId && nlink !== undefined && ctimeNs !== undefined) {
+						savedSession = {
+							id: match.sessionId,
+							path: match.path,
+							identity: {
+								dev: match.identity.dev.toString(),
+								ino: match.identity.ino.toString(),
+								nlink: nlink.toString(),
+								size: match.identity.size,
+								mtimeMs: match.identity.mtimeMs,
+								mtimeNs: match.identity.mtimeNs.toString(),
+								ctimeNs: ctimeNs.toString(),
+								sha256: match.identity.sha256,
+							},
+						};
+					}
+				} else {
+					savedSessionOmission = { sessionId: resolveSessionId, reason: "candidate_not_found" };
+				}
 				return {
 					...page,
 					result: {
 						...pageResult,
 						...(savedSession === undefined ? {} : { savedSession }),
+						...(savedSessionOmission === undefined ? {} : { savedSessionOmission }),
 					},
 				};
 			}
