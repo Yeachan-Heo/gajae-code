@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { Stats } from "node:fs";
+import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
@@ -313,7 +313,7 @@ async function readBoundedFileBytes(
 		throw new DeepInterviewCommandError(2, `${label} must not be a symlink`);
 	if (!lexicalStat.isFile()) throw new DeepInterviewCommandError(2, `${label} is not a regular file`);
 	if (options.expectedIdentity) {
-		let expectedStat: Awaited<ReturnType<typeof fs.lstat>>;
+		let expectedStat: BigIntStats;
 		try {
 			expectedStat = await fs.lstat(filePath, { bigint: true });
 		} catch {
