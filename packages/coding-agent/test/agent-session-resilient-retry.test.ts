@@ -1761,7 +1761,7 @@ describe.serial("AgentSession resilient retry", () => {
 			await configuredSession.waitForIdle();
 			expect(capturedTimeouts, testCase.name).toEqual([testCase.expected]);
 
-			await configuredSession.dispose();
+			await disposeAfterCoordinatorPersistence(configuredSession);
 			session = undefined;
 		}
 	}, 120_000);
