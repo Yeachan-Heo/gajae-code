@@ -438,7 +438,11 @@ export class AcpSdkAdapter {
 		if (this.#client) await this.#client.close();
 	}
 
-	async prompt(params: JsonObject | string, beforeDispatch?: (context: SdkDispatchContext) => void): Promise<unknown> {
+	async prompt(
+		params: JsonObject | string,
+		beforeDispatch?: (context: SdkDispatchContext) => void,
+		onDispatch?: (context: SdkDispatchContext) => void,
+	): Promise<unknown> {
 		const rawText =
 			typeof params === "string"
 				? params
@@ -461,7 +465,7 @@ export class AcpSdkAdapter {
 				input: { ...(typeof params === "object" ? params : {}), text },
 			},
 			false,
-			beforeDispatch === undefined ? undefined : { beforeDispatch },
+			{ beforeDispatch, onDispatch },
 		);
 	}
 	/** Machine-origin upload controls; never route these through the public control() disposition. */
@@ -577,7 +581,11 @@ export class AcpSdkAdapter {
 	async #requestSession(
 		frame: JsonObject,
 		raw = false,
-		options?: { timeoutMs?: number; beforeDispatch?: (context: SdkDispatchContext) => void },
+		options?: {
+			timeoutMs?: number;
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+			onDispatch?: (context: SdkDispatchContext) => void;
+		},
 	): Promise<unknown> {
 		const router = this.#router;
 		if (!router)

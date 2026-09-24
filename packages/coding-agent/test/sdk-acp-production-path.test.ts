@@ -327,11 +327,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const skillInputs: Record<string, unknown>[] = [];
 	const controlOperations: string[] = [];
 	const controlInputs: Array<{ operation: string; input: Record<string, unknown> }> = [];
-	const imageUploads = new PromptImageUploadStore();
+	const imageUploads = new PromptImageUploadStore(() => true);
 	const imageFrameBytes: number[] = [];
 	const redeemedImages: Buffer[] = [];
 	const connections = new WeakMap<object, string>();
 	let imageEchoPresentAtDispatch = false;
+	let imageEchoStartIndex = 0;
 	let originalImageBase64 = "";
 	let corruptNextImageBeginAck = false;
 	let malformedBeginId: string | undefined;
@@ -341,6 +342,13 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let releaseUploadAck: (() => void) | undefined;
 	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
+	const expectNewDiscardedLease = (since: number): void => {
+		const discards = controlInputs.slice(since).filter(entry => entry.operation === "turn.image.discard");
+		expect(discards).toHaveLength(1);
+		expect(() => imageUploads.redeem("acp-contract-reconnected", [{ id: discards[0]!.input.id }])).toThrow(
+			expect.objectContaining({ code: "resource_gone" }),
+		);
+	};
 	const providerRegistrations: Array<Record<string, unknown>> = [];
 	let closeSessionTransport: (() => void) | undefined;
 	let reconnectingSessionTransport = false;
@@ -692,13 +700,15 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						const stagedImages = (frame.input as { stagedImages?: Array<{ id: string }> }).stagedImages;
 						if (stagedImages) {
 							imageFrameBytes.push(Buffer.byteLength(String(raw)));
-							imageEchoPresentAtDispatch = updates.some(
-								update =>
-									update.update.sessionUpdate === "user_message_chunk" &&
-									(update.update as { content?: { type?: string; data?: string } }).content?.type ===
-										"image" &&
-									(update.update as { content?: { data?: string } }).content?.data === originalImageBase64,
-							);
+							imageEchoPresentAtDispatch = updates
+								.slice(imageEchoStartIndex)
+								.some(
+									update =>
+										update.update.sessionUpdate === "user_message_chunk" &&
+										(update.update as { content?: { type?: string; data?: string } }).content?.type ===
+											"image" &&
+										(update.update as { content?: { data?: string } }).content?.data === originalImageBase64,
+								);
 							try {
 								const accepted = imageUploads.redeem(connections.get(socket), stagedImages);
 								for (const image of accepted.images) redeemedImages.push(Buffer.from(image.data, "base64"));
@@ -1743,6 +1753,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		}
 		return await originalRequest.apply(this, args);
 	};
+	const beforeRouterInputs = controlInputs.length;
 	try {
 		const beforeRouterAbort = abortFrames.length;
 		const heldPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
@@ -1756,10 +1767,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		SessionRouter.prototype.request = originalRequest;
 	}
 	await waitFor(() => controlOperations.at(-1) === "turn.image.discard", "Router-held image lease discard");
+	expectNewDiscardedLease(beforeRouterInputs);
 	expect(promptInputs).toHaveLength(beforeImagePrompt);
 	for (const operation of ["turn.image.append", "turn.image.finish"] as const) {
 		const beforeCancelAbort = abortFrames.length;
 		const beforeCancelUpload = controlOperations.length;
+		const beforeCancelInputs = controlInputs.length;
 		holdNextUploadAck = operation;
 		const pendingUpload = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
 		await waitFor(() => releaseUploadAck !== undefined, `held ${operation} acknowledgement`);
@@ -1772,9 +1785,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			() => controlOperations.slice(beforeCancelUpload).includes("turn.image.discard"),
 			`${operation} lease discard`,
 		);
+		expectNewDiscardedLease(beforeCancelInputs);
 		expect(promptInputs).toHaveLength(beforeImagePrompt);
 	}
 	const beforeCancelledUpload = controlOperations.length;
+	const beforeCancelledInputs = controlInputs.length;
 	const beforeCancelledAbort = abortFrames.length;
 	holdNextImageBeginAck = true;
 	const cancelledImagePrompt = agent.prompt({
@@ -1791,6 +1806,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		() => controlOperations.slice(beforeCancelledUpload).includes("turn.image.discard"),
 		"late image begin lease discard",
 	);
+	expectNewDiscardedLease(beforeCancelledInputs);
 	expect(promptInputs).toHaveLength(beforeImagePrompt);
 
 	// SdkClient adds a UUID id and Router stamps the nonempty connectionId.
@@ -1854,9 +1870,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		"malformed image begin lease discard",
 	);
 	expect(malformedBeginId).toEqual(expect.any(String));
-	expect(() => imageUploads.redeem("acp-contract", [{ id: malformedBeginId! }])).toThrow(
+	expect(() => imageUploads.redeem("acp-contract-reconnected", [{ id: malformedBeginId! }])).toThrow(
 		expect.objectContaining({ code: "resource_gone" }),
 	);
+	imageEchoStartIndex = updates.length;
+	imageEchoPresentAtDispatch = false;
 	const imagePrompt = agent.prompt({
 		sessionId: created.sessionId,
 		prompt: [{ type: "image", mimeType: "image/png", data: originalImageBase64 }],

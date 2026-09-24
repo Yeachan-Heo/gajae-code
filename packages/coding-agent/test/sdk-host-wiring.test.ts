@@ -77,6 +77,7 @@ import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
 import type { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { SdkClient } from "../src/sdk/client";
 import { SESSION_HOST_OBSERVER_CAPABILITY, SessionSdkHost } from "../src/sdk/host";
+import { TypedControlError } from "../src/sdk/host/control";
 import { createSdkRunCapability } from "../src/sdk/host/sdk-run-capability";
 import { type SessionAttachment, SessionRouter } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
@@ -2491,6 +2492,155 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 	}
 });
 
+test("fatal prompt claim failure releases accepted image capacity without publishing a terminal", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fatal-image-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-fatal-image-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = { ...sessionManager, getSessionFile: () => sessionFile };
+	const failedCommit = failNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	const originalRedeem = PromptImageUploadStore.prototype.redeem;
+	let reserved = 0;
+	let releases = 0;
+	// Use the real upload/redeem path, with a one-reservation quota so a
+	// retained accepted image deterministically blocks the next connection.
+	const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+		this: PromptImageUploadStore,
+		owner,
+		ids,
+	) {
+		if (reserved) throw new TypedControlError("busy", "Accepted image capacity exceeded.");
+		const reservation = originalRedeem.call(this, owner, ids);
+		reserved++;
+		let released = false;
+		return {
+			images: reservation.images,
+			release: () => {
+				if (released) return;
+				released = true;
+				reservation.release();
+				reserved--;
+				releases++;
+			},
+		};
+	});
+	try {
+		const handlers = start(
+			sessionContext,
+			undefined,
+			async (_content, options) => {
+				await firePreflightAccept(options);
+			},
+			true,
+		);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const open = async () => {
+			const frames: Record<string, unknown>[] = [];
+			const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+			sockets.push(socket);
+			socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+			await new Promise<void>((resolve, reject) => {
+				socket.addEventListener("open", () => resolve(), { once: true });
+				socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+			});
+			const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+				const json = JSON.stringify({ type: "control_request", id, operation, input });
+				expect(Buffer.byteLength(json)).toBeLessThan(256 * 1024);
+				socket.send(json);
+				await waitFor(
+					() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+					`${id} response`,
+				);
+				return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+			};
+			return { frames, control };
+		};
+		const requester = await open();
+		const healthy = await open();
+		const bytes = Buffer.from(
+			await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+		);
+		const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+		const stage = async (client: typeof requester, name: string) => {
+			const begun = await client.control(`${name}-begin`, "turn.image.begin", {
+				mimeType: "image/png",
+				byteLength: bytes.length,
+				sha256,
+			});
+			expect(begun).toMatchObject({ ok: true });
+			const id = (begun.result as { id: string }).id;
+			let sequence = 0;
+			for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+				expect(
+					await client.control(`${name}-chunk-${sequence}`, "turn.image.append", {
+						id,
+						sequence: sequence++,
+						data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+					}),
+				).toMatchObject({ ok: true });
+			}
+			expect(await client.control(`${name}-finish`, "turn.image.finish", { id })).toMatchObject({ ok: true });
+			return id;
+		};
+		const firstId = await stage(requester, "fatal");
+		const nextId = await stage(healthy, "healthy");
+		const accepted = await requester.control("fatal-prompt", "turn.prompt", {
+			text: "This terminal claim will fail",
+			stagedImages: [{ id: firstId }],
+		});
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+		const correlation = acceptedCorrelation(accepted);
+		expect(reserved).toBe(1);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		failedCommit.arm();
+		await handlers.get("agent_end")?.(assistantEndEvent("must not publish"), sessionContext);
+		await failedCommit.failed;
+		await waitFor(
+			() =>
+				requester.frames.some(frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId),
+			"fatal prompt closure",
+		);
+		const terminalFrames = () =>
+			requester.frames.filter(
+				frame =>
+					(frame.type === "agent_failed" || frame.type === "agent_end") &&
+					frame.commandId === correlation.commandId &&
+					frame.turnId === correlation.turnId,
+			);
+		expect(terminalFrames()).toEqual([
+			expect.objectContaining({
+				type: "agent_failed",
+				error: { code: "terminal_uncertain", message: "Prompt reconciliation is unavailable." },
+			}),
+		]);
+		expect(reserved).toBe(0);
+		expect(releases).toBe(1);
+		const next = await healthy.control("healthy-prompt", "turn.prompt", {
+			text: "Capacity is available to this live socket",
+			stagedImages: [{ id: nextId }],
+		});
+		expect(next).toMatchObject({ ok: true, result: { accepted: true } });
+		expect(reserved).toBe(1);
+		expect(terminalFrames()).toHaveLength(1);
+		const shutdownFailure = await Promise.resolve(
+			handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+		).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		expect((shutdownFailure as { code?: string } | undefined)?.code).toBe("sdk_reconciliation_teardown_failed");
+	} finally {
+		redeemSpy.mockRestore();
+		warnSpy.mockRestore();
+		failedCommit.restore();
+	}
+}, 60_000);
+
 test("queued image controls cannot recreate leases after their connection closes", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-disconnect-"));
 	dirs.push(cwd);
@@ -2505,21 +2655,18 @@ test("queued image controls cannot recreate leases after their connection closes
 	const release = Promise.withResolvers<void>();
 	const originalDisconnect = PromptImageUploadStore.prototype.disconnect;
 	const originalBegin = PromptImageUploadStore.prototype.begin;
-	const beginOutcomes: Array<{ owner: string | undefined; code: string; live: boolean | undefined }> = [];
+	const beginOutcomes: Array<{ owner: string | undefined; code: string }> = [];
 	const beginSpy = spyOn(PromptImageUploadStore.prototype, "begin").mockImplementation(function (
 		this: PromptImageUploadStore,
 		owner,
 		value,
 	) {
-		const live = owner
-			? (this as unknown as { isConnectionOpen?: (id: string) => boolean }).isConnectionOpen?.(owner)
-			: undefined;
 		try {
 			const result = originalBegin.call(this, owner, value);
-			beginOutcomes.push({ owner, code: "ok", live });
+			beginOutcomes.push({ owner, code: "ok" });
 			return result;
 		} catch (error) {
-			beginOutcomes.push({ owner, code: (error as { code?: string }).code ?? "internal", live });
+			beginOutcomes.push({ owner, code: (error as { code?: string }).code ?? "internal" });
 			throw error;
 		}
 	});
@@ -2601,10 +2748,7 @@ test("queued image controls cannot recreate leases after their connection closes
 		expect(healthy.frames.find(frame => frame.id === "live-prompt")).toMatchObject({ ok: true });
 		expect(sent).toHaveLength(1);
 		const disconnectedBegins = beginOutcomes.filter(outcome => outcome.owner === disconnectedId);
-		expect(disconnectedBegins.map(outcome => ({ code: outcome.code, live: outcome.live }))).toEqual([
-			{ code: "ok", live: true },
-			{ code: "resource_gone", live: false },
-		]);
+		expect(disconnectedBegins.map(outcome => outcome.code)).toEqual(["ok", "resource_gone"]);
 		send(healthy.socket, "live-begin", "turn.image.begin", descriptor);
 		await waitFor(() => healthy.frames.some(frame => frame.id === "live-begin"), "live image control");
 		expect(healthy.frames.find(frame => frame.id === "live-begin")).toMatchObject({ ok: true });

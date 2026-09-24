@@ -4,6 +4,8 @@ import { deflateSync } from "node:zlib";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
 
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+// Standalone tests deliberately allow synthetic owners; hosts bind this to live sockets.
+const alwaysConnected = (_owner: string): boolean => true;
 
 function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
 	const name = Buffer.from(type, "ascii");
@@ -75,7 +77,7 @@ async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer
 test("a valid original image larger than 256 KiB survives chunk upload and host redemption byte for byte", async () => {
 	const bytes = originalLargePng();
 	expect(bytes.length).toBeGreaterThan(256 * 1024);
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const id = await stage(store, "sender", bytes);
 		const accepted = store.redeem("sender", [{ id }]);
@@ -94,7 +96,7 @@ test("a valid original image larger than 256 KiB survives chunk upload and host 
 
 test("concurrent finishes validate one lease only once and reject appends during finalization", async () => {
 	const bytes = originalLargePng();
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const { id } = store.begin("sender", descriptor(bytes));
 		for (let offset = 0, sequence = 0; offset < bytes.length; offset += 96 * 1024, sequence++)
@@ -125,8 +127,8 @@ test("concurrent finishes validate one lease only once and reject appends during
 
 test("distinct sessions share one process-wide decode slot and recover it after finalization", async () => {
 	const bytes = originalLargePng();
-	const firstStore = new PromptImageUploadStore();
-	const secondStore = new PromptImageUploadStore();
+	const firstStore = new PromptImageUploadStore(alwaysConnected);
+	const secondStore = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const first = upload(firstStore, "sender", bytes);
 		const second = upload(secondStore, "sender", bytes);
@@ -152,8 +154,8 @@ test("distinct sessions share one process-wide decode slot and recover it after 
 
 test("discard during decoding retains the shared slot until its in-flight finish settles", async () => {
 	const bytes = originalLargePng();
-	const firstStore = new PromptImageUploadStore();
-	const secondStore = new PromptImageUploadStore();
+	const firstStore = new PromptImageUploadStore(alwaysConnected);
+	const secondStore = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const first = upload(firstStore, "sender", bytes);
 		const second = upload(secondStore, "sender", bytes);
@@ -177,7 +179,7 @@ test("discard during decoding retains the shared slot until its in-flight finish
 
 test("upload chunks reject out-of-order, duplicate, noncanonical, cross-connection and bad-digest inputs", async () => {
 	const bytes = originalLargePng();
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const { id } = store.begin("sender", descriptor(bytes));
 		const chunk = bytes.subarray(0, 96 * 1024).toString("base64");
@@ -222,7 +224,7 @@ test("upload chunks reject out-of-order, duplicate, noncanonical, cross-connecti
 test("redemption is atomic, ordered and connection-owned; discard, disconnect and close expire leases", async () => {
 	const bytes = originalLargePng();
 	const other = originalLargePng(0x87654321);
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	try {
 		const first = await stage(store, "sender", bytes);
 		const second = await stage(store, "sender", other);
@@ -302,7 +304,7 @@ test("live-connection gate rejects queued image mutations after the disconnect s
 
 test("expired leases free capacity and a discard during decoding cannot resurrect an upload", async () => {
 	const bytes = originalLargePng();
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	try {
 		vi.useFakeTimers();
 		const expired = store.begin("sender", descriptor(bytes));
@@ -340,7 +342,7 @@ test("expired leases free capacity and a discard during decoding cannot resurrec
 });
 
 test("pending uploads enforce the 64 MiB session budget and recover capacity on discard and disconnect", () => {
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	const capacity = 64 * 1024 * 1024;
 	const imageLength = capacity / 4;
 	const chunk = Buffer.alloc(96 * 1024).toString("base64");
@@ -381,7 +383,7 @@ test("accepted images enforce the 64 MiB session budget until their terminal rel
 		pngChunk("ruSt", Buffer.alloc(17 * 1024 * 1024)),
 		original.subarray(-12),
 	]);
-	const store = new PromptImageUploadStore();
+	const store = new PromptImageUploadStore(alwaysConnected);
 	const releases: Array<() => void> = [];
 	try {
 		for (let index = 0; index < 3; index++) {
@@ -408,7 +410,7 @@ test("accepted base64 copies and transient decoding share a process-wide budget 
 		pngChunk("ruSt", Buffer.alloc(19 * 1024 * 1024)),
 		original.subarray(-12),
 	]);
-	const stores = Array.from({ length: 6 }, () => new PromptImageUploadStore());
+	const stores = Array.from({ length: 6 }, () => new PromptImageUploadStore(alwaysConnected));
 	const releases: Array<() => void> = [];
 	try {
 		for (const store of stores.slice(0, 5)) {
@@ -438,7 +440,7 @@ test("discarded in-flight source bytes stay reserved until decode settles, then 
 		pngChunk("ruSt", Buffer.alloc(18.5 * 1024 * 1024)),
 		original.subarray(-12),
 	]);
-	const stores = Array.from({ length: 5 }, () => new PromptImageUploadStore());
+	const stores = Array.from({ length: 5 }, () => new PromptImageUploadStore(alwaysConnected));
 	const pendingStore = stores[4]!;
 	const releases: Array<() => void> = [];
 	try {

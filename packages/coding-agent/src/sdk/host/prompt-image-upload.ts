@@ -55,12 +55,15 @@ function ownerId(connectionId: string | undefined): string {
 /** Session-scoped, connection-owned image leases; no client-supplied path or identity is trusted. */
 export class PromptImageUploadStore {
 	readonly #uploads = new Map<string, Upload>();
+	readonly #isConnectionOpen: (connectionId: string) => boolean;
 	#closed = false;
 	#uploadBytes = 0;
 	#acceptedBytes = 0;
 
-	/** The host supplies live socket membership; direct stores may operate without a transport. */
-	constructor(private readonly isConnectionOpen?: (connectionId: string) => boolean) {}
+	/** The host supplies live socket membership; standalone callers must choose an explicit policy. */
+	constructor(isConnectionOpen: (connectionId: string) => boolean) {
+		this.#isConnectionOpen = isConnectionOpen;
+	}
 
 	begin(connectionId: string | undefined, value: unknown): { id: string; nextSequence: 0 } {
 		this.#assertOpen();
@@ -277,7 +280,7 @@ export class PromptImageUploadStore {
 		if (this.#closed) throw new TypedControlError("resource_gone", "Image upload session is closed.");
 	}
 	#assertConnected(owner: string): void {
-		if (this.isConnectionOpen && !this.isConnectionOpen(owner))
+		if (!this.#isConnectionOpen(owner))
 			throw new TypedControlError("resource_gone", "Image upload connection is closed.");
 	}
 	#remove(id: string): void {
