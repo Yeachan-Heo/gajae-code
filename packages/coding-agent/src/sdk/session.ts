@@ -1552,6 +1552,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		options.settings === undefined
 			? logger.time("settings", Settings.loadForScope, { cwd, agentDir })
 			: Promise.resolve(options.settings);
+	type StartupValue<T> = { ok: true; value: T } | { ok: false; error: unknown };
+	const captureStartupValue = <T>(pending: Promise<T>): Promise<StartupValue<T>> =>
+		pending.then(
+			value => ({ ok: true as const, value }),
+			error => ({ ok: false as const, error }),
+		);
+	const settingsOutcome = captureStartupValue(settingsPromise);
 	const startupAuthConfigPromise = Promise.resolve(
 		hasInjectedAuth
 			? options.modelRegistryStartupMutation?.owner === "cli-root"
@@ -1566,16 +1573,45 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: startupAuthConfigPromise.then(startupAuthConfig =>
 					logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig)),
 				);
-	const [settingsResult, authStorageResult] = await Promise.allSettled([settingsPromise, authStoragePromise]);
-	if (settingsResult.status === "rejected") {
-		if (authStorageResult.status === "fulfilled" && ownsAuthStorage) {
+	const authStorageOutcome = captureStartupValue(authStoragePromise);
+	const discoveredAuthStorage = await authStorageOutcome;
+	if (!discoveredAuthStorage.ok) {
+		const loadedSettings = await settingsOutcome;
+		if (loadedSettings.ok && ownsScopedSettings) {
 			try {
-				authStorageResult.value.close();
+				await loadedSettings.value.close();
 			} catch (cleanupError) {
-				logger.warn("Failed to close auth storage after scoped settings load failure", { error: cleanupError });
+				logger.warn("Failed to close scoped settings after auth storage setup failure", { error: cleanupError });
+			} finally {
+				releaseSettingsScope(loadedSettings.value);
 			}
 		}
-		throw settingsResult.reason;
+		throw discoveredAuthStorage.error;
+	}
+	const authStorage = discoveredAuthStorage.value;
+	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
+	let credentialDisabledTarget: ExtensionRunner | undefined;
+	let unsubscribeCredentialDisabled: (() => void) | undefined;
+	const releaseCredentialDisabledSubscription = (): void => {
+		const unsubscribe = unsubscribeCredentialDisabled;
+		unsubscribeCredentialDisabled = undefined;
+		unsubscribe?.();
+	};
+	// Subscribe before owned-registry construction as its first catalog pass may
+	// probe credentials. Embedder handlers disable AuthStorage's no-listener
+	// buffer, so the SDK listener must already be present before any startup probe.
+	unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
+		if (credentialDisabledTarget) {
+			void credentialDisabledTarget.emitCredentialDisabled(event);
+		} else {
+			startupCredentialDisabledEvents.push(event);
+		}
+	});
+	const settingsResult = await settingsOutcome;
+	if (!settingsResult.ok) {
+		releaseCredentialDisabledSubscription();
+		if (ownsAuthStorage) authStorage.close();
+		throw settingsResult.error;
 	}
 	const settings = settingsResult.value;
 	const closeOwnedSettings = async (): Promise<void> => {
@@ -1586,22 +1622,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			releaseSettingsScope(settings);
 		}
 	};
-	if (authStorageResult.status === "rejected") {
-		try {
-			await closeOwnedSettings();
-		} catch (cleanupError) {
-			logger.warn("Failed to close scoped settings after auth storage setup failure", { error: cleanupError });
-		}
-		throw authStorageResult.reason;
-	}
 	const startupAuthConfig = await startupAuthConfigPromise;
-	const authStorage = authStorageResult.value;
 	let modelRegistry: ModelRegistry;
 	try {
 		modelRegistry =
 			options.modelRegistry ??
 			new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), settings, { agentDir });
 	} catch (error) {
+		releaseCredentialDisabledSubscription();
 		if (ownsAuthStorage) authStorage.close();
 		try {
 			await closeOwnedSettings();
@@ -1680,12 +1708,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		authStorageClosed = true;
 		authStorage.close();
 	};
-	let unsubscribeCredentialDisabled: (() => void) | undefined;
-	const releaseCredentialDisabledSubscription = (): void => {
-		const unsubscribe = unsubscribeCredentialDisabled;
-		unsubscribeCredentialDisabled = undefined;
-		unsubscribe?.();
-	};
 	let inheritedMcpToolsPublisher: ((tools: readonly CustomTool[]) => void) | undefined;
 	let inheritedMcpToolsUnsubscribe: (() => void) | undefined;
 	const stopInheritedMcpToolsSubscription = (): void => {
@@ -1696,20 +1718,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	try {
-		// Subscribe before any getApiKey() call so startup model probes can't fire a
-		// credential_disabled event past us. An embedder's constructor handler makes the
-		// listener set non-empty from construction, which defeats AuthStorage's no-listener
-		// buffer — so we can't rely on it to catch startup events for the extension runner.
-		const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
-		let credentialDisabledTarget: ExtensionRunner | undefined;
-		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
-			if (credentialDisabledTarget) {
-				// Discard return: any handler error is routed through runner.onError listeners.
-				void credentialDisabledTarget.emitCredentialDisabled(event);
-			} else {
-				startupCredentialDisabledEvents.push(event);
-			}
-		});
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
