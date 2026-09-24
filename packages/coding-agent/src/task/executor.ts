@@ -243,6 +243,15 @@ export interface ExecutorOptions {
 	routing?: TaskRoutingEvidence;
 	/** Ordered, normalized autorouting candidates for the cross-phase preflight ledger. */
 	autoroutingCandidates?: string[];
+	/**
+	 * Effort that belongs to a specific candidate, keyed by selector.
+	 *
+	 * A decided tier may carry its own effort, but the candidates behind it in the
+	 * chain are the caller's own route and must keep the caller's effort. A single
+	 * `thinkingLevel` for the whole chain would hand the tier's effort to whichever
+	 * fallback ends up running.
+	 */
+	autoroutingCandidateEfforts?: Readonly<Record<string, ThinkingLevel>>;
 	autoroutingSkips?: Array<{ selector: string; code: AutoroutingReasonCode }>;
 	autoroutingPreflightErrors?: Map<string, unknown>;
 	autoroutingPreflight?: boolean;
@@ -1884,9 +1893,16 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			const forkContextSeed = options.forkContextSeed
 				? trimForkContextSeedForModel(options.forkContextSeed, model)
 				: undefined;
+			// Without preflight the whole chain is handed to one resolution pass, which
+			// may skip past unauthenticated or unknown entries. The effort has to
+			// follow the selector that actually resolved, not the head of the chain.
+			const resolvedSelector = activeIndex === undefined ? undefined : modelPatterns[activeIndex];
+			const candidateThinkingLevel =
+				resolvedSelector === undefined ? undefined : options.autoroutingCandidateEfforts?.[resolvedSelector];
+			const requestedThinkingLevel = candidateThinkingLevel ?? thinkingLevel;
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
-				: (thinkingLevel ?? resolvedThinkingLevel);
+				: (requestedThinkingLevel ?? resolvedThinkingLevel);
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			preflightOperation = "session_open";
@@ -2919,14 +2935,20 @@ async function runSubprocessInternal(options: ExecutorOptions): Promise<SingleRe
 			attempts.push({ selector, phase: "probe", code });
 			return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "preflight_exhausted");
 		}
+		// Each candidate runs with its own effort: the decided tier's when it has
+		// one, the caller's otherwise. The map is cleared below because the inner
+		// call is already narrowed to a single selector.
+		const candidateThinkingLevel = options.autoroutingCandidateEfforts?.[selector] ?? options.thinkingLevel;
 		const probe = await runSubprocessOnce({
 			...options,
 			autoroutingPreflight: false,
 			preflightProbe: true,
 			preflightDurable: false,
 			modelOverride: [selector],
+			thinkingLevel: candidateThinkingLevel,
 			parentActiveModelPattern: undefined,
 			autoroutingCandidates: undefined,
+			autoroutingCandidateEfforts: undefined,
 			autoroutingSkips: undefined,
 			sessionFile: null,
 			artifactsDir: undefined,
@@ -2961,8 +2983,10 @@ async function runSubprocessInternal(options: ExecutorOptions): Promise<SingleRe
 			preflightDurable: durablePublicationAvailable,
 			autoroutingAttemptId: `${options.id}-${consumed.size}`,
 			modelOverride: [selector],
+			thinkingLevel: candidateThinkingLevel,
 			parentActiveModelPattern: undefined,
 			autoroutingCandidates: undefined,
+			autoroutingCandidateEfforts: undefined,
 			autoroutingSkips: undefined,
 			routing: routedOptions,
 		});
@@ -3105,8 +3129,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			executionOptions = {
 				...options,
 				modelOverride: candidates,
-				thinkingLevel: applied.effort ?? options.thinkingLevel,
+				// The caller's effort stays the chain default; the decided effort is
+				// attached to the decided selector alone, so a fallback that runs
+				// because the tier failed preflight keeps the effort it was asked for.
+				thinkingLevel: options.thinkingLevel,
 				autoroutingCandidates: candidates,
+				autoroutingCandidateEfforts:
+					applied.effort === undefined
+						? options.autoroutingCandidateEfforts
+						: { ...options.autoroutingCandidateEfforts, [applied.selector]: applied.effort },
 				autoroutingPreflight: Boolean(options.autoroutingPreflight),
 				routing: {
 					...(options.routing ?? {

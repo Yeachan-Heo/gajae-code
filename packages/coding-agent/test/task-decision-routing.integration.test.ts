@@ -147,16 +147,22 @@ describe("fresh-subagent decision integration", () => {
 
 	test("a decided tier that fails preflight still falls back to the original route", async () => {
 		const f = await fixture({ decide: async () => recommendation });
-		const attempts: string[] = [];
+		const attempts: Array<{ model: string; effort: unknown }> = [];
 		vi.spyOn(sdk, "createAgentSession").mockImplementation(async init => {
-			attempts.push(init?.model?.id ?? "unknown");
+			attempts.push({ model: init?.model?.id ?? "unknown", effort: init?.thinkingLevel });
 			throw Object.assign(new Error("synthetic transient failure"), { transient: true });
 		});
 		const result = await runSubprocess({ ...f.options, autoroutingPreflight: true });
 		expect(result.exitCode).toBe(1);
 		// The decision reorders the route; it must not delete the caller's own model.
-		expect(attempts[0]).toBe(selected.id);
-		expect(attempts).toContain(original.id);
+		expect(attempts[0]?.model).toBe(selected.id);
+		expect(attempts.map(attempt => attempt.model)).toContain(original.id);
+		// The tier's `:low` belongs to the tier alone. The caller asked for High on
+		// its own route, and a fallback that runs must not inherit the tier's effort.
+		expect(attempts[0]?.effort).toBe(Effort.Low);
+		const fallbacks = attempts.filter(attempt => attempt.model === original.id);
+		expect(fallbacks.length).toBeGreaterThan(0);
+		for (const attempt of fallbacks) expect(attempt.effort).toBe(Effort.High);
 	});
 
 	test("failure preserves original pins and runs once across preflight fallback attempts", async () => {
