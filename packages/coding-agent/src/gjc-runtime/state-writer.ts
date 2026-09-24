@@ -617,7 +617,10 @@ const LINUX_O_PATH = 0o10000000;
 async function readPrivateExistingStateForMutation(filePath: string): Promise<StrictMutationReadResult> {
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW | nodeFs.constants.O_NONBLOCK);
+		handle = await fs.open(
+			filePath,
+			nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW | nodeFs.constants.O_NONBLOCK,
+		);
 		const stat = await handle.stat();
 		if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.uid !== currentUid())
 			throw new Error("unsafe private publication file");
