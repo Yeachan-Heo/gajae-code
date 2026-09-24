@@ -84,8 +84,8 @@ describe("task decision providers", () => {
 			expect(() => new JevDecisionProvider({ timeoutMs, authStorage })).not.toThrow();
 		}
 		for (const timeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 60_001, "invalid"]) {
-			expect(() => new KevDecisionProvider({ timeoutMs })).toThrow();
-			expect(() => new JevDecisionProvider({ timeoutMs, authStorage })).toThrow();
+			expect(() => new KevDecisionProvider({ timeoutMs: timeoutMs as never })).toThrow();
+			expect(() => new JevDecisionProvider({ timeoutMs: timeoutMs as never, authStorage })).toThrow();
 		}
 	});
 
