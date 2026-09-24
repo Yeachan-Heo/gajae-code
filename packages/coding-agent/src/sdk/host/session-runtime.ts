@@ -5525,6 +5525,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 							)
 						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
 		return trackLifecycle(async () => {
 			for (const invocation of failureCandidates) {
 				if (
@@ -5594,6 +5595,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				event.stopReason,
 			);
 		}, owner).finally(() => {
+			releaseTerminalRetention();
 			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
 				lifecycleRunOwners.delete(event.sdkRunToken);
 		});
