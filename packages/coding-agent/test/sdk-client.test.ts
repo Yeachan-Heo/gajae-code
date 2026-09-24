@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client";
+import { deriveSessionLifecycleIdempotencyKey, SessionLifecycleService } from "../src/sdk/lifecycle/service";
 
 type FakeListener = ((event: Event) => void) | { handleEvent(event: Event): void };
 type FakeListenerOptions = { once?: boolean };
@@ -440,6 +441,77 @@ test("SdkClient distinguishes pre-send closure from a sent lifecycle request and
 		await expect(reconciliation).resolves.toMatchObject({ result: { sessionId: "durably-persisted" } });
 		expect(client.getSentRecord(record.id)).toBeUndefined();
 		await client.close();
+	});
+});
+
+test("SessionLifecycleService reports a dispatched create timeout as uncertain", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });
+		try {
+			const socket = await connect(client);
+			const actor = { id: "operator-1", namespace: "sdk:test" };
+			const requestKey = "timeout-create-request";
+			const target = { cwd: "/repo", stateRoot: "/repo/.gjc/state" };
+			const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, "session.create");
+			const service = new SessionLifecycleService(client);
+			const outcome = service.create({ actor, capability: "session.create", requestKey, target, timeoutMs: 10_000 });
+			await flush();
+
+			const frame = sent(socket);
+			if (typeof frame.id !== "string") throw new Error("lifecycle request id missing");
+			expect(frame).toMatchObject({
+				type: "broker_request",
+				operation: "session.create",
+				input: target,
+				idempotencyKey,
+			});
+			const dispatchedCreates = () =>
+				socket.sent.filter(raw => (JSON.parse(raw) as Record<string, unknown>).operation === "session.create");
+			expect(dispatchedCreates()).toHaveLength(1);
+
+			clock.advanceBy(10_000);
+			for (let index = 0; index < 4; index++) await flush();
+
+			await expect(outcome).resolves.toMatchObject({
+				ok: false,
+				certainty: "uncertain",
+				error: { code: "uncertain_after_send" },
+			});
+			expect(dispatchedCreates()).toHaveLength(1);
+			expect(client.getSentRecord(frame.id)).toMatchObject({
+				id: frame.id,
+				operation: "session.create",
+				idempotencyKey,
+			});
+
+			const lookup = service.lookup({
+				actor,
+				capability: "session.lookup",
+				operation: "session.create",
+				requestKey,
+				target,
+				timeoutMs: 10_000,
+			});
+			for (let index = 0; index < 4; index++) await flush();
+			const lookupFrame = sent(socket, 1);
+			expect(lookupFrame).toMatchObject({
+				type: "broker_request",
+				operation: "session.lookup",
+				input: { operation: "session.create", target },
+				idempotencyKey,
+			});
+			clock.advanceBy(10_000);
+			for (let index = 0; index < 4; index++) await flush();
+			await expect(lookup).resolves.toMatchObject({
+				ok: false,
+				operation: "session.lookup",
+				status: "unavailable",
+				certainty: "uncertain",
+				error: { code: "uncertain_after_send" },
+			});
+		} finally {
+			await client.close();
+		}
 	});
 });
 
