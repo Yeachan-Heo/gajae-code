@@ -885,6 +885,12 @@ SDK core exposes two related provider-neutral capabilities:
    than deriving a replacement identity from the numeric generation. A supplied
    saved-session `sessionIdentity` is enforced as the transcript snapshot
    precondition for resume and fork.
+   For `session.list` targets that include `cwd` and `resolveSessionId`, the
+   Broker attaches `savedSession` only after managed-scope and transcript
+   identity validation. It retries one complete scan after a concurrent source
+   change; a continued omission includes `savedSessionOmission` with the
+   requested session ID and a path-free reason, never transcript contents or
+   credentials.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after
