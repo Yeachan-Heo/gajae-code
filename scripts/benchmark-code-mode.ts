@@ -1575,6 +1575,19 @@ async function gitText(cwd: string, ...args: string[]): Promise<string> {
 	return stdout.trim();
 }
 
+async function gitIsAncestor(cwd: string, commit: string, branch: string): Promise<boolean> {
+	const args = ["merge-base", "--is-ancestor", commit, branch];
+	const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	if (exitCode === 0) return true;
+	if (exitCode === 1) return false;
+	throw new Error(`git ${args.join(" ")} failed: ${safeError(stderr || stdout)}`);
+}
+
 export async function assertTaskSnapshotMatchesOrigin(
 	repositoryRoot: string,
 	taskHead: string,
@@ -1588,9 +1601,8 @@ export async function assertTaskSnapshotMatchesOrigin(
 			);
 		}
 		if (taskHead !== originDev) {
-			try {
-				await gitText(repositoryRoot, "merge-base", "--is-ancestor", taskHead, originDev);
-			} catch {
+			const isAncestor = await gitIsAncestor(repositoryRoot, taskHead, originDev);
+			if (!isAncestor) {
 				throw new Error(
 					`The resumed task snapshot ${taskHead} is no longer an ancestor of origin/dev (${originDev}); refusing to resume.`,
 				);

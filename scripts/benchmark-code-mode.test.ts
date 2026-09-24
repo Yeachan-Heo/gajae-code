@@ -237,7 +237,6 @@ describe("pinned task snapshot resume", () => {
 	test("allows only an exact recorded snapshot that is current or an ancestor of origin/dev", async () => {
 		const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-benchmark-resume-"));
 		const repository = path.join(temporaryRoot, "repo");
-		const unrelatedRepository = path.join(temporaryRoot, "unrelated");
 		const runGit = async (cwd: string, ...args: string[]): Promise<string> => {
 			const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
 			const [stdout, stderr, exitCode] = await Promise.all([
@@ -250,7 +249,6 @@ describe("pinned task snapshot resume", () => {
 		};
 		try {
 			await fs.mkdir(repository, { recursive: true });
-			await fs.mkdir(unrelatedRepository, { recursive: true });
 			await runGit(repository, "init", "--initial-branch=main");
 			await runGit(repository, "config", "user.name", "GJC Test");
 			await runGit(repository, "config", "user.email", "gjc-test@example.invalid");
@@ -271,16 +269,14 @@ describe("pinned task snapshot resume", () => {
 				assertTaskSnapshotMatchesOrigin(repository, currentDev, currentDev, recordedSnapshot),
 			).rejects.toThrow(/match the resumed report snapshot/);
 
-			await runGit(unrelatedRepository, "init", "--initial-branch=main");
-			await runGit(unrelatedRepository, "config", "user.name", "GJC Test");
-			await runGit(unrelatedRepository, "config", "user.email", "gjc-test@example.invalid");
-			await fs.writeFile(path.join(unrelatedRepository, "other.txt"), "unrelated\n");
-			await runGit(unrelatedRepository, "add", "other.txt");
-			await runGit(unrelatedRepository, "commit", "-m", "unrelated snapshot");
-			const unrelatedCommit = await runGit(unrelatedRepository, "rev-parse", "HEAD");
+			const currentTree = await runGit(repository, "rev-parse", `${currentDev}^{tree}`);
+			const unrelatedCommit = await runGit(repository, "commit-tree", currentTree, "-m", "unrelated snapshot");
 			await expect(
 				assertTaskSnapshotMatchesOrigin(repository, unrelatedCommit, currentDev, unrelatedCommit),
 			).rejects.toThrow(/no longer an ancestor of origin\/dev/);
+			await expect(
+				assertTaskSnapshotMatchesOrigin(temporaryRoot, recordedSnapshot, currentDev, recordedSnapshot),
+			).rejects.toThrow(/git merge-base --is-ancestor .* failed/);
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
 		}
