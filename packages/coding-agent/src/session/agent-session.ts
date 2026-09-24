@@ -5677,6 +5677,25 @@ export class AgentSession {
 							args: ctx.args,
 							isError: ctx.isError,
 							resultError: ctx.result.isError === true,
+							getRemainingContextRatio: () => {
+								const percent = this.getContextUsage()?.percent;
+								return typeof percent === "number" && Number.isFinite(percent)
+									? Math.min(1, Math.max(0, 1 - percent / 100))
+									: undefined;
+							},
+							getActivePlanStepCount: () => {
+								// Tasks within a phase are peers; do not combine separate ordered phases.
+								return this.getTodoPhases().reduce(
+									(largestPhase, phase) =>
+										Math.max(
+											largestPhase,
+											phase.tasks.filter(
+												task => task.status === "pending" || task.status === "in_progress",
+											).length,
+										),
+									0,
+								);
+							},
 						},
 						signal,
 					);
