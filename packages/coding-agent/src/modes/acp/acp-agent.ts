@@ -193,8 +193,10 @@ interface PromptWaiter {
 	invocationKind: "prompt" | "skill";
 	/** ACP-owned identity, never inherited from caller metadata or reused for replay. */
 	clientRef: string;
-	/** True at turn.prompt's synchronous pre-send boundary (or skill.invoke dispatch); host abort owns cancellation thereafter. */
+	/** True after turn.prompt's synchronous socket send returns (or skill.invoke dispatch); host abort owns cancellation thereafter. */
 	dispatched: boolean;
+	/** While socket.send is synchronous and unresolved, cancellation must wait for its send/throw disposition. */
+	dispatchPending?: Promise<void>;
 	/** True only while the dispatched control request can still reveal its correlation. */
 	acknowledgementPending: boolean;
 
@@ -2850,6 +2852,7 @@ export class AcpAgent implements Agent {
 						);
 					return await response;
 				}
+
 				record.activePrompt = undefined;
 				record.busy = record.backgroundBusy;
 				clearPromptWatchdog(waiter);
@@ -2874,6 +2877,7 @@ export class AcpAgent implements Agent {
 
 			waiter.acknowledgementPending = true;
 			const promptAdapter = record.adapter;
+			let finishDispatch: (() => void) | undefined;
 			const acknowledgementTask = (async (): Promise<PromptResponse> => {
 				if (waiter.settled || record.activePrompt !== waiter) return await response;
 				const submit = async (): Promise<unknown> =>
@@ -2900,8 +2904,17 @@ export class AcpAgent implements Agent {
 											"invalid_input",
 											"ACP prompt exceeds the SDK transport limit.",
 										);
+									const pending = Promise.withResolvers<void>();
+									waiter.dispatchPending = pending.promise;
+									finishDispatch = () => {
+										if (waiter.dispatchPending === pending.promise) waiter.dispatchPending = undefined;
+										pending.resolve();
+									};
+								},
+								() => {
 									waiter.dispatched = true;
 									if (retryReservation) retryReservation.admitted = true;
+									finishDispatch?.();
 								},
 							);
 				let acknowledgement: unknown;
@@ -3161,6 +3174,11 @@ export class AcpAgent implements Agent {
 				return await response;
 			})()
 				.catch(async error => {
+					if (error instanceof SdkClientError && error.code === "uncertain_after_send") {
+						waiter.dispatched = true;
+						if (retryReservation) retryReservation.admitted = true;
+					}
+					finishDispatch?.();
 					if (
 						!(error instanceof SdkClientError || error instanceof AcpSdkAdapterError) ||
 						error.code !== "uncertain_after_send"
@@ -3171,6 +3189,7 @@ export class AcpAgent implements Agent {
 					return await response;
 				})
 				.finally(() => {
+					finishDispatch?.();
 					discardStaged();
 					waiter.acknowledgementPending = false;
 					this.#releaseRetiredPromptAcknowledgement(params.sessionId, waiter);
@@ -3232,6 +3251,9 @@ export class AcpAgent implements Agent {
 		this.#settlePendingPromptAdmission(record, { kind: "cancelled" });
 		const waiter = record.activePrompt;
 		waiter?.uploadAbort.abort();
+		// A reentrant cancel inside socket.send cannot decide whether the frame was
+		// accepted until onDispatch or the synchronous send failure is observed.
+		if (waiter?.dispatchPending) await waiter.dispatchPending;
 		// Nothing has reached turn.prompt yet: the upload belongs entirely to this
 		// ACP request, and a host terminal abort could stop an unrelated turn.
 		if (waiter && !waiter.dispatched) {

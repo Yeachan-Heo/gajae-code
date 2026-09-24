@@ -6180,6 +6180,7 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
+			releaseAcceptedImage(correlation);
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (submission.workLease) {
