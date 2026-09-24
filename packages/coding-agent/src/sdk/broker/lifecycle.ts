@@ -1767,8 +1767,35 @@ export class LifecycleReadinessCleanupError extends Error {
 
 const LIFECYCLE_READY_REVOCATION_GRACE_MS = 100;
 
-/** The child writes this only after its endpoint and semantic ready event are both live. */
+type LifecyclePublicationIdentity = {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	sha256: string;
+};
 
+function removeLifecyclePublicationFile(
+	file: string,
+	identity: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+	allowHardLink = false,
+): boolean {
+	try {
+		const result = nativeLifecycle().exactUnlinkDirect(file, {
+			...identity,
+			...(allowHardLink ? { allowHardLink: true } : {}),
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+		});
+		return result.ok || result.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+/** The child writes this only after its endpoint and semantic ready event are both live. */
 export async function writeSessionLifecycleReady(
 	root: string,
 	id: string,
@@ -1787,6 +1814,7 @@ export async function writeSessionLifecycleReady(
 	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
 	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
 	const readyPath = lifecycleReadyPath(root, id);
+
 	let handle: fs.FileHandle | undefined;
 	let published = false;
 	let publicationIdentity: NativeExactFileIdentity | undefined;
@@ -1853,6 +1881,7 @@ export async function writeSessionLifecycleReady(
 		published = true;
 		onPublishing?.(revoke);
 		await syncDirectory(directory);
+		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed after publication.");
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
 		onPublished?.();
 	} catch (error) {
@@ -1970,6 +1999,97 @@ async function syncDirectory(directory: string): Promise<void> {
 	}
 }
 
+export class LifecycleFailurePublicationCleanupError extends Error {
+	constructor(cause: unknown) {
+		super("Lifecycle failure receipt cleanup could not be proven.", { cause });
+		this.name = "LifecycleFailurePublicationCleanupError";
+	}
+}
+
+function removeOwnedFailurePublicationFile(
+	file: string,
+	identity: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): boolean {
+	try {
+		const result = nativeLifecycle().exactUnlinkDirect(file, {
+			...identity,
+			allowHardLink: true,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(file)}`,
+		});
+		return result.ok || result.code === "not_found";
+	} catch {
+		return false;
+	}
+}
+
+async function replaceOwnedFailureReceiptWithIncomplete(
+	directory: string,
+	target: string,
+	artifact: LifecycleFailureArtifact,
+	expectedDestination: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): Promise<boolean> {
+	const incomplete: LifecycleFailureArtifact = {
+		...artifact,
+		rollback: {
+			endpointGeneration: artifact.rollback.endpointGeneration,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		},
+	};
+	const bytes = Buffer.from(canonicalJson(incomplete), "utf8");
+	const temporary = path.join(directory, `.${artifact.effectMarker}.lifecycle.failure.incomplete.${randomUUID()}.tmp`);
+	let handle: fs.FileHandle | undefined;
+	let replaced = false;
+	try {
+		handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			0o600,
+		);
+		await handle.writeFile(bytes);
+		await handle.sync();
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile() || stat.nlink !== 1n) return false;
+		await handle.close();
+		handle = undefined;
+		const result = nativeLifecycle().exactReplacePath(
+			temporary,
+			target,
+			{
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+			},
+			{
+				...expectedDestination,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+			},
+		);
+		if (!result.ok || result.retainedPlaceholderPath) return false;
+		replaced = true;
+		await fs.rm(temporary, { force: true });
+		await syncDirectory(directory);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await handle?.close().catch(() => {});
+		if (!replaced) await fs.rm(temporary, { force: true }).catch(() => {});
+	}
+}
+
 /** Writes bounded startup diagnostics. The child stamps its own pid; the broker may stamp a proven child identity. */
 export async function writeSessionLifecycleFailure(
 	root: string,
@@ -2004,32 +2124,93 @@ export async function writeSessionLifecycleFailure(
 	const bytes = Buffer.from(canonicalJson(artifact), "utf8");
 	if (bytes.length > MAX_LIFECYCLE_METADATA_BYTES)
 		throw new Error("Lifecycle startup failure exceeds the metadata size ceiling.");
+	const parent = lifecycleParentIdentity(directory);
+	if (!parent) throw new Error("Lifecycle failure receipt parent identity is unavailable.");
+	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
 	const target = lifecycleFailurePath(root, id, effectMarker);
 	const temporary = path.join(directory, `.${id}.lifecycle.failure.${effectMarker}.${randomUUID()}.tmp`);
+	let handle: fs.FileHandle | undefined;
+	let temporaryCreatedByUs = false;
+	let temporaryIdentity: LifecyclePublicationIdentity | undefined;
 	let published = false;
+	let directoryChanged = false;
 	try {
-		const handle = await fs.open(
+		handle = await fs.open(
 			temporary,
 			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
 			0o600,
 		);
-		try {
-			await handle.writeFile(bytes);
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
+		temporaryCreatedByUs = true;
+		await handle.writeFile(bytes);
+		await handle.sync();
+		const stat = await handle.stat({ bigint: true });
+		if (!stat.isFile() || stat.nlink !== 1n)
+			throw new Error("Lifecycle failure receipt temporary file identity is invalid.");
+		temporaryIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
+		await handle.close();
+		handle = undefined;
 		try {
 			await fs.link(temporary, target);
 			published = true;
+			directoryChanged = true;
 		} catch (writeError) {
 			if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
 			const existing = await readLifecycleFailureArtifact(target, artifact);
 			if (!existing?.bytes.equals(bytes)) throw new Error("Lifecycle startup failure artifact collision.");
 		}
-	} finally {
 		await fs.rm(temporary, { force: true });
-		if (published) await syncDirectory(directory);
+		directoryChanged = true;
+		await syncDirectory(directory);
+	} catch (error) {
+		const cleanupErrors: unknown[] = [];
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (temporaryCreatedByUs && temporaryIdentity) {
+			if (published && !removeOwnedFailurePublicationFile(target, temporaryIdentity, parentIdentity)) {
+				const downgraded = await replaceOwnedFailureReceiptWithIncomplete(
+					directory,
+					target,
+					artifact,
+					temporaryIdentity,
+					parentIdentity,
+				);
+				if (!downgraded)
+					cleanupErrors.push(
+						new Error("The published lifecycle failure receipt could not be revoked or downgraded."),
+					);
+			}
+			if (!removeOwnedFailurePublicationFile(temporary, temporaryIdentity, parentIdentity))
+				cleanupErrors.push(new Error("The exact lifecycle failure temporary file could not be removed."));
+			directoryChanged = true;
+		} else if (temporaryCreatedByUs) {
+			try {
+				await fs.rm(temporary, { force: true });
+				directoryChanged = true;
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (directoryChanged) {
+			try {
+				await syncDirectory(directory);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw new LifecycleFailurePublicationCleanupError(new AggregateError([error, ...cleanupErrors]));
+		throw error;
 	}
 }
 

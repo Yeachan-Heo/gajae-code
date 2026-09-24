@@ -1673,8 +1673,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		throw primary;
 	};
 	// Subscribe before owned-registry construction as its first catalog pass may
-	// probe credentials. Preserve the listener cleanup contract if scoped settings
-	// loading fails after the storage has been acquired.
+	// probe credentials. Embedder handlers disable AuthStorage's no-listener
+	// buffer, so the SDK listener must already be present before any startup probe.
 	try {
 		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
 			if (credentialDisabledTarget) {

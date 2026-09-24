@@ -199,6 +199,43 @@ describe("lifecycle session explicit model pin", () => {
 		}
 	}, 30_000);
 
+	test("marks startup configuration rejection incomplete when credential unsubscribe fails", async () => {
+		const cwd = tempCwd();
+		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let removeUnderlyingListener: (() => void) | undefined;
+		const subscribe = vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			removeUnderlyingListener = originalSubscribe(listener);
+			return () => {
+				throw new Error("controlled credential listener cleanup failure");
+			};
+		});
+		const close = vi.spyOn(authStorage, "close");
+		const rollback = new SdkStartupRollbackTracker();
+		const capability = new SdkStartupCapability(rollback, "immediate", "startup-auth-rejection");
+		const rejectedStartupConfig = Promise.reject(new Error("controlled startup auth config failure")) as never;
+		try {
+			const created = await createLifecycleAgentSession(
+				{
+					cwd,
+					agentDir: cwd,
+					authStorage,
+					settings: Settings.isolated(),
+					startupAuthConfig: rejectedStartupConfig,
+					modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+				},
+				{ capability, rollback },
+			);
+			if (!("failure" in created)) throw new Error("Expected startup auth configuration failure.");
+			expect(created.cleanupComplete).toBe(false);
+			expect(created.failure.message).toContain("controlled startup auth config failure");
+			expect(close).not.toHaveBeenCalled();
+		} finally {
+			subscribe.mockRestore();
+			close.mockRestore();
+			removeUnderlyingListener?.();
+		}
+	}, 30_000);
+
 	test("keeps the pin as the effective model after default-profile and mpreset processing", async () => {
 		const cwd = tempCwd();
 		const settings = Settings.isolated();
