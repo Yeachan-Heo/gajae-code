@@ -267,21 +267,30 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 
 async function appendPrivate(filePath: string, content: string): Promise<void> {
 	let initialStat: nodeFs.BigIntStats | undefined;
-	try {
-		initialStat = await fs.lstat(filePath, { bigint: true });
-	} catch (error) {
-		if (!isErrno(error, "ENOENT")) throw error;
-	}
-	if (initialStat && (!initialStat.isFile() || initialStat.isSymbolicLink() || initialStat.nlink !== 1n))
-		throw new Error("append target must be a regular single-linked file");
-	const flags = initialStat
-		? nodeFs.constants.O_WRONLY |
-			nodeFs.constants.O_APPEND |
-			(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
-		: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
 	let handle: fs.FileHandle | undefined;
+	for (let attempt = 0; attempt < 8 && !handle; attempt++) {
+		initialStat = undefined;
+		try {
+			initialStat = await fs.lstat(filePath, { bigint: true });
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) throw error;
+		}
+		if (initialStat && (!initialStat.isFile() || initialStat.isSymbolicLink() || initialStat.nlink !== 1n))
+			throw new Error("append target must be a regular single-linked file");
+		const flags = initialStat
+			? nodeFs.constants.O_WRONLY |
+				nodeFs.constants.O_APPEND |
+				(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
+			: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
+		try {
+			handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
+		} catch (error) {
+			if (!initialStat && attempt < 7 && isErrno(error, "EEXIST")) continue;
+			throw error;
+		}
+	}
+	if (!handle) throw new Error("append target changed repeatedly while opening");
 	try {
-		handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
 		const openedStat = await handle.stat({ bigint: true });
 		const pathStat = await fs.lstat(filePath, { bigint: true });
 		const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
