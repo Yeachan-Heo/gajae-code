@@ -5948,17 +5948,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 	} catch (error) {
 		let cleanupDiagnostic: unknown;
+		let ownedMcpCleanupFailed = false;
+		let ownedMcpCleanupError: unknown;
 		const recordCleanupFailure = (cleanupError: unknown): void => {
 			cleanupDiagnostic =
 				cleanupDiagnostic === undefined
 					? cleanupError
 					: new AggregateError([cleanupDiagnostic, cleanupError], "Multiple startup cleanup operations failed.");
 		};
-		const attemptCleanup = async (cleanup: () => void | Promise<void>): Promise<void> => {
+		const attemptCleanup = async (
+			cleanup: () => void | Promise<void>,
+			onFailure?: (cleanupError: unknown) => void,
+		): Promise<void> => {
 			try {
 				await cleanup();
 			} catch (cleanupError) {
 				recordCleanupFailure(cleanupError);
+				onFailure?.(cleanupError);
 			}
 		};
 		// Release the subscription if the throw happened after install but before the
@@ -5996,7 +6002,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await ownedAsyncJobManager.dispose({ timeoutMs: 100 });
 				});
 			}
-			if (cleanupOwnedMcpManager) await attemptCleanup(cleanupOwnedMcpManager);
+			if (cleanupOwnedMcpManager)
+				await attemptCleanup(cleanupOwnedMcpManager, cleanupError => {
+					ownedMcpCleanupFailed = true;
+					ownedMcpCleanupError = cleanupError;
+				});
 			const evalCleanup = Promise.all([import("../eval/py/executor"), import("../eval/js/context-manager")]);
 			let evalCleanupModules: Awaited<typeof evalCleanup> | undefined;
 			try {
@@ -6021,8 +6031,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (cleanupDiagnostic !== undefined) {
 			logger.warn("Failed to clean up createAgentSession resources after startup error", {
 				error: safeErrorForLog(error),
-				cleanupDiagnostic: safeErrorForLog(cleanupDiagnostic),
+				cleanupDiagnostic: ownedMcpCleanupFailed
+					? safeCleanupDiagnosticForLog({ code: "MCP_MANAGER_CLEANUP_FAILED", cause: ownedMcpCleanupError })
+					: safeErrorForLog(cleanupDiagnostic),
 			});
+			if (ownedMcpCleanupFailed) {
+				const withMcpCleanupDiagnostic = attachMcpCleanupDiagnostic(error, ownedMcpCleanupError);
+				if (cleanupDiagnostic === ownedMcpCleanupError) throw withMcpCleanupDiagnostic;
+				throw attachStartupCleanupDiagnostic(withMcpCleanupDiagnostic, cleanupDiagnostic);
+			}
 			throw attachStartupCleanupDiagnostic(error, cleanupDiagnostic);
 		}
 		throw error;
