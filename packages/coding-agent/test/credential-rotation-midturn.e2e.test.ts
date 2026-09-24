@@ -296,6 +296,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	runtimeApiKey?: string;
 	addApiKeyDuringMark?: string;
 	predecessorModel?: Model;
+	terminalCodexEntry?: boolean;
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
 	unresolvablePeerDuringMark?: boolean;
@@ -419,9 +420,12 @@ async function runManagedFallbackQuotaScenario(options: {
 			modelRegistry: registry,
 		});
 		const entries = options.predecessorModel
-			? [selector(options.predecessorModel), selector(model), selector(fallback)]
+			? options.terminalCodexEntry
+				? [selector(options.predecessorModel), selector(model)]
+				: [selector(options.predecessorModel), selector(model), selector(fallback)]
 			: [selector(model), selector(fallback)];
 		session.setConfiguredModelChain("default", entries, "test");
+		if (options.terminalCodexEntry) session.seedDefaultFallbackResolution(1, []);
 		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
 		const markUsageLimitReached = vi.spyOn(storage, "markUsageLimitReached");
 		if (
@@ -694,6 +698,33 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
 			markCount: 1,
 		});
+	});
+
+	test("does not mark another account after a ceiling on the final model entry", async () => {
+		const predecessor = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		if (!predecessor || !model) throw new Error("Missing bundled terminal fallback fixture models");
+		const previousAnthropicApiKey = Bun.env.ANTHROPIC_API_KEY;
+		const previousAnthropicOAuthToken = Bun.env.ANTHROPIC_OAUTH_TOKEN;
+		delete Bun.env.ANTHROPIC_API_KEY;
+		delete Bun.env.ANTHROPIC_OAUTH_TOKEN;
+		try {
+			const result = await runManagedFallbackQuotaScenario({
+				accounts: ["a", "b", "c"],
+				quotaKeys: ["TOKEN-a", "TOKEN-b", "TOKEN-c"],
+				providerRetryMaxAttempts: 2,
+				predecessorModel: predecessor,
+				terminalCodexEntry: true,
+			});
+			expect(result.models).toEqual([selector(model), selector(model)]);
+			expect(result.keys).toEqual(["TOKEN-a", "TOKEN-b"]);
+			expect(result.markCount).toBe(1);
+		} finally {
+			if (previousAnthropicApiKey === undefined) delete Bun.env.ANTHROPIC_API_KEY;
+			else Bun.env.ANTHROPIC_API_KEY = previousAnthropicApiKey;
+			if (previousAnthropicOAuthToken === undefined) delete Bun.env.ANTHROPIC_OAUTH_TOKEN;
+			else Bun.env.ANTHROPIC_OAUTH_TOKEN = previousAnthropicOAuthToken;
+		}
 	});
 
 	test("keeps the active non-head fallback entry when quota rotation retries it", async () => {
