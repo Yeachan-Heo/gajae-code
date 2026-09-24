@@ -52,7 +52,7 @@ function originalLargePng(seed = 0x12345678): Buffer {
 const digest = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 const descriptor = (bytes: Buffer) => ({ mimeType: "image/png", byteLength: bytes.length, sha256: digest(bytes) });
 
-async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer): Promise<string> {
+function upload(store: PromptImageUploadStore, owner: string, bytes: Buffer): string {
 	const { id } = store.begin(owner, descriptor(bytes));
 	let sequence = 0;
 	for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
@@ -63,6 +63,11 @@ async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer
 			receivedBytes: offset + chunk.length,
 		});
 	}
+	return id;
+}
+
+async function stage(store: PromptImageUploadStore, owner: string, bytes: Buffer): Promise<string> {
+	const id = upload(store, owner, bytes);
 	await store.finish(owner, { id });
 	return id;
 }
@@ -115,6 +120,58 @@ test("concurrent finishes validate one lease only once and reject appends during
 		}
 	} finally {
 		store.close();
+	}
+});
+
+test("distinct sessions share one process-wide decode slot and recover it after finalization", async () => {
+	const bytes = originalLargePng();
+	const firstStore = new PromptImageUploadStore();
+	const secondStore = new PromptImageUploadStore();
+	try {
+		const first = upload(firstStore, "sender", bytes);
+		const second = upload(secondStore, "sender", bytes);
+		const finishing = firstStore.finish("sender", { id: first });
+		const competing = secondStore.finish("sender", { id: second });
+		await expect(competing).rejects.toMatchObject({ code: "busy" });
+		await finishing;
+		await secondStore.finish("sender", { id: second });
+		const firstAccepted = firstStore.redeem("sender", [{ id: first }]);
+		const secondAccepted = secondStore.redeem("sender", [{ id: second }]);
+		try {
+			expect(Buffer.from(firstAccepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+			expect(Buffer.from(secondAccepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			firstAccepted.release();
+			secondAccepted.release();
+		}
+	} finally {
+		firstStore.close();
+		secondStore.close();
+	}
+});
+
+test("discard during decoding retains the shared slot until its in-flight finish settles", async () => {
+	const bytes = originalLargePng();
+	const firstStore = new PromptImageUploadStore();
+	const secondStore = new PromptImageUploadStore();
+	try {
+		const first = upload(firstStore, "sender", bytes);
+		const second = upload(secondStore, "sender", bytes);
+		const finishing = firstStore.finish("sender", { id: first });
+		firstStore.discard("sender", { id: first });
+		const competing = secondStore.finish("sender", { id: second });
+		await expect(competing).rejects.toMatchObject({ code: "busy" });
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		await secondStore.finish("sender", { id: second });
+		const accepted = secondStore.redeem("sender", [{ id: second }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(bytes)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		firstStore.close();
+		secondStore.close();
 	}
 });
 
@@ -301,5 +358,84 @@ test("accepted images enforce the 64 MiB session budget until their terminal rel
 	} finally {
 		for (const release of releases) release();
 		store.close();
+	}
+}, 60_000);
+
+test("accepted base64 copies and transient decoding share a process-wide budget across sessions", async () => {
+	const original = originalLargePng();
+	const image = Buffer.concat([
+		original.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(19 * 1024 * 1024)),
+		original.subarray(-12),
+	]);
+	const stores = Array.from({ length: 6 }, () => new PromptImageUploadStore());
+	const releases: Array<() => void> = [];
+	try {
+		for (const store of stores.slice(0, 5)) {
+			const id = await stage(store, "sender", image);
+			releases.push(store.redeem("sender", [{ id }]).release);
+		}
+		const pending = upload(stores[5]!, "sender", image);
+		await expect(stores[5]!.finish("sender", { id: pending })).rejects.toMatchObject({ code: "busy" });
+		releases[0]!();
+		await stores[5]!.finish("sender", { id: pending });
+		const recovered = stores[5]!.redeem("sender", [{ id: pending }]);
+		try {
+			expect(Buffer.from(recovered.images[0]!.data, "base64").equals(image)).toBe(true);
+		} finally {
+			recovered.release();
+		}
+	} finally {
+		for (const release of releases) release();
+		for (const store of stores) store.close();
+	}
+}, 60_000);
+
+test("discarded in-flight source bytes stay reserved until decode settles, then capacity recovers", async () => {
+	const original = originalLargePng();
+	const image = Buffer.concat([
+		original.subarray(0, -12),
+		pngChunk("ruSt", Buffer.alloc(18.5 * 1024 * 1024)),
+		original.subarray(-12),
+	]);
+	const stores = Array.from({ length: 5 }, () => new PromptImageUploadStore());
+	const pendingStore = stores[4]!;
+	const releases: Array<() => void> = [];
+	try {
+		for (const store of stores.slice(0, 4)) {
+			const id = await stage(store, "sender", image);
+			releases.push(store.redeem("sender", [{ id }]).release);
+		}
+		const first = upload(pendingStore, "sender", image);
+		const second = upload(pendingStore, "sender", image);
+		const finishing = pendingStore.finish("sender", { id: first });
+		pendingStore.discard("sender", { id: first });
+		const third = upload(pendingStore, "sender", image);
+		const fourth = pendingStore.begin("sender", descriptor(image));
+		const chunk = image.subarray(0, 96 * 1024).toString("base64");
+		let capacityReached = false;
+		for (let sequence = 0; sequence < 64; sequence++) {
+			try {
+				pendingStore.append("sender", { id: fourth.id, sequence, data: chunk });
+			} catch (error) {
+				expect(error).toMatchObject({ code: "busy" });
+				capacityReached = true;
+				break;
+			}
+		}
+		expect(capacityReached).toBe(true);
+		await expect(finishing).rejects.toMatchObject({ code: "resource_gone" });
+		for (const id of [second, third, fourth.id]) pendingStore.discard("sender", { id });
+		for (const release of releases) release();
+		const recovered = await stage(pendingStore, "sender", original);
+		const accepted = pendingStore.redeem("sender", [{ id: recovered }]);
+		try {
+			expect(Buffer.from(accepted.images[0]!.data, "base64").equals(original)).toBe(true);
+		} finally {
+			accepted.release();
+		}
+	} finally {
+		for (const release of releases) release();
+		for (const store of stores) store.close();
 	}
 }, 60_000);
