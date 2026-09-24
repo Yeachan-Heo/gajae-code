@@ -284,6 +284,43 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
+	test("captured terminal intent stays deferred after expiry leaves the active state", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-captured-terminal", turnId: "turn-captured-terminal" };
+		manager.onAccepted(correlation);
+		manager.noteTerminalTransition(
+			correlation,
+			undefined,
+			{ outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } },
+			true,
+		);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
+	test("a later ordinary terminal observation cannot downgrade deadline deferral", () => {
+		const { reconciliation } = fakeReconciliation();
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-deferred-terminal", turnId: "turn-deferred-terminal" };
+		manager.onAccepted(correlation);
+		const evidence = { outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" } as const };
+		manager.noteTerminalTransition(correlation, undefined, evidence, true);
+		manager.noteTerminalTransition(correlation, undefined, evidence);
+
+		expect(manager.shouldDeferTerminalTransition(correlation)).toBe(true);
+		manager.clearAll();
+	});
+
 	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.noteTransitionFailures = 1;
