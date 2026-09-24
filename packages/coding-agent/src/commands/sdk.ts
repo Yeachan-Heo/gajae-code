@@ -10,6 +10,7 @@ import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-comm
 import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
+import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { initTheme } from "../modes/theme/theme";
@@ -1264,6 +1265,7 @@ export default class Sdk extends Command {
 		}
 
 		const internal = parseSdkInternalArgv(this.argv);
+		if (internal.action === "broker-internal") usePostmortemSignalExitAuthority();
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
 			return;
