@@ -2101,9 +2101,19 @@ async function syncDirectory(directory: string): Promise<void> {
 }
 
 export class LifecycleFailurePublicationCleanupError extends Error {
-	constructor(cause: unknown) {
+	readonly unresolvedPaths: readonly string[];
+	constructor(cause: unknown, unresolvedPaths: readonly string[] = []) {
 		super("Lifecycle failure receipt cleanup could not be proven.", { cause });
 		this.name = "LifecycleFailurePublicationCleanupError";
+		this.unresolvedPaths = [...unresolvedPaths];
+	}
+}
+
+function unresolvedLifecycleFailurePaths(error: unknown): readonly string[] {
+	try {
+		return error instanceof LifecycleFailurePublicationCleanupError ? error.unresolvedPaths : [];
+	} catch {
+		return [];
 	}
 }
 
@@ -2222,6 +2232,7 @@ async function replaceOwnedFailureReceipt(
 	let handle: fs.FileHandle | undefined;
 	let temporaryCreatedByUs = false;
 	let sourceIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	let unresolvedPaths: string[] = [];
 	try {
 		handle = await fs.open(
 			temporary,
@@ -2250,24 +2261,52 @@ async function replaceOwnedFailureReceipt(
 				parentIno: parent.ino,
 			},
 		);
-		if (!result.ok || result.retainedPlaceholderPath || result.retainedUnknownPath)
+		if (!result.ok || result.retainedPlaceholderPath || result.retainedUnknownPath) {
+			unresolvedPaths = [result.retainedPlaceholderPath, result.retainedUnknownPath].filter(
+				(pathname): pathname is string => pathname !== undefined,
+			);
 			throw new Error(`Lifecycle failure receipt replacement failed: ${result.code ?? "unknown"}.`);
-		return true;
-	} catch {}
-	if (handle && temporaryCreatedByUs && !sourceIdentity) {
-		try {
-			sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
-		} catch {
-			// Without descriptor identity, leave the temporary pathname untouched.
 		}
+		return true;
+	} catch (error) {
+		const cleanupErrors: unknown[] = [error];
+		if (handle && temporaryCreatedByUs && !sourceIdentity) {
+			try {
+				sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (handle) {
+			try {
+				await handle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (temporaryCreatedByUs) {
+			if (!sourceIdentity) {
+				unresolvedPaths.push(temporary);
+				cleanupErrors.push(new Error("Replacement lifecycle failure receipt temp identity is unavailable."));
+			} else if (!removeLifecyclePublicationFile(temporary, sourceIdentity, parent, true)) {
+				unresolvedPaths.push(temporary);
+				cleanupErrors.push(new Error("Replacement lifecycle failure receipt temp could not be exactly removed."));
+			} else {
+				try {
+					await syncDirectory(directory);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+			}
+		}
+		if (unresolvedPaths.length > 0 || cleanupErrors.length > 1)
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError(cleanupErrors, "Replacement lifecycle failure receipt cleanup was not confirmed."),
+				unresolvedPaths,
+			);
+		return false;
 	}
-	if (handle) await handle.close().catch(() => {});
-	if (!temporaryCreatedByUs || !sourceIdentity) return false;
-	removeLifecyclePublicationFile(temporary, sourceIdentity, parent, true);
-	await syncDirectory(directory).catch(() => {});
-	return false;
 }
-
 /** Writes bounded startup diagnostics. The child stamps its own pid; the broker may stamp a proven child identity. */
 export async function writeSessionLifecycleFailure(
 	root: string,
@@ -2459,48 +2498,58 @@ export async function writeSessionLifecycleFailure(
 				cleanupErrors.push(cleanupError);
 			}
 		}
+		const unresolvedReplacementPaths = unresolvedLifecycleFailurePaths(error);
 		if (promotionFence) {
-			const current = await readLifecycleFailureArtifact(target, artifact, true);
-			const targetAbsent = (() => {
-				try {
-					fsSync.lstatSync(target);
-					return false;
-				} catch (error) {
-					return (error as NodeJS.ErrnoException).code === "ENOENT";
-				}
-			})();
-			if (!targetAbsent && !current?.bytes.equals(stagedBytes)) {
+			if (unresolvedReplacementPaths.length > 0) {
 				cleanupErrors.push(
-					new Error("Lifecycle failure promotion fence retained because canonical state is unresolved."),
+					new Error("Lifecycle failure promotion fence retained because native replacement paths are unresolved."),
 				);
 			} else {
-				let canonicalStateSynced = false;
-				try {
-					await syncDirectory(directory);
-					canonicalStateSynced = true;
-				} catch (cleanupError) {
-					cleanupErrors.push(cleanupError);
-				}
-				if (canonicalStateSynced) {
-					if (removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity)) {
-						promotionFence = undefined;
-						try {
-							await syncDirectory(directory);
-						} catch (cleanupError) {
-							cleanupErrors.push(cleanupError);
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				const targetAbsent = (() => {
+					try {
+						fsSync.lstatSync(target);
+						return false;
+					} catch (error) {
+						return (error as NodeJS.ErrnoException).code === "ENOENT";
+					}
+				})();
+				if (!targetAbsent && !current?.bytes.equals(stagedBytes)) {
+					cleanupErrors.push(
+						new Error("Lifecycle failure promotion fence retained because canonical state is unresolved."),
+					);
+				} else {
+					let canonicalStateSynced = false;
+					try {
+						await syncDirectory(directory);
+						canonicalStateSynced = true;
+					} catch (cleanupError) {
+						cleanupErrors.push(cleanupError);
+					}
+					if (canonicalStateSynced) {
+						if (removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity)) {
+							promotionFence = undefined;
+							try {
+								await syncDirectory(directory);
+							} catch (cleanupError) {
+								cleanupErrors.push(cleanupError);
+							}
+						} else {
+							cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
 						}
 					} else {
-						cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
+						cleanupErrors.push(
+							new Error("Lifecycle failure promotion fence retained without durable canonical state."),
+						);
 					}
-				} else {
-					cleanupErrors.push(
-						new Error("Lifecycle failure promotion fence retained without durable canonical state."),
-					);
 				}
 			}
 		}
 		if (cleanupErrors.length > 0)
-			throw new LifecycleFailurePublicationCleanupError(new AggregateError([error, ...cleanupErrors]));
+			throw new LifecycleFailurePublicationCleanupError(
+				new AggregateError([error, ...cleanupErrors]),
+				unresolvedReplacementPaths,
+			);
 		throw error;
 	}
 }

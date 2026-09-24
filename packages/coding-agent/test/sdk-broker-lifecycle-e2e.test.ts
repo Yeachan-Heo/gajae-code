@@ -2629,6 +2629,73 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.skipIf(process.platform === "win32")(
+	"retained native replacement paths keep the promotion fence and stay unreadable",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-retained-replace-"));
+		const sessionId = "receipt-retained-replace";
+		const effectMarker = "receipt-retained-replace-marker";
+		const incarnation = "receipt-retained-replace-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+		const retainedPath = path.join(path.dirname(failurePath), ".retained-replacement-unknown");
+		const originalExactReplace = native.exactReplacePath.bind(native);
+		let replacementCalls = 0;
+		let restoreReplaceSpy: (() => void) | undefined;
+		try {
+			const replaceSpy = vi.spyOn(native, "exactReplacePath").mockImplementation((source, destination, from, to) => {
+				if (path.resolve(destination) !== path.resolve(failurePath))
+					return originalExactReplace(source, destination, from, to);
+				replacementCalls++;
+				if (replacementCalls === 1) {
+					const replaced = originalExactReplace(source, destination, from, to);
+					if (!replaced.ok) return replaced;
+					writeFileSync(retainedPath, "retained replacement authority");
+					return {
+						ok: false,
+						code: "controlled post-replacement retention",
+						retainedUnknownPath: retainedPath,
+					};
+				}
+				return originalExactReplace(source, destination, from, to);
+			});
+			restoreReplaceSpy = () => replaceSpy.mockRestore();
+
+			const thrown = await writeSessionLifecycleFailure(
+				root,
+				sessionId,
+				effectMarker,
+				{ phase: "startup", reason: "pending", message: "controlled retained replacement" },
+				{
+					endpointGeneration: 8,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				undefined,
+				incarnation,
+				process.pid,
+			).then(
+				() => undefined,
+				error => error,
+			);
+			expect(thrown).toBeInstanceOf(LifecycleFailurePublicationCleanupError);
+			if (!(thrown instanceof LifecycleFailurePublicationCleanupError)) return;
+			expect(thrown.unresolvedPaths).toContain(retainedPath);
+			expect(replacementCalls).toBeGreaterThanOrEqual(2);
+			expect(await Bun.file(promotionFencePath).exists()).toBe(true);
+			expect(await Bun.file(retainedPath).exists()).toBe(true);
+			expect(
+				await readSessionLifecycleFailure(root, sessionId, { pid: process.pid, effectMarker, incarnation }),
+			).toBeUndefined();
+		} finally {
+			restoreReplaceSpy?.();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
 	"post-exchange durability failure keeps all-true receipt fenced from readers",
 	async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-failure-receipt-exchange-failure-"));
