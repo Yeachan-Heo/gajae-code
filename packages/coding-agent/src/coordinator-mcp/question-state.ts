@@ -1879,7 +1879,10 @@ export async function bindCreationRequest(
 			)
 		)
 			throw new Error("session_closing");
-		if (request.canonical_create_intent && canonicalJson(request.canonical_create_intent) !== canonicalJson(intent))
+		if (
+			request.canonical_create_intent &&
+			creationIntentDigest(request.canonical_create_intent) !== creationIntentDigest(intent)
+		)
 			throw new Error("idempotency_conflict");
 		request.canonical_create_intent ??= intent;
 		request.session_id = session.session_id;
