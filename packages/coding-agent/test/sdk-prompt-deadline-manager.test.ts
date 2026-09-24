@@ -224,21 +224,24 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
-	test("a recorded real failure wins over deadline expiry and remains failed", async () => {
+	test("a diagnostic failure without terminal proof stays recoverable", async () => {
 		const { reconciliation, state } = fakeReconciliation();
 		state.error = { code: "provider_unavailable", message: "Agent run failed." };
 		const manager = new PromptDeadlineManager({
 			reconciliation: reconciliation as never,
 			getLeaseMs: () => 20,
 			getMaxMs: () => 60_000,
+			onDeadlineTerminalization: async () => "uncertain" as const,
 		});
 		const correlation = { commandId: "cmd-real-failure", turnId: "turn-real-failure" };
 		manager.onAccepted(correlation);
 		await Bun.sleep(80);
-		expect(state.noteTransitionFrames).toEqual(["agent_end"]);
+		expect(state.noteTransitionFrames).toEqual([]);
 		expect(state.finalizeCodes).toEqual([]);
-		expect(state.status).toBe("failed");
-		expect(manager.has(correlation)).toBe(false);
+		expect(state.status).toBe("uncertain");
+		expect(state.uncertainCalls).toBeGreaterThan(0);
+		expect(manager.has(correlation)).toBe(true);
+		manager.clearAll();
 	});
 
 	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {

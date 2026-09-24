@@ -291,31 +291,22 @@ export class PromptDeadlineManager {
 			this.clear(correlation);
 			return;
 		}
-		if (lookup.error !== undefined && !this.#deadlineDeferredTerminalTransitions.has(key)) {
-			// A real agent_failed diagnostic already won before the zero-activity
-			// deadline. Use the synthetic boundary only to close that failed run;
-			// never overwrite its authenticated classifier with
-			// prompt_deadline_exceeded, which a late real agent_end could otherwise
-			// upgrade to terminal_ok.
-			try {
-				await this.#reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
-			} catch {
-				this.#retry(key);
-				return;
-			}
-			if (this.#backOffIfSuperseded(key, lease, lease.generation)) return;
-			this.#expiryRetries.delete(key);
-			this.#onExpired?.(correlation);
-			this.clear(correlation);
-			return;
-		}
 		const generation = lease.generation;
 		const outcome: PromptDeadlineOutcome = failedPromptOutcome({
 			code: "prompt_deadline_exceeded",
 			provenance: "deadline",
 			evidence: {},
 		}) as PromptDeadlineOutcome;
-		let winner: SdkPromptTerminalOutcome = outcome;
+		const lookupFailure =
+			lookup.error !== undefined && lookup.error.code !== "prompt_deadline_exceeded"
+				? failedPromptOutcome({
+						code: "prompt_failed",
+						provenance: "agent_failed",
+						providerCode: lookup.error.code,
+						evidence: {},
+					})
+				: undefined;
+		let winner: SdkPromptTerminalOutcome = lookupFailure ?? outcome;
 		try {
 			const claimed =
 				"listDeadlineRecoveryPendingPrompts" in this.#reconciliation
@@ -330,18 +321,17 @@ export class PromptDeadlineManager {
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
 		}
-		// A real terminal may win between lookup and this claim. Its existing
-		// A competing terminal outcome is authoritative. If its real agent_end was
-		// deferred behind this exact expiry fence, continue only to prove settlement
-		// and flush before replaying that boundary; never replace it with the synthetic
-		// deadline outcome.
+		// A real terminal may win between lookup and this claim. A diagnostic-only
+		// failure is not terminal evidence; preserve it privately until the host hook
+		// proves the exact run/tool settlement and captures its correlated agent_end.
 		const realDeferredTerminalWon =
 			this.#pendingTerminalTransitions.has(key) && this.#deadlineDeferredTerminalTransitions.has(key);
 		if (
 			!realDeferredTerminalWon &&
-			(winner.kind !== "failed" || winner.code !== "prompt_deadline_exceeded" || winner.provenance !== "deadline")
+			(winner.kind !== "failed" || winner.code !== "prompt_deadline_exceeded" || winner.provenance !== "deadline") &&
+			this.#onDeadlineTerminalization === undefined
 		) {
-			this.clear(correlation);
+			this.#recoverUncertainty(key, correlation, lease, generation);
 			return;
 		}
 		// Re-verify the captured lease is still authoritative after the claim
