@@ -281,7 +281,7 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 			GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
 			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
 			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
-			GJC_TMUX_SESSION: "tui-tmux-session",
+			GJC_TMUX_SESSION: "user-configured-tmux",
 			GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
 			GJC_TMUX_LAUNCHED: "1",
 			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
@@ -298,6 +298,11 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 			GJC_TMUX_COMMAND: "custom-tmux",
 			GJC_TMUX_PROFILE: "1",
 			OWNED_SENTINEL: "kept",
+			gJc_Session_Custom_Marker: "mixed-tui-session-marker",
+			gJc_Coordinator_Session_Launch_Id: "mixed-tui-launch",
+			gJc_Lifecycle_Request_Id: "mixed-tui-lifecycle",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Session_Context_Budget_Bytes: "2147483648",
 		},
 	});
 	const environment = brokerSpawnEnvironmentForTest(command);
@@ -317,7 +322,6 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		"GJC_COORDINATOR_SIDECAR_SIGNING_KEY",
 		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
 		"GJC_COORDINATOR_SIDECAR_KEY_ID",
-		"GJC_TMUX_SESSION",
 		"GJC_TMUX_ACTIVE_SESSION",
 		"GJC_TMUX_LAUNCHED",
 		"GJC_TMUX_OWNER_GENERATION",
@@ -330,11 +334,17 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		"GJC_STATE_ROOT",
 		"TMUX",
 		"TMUX_PANE",
+		"gJc_Session_Custom_Marker",
+		"gJc_Coordinator_Session_Launch_Id",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_Managed_Owner_Child_Token",
 	])
 		expect(environment[name]).toBeUndefined();
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
 	expect(environment.GJC_TMUX_PROFILE).toBe("1");
 	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.gJc_Session_Context_Budget_Bytes).toBe("2147483648");
 	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
 	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
 	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
@@ -355,6 +365,12 @@ it("strips inherited session markers from compiled broker environments", () => {
 			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
 			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
 			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
+			gJc_Session_Id: "mixed-tui-session",
+			gJc_Coordinator_Session_Readiness_File: "/tmp/mixed-ready.json",
+			gJc_Coordinator_Sidecar_Key_Id: "mixed-key-id",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Lifecycle_Request_Id: "mixed-lifecycle-request",
+			gJc_State_Root: "/tmp/mixed-state-root",
 			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
 			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
 			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
@@ -367,6 +383,7 @@ it("strips inherited session markers from compiled broker environments", () => {
 			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
 			GJC_STATE_ROOT: "/tui/.gjc/state",
 			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_SESSION: "user-configured-tmux",
 			GJC_TMUX_PROFILE: "1",
 			GJC_MOUSE: "1",
 			PI_COMPILED: "1",
@@ -382,6 +399,12 @@ it("strips inherited session markers from compiled broker environments", () => {
 		"GJC_SESSION_FILE",
 		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
 		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"gJc_Session_Id",
+		"gJc_Coordinator_Session_Readiness_File",
+		"gJc_Coordinator_Sidecar_Key_Id",
+		"gJc_Managed_Owner_Child_Token",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_State_Root",
 		"GJC_COORDINATOR_SESSION_ID",
 		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
 		"GJC_COORDINATOR_SESSION_READINESS_FILE",
@@ -396,6 +419,7 @@ it("strips inherited session markers from compiled broker environments", () => {
 	])
 		expect(environment[name]).toBeUndefined();
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
 	expect(environment.GJC_TMUX_PROFILE).toBe("1");
 	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
 	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");

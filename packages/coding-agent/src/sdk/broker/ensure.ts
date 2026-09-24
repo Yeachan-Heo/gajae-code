@@ -87,7 +87,6 @@ const BROKER_SESSION_ENV_NAMES = new Set([
 	"GJC_SESSION_CWD",
 	"GJC_SESSION_PROMPT_ACCEPTED_JSON",
 	"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
-	"GJC_TMUX_SESSION",
 	"GJC_TMUX_ACTIVE_SESSION",
 	"GJC_TMUX_LAUNCHED",
 	"TMUX",
@@ -492,10 +491,15 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 	// The broker outlives the TUI session that happened to start it. Never let
 	// that session's identity or coordinator/tmux ownership markers flow through
 	// the broker's process.env into unrelated session hosts. Keep user tmux
-	// configuration (for example GJC_TMUX_COMMAND and GJC_TMUX_PROFILE) intact.
+	// configuration (for example GJC_TMUX_SESSION, GJC_TMUX_COMMAND, GJC_MOUSE,
+	// and GJC_TMUX_PROFILE) intact. Windows environment names are case-insensitive.
 	for (const name of Object.keys(environment)) {
-		if (BROKER_SESSION_ENV_PRESERVED_NAMES.has(name)) continue;
-		if (BROKER_SESSION_ENV_NAMES.has(name) || BROKER_SESSION_ENV_PREFIXES.some(prefix => name.startsWith(prefix)))
+		const normalizedName = name.toUpperCase();
+		if (BROKER_SESSION_ENV_PRESERVED_NAMES.has(normalizedName)) continue;
+		if (
+			BROKER_SESSION_ENV_NAMES.has(normalizedName) ||
+			BROKER_SESSION_ENV_PREFIXES.some(prefix => normalizedName.startsWith(prefix))
+		)
 			delete environment[name];
 	}
 	if (command.kind === "bun-source") {
