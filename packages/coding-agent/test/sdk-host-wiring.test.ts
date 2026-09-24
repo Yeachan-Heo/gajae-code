@@ -2641,6 +2641,189 @@ test("fatal prompt claim failure releases accepted image capacity without publis
 	}
 }, 60_000);
 
+test("unsettled fatal abort retains accepted images until session teardown", async () => {
+	for (const settlement of ["throws", "unfenced"] as const) {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-unsettled-image-${settlement}-`));
+		dirs.push(cwd);
+		const sessionId = `sdk-unsettled-image-${settlement}-${Date.now()}`;
+		const live = { idle: true };
+		const base = context(cwd, sessionId, "main", live);
+		let abortCalls = 0;
+		const sessionContext = {
+			...base,
+			sessionManager: {
+				...(base.sessionManager as Record<string, unknown>),
+				getSessionFile: () => path.join(cwd, "session.jsonl"),
+			},
+			getActivePromptHandle: () => "live-image-run",
+			getTerminalTurnEpoch: () => 1,
+			abortPromptAndWait: async (handle: string) => {
+				expect(handle).toBe("live-image-run");
+				abortCalls++;
+				if (settlement === "throws") throw new Error("run is still holding image strings");
+				return { status: "unfenced", reason: "resources_pending", pending: [] };
+			},
+		};
+		const originalRedeem = PromptImageUploadStore.prototype.redeem;
+		let reserved = 0;
+		let releases = 0;
+		const redeemSpy = spyOn(PromptImageUploadStore.prototype, "redeem").mockImplementation(function (
+			this: PromptImageUploadStore,
+			owner,
+			ids,
+		) {
+			if (reserved) throw new TypedControlError("busy", "Accepted image capacity exceeded.");
+			const reservation = originalRedeem.call(this, owner, ids);
+			reserved++;
+			let released = false;
+			return {
+				images: reservation.images,
+				release: () => {
+					if (released) return;
+					released = true;
+					reservation.release();
+					reserved--;
+					releases++;
+				},
+			};
+		});
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const handlers = start(
+				sessionContext,
+				{ get: () => undefined, getAgentDir: () => cwd } as unknown as Settings,
+				async (_content, options) => {
+					await firePreflightAccept(options);
+				},
+				true,
+			);
+			const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+			await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+			const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+			const open = async () => {
+				const frames: Record<string, unknown>[] = [];
+				const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+				sockets.push(socket);
+				socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+				await new Promise<void>((resolve, reject) => {
+					socket.addEventListener("open", () => resolve(), { once: true });
+					socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+				});
+				const control = async (id: string, operation: string, input: Record<string, unknown>) => {
+					socket.send(JSON.stringify({ type: "control_request", id, operation, input }));
+					await waitFor(
+						() => frames.some(frame => frame.type === "control_response" && frame.id === id),
+						`${id} response`,
+					);
+					return frames.find(frame => frame.type === "control_response" && frame.id === id)!;
+				};
+				return { socket, frames, control };
+			};
+			const requester = await open();
+			const other = await open();
+			const bytes = Buffer.from(
+				await Bun.file(new URL("./fixtures/sdk-inline-image-large.png", import.meta.url)).arrayBuffer(),
+			);
+			const sha256 = Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
+			const stage = async (client: typeof requester, name: string) => {
+				const begun = await client.control(`${name}-begin`, "turn.image.begin", {
+					mimeType: "image/png",
+					byteLength: bytes.length,
+					sha256,
+				});
+				expect(begun).toMatchObject({ ok: true });
+				const id = (begun.result as { id: string }).id;
+				let sequence = 0;
+				for (let offset = 0; offset < bytes.length; offset += 96 * 1024) {
+					expect(
+						await client.control(`${name}-chunk-${sequence}`, "turn.image.append", {
+							id,
+							sequence: sequence++,
+							data: bytes.subarray(offset, offset + 96 * 1024).toString("base64"),
+						}),
+					).toMatchObject({ ok: true });
+				}
+				expect(await client.control(`${name}-finish`, "turn.image.finish", { id })).toMatchObject({ ok: true });
+				return id;
+			};
+			const firstId = await stage(requester, "first");
+			const secondId = await stage(other, "second");
+			const accepted = await requester.control("live-prompt", "turn.prompt", {
+				text: "Keep the image in the run",
+				stagedImages: [{ id: firstId }],
+			});
+			expect(accepted).toMatchObject({ ok: true, result: { accepted: true } });
+			const correlation = acceptedCorrelation(accepted);
+			await handlers.get("agent_start")?.(
+				{
+					type: "agent_start",
+					runId: "live-image-run",
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+				},
+				sessionContext,
+			);
+			live.idle = false;
+			// The abort response may be fenced with the requester; the fatal frame
+			// is the observable result of this deliberately unsettled run.
+			requester.socket.send(
+				JSON.stringify({
+					type: "control_request",
+					id: "fatal-abort",
+					operation: "turn.abort",
+					input: { mode: "terminal" },
+					idempotencyKey: `fatal-abort-${settlement}`,
+				}),
+			);
+			await waitFor(
+				() =>
+					requester.frames.some(
+						frame => frame.type === "agent_failed" && frame.commandId === correlation.commandId,
+					),
+				"fatal abort closure",
+			);
+			expect(abortCalls).toBe(1);
+			expect(
+				requester.frames.filter(
+					frame =>
+						(frame.type === "agent_end" || frame.type === "agent_failed") &&
+						frame.commandId === correlation.commandId,
+				),
+			).toEqual([
+				expect.objectContaining({
+					type: "agent_failed",
+					error: expect.objectContaining({ code: "terminal_uncertain" }),
+				}),
+			]);
+			expect(reserved).toBe(1);
+			expect(releases).toBe(0);
+			expect(
+				await other.control("blocked-prompt", "turn.prompt", {
+					text: "Cannot overbook the still-running image",
+					stagedImages: [{ id: secondId }],
+				}),
+			).toMatchObject({ ok: false, error: { code: "busy" } });
+			expect(reserved).toBe(1);
+			// Fatal closure cleared the run's correlation; an uncorrelated end
+			// cannot prove that this exact accepted image has been released.
+			await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+			expect(reserved).toBe(1);
+			const shutdownFailure = await Promise.resolve(
+				handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+			).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(shutdownFailure).toBeUndefined();
+			expect(reserved).toBe(0);
+			expect(releases).toBe(1);
+		} finally {
+			redeemSpy.mockRestore();
+			warnSpy.mockRestore();
+		}
+	}
+}, 60_000);
+
 test("queued image controls cannot recreate leases after their connection closes", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-image-disconnect-"));
 	dirs.push(cwd);

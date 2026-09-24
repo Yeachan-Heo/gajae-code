@@ -1227,6 +1227,7 @@ interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
 	imageUploads: PromptImageUploadStore;
+	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -5357,9 +5358,10 @@ export function createNotificationsExtension(
 			}
 			promptSubmissions.delete(key);
 			const [commandId, turnId] = key.split(":", 2);
-			if (commandId && turnId) releaseAcceptedImage({ commandId, turnId });
 			// A fatal closure is transport-level, not a committed semantic terminal: the
-			// durable record stays authoritative, so it must never leave a tombstone.
+			// durable record stays authoritative, so it must never leave a tombstone
+			// or release images still retained by an unsettled run. Runtime teardown
+			// releases those reservations even if this delivery record expires.
 			if (submission.fatal) return;
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
@@ -5837,7 +5839,6 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
-			releaseAcceptedImage(correlation);
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (submission.workLease) {
@@ -7770,6 +7771,7 @@ export function createNotificationsExtension(
 			server,
 			host,
 			imageUploads,
+			releaseAcceptedImage,
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
@@ -9689,6 +9691,11 @@ export function createNotificationsExtension(
 		rt.busy = false;
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
+			// This attributed agent_end is an execution boundary even when the
+			// subsequent durable terminal claim fails. A fatal transport closure
+			// clears attribution, so an unrelated later agent_end cannot release
+			// reservations for a run whose settlement was never proved.
+			rt.releaseAcceptedImage(correlation);
 			const assistants = (Array.isArray(event.messages) ? [...event.messages].reverse() : []).filter(
 				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
 			) as Array<{ stopReason?: unknown; errorKind?: unknown; errorCode?: unknown }>;
