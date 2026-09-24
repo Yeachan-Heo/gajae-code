@@ -255,31 +255,35 @@ it("never lets the master capability cross into a cold-started broker", () => {
 });
 
 it("strips inherited TUI session identity from a cold-started broker", () => {
-	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {});
-	const environment = brokerSpawnEnvironmentForTest(command, {
-		PATH: process.env.PATH,
-		GJC_SESSION_ID: "tui-session",
-		GJC_SESSION_CWD: "/tui/workspace",
-		GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
-		GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
-		GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
-		GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
-		GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
-		GJC_TMUX_SESSION: "tui-tmux-session",
-		GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
-		GJC_TMUX_LAUNCHED: "1",
-		GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
-		GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
-		GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
-		GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
-		TMUX: "/tmp/tmux,1234,0",
-		TMUX_PANE: "%7",
-		GJC_TMUX_COMMAND: "custom-tmux",
-		GJC_TMUX_PROFILE: "1",
-		OWNED_SENTINEL: "kept",
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_ID: "tui-session",
+			GJC_SESSION_CWD: "/tui/workspace",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
+			GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
+			GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
+			GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
+			GJC_TMUX_SESSION: "tui-tmux-session",
+			GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
+			GJC_TMUX_LAUNCHED: "1",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
+			GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			TMUX: "/tmp/tmux,1234,0",
+			TMUX_PANE: "%7",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_PROFILE: "1",
+			OWNED_SENTINEL: "kept",
+		},
 	});
+	const environment = brokerSpawnEnvironmentForTest(command);
 
 	for (const name of [
+		"GJC_SESSION_FILE",
 		"GJC_SESSION_ID",
 		"GJC_SESSION_CWD",
 		"GJC_COORDINATOR_SESSION_ID",
@@ -2540,27 +2544,32 @@ describe("SDK broker identity and discovery", () => {
 	});
 	it("ignores terminal legacy rows for fresh creates but keeps live legacy rows ambiguous", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
-		const broker = new Broker({ agentDir: path.join(root, "agent") });
+		const agentDir = path.join(root, "agent");
+		const legacyLedger = await new LifecycleLedger(agentDir).open();
+		for (const [identity, state] of [
+			["legacy-terminal-ok", "terminal_ok"],
+			["legacy-terminal-error", "terminal_error"],
+		] as const) {
+			await legacyLedger.begin(identity, `legacy-request-${identity}`);
+			await legacyLedger.transition(identity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: identity } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy terminal error" } },
+			});
+			expect(legacyLedger.get(identity)?.operationKey).toBeUndefined();
+		}
+		let broker = new Broker({ agentDir });
 		let launchAttempts = 0;
-		setLifecycleCommandResolverForTest(broker, () => {
+		const lifecycleCommandResolver = () => {
 			launchAttempts += 1;
 			return { file: path.join(root, "missing-gjc"), args: [] };
-		});
+		};
+		setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
 		try {
 			await broker.start();
-			for (const [identity, state] of [
-				["legacy-terminal-ok", "terminal_ok"],
-				["legacy-terminal-error", "terminal_error"],
-			] as const) {
-				await broker.ledger.begin(identity, `legacy-request-${identity}`);
-				await broker.ledger.transition(identity, state, {
-					response:
-						state === "terminal_ok"
-							? { ok: true, result: { sessionId: identity } }
-							: { ok: false, error: { code: "fixture_error", message: "legacy terminal error" } },
-				});
-				expect(broker.ledger.get(identity)?.operationKey).toBeUndefined();
-			}
+			expect(broker.ledger.get("legacy-terminal-ok")?.operationKey).toBeUndefined();
+			expect(broker.ledger.get("legacy-terminal-error")?.operationKey).toBeUndefined();
 
 			await expect(
 				broker.handleRequest("session.create", { cwd: root }, "fresh-after-upgrade"),
@@ -2570,13 +2579,29 @@ describe("SDK broker identity and discovery", () => {
 			});
 			expect(launchAttempts).toBe(1);
 
-			await broker.ledger.begin("legacy-in-flight", "legacy-request-in-flight");
-			await expect(broker.handleRequest("session.create", { cwd: root }, "fresh-with-live-legacy")).resolves.toEqual(
-				{
+			const liveIdentity = "legacy-in-flight";
+			await broker.ledger.begin(liveIdentity, "legacy-request-in-flight");
+			const assertLegacyIdentityFenced = async (key: string): Promise<void> => {
+				await expect(broker.handleRequest("session.create", { cwd: root }, key)).resolves.toEqual({
 					ok: false,
 					error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
-				},
-			);
+				});
+				expect(launchAttempts).toBe(1);
+			};
+			await assertLegacyIdentityFenced("fresh-with-accepted-legacy");
+			await broker.ledger.transition(liveIdentity, "effect_started");
+			await assertLegacyIdentityFenced("fresh-with-effect-started-legacy");
+			await broker.ledger.transition(liveIdentity, "awaiting_ready");
+			await assertLegacyIdentityFenced("fresh-with-awaiting-ready-legacy");
+
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
+			await broker.start();
+			expect(broker.ledger.get(liveIdentity)?.state).toBe("terminal_uncertain");
+			expect(broker.ledger.get(liveIdentity)?.operationKey).toBeUndefined();
+			await assertLegacyIdentityFenced("fresh-with-recovered-uncertain-legacy");
 			expect(launchAttempts).toBe(1);
 		} finally {
 			setLifecycleCommandResolverForTest(broker, undefined);
