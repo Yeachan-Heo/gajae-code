@@ -1593,6 +1593,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				: undefined
 			: (options.startupAuthConfig ?? resolveStartupAuthConfig(agentDir)),
 	);
+	const startupAuthConfigOutcome = captureStartupValue(startupAuthConfigPromise);
 	const authStoragePromise = options.modelRegistry
 		? Promise.resolve(options.modelRegistry.authStorage)
 		: options.authStorage
@@ -1604,15 +1605,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const discoveredAuthStorage = await authStorageOutcome;
 	if (!discoveredAuthStorage.ok) {
 		const loadedSettings = await settingsOutcome;
+		const cleanupErrors: unknown[] = [];
 		if (loadedSettings.ok && ownsScopedSettings) {
 			try {
 				await loadedSettings.value.close();
 			} catch (cleanupError) {
-				logger.warn("Failed to close scoped settings after auth storage setup failure", { error: cleanupError });
-			} finally {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
 				releaseSettingsScope(loadedSettings.value);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
 			}
 		}
+		if (cleanupErrors.length > 0)
+			throw attachStartupCleanupDiagnostic(
+				discoveredAuthStorage.error,
+				new AggregateError(cleanupErrors, "Failed to release scoped settings after auth storage setup failure."),
+			);
 		throw discoveredAuthStorage.error;
 	}
 	const authStorage = discoveredAuthStorage.value;
@@ -1624,22 +1634,56 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		unsubscribeCredentialDisabled = undefined;
 		unsubscribe?.();
 	};
+	const failInitialSetup = async (primary: unknown, scopedSettings?: Settings): Promise<never> => {
+		const cleanupErrors: unknown[] = [];
+		try {
+			releaseCredentialDisabledSubscription();
+		} catch (cleanupError) {
+			cleanupErrors.push(cleanupError);
+		}
+		if (scopedSettings && ownsScopedSettings) {
+			try {
+				await scopedSettings.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+			try {
+				releaseSettingsScope(scopedSettings);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (ownsAuthStorage) {
+			try {
+				authStorage.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (cleanupErrors.length > 0)
+			throw attachStartupCleanupDiagnostic(
+				primary,
+				new AggregateError(cleanupErrors, "Failed to release resources after initial session setup failure."),
+			);
+		throw primary;
+	};
 	// Subscribe before owned-registry construction as its first catalog pass may
 	// probe credentials. Embedder handlers disable AuthStorage's no-listener
 	// buffer, so the SDK listener must already be present before any startup probe.
-	unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
-		if (credentialDisabledTarget) {
-			void credentialDisabledTarget.emitCredentialDisabled(event);
-		} else {
-			startupCredentialDisabledEvents.push(event);
-		}
-	});
-	const settingsResult = await settingsOutcome;
-	if (!settingsResult.ok) {
-		releaseCredentialDisabledSubscription();
-		if (ownsAuthStorage) authStorage.close();
-		throw settingsResult.error;
+	try {
+		unsubscribeCredentialDisabled = authStorage.onCredentialDisabled(event => {
+			if (credentialDisabledTarget) {
+				void credentialDisabledTarget.emitCredentialDisabled(event);
+			} else {
+				startupCredentialDisabledEvents.push(event);
+			}
+		});
+	} catch (error) {
+		const loadedSettings = await settingsOutcome;
+		return await failInitialSetup(error, loadedSettings.ok ? loadedSettings.value : undefined);
 	}
+	const settingsResult = await settingsOutcome;
+	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
 	const settings = settingsResult.value;
 	const closeOwnedSettings = async (): Promise<void> => {
 		if (!ownsScopedSettings) return;
@@ -1649,21 +1693,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			releaseSettingsScope(settings);
 		}
 	};
-	const startupAuthConfig = await startupAuthConfigPromise;
+	const startupAuthConfigResult = await startupAuthConfigOutcome;
+	if (!startupAuthConfigResult.ok) return await failInitialSetup(startupAuthConfigResult.error, settings);
+	const startupAuthConfig = startupAuthConfigResult.value;
 	let modelRegistry: ModelRegistry;
 	try {
 		modelRegistry =
 			options.modelRegistry ??
 			new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), settings, { agentDir });
 	} catch (error) {
-		releaseCredentialDisabledSubscription();
-		if (ownsAuthStorage) authStorage.close();
-		try {
-			await closeOwnedSettings();
-		} catch (cleanupError) {
-			logger.warn("Failed to close scoped settings after model registry setup failure", { error: cleanupError });
-		}
-		throw error;
+		return await failInitialSetup(error, settings);
 	}
 	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 

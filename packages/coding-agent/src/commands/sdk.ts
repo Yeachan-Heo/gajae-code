@@ -23,6 +23,7 @@ import {
 } from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
+	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -472,15 +473,14 @@ export async function openLifecycleSessionManager(
 			sessionManagerCloseError = error;
 		}
 	}
-	if (sessionManagerCloseError !== undefined) {
+	if (sessionManagerCloseError !== undefined || cleanupError !== undefined) {
 		throw new LifecycleSessionManagerCleanupError(
 			new AggregateError(
 				[operationError, cleanupError, sessionManagerCloseError].filter(error => error !== undefined),
-				"Lifecycle session-manager open failed and cleanup did not complete.",
+				"Lifecycle session-manager open failed and owned cleanup did not complete.",
 			),
 		);
 	}
-	if (cleanupError !== undefined) throw cleanupError;
 	if (operationError !== undefined) throw operationError;
 	if (!result) throw new Error("Lifecycle session manager result was not produced.");
 	return result;
@@ -510,6 +510,7 @@ export async function runSessionHost(
 		cwd?: string;
 		processIncarnation?: (pid: number) => string | undefined;
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
+		initializeLifecycleExtensions?: typeof initializeExtensions;
 		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 	} = {},
@@ -518,9 +519,11 @@ export async function runSessionHost(
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
+	const initializeSessionExtensions = timing.initializeLifecycleExtensions ?? initializeExtensions;
 	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
+	let constructionCleanupComplete = true;
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
@@ -572,15 +575,20 @@ export async function runSessionHost(
 		transcript?: LifecycleTranscriptEvidence,
 	): Promise<void> => {
 		if (!request.effectMarker) return;
-		await writeSessionLifecycleFailure(
-			request.stateRoot,
-			request.sessionId,
-			effectMarker,
-			failure,
-			rollback,
-			transcript,
-			incarnation,
-		);
+		try {
+			await writeSessionLifecycleFailure(
+				request.stateRoot,
+				request.sessionId,
+				effectMarker,
+				failure,
+				rollback,
+				transcript,
+				incarnation,
+			);
+		} catch (error) {
+			if (error instanceof LifecycleFailurePublicationCleanupError) constructionCleanupComplete = false;
+			throw error;
+		}
 	};
 
 	if (now() >= request.semanticReadyDeadlineAt) {
@@ -693,7 +701,6 @@ export async function runSessionHost(
 		if ("error" in settlement) throw settlement.error;
 		return settlement.value;
 	};
-	let constructionCleanupComplete = true;
 	const constructionFailure = (error: unknown): SdkStartupFailure => {
 		if (error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error)
 			return error as SdkStartupFailure;
@@ -1026,7 +1033,7 @@ export async function runSessionHost(
 					}),
 		);
 		await beforeCutoff(() =>
-			initializeExtensions(session, {
+			initializeSessionExtensions(session, {
 				reportSendError: () => {},
 				reportRuntimeError: () => {},
 				onShutdown: stop,
