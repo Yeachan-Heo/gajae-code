@@ -1,3 +1,13 @@
+/**
+ * Maps a tier decision onto the configured tier map and a frozen model snapshot.
+ *
+ * Scope, deliberately narrow: this applies the tier `choice` (`fast | balanced |
+ * strong`) in `shadow` or `routing` mode and nothing else. It does **not**
+ * implement #5842's `noul` delegation decision or its advisory `hint` mode, and
+ * `enforce` is refused by both the settings schema and `createTaskDecisionProvider`.
+ * #5842 stays open pending the owner's data-scope decision.
+ */
+
 import { createHash } from "node:crypto";
 import type { ThinkingLevel } from "@gajae-code/agent-core/thinking";
 import type { AuthStorage, Model } from "@gajae-code/ai/core";

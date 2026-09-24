@@ -1,3 +1,12 @@
+/**
+ * Wire contract for the subagent tier decision.
+ *
+ * Scope, deliberately narrow: the only decision modelled here is the tier
+ * `choice` among `fast | balanced | strong`, consumed in `shadow` or `routing`
+ * mode. This is **not** a complete implementation of #5842 — there is no `noul`
+ * delegation decision and no advisory `hint` output, and neither is planned in
+ * this change. #5842 stays open pending the owner's data-scope decision.
+ */
 export const DECISION_TIERS = ["fast", "balanced", "strong"] as const;
 export type DecisionTier = (typeof DECISION_TIERS)[number];
 export type DecisionCandidates = Readonly<Partial<Record<DecisionTier, string>>>;
