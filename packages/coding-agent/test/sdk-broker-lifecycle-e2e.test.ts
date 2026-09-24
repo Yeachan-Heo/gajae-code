@@ -1812,9 +1812,8 @@ test("session host retries MCP cleanup while retaining exact directory authority
 	const previous = names.map(name => process.env[name]);
 	let sessionManager: SessionManager | undefined;
 	let mcpDirectory: string | undefined;
-	let failNextIdentityCheck = false;
-	let identityChecks = 0;
-	let restoreLstatSpy: (() => void) | undefined;
+	let cleanupAttempts = 0;
+	let restoreRemoveSpy: (() => void) | undefined;
 	try {
 		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
 		await fs.mkdir(agentDir, { recursive: true });
@@ -1838,24 +1837,17 @@ test("session host retries MCP cleanup while retaining exact directory authority
 		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
 		const parsed = await lifecycleArgs(request, root, agentDir);
 		sessionManager = SessionManager.inMemory(root);
-		const originalLstat = fs.lstat.bind(fs);
-		const lstatImplementation = async (target: unknown, options?: unknown) => {
-			if (
-				typeof target === "string" &&
-				typeof target === "string" &&
-				mcpDirectory !== undefined &&
-				path.resolve(target) === path.resolve(mcpDirectory)
-			) {
-				identityChecks++;
-				if (failNextIdentityCheck) {
-					failNextIdentityCheck = false;
-					throw Object.assign(new Error("controlled transient MCP directory identity failure"), { code: "EIO" });
+		const originalExactRemove = native.exactRemoveDirectoryTree.bind(native);
+		const removeSpy = vi
+			.spyOn(native, "exactRemoveDirectoryTree")
+			.mockImplementation((target, snapshot, parent, detachOnly) => {
+				if (mcpDirectory !== undefined && path.resolve(target) === path.resolve(mcpDirectory)) {
+					cleanupAttempts++;
+					if (cleanupAttempts === 1) return { ok: false, code: "controlled transient MCP tree removal" };
 				}
-			}
-			return await originalLstat(target as string, options as never);
-		};
-		const lstatSpy = vi.spyOn(fs, "lstat").mockImplementation(lstatImplementation as unknown as typeof fs.lstat);
-		restoreLstatSpy = () => lstatSpy.mockRestore();
+				return originalExactRemove(target, snapshot, parent, detachOnly);
+			});
+		restoreRemoveSpy = () => removeSpy.mockRestore();
 		await expect(
 			runSessionHost({
 				cwd: root,
@@ -1869,7 +1861,6 @@ test("session host retries MCP cleanup while retaining exact directory authority
 					if (!owner) throw new Error("Expected lifecycle startup owner.");
 					if (!_options?.mcpConfigPath) throw new Error("Expected temporary MCP config.");
 					mcpDirectory = path.dirname(_options.mcpConfigPath);
-					failNextIdentityCheck = true;
 					return {
 						capability: owner.capability,
 						rollback: owner.rollback,
@@ -1882,13 +1873,13 @@ test("session host retries MCP cleanup while retaining exact directory authority
 					};
 				},
 			}),
-		).rejects.toThrow("controlled transient MCP directory identity failure");
+		).rejects.toThrow("controlled transient MCP tree removal");
 
-		expect(identityChecks).toBeGreaterThan(1);
+		expect(cleanupAttempts).toBeGreaterThan(1);
 		expect(mcpDirectory).toBeDefined();
 		await expect(fs.stat(mcpDirectory!)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
-		restoreLstatSpy?.();
+		restoreRemoveSpy?.();
 		await sessionManager?.close().catch(() => {});
 		names.forEach((name, index) => {
 			const value = previous[index];
