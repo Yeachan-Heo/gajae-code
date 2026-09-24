@@ -59,13 +59,37 @@ export type CreateLifecycleAgentSessionOptions = Omit<CreateAgentSessionOptions,
 	lifecycleRequestId?: string;
 };
 
+export interface SdkLifecycleStartupOwner {
+	readonly capability: SdkStartupCapability;
+	readonly rollback: SdkStartupRollbackTracker;
+}
+
+async function disposePartialSession(session: AgentSession): Promise<void> {
+	try {
+		await session.dispose();
+	} catch (error) {
+		if (!isSessionDisposalIncompleteError(error)) throw error;
+		await session.awaitDisposeCompletion();
+	}
+}
+
 /** Internal lifecycle-only session construction with an owner-bound SDK startup result. */
 export async function createLifecycleAgentSession(
 	options: CreateLifecycleAgentSessionOptions = {},
+	owner?: SdkLifecycleStartupOwner,
 ): Promise<CreateLifecycleAgentSessionResult> {
-	const rollback = new SdkStartupRollbackTracker();
-	const capability = new SdkStartupCapability(rollback, options.readiness ?? "immediate", options.lifecycleRequestId);
+	const rollback = owner?.rollback ?? new SdkStartupRollbackTracker();
+	const capability =
+		owner?.capability ??
+		new SdkStartupCapability(rollback, options.readiness ?? "immediate", options.lifecycleRequestId);
 	try {
+		if (capability.cancelled) {
+			const failure =
+				capability.result?.status === "failed"
+					? capability.result.failure
+					: capability.normalizeFailure("startup", "pending");
+			return { capability, rollback, failure };
+		}
 		const {
 			modelId,
 			mcpStartupTimeoutMs,
@@ -91,6 +115,14 @@ export async function createLifecycleAgentSession(
 			[lifecycleMcpStartupTimeoutOption]?: number;
 		};
 		const result = await createAgentSession(internalOptions);
+		if (capability.cancelled) {
+			await disposePartialSession(result.session);
+			const failure =
+				capability.result?.status === "failed"
+					? capability.result.failure
+					: capability.normalizeFailure("startup", "pending");
+			return { capability, rollback, failure };
+		}
 		// Explicit model pin (#4707) is a guarantee, not a preference. The
 		// coordinator validated the selector against its own registry; this child
 		// owns the registry that actually serves requests, and the two can drift
@@ -106,12 +138,7 @@ export async function createLifecycleAgentSession(
 			const expected = parseModelString(modelId);
 			const expectedSelector = expected ? `${expected.provider}/${expected.id}` : modelId;
 			if (!activeSelector || activeSelector.toLowerCase() !== expectedSelector.toLowerCase()) {
-				try {
-					await result.session.dispose();
-				} catch (error) {
-					if (!isSessionDisposalIncompleteError(error)) throw error;
-					await result.session.awaitDisposeCompletion();
-				}
+				await disposePartialSession(result.session);
 				throw new Error(
 					`Model "${modelId}" not found. Use --list-models to see available models.${
 						activeSelector ? ` Session resolved ${activeSelector} instead.` : ""
