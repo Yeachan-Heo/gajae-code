@@ -711,13 +711,25 @@ export class LifecycleLedger {
 		return [...this.#byIdentity.values()].findLast(entry => entry.operationKey === operationKey);
 	}
 	/**
-	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * Live or uncertain legacy rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
-	 * must reject rather than create a second admission.
+	 * must reject rather than create a second admission. A fresh session.create
+	 * may ignore completed terminal legacy rows so old successful operations do
+	 * not block coordinator startup. Other operations retain the legacy fence
+	 * because target-bound legacy identities cannot prove key uniqueness. For
+	 * target-bound terminal creates, the opaque legacy identity also cannot reveal
+	 * the original caller key, so this exception retires that legacy key history;
+	 * exact key-only legacy creates are still rejected by the earlier lookup.
 	 */
-	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>): boolean {
+	hasLegacyIdentity(
+		excludedIdentities?: ReadonlySet<string>,
+		options: { ignoreTerminalRows?: boolean } = {},
+	): boolean {
 		return [...this.#byIdentity.values()].some(
-			entry => entry.operationKey === undefined && !excludedIdentities?.has(entry.identity),
+			entry =>
+				entry.operationKey === undefined &&
+				!(options.ignoreTerminalRows && terminal(entry.state)) &&
+				!excludedIdentities?.has(entry.identity),
 		);
 	}
 	async migrateIdentity(

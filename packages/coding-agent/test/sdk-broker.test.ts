@@ -9,7 +9,13 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker, type BrokerResponse, setPublicationObservationForTest } from "../src/sdk/broker/broker";
+import {
+	Broker,
+	type BrokerResponse,
+	lifecycleTargetForTest,
+	normalizeBrokerInput,
+	setPublicationObservationForTest,
+} from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -28,12 +34,13 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import { deriveLegacyIdentity, deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	setLifecycleCommandResolverForTest,
 	terminalUncertainStartupMessage,
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
@@ -246,11 +253,196 @@ it("never lets the master capability cross into a cold-started broker", () => {
 	const environment = brokerSpawnEnvironmentForTest(command, {
 		PATH: process.env.PATH,
 		GJC_MASTER_CAPABILITY: "must-not-cross-the-lifecycle-boundary",
+		GJC_MASTER_OWNER_SESSION_ID: "must-not-cross-the-owner-session-boundary",
+		gJc_Master_Capability: "mixed-capability",
+		gJc_Master_Owner_Session_Id: "mixed-owner-session",
 		OWNED_SENTINEL: "kept",
 	});
 	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
+	expect(environment.GJC_MASTER_OWNER_SESSION_ID).toBeUndefined();
+	expect(environment.gJc_Master_Capability).toBeUndefined();
+	expect(environment.gJc_Master_Owner_Session_Id).toBeUndefined();
 	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited TUI session identity from a cold-started broker", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_ID: "tui-session",
+			GJC_SESSION_CWD: "/tui/workspace",
+			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
+			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
+			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
+			GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
+			GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
+			GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
+			GJC_TMUX_SESSION: "user-configured-tmux",
+			GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
+			GJC_TMUX_LAUNCHED: "1",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
+			GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
+			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
+			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
+			GJC_STATE_ROOT: "/tui/.gjc/state",
+			TMUX: "/tmp/tmux,1234,0",
+			TMUX_PANE: "%7",
+			GJC_MOUSE: "1",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_PROFILE: "1",
+			OWNED_SENTINEL: "kept",
+			gJc_Session_Custom_Marker: "mixed-tui-session-marker",
+			gJc_Coordinator_Session_Launch_Id: "mixed-tui-launch",
+			gJc_Lifecycle_Request_Id: "mixed-tui-lifecycle",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Session_Context_Budget_Bytes: "2147483648",
+		},
+	});
+	const environment = brokerSpawnEnvironmentForTest(command);
+
+	for (const name of [
+		"GJC_SESSION_FILE",
+		"GJC_SESSION_ID",
+		"GJC_SESSION_CWD",
+		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_STATE_FILE",
+		"GJC_COORDINATOR_SESSION_BRANCH",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+		"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+		"GJC_COORDINATOR_SIDECAR_SIGNING_KEY",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
+		"GJC_TMUX_ACTIVE_SESSION",
+		"GJC_TMUX_LAUNCHED",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_TMUX_OWNER_STATE_DIR",
+		"GJC_TMUX_OWNER_SERVER_KEY",
+		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_STATE_ROOT",
+		"TMUX",
+		"TMUX_PANE",
+		"gJc_Session_Custom_Marker",
+		"gJc_Coordinator_Session_Launch_Id",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_Managed_Owner_Child_Token",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.gJc_Session_Context_Budget_Bytes).toBe("2147483648");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
+	expect(environment.GJC_MOUSE).toBe("1");
+	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited session markers from compiled broker environments", () => {
+	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		execPath: process.execPath,
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
+			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
+			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
+			gJc_Session_Id: "mixed-tui-session",
+			gJc_Coordinator_Session_Readiness_File: "/tmp/mixed-ready.json",
+			gJc_Coordinator_Sidecar_Key_Id: "mixed-key-id",
+			gJc_Managed_Owner_Child_Token: "mixed-owner-token",
+			gJc_Lifecycle_Request_Id: "mixed-lifecycle-request",
+			gJc_State_Root: "/tmp/mixed-state-root",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
+			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
+			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
+			GJC_STATE_ROOT: "/tui/.gjc/state",
+			GJC_MASTER_CAPABILITY: "compiled-master-capability",
+			GJC_MASTER_OWNER_SESSION_ID: "compiled-master-owner",
+			gJc_Master_Capability: "compiled-mixed-capability",
+			gJc_Master_Owner_Session_Id: "compiled-mixed-owner",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_SESSION: "user-configured-tmux",
+			GJC_TMUX_PROFILE: "1",
+			GJC_MOUSE: "1",
+			PI_COMPILED: "1",
+			GJC_COMPILED: "1",
+		},
+		markerPath,
+		embeddedFiles: [{ name: path.basename(markerPath) }],
+	});
+	const environment = brokerSpawnEnvironmentForTest(command);
+
+	expect(command.kind).toBe("compiled");
+	for (const name of [
+		"GJC_SESSION_FILE",
+		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"gJc_Session_Id",
+		"gJc_Coordinator_Session_Readiness_File",
+		"gJc_Coordinator_Sidecar_Key_Id",
+		"gJc_Managed_Owner_Child_Token",
+		"gJc_Lifecycle_Request_Id",
+		"gJc_State_Root",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_STATE_ROOT",
+		"GJC_MASTER_CAPABILITY",
+		"GJC_MASTER_OWNER_SESSION_ID",
+		"gJc_Master_Capability",
+		"gJc_Master_Owner_Session_Id",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_SESSION).toBe("user-configured-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
+	expect(environment.PI_COMPILED).toBe("1");
+	expect(environment.GJC_COMPILED).toBe("1");
+	expect(environment.GJC_MOUSE).toBe("1");
 });
 
 it("fails closed when compiled marker evidence disagrees", () => {
@@ -2486,6 +2678,221 @@ describe("SDK broker identity and discovery", () => {
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("ignores unrelated terminal legacy rows but keeps reused and live create keys fenced", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
+		const agentDir = path.join(root, "agent");
+		const legacyLedger = await new LifecycleLedger(agentDir).open();
+		for (const [identity, state] of [
+			["legacy-terminal-ok", "terminal_ok"],
+			["legacy-terminal-error", "terminal_error"],
+		] as const) {
+			await legacyLedger.begin(identity, `legacy-request-${identity}`);
+			await legacyLedger.transition(identity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: identity } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy terminal error" } },
+			});
+			expect(legacyLedger.get(identity)?.operationKey).toBeUndefined();
+		}
+		const reusedCreateKey = "reused-terminal-create-key";
+		const reusedCreateIdentity = await deriveLegacyIdentity(agentDir, "session.create", reusedCreateKey);
+		await legacyLedger.begin(reusedCreateIdentity, "legacy-terminal-create-request");
+		await legacyLedger.transition(reusedCreateIdentity, "terminal_error", {
+			response: { ok: false, error: { code: "fixture_error", message: "legacy create completed" } },
+		});
+		expect(legacyLedger.get(reusedCreateIdentity)?.operationKey).toBeUndefined();
+		let broker = new Broker({ agentDir });
+		let launchAttempts = 0;
+		const lifecycleCommandResolver = () => {
+			launchAttempts += 1;
+			return { file: path.join(root, "missing-gjc"), args: [] };
+		};
+		setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
+		try {
+			await broker.start();
+			expect(broker.ledger.get("legacy-terminal-ok")?.operationKey).toBeUndefined();
+			expect(broker.ledger.get("legacy-terminal-error")?.operationKey).toBeUndefined();
+			await expect(broker.handleRequest("session.create", { cwd: root }, reusedCreateKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(0);
+
+			await expect(
+				broker.handleRequest("session.create", { cwd: root }, "fresh-after-upgrade"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+
+			const liveIdentity = "legacy-in-flight";
+			await broker.ledger.begin(liveIdentity, "legacy-request-in-flight");
+			const assertLegacyIdentityFenced = async (key: string): Promise<void> => {
+				await expect(broker.handleRequest("session.create", { cwd: root }, key)).resolves.toEqual({
+					ok: false,
+					error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+				});
+				expect(launchAttempts).toBe(1);
+			};
+			await assertLegacyIdentityFenced("fresh-with-accepted-legacy");
+			await broker.ledger.transition(liveIdentity, "effect_started");
+			await assertLegacyIdentityFenced("fresh-with-effect-started-legacy");
+			await broker.ledger.transition(liveIdentity, "awaiting_ready");
+			await assertLegacyIdentityFenced("fresh-with-awaiting-ready-legacy");
+
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			broker = new Broker({ agentDir });
+			setLifecycleCommandResolverForTest(broker, lifecycleCommandResolver);
+			await broker.start();
+			expect(broker.ledger.get(liveIdentity)?.state).toBe("terminal_uncertain");
+			expect(broker.ledger.get(liveIdentity)?.operationKey).toBeUndefined();
+			await assertLegacyIdentityFenced("fresh-with-recovered-uncertain-legacy");
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
+		const normalizedCreateInput = (input: Record<string, unknown>): Record<string, unknown> => {
+			const normalized = normalizeBrokerInput("session.create", input);
+			if (!("input" in normalized)) throw new Error("Expected valid legacy create fixture input");
+			return normalized.input;
+		};
+		const requestHashFor = (input: Record<string, unknown>): string =>
+			createHash("sha256")
+				.update(JSON.stringify({ input, operation: "session.create" }))
+				.digest("hex");
+		const exactRoot = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-exact-"));
+		const exactAgentDir = path.join(exactRoot, "agent");
+		const exactInput = { cwd: path.join(exactRoot, "workspace") };
+		const exactNormalizedInput = normalizedCreateInput(exactInput);
+		await fs.mkdir(exactInput.cwd, { recursive: true });
+		const exactKey = "legacy-target-create-key";
+		const exactTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", exactNormalizedInput)))
+			.digest("hex");
+		const exactRequestHash = requestHashFor(exactNormalizedInput);
+		const exactIdentity = await deriveLegacyTargetIdentity(
+			exactAgentDir,
+			"session.create",
+			exactKey,
+			exactTargetHash,
+		);
+		const exactLedger = await new LifecycleLedger(exactAgentDir).open();
+		const exactResponse = {
+			ok: false,
+			error: { code: "spawn_failed", message: "legacy create did not start" },
+		} as const;
+		await exactLedger.begin(exactIdentity, exactRequestHash);
+		await exactLedger.transition(exactIdentity, "terminal_error", { response: exactResponse });
+		const exactBroker = new Broker({ agentDir: exactAgentDir });
+		await exactBroker.start();
+		try {
+			await expect(exactBroker.handleRequest("session.create", exactInput, exactKey)).resolves.toEqual(
+				exactResponse,
+			);
+			expect(exactBroker.ledger.findByOperationKey(`session.create\0${exactKey}`)?.state).toBe("terminal_error");
+		} finally {
+			await exactBroker.stop();
+			await fs.rm(exactRoot, { recursive: true, force: true });
+		}
+
+		const changedRoot = await fs.mkdtemp(
+			path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-changed-"),
+		);
+		const changedAgentDir = path.join(changedRoot, "agent");
+		const priorInput = { cwd: path.join(changedRoot, "prior-workspace") };
+		const changedInput = { cwd: path.join(changedRoot, "new-workspace") };
+		const normalizedPriorInput = normalizedCreateInput(priorInput);
+		await fs.mkdir(priorInput.cwd, { recursive: true });
+		await fs.mkdir(changedInput.cwd, { recursive: true });
+		const changedKey = "legacy-target-create-key";
+		const priorTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", normalizedPriorInput)))
+			.digest("hex");
+		const priorRequestHash = requestHashFor(normalizedPriorInput);
+		const priorIdentity = await deriveLegacyTargetIdentity(
+			changedAgentDir,
+			"session.create",
+			changedKey,
+			priorTargetHash,
+		);
+		const changedLedger = await new LifecycleLedger(changedAgentDir).open();
+		await changedLedger.begin(priorIdentity, priorRequestHash);
+		await changedLedger.transition(priorIdentity, "terminal_error", { response: exactResponse });
+		const changedBroker = new Broker({ agentDir: changedAgentDir });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(changedBroker, () => {
+			launchAttempts += 1;
+			return { file: path.join(changedRoot, "missing-gjc"), args: [] };
+		});
+		try {
+			await changedBroker.start();
+			await expect(changedBroker.handleRequest("session.create", changedInput, changedKey)).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+			await expect(changedBroker.handleRequest("session.create", priorInput, changedKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(changedBroker, undefined);
+			await changedBroker.stop();
+			await fs.rm(changedRoot, { recursive: true, force: true });
+		}
+	});
+	it("keeps terminal target-inclusive legacy delete keys fenced across target reuse", async () => {
+		for (const state of ["terminal_ok", "terminal_error"] as const) {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-delete-key-"));
+			const agentDir = path.join(root, "agent");
+			const idempotencyKey = `reused-${state}-delete-key`;
+			const priorTarget = { sessionId: `legacy-delete-a-${state}` };
+			const priorTargetHash = createHash("sha256")
+				.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
+				.digest("hex");
+			const legacyIdentity = await deriveLegacyTargetIdentity(
+				agentDir,
+				"session.delete",
+				idempotencyKey,
+				priorTargetHash,
+			);
+			const legacyLedger = await new LifecycleLedger(agentDir).open();
+			await legacyLedger.begin(legacyIdentity, `legacy-${state}-delete-request`);
+			await legacyLedger.transition(legacyIdentity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: priorTarget.sessionId } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy delete completed" } },
+			});
+			expect(legacyLedger.get(legacyIdentity)?.operationKey).toBeUndefined();
+
+			const broker = new Broker({ agentDir });
+			await broker.start();
+			try {
+				await expect(
+					broker.handleRequest(
+						"session.delete",
+						{ sessionId: `legacy-delete-b-${state}`, sessionPath: path.join(root, "missing.json") },
+						idempotencyKey,
+					),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+				});
+			} finally {
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
 		}
 	});
 	it("binds session.delete to the requested session header and configured storage root", async () => {

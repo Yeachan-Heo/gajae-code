@@ -81,6 +81,34 @@ const SPAWN_LOCK_WAIT_MS = STALE_BROKER_RETIREMENT_TIMEOUT_MS + DISCOVERY_TIMEOU
 const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
+const BROKER_SESSION_ENV_NAMES = new Set([
+	"GJC_SESSION_FILE",
+	"GJC_SESSION_ID",
+	"GJC_SESSION_CWD",
+	"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+	"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+	"GJC_TMUX_ACTIVE_SESSION",
+	"GJC_TMUX_LAUNCHED",
+	"TMUX",
+	"TMUX_PANE",
+	"GJC_LIFECYCLE_REQUEST_ID",
+	"GJC_SDK_LIFECYCLE_REQUEST",
+	"GJC_STATE_ROOT",
+	"GJC_MASTER_CAPABILITY",
+	"GJC_MASTER_OWNER_SESSION_ID",
+]);
+const BROKER_SESSION_ENV_PRESERVED_NAMES = new Set([
+	"GJC_SESSION_CONTEXT_BUDGET_BYTES",
+	"GJC_SESSION_MEMORY_GC_STRATEGY",
+	"GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE",
+]);
+const BROKER_SESSION_ENV_PREFIXES = [
+	"GJC_SESSION_",
+	"GJC_COORDINATOR_SESSION_",
+	"GJC_COORDINATOR_SIDECAR_",
+	"GJC_TMUX_OWNER_",
+	"GJC_MANAGED_OWNER_",
+] as const;
 
 export interface BrokerStartupLockTestHooks {
 	onAcquired?: () => void;
@@ -457,11 +485,22 @@ function registerBrokerOwner(
 function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const environment = { ...(override ?? command.env) };
 	delete environment.BUN_OPTIONS;
-	// The master capability is a transient in-memory dispatch input. A broker
-	// cold-started from the master's own Bash environment would otherwise inherit
-	// it and pass it on to every substrate child it later launches, so it is
-	// stripped at the lifecycle boundary exactly as lifecycle children strip it.
-	delete environment.GJC_MASTER_CAPABILITY;
+	// Master capability and owner-session markers are matched by the normalized
+	// identity-name set below, including differently-cased Windows environment keys.
+	// The broker outlives the TUI session that happened to start it. Never let
+	// that session's identity or coordinator/tmux ownership markers flow through
+	// the broker's process.env into unrelated session hosts. Keep user tmux
+	// configuration (for example GJC_TMUX_SESSION, GJC_TMUX_COMMAND, GJC_MOUSE,
+	// and GJC_TMUX_PROFILE) intact. Windows environment names are case-insensitive.
+	for (const name of Object.keys(environment)) {
+		const normalizedName = name.toUpperCase();
+		if (BROKER_SESSION_ENV_PRESERVED_NAMES.has(normalizedName)) continue;
+		if (
+			BROKER_SESSION_ENV_NAMES.has(normalizedName) ||
+			BROKER_SESSION_ENV_PREFIXES.some(prefix => normalizedName.startsWith(prefix))
+		)
+			delete environment[name];
+	}
 	if (command.kind === "bun-source") {
 		delete environment.PI_COMPILED;
 		delete environment.GJC_COMPILED;
