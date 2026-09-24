@@ -6910,6 +6910,7 @@ export class AgentSession {
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+	#coordinatorPersistFailuresForTests: unknown[] | undefined;
 
 	#recordPostPublicationOutcome(
 		context: CoordinatorRuntimeStatePersistContext,
@@ -7047,6 +7048,7 @@ export class AgentSession {
 					await Bun.sleep(COORDINATOR_PERSIST_RETRY_DELAY_MS);
 					continue;
 				}
+				this.#coordinatorPersistFailuresForTests?.push(error);
 				this.#warnPersistFailure(
 					"Failed to persist coordinator runtime state",
 					error,
@@ -10594,6 +10596,11 @@ export class AgentSession {
 		});
 	}
 
+	/** Enable sidecar write failure reporting for retry-test teardown. */
+	trackCoordinatorRuntimeStatePersistenceFailuresForTests(): void {
+		this.#coordinatorPersistFailuresForTests = [];
+	}
+
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
 		// A terminal abort can schedule a preserved follow-up as a fresh turn after
@@ -10616,6 +10623,11 @@ export class AgentSession {
 		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
+		const failures = this.#coordinatorPersistFailuresForTests;
+		if (failures && failures.length > 0) {
+			this.#coordinatorPersistFailuresForTests = [];
+			throw new AggregateError(failures, "Coordinator runtime-state persistence failed during test");
+		}
 	}
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
 		this.#agentEventAdmission.set(event, {
