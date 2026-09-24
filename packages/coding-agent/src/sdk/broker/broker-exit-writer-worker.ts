@@ -1,7 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
+import * as crypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as syncFs from "node:fs";
-import path from "node:path";
+import * as path from "node:path";
 import * as nodeWorkerThreads from "node:worker_threads";
 import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { exactReplacePath, exactUnlinkDirect, renameNoReplacePath } from "@gajae-code/natives";
@@ -72,7 +72,7 @@ function snapshotFile(filePath: string, quarantineName: string): FileSnapshot | 
 		if (!parent.isDirectory()) throw new Error("SDK broker exit record parent is not a directory.");
 		const fileSize = Number(before.size);
 		const contents = fileSize <= MAX_BROKER_EXIT_RECORD_BYTES ? Buffer.alloc(fileSize) : undefined;
-		const hash = createHash("sha256");
+		const hash = crypto.createHash("sha256");
 		const chunk = Buffer.allocUnsafe(64 * 1024);
 		let offset = 0;
 		while (offset < fileSize) {
@@ -223,7 +223,7 @@ async function publishRecord(
 			const currentSource = snapshotFile(request.temporaryPath, sourceQuarantineName);
 			if (!currentSource || !sameFile(currentSource.identity, sourceIdentity))
 				throw new Error("SDK broker exit record staging identity changed before publication.");
-			const destinationQuarantineName = `${path.basename(request.temporaryPath)}.${attempt}.${randomUUID()}.retired`;
+			const destinationQuarantineName = `${path.basename(request.temporaryPath)}.${attempt}.${crypto.randomUUID()}.retired`;
 			const destination = snapshotFile(request.destinationPath, destinationQuarantineName);
 			const destinationGeneration = recordGeneration(destination?.contents, destination?.identity.mtimeNs);
 			if (
