@@ -9,6 +9,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { applyStartupModelProfiles } from "../src/main";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../src/sdk/lifecycle-session";
+import { SdkStartupCapability, SdkStartupRollbackTracker } from "../src/sdk/startup-capability";
 
 /**
  * The coordinator model pin (#4707) validates a selector against its own
@@ -82,6 +83,16 @@ describe("lifecycle session explicit model pin", () => {
 		// alternate model can activate behind the reported pin.
 		expect("session" in created).toBe(false);
 	}, 30_000);
+
+	test("does not construct a session after its startup owner has cancelled", async () => {
+		const rollback = new SdkStartupRollbackTracker();
+		const capability = new SdkStartupCapability(rollback, "immediate", "cancelled-before-construction");
+		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
+		capability.cancel(failure);
+
+		const created = await createLifecycleAgentSession({}, { capability, rollback });
+		expect(created).toEqual({ capability, rollback, failure });
+	});
 
 	test("keeps the pin as the effective model after default-profile and mpreset processing", async () => {
 		const cwd = tempCwd();
