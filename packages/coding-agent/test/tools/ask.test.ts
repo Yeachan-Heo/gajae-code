@@ -3541,6 +3541,61 @@ describe("AskTool deep-interview recorder persistence", () => {
 		}
 	});
 
+	it("aborts an unanswered headless workflow gate at the configured deadline", async () => {
+		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+		process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = "50";
+		try {
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const abort = vi.fn();
+			const gateEmitter = {
+				supportsRemoteGateAnswers: () => true,
+				emitGate: vi.fn(() => new Promise<never>(() => {})),
+			};
+			const abortError = { value: undefined as Error | undefined };
+			const outcome = await Promise.race([
+				new AskTool(createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter }))
+					.execute(
+						"call-workflow-gate-deadline",
+						{
+							questions: [
+								{
+									id: "handoff-gate",
+									question: "Continue to planning?",
+									options: [{ label: "Continue" }, { label: "Stop here" }],
+									workflowGate: { stage: "deep-interview", kind: "question" },
+								},
+							],
+						},
+						undefined,
+						undefined,
+						{ hasUI: false, abort } as unknown as AgentToolContext,
+					)
+					.then(
+						() => "settled",
+						error => {
+							abortError.value = error instanceof Error ? error : new Error(String(error));
+							return "rejected";
+						},
+					),
+				Bun.sleep(1_000).then(() => "hung"),
+			]);
+
+			expect(outcome).toBe("rejected");
+			expect(abortError.value?.message).toContain(
+				"no answer was received within 0.05s of the headless ask answer deadline",
+			);
+			expect(abort).toHaveBeenCalledTimes(1);
+			expect(gateEmitter.emitGate).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				"ask_answer_deadline_exceeded",
+				expect.objectContaining({ answerSource: "workflow_gate", deadlineMs: 50 }),
+			);
+		} finally {
+			if (prior === undefined) delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
+			else process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV] = prior;
+		}
+	}, 3_000);
+
 	it("locks the unbounded default for a headless ask with no configured deadline", async () => {
 		const prior = process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
 		delete process.env[GJC_ASK_ANSWER_DEADLINE_MS_ENV];
