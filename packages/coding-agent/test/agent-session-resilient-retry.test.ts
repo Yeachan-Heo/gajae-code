@@ -3024,8 +3024,8 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(coordinatorStateFiles).toHaveLength(5);
 		expect(coordinatorNamespaceLocks).toHaveLength(5);
 		expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
-		// The combined lifecycle loop must remain within the shard's 30s budget,
-		// well below the existing 120s per-test ceiling.
+		// Preserve the existing 150s runner timeout, but keep the measured loop
+		// within 30s so it remains well below the issue's 120s shard budget.
 	}, 150_000);
 
 	it("still fails closed on generic unknown errors under a bare default config", async () => {
