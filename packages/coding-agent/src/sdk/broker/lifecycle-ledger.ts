@@ -713,15 +713,19 @@ export class LifecycleLedger {
 	/**
 	 * Live or uncertain legacy rows predate the operation/key index. Their opaque
 	 * identities cannot establish that a different target is safe, so callers
-	 * must reject rather than create a second admission. Successful and failed
-	 * terminal rows have no outstanding effect and do not fence unrelated work.
+	 * must reject rather than create a second admission. A fresh session.create
+	 * may ignore completed terminal legacy rows so old successful operations do
+	 * not block coordinator startup; other lifecycle operations retain the legacy
+	 * fence because target-bound legacy identities cannot prove key uniqueness.
 	 */
-	hasLegacyIdentity(excludedIdentities?: ReadonlySet<string>): boolean {
+	hasLegacyIdentity(
+		excludedIdentities?: ReadonlySet<string>,
+		options: { ignoreTerminalRows?: boolean } = {},
+	): boolean {
 		return [...this.#byIdentity.values()].some(
 			entry =>
 				entry.operationKey === undefined &&
-				entry.state !== "terminal_ok" &&
-				entry.state !== "terminal_error" &&
+				!(options.ignoreTerminalRows && terminal(entry.state)) &&
 				!excludedIdentities?.has(entry.identity),
 		);
 	}
