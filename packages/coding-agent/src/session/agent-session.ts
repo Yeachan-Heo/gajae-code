@@ -410,6 +410,7 @@ import {
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
+import { DelegationHintController } from "../task/delegation-hint";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -3658,6 +3659,7 @@ export class AgentSession {
 		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
+	#unregisterDelegationHintSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -3830,6 +3832,7 @@ export class AgentSession {
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
+	#delegationHint: DelegationHintController;
 	#pendingTtsrInjections: Rule[] = [];
 	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
 	 *  These are folded into the matched tool call's `toolResult` content as an
@@ -5646,10 +5649,39 @@ export class AgentSession {
 		this.#credentialStoreIdentity = config.credentialStoreIdentity;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
+		this.#delegationHint = new DelegationHintController({
+			getMode: () => this.settings.get("task.delegationHint.mode"),
+			getAutoroutingEnabled: () => this.settings.getEffectiveAutorouting().active,
+			getAutoroutingTiers: () => this.settings.get("task.autorouting.tiers"),
+			notify: message => this.emitNotice("info", message, "delegation-hint"),
+		});
+		this.#unregisterDelegationHintSettings = this.settings.onChanged(settingPath => {
+			if (settingPath === "task.delegationHint.mode") {
+				this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			}
+		});
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
-		this.agent.afterToolCall = ctx => {
+		this.agent.afterToolCall = (ctx, signal) => {
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
-			return this.#ttsrAfterToolCall(ctx);
+			const ttsrResult = this.#ttsrAfterToolCall(ctx);
+			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
+			this.#delegationHint.setEnabled(delegationHintEnabled);
+			if (delegationHintEnabled) {
+				try {
+					this.#delegationHint.observeAfterToolCall(
+						{
+							toolName: ctx.toolCall.name,
+							args: ctx.args,
+							isError: ctx.isError,
+							resultError: ctx.result.isError === true,
+						},
+						signal,
+					);
+				} catch {
+					// Advisory inference never overrides an executed tool result.
+				}
+			}
+			return ttsrResult;
 		};
 		// Bind immutable lineage/attempt metadata to each tool call id before the
 		// tool executes. Background registrations made inside the tool (task, Bash)
@@ -7080,10 +7112,17 @@ export class AgentSession {
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
+			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
+			this.#delegationHint.setEnabled(delegationHintEnabled);
+			if (delegationHintEnabled) this.#delegationHint.onTurnStart();
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
+		}
+		if (event.type === "message_end" && event.message.role === "user") {
+			this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			this.#delegationHint.onUserMessage();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -10332,6 +10371,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		this.#unregisterBeforeMoveListener?.();
@@ -10443,6 +10484,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
