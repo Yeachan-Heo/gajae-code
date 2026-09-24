@@ -4654,6 +4654,10 @@ export class Broker {
 					// identity-bound inspection. Retry one complete scan, rerunning every
 					// scope, no-follow, uniqueness, and identity check against fresh state.
 					listed = await listManagedSessionCandidates({ scope: scope.scope });
+				const invalidCandidate =
+					listed?.kind === "complete"
+						? listed.invalid.find(candidate => candidate.sessionId === resolveSessionId)
+						: undefined;
 				const matches =
 					listed?.kind === "complete"
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
@@ -4673,13 +4677,17 @@ export class Broker {
 						reason: "candidate_scan_failed",
 						...(listed === undefined ? {} : { detailCode: listed.code }),
 					};
-				} else if (matches.length === 0) {
-					const invalid = listed.invalid.find(candidate => candidate.sessionId === resolveSessionId);
-					const detailCode = invalid === undefined ? undefined : savedSessionOmissionDetailCode(invalid.code);
+				} else if (invalidCandidate !== undefined) {
+					const detailCode = savedSessionOmissionDetailCode(invalidCandidate.code);
 					savedSessionOmission = {
 						sessionId: resolveSessionId,
-						reason: invalid ? "candidate_invalid" : "candidate_not_found",
+						reason: "candidate_invalid",
 						...(detailCode === undefined ? {} : { detailCode }),
+					};
+				} else if (matches.length === 0) {
+					savedSessionOmission = {
+						sessionId: resolveSessionId,
+						reason: "candidate_not_found",
 					};
 				} else if (matches.length > 1) {
 					savedSessionOmission = {
