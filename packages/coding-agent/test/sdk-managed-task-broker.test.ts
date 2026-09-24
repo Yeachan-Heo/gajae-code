@@ -1937,3 +1937,34 @@ describe.skipIf(process.platform !== "linux")("managed task.dag broker admission
 		}
 	});
 });
+
+describe.skipIf(process.platform === "linux")("managed enrollment off Linux", () => {
+	it("reads an absent index as empty but fails closed on a non-file index entry", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-"));
+		roots.push(agentDir);
+		expect(await loadManagedEnrollmentRecord(agentDir)).toEqual({
+			controlRoots: [],
+			establishedRoots: [],
+			publishingRoots: [],
+			nativeIdentities: [],
+			byRoot: {},
+		});
+		const target = managedEnrollmentIndexPath(await fs.realpath(agentDir));
+		await fs.mkdir(target, { recursive: true });
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+		await fs.rm(target, { recursive: true });
+		await fs.symlink(path.join(agentDir, "missing"), target);
+		await expect(loadManagedEnrollmentRecord(agentDir)).rejects.toThrow("corrupt managed enrollment index");
+	});
+
+	it("starts a broker that never used task.dag", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-offlinux-broker-"));
+		roots.push(agentDir);
+		const broker = new Broker({ agentDir: path.join(agentDir, "agent"), packageGeneration: "test" });
+		try {
+			expect((await broker.start()).url).toStartWith("ws");
+		} finally {
+			await broker.stop();
+		}
+	});
+});

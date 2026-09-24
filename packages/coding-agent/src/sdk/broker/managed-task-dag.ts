@@ -1633,8 +1633,9 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	const target = managedEnrollmentIndexPath(agent);
 	// Managed enrollment can only be published on Linux (private durable publication). Elsewhere
 	// an absent index is the only reachable state; do not let the Linux-only lock turn it into a
-	// startup failure for brokers that never used task.dag. A present index still fails closed.
-	if (process.platform !== "linux" && !(await Bun.file(target).exists()))
+	// startup failure for brokers that never used task.dag. Only a proven ENOENT is absent: any
+	// other entry (directory, dangling symlink, unreadable path) still fails closed below.
+	if (process.platform !== "linux" && (await isAbsentPath(target)))
 		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 	try {
 		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
@@ -1646,6 +1647,15 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 			return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
 		if (error instanceof Error && error.message === "corrupt managed enrollment index") throw error;
 		throw new Error("corrupt managed enrollment index");
+	}
+}
+
+async function isAbsentPath(target: string): Promise<boolean> {
+	try {
+		await fs.lstat(target);
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	}
 }
 
