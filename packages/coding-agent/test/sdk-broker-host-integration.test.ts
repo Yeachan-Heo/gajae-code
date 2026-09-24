@@ -291,6 +291,24 @@ test("broker session.list retries one changed snapshot and diagnoses persistent 
 		);
 		await fs.mkdir(legacyDirectory, { recursive: true });
 		const duplicatePath = path.join(legacyDirectory, `${sessionId}.jsonl`);
+		if (process.platform !== "win32") {
+			await fs.symlink(sessionPath, duplicatePath);
+			const invalidAndOwned = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
+			expect(invalidAndOwned).toMatchObject({
+				ok: true,
+				result: {
+					sessions: [expect.objectContaining({ sessionId })],
+					savedSessionOmission: {
+						sessionId,
+						reason: "candidate_invalid",
+						detailCode: "unreadable_candidate",
+					},
+				},
+			});
+			if (invalidAndOwned.ok) expect(invalidAndOwned.result).not.toHaveProperty("savedSession");
+			expect(JSON.stringify(invalidAndOwned)).not.toContain(sessionPath);
+			await fs.rm(duplicatePath);
+		}
 		await fs.copyFile(sessionPath, duplicatePath);
 		const ambiguous = await broker.handleRequest("session.list", { cwd, resolveSessionId: sessionId });
 		expect(ambiguous).toMatchObject({
