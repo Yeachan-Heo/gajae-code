@@ -13,6 +13,7 @@ import {
 	Broker,
 	type BrokerResponse,
 	lifecycleTargetForTest,
+	normalizeBrokerInput,
 	setPublicationObservationForTest,
 } from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
@@ -2742,6 +2743,93 @@ describe("SDK broker identity and discovery", () => {
 			setLifecycleCommandResolverForTest(broker, undefined);
 			await broker.stop();
 			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("replays exact-target terminal legacy creates and expires opaque cross-target key history", async () => {
+		const normalizedCreateInput = (input: Record<string, unknown>): Record<string, unknown> => {
+			const normalized = normalizeBrokerInput("session.create", input);
+			if (!("input" in normalized)) throw new Error("Expected valid legacy create fixture input");
+			return normalized.input;
+		};
+		const requestHashFor = (input: Record<string, unknown>): string =>
+			createHash("sha256")
+				.update(JSON.stringify({ input, operation: "session.create" }))
+				.digest("hex");
+		const exactRoot = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-exact-"));
+		const exactAgentDir = path.join(exactRoot, "agent");
+		const exactInput = { cwd: path.join(exactRoot, "workspace") };
+		const exactNormalizedInput = normalizedCreateInput(exactInput);
+		await fs.mkdir(exactInput.cwd, { recursive: true });
+		const exactKey = "legacy-target-create-key";
+		const exactTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", exactNormalizedInput)))
+			.digest("hex");
+		const exactRequestHash = requestHashFor(exactNormalizedInput);
+		const exactIdentity = await deriveLegacyTargetIdentity(
+			exactAgentDir,
+			"session.create",
+			exactKey,
+			exactTargetHash,
+		);
+		const exactLedger = await new LifecycleLedger(exactAgentDir).open();
+		const exactResponse = {
+			ok: false,
+			error: { code: "spawn_failed", message: "legacy create did not start" },
+		} as const;
+		await exactLedger.begin(exactIdentity, exactRequestHash);
+		await exactLedger.transition(exactIdentity, "terminal_error", { response: exactResponse });
+		const exactBroker = new Broker({ agentDir: exactAgentDir });
+		await exactBroker.start();
+		try {
+			await expect(exactBroker.handleRequest("session.create", exactInput, exactKey)).resolves.toEqual(
+				exactResponse,
+			);
+			expect(exactBroker.ledger.findByOperationKey(`session.create\0${exactKey}`)?.state).toBe("terminal_error");
+		} finally {
+			await exactBroker.stop();
+			await fs.rm(exactRoot, { recursive: true, force: true });
+		}
+
+		const changedRoot = await fs.mkdtemp(
+			path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-changed-"),
+		);
+		const changedAgentDir = path.join(changedRoot, "agent");
+		const priorInput = { cwd: path.join(changedRoot, "prior-workspace") };
+		const changedInput = { cwd: path.join(changedRoot, "new-workspace") };
+		const normalizedPriorInput = normalizedCreateInput(priorInput);
+		await fs.mkdir(priorInput.cwd, { recursive: true });
+		await fs.mkdir(changedInput.cwd, { recursive: true });
+		const changedKey = "legacy-target-create-key";
+		const priorTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.create", normalizedPriorInput)))
+			.digest("hex");
+		const priorRequestHash = requestHashFor(normalizedPriorInput);
+		const priorIdentity = await deriveLegacyTargetIdentity(
+			changedAgentDir,
+			"session.create",
+			changedKey,
+			priorTargetHash,
+		);
+		const changedLedger = await new LifecycleLedger(changedAgentDir).open();
+		await changedLedger.begin(priorIdentity, priorRequestHash);
+		await changedLedger.transition(priorIdentity, "terminal_error", { response: exactResponse });
+		const changedBroker = new Broker({ agentDir: changedAgentDir });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(changedBroker, () => {
+			launchAttempts += 1;
+			return { file: path.join(changedRoot, "missing-gjc"), args: [] };
+		});
+		try {
+			await changedBroker.start();
+			await expect(changedBroker.handleRequest("session.create", changedInput, changedKey)).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(changedBroker, undefined);
+			await changedBroker.stop();
+			await fs.rm(changedRoot, { recursive: true, force: true });
 		}
 	});
 	it("keeps terminal target-inclusive legacy delete keys fenced across target reuse", async () => {
