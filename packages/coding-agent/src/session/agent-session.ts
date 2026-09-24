@@ -3474,6 +3474,8 @@ export class AgentSession {
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
 		this.#managedFallbackProviderAttemptCount = 0;
+		this.#managedFallbackTriedCredentialRows.clear();
+		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 		this.#codexCredentialModelUnavailableRetried = false;
 	}
 
@@ -3515,6 +3517,9 @@ export class AgentSession {
 	#providerRetryMaxAttempts: number | undefined;
 	/** Actual managed upstream requests for the current model entry, including credential rotations. */
 	#managedFallbackProviderAttemptCount = 0;
+	/** Same-kind credential rows already visited by managed quota/rate-limit retries in this prompt generation. */
+	#managedFallbackTriedCredentialRowsGeneration = -1;
+	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
 	/** One content-free retry is allowed after Codex says the active account lacks the model. */
 	#codexCredentialModelUnavailableRetried = false;
 	#retryAttempt = 0;
@@ -23741,6 +23746,20 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
+	#managedFallbackTriedRows(provider: string, credentialKind: string): Set<number> {
+		if (this.#managedFallbackTriedCredentialRowsGeneration !== this.#promptGeneration) {
+			this.#managedFallbackTriedCredentialRows.clear();
+			this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
+		}
+		const key = JSON.stringify([provider, credentialKind]);
+		let rowIds = this.#managedFallbackTriedCredentialRows.get(key);
+		if (!rowIds) {
+			rowIds = new Set<number>();
+			this.#managedFallbackTriedCredentialRows.set(key, rowIds);
+		}
+		return rowIds;
+	}
+
 	/**
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
@@ -23765,6 +23784,7 @@ export class AgentSession {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
+		trackSameTurnRows?: boolean;
 	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
 		const model = this.model;
 		if (
@@ -23806,9 +23826,15 @@ export class AgentSession {
 				...(before === undefined ? {} : { rowId: before }),
 			});
 			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
+			const triedRows =
+				trigger.trackSameTurnRows && credentialKind !== undefined
+					? this.#managedFallbackTriedRows(provider, credentialKind)
+					: undefined;
+			if (state === "marked" && failedRowId !== undefined) triedRows?.add(failedRowId);
 			if (remainingCredentialIds.length === 0) return state === "marked" ? "exhausted" : "unchanged";
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
+				if (triedRows?.has(peerId)) continue;
 				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
 				let peerApiKey: string | undefined;
 				try {
@@ -23827,12 +23853,13 @@ export class AgentSession {
 					selectedKind === credentialKind &&
 					authStorage.isCredentialAvailable(provider, peerId)
 				) {
+					triedRows?.add(selectedRowId);
 					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
 						? "rotated"
 						: "alternate";
 				}
 			}
-			return "exhausted";
+			return triedRows ? (state === "marked" ? "exhausted" : "unchanged") : "exhausted";
 		}
 		const activeApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 
@@ -24042,7 +24069,10 @@ export class AgentSession {
 			(trigger.class === "quota" || trigger.class === "rate_limit") &&
 			!providerRetryCeilingReached
 		) {
-			quotaCredentialMark = await this.#markFailedCredential(trigger);
+			quotaCredentialMark = await this.#markFailedCredential({
+				...trigger,
+				trackSameTurnRows: managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+			});
 			credentialRotated =
 				quotaCredentialMark === "rotated" || (managedFallback && quotaCredentialMark === "alternate");
 			if (quotaCredentialMark === "exhausted") this.#stampQuotaRetryableAt(message);
@@ -24172,7 +24202,13 @@ export class AgentSession {
 					(trigger.class === "quota" || trigger.class === "rate_limit")
 				) {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
-						const mark = quotaCredentialMark ?? (await this.#markFailedCredential(trigger));
+						const mark =
+							quotaCredentialMark ??
+							(await this.#markFailedCredential({
+								...trigger,
+								trackSameTurnRows:
+									managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+							}));
 						if (mark === "exhausted") {
 							this.#stampQuotaRetryableAt(message);
 							errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
@@ -24223,7 +24259,10 @@ export class AgentSession {
 				!providerRetryCeilingReached &&
 				!(this.#isCodexCredentialModelUnavailable(message) && this.#codexCredentialModelUnavailableRetried)
 			) {
-				const mark = await this.#markFailedCredential(trigger);
+				const mark = await this.#markFailedCredential({
+					...trigger,
+					trackSameTurnRows: managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+				});
 				if (mark === "rotated") credentialRotated = true;
 				quotaPoolExhausted = mark === "exhausted";
 			}
