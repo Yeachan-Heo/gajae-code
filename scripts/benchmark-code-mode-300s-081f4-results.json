@@ -51,12 +51,7 @@
       ],
       "initialSearchQuery": "createAgentSession",
       "requiredFollowupSearchTerm": "modelPattern",
-      "requiredAnswerTerms": [
-        "in-process-client.ts",
-        "modelPattern",
-        "authStorage",
-        "toolNames"
-      ]
+      "requiredAnswerTerms": ["in-process-client.ts", "modelPattern", "authStorage", "toolNames"]
     },
     {
       "id": "CM02",
@@ -69,12 +64,7 @@
       ],
       "initialSearchQuery": "supportsFreeformApplyPatchCodex",
       "requiredFollowupSearchTerm": "applyPatchToolType",
-      "requiredAnswerTerms": [
-        "openai-codex-responses.ts",
-        "applyPatchToolType",
-        "customFormat",
-        "syntax"
-      ]
+      "requiredAnswerTerms": ["openai-codex-responses.ts", "applyPatchToolType", "customFormat", "syntax"]
     },
     {
       "id": "CM03",
@@ -87,12 +77,7 @@
       ],
       "initialSearchQuery": "const readSchema",
       "requiredFollowupSearchTerm": "truncation",
-      "requiredAnswerTerms": [
-        "read.ts",
-        "readSchema",
-        "path",
-        "truncation"
-      ]
+      "requiredAnswerTerms": ["read.ts", "readSchema", "path", "truncation"]
     },
     {
       "id": "CM04",
@@ -105,12 +90,7 @@
       ],
       "initialSearchQuery": "interface SearchToolDetails",
       "requiredFollowupSearchTerm": "fileMatches",
-      "requiredAnswerTerms": [
-        "search.ts",
-        "files",
-        "fileMatches",
-        "matchCount"
-      ]
+      "requiredAnswerTerms": ["search.ts", "files", "fileMatches", "matchCount"]
     },
     {
       "id": "CM05",
@@ -123,12 +103,7 @@
       ],
       "initialSearchQuery": "getSessionStats(): SessionStats",
       "requiredFollowupSearchTerm": "cacheRead",
-      "requiredAnswerTerms": [
-        "agent-session.ts",
-        "assistantMessages",
-        "cacheRead",
-        "cacheWrite"
-      ]
+      "requiredAnswerTerms": ["agent-session.ts", "assistantMessages", "cacheRead", "cacheWrite"]
     },
     {
       "id": "CM06",
@@ -141,12 +116,7 @@
       ],
       "initialSearchQuery": "turn_start",
       "requiredFollowupSearchTerm": "turn_end",
-      "requiredAnswerTerms": [
-        "agent-loop.ts",
-        "turn_start",
-        "turn_end",
-        "runLoop"
-      ]
+      "requiredAnswerTerms": ["agent-loop.ts", "turn_start", "turn_end", "runLoop"]
     },
     {
       "id": "CM07",
@@ -159,12 +129,7 @@
       ],
       "initialSearchQuery": "customWireName",
       "requiredFollowupSearchTerm": "customFormat",
-      "requiredAnswerTerms": [
-        "packages/ai/src/types.ts",
-        "customWireName",
-        "customFormat",
-        "activeToolForCallName"
-      ]
+      "requiredAnswerTerms": ["packages/ai/src/types.ts", "customWireName", "customFormat", "activeToolForCallName"]
     },
     {
       "id": "CM08",
@@ -177,12 +142,7 @@
       ],
       "initialSearchQuery": "bench:orchestration-tokens",
       "requiredFollowupSearchTerm": "bench:composer-stability-v3",
-      "requiredAnswerTerms": [
-        "package.json",
-        "bench:orchestration-tokens",
-        "bench:edit",
-        "bench:composer-stability-v3"
-      ]
+      "requiredAnswerTerms": ["package.json", "bench:orchestration-tokens", "bench:edit", "bench:composer-stability-v3"]
     }
   ],
   "schedule": [
@@ -190,217 +150,145 @@
       "pairId": "CM01-R1",
       "taskId": "CM01",
       "repetition": 1,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM01-R2",
       "taskId": "CM01",
       "repetition": 2,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM01-R3",
       "taskId": "CM01",
       "repetition": 3,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM02-R1",
       "taskId": "CM02",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM02-R2",
       "taskId": "CM02",
       "repetition": 2,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM02-R3",
       "taskId": "CM02",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM03-R1",
       "taskId": "CM03",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM03-R2",
       "taskId": "CM03",
       "repetition": 2,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM03-R3",
       "taskId": "CM03",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM04-R1",
       "taskId": "CM04",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM04-R2",
       "taskId": "CM04",
       "repetition": 2,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM04-R3",
       "taskId": "CM04",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM05-R1",
       "taskId": "CM05",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM05-R2",
       "taskId": "CM05",
       "repetition": 2,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM05-R3",
       "taskId": "CM05",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM06-R1",
       "taskId": "CM06",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM06-R2",
       "taskId": "CM06",
       "repetition": 2,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM06-R3",
       "taskId": "CM06",
       "repetition": 3,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM07-R1",
       "taskId": "CM07",
       "repetition": 1,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM07-R2",
       "taskId": "CM07",
       "repetition": 2,
-      "armOrder": [
-        "A",
-        "B"
-      ]
+      "armOrder": ["A", "B"]
     },
     {
       "pairId": "CM07-R3",
       "taskId": "CM07",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM08-R1",
       "taskId": "CM08",
       "repetition": 1,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM08-R2",
       "taskId": "CM08",
       "repetition": 2,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     },
     {
       "pairId": "CM08-R3",
       "taskId": "CM08",
       "repetition": 3,
-      "armOrder": [
-        "B",
-        "A"
-      ]
+      "armOrder": ["B", "A"]
     }
   ],
   "perTask": [
@@ -479,11 +367,11 @@
       "scheduledPairs": 3,
       "A": {
         "medianModelRequests": 8,
-        "medianTurnsToGreen": 9,
+        "medianTurnsToGreen": null,
         "medianProviderInputTokens": 34836,
         "medianModelFacingToolCalls": 6,
         "medianReadSearchHandlerCalls": 6,
-        "greenRuns": 1
+        "greenRuns": 0
       },
       "B": {
         "medianModelRequests": 12,
@@ -502,11 +390,11 @@
       "scheduledPairs": 3,
       "A": {
         "medianModelRequests": 14,
-        "medianTurnsToGreen": 14,
+        "medianTurnsToGreen": null,
         "medianProviderInputTokens": 227712,
         "medianModelFacingToolCalls": 12,
         "medianReadSearchHandlerCalls": 12,
-        "greenRuns": 1
+        "greenRuns": 0
       },
       "B": {
         "medianModelRequests": 18,
@@ -591,17 +479,17 @@
   ],
   "runCounts": {
     "scheduled": 48,
-    "green": 2,
-    "failed": 46,
+    "green": 0,
+    "failed": 48,
     "retries": 48,
     "errors": 466
   },
   "runCountsByArm": {
     "A": {
       "scheduled": 24,
-      "green": 2,
-      "failed": 22,
-      "failureRate": 0.9166666666666666,
+      "green": 0,
+      "failed": 24,
+      "failureRate": 1,
       "retries": 24,
       "retryRate": 1
     },
@@ -621,11 +509,31 @@
       "lower": -21,
       "upper": -4
     },
-    "armAGreenRate": 0.08333333333333333,
+    "armAGreenRate": 0,
     "armBGreenRate": 0,
-    "completionRateDrop": 0.08333333333333333,
+    "completionRateDrop": 0,
     "pass": false,
     "medianPairedPercentReductionPercent": -81.25
+  },
+  "postRunTaskChainAudit": {
+    "validator": "validateTaskCallSequence in scripts/benchmark-code-mode.ts",
+    "method": "Replayed each originally green attempt's recorded tool sequence against its preregistered first-three-call search-read-search contract; no model attempts were rerun.",
+    "originallyGreenArmAAttempts": [
+      {
+        "runId": "CM04-R1-A",
+        "observedSequence": ["search", "read", "read", "search"],
+        "reclassifiedAs": "failed: the third call must be the registered follow-up search"
+      },
+      {
+        "runId": "CM05-R2-A",
+        "observedSequence": ["search", "read", "read", "search"],
+        "reclassifiedAs": "failed: the third call must be the registered follow-up search"
+      }
+    ],
+    "armAGreenRunsAfterAudit": 0,
+    "armBGreenRunsAfterAudit": 0,
+    "rawRunArchivePreserved": true,
+    "decisionEffect": "The no-go remains: Arm B is 0/24 against the preregistered 80% completion requirement."
   },
   "executionStatus": "complete",
   "decisionEligible": true,
@@ -647,16 +555,16 @@
   "armMetricsSummary": {
     "A": {
       "scheduledRuns": 24,
-      "greenRuns": 2,
-      "failedRuns": 22,
+      "greenRuns": 0,
+      "failedRuns": 24,
       "retries": 24,
       "modelRequestCountMedian": 9.0,
-      "assistantTurnsToGreenMedianAmongGreenRuns": 11.5,
+      "assistantTurnsToGreenMedianAmongGreenRuns": null,
       "providerInputTokensMedianPerRun": 74735.0,
       "providerInputTokensTotal": 3435223,
       "modelFacingToolCallsMedian": 7.0,
       "readSearchHandlerCallsMedian": 7.0,
-      "failureRate": 0.9166666666666666
+      "failureRate": 1.0
     },
     "B": {
       "scheduledRuns": 24,
@@ -706,11 +614,12 @@
     "originDevAtMeasurementStart": "081f4c6604fe74e3598ddbfc0d258f416b114c52",
     "latestOriginDevValidatedDuringResume": "45163750bb772c0217e70cd94206a32a53a87d52"
   },
-  "validityReason": "All 24 randomized pairs (8 tasks x 3 repetitions) completed on one clean, read-only 081f4c66 task snapshot. Both arms used openai/gpt-5.5 and the symmetric 300000 ms full-attempt deadline. All 96 attempts finished below the deadline; neither arm was timeout-censored. The frozen gate fails: Arm B used more model requests, had no green runs, and the task-clustered interval is below zero. This decision applies only to the tested constrained exec consumer, not to a more expressive code-mode design.",
+  "validityReason": "All 24 randomized pairs (8 tasks x 3 repetitions) completed on one clean, read-only 081f4c66 task snapshot. Both arms used openai/gpt-5.5 and the symmetric 300000 ms full-attempt deadline. All 96 attempts finished below the deadline; neither arm was timeout-censored. A post-run task-chain audit reclassified the two originally green Arm A traces because each used search → read → read → search instead of the preregistered first-three-call search → read → search chain. The corrected completion rates are 0/24 for both arms; the frozen gate still fails because Arm B is below its 80% green-rate requirement, and the request-reduction criteria also fail. This decision applies only to the tested constrained exec consumer, not to a more expressive code-mode design.",
   "limitations": [
     "Results describe only this fixed eight-task repository-investigation cohort and the tested constrained exec consumer; they do not establish user popularity or general performance of a product code-mode feature.",
     "Arm B invokes the same read/search handler objects directly without AgentToolContext or the ordinary agent-loop dispatcher; interpret outcomes as specific to this consumer prototype.",
     "The reference grammar cannot combine a search-result path with its matched line selector. CM05 needs a targeted read beyond the default excerpt, so this limitation may contribute to Arm B failures; it is not evidence against every more expressive code-mode design.",
+    "The raw run archive preserves the original classifier's green flags. The summary's post-run task-chain audit reclassifies CM04-R1-A and CM05-R2-A as failures because both used an extra read before the registered follow-up search.",
     "The task corpus is the exact origin/dev snapshot at measurement start (081f4c6604fe74e3598ddbfc0d258f416b114c52); origin/dev later advanced to 45163750bb772c0217e70cd94206a32a53a87d52 while the experiment was running. All pairs remained pinned to the initial snapshot."
   ]
 }

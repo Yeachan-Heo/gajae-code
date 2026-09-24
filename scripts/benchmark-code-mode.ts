@@ -353,7 +353,9 @@ export function parseBenchmarkTasks(markdown: string): BenchmarkTask[] {
 		if (
 			!/^1\.\s+Search\b.*without a `paths` filter/i.test(dependencyRequirements[0]!) ||
 			!/^2\.\s+Read\b.*path returned by that search/i.test(dependencyRequirements[1]!) ||
-			!/^3\.\s+Search\b.*copied identifier `[^`]+` from the immediately preceding read/i.test(dependencyRequirements[2]!) ||
+			!/^3\.\s+Search\b.*copied identifier `[^`]+` from the immediately preceding read/i.test(
+				dependencyRequirements[2]!,
+			) ||
 			sections[3]!.trim().length === 0
 		) {
 			throw new Error(
@@ -368,7 +370,9 @@ export function parseBenchmarkTasks(markdown: string): BenchmarkTask[] {
 			throw new Error(`Task ${marker[1]} must pre-register at least two required answer terms.`);
 		}
 		const initialSearchQuery = /Start with a repository-wide search for `([^`]+)`/i.exec(sections[1]!)?.[1];
-		const requiredFollowupSearchTerm = /^3\.\s+Search\b.*copied identifier `([^`]+)`/i.exec(dependencyRequirements[2]!)?.[1];
+		const requiredFollowupSearchTerm = /^3\.\s+Search\b.*copied identifier `([^`]+)`/i.exec(
+			dependencyRequirements[2]!,
+		)?.[1];
 		if (!initialSearchQuery || !requiredFollowupSearchTerm) {
 			throw new Error(`Task ${marker[1]} must freeze an initial query and a distinctive follow-up search term.`);
 		}
@@ -517,18 +521,41 @@ export function usesPreviousResult(toolName: string, args: unknown, previousResu
 
 export function validateTaskCallSequence(
 	task: Pick<BenchmarkTask, "id" | "initialSearchQuery" | "requiredFollowupSearchTerm">,
-	entries: readonly Pick<AToolTraceEntry, "toolName" | "args" | "resultText">[],
+	entries: readonly { toolName: string; args: unknown }[],
 ): string[] {
 	const reasons: string[] = [];
 	const initial = entries[0];
-	if (!initial || initial.toolName !== "search" || !isRecord(initial.args) || typeof initial.args.pattern !== "string") {
+	if (
+		!initial ||
+		initial.toolName !== "search" ||
+		!isRecord(initial.args) ||
+		typeof initial.args.pattern !== "string"
+	) {
 		return [`Task ${task.id} must start with its registered repository-wide search.`];
 	}
-	if (entries.length < MIN_PLAN_STEPS) reasons.push(`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`);
+	if (entries.length < MIN_PLAN_STEPS)
+		reasons.push(`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`);
 	if (!normalizeSearchPattern(initial.args.pattern).includes(task.initialSearchQuery)) {
 		reasons.push(`Task ${task.id} initial search did not contain ${task.initialSearchQuery}.`);
 	}
 	if (initial.args.paths != null) reasons.push(`Task ${task.id} initial search constrained paths.`);
+	if (!entries[1] || entries[1].toolName !== "read") {
+		reasons.push(`Task ${task.id} second call must be a read.`);
+	}
+	const followup = entries[2];
+	if (
+		!followup ||
+		followup.toolName !== "search" ||
+		!isRecord(followup.args) ||
+		typeof followup.args.pattern !== "string"
+	) {
+		reasons.push(`Task ${task.id} third call must be the registered follow-up search.`);
+	} else {
+		if (!normalizeSearchPattern(followup.args.pattern).includes(task.requiredFollowupSearchTerm)) {
+			reasons.push(`Task ${task.id} follow-up search did not contain ${task.requiredFollowupSearchTerm}.`);
+		}
+		if (followup.args.paths != null) reasons.push(`Task ${task.id} follow-up search constrained paths.`);
+	}
 	return reasons;
 }
 
@@ -605,23 +632,12 @@ function validateBTrace(entries: readonly BExecTraceEntry[], task: BenchmarkTask
 	const steps = entries.flatMap(entry => entry.steps);
 	if (steps.length < MIN_PLAN_STEPS)
 		reasons.push(`Expected at least ${MIN_PLAN_STEPS} executed read/search steps in the plan.`);
-	const first = steps[0];
-	const second = steps[1];
-	const third = steps[2];
-	if (!first || first.tool !== "search" || typeof first.resolvedInput.pattern !== "string") {
-		reasons.push(`Task ${task.id} Arm B must start with its registered repository-wide search.`);
-	} else {
-		if (!normalizeSearchPattern(first.resolvedInput.pattern).includes(task.initialSearchQuery)) {
-			reasons.push(`Task ${task.id} Arm B initial search omitted ${task.initialSearchQuery}.`);
-		}
-		if (first.resolvedInput.paths != null) reasons.push(`Task ${task.id} Arm B initial search constrained paths.`);
-	}
-	if (!second || second.tool !== "read") reasons.push(`Task ${task.id} Arm B second step must be a read.`);
-	if (!third || third.tool !== "search" || typeof third.resolvedInput.pattern !== "string") {
-		reasons.push(`Task ${task.id} Arm B third step must be the registered follow-up search.`);
-	} else if (!normalizeSearchPattern(third.resolvedInput.pattern).includes(task.requiredFollowupSearchTerm)) {
-		reasons.push(`Task ${task.id} Arm B follow-up search omitted ${task.requiredFollowupSearchTerm}.`);
-	}
+	reasons.push(
+		...validateTaskCallSequence(
+			task,
+			steps.map(step => ({ toolName: step.tool, args: step.resolvedInput })),
+		),
+	);
 	for (let index = 0; index < steps.length; index++) {
 		const current = steps[index]!;
 		if (current.isError || !current.result || !current.resultText)
@@ -818,11 +834,14 @@ function withTimeout<T>(
 ): Promise<T> {
 	const completion = Promise.withResolvers<T>();
 	let timedOut = false;
-	const timer = setTimeout(() => {
-		timedOut = true;
-		onTimeout?.();
-		completion.reject(new Error(message));
-	}, Math.max(1, timeoutMs));
+	const timer = setTimeout(
+		() => {
+			timedOut = true;
+			onTimeout?.();
+			completion.reject(new Error(message));
+		},
+		Math.max(1, timeoutMs),
+	);
 	operation.then(
 		value => {
 			if (timedOut) {
@@ -1486,7 +1505,8 @@ function parseCliOptions(args: string[]): CliOptions {
 			outputPath = value;
 		} else if (argument === "--task-repo") {
 			const value = args[++index];
-			if (!value || value.startsWith("--")) throw new Error("--task-repo requires an isolated clean repository snapshot path.");
+			if (!value || value.startsWith("--"))
+				throw new Error("--task-repo requires an isolated clean repository snapshot path.");
 			taskRepoPath = value;
 		} else if (argument === "--timeout-ms") {
 			const value = Number(args[++index]);
@@ -1666,7 +1686,9 @@ export async function assertRepositoryScopedArguments(
 		}
 		const canonicalPath = await fs.realpath(lexicalPath);
 		if (!isPathInside(root, canonicalPath)) {
-			throw new Error(`Repository benchmark ${toolName} path resolves through a symlink outside the task repository.`);
+			throw new Error(
+				`Repository benchmark ${toolName} path resolves through a symlink outside the task repository.`,
+			);
 		}
 	}
 }
@@ -1755,7 +1777,8 @@ async function resolveTaskWorkspace(
 	resumeWorkspaceSnapshot?: { commit: string; originDevAtMeasurementStart: string },
 ): Promise<TaskWorkspace> {
 	const root = await fs.realpath(options.taskRepoPath);
-	if (root === REPO_ROOT) throw new Error("--task-repo must be a separate clean snapshot, never the harness checkout.");
+	if (root === REPO_ROOT)
+		throw new Error("--task-repo must be a separate clean snapshot, never the harness checkout.");
 	await assertOutputPathOutsideWorkspace(root, options.outputPath);
 	const [gitRoot, taskHead, originDev, status] = await Promise.all([
 		gitText(root, "rev-parse", "--show-toplevel"),
@@ -1763,7 +1786,8 @@ async function resolveTaskWorkspace(
 		gitText(REPO_ROOT, "rev-parse", "origin/dev"),
 		gitText(root, "status", "--porcelain", "--untracked-files=all"),
 	]);
-	if ((await fs.realpath(gitRoot)) !== root) throw new Error("--task-repo must be the root of a Git checkout or worktree.");
+	if ((await fs.realpath(gitRoot)) !== root)
+		throw new Error("--task-repo must be the root of a Git checkout or worktree.");
 	await assertTaskSnapshotMatchesOrigin(REPO_ROOT, taskHead, originDev, resumeWorkspaceSnapshot?.commit);
 	if (status.length > 0) throw new Error("--task-repo must have a clean working tree before benchmark tasks begin.");
 	await assertTrackedSymlinksStayInsideWorkspace(root);
@@ -1811,25 +1835,29 @@ async function runBenchmark(
 			throw new Error(`Resume report model does not match the pinned model ${resolvedModel}.`);
 		}
 		if (!isRecord(prior.workspaceSnapshot) || prior.workspaceSnapshot.commit !== taskWorkspace.commit) {
-			throw new Error(`Resume report task corpus does not match the clean origin/dev snapshot ${taskWorkspace.commit}.`);
+			throw new Error(
+				`Resume report task corpus does not match the clean origin/dev snapshot ${taskWorkspace.commit}.`,
+			);
 		}
-		const taskManifest = TASKS.map(({
-			id,
-			title,
-			prompt,
-			dependencyRequirements,
-			initialSearchQuery,
-			requiredFollowupSearchTerm,
-			requiredAnswerTerms,
-		}) => ({
-			id,
-			title,
-			prompt,
-			dependencyRequirements,
-			initialSearchQuery,
-			requiredFollowupSearchTerm,
-			requiredAnswerTerms,
-		}));
+		const taskManifest = TASKS.map(
+			({
+				id,
+				title,
+				prompt,
+				dependencyRequirements,
+				initialSearchQuery,
+				requiredFollowupSearchTerm,
+				requiredAnswerTerms,
+			}) => ({
+				id,
+				title,
+				prompt,
+				dependencyRequirements,
+				initialSearchQuery,
+				requiredFollowupSearchTerm,
+				requiredAnswerTerms,
+			}),
+		);
 		if (JSON.stringify(prior.tasks) !== JSON.stringify(taskManifest)) {
 			throw new Error("Resume report task prompts or answer requirements do not match the frozen task manifest.");
 		}
@@ -1909,19 +1937,30 @@ async function runBenchmark(
 				runTimeoutMs: options.timeoutMs,
 				handlerSetupTimeoutMs: options.timeoutMs,
 				setupCleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
-				runTimeoutScope: "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
+				runTimeoutScope:
+					"Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
 				decisionRule:
 					"Pass iff median paired request reduction >= 1, median paired percent reduction >= 25%, task-clustered bootstrap 95% CI lower bound > 0, Arm B green rate >= 80%, and B green rate is no more than 10 percentage points below A.",
 			},
-			tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, initialSearchQuery, requiredFollowupSearchTerm, requiredAnswerTerms }) => ({
-				id,
-				title,
-				prompt,
-				dependencyRequirements,
-				initialSearchQuery,
-				requiredFollowupSearchTerm,
-				requiredAnswerTerms,
-			})),
+			tasks: TASKS.map(
+				({
+					id,
+					title,
+					prompt,
+					dependencyRequirements,
+					initialSearchQuery,
+					requiredFollowupSearchTerm,
+					requiredAnswerTerms,
+				}) => ({
+					id,
+					title,
+					prompt,
+					dependencyRequirements,
+					initialSearchQuery,
+					requiredFollowupSearchTerm,
+					requiredAnswerTerms,
+				}),
+			),
 			schedule: pairs.map(pair => ({
 				pairId: pair.pairId,
 				taskId: pair.taskId,
@@ -2076,7 +2115,8 @@ async function runBenchmark(
 			runTimeoutMs: options.timeoutMs,
 			handlerSetupTimeoutMs: options.timeoutMs,
 			setupCleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
-			runTimeoutScope: "Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
+			runTimeoutScope:
+				"Each attempt timeout starts before AgentSession creation and covers initialization, prompt execution, and wait-for-idle; handler setup has the same bound, and disposal has a separate bounded cleanup grace.",
 			roundTripDefinition: "AgentSession turn_start events (one model request/response cycle per round trip).",
 			assistantTurnDefinition:
 				"Assistant-role turn_end events; turns-to-green stops at the first final answer that passes task-specific answer-term, JSON/evidence, and dependent-trace validation.",
@@ -2095,15 +2135,25 @@ async function runBenchmark(
 			},
 		},
 		systemPrompt: SYSTEM_PROMPT,
-		tasks: TASKS.map(({ id, title, prompt, dependencyRequirements, initialSearchQuery, requiredFollowupSearchTerm, requiredAnswerTerms }) => ({
-			id,
-			title,
-			prompt,
-			dependencyRequirements,
-			initialSearchQuery,
-			requiredFollowupSearchTerm,
-			requiredAnswerTerms,
-		})),
+		tasks: TASKS.map(
+			({
+				id,
+				title,
+				prompt,
+				dependencyRequirements,
+				initialSearchQuery,
+				requiredFollowupSearchTerm,
+				requiredAnswerTerms,
+			}) => ({
+				id,
+				title,
+				prompt,
+				dependencyRequirements,
+				initialSearchQuery,
+				requiredFollowupSearchTerm,
+				requiredAnswerTerms,
+			}),
+		),
 		schedule: pairs.map(pair => ({
 			pairId: pair.pairId,
 			taskId: pair.taskId,
@@ -2140,11 +2190,7 @@ async function main(): Promise<void> {
 			null,
 			2,
 		);
-		await fs.writeFile(
-			options.outputPath,
-			`${preflight}\n`,
-			{ flag: "wx" },
-		);
+		await fs.writeFile(options.outputPath, `${preflight}\n`, { flag: "wx" });
 	}
 	const report = await runBenchmark(options, taskWorkspace, value =>
 		fs.writeFile(options.outputPath, `${JSON.stringify(value, null, 2)}\n`),

@@ -190,13 +190,23 @@ describe("repository-scoped file handlers", () => {
 			);
 			if (process.platform !== "win32") {
 				await fs.symlink(insideFile, outputSymlink);
-				await expect(assertOutputPathOutsideWorkspace(workspace, outputSymlink)).rejects.toThrow(/may not be a symlink/);
+				await expect(assertOutputPathOutsideWorkspace(workspace, outputSymlink)).rejects.toThrow(
+					/may not be a symlink/,
+				);
 			}
 			await fs.link(insideFile, outputHardlink);
-			await expect(assertOutputPathOutsideWorkspace(workspace, outputHardlink)).rejects.toThrow(/single-link regular file/);
-			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "packages/main.ts:1-2" })).resolves.toBeUndefined();
-			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: ["packages/**/*.ts"] })).resolves.toBeUndefined();
-			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: null })).resolves.toBeUndefined();
+			await expect(assertOutputPathOutsideWorkspace(workspace, outputHardlink)).rejects.toThrow(
+				/single-link regular file/,
+			);
+			await expect(
+				assertRepositoryScopedArguments(workspace, "read", { path: "packages/main.ts:1-2" }),
+			).resolves.toBeUndefined();
+			await expect(
+				assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: ["packages/**/*.ts"] }),
+			).resolves.toBeUndefined();
+			await expect(
+				assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: null }),
+			).resolves.toBeUndefined();
 			await expect(
 				assertRepositoryScopedArguments(workspace, "search", {
 					pattern: "secret",
@@ -209,23 +219,23 @@ describe("repository-scoped file handlers", () => {
 			await expect(assertRepositoryScopedArguments(workspace, "read", { path: externalFile })).rejects.toThrow(
 				/outside the task repository/,
 			);
-			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "https://example.com/secret" })).rejects.toThrow(
-				/local path inside the task repository/,
-			);
-			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: [externalFile] })).rejects.toThrow(
-				/outside the task repository/,
-			);
-			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", gitignore: false })).rejects.toThrow(
-				/may not disable gitignore/,
-			);
+			await expect(
+				assertRepositoryScopedArguments(workspace, "read", { path: "https://example.com/secret" }),
+			).rejects.toThrow(/local path inside the task repository/);
+			await expect(
+				assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: [externalFile] }),
+			).rejects.toThrow(/outside the task repository/);
+			await expect(
+				assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", gitignore: false }),
+			).rejects.toThrow(/may not disable gitignore/);
 			if (process.platform !== "win32") {
 				await fs.symlink(externalFile, path.join(workspace, "escape.ts"));
 				await expect(assertRepositoryScopedArguments(workspace, "read", { path: "escape.ts" })).rejects.toThrow(
 					/resolves through a symlink outside/,
 				);
-				await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: ["escape.ts"] })).rejects.toThrow(
-					/resolves through a symlink outside/,
-				);
+				await expect(
+					assertRepositoryScopedArguments(workspace, "search", { pattern: "secret", paths: ["escape.ts"] }),
+				).rejects.toThrow(/resolves through a symlink outside/);
 			}
 		} finally {
 			await fs.rm(temporaryRoot, { recursive: true, force: true });
@@ -261,9 +271,9 @@ describe("pinned task snapshot resume", () => {
 			const currentDev = await runGit(repository, "rev-parse", "HEAD");
 
 			await assertTaskSnapshotMatchesOrigin(repository, currentDev, currentDev);
-			await expect(
-				assertTaskSnapshotMatchesOrigin(repository, recordedSnapshot, currentDev),
-			).rejects.toThrow(/exact clean snapshot of origin\/dev/);
+			await expect(assertTaskSnapshotMatchesOrigin(repository, recordedSnapshot, currentDev)).rejects.toThrow(
+				/exact clean snapshot of origin\/dev/,
+			);
 			await assertTaskSnapshotMatchesOrigin(repository, recordedSnapshot, currentDev, recordedSnapshot);
 			await expect(
 				assertTaskSnapshotMatchesOrigin(repository, currentDev, currentDev, recordedSnapshot),
@@ -300,7 +310,7 @@ describe("pre-registered task contracts", () => {
 		}
 	});
 
-	test("requires the registered repository-wide first search but allows any fully dependent third call", () => {
+	test("requires the registered repository-wide first search during plan parsing", () => {
 		const task = parseBenchmarkTasks(benchmarkCodeModeTasks)[0]!;
 		expect(parseScriptPlan(JSON.stringify(planForTask(task)), task).steps).toHaveLength(3);
 		const scoped = planForTask(task) as { steps: Array<Record<string, unknown>> };
@@ -317,23 +327,23 @@ describe("pre-registered task contracts", () => {
 		expect(parseScriptPlan(JSON.stringify(dependentRead), task).steps[2]?.tool).toBe("read");
 	});
 
-	test("requires three dependent calls and the registered repository-wide first query for Arm A", () => {
-		const task = parseBenchmarkTasks(benchmarkCodeModeTasks)[0]!;
+	test("requires each task's registered search-read-search chain for either arm", () => {
+		const task = parseBenchmarkTasks(benchmarkCodeModeTasks).find(candidate => candidate.id === "CM04")!;
 		const valid = [
 			{
 				toolName: "search",
 				args: { pattern: task.initialSearchQuery, paths: null },
-				resultText: "Found packages/example.ts",
+				resultText: "Found packages/coding-agent/src/tools/search.ts",
 			},
 			{
 				toolName: "read",
-				args: { path: "packages/example.ts" },
+				args: { path: "packages/coding-agent/src/tools/search.ts" },
 				resultText: `The source declares ${task.requiredFollowupSearchTerm}.`,
 			},
 			{
 				toolName: "search",
 				args: { pattern: task.requiredFollowupSearchTerm, paths: null },
-				resultText: "Confirmed.",
+				resultText: "Confirmed fileMatches metadata.",
 			},
 		];
 		expect(validateTaskCallSequence(task, valid)).toEqual([]);
@@ -341,13 +351,47 @@ describe("pre-registered task contracts", () => {
 			{ ...valid[0]!, args: { pattern: task.initialSearchQuery, paths: ["."] } },
 			...valid.slice(1),
 		];
-		expect(validateTaskCallSequence(task, scopedSearch)).toContain(`Task ${task.id} initial search constrained paths.`);
+		expect(validateTaskCallSequence(task, scopedSearch)).toContain(
+			`Task ${task.id} initial search constrained paths.`,
+		);
 		expect(validateTaskCallSequence(task, valid.slice(0, 2))).toContain(
 			`Task ${task.id} completed fewer than ${MIN_PLAN_STEPS} dependent calls.`,
 		);
 		const unrelatedSearch = [{ ...valid[0]!, args: { pattern: "unrelated" } }, ...valid.slice(1)];
 		expect(validateTaskCallSequence(task, unrelatedSearch)).toContain(
 			`Task ${task.id} initial search did not contain ${task.initialSearchQuery}.`,
+		);
+		const wrongSecondCall = [valid[0]!, { ...valid[1]!, toolName: "search" }, valid[2]!];
+		expect(validateTaskCallSequence(task, wrongSecondCall)).toContain(`Task ${task.id} second call must be a read.`);
+		const falseGreenSequence = [
+			...valid.slice(0, 2),
+			{
+				toolName: "read",
+				args: { path: "packages/coding-agent/src/tools/search.ts:219-260" },
+				resultText: "SearchToolDetails includes fileMatches.",
+			},
+			valid[2]!,
+		];
+		const falseGreenReasons = validateTaskCallSequence(task, falseGreenSequence);
+		expect(falseGreenReasons).toContain(`Task ${task.id} third call must be the registered follow-up search.`);
+		expect(
+			validateFinalAnswer(
+				"{}",
+				{ valid: false, reasons: falseGreenReasons, toolResultText: "" },
+				task.requiredAnswerTerms,
+			).valid,
+		).toBe(false);
+		const wrongFollowup = [valid[0]!, valid[1]!, { ...valid[2]!, args: { pattern: "matchCount", paths: null } }];
+		expect(validateTaskCallSequence(task, wrongFollowup)).toContain(
+			`Task ${task.id} follow-up search did not contain ${task.requiredFollowupSearchTerm}.`,
+		);
+		const scopedFollowup = [
+			valid[0]!,
+			valid[1]!,
+			{ ...valid[2]!, args: { pattern: task.requiredFollowupSearchTerm, paths: ["packages"] } },
+		];
+		expect(validateTaskCallSequence(task, scopedFollowup)).toContain(
+			`Task ${task.id} follow-up search constrained paths.`,
 		);
 	});
 
