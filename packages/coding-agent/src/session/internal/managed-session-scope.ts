@@ -303,7 +303,7 @@ export type ManagedCandidateListing =
 			scope: ManagedScope;
 			owned: readonly ManagedCandidate[];
 			foreignCount: number;
-			invalid: readonly { code: string }[];
+			invalid: readonly { code: string; sessionId?: string }[];
 	  }
 	| { kind: "error"; code: "scan_failed" | "unsafe_root" | "invalid_candidate"; message: string };
 
@@ -347,6 +347,7 @@ export interface ManagedLockReleaseTestEvent {
 export const ManagedSessionScopeTestHooks: {
 	beforeVerifiedDelete?: (event: ManagedVerifiedDeleteTestEvent) => void | Promise<void>;
 	beforeManagedLockRelease?: (event: ManagedLockReleaseTestEvent) => void | Promise<void>;
+	afterCandidatePreflight?: (event: { readonly sessionId?: string }) => void;
 } = {};
 
 async function deleteSessionVerifiedWithFence(
@@ -801,49 +802,86 @@ export function fsyncCanonicalBinding(bindingPath: string, expected: string): vo
 }
 
 type CandidatePreflight =
-	| { kind: "capture"; identity: { dev: bigint; ino: bigint; size: number; mtimeNs: bigint } }
+	| {
+			kind: "capture";
+			sessionId: string;
+			cwd: string;
+			diagnosticSessionId?: string;
+			identity: Pick<ManagedFileSnapshot["identity"], "dev" | "ino" | "nlink" | "size" | "mtimeNs" | "ctimeNs">;
+	  }
 	| {
 			kind: "foreign";
 	  }
 	| {
 			kind: "invalid";
 			code: string;
+			diagnosticSessionId?: string;
 	  };
+
+function safeManagedCandidateSessionId(value: unknown): string | undefined {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) ? value : undefined;
+}
+
+function invalidCandidatePreflight(filePath: string, code: string): CandidatePreflight {
+	const diagnosticSessionId = safeManagedCandidateSessionId(path.basename(filePath, ".jsonl"));
+	return {
+		kind: "invalid",
+		code,
+		...(diagnosticSessionId === undefined ? {} : { diagnosticSessionId }),
+	};
+}
 
 function preflightCandidate(filePath: string, scope: ManagedScope): CandidatePreflight {
 	try {
 		const snapshot = captureManagedFilePrefixNoFollow(filePath, HEADER_MAX_BYTES);
 		const lineEnd = snapshot.bytes.indexOf(0x0a);
-		if (lineEnd < 0) return { kind: "invalid", code: "invalid_header" };
+		if (lineEnd < 0) return invalidCandidatePreflight(filePath, "invalid_header");
 		const value: unknown = JSON.parse(snapshot.bytes.subarray(0, lineEnd).toString("utf8"));
 		if (!value || typeof value !== "object" || Array.isArray(value))
-			return { kind: "invalid", code: "invalid_header" };
+			return invalidCandidatePreflight(filePath, "invalid_header");
 		const header = value as Record<string, unknown>;
 		if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string")
-			return { kind: "invalid", code: "invalid_header" };
+			return invalidCandidatePreflight(filePath, "invalid_header");
+		const diagnosticSessionId = safeManagedCandidateSessionId(header.id);
 		const candidateIdentity = identityFor(header.cwd);
 		if (
 			candidateIdentity.ok &&
 			(candidateIdentity.platform !== scope.platform || candidateIdentity.canonicalPath !== scope.canonicalCwd)
 		)
 			return { kind: "foreign" };
-		return { kind: "capture", identity: snapshot.identity };
-	} catch {
-		return { kind: "invalid", code: "unreadable_candidate" };
+		return {
+			kind: "capture",
+			sessionId: header.id,
+			cwd: header.cwd,
+			...(diagnosticSessionId === undefined ? {} : { diagnosticSessionId }),
+			identity: snapshot.identity,
+		};
+	} catch (error) {
+		return invalidCandidatePreflight(
+			filePath,
+			error instanceof Error && error.message === "source_changed" ? "source_changed" : "unreadable_candidate",
+		);
 	}
 }
 
 function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: CandidatePreflight): boolean {
 	return (
 		preflight.kind === "capture" &&
+		candidate.sessionId === preflight.sessionId &&
+		candidate.cwd === preflight.cwd &&
 		candidate.identity.dev === preflight.identity.dev &&
 		candidate.identity.ino === preflight.identity.ino &&
+		candidate.identity.nlink === preflight.identity.nlink &&
 		candidate.identity.size === preflight.identity.size &&
-		candidate.identity.mtimeNs === preflight.identity.mtimeNs
+		candidate.identity.mtimeNs === preflight.identity.mtimeNs &&
+		candidate.identity.ctimeNs === preflight.identity.ctimeNs
 	);
 }
 
-function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
+function inspectCandidate(
+	filePath: string,
+	provenance: "v2" | "legacy",
+): ManagedCandidate | { code: string; sessionId?: string } {
 	try {
 		const snapshot = inspectManagedFileNoFollow(filePath, HEADER_MAX_BYTES);
 		const lineEnd = snapshot.bytes.subarray(0, HEADER_MAX_BYTES).indexOf(0x0a);
@@ -905,7 +943,7 @@ function discoveredLegacyDirectoryNames(scope: ManagedScope): readonly string[] 
 	return [...known, ...discovered];
 }
 
-type CandidateInspection = ManagedCandidate | { code: string } | { foreign: true };
+type CandidateInspection = ManagedCandidate | { code: string; sessionId?: string } | { foreign: true };
 
 function listDirectoryCandidates(
 	directory: string,
@@ -926,11 +964,29 @@ function listDirectoryCandidates(
 		.map(entry => {
 			const filePath = path.join(directory, entry.name);
 			const preflight = preflightCandidate(filePath, scope);
-			if (preflight.kind === "invalid") return { code: preflight.code };
+			if (preflight.kind === "invalid")
+				return {
+					code: preflight.code,
+					...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
+				};
 			if (preflight.kind === "foreign") return { foreign: true };
+			ManagedSessionScopeTestHooks.afterCandidatePreflight?.({
+				...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
+			});
 			const candidate = inspectCandidate(filePath, provenance);
-			if ("code" in candidate) return candidate;
-			return matchesPreflightIdentity(candidate, preflight) ? candidate : { code: "source_changed" };
+			if ("code" in candidate)
+				return {
+					...candidate,
+					...(candidate.sessionId === undefined && preflight.diagnosticSessionId !== undefined
+						? { sessionId: preflight.diagnosticSessionId }
+						: {}),
+				};
+			return matchesPreflightIdentity(candidate, preflight)
+				? candidate
+				: {
+						code: "source_changed",
+						...(preflight.diagnosticSessionId === undefined ? {} : { sessionId: preflight.diagnosticSessionId }),
+					};
 		});
 }
 
@@ -1645,7 +1701,7 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		if (!root.isDirectory() || root.isSymbolicLink())
 			return { kind: "error", code: "unsafe_root", message: "The sessions root is unsafe." };
 		const owned: ManagedCandidate[] = [];
-		const invalid: { code: string }[] = [];
+		const invalid: { code: string; sessionId?: string }[] = [];
 		let foreignCount = 0;
 		const directories: Array<{ path: string; provenance: "v2" | "legacy" }> = [
 			{ path: scope.directoryPath, provenance: "v2" },
@@ -1658,7 +1714,10 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 		for (const directory of directories) {
 			for (const candidate of listDirectoryCandidates(directory.path, directory.provenance, scope)) {
 				if ("code" in candidate) {
-					invalid.push({ code: candidate.code });
+					invalid.push({
+						code: candidate.code,
+						...(candidate.sessionId === undefined ? {} : { sessionId: candidate.sessionId }),
+					});
 					continue;
 				}
 				if ("foreign" in candidate) {
@@ -1667,7 +1726,12 @@ export function listManagedCandidates(scope: ManagedScope): ManagedCandidateList
 				}
 				const candidateIdentity = identityFor(candidate.cwd);
 				if (!candidateIdentity.ok) {
-					invalid.push({ code: `cwd_${candidateIdentity.code}` });
+					invalid.push({
+						code: `cwd_${candidateIdentity.code}`,
+						...(safeManagedCandidateSessionId(candidate.sessionId) === undefined
+							? {}
+							: { sessionId: candidate.sessionId }),
+					});
 					continue;
 				}
 				if (
