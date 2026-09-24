@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -22,6 +22,8 @@ import {
 	admitSessionClose,
 	advanceDeletion,
 	advanceDeliveryDiscoveryCursor,
+	bindCreationRequest,
+	type CanonicalCreateIntentV1,
 	claimPublicDelivery,
 	coordinatorStatePaths,
 	deterministicOutboxId,
@@ -146,6 +148,33 @@ async function injectPendingDeliveryForTest(
 		registry.retained_sessions[sessionId] = { session_id: sessionId, updated_at: new Date().toISOString() };
 	});
 	await fs.access(transactionPath(paths, sessionId));
+}
+
+async function leaveStartSessionCreationIncomplete(
+	server: CoordinatorMcpServer,
+	root: string,
+	idempotencyKey: string,
+): Promise<void> {
+	const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+	const creationKeyDigest = createHash("sha256")
+		.update(`gjc_coordinator_start_session\0${idempotencyKey}`)
+		.digest("hex");
+	await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[creationKeyDigest];
+		if (!request?.canonical_create_intent) throw new Error("missing_start_session_creation_intent");
+		request.phase = "wal_committed";
+		delete request.safe_response;
+	});
+	const receiptFile = path.join(
+		coordinatorNamespace(root),
+		"idempotency",
+		`${createHash("sha256").update(idempotencyKey).digest("hex")}.json`,
+	);
+	const receipt = JSON.parse(await fs.readFile(receiptFile, "utf8")) as Record<string, unknown>;
+	delete receipt.response;
+	delete receipt.completed_at;
+	receipt.state = "in_progress";
+	await fs.writeFile(receiptFile, `${JSON.stringify(receipt)}\n`);
 }
 
 /** Real detached-broker fixtures are cleaned solely by cleanupFixtureRoot. */
@@ -1212,6 +1241,76 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
 		expect(persisted.activity).toMatchObject({ phase: "exfiltrating", note: "LEAKY-NOTE" });
 		expect((report.session_state as Record<string, unknown>).activity).toBeUndefined();
+	});
+
+	it("recovers an incomplete start_session creation after observation time advances", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const idempotencyKey = "recover-start-after-timestamp-change";
+		const args = { cwd: root, idempotency_key: idempotencyKey, allow_mutation: true };
+		setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		try {
+			const server = await createSdkControlServer(root, controls);
+			const started = await server.callTool("gjc_coordinator_start_session", args);
+			expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+			await leaveStartSessionCreationIncomplete(server, root, idempotencyKey);
+
+			setSystemTime(new Date("2026-01-01T00:01:00.000Z"));
+			expect(new Date().toISOString()).toBe("2026-01-01T00:01:00.000Z");
+			const recovered = await server.callTool("gjc_coordinator_start_session", args);
+
+			expect(recovered).toMatchObject({
+				ok: true,
+				session: { session_id: "created-session-1" },
+				session_state: { state: "ready_for_input" },
+			});
+			expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("rejects incomplete start_session recovery when the saved intent changes semantically", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const idempotencyKey = "recover-start-semantic-conflict";
+		const args = {
+			cwd: root,
+			prompt: "original prompt",
+			idempotency_key: idempotencyKey,
+			allow_mutation: true,
+		};
+		setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		try {
+			const server = await createSdkControlServer(root, controls);
+			const started = await server.callTool("gjc_coordinator_start_session", args);
+			expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+			await leaveStartSessionCreationIncomplete(server, root, idempotencyKey);
+
+			const paths = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity);
+			const creationKeyDigest = createHash("sha256")
+				.update(`gjc_coordinator_start_session\0${idempotencyKey}`)
+				.digest("hex");
+			let originalIntent: CanonicalCreateIntentV1 | undefined;
+			await withNamespaceRegistry(paths, async registry => {
+				const intent = registry.creations[creationKeyDigest]?.canonical_create_intent;
+				if (intent?.kind !== "start" || !intent.initial_prompt)
+					throw new Error("missing_start_session_prompt_intent");
+				originalIntent = structuredClone(intent);
+				intent.initial_prompt.text = "different semantic prompt";
+			});
+			if (!originalIntent) throw new Error("missing_original_start_session_intent");
+			await expect(bindCreationRequest(paths, creationKeyDigest, originalIntent)).rejects.toThrow(
+				"idempotency_conflict",
+			);
+
+			const recovered = await server.callTool("gjc_coordinator_start_session", args);
+			expect(recovered).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+			expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+			expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+		} finally {
+			setSystemTime();
+		}
 	});
 
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
