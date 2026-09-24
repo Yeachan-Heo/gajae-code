@@ -1410,7 +1410,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				});
 				let answer: unknown;
 				try {
-					answer = await gateEmitter.emitGate(questionToGate(gateQuestion));
+					answer = await awaitAskAnswer(() => gateEmitter.emitGate(questionToGate(gateQuestion)));
 				} finally {
 					stopGateObservation?.();
 				}
