@@ -23810,14 +23810,16 @@ export class AgentSession {
 			if (credentialKind === undefined) return "unchanged";
 			for (const peerId of remainingCredentialIds) {
 				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				let peerApiKey: string | undefined;
 				try {
-					await this.#modelRegistry.getApiKey(model, credentialSessionId, {
+					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(peerId) },
 					});
 				} catch (error) {
 					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
 					continue;
 				}
+				if (!isAuthenticated(peerApiKey)) continue;
 				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
 				const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
 				if (
