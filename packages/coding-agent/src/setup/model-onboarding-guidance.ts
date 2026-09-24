@@ -27,6 +27,32 @@ export function formatNoModelOnboardingError(): string {
 	return `No model selected.\n\n${formatModelOnboardingGuidance()}`;
 }
 
+/** Control-protocol code for a prompt refused because the session has no model. */
+export const MODEL_NOT_SELECTED_CODE = "model_not_selected";
+
+/**
+ * Fixed public text for {@link MODEL_NOT_SELECTED_CODE}. The onboarding
+ * guidance names providers, commands, environment variables and local setup
+ * paths, so it stays local-only; external clients get this constant instead.
+ */
+export const MODEL_NOT_SELECTED_PUBLIC_MESSAGE =
+	"No model is selected for this session. Select a model before submitting a prompt.";
+
+/**
+ * Missing-model prompt preflight failure. The message keeps the full local
+ * onboarding guidance for the TUI and in-process callers; the `code` is what
+ * lets the SDK control surface answer with a safe, known diagnostic instead of
+ * a generic internal error.
+ */
+export class NoModelSelectedError extends Error {
+	readonly code = MODEL_NOT_SELECTED_CODE;
+
+	constructor() {
+		super(formatNoModelOnboardingError());
+		this.name = "NoModelSelectedError";
+	}
+}
+
 export function formatNoCredentialOnboardingError(providerId: string): string {
 	const lines = [
 		`No credentials found for ${providerId}.`,
