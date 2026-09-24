@@ -9,7 +9,12 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker, type BrokerResponse, setPublicationObservationForTest } from "../src/sdk/broker/broker";
+import {
+	Broker,
+	type BrokerResponse,
+	lifecycleTargetForTest,
+	setPublicationObservationForTest,
+} from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -28,7 +33,7 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import { deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
@@ -2609,6 +2614,45 @@ describe("SDK broker identity and discovery", () => {
 			expect(launchAttempts).toBe(1);
 		} finally {
 			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("keeps terminal target-inclusive legacy delete keys fenced across target reuse", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-delete-key-"));
+		const agentDir = path.join(root, "agent");
+		const idempotencyKey = "reused-terminal-delete-key";
+		const priorTarget = { sessionId: "legacy-delete-a" };
+		const priorTargetHash = createHash("sha256")
+			.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
+			.digest("hex");
+		const legacyIdentity = await deriveLegacyTargetIdentity(
+			agentDir,
+			"session.delete",
+			idempotencyKey,
+			priorTargetHash,
+		);
+		const legacyLedger = await new LifecycleLedger(agentDir).open();
+		await legacyLedger.begin(legacyIdentity, "legacy-terminal-delete-request");
+		await legacyLedger.transition(legacyIdentity, "terminal_error", {
+			response: { ok: false, error: { code: "fixture_error", message: "legacy delete completed" } },
+		});
+		expect(legacyLedger.get(legacyIdentity)?.operationKey).toBeUndefined();
+
+		const broker = new Broker({ agentDir });
+		await broker.start();
+		try {
+			await expect(
+				broker.handleRequest(
+					"session.delete",
+					{ sessionId: "legacy-delete-b", sessionPath: path.join(root, "missing.json") },
+					idempotencyKey,
+				),
+			).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+			});
+		} finally {
 			await broker.stop();
 			await fs.rm(root, { recursive: true, force: true });
 		}
