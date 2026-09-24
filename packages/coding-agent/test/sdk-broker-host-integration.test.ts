@@ -75,7 +75,7 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 		await busIndex.append(event("host_registered", "two", stateRoot));
 		await busIndex.append(event("host_registered", "three", stateRoot));
 
-		const first = await broker.handleRequest("session.list", { limit: 2 });
+		const first = await broker.handleRequest("session.list", { cwd: "/repo", limit: 2 });
 		expect(first.ok).toBe(true);
 		if (!first.ok) throw new Error(first.error.message);
 		const firstPage = first.result as {
@@ -109,12 +109,24 @@ test("broker session.list returns bounded stable cursor pages", async () => {
 			}),
 		).toEqual({
 			ok: false,
-			error: { code: "invalid_input", message: "cursor cannot be combined with cwd or resolveSessionId" },
+			error: { code: "invalid_input", message: "cursor cannot be combined with resolveSessionId" },
+		});
+		expect(
+			await broker.handleRequest("session.list", {
+				cursor: firstPage.continuationCursor,
+				cwd: "/other",
+			}),
+		).toEqual({
+			ok: false,
+			error: { code: "cwd_cursor_mismatch", message: "cwd must match the cursor snapshot" },
 		});
 
 		await busIndex.append(event("host_registered", "four", stateRoot));
 		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), '{"version":999}\n');
-		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
+		const second = await broker.handleRequest("session.list", {
+			cursor: firstPage.continuationCursor,
+			cwd: "/repo",
+		});
 		expect(second).toMatchObject({
 			ok: true,
 			indexSeq: firstPage.indexSeq,

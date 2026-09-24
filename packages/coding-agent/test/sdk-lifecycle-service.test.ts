@@ -494,7 +494,7 @@ describe("SessionLifecycleService", () => {
 			operation: "session.list",
 			result: { sessions: [{ sessionId: "first" }, { sessionId: "second" }] },
 		});
-		expect(client.calls.map(call => call.input)).toEqual([{ cwd: "/repo" }, { cursor: "page-2" }]);
+		expect(client.calls.map(call => call.input)).toEqual([{ cwd: "/repo" }, { cwd: "/repo", cursor: "page-2" }]);
 	});
 	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
 		const { service, client } = serviceWith();

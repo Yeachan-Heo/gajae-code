@@ -116,12 +116,7 @@ export async function traverseSessionList<
 	if (typeof initialCursor === "string" && initialCursor.length > 0) seenCursors.add(initialCursor);
 	let cursor: string | undefined;
 	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
-		const requestInput: Record<string, unknown> = {
-			...input,
-			...(cursor === undefined ? {} : { cursor }),
-		};
-		if (cursor !== undefined) delete requestInput.cwd;
-		const response = await request(requestInput as TInput);
+		const response = await request({ ...input, ...(cursor === undefined ? {} : { cursor }) } as TInput);
 		const page = pageFromResponse(response);
 		if (!page || !Array.isArray(page.sessions)) throw new SessionListTraversalError("malformed_page");
 		const continuationCursor = page.continuationCursor;

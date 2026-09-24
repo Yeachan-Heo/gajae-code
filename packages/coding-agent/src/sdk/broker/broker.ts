@@ -397,6 +397,7 @@ type SessionListCursor = {
 	limit: number;
 	offset: number;
 	expiresAt: number;
+	cwd?: string;
 	scope?: ResolvedScopeV1;
 	observedAt?: string;
 };
@@ -764,8 +765,8 @@ export function normalizeBrokerInput(operation: string, input: Record<string, un
 			return error("invalid_input", "cwd must be a non-empty string");
 		if (input.cursor !== undefined && (typeof input.cursor !== "string" || input.cursor.length === 0))
 			return error("invalid_input", "cursor must be a non-empty opaque string");
-		if (input.cursor !== undefined && (cwd !== undefined || resolved !== undefined))
-			return error("invalid_input", "cursor cannot be combined with cwd or resolveSessionId");
+		if (input.cursor !== undefined && resolved !== undefined)
+			return error("invalid_input", "cursor cannot be combined with resolveSessionId");
 		if (input.scope !== undefined && (cwd !== undefined || resolved !== undefined))
 			return error("invalid_input", "scope cannot be combined with cwd or resolveSessionId");
 		const limit = sessionListLimit(input);
@@ -4485,6 +4486,8 @@ export class Broker {
 			if (typeof cursor === "string") this.#sessionListCursors.delete(cursor);
 			return error("invalid_input", "cursor is expired or invalid");
 		}
+		if (stored && input.cwd !== undefined && input.cwd !== stored.cwd)
+			return error("cwd_cursor_mismatch", "cwd must match the cursor snapshot");
 		if (stored && requestedLimit !== undefined && stored.limit !== requestedLimit)
 			return error("invalid_input", "limit must match the cursor page shape");
 		let scope: ResolvedScopeV1 | undefined;
@@ -4527,6 +4530,7 @@ export class Broker {
 			limit,
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
+			...(typeof input.cwd === "string" ? { cwd: input.cwd } : {}),
 			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {

@@ -1329,12 +1329,12 @@ export class SessionLifecycleService {
 				"invalid_request",
 				"cwd and resolveSessionId cannot be combined with a scoped session.list target",
 			);
-		if (target.cursor !== undefined && (target.cwd !== undefined || target.resolveSessionId !== undefined))
+		if (target.cursor !== undefined && target.resolveSessionId !== undefined)
 			return failure(
 				"session.list",
 				"terminal",
 				"invalid_request",
-				"cursor cannot be combined with cwd or resolveSessionId",
+				"cursor cannot be combined with resolveSessionId",
 			);
 		let locallyResolvedScope: SdkSearchResultV1["scope"] | undefined;
 		if (scopeRequest !== undefined) {
