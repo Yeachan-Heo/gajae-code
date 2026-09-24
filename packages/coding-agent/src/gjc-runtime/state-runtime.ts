@@ -2484,7 +2484,14 @@ async function nonCrystalApprovalAuditRows(
 	stage: ExecutionApprovalStage,
 ): Promise<Record<string, unknown>[]> {
 	const recordPath = nonCrystalExecutionApprovalRecordPath(cwd, sessionId, stage);
-	const audit = await readBoundedIdentityText(auditPath(cwd, sessionId), 16 * 1024 * 1024, "execution approval audit");
+	const audit = await readBoundedIdentityText(
+		auditPath(cwd, sessionId),
+		16 * 1024 * 1024,
+		"execution approval audit",
+		{
+			tail: true,
+		},
+	);
 	const rows = (audit ?? "")
 		.split(/\r?\n/)
 		.filter(Boolean)
