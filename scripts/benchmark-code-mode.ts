@@ -1610,6 +1610,9 @@ export async function assertRepositoryScopedArguments(
 		if (!Array.isArray(args.paths) || args.paths.some(candidate => typeof candidate !== "string")) {
 			throw new Error("Repository benchmark search paths must be strings inside the task repository.");
 		}
+		if ((args.paths as string[]).some(candidate => candidate.includes("{") || candidate.includes("}"))) {
+			throw new Error("Repository benchmark search does not allow brace-expanded path alternatives.");
+		}
 		candidates = args.paths.map(candidate => staticGlobPrefix(candidate as string));
 	}
 	for (const candidate of candidates) {
