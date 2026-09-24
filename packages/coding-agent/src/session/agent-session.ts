@@ -23748,7 +23748,7 @@ export class AgentSession {
 			this.#managedFallbackTriedCredentialRows.clear();
 			this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 		}
-		const key = JSON.stringify([provider, credentialKind]);
+		const key = JSON.stringify([resolveOAuthStorageProvider(provider), credentialKind]);
 		let rowIds = this.#managedFallbackTriedCredentialRows.get(key);
 		if (!rowIds) {
 			rowIds = new Set<number>();

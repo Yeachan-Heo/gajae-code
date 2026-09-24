@@ -305,6 +305,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	addApiKeyDuringMark?: string;
 	predecessorModel?: Model;
 	modelProviderAlias?: boolean;
+	canonicalThenAlias?: boolean;
 	terminalCodexEntry?: boolean;
 	removeFailedCredentialDuringMark?: boolean;
 	unknownRowIdBeforeMark?: boolean;
@@ -344,6 +345,7 @@ async function runManagedFallbackQuotaScenario(options: {
 	const aliasSourceId = `fixture:${root}`;
 	let registeredRegistry: ModelRegistry | undefined;
 	let model = getBundledModel(provider, "gpt-5.1-codex");
+	let aliasModel: Model | undefined;
 	const fallback = getBundledModel("openai", "gpt-4o-mini");
 	if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
 	let restoreUnknownRowId: (() => void) | undefined;
@@ -381,7 +383,7 @@ async function runManagedFallbackQuotaScenario(options: {
 		storage.setRuntimeApiKey("openai", "fallback-test-key");
 		const registry = new ModelRegistry(storage, path.join(root, "models.yml"));
 		registeredRegistry = registry;
-		if (options.modelProviderAlias) {
+		if (options.modelProviderAlias || options.canonicalThenAlias) {
 			registry.registerProvider(
 				providerAlias,
 				{
@@ -409,12 +411,15 @@ async function runManagedFallbackQuotaScenario(options: {
 				},
 				aliasSourceId,
 			);
-			const aliasModel = registry.find(providerAlias, model.id);
+			aliasModel = registry.find(providerAlias, model.id);
 			if (!aliasModel) throw new Error("Could not register the Codex device-alias fixture model");
-			model = aliasModel;
+			if (options.modelProviderAlias) model = aliasModel;
 		}
 		const initialModel = options.predecessorModel ?? model;
-		const credentialModelProvider = options.modelProviderAlias ? providerAlias : provider;
+		const isCredentialProvider = (requestedProvider: string) =>
+			options.modelProviderAlias
+				? requestedProvider === providerAlias
+				: requestedProvider === provider || (options.canonicalThenAlias && requestedProvider === providerAlias);
 		if (options.unresolvablePeerDuringMark) {
 			const getApiKeyBeforeMock = registry.getApiKey.bind(registry);
 			const getApiKeySpy = vi.spyOn(registry, "getApiKey");
@@ -447,7 +452,7 @@ async function runManagedFallbackQuotaScenario(options: {
 			streamFn: (requestedModel, context, streamOptions) => {
 				const key = String(streamOptions?.apiKey);
 				calls.push({ model: selector(requestedModel), key });
-				if (requestedModel.provider === credentialModelProvider) {
+				if (isCredentialProvider(requestedModel.provider)) {
 					providerDispatchCount++;
 					if (options.dispatchGuardLimit !== undefined && providerDispatchCount > options.dispatchGuardLimit) {
 						dispatchGuardExceeded = true;
@@ -455,14 +460,14 @@ async function runManagedFallbackQuotaScenario(options: {
 					}
 				}
 				if (
-					requestedModel.provider === credentialModelProvider &&
+					isCredentialProvider(requestedModel.provider) &&
 					options.failFirstProviderDispatch &&
 					!firstProviderDispatchQuotaInjected
 				) {
 					quotaKeys.add(key);
 					firstProviderDispatchQuotaInjected = true;
 				}
-				if (requestedModel.provider === credentialModelProvider && quotaKeys.has(key)) {
+				if (isCredentialProvider(requestedModel.provider) && quotaKeys.has(key)) {
 					if (options.unknownRowIdBeforeMark && !unknownRowIdInjected) {
 						const rowIdSpy = vi.spyOn(storage, "getSessionCredentialRowId").mockReturnValueOnce(undefined);
 						restoreUnknownRowId = () => rowIdSpy.mockRestore();
@@ -488,7 +493,9 @@ async function runManagedFallbackQuotaScenario(options: {
 			? options.terminalCodexEntry
 				? [selector(options.predecessorModel), selector(model)]
 				: [selector(options.predecessorModel), selector(model), selector(fallback)]
-			: [selector(model), selector(fallback)];
+			: options.canonicalThenAlias
+				? [selector(model), selector(aliasModel!), selector(fallback)]
+				: [selector(model), selector(fallback)];
 		session.setConfiguredModelChain("default", entries, "test");
 		if (options.terminalCodexEntry) session.seedDefaultFallbackResolution(1, []);
 		const markBeforeRemoval = storage.markUsageLimitReached.bind(storage);
@@ -578,6 +585,28 @@ describe("managed fallback quota credential rotation", () => {
 			keys: ["TOKEN-a", "TOKEN-b", "fallback-test-key"],
 			markCount: 2,
 		});
+	});
+
+	test("shares tried OAuth rows across canonical and device-alias chain entries", async () => {
+		const model = getBundledModel(provider, "gpt-5.1-codex");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!model || !fallback) throw new Error("Missing bundled managed-fallback fixture models");
+		const result = await runManagedFallbackQuotaScenario({
+			accounts: ["a", "b"],
+			quotaKeys: ["TOKEN-a", "TOKEN-b"],
+			retryAfterMs: 0,
+			dispatchGuardLimit: 6,
+			canonicalThenAlias: true,
+		});
+		expect(result.dispatchGuardExceeded).toBe(false);
+		expect(result.models).toEqual([
+			selector(model),
+			selector(model),
+			`${providerAlias}/${model.id}`,
+			selector(fallback),
+		]);
+		expect(result.keys).toEqual(["TOKEN-a", "TOKEN-b", "TOKEN-b", "fallback-test-key"]);
+		expect(result.markCount).toBe(3);
 	});
 
 	test("stays within the failed credential kind when another kind is also stored", async () => {
