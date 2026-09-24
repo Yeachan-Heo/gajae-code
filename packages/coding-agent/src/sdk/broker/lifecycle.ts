@@ -1768,6 +1768,7 @@ export class LifecycleReadinessCleanupError extends Error {
 const LIFECYCLE_READY_REVOCATION_GRACE_MS = 100;
 
 /** The child writes this only after its endpoint and semantic ready event are both live. */
+
 export async function writeSessionLifecycleReady(
 	root: string,
 	id: string,
