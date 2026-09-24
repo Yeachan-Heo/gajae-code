@@ -27,7 +27,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { isNonDispatchedToolEvent, type RunSettlementProof, ThinkingLevel } from "@gajae-code/agent-core";
+import {
+	getAgentTerminalOwnerContext,
+	isNonDispatchedToolEvent,
+	type RunSettlementProof,
+	ThinkingLevel,
+} from "@gajae-code/agent-core";
 import type { ImageContent, TextContent, Tool } from "@gajae-code/ai/core";
 import type { NotificationServer as NativeNotificationServer } from "@gajae-code/natives";
 
@@ -1228,6 +1233,7 @@ interface SessionRuntime {
 	host: SessionSdkHost;
 	imageUploads: PromptImageUploadStore;
 	releaseAcceptedImage: (correlation: { commandId: string; turnId: string }) => void;
+	releaseAcceptedImagesForRun: (handle: string) => void;
 	releaseAcceptedImages: () => void;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
@@ -4885,10 +4891,20 @@ export function createNotificationsExtension(
 			return incarnation !== undefined && !incarnation.closed;
 		});
 		const acceptedImages = new Map<string, () => void>();
+		const acceptedImageRunHandles = new Map<string, string>();
 		const releaseAcceptedImage = (correlation: { commandId: string; turnId: string }) => {
 			const key = `${correlation.commandId}:${correlation.turnId}`;
 			acceptedImages.get(key)?.();
 			acceptedImages.delete(key);
+			acceptedImageRunHandles.delete(key);
+		};
+		const releaseAcceptedImagesForRun = (handle: string) => {
+			for (const [key, owner] of acceptedImageRunHandles) {
+				if (owner !== handle) continue;
+				acceptedImages.get(key)?.();
+				acceptedImages.delete(key);
+				acceptedImageRunHandles.delete(key);
+			}
 		};
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
@@ -5896,10 +5912,12 @@ export function createNotificationsExtension(
 			correlation: { commandId: string; turnId: string },
 			handle: string | undefined,
 		) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
+			const key = promptSubmissionKey(correlation);
+			const submission = promptSubmissions.get(key);
 			if (submission) {
 				submission.executionHandle = handle;
 				submission.preflightAbort = undefined;
+				if (handle && acceptedImages.has(key)) acceptedImageRunHandles.set(key, handle);
 			}
 		};
 		const terminalizePrompt = async (
@@ -7772,9 +7790,11 @@ export function createNotificationsExtension(
 			host,
 			imageUploads,
 			releaseAcceptedImage,
+			releaseAcceptedImagesForRun,
 			releaseAcceptedImages: () => {
 				for (const release of acceptedImages.values()) release();
 				acceptedImages.clear();
+				acceptedImageRunHandles.clear();
 			},
 			broadcastEventFrame,
 			broadcastEventFrameWithReceipts,
@@ -9689,6 +9709,11 @@ export function createNotificationsExtension(
 			.catch(error => logger.warn(`notifications: idle activity checkpoint failed: ${String(error)}`));
 		// Clear the streaming flag for SDK consumers even when notifications are off.
 		rt.busy = false;
+		// The Agent's terminal owner is independent of delivery correlation: a
+		// failed transport may have cleared the latter while the original run
+		// still owned image strings. Never borrow a successor's run handle.
+		const terminalOwner = getAgentTerminalOwnerContext(event);
+		if (terminalOwner) rt.releaseAcceptedImagesForRun(terminalOwner.resourceRunId);
 		const correlation = rt.activePromptCorrelation;
 		if (correlation) {
 			// This attributed agent_end is an execution boundary even when the

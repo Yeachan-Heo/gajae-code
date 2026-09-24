@@ -48,6 +48,7 @@ import {
 	type RunResourceProducerLease,
 	type RunSettlementProof,
 	resolveTelemetry,
+	setAgentTerminalOwnerContext,
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
@@ -9864,17 +9865,19 @@ export class AgentSession {
 					deliveryScope,
 				);
 			} else if (event.type === "agent_end") {
-				await this.#extensionRunner.emit(
-					{
-						type: "agent_end",
-						messages: event.messages,
-						stopReason: event.stopReason,
-						maintenanceOutcome: event.maintenanceOutcome,
-						...(sdkRunToken ? { sdkRunToken } : {}),
-					},
-					undefined,
-					deliveryScope,
-				);
+				const extensionEvent = {
+					type: "agent_end" as const,
+					messages: event.messages,
+					stopReason: event.stopReason,
+					maintenanceOutcome: event.maintenanceOutcome,
+					...(sdkRunToken ? { sdkRunToken } : {}),
+				};
+				// The run handle is not an extension wire field. Preserve its Agent-owned
+				// side channel across the session-to-extension event projection so a
+				// fatal delivery can later release only its own accepted images.
+				const terminalOwner = getAgentTerminalOwnerContext(event);
+				if (terminalOwner) setAgentTerminalOwnerContext(extensionEvent, terminalOwner);
+				await this.#extensionRunner.emit(extensionEvent, undefined, deliveryScope);
 			} else if (event.type === "turn_start") {
 				const hookEvent: TurnStartEvent = {
 					type: "turn_start",
