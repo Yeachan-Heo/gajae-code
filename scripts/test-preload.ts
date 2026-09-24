@@ -47,7 +47,9 @@ const isolatedTempDirs: Array<{ dir: string; prefix: string }> = [];
 
 function createIsolatedTempDir(prefix: string): string {
 	if (testTempRoot === path.parse(testTempRoot).root) {
-		throw new Error(`Cannot create isolated test temp directories directly under the filesystem root: ${testTempRoot}`);
+		throw new Error(
+			`Cannot create isolated test temp directories directly under the filesystem root: ${testTempRoot}`,
+		);
 	}
 	const dir = path.join(testTempRoot, `${prefix}${crypto.randomUUID()}`);
 	const forgetOwnedRoot = registerOwnedDeletionRoot(dir);
@@ -94,7 +96,17 @@ export function cleanupIsolatedTempDirs(): void {
 	}
 	if (cleanupError !== undefined) throw cleanupError;
 }
-// Bun test file isolates can be disposed without process lifecycle events; the
+
+function cleanupAfterInitializationFailure(error: unknown): never {
+	try {
+		cleanupIsolatedTempDirs();
+	} catch (cleanupError) {
+		throw new AggregateError([error, cleanupError], "Test preload initialization and temp cleanup both failed");
+	}
+	throw error;
+}
+
+// Bun test file isolates can be disposed without emitting process exit events; the
 // test-only preload bridge also calls this from afterAll. Keep these hooks for
 // ordinary process shutdown. Forceful safe removal makes every call idempotent.
 process.on("beforeExit", cleanupIsolatedTempDirs);
@@ -191,7 +203,11 @@ if (isolation.action === "isolate") {
 // `dirs.ts` was loaded above to capture the operator profile. Rebuild its
 // resolver after the agent isolation variables change so production consumers
 // in this test process resolve the isolated profile, not the pre-isolation one.
-resetAgentDirFromEnvironment();
+try {
+	resetAgentDirFromEnvironment();
+} catch (error) {
+	cleanupAfterInitializationFailure(error);
+}
 
 // Isolate the log sink for every test process (issue #5618). The agent-dir
 // isolation above does not cover logging: `getLogsDir()` resolves
@@ -220,23 +236,31 @@ resetAgentDirFromEnvironment();
 // can survive production's provenance check — throw. Continuing would silently
 // run the suite against the operator's live log sink, which is the regression
 // this exists to prevent.
-const logIsolation = decideLogDirIsolation({
-	env: preIsolationLogEnv,
-	projectEnv,
-	inheritedLogDir,
-	sharedLogDir: defaultLogDirFor({
-		home: preIsolationHome,
-		env: preIsolationLogEnv,
-		projectEnv,
-		xdgEligible: preIsolationXdgEligible,
-	}),
-});
+const logIsolation = (() => {
+	try {
+		return decideLogDirIsolation({
+			env: preIsolationLogEnv,
+			projectEnv,
+			inheritedLogDir,
+			sharedLogDir: defaultLogDirFor({
+				home: preIsolationHome,
+				env: preIsolationLogEnv,
+				projectEnv,
+				xdgEligible: preIsolationXdgEligible,
+			}),
+		});
+	} catch (error) {
+		cleanupAfterInitializationFailure(error);
+	}
+})();
 if (logIsolation.action === "fail") {
-	throw new Error(
-		"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
-			"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
-			"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
-			"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+	cleanupAfterInitializationFailure(
+		new Error(
+			"Test log-directory isolation failed (dynamic): this checkout's .env declares GJC_LOG_DIR with a `$` or " +
+				"backtick in its value. Bun expands it at load time, so the trust check in packages/utils/src/dirs.ts " +
+				"rejects the key entirely and log writes would fall back to the operator's live log sink no matter what " +
+				"this preload pins. Remove GJC_LOG_DIR from the project .env before running tests.",
+		),
 	);
 }
 if (logIsolation.action === "isolate") {
@@ -244,8 +268,10 @@ if (logIsolation.action === "isolate") {
 		const logDir = createIsolatedTempDir("gjc-test-logs-");
 		process.env.GJC_LOG_DIR = logDir;
 	} catch (error) {
-		throw new Error(
-			`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
+		cleanupAfterInitializationFailure(
+			new Error(
+				`Test log-directory isolation failed (${logIsolation.reason}); refusing to run tests against the live log sink: ${String(error)}`,
+			),
 		);
 	}
 }
@@ -265,4 +291,8 @@ process.env[logDirProvenanceKey] = process.env.GJC_LOG_DIR ?? "";
 // module-load time — before any test mutates process.env.HOME — so a cleanup
 // bug that resolves back to the operator home aborts this process instead of
 // deleting it. A refusal exits 70 by default.
-installRuntimeDeletionGuard({ label: "test-preload" });
+try {
+	installRuntimeDeletionGuard({ label: "test-preload" });
+} catch (error) {
+	cleanupAfterInitializationFailure(error);
+}

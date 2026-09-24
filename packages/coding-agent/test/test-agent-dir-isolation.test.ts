@@ -250,6 +250,51 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		30_000,
 	);
 
+	test("rolls back agent isolation when log isolation fails before the afterAll bridge loads", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-init-failure-"));
+		const tempRoot = path.join(root, "tmp");
+		const testPath = path.join(root, "init-failure.test.ts");
+		const bridge = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
+		await fs.promises.mkdir(tempRoot);
+		await fs.promises.writeFile(path.join(root, ".env"), "GJC_LOG_DIR=$HOME/.gjc/logs\n");
+		await fs.promises.writeFile(testPath, 'import { test } from "bun:test"; test("preload must fail", () => {});\n');
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			HOME: os.homedir(),
+			TMPDIR: tempRoot,
+			TMP: tempRoot,
+			TEMP: tempRoot,
+			GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+			PI_CODING_AGENT_DIR: "",
+			GJC_CONFIG_DIR: "",
+			PI_CONFIG_DIR: "",
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+		};
+		delete childEnv.GJC_LOG_DIR;
+		delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+		delete childEnv.GJC_TEST_KEEP_TMP;
+		delete childEnv.XDG_STATE_HOME;
+
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "test", "--parallel=1", "--preload", bridge, testPath],
+				cwd: root,
+				env: childEnv,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).not.toBe(0);
+			expect(probe.stderr.toString()).toContain("Test log-directory isolation failed (dynamic)");
+			expect(
+				fs
+					.readdirSync(tempRoot)
+					.filter(name => name.startsWith("gjc-test-agent-") || name.startsWith("gjc-test-logs-")),
+			).toEqual([]);
+		} finally {
+			safeRmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	test("an explicit trusted non-default pin survives the real preload", async () => {
 		const pinned = path.join(os.tmpdir(), `gjc-test-agent-${crypto.randomUUID()}`);
 		const sentinel = path.join(pinned, "owned-marker");
@@ -334,15 +379,28 @@ test("isolated directories and log sink are live before file completion", async 
 		const boundaryTestSource = `
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 const report = JSON.parse(fs.readFileSync(${JSON.stringify(reportPath)}, "utf8")) as {
 	agentDir: string;
 	logDir: string;
 };
+const agentDir = process.env.GJC_CODING_AGENT_DIR!;
+const logDir = process.env.GJC_LOG_DIR!;
 
-test("the prior file's directories are removed before the runner exits", () => {
+test("the prior file's directories are removed and the next isolate gets fresh roots", () => {
 	expect(fs.existsSync(report.agentDir)).toBe(false);
 	expect(fs.existsSync(report.logDir)).toBe(false);
+	for (const [dir, previous, prefix] of [
+		[agentDir, report.agentDir, "gjc-test-agent-"],
+		[logDir, report.logDir, "gjc-test-logs-"],
+	] as const) {
+		expect(dir).not.toBe(previous);
+		expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
+		expect(path.basename(dir)).toMatch(new RegExp("^" + prefix));
+		expect(fs.statSync(dir).isDirectory()).toBe(true);
+	}
 });
 `;
 		await Promise.all([
@@ -362,6 +420,7 @@ test("the prior file's directories are removed before the runner exits", () => {
 		};
 		delete childEnv.GJC_LOG_DIR;
 		delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+		delete childEnv.GJC_TEST_KEEP_TMP;
 		delete childEnv.XDG_STATE_HOME;
 
 		try {
