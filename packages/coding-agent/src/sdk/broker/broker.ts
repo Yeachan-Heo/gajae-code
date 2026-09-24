@@ -4737,6 +4737,7 @@ export class Broker {
 				} else if (
 					this.ledger.hasLegacyIdentity(
 						new Set(this.#spawnAuthority?.claims().map(claim => claim.lifecycleIdentity) ?? []),
+						{ ignoreTerminalRows: operation === "session.create" },
 					)
 				) {
 					return error("idempotency_conflict", "legacy lifecycle request has an ambiguous target");
