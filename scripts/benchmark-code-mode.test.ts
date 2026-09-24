@@ -6,6 +6,7 @@ import * as z from "zod/v4";
 import {
 	MAX_PLAN_STEPS,
 	MIN_PLAN_STEPS,
+	assertOutputPathOutsideWorkspace,
 	assertRepositoryScopedArguments,
 	medianMetric,
 	type PairedRequestCount,
@@ -177,10 +178,21 @@ describe("repository-scoped file handlers", () => {
 		const packages = path.join(workspace, "packages");
 		const insideFile = path.join(packages, "main.ts");
 		const externalFile = path.join(temporaryRoot, "secret.txt");
-		await fs.mkdir(packages, { recursive: true });
-		await fs.writeFile(insideFile, "export const safe = true;\n");
-		await fs.writeFile(externalFile, "not in the repo\n");
+		const outputSymlink = path.join(temporaryRoot, "output-symlink.json");
+		const outputHardlink = path.join(temporaryRoot, "output-hardlink.json");
 		try {
+			await fs.mkdir(packages, { recursive: true });
+			await fs.writeFile(insideFile, "export const safe = true;\n");
+			await fs.writeFile(externalFile, "not in the repo\n");
+			await expect(assertOutputPathOutsideWorkspace(workspace, path.join(workspace, "report.json"))).rejects.toThrow(
+				/outside the task repository/,
+			);
+			if (process.platform !== "win32") {
+				await fs.symlink(insideFile, outputSymlink);
+				await expect(assertOutputPathOutsideWorkspace(workspace, outputSymlink)).rejects.toThrow(/may not be a symlink/);
+			}
+			await fs.link(insideFile, outputHardlink);
+			await expect(assertOutputPathOutsideWorkspace(workspace, outputHardlink)).rejects.toThrow(/single-link regular file/);
 			await expect(assertRepositoryScopedArguments(workspace, "read", { path: "packages/main.ts:1-2" })).resolves.toBeUndefined();
 			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: ["packages/**/*.ts"] })).resolves.toBeUndefined();
 			await expect(assertRepositoryScopedArguments(workspace, "search", { pattern: "safe", paths: null })).resolves.toBeUndefined();
