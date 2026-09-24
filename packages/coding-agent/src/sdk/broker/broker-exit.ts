@@ -180,49 +180,6 @@ async function writeAtomicExitRecord(destination: string, record: object, signal
 	}
 }
 
-/**
- * Signal-handler fallback for pre-readiness exits. Postmortem owns asynchronous
- * cleanup, but a signal can terminate the bootstrap before promise continuations
- * drain; this small bounded record is written synchronously so the supervisor
- * still has a reason if that happens.
- */
-export function writeBrokerStartupExitRecordSynchronously(agentDir: string, record: BrokerStartupExitRecord): boolean {
-	const serialized = JSON.stringify(record);
-	if (!isBrokerStartupExitRecord(record) || Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
-		return false;
-	return writeAtomicExitRecordSynchronously(brokerStartupExitRecordPath(agentDir), serialized);
-}
-
-function writeAtomicExitRecordSynchronously(destination: string, serialized: string): boolean {
-	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
-	let descriptor: number | undefined;
-	let published = false;
-	try {
-		syncFs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-		descriptor = syncFs.openSync(temporary, "wx", 0o600);
-		syncFs.writeFileSync(descriptor, serialized, "utf8");
-		syncFs.fsyncSync(descriptor);
-		syncFs.closeSync(descriptor);
-		descriptor = undefined;
-		syncFs.renameSync(temporary, destination);
-		published = true;
-		return true;
-	} catch {
-		return false;
-	} finally {
-		if (descriptor !== undefined) {
-			try {
-				syncFs.closeSync(descriptor);
-			} catch {}
-		}
-		if (!published) {
-			try {
-				syncFs.rmSync(temporary, { force: true });
-			} catch {}
-		}
-	}
-}
-
 /** Atomically persist the latest bounded graceful-exit reason for supervisors. */
 export async function writeBrokerExitRecord(
 	agentDir: string,
@@ -231,15 +188,6 @@ export async function writeBrokerExitRecord(
 ): Promise<void> {
 	await writeAtomicExitRecord(brokerExitRecordPath(agentDir), record, signal);
 }
-
-/** Persist an exit synchronously when a process signal can preempt async writes. */
-export function writeBrokerExitRecordSynchronously(agentDir: string, record: BrokerExitRecord): boolean {
-	const serialized = JSON.stringify(record);
-	if (!isBrokerExitRecord(record) || Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
-		return false;
-	return writeAtomicExitRecordSynchronously(brokerExitRecordPath(agentDir), serialized);
-}
-
 /** Read the bounded previous-exit record; malformed or absent files are ignored. */
 export async function readBrokerExitRecord(agentDir: string): Promise<BrokerExitRecord | undefined> {
 	try {
