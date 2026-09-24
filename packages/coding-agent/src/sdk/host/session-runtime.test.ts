@@ -3910,34 +3910,43 @@ async function invocationHarness(
 			? { onInvocationCompletionReconciledForTests: hooks.onInvocationCompletionReconciled }
 			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
-		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
-			sessionId: id,
-			stateRoot,
-			token,
-			onFrame(handler) {
-				deliver = handler;
-				deliveries.set(id, handler);
-				return () => {
-					if (deliver === handler) deliver = undefined;
-					if (deliveries.get(id) === handler) deliveries.delete(id);
-				};
-			},
-			sendFrame(_connectionId, frame) {
-				const response = frame as ResponseFrame;
-				const frames = sentFrames.get(id) ?? [];
-				frames.push(frame);
-				sentFrames.set(id, frames);
-				if (typeof response.id === "string") waiters.get(response.id)?.(response);
-			},
-			broadcastFrame(frame) {
-				// Interception precedes recording: a frame whose publication throws never
-				// reached the wire, so it must not appear in the observed broadcasts.
-				hooks.broadcastInterceptor?.(frame);
-				broadcasts.push(frame);
-			},
-			start: async () => ({ url: "ws://127.0.0.1:1" }),
-			stop: async () => {},
-		}),
+		createTransport: async ({ sessionId: id, stateRoot, token }) => {
+			let open = false;
+			return {
+				sessionId: id,
+				stateRoot,
+				token,
+				isConnectionOpen: connectionId => open && connectionId === "client",
+				onFrame(handler) {
+					deliver = handler;
+					deliveries.set(id, handler);
+					return () => {
+						if (deliver === handler) deliver = undefined;
+						if (deliveries.get(id) === handler) deliveries.delete(id);
+					};
+				},
+				sendFrame(_connectionId, frame) {
+					const response = frame as ResponseFrame;
+					const frames = sentFrames.get(id) ?? [];
+					frames.push(frame);
+					sentFrames.set(id, frames);
+					if (typeof response.id === "string") waiters.get(response.id)?.(response);
+				},
+				broadcastFrame(frame) {
+					// Interception precedes recording: a frame whose publication throws never
+					// reached the wire, so it must not appear in the observed broadcasts.
+					hooks.broadcastInterceptor?.(frame);
+					broadcasts.push(frame);
+				},
+				start: async () => {
+					open = true;
+					return { url: "ws://127.0.0.1:1" };
+				},
+				stop: async () => {
+					open = false;
+				},
+			};
+		},
 	});
 	const ctx = {
 		cwd,
