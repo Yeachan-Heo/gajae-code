@@ -768,7 +768,9 @@ jobs:
       # unchanged: nightly publishes on channel, stable only behind approval.
       if: ${{ always() && needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
       needs: [release_prepare, release_approval, release_metadata]
-      # 13 sequential publishes, each bounded by a 10-minute visibility window.
+      # 13 sequential publishes; each package gets a 10-minute integrity and a
+      # 5-minute dist-tag window of wall time, but uncached observation normally
+      # settles in seconds.
       # 0.17.4 took 43 minutes and 0.17.5 timed out at 45 before uncached
       # observation; 90 keeps a slow-registry day from stranding a half-published
       # release without letting a hung publish hold the OIDC token indefinitely.
@@ -876,28 +878,35 @@ jobs:
                        echo "Published $name@$version"
                     fi
                     # npm is read-after-write eventually consistent: re-observe
-                    # with bounded backoff until the sealed integrity is visible.
-                    # 0.15.4 proved 60s is not enough (agent-core became visible
-                    # only after the window elapsed, failing an otherwise clean
-                    # publish); allow up to 10 minutes. The per-version endpoint
-                    # is uncached, so a short poll interval is cheap.
-                    attempt=0
+                    # until the sealed integrity is visible. 0.15.4 proved 60s is
+                    # not enough (agent-core became visible only after the window
+                    # elapsed, failing an otherwise clean publish); allow up to 10
+                    # minutes of wall time, transfer time included, so a stalled
+                    # registry cannot stretch the window.
+                    deadline=$((SECONDS + 600))
                     while :; do
-                       attempt=$((attempt + 1))
                        observed="$(registry_integrity "$name" "$version")"
                        [ "$observed" = "$expected_sri" ] && break
-                       if [ "$attempt" -ge 120 ]; then
+                       if [ "$SECONDS" -ge "$deadline" ]; then
                           echo "$name@$version did not become visible with the sealed integrity" >&2
                           exit 1
                        fi
                        sleep 5
                     done
                  fi
-                 tagged="$(registry_dist_tag "$name" "$npm_tag")"
-                 if [ "$tagged" != "$version" ]; then
-                    echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
-                    exit 1
-                 fi
+                 # The dist-tag lands with the publish but is read from a separate
+                 # endpoint; a transient miss must not abort a release whose bytes
+                 # are already immutable, so it gets its own bounded window.
+                 deadline=$((SECONDS + 300))
+                 while :; do
+                    tagged="$(registry_dist_tag "$name" "$npm_tag")"
+                    [ "$tagged" = "$version" ] && break
+                    if [ "$SECONDS" -ge "$deadline" ]; then
+                       echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
+                       exit 1
+                    fi
+                    sleep 5
+                 done
                  jq --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
                     '. += [{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}]' \
                     "$records" > "$records.tmp"
