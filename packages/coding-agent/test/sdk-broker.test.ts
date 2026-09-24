@@ -263,12 +263,15 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
 		environment: {
 			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
 			GJC_SESSION_FILE: "/tui/session.jsonl",
 			GJC_SESSION_ID: "tui-session",
 			GJC_SESSION_CWD: "/tui/workspace",
 			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
 			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
 			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
 			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
 			GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
 			GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
@@ -299,7 +302,6 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		"GJC_SESSION_CWD",
 		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
 		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
-		"GJC_SESSION_CUSTOM_MARKER",
 		"GJC_COORDINATOR_SESSION_ID",
 		"GJC_COORDINATOR_SESSION_STATE_FILE",
 		"GJC_COORDINATOR_SESSION_BRANCH",
@@ -321,6 +323,10 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		expect(environment[name]).toBeUndefined();
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
 	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBe("tui-custom-session-marker");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
 });
 
@@ -330,10 +336,13 @@ it("strips inherited session markers from compiled broker environments", () => {
 		execPath: process.execPath,
 		environment: {
 			PATH: process.env.PATH,
+			GJC_SESSION_CONTEXT_BUDGET_BYTES: "1073741824",
 			GJC_SESSION_FILE: "/tui/session.jsonl",
 			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
 			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
 			GJC_SESSION_CUSTOM_MARKER: "tui-custom-session-marker",
+			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
+			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
 			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
 			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
 			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
@@ -355,7 +364,6 @@ it("strips inherited session markers from compiled broker environments", () => {
 		"GJC_SESSION_FILE",
 		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
 		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
-		"GJC_SESSION_CUSTOM_MARKER",
 		"GJC_COORDINATOR_SESSION_ID",
 		"GJC_TMUX_OWNER_GENERATION",
 		"GJC_MANAGED_OWNER_RUN_ID",
@@ -366,6 +374,10 @@ it("strips inherited session markers from compiled broker environments", () => {
 		expect(environment[name]).toBeUndefined();
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
 	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
+	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
+	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBe("tui-custom-session-marker");
 	expect(environment.PI_COMPILED).toBe("1");
 	expect(environment.GJC_COMPILED).toBe("1");
 });
