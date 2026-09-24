@@ -1396,6 +1396,33 @@ function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown
 	return new McpManagerCleanupDiagnosticError(primary, cleanup);
 }
 
+function attachStartupCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
+	const diagnostic = { code: "STARTUP_RESOURCE_CLEANUP_FAILED" as const, cause: cleanup };
+	if (primary && (typeof primary === "object" || typeof primary === "function")) {
+		try {
+			Object.defineProperty(primary, "startupCleanupDiagnostic", {
+				value: diagnostic,
+				enumerable: false,
+				configurable: true,
+			});
+			return primary;
+		} catch {
+			// Frozen errors retain their original message in this typed wrapper.
+		}
+	}
+	const wrapped = new AggregateError(
+		[primary, cleanup],
+		primary instanceof Error ? primary.message : String(primary),
+		{ cause: primary },
+	);
+	Object.defineProperty(wrapped, "startupCleanupDiagnostic", {
+		value: diagnostic,
+		enumerable: false,
+		configurable: true,
+	});
+	return wrapped;
+}
+
 function findExactMcpToolNameCollisions(
 	exactMcpToolNames: readonly string[],
 	catalogToolNames: Iterable<string>,
@@ -1699,14 +1726,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
 	const closeOwnedAuthStorage = async (): Promise<void> => {
-		if (ownsModelRegistry) await modelRegistry.dispose();
-		if (!hasSession && credentialScopeLeased && credentialScopeId) {
-			authStorage.releaseCredentialScope(credentialScopeId);
-			credentialScopeLeased = false;
+		const cleanupErrors: unknown[] = [];
+		if (ownsModelRegistry) {
+			try {
+				await modelRegistry.dispose();
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
 		}
-		if (!ownsAuthStorage || authStorageClosed) return;
-		authStorageClosed = true;
-		authStorage.close();
+		if (!hasSession && credentialScopeLeased && credentialScopeId) {
+			try {
+				authStorage.releaseCredentialScope(credentialScopeId);
+				credentialScopeLeased = false;
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+		}
+		if (ownsAuthStorage && !authStorageClosed) {
+			authStorageClosed = true;
+			try {
+				authStorage.close();
+			} catch (error) {
+				cleanupErrors.push(error);
+			}
+		}
+		if (cleanupErrors.length === 1) throw cleanupErrors[0];
+		if (cleanupErrors.length > 1)
+			throw new AggregateError(cleanupErrors, "Failed to close owned model registry and auth storage.");
 	};
 	let inheritedMcpToolsPublisher: ((tools: readonly CustomTool[]) => void) | undefined;
 	let inheritedMcpToolsUnsubscribe: (() => void) | undefined;
@@ -5869,67 +5915,84 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {
-		// Release the subscription if the throw happened after install but before the
-		// dispose-wrap took ownership.
-		stopInheritedMcpToolsSubscription();
-		releaseCredentialDisabledSubscription();
 		let cleanupDiagnostic: unknown;
-		try {
-			if (hasSession) {
+		const recordCleanupFailure = (cleanupError: unknown): void => {
+			cleanupDiagnostic =
+				cleanupDiagnostic === undefined
+					? cleanupError
+					: new AggregateError([cleanupDiagnostic, cleanupError], "Multiple startup cleanup operations failed.");
+		};
+		const attemptCleanup = async (cleanup: () => void | Promise<void>): Promise<void> => {
+			try {
+				await cleanup();
+			} catch (cleanupError) {
+				recordCleanupFailure(cleanupError);
+			}
+		};
+		// Release the subscription if the throw happened after install but before the
+		// dispose-wrap took ownership. Each independent cleanup still runs if another
+		// teardown reports an error, and every failure is retained for lifecycle proof.
+		await attemptCleanup(stopInheritedMcpToolsSubscription);
+		await attemptCleanup(releaseCredentialDisabledSubscription);
+		if (hasSession) {
+			await attemptCleanup(async () => {
 				try {
 					await session.dispose();
 				} catch (disposeError) {
-					if (!isSessionDisposalIncompleteError(disposeError)) {
-						throw disposeError;
-					}
+					if (!isSessionDisposalIncompleteError(disposeError)) throw disposeError;
 					// The first call is intentionally bounded for startup callers. Join the
 					// retained teardown before releasing the resources it still owns.
 					await session.awaitDisposeCompletion();
 				}
-			} else {
-				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
-				// Admission happens before session construction. Any later startup
-				// failure must eventually release THIS manager's endpoint mapping
-				// through disposal and restore the prior global only when this manager
-				// is still global: otherwise a retry under the same endpoint is falsely
-				// rejected and an orphan redirects global-manager consumers away from
-				// the live session (review thread P1).
-				if (asyncJobManagerOwned && asyncJobManager) {
-					if (asyncJobManagerAdmitted) {
-						if (AsyncJobManager.instance() === asyncJobManager) {
-							AsyncJobManager.setInstance(priorAsyncJobManager);
-						}
-					}
-					await asyncJobManager.dispose({ timeoutMs: 100 });
-				}
-				await cleanupOwnedMcpManager?.();
-				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
-					import("../eval/py/executor"),
-					import("../eval/js/context-manager"),
-				]);
-				await disposeKernelSessionsByOwner(evalKernelOwnerId);
-				await disposeVmContextsByOwner(evalKernelOwnerId);
-				await closeOwnedSettings();
-			}
-		} catch (cleanupError) {
-			cleanupDiagnostic = cleanupError;
-			logger.warn("Failed to clean up createAgentSession resources after startup error", {
-				error: safeErrorForLog(error),
-				cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
 			});
-		} finally {
-			if (processCwdClaimed) {
+		} else {
+			if (hasRegistered)
+				await attemptCleanup(() => {
+					agentRegistry.unregister(resolvedAgentId);
+				});
+			// Admission happens before session construction. Any later startup failure
+			// must release this manager's endpoint mapping; a failed restoration cannot
+			// prevent disposal of the owned manager or other startup resources.
+			if (asyncJobManagerOwned && asyncJobManager) {
+				const ownedAsyncJobManager = asyncJobManager;
+				if (asyncJobManagerAdmitted)
+					await attemptCleanup(() => {
+						if (AsyncJobManager.instance() === ownedAsyncJobManager)
+							AsyncJobManager.setInstance(priorAsyncJobManager);
+					});
+				await attemptCleanup(async () => {
+					await ownedAsyncJobManager.dispose({ timeoutMs: 100 });
+				});
+			}
+			if (cleanupOwnedMcpManager) await attemptCleanup(cleanupOwnedMcpManager);
+			const evalCleanup = Promise.all([import("../eval/py/executor"), import("../eval/js/context-manager")]);
+			let evalCleanupModules: Awaited<typeof evalCleanup> | undefined;
+			try {
+				evalCleanupModules = await evalCleanup;
+			} catch (cleanupError) {
+				recordCleanupFailure(cleanupError);
+			}
+			if (evalCleanupModules) {
+				const [kernelExecutor, contextManager] = evalCleanupModules;
+				await attemptCleanup(() => kernelExecutor.disposeKernelSessionsByOwner(evalKernelOwnerId));
+				await attemptCleanup(() => contextManager.disposeVmContextsByOwner(evalKernelOwnerId));
+			}
+			await attemptCleanup(closeOwnedSettings);
+		}
+		if (processCwdClaimed)
+			await attemptCleanup(() => {
 				SessionManager.releaseProcessCwdOwnership(sessionManager);
 				processCwdClaimed = false;
-			}
-			releaseLocalProtocolOverride();
-			try {
-				await closeOwnedAuthStorage();
-			} catch (authCleanupError) {
-				logger.warn("Failed to close owned auth storage after startup error", { error: authCleanupError });
-			}
+			});
+		await attemptCleanup(releaseLocalProtocolOverride);
+		await attemptCleanup(closeOwnedAuthStorage);
+		if (cleanupDiagnostic !== undefined) {
+			logger.warn("Failed to clean up createAgentSession resources after startup error", {
+				error: safeErrorForLog(error),
+				cleanupDiagnostic: safeErrorForLog(cleanupDiagnostic),
+			});
+			throw attachStartupCleanupDiagnostic(error, cleanupDiagnostic);
 		}
-		if (cleanupDiagnostic !== undefined) throw attachMcpCleanupDiagnostic(error, cleanupDiagnostic);
 		throw error;
 	}
 }
