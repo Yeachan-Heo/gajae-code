@@ -1619,114 +1619,125 @@ describe("managed task.dag broker admission (test-only, no M3 recovery)", () => 
 			await broker.stop();
 		}
 	});
+	// Keep a test-level watchdog above Bun's default for the 20 fresh broker lifecycles.
 	it("cancel waits for delayed launch and closes its exact child before succeeding", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-launch-cancel-"));
-		roots.push(root);
-		const launchEntered = Promise.withResolvers<void>();
-		const launchRelease = Promise.withResolvers<void>();
-		const closedSignal = Promise.withResolvers<void>();
-		const closed = new Set<number>();
-		let closeCalls = 0;
-		const launchedPid = 6123;
-		const provider = {
-			launch: async () => {
-				launchEntered.resolve();
-				await launchRelease.promise;
-				return {
-					ok: true as const,
-					proof: {
-						substrateKind: "headless" as const,
-						providerIdentity: "managed-delayed-fixture",
+		for (let iteration = 0; iteration < 20; iteration += 1) {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-launch-cancel-"));
+			roots.push(root);
+			const launchEntered = Promise.withResolvers<void>();
+			const launchRelease = Promise.withResolvers<void>();
+			const closedSignal = Promise.withResolvers<void>();
+			const closed = new Set<number>();
+			const closeProofs: Array<{ pid?: number; processIncarnation?: string }> = [];
+			let closeCalls = 0;
+			const launchedPid = 6123;
+			const provider = {
+				launch: async () => {
+					launchEntered.resolve();
+					await launchRelease.promise;
+					return {
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "managed-delayed-fixture",
+							pid: launchedPid,
+							processIncarnation: `inc-${launchedPid}`,
+						},
+					};
+				},
+				verify: async (proof: { pid?: number }) =>
+					proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
+				close: async (proof: { pid?: number; processIncarnation?: string }) => {
+					closeCalls += 1;
+					closeProofs.push({ pid: proof.pid, processIncarnation: proof.processIncarnation });
+					if (closeCalls === 1) return { ok: false };
+					if (proof.pid !== undefined) closed.add(proof.pid);
+					closedSignal.resolve();
+					return { ok: true };
+				},
+			};
+			const broker = new Broker({
+				agentDir: path.join(root, "agent"),
+				packageGeneration: "test",
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: provider,
+				spawnPromptLayer: promptLayer,
+			});
+			let wsForCleanup: WebSocket | undefined;
+			let wsCancelForCleanup: WebSocket | undefined;
+			try {
+				setManagedCloseWaitForTest(broker, 20);
+				const discovery = await broker.start();
+				const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+				wsForCleanup = ws;
+				const wsCancel = await connect(`${discovery.url}/?token=${discovery.token}`);
+				wsCancelForCleanup = wsCancel;
+				await attest(broker, root);
+				const auth = {
+					controlRoot: root,
+					enrollmentId: "enrollment",
+					ownerSessionId: ownerId,
+					attestationEpoch: epoch,
+					masterCapability: grant,
+					worktrees: [root],
+				};
+				expect(
+					await request(ws, "define-delayed", "task.dag", {
+						...auth,
+						action: "define",
+						graphId: "delayed",
+						expectedRevision: 0,
+						nodes: [node("n", root, "delayed")],
+					}),
+				).toMatchObject({ ok: true });
+				const advance = request(
+					ws,
+					"advance-delayed",
+					"task.dag",
+					{ ...auth, action: "advance", graphId: "delayed", nodeId: "n", expectedRevision: 1 },
+					"delayed-key",
+				);
+				await launchEntered.promise;
+				const currentRevision = (
+					(await request(wsCancel, "status-before-cancel", "task.dag", { ...auth, action: "status" })).result as {
+						stateRevision: number;
+					}
+				).stateRevision;
+				const cancel = request(wsCancel, "cancel-delayed", "task.dag", {
+					...auth,
+					action: "cancel",
+					graphId: "delayed",
+					expectedRevision: currentRevision,
+					nodeIds: ["n"],
+				});
+				expect(await cancel).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				const duringLaunch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
+					graphs: Array<{ attempts: Array<{ fence: string }> }>;
+				};
+				expect(duringLaunch.graphs[0]!.attempts[0]!.fence).toBe("canceled");
+				expect(closed.size).toBe(0);
+				expect(closeCalls).toBe(0);
+				expect(closeProofs).toEqual([]);
+				launchRelease.resolve();
+				expect(await advance).toMatchObject({ ok: false });
+				await closedSignal.promise;
+				expect([...closed]).toEqual([launchedPid]);
+				expect(closeCalls).toBeGreaterThanOrEqual(2);
+				expect(closeProofs).toEqual(
+					Array.from({ length: closeCalls }, () => ({
 						pid: launchedPid,
 						processIncarnation: `inc-${launchedPid}`,
-					},
-				};
-			},
-			verify: async (proof: { pid?: number }) =>
-				proof.pid !== undefined && closed.has(proof.pid) ? ("gone" as const) : ("verified" as const),
-			close: async (proof: { pid?: number }) => {
-				closeCalls += 1;
-				if (closeCalls === 1) return { ok: false };
-				if (proof.pid !== undefined) closed.add(proof.pid);
-				closedSignal.resolve();
-				return { ok: true };
-			},
-		};
-		const broker = new Broker({
-			agentDir: path.join(root, "agent"),
-			packageGeneration: "test",
-			masterCapabilityVerifier: verifier,
-			spawnSubstrateProvider: provider,
-			spawnPromptLayer: promptLayer,
-		});
-		const discovery = await broker.start();
-		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
-		const wsCancel = await connect(`${discovery.url}/?token=${discovery.token}`);
-		setManagedCloseWaitForTest(broker, 20);
-		try {
-			await attest(broker, root);
-			const auth = {
-				controlRoot: root,
-				enrollmentId: "enrollment",
-				ownerSessionId: ownerId,
-				attestationEpoch: epoch,
-				masterCapability: grant,
-				worktrees: [root],
-			};
-			expect(
-				await request(ws, "define-delayed", "task.dag", {
-					...auth,
-					action: "define",
-					graphId: "delayed",
-					expectedRevision: 0,
-					nodes: [node("n", root, "delayed")],
-				}),
-			).toMatchObject({ ok: true });
-			const advance = request(
-				ws,
-				"advance-delayed",
-				"task.dag",
-				{ ...auth, action: "advance", graphId: "delayed", nodeId: "n", expectedRevision: 1 },
-				"delayed-key",
-			);
-			await launchEntered.promise;
-			const currentRevision = (
-				(await request(wsCancel, "status-before-cancel", "task.dag", { ...auth, action: "status" })).result as {
-					stateRevision: number;
-				}
-			).stateRevision;
-			const cancel = request(wsCancel, "cancel-delayed", "task.dag", {
-				...auth,
-				action: "cancel",
-				graphId: "delayed",
-				expectedRevision: currentRevision,
-				nodeIds: ["n"],
-			});
-			let cancelSettled = false;
-			void cancel.then(() => {
-				cancelSettled = true;
-			});
-			await Bun.sleep(50);
-			expect(cancelSettled).toBe(true);
-			expect(await cancel).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-			const duringLaunch = JSON.parse(await fs.readFile(managedTaskDomainPath(root), "utf8")) as {
-				graphs: Array<{ attempts: Array<{ fence: string }> }>;
-			};
-			expect(duringLaunch.graphs[0]!.attempts[0]!.fence).toBe("canceled");
-			expect(closed.size).toBe(0);
-			launchRelease.resolve();
-			expect(await advance).toMatchObject({ ok: false });
-			await Promise.race([closedSignal.promise, Bun.sleep(1_000)]);
-			expect([...closed]).toEqual([launchedPid]);
-			expect(closeCalls).toBeGreaterThanOrEqual(2);
-		} finally {
-			launchRelease.resolve();
-			setManagedCloseWaitForTest(broker, undefined);
-			ws.close();
-			wsCancel.close();
-			await broker.stop();
+					})),
+				);
+			} finally {
+				launchRelease.resolve();
+				setManagedCloseWaitForTest(broker, undefined);
+				wsForCleanup?.close();
+				wsCancelForCleanup?.close();
+				await broker.stop();
+			}
 		}
-	});
+	}, 15_000);
 	it("withholds discovery when restart cannot establish managed enrollment membership", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-broker-enrollment-loss-"));
 		roots.push(root);
