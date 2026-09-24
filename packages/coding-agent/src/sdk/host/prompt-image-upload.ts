@@ -14,9 +14,12 @@ const MAX_IMAGES = 16;
 const MAX_UPLOADS = 16;
 const MAX_ACCEPTED_BYTES = 64 * 1024 * 1024;
 const MAX_PROCESS_BYTES = 256 * 1024 * 1024;
+const MAX_CONCURRENT_FINISHES = 1;
 const LEASE_MS = 2 * 60_000;
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 let processBytes = 0;
+let transientBytes = 0;
+let concurrentFinishes = 0;
 
 type Upload = {
 	owner: string;
@@ -114,7 +117,7 @@ export class PromptImageUploadStore {
 		if (upload.length + bytes.length > upload.byteLength) invalid("Image upload exceeds its declared size.");
 		if (
 			this.#uploadBytes + bytes.length > MAX_PASTED_IMAGE_SOURCE_BYTES ||
-			processBytes + bytes.length > MAX_PROCESS_BYTES
+			processBytes + transientBytes + bytes.length > MAX_PROCESS_BYTES
 		)
 			busy("Image staging capacity exceeded.");
 		upload.chunks.push(bytes);
@@ -133,8 +136,16 @@ export class PromptImageUploadStore {
 		const upload = this.#owned(connectionId, input.id);
 		if (upload.finishing || upload.finished) invalid("Image upload is already finishing or finished.");
 		if (upload.length !== upload.byteLength) invalid("Image upload is incomplete.");
-		// Reserve the lease synchronously: host controls are dispatched concurrently.
+		// Claim the lease, decoder slot and copy capacity before the first allocation or await.
+		if (
+			concurrentFinishes >= MAX_CONCURRENT_FINISHES ||
+			processBytes + transientBytes + upload.length > MAX_PROCESS_BYTES
+		)
+			busy("Image finalization capacity exceeded.");
 		upload.finishing = true;
+		concurrentFinishes++;
+		transientBytes += upload.length;
+		let reservedBytes = upload.length;
 		try {
 			const bytes = Buffer.concat(upload.chunks, upload.length);
 			if (crypto.createHash("sha256").update(bytes).digest("hex") !== upload.sha256)
@@ -150,6 +161,11 @@ export class PromptImageUploadStore {
 				metadata.width * metadata.height > MAX_PASTED_IMAGE_PIXELS
 			)
 				invalid("Image MIME type, structure or dimensions are invalid.");
+			const decodedBytes = metadata.width * metadata.height * 4;
+			if (processBytes + transientBytes + decodedBytes > MAX_PROCESS_BYTES)
+				busy("Image decoding capacity exceeded.");
+			transientBytes += decodedBytes;
+			reservedBytes += decodedBytes;
 			try {
 				const decoded = await new Bun.Image(bytes).metadata();
 				if (decoded.width !== metadata.width || decoded.height !== metadata.height)
@@ -165,6 +181,13 @@ export class PromptImageUploadStore {
 			upload.finished = true;
 			return { id: input.id as string, byteLength: upload.length, sha256: upload.sha256, mimeType: upload.mimeType };
 		} finally {
+			// A discarded lease still owns its source chunks until this async decode settles.
+			if (this.#uploads.get(input.id as string) !== upload) {
+				this.#uploadBytes -= upload.length;
+				processBytes -= upload.length;
+			}
+			transientBytes -= reservedBytes;
+			concurrentFinishes--;
 			upload.finishing = false;
 		}
 	}
@@ -198,20 +221,21 @@ export class PromptImageUploadStore {
 			bytes += entry.length;
 			entries.push([id, entry]);
 		}
+		const encodedBytes = entries.reduce((total, [, entry]) => total + Math.ceil(entry.length / 3) * 4, 0);
 		if (
 			bytes > MAX_PASTED_IMAGE_SOURCE_BYTES ||
 			this.#acceptedBytes + bytes > MAX_ACCEPTED_BYTES ||
-			processBytes + bytes > MAX_PROCESS_BYTES
+			processBytes + transientBytes + bytes + encodedBytes > MAX_PROCESS_BYTES
 		)
 			busy("Accepted image capacity exceeded.");
 		this.#acceptedBytes += bytes;
-		processBytes += bytes;
+		processBytes += bytes + encodedBytes;
 		let released = false;
 		const release = () => {
 			if (released) return;
 			released = true;
 			this.#acceptedBytes -= bytes;
-			processBytes -= bytes;
+			processBytes -= bytes + encodedBytes;
 		};
 		try {
 			const images: ImageContent[] = entries.map(([, entry]) => ({
@@ -251,7 +275,9 @@ export class PromptImageUploadStore {
 		if (!upload) return;
 		this.#uploads.delete(id);
 		clearTimeout(upload.timer);
-		this.#uploadBytes -= upload.length;
-		processBytes -= upload.length;
+		if (!upload.finishing) {
+			this.#uploadBytes -= upload.length;
+			processBytes -= upload.length;
+		}
 	}
 }
