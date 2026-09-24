@@ -29,6 +29,56 @@ describe("AuthStorage provider evidence generation", () => {
 		}
 	});
 
+	test("keeps evidence stable before and after resolving a runtime override", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const provider = "unit-runtime-override-evidence";
+		const firstKey = "runtime-evidence-key-a";
+		authStorage.setRuntimeApiKey(provider, firstKey);
+
+		const beforeResolution = authStorage.getProviderEvidenceGeneration(provider);
+		await expect(authStorage.getApiKey(provider)).resolves.toBe(firstKey);
+		expect(authStorage.getProviderEvidenceGeneration(provider, firstKey)).toBe(beforeResolution);
+
+		const secondKey = "runtime-evidence-key-b";
+		authStorage.setRuntimeApiKey(provider, secondKey);
+		const afterRotation = authStorage.getProviderEvidenceGeneration(provider);
+		expect(afterRotation).not.toBe(beforeResolution);
+		expect(authStorage.getProviderEvidenceGeneration(provider, secondKey)).toBe(afterRotation);
+	});
+
+	test("keeps owner-scoped config evidence stable before and after resolving its override", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const provider = "unit-owner-config-override-evidence";
+		const owner = {};
+		const firstKey = "owner-config-evidence-key-a";
+		authStorage.setConfigApiKey(provider, firstKey, { owner });
+
+		const beforeResolution = authStorage.getProviderEvidenceGeneration(provider, undefined, owner);
+		await expect(authStorage.getApiKey(provider, undefined, { owner })).resolves.toBe(firstKey);
+		expect(authStorage.getProviderEvidenceGeneration(provider, firstKey, owner)).toBe(beforeResolution);
+
+		const secondKey = "owner-config-evidence-key-b";
+		authStorage.setConfigApiKey(provider, secondKey, { owner });
+		const afterRotation = authStorage.getProviderEvidenceGeneration(provider, undefined, owner);
+		expect(afterRotation).not.toBe(beforeResolution);
+		expect(authStorage.getProviderEvidenceGeneration(provider, secondKey, owner)).toBe(afterRotation);
+	});
+
+	test("keeps evidence stable before and after resolving an environment key", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		const previousKey = Bun.env.OPENAI_API_KEY;
+		const key = "environment-evidence-key";
+		Bun.env.OPENAI_API_KEY = key;
+		try {
+			const beforeResolution = authStorage.getProviderEvidenceGeneration("openai");
+			await expect(authStorage.getApiKey("openai")).resolves.toBe(key);
+			expect(authStorage.getProviderEvidenceGeneration("openai", key)).toBe(beforeResolution);
+		} finally {
+			if (previousKey === undefined) delete Bun.env.OPENAI_API_KEY;
+			else Bun.env.OPENAI_API_KEY = previousKey;
+		}
+	});
+
 	test("keeps evidence stable when an OAuth token refreshes in place", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const provider = "unit-oauth-evidence-refresh";
