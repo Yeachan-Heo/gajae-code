@@ -51,9 +51,9 @@ Pin the fixture corpus to the reviewed `dev` commit and keep expected answers ou
 3. Locate the model capability flag and identify which model/provider metadata controls the freeform path.
 4. Compare internal and wire-level tool names and cite where dispatch accepts each.
 5. Find the existing freeform `apply_patch` tests that distinguish a custom grammar tool from a function tool.
-6. Summarize which provider families ignore the custom-format field and cite the type contract.
+6. Identify which provider families ignore the custom-format field by reconciling the declared type contract with concrete serializers; include the Codex Responses capability-gated exception.
 
-Each expected answer must contain the required facts and file evidence. The grader must reject unsupported claims and missing citations. Freeze task text, fixture hashes, expected answers, and the grader before the first model call.
+Each expected answer must contain the required facts and file evidence. The grader must reject unsupported claims and missing citations. For task 6, its grader-only facts (kept outside the model prompt) must note that `packages/ai/src/types.ts` describes `openai-responses` as the only grammar-constrained custom-tool provider, while `packages/ai/src/providers/openai-codex-responses.ts` also emits `customFormat` as a custom grammar tool when `applyPatchToolType` is `freeform`; `packages/ai/test/apply-patch-freeform.test.ts` verifies the custom payload and fallback when the flag is absent. Do not score an answer that relies only on the type comment, and keep any source-contract correction outside this docs-only PR. Freeze task text, fixture hashes, expected answers, and the grader before the first model call.
 
 ### Controls and metrics
 
