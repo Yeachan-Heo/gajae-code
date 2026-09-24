@@ -4731,6 +4731,7 @@ export class Broker {
 			? entry.response
 			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
 	}
+	// Wire requests are readiness-gated by BrokerTransport before reaching this dispatcher.
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
 		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
 		if (operation === "broker.prepare_restart")
