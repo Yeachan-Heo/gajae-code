@@ -64,7 +64,33 @@ test("retained terminal claims survive more than 1024 later boundaries", () => {
 		releaseTarget();
 	}
 
+	expect(claims.size).toBe(1_024);
+	expect(claims.hasClaimed(target)).toBe(true);
+	expect(claims.publicationResult(target)).toBe(true);
 	expect(claims.claim("after-release")).toBe(true);
+	expect(claims.hasClaimed(target)).toBe(false);
+	expect(claims.publicationResult(target)).toBeUndefined();
+	expect(claims.size).toBe(1_024);
+});
+
+test("terminal boundary history trims as soon as retained publishers release", () => {
+	const claims = new RetainedTerminalBoundaryRegistry();
+	const target = "held-target";
+	const laterBoundaries = Array.from({ length: 1_024 }, (_, index) => `held-later-${index}`);
+	const release = claims.retain([target, ...laterBoundaries]);
+	try {
+		for (const key of [target, ...laterBoundaries]) {
+			expect(claims.claim(key)).toBe(true);
+			claims.setPublicationResult(key, true);
+		}
+		expect(claims.size).toBe(1_025);
+		expect(claims.hasClaimed(target)).toBe(true);
+		expect(claims.publicationResult(target)).toBe(true);
+	} finally {
+		release();
+	}
+
+	expect(claims.size).toBe(1_024);
 	expect(claims.hasClaimed(target)).toBe(false);
 	expect(claims.publicationResult(target)).toBeUndefined();
 });

@@ -152,12 +152,18 @@ export class RetainedTerminalBoundaryRegistry {
 				if (retained > 1) this.#retained.set(key, retained - 1);
 				else this.#retained.delete(key);
 			}
+			this.#trim();
 		};
 	}
 
 	claim(key: string): boolean {
 		if (this.#published.has(key)) return false;
 		this.#published.add(key);
+		this.#trim();
+		return true;
+	}
+
+	#trim(): void {
 		while (this.#published.size > RetainedTerminalBoundaryRegistry.#MAX_PUBLISHED) {
 			let victim: string | undefined;
 			for (const candidate of this.#published) {
@@ -169,7 +175,6 @@ export class RetainedTerminalBoundaryRegistry {
 			this.#published.delete(victim);
 			this.#publicationResults.delete(victim);
 		}
-		return true;
 	}
 
 	hasClaimed(key: string): boolean {
@@ -187,6 +192,7 @@ export class RetainedTerminalBoundaryRegistry {
 	releaseClaim(key: string): void {
 		this.#published.delete(key);
 		this.#publicationResults.delete(key);
+		this.#trim();
 	}
 }
 
