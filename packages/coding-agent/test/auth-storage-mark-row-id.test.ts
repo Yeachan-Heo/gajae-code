@@ -2,7 +2,12 @@ import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@gajae-code/ai";
+import {
+	type AuthCredentialStore,
+	AuthStorage,
+	SqliteAuthCredentialStore,
+	type UsageLimitMarkResult,
+} from "@gajae-code/ai";
 import type { UsageReport } from "@gajae-code/ai/usage";
 import * as oauth from "@gajae-code/ai/utils/oauth";
 
@@ -22,7 +27,7 @@ describe("usage-limit mark captures one stored row", () => {
 				});
 				const entered = Promise.withResolvers<void>();
 				const release = Promise.withResolvers<UsageReport | null>();
-				let pending: ReturnType<typeof storage.markUsageLimitReached> | undefined;
+				let pending: Promise<UsageLimitMarkResult> | undefined;
 				vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
 					const credential = credentials[provider];
 					return credential ? { apiKey: credential.access, newCredentials: credential } : null;
@@ -148,7 +153,7 @@ describe("usage-limit mark captures one stored row", () => {
 		});
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<UsageReport | null>();
-		let pending: ReturnType<typeof storage.markUsageLimitReached> | undefined;
+		let pending: Promise<UsageLimitMarkResult> | undefined;
 		let parked = false;
 		vi.spyOn(oauth, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
 			const credential = credentials[provider];
