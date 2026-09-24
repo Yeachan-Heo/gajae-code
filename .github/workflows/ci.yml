@@ -768,7 +768,13 @@ jobs:
       # unchanged: nightly publishes on channel, stable only behind approval.
       if: ${{ always() && needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
       needs: [release_prepare, release_approval, release_metadata]
-      timeout-minutes: 45
+      # 13 sequential publishes; each package gets a 10-minute integrity and a
+      # 5-minute dist-tag window of wall time, but uncached observation normally
+      # settles in seconds.
+      # 0.17.4 took 43 minutes and 0.17.5 timed out at 45 before uncached
+      # observation; 90 keeps a slow-registry day from stranding a half-published
+      # release without letting a hung publish hold the OIDC token indefinitely.
+      timeout-minutes: 90
       runs-on: ubuntu-22.04
       permissions:
          # npm trusted publishing (OIDC): npm >= 11.5.1 exchanges this job's
@@ -819,6 +825,21 @@ jobs:
                  nightly) npm_tag=nightly ;;
                  *) echo "Unknown release channel $RELEASE_CHANNEL" >&2; exit 1 ;;
               esac
+              # Observe the registry through its uncached endpoints. The npm CLI's
+              # view command reads the full packument, which the registry CDN serves with
+              # max-age=300, so a fresh publish stayed invisible for up to five
+              # minutes per package and serialized ~13 packages into ~45 minutes.
+              # The per-version document and the dist-tags endpoint are served
+              # uncached (cf-cache-status: DYNAMIC) and reflect the publish at once.
+              registry_path() { local name="$1"; printf '%s' "${name/\//%2f}"; }
+              registry_integrity() {
+                 curl --silent --fail --max-time 30 "${registry}$(registry_path "$1")/$2" 2>/dev/null \
+                    | jq -r '.dist.integrity // empty' 2>/dev/null || true
+              }
+              registry_dist_tag() {
+                 curl --silent --fail --max-time 30 "${registry}-/package/$(registry_path "$1")/dist-tags" 2>/dev/null \
+                    | jq -r --arg tag "$2" '.[$tag] // empty' 2>/dev/null || true
+              }
               records="$RUNNER_TEMP/receipt-records.json"
               echo '[]' > "$records"
               order_file="$evidence_dir/gajae-release-publish-order-v1.json"
@@ -841,12 +862,12 @@ jobs:
                  # Re-verify the sealed bytes at the credential boundary.
                  echo "$sha  $tarball" | sha512sum --check --strict -
                  published=false
-                 observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                 observed="$(registry_integrity "$name" "$version")"
                  if [ "$observed" = "$expected_sri" ]; then
                     echo "Skipping $name@$version (registry already carries the sealed bytes)"
                  else
                     if ! output="$(npm publish "$tarball" --access public --registry="$registry" --tag="$npm_tag" 2>&1)"; then
-                       raced="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       raced="$(registry_integrity "$name" "$version")"
                        if [ "$raced" != "$expected_sri" ]; then
                           echo "npm publish failed for $name@$version: $output" >&2
                           exit 1
@@ -857,27 +878,35 @@ jobs:
                        echo "Published $name@$version"
                     fi
                     # npm is read-after-write eventually consistent: re-observe
-                    # with bounded backoff until the sealed integrity is visible.
-                    # 0.15.4 proved 60s is not enough (agent-core became visible
-                    # only after the window elapsed, failing an otherwise clean
-                    # publish); allow up to 10 minutes.
-                    attempt=0
+                    # until the sealed integrity is visible. 0.15.4 proved 60s is
+                    # not enough (agent-core became visible only after the window
+                    # elapsed, failing an otherwise clean publish); allow up to 10
+                    # minutes of wall time, transfer time included, so a stalled
+                    # registry cannot stretch the window.
+                    deadline=$((SECONDS + 600))
                     while :; do
-                       attempt=$((attempt + 1))
-                       observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       observed="$(registry_integrity "$name" "$version")"
                        [ "$observed" = "$expected_sri" ] && break
-                       if [ "$attempt" -ge 40 ]; then
+                       if [ "$SECONDS" -ge "$deadline" ]; then
                           echo "$name@$version did not become visible with the sealed integrity" >&2
                           exit 1
                        fi
-                       sleep 15
+                       sleep 5
                     done
                  fi
-                 tagged="$(npm view "${name}@${npm_tag}" version --registry="$registry" 2>/dev/null || true)"
-                 if [ "$tagged" != "$version" ]; then
-                    echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
-                    exit 1
-                 fi
+                 # The dist-tag lands with the publish but is read from a separate
+                 # endpoint; a transient miss must not abort a release whose bytes
+                 # are already immutable, so it gets its own bounded window.
+                 deadline=$((SECONDS + 300))
+                 while :; do
+                    tagged="$(registry_dist_tag "$name" "$npm_tag")"
+                    [ "$tagged" = "$version" ] && break
+                    if [ "$SECONDS" -ge "$deadline" ]; then
+                       echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
+                       exit 1
+                    fi
+                    sleep 5
+                 done
                  jq --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
                     '. += [{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}]' \
                     "$records" > "$records.tmp"

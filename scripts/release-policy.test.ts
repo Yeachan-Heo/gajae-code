@@ -208,6 +208,11 @@ describe("stable release policy", () => {
 		expect(publish).toContain("Publish sealed tarballs to npm");
 		expect(publish).toContain("sha512sum --check --strict");
 		expect(publish).toContain("gajae-release-oidc-publish-receipt-v1.json");
+		// Registry observation must bypass the CDN-cached packument (max-age=300):
+		// `npm view` made every package wait up to five minutes and timed out 0.17.5.
+		expect(publish).not.toContain("npm view");
+		expect(publish).toContain('"${registry}$(registry_path "$1")/$2"');
+		expect(publish).toContain('"${registry}-/package/$(registry_path "$1")/dist-tags"');
 	});
 
 	test("gates the OIDC boundary on the approval environment without changing the publish subject", async () => {
@@ -252,6 +257,15 @@ describe("stable release policy", () => {
 		);
 		expect(prepareBranch).toContain("await checkTypeDeclarations()");
 		expect(publishScript.slice(publishScript.indexOf("await publishFromExpectedEvidence"))).not.toContain("checkTypeDeclarations");
+	});
+
+	test("observes registry state through uncached per-document reads outside the publish boundary", async () => {
+		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		// Finalize re-observes right after publication; a CDN-cached packument read
+		// (`npm view`, max-age=300) would see a stale 404 or an old dist-tag and fail it.
+		expect(publishScript).not.toMatch(/\$`npm view/u);
+		expect(publishScript).toContain("async function readRegistryDocument(");
+		expect(publishScript).toContain('packageName.replace("/", "%2f")');
 	});
 
 	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {
