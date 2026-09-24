@@ -2213,7 +2213,13 @@ describe("SDK session CLI", () => {
 			status: "conflict",
 			request: { operation: "session.create", requestKey },
 			certainty: "uncertain",
-			error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			// The broker's own conflict text never reaches CLI output: this route bypasses the
+			// public error envelope, so the message is the fixed, cause-neutral public text.
+			error: {
+				code: "idempotency_conflict",
+				message:
+					"The broker reported an idempotency conflict. Reconcile existing lifecycle state before deciding whether another request is safe.",
+			},
 		});
 		expect(operations).toEqual(["session.lookup", "session.lookup", "session.lookup"]);
 	}, 60_000);
