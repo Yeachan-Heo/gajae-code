@@ -1652,7 +1652,9 @@ export default class Sdk extends Command {
 			}
 			startupAbortController.abort();
 			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
-			await candidateStartTask?.catch(() => undefined);
+			// Startup may remain blocked in awaited I/O after abort. Bound best-effort
+			// rollback so shared postmortem can exit with the original signal status.
+			await waitForStartupAbortCleanup();
 		});
 		const finishPendingStartupSignal = async (): Promise<boolean> => {
 			const signal = pendingShutdownSignal;
@@ -1671,7 +1673,11 @@ export default class Sdk extends Command {
 				const startupWatchdog = setTimeout(() => {
 					startupAbortController.abort();
 					void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
-						if (!started) return;
+						if (!started) {
+							// A prior startup signal owns the exit cause; its postmortem callback
+							// returns after bounded cleanup and preserves the signal status.
+							return;
+						}
 						await waitForStartupAbortCleanup();
 						process.exit(1);
 					});
