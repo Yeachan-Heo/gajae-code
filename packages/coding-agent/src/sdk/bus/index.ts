@@ -5356,10 +5356,11 @@ export function createNotificationsExtension(
 				submission.workLease = undefined;
 			}
 			promptSubmissions.delete(key);
+			const [commandId, turnId] = key.split(":", 2);
+			if (commandId && turnId) releaseAcceptedImage({ commandId, turnId });
 			// A fatal closure is transport-level, not a committed semantic terminal: the
 			// durable record stays authoritative, so it must never leave a tombstone.
 			if (submission.fatal) return;
-			const [commandId, turnId] = key.split(":", 2);
 			if (!commandId || !turnId) return;
 			removePendingPromptCorrelation({ commandId, turnId });
 			addTerminalTombstone(key, submission.connectionId);
@@ -5836,6 +5837,7 @@ export function createNotificationsExtension(
 			code: string,
 			message: string,
 		) => {
+			releaseAcceptedImage(correlation);
 			submission.deadlineAttempt = undefined;
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (submission.workLease) {

@@ -595,6 +595,82 @@ test("cancelling before image echo completes settles locally without aborting a 
 	}
 });
 
+test("a reentrant cancel during a throwing prompt socket send never aborts unrelated host work", async () => {
+	const fixture = await createFixture();
+	const send = WebSocket.prototype.send;
+	let cancelTask: Promise<void> | undefined;
+	let intercepted = false;
+	try {
+		WebSocket.prototype.send = function (this: WebSocket, data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+			if (typeof data === "string" && JSON.parse(data).operation === "turn.prompt") {
+				intercepted = true;
+				cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+				throw new Error("simulated synchronous send failure");
+			}
+			send.call(this, data as string);
+		};
+		const pending = prompt(fixture, "unsent prompt");
+		expect(await bounded(pending, "cancelled unsent prompt")).toEqual({ stopReason: "cancelled" });
+		await bounded(cancelTask ?? Promise.reject(new Error("Cancel never entered socket send")), "reentrant cancel");
+		expect(intercepted).toBe(true);
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.abortCount()).toBe(0);
+	} finally {
+		WebSocket.prototype.send = send;
+		fixture.dispose();
+	}
+});
+
+test("Router pre-send cancellation still settles locally without emitting abort or prompt", async () => {
+	const fixture = await createFixture();
+	const originalPrompt = AcpSdkAdapter.prototype.prompt;
+	let cancelTask: Promise<void> | undefined;
+	try {
+		AcpSdkAdapter.prototype.prompt = function (params, beforeDispatch, onDispatch) {
+			return originalPrompt.call(
+				this,
+				params,
+				context => {
+					cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+					beforeDispatch?.(context);
+				},
+				onDispatch,
+			);
+		};
+		const pending = prompt(fixture, "cancel at Router pre-send boundary");
+		expect(await bounded(pending, "Router pre-send cancelled prompt")).toEqual({ stopReason: "cancelled" });
+		await bounded(cancelTask ?? Promise.reject(new Error("Router pre-send hook was not entered")), "pre-send cancel");
+		expect(fixture.promptDeliveryCount()).toBe(0);
+		expect(fixture.abortCount()).toBe(0);
+	} finally {
+		AcpSdkAdapter.prototype.prompt = originalPrompt;
+		fixture.dispose();
+	}
+});
+
+test("a reentrant cancel during a successful prompt socket send waits for dispatch before aborting", async () => {
+	const fixture = await createFixture();
+	const send = WebSocket.prototype.send;
+	let cancelTask: Promise<void> | undefined;
+	try {
+		WebSocket.prototype.send = function (this: WebSocket, data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+			if (typeof data === "string" && JSON.parse(data).operation === "turn.prompt") {
+				cancelTask = fixture.agent.cancel({ sessionId: fixture.sessionId });
+			}
+			send.call(this, data as string);
+		};
+		const pending = prompt(fixture, "sent prompt");
+		await waitFor(() => fixture.abortCount() === 1, "abort after successful send");
+		await bounded(cancelTask ?? Promise.reject(new Error("Cancel never entered socket send")), "reentrant cancel");
+		expect(fixture.promptDeliveryCount()).toBe(1);
+		fixture.sendStopped("cancelled");
+		expect(await bounded(pending, "cancelled sent prompt")).toEqual({ stopReason: "cancelled" });
+	} finally {
+		WebSocket.prototype.send = send;
+		fixture.dispose();
+	}
+});
+
 test("a cancelled image echo that never completes bounds the waiting successor and tears down the session", async () => {
 	const echoStarted = Promise.withResolvers<void>();
 	const echoGate = Promise.withResolvers<void>();

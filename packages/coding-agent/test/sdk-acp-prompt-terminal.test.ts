@@ -146,7 +146,7 @@ async function createFixture(
 	const recoveryInputs: Record<string, unknown>[] = [];
 	const imageUploadIds: string[] = [];
 	const redeemedImages: Buffer[] = [];
-	const imageUploads = options.acceptStagedImages ? new PromptImageUploadStore() : undefined;
+	const imageUploads = options.acceptStagedImages ? new PromptImageUploadStore(() => true) : undefined;
 	let recoveryQuery: { socket: TestSocket; id: unknown } | undefined;
 	const recoveryAcknowledgements: Array<{ socket: TestSocket; id: unknown }> = [];
 	const idleUpdateRelease = Promise.withResolvers<void>();
