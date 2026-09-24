@@ -715,8 +715,8 @@ export class LifecycleLedger {
 	 * identities cannot establish that a different target is safe, so callers
 	 * must reject rather than create a second admission. A fresh session.create
 	 * may ignore completed terminal legacy rows so old successful operations do
-	 * not block coordinator startup; other lifecycle operations retain the legacy
-	 * fence because target-bound legacy identities cannot prove key uniqueness.
+	 * not block coordinator startup. Other operations retain the legacy fence
+	 * because target-bound legacy identities cannot prove key uniqueness.
 	 */
 	hasLegacyIdentity(
 		excludedIdentities?: ReadonlySet<string>,

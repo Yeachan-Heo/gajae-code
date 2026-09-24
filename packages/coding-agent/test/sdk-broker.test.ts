@@ -33,7 +33,7 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import { deriveLegacyIdentity, deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
@@ -314,6 +314,44 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
 	expect(environment.GJC_TMUX_PROFILE).toBe("1");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited session markers from compiled broker environments", () => {
+	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {
+		execPath: process.execPath,
+		environment: {
+			PATH: process.env.PATH,
+			GJC_SESSION_FILE: "/tui/session.jsonl",
+			GJC_SESSION_PROMPT_ACCEPTED_JSON: "/tmp/tui-prompt-accepted.json",
+			GJC_SESSION_WORKTREE_BASELINE_DIRTY: "true",
+			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_TMUX_COMMAND: "custom-tmux",
+			GJC_TMUX_PROFILE: "1",
+			PI_COMPILED: "1",
+			GJC_COMPILED: "1",
+		},
+		markerPath,
+		embeddedFiles: [{ name: path.basename(markerPath) }],
+	});
+	const environment = brokerSpawnEnvironmentForTest(command);
+
+	expect(command.kind).toBe("compiled");
+	for (const name of [
+		"GJC_SESSION_FILE",
+		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
+		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_MANAGED_OWNER_RUN_ID",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
+	expect(environment.PI_COMPILED).toBe("1");
+	expect(environment.GJC_COMPILED).toBe("1");
 });
 
 it("fails closed when compiled marker evidence disagrees", () => {
@@ -2551,7 +2589,7 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("ignores terminal legacy rows for fresh creates but keeps live legacy rows ambiguous", async () => {
+	it("ignores unrelated terminal legacy rows but keeps reused and live create keys fenced", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
 		const agentDir = path.join(root, "agent");
 		const legacyLedger = await new LifecycleLedger(agentDir).open();
@@ -2568,6 +2606,13 @@ describe("SDK broker identity and discovery", () => {
 			});
 			expect(legacyLedger.get(identity)?.operationKey).toBeUndefined();
 		}
+		const reusedCreateKey = "reused-terminal-create-key";
+		const reusedCreateIdentity = await deriveLegacyIdentity(agentDir, "session.create", reusedCreateKey);
+		await legacyLedger.begin(reusedCreateIdentity, "legacy-terminal-create-request");
+		await legacyLedger.transition(reusedCreateIdentity, "terminal_error", {
+			response: { ok: false, error: { code: "fixture_error", message: "legacy create completed" } },
+		});
+		expect(legacyLedger.get(reusedCreateIdentity)?.operationKey).toBeUndefined();
 		let broker = new Broker({ agentDir });
 		let launchAttempts = 0;
 		const lifecycleCommandResolver = () => {
@@ -2579,6 +2624,11 @@ describe("SDK broker identity and discovery", () => {
 			await broker.start();
 			expect(broker.ledger.get("legacy-terminal-ok")?.operationKey).toBeUndefined();
 			expect(broker.ledger.get("legacy-terminal-error")?.operationKey).toBeUndefined();
+			await expect(broker.handleRequest("session.create", { cwd: root }, reusedCreateKey)).resolves.toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "idempotency key was used with a different request" },
+			});
+			expect(launchAttempts).toBe(0);
 
 			await expect(
 				broker.handleRequest("session.create", { cwd: root }, "fresh-after-upgrade"),
@@ -2619,42 +2669,47 @@ describe("SDK broker identity and discovery", () => {
 		}
 	});
 	it("keeps terminal target-inclusive legacy delete keys fenced across target reuse", async () => {
-		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-delete-key-"));
-		const agentDir = path.join(root, "agent");
-		const idempotencyKey = "reused-terminal-delete-key";
-		const priorTarget = { sessionId: "legacy-delete-a" };
-		const priorTargetHash = createHash("sha256")
-			.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
-			.digest("hex");
-		const legacyIdentity = await deriveLegacyTargetIdentity(
-			agentDir,
-			"session.delete",
-			idempotencyKey,
-			priorTargetHash,
-		);
-		const legacyLedger = await new LifecycleLedger(agentDir).open();
-		await legacyLedger.begin(legacyIdentity, "legacy-terminal-delete-request");
-		await legacyLedger.transition(legacyIdentity, "terminal_error", {
-			response: { ok: false, error: { code: "fixture_error", message: "legacy delete completed" } },
-		});
-		expect(legacyLedger.get(legacyIdentity)?.operationKey).toBeUndefined();
-
-		const broker = new Broker({ agentDir });
-		await broker.start();
-		try {
-			await expect(
-				broker.handleRequest(
-					"session.delete",
-					{ sessionId: "legacy-delete-b", sessionPath: path.join(root, "missing.json") },
-					idempotencyKey,
-				),
-			).resolves.toEqual({
-				ok: false,
-				error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+		for (const state of ["terminal_ok", "terminal_error"] as const) {
+			const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-delete-key-"));
+			const agentDir = path.join(root, "agent");
+			const idempotencyKey = `reused-${state}-delete-key`;
+			const priorTarget = { sessionId: `legacy-delete-a-${state}` };
+			const priorTargetHash = createHash("sha256")
+				.update(JSON.stringify(lifecycleTargetForTest("session.delete", priorTarget)))
+				.digest("hex");
+			const legacyIdentity = await deriveLegacyTargetIdentity(
+				agentDir,
+				"session.delete",
+				idempotencyKey,
+				priorTargetHash,
+			);
+			const legacyLedger = await new LifecycleLedger(agentDir).open();
+			await legacyLedger.begin(legacyIdentity, `legacy-${state}-delete-request`);
+			await legacyLedger.transition(legacyIdentity, state, {
+				response:
+					state === "terminal_ok"
+						? { ok: true, result: { sessionId: priorTarget.sessionId } }
+						: { ok: false, error: { code: "fixture_error", message: "legacy delete completed" } },
 			});
-		} finally {
-			await broker.stop();
-			await fs.rm(root, { recursive: true, force: true });
+			expect(legacyLedger.get(legacyIdentity)?.operationKey).toBeUndefined();
+
+			const broker = new Broker({ agentDir });
+			await broker.start();
+			try {
+				await expect(
+					broker.handleRequest(
+						"session.delete",
+						{ sessionId: `legacy-delete-b-${state}`, sessionPath: path.join(root, "missing.json") },
+						idempotencyKey,
+					),
+				).resolves.toEqual({
+					ok: false,
+					error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+				});
+			} finally {
+				await broker.stop();
+				await fs.rm(root, { recursive: true, force: true });
+			}
 		}
 	});
 	it("binds session.delete to the requested session header and configured storage root", async () => {
