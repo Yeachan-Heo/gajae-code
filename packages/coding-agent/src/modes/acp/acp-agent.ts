@@ -67,7 +67,12 @@ import type {
 	SdkPromptFailurePhase,
 	SdkPromptTerminalOutcome,
 } from "../../sdk/prompt-status";
-import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
+import {
+	ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+	PromptActivity,
+	type PromptWatchdogClock,
+	systemPromptWatchdogClock,
+} from "../../sdk/prompt-watchdog";
 import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
@@ -182,11 +187,13 @@ type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	/** Stops pre-dispatch image work on cancellation, settlement, or attachment loss. */
 	uploadAbort: AbortController;
+	/** User echo in flight; cancellation fences successor publication until it completes. */
+	echoPublication?: Promise<void>;
 	acknowledged: boolean;
 	invocationKind: "prompt" | "skill";
 	/** ACP-owned identity, never inherited from caller metadata or reused for replay. */
 	clientRef: string;
-	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
+	/** True at turn.prompt's synchronous pre-send boundary (or skill.invoke dispatch); host abort owns cancellation thereafter. */
 	dispatched: boolean;
 	/** True only while the dispatched control request can still reveal its correlation. */
 	acknowledgementPending: boolean;
@@ -317,6 +324,8 @@ type SessionRecord = {
 	uncertainAbortOwner?: UncertainAbortOwner;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
+	/** A cancelled user echo must finish publication before a successor publishes its message. */
+	cancelledEchoTail?: Promise<void>;
 	/** True once the session's first logical prompt has settled; gates first-turn readiness retries. */
 	firstPromptDone?: boolean;
 	/** Whether the current prompt attempt was observed doing work; reset per attempt, read by the first-turn retry gate. */
@@ -2492,6 +2501,9 @@ export class AcpAgent implements Agent {
 			return { stopReason: "cancelled" };
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
+		if (record.cancelledEchoTail) await record.cancelledEchoTail;
+		if (this.#sessions.get(params.sessionId) !== record)
+			throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// A first-turn retry holds the session across its backoff gap. Any prompt that is not the
 		// retry owner is rejected here, before any state mutation or dispatch, so it cannot steal
 		// the first turn while the authorized retry is still pending (review P1, issue #5574).
@@ -2582,6 +2594,7 @@ export class AcpAgent implements Agent {
 				// the field even though it is not part of the skill input payload.
 				...(skillInvocation ? { confirm: false } : {}),
 				id: PROMPT_FRAME_ID_PLACEHOLDER,
+				...(record.adapter.connectionId === undefined ? {} : { connectionId: record.adapter.connectionId }),
 			}),
 		);
 		const stageImages = !skillInvocation && payload.images.length > 0 && promptFrameBytes > MAX_PROMPT_FRAME_BYTES;
@@ -2638,7 +2651,9 @@ export class AcpAgent implements Agent {
 				void record.adapter.uploadImageDiscard(id).catch(() => undefined);
 			}
 		};
-		// Fence each upload step after prompt settlement or cancellation.
+		waiter.uploadAbort.signal.addEventListener("abort", discardStaged, { once: true });
+		// A request already on the wire cannot be cancelled. Fence each subsequent step
+		// and discard a late begin response instead of leaking its host lease.
 		const whileActive = async <T>(task: Promise<T>): Promise<T> => {
 			const value = await Promise.race([task, settlement, uploadStopped]);
 			if (promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
@@ -2711,23 +2726,26 @@ export class AcpAgent implements Agent {
 			// A first-turn readiness retry (issue #5574) skips the echo: the message was already
 			// published on the first attempt and re-echoing would duplicate it in the transcript.
 			let echoPending = false;
+			let echoTask: Promise<void> | undefined;
 			try {
 				if (echoUserMessage)
 					for (const block of params.prompt) {
 						if (block.type !== "text" && block.type !== "image") continue;
 						if (block.type === "text" && block.text.length === 0) continue;
 						echoPending = true;
-						await whileActive(
-							this.#publishSessionUpdate(
-								params.sessionId,
-								{
-									sessionId: params.sessionId,
-									update: { sessionUpdate: "user_message_chunk", content: block },
-								},
-								record.adapter,
-							),
+						echoTask = this.#publishSessionUpdate(
+							params.sessionId,
+							{
+								sessionId: params.sessionId,
+								update: { sessionUpdate: "user_message_chunk", content: block },
+							},
+							record.adapter,
 						);
+						waiter.echoPublication = echoTask;
+						await whileActive(echoTask);
 						echoPending = false;
+						echoTask = undefined;
+						waiter.echoPublication = undefined;
 					}
 				if (stageImages) {
 					for (const image of payload.images) {
@@ -2808,7 +2826,7 @@ export class AcpAgent implements Agent {
 				waiter.uploadAbort.abort();
 				discardStaged();
 				if (waiter.settled || record.activePrompt !== waiter) {
-					if (echoPending && this.#sessions.get(params.sessionId) === record)
+					if (echoPending && !waiter.cancelAcknowledged && this.#sessions.get(params.sessionId) === record)
 						void this.#failSession(
 							params.sessionId,
 							record.adapter,
@@ -2840,18 +2858,19 @@ export class AcpAgent implements Agent {
 				throw error;
 			}
 			if (waiter.settled || record.activePrompt !== waiter) {
+				discardStaged();
 				return await response;
 			}
 			if (record.cancelRequested && (waiter.cancelAcknowledged || waiter.cancelBeforeAdmission)) {
+				discardStaged();
 				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
-			waiter.dispatched = true;
+			if (skillInvocation) {
+				waiter.dispatched = true;
+				if (retryReservation) retryReservation.admitted = true;
+			}
 			record.sdkIdle = false;
-			// The turn is now dispatched to the host: this prompt owned the session's first turn,
-			// so it — not a preflight rejection that threw before this point — is what settles
-			// `firstPromptDone` in `prompt()` (review P2).
-			if (retryReservation) retryReservation.admitted = true;
 
 			waiter.acknowledgementPending = true;
 			const promptAdapter = record.adapter;
@@ -2860,15 +2879,31 @@ export class AcpAgent implements Agent {
 				const submit = async (): Promise<unknown> =>
 					skillInvocation
 						? await promptAdapter.control("skill.invoke", { ...skillInvocation, clientRef })
-						: await promptAdapter.prompt({
-								text: payload.text,
-								clientRef,
-								...(stageImages
-									? { stagedImages: [...stagedIds].map(id => ({ id })) }
-									: payload.images.length
-										? { images: payload.images }
-										: {}),
-							});
+						: await promptAdapter.prompt(
+								{
+									text: payload.text,
+									clientRef,
+									...(stageImages
+										? { stagedImages: [...stagedIds].map(id => ({ id })) }
+										: payload.images.length
+											? { images: payload.images }
+											: {}),
+								},
+								context => {
+									if (promptWaiterRetired(record, waiter) || waiter.uploadAbort.signal.aborted)
+										throw new AcpSdkAdapterError(
+											"prompt_cancelled",
+											"ACP prompt stopped before image dispatch.",
+										);
+									if (Buffer.byteLength(JSON.stringify(context.frame)) > MAX_PROMPT_FRAME_BYTES)
+										throw new AcpSdkAdapterError(
+											"invalid_input",
+											"ACP prompt exceeds the SDK transport limit.",
+										);
+									waiter.dispatched = true;
+									if (retryReservation) retryReservation.admitted = true;
+								},
+							);
 				let acknowledgement: unknown;
 				try {
 					acknowledgement = await submit();
@@ -3195,7 +3230,47 @@ export class AcpAgent implements Agent {
 		record.cancelRequested = true;
 		const localCommand = !record.activePrompt && record.pendingPromptAdmission?.localCommand === true;
 		this.#settlePendingPromptAdmission(record, { kind: "cancelled" });
-		record.activePrompt?.uploadAbort.abort();
+		const waiter = record.activePrompt;
+		waiter?.uploadAbort.abort();
+		// Nothing has reached turn.prompt yet: the upload belongs entirely to this
+		// ACP request, and a host terminal abort could stop an unrelated turn.
+		if (waiter && !waiter.dispatched) {
+			if (waiter.echoPublication) {
+				const { promise: tail, resolve, reject } = Promise.withResolvers<void>();
+				const failEcho = (message: string) => {
+					const error = new AcpSdkAdapterError("connection_closed", message);
+					void this.#failSession(params.sessionId, record.adapter, error);
+					reject(error);
+				};
+				const cancelDeadline = this.#promptWatchdogClock.schedule(
+					() =>
+						failEcho(
+							"ACP cancelled user-message publication did not complete before the prompt inactivity bound.",
+						),
+					ACP_PROMPT_INACTIVITY_TIMEOUT_MS,
+				);
+				void waiter.echoPublication.then(
+					() => {
+						cancelDeadline();
+						resolve();
+					},
+					() => {
+						cancelDeadline();
+						failEcho("ACP cancelled user-message publication failed.");
+					},
+				);
+				record.cancelledEchoTail = tail;
+				void tail.catch(() => undefined);
+				void tail
+					.finally(() => {
+						if (record.cancelledEchoTail === tail) record.cancelledEchoTail = undefined;
+					})
+					.catch(() => undefined);
+			}
+			waiter.cancelAcknowledged = true;
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return;
+		}
 		// C04 terminal abort: an external client cancel stops the current turn
 		// (`scope:"turn"`, the default, matching the SDK `turn.abort` default and
 		// other ACP clients' cancel behavior). A client that also wants exact owned

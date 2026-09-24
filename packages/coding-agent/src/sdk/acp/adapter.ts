@@ -445,7 +445,7 @@ export class AcpSdkAdapter {
 		if (this.#client) await this.#client.close();
 	}
 
-	async prompt(params: JsonObject | string): Promise<unknown> {
+	async prompt(params: JsonObject | string, beforeDispatch?: (context: SdkDispatchContext) => void): Promise<unknown> {
 		const rawText =
 			typeof params === "string"
 				? params
@@ -461,11 +461,15 @@ export class AcpSdkAdapter {
 				: {}),
 		});
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
-		return await this.#requestSession({
-			type: "control_request",
-			operation: "turn.prompt",
-			input: { ...(typeof params === "object" ? params : {}), text },
-		});
+		return await this.#requestSession(
+			{
+				type: "control_request",
+				operation: "turn.prompt",
+				input: { ...(typeof params === "object" ? params : {}), text },
+			},
+			false,
+			beforeDispatch === undefined ? undefined : { beforeDispatch },
+		);
 	}
 	/** Machine-origin upload controls; never route these through the public control() disposition. */
 	async uploadImageBegin(input: {
@@ -580,7 +584,11 @@ export class AcpSdkAdapter {
 	async #requestSession(
 		frame: JsonObject,
 		raw = false,
-		options?: { timeoutMs: number; deadline?: number },
+		options?: {
+			timeoutMs?: number;
+			deadline?: number;
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+		},
 	): Promise<unknown> {
 		const router = this.#router;
 		if (!router)

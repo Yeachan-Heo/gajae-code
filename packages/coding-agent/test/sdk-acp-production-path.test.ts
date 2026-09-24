@@ -9,6 +9,7 @@ import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { PromptImageUploadStore } from "../src/sdk/host/prompt-image-upload";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 type TestServer = {
 	port: number | undefined;
@@ -334,6 +335,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	let originalImageBase64 = "";
 	let corruptNextImageBeginAck = false;
 	let malformedBeginId: string | undefined;
+	let holdNextImageBeginAck = false;
+	let releaseImageBeginAck: (() => void) | undefined;
+	let holdNextUploadAck: "turn.image.append" | "turn.image.finish" | undefined;
+	let releaseUploadAck: (() => void) | undefined;
 	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
@@ -625,6 +630,18 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 											: frame.operation === "turn.image.finish"
 												? await imageUploads.finish(owner, frame.input)
 												: imageUploads.discard(owner, frame.input);
+								if (frame.operation === "turn.image.begin" && holdNextImageBeginAck) {
+									holdNextImageBeginAck = false;
+									releaseImageBeginAck = () =>
+										socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+									return;
+								}
+								if (frame.operation === holdNextUploadAck) {
+									holdNextUploadAck = undefined;
+									releaseUploadAck = () =>
+										socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result }));
+									return;
+								}
 								if (frame.operation === "turn.image.begin" && corruptNextImageBeginAck) {
 									corruptNextImageBeginAck = false;
 									malformedBeginId = (result as { id: string }).id;
@@ -1710,7 +1727,120 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	expect(controlOperations).toHaveLength(beforeInvalidImages);
 
-	const beforeImagePrompt = promptInputs.length;
+	let beforeImagePrompt = promptInputs.length;
+	const routerPreparation = Promise.withResolvers<void>();
+	const releaseRouterPreparation = Promise.withResolvers<void>();
+	const originalRequest = SessionRouter.prototype.request;
+	let holdNextPromptInRouter = true;
+	SessionRouter.prototype.request = async function (
+		this: SessionRouter,
+		...args: Parameters<SessionRouter["request"]>
+	) {
+		if (holdNextPromptInRouter && args[1].operation === "turn.prompt") {
+			holdNextPromptInRouter = false;
+			routerPreparation.resolve();
+			await releaseRouterPreparation.promise;
+		}
+		return await originalRequest.apply(this, args);
+	};
+	try {
+		const beforeRouterAbort = abortFrames.length;
+		const heldPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
+		await bounded(routerPreparation.promise, "staged prompt held before Router send");
+		await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel during Router preparation");
+		expect(await bounded(heldPrompt, "cancelled Router-prepared image prompt")).toEqual({ stopReason: "cancelled" });
+		expect(abortFrames).toHaveLength(beforeRouterAbort);
+		expect(promptInputs).toHaveLength(beforeImagePrompt);
+	} finally {
+		releaseRouterPreparation.resolve();
+		SessionRouter.prototype.request = originalRequest;
+	}
+	await waitFor(() => controlOperations.at(-1) === "turn.image.discard", "Router-held image lease discard");
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+	for (const operation of ["turn.image.append", "turn.image.finish"] as const) {
+		const beforeCancelAbort = abortFrames.length;
+		const beforeCancelUpload = controlOperations.length;
+		holdNextUploadAck = operation;
+		const pendingUpload = agent.prompt({ sessionId: created.sessionId, prompt: [imageBlock(originalImageBase64)] });
+		await waitFor(() => releaseUploadAck !== undefined, `held ${operation} acknowledgement`);
+		await bounded(agent.cancel({ sessionId: created.sessionId }), `cancel during ${operation}`);
+		expect(await bounded(pendingUpload, `cancelled ${operation} prompt`)).toEqual({ stopReason: "cancelled" });
+		expect(abortFrames).toHaveLength(beforeCancelAbort);
+		releaseUploadAck!();
+		releaseUploadAck = undefined;
+		await waitFor(
+			() => controlOperations.slice(beforeCancelUpload).includes("turn.image.discard"),
+			`${operation} lease discard`,
+		);
+		expect(promptInputs).toHaveLength(beforeImagePrompt);
+	}
+	const beforeCancelledUpload = controlOperations.length;
+	const beforeCancelledAbort = abortFrames.length;
+	holdNextImageBeginAck = true;
+	const cancelledImagePrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [imageBlock(originalImageBase64)],
+	});
+	await waitFor(() => releaseImageBeginAck !== undefined, "held image begin acknowledgement");
+	await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel before image dispatch");
+	expect(await bounded(cancelledImagePrompt, "cancelled staged image prompt")).toEqual({ stopReason: "cancelled" });
+	expect(abortFrames).toHaveLength(beforeCancelledAbort);
+	releaseImageBeginAck!();
+	releaseImageBeginAck = undefined;
+	await waitFor(
+		() => controlOperations.slice(beforeCancelledUpload).includes("turn.image.discard"),
+		"late image begin lease discard",
+	);
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+
+	// SdkClient adds a UUID id and Router stamps the nonempty connectionId.
+	// The old staged-only estimate omitted that stamp and sent a frame just over 256 KiB.
+	const stagedEnvelope = {
+		type: "control_request",
+		operation: "turn.prompt",
+		id: "00000000-0000-4000-8000-000000000000",
+		input: {
+			text: "",
+			stagedImages: [{ id: "00000000-0000-4000-8000-000000000000" }],
+			clientRef: "00000000-0000-4000-8000-000000000000",
+		},
+		connectionId: "acp-contract-reconnected",
+	};
+	const boundaryText = "x".repeat(256 * 1024 - Buffer.byteLength(JSON.stringify(stagedEnvelope)) + 1);
+	const beforeOversizeUpload = controlOperations.length;
+	await expect(
+		bounded(
+			agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: boundaryText }, imageBlock(originalImageBase64)],
+			}),
+			"staged frame above transport limit",
+		),
+	).rejects.toMatchObject({ code: "invalid_input", message: expect.stringContaining("transport limit") });
+	expect(promptInputs).toHaveLength(beforeImagePrompt);
+	await waitFor(
+		() => controlOperations.slice(beforeOversizeUpload).includes("turn.image.discard"),
+		"oversize staged image discard",
+	);
+	const boundaryPrompt = agent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: boundaryText.slice(1) }, imageBlock(originalImageBase64)],
+	});
+	await waitFor(() => promptInputs.length === beforeImagePrompt + 1, "exact 256 KiB staged prompt");
+	expect(imageFrameBytes.at(-1)).toBe(256 * 1024);
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			...currentPromptCorrelation(),
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(boundaryPrompt, "exact-limit staged image prompt completion")).toEqual({
+		stopReason: "end_turn",
+	});
+	beforeImagePrompt = promptInputs.length;
+
 	corruptNextImageBeginAck = true;
 	const beforeMalformedBegin = controlOperations.length;
 	await expect(
@@ -1735,7 +1865,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	expect(imageEchoPresentAtDispatch).toBe(true);
 	expect(promptInputs.at(-1)).toMatchObject({ text: "", stagedImages: [{ id: expect.any(String) }] });
 	expect(promptInputs.at(-1)).not.toHaveProperty("images");
-	expect(redeemedImages).toEqual([original]);
+	expect(redeemedImages).toHaveLength(2);
+	expect(redeemedImages[0]?.equals(original)).toBe(true);
+	expect(redeemedImages[1]?.equals(original)).toBe(true);
 	expect(controlOperations.filter(operation => operation === "turn.image.append").length).toBeGreaterThan(1);
 	expect(imageFrameBytes.length).toBeGreaterThan(4);
 	expect(imageFrameBytes.every(bytes => bytes <= 256 * 1024)).toBe(true);
