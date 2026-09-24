@@ -652,9 +652,11 @@ it("keeps the deadline reason when SIGTERM arrives during its async record fallb
 		});
 		try {
 			await waitForFile(path.join(signalDir, "startup-exit-record-fallback-waiting"));
+			const fallbackObservedAt = Date.now();
 			process.kill(child.pid, "SIGTERM");
 			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 			expect(code).toBe(1);
+			expect(Date.now() - fallbackObservedAt).toBeLessThan(1_500);
 			expect(stderr).toContain("SDK broker startup exceeded its 250ms fence deadline.");
 			expect(stderr).not.toContain("SDK broker startup interrupted by SIGTERM before readiness.");
 			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
@@ -799,9 +801,11 @@ it("records a startup signal after discovery caching but before publication", as
 		try {
 			await waitForFile(path.join(signalDir, "pre-publication-ready"));
 			expect(await brokerDiscovery.readBrokerDiscovery(dir)).toBeNull();
+			const signalSentAt = Date.now();
 			process.kill(child.pid, "SIGTERM");
 			const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
 			expect(code).toBe(143);
+			expect(Date.now() - signalSentAt).toBeLessThan(1_500);
 			expect(stderr).toContain("SDK broker startup interrupted by SIGTERM before readiness.");
 			expect(await readBrokerStartupExitRecord(dir)).toMatchObject({
 				mode: "startup",
