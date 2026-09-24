@@ -8967,18 +8967,34 @@ test("a missing-model preflight is rejected, leaks nothing, and releases its adm
 		expect(abortAndPrompt.result).toBeUndefined();
 		expect(aborts).toBe(1);
 
-		// 5. Anonymous reservations are released too: drive more anonymous rejections
-		// than the admission capacity. A leaked reservation would answer
-		// `reconciliation_capacity` instead of the missing-model diagnostic.
+		// 5. The ANONYMOUS abort_and_prompt path has no clientRef to re-probe, so
+		// sweep the very operation under test past the admission capacity: the
+		// classification, the fixed message and the absence of a result must hold for
+		// every one of them, and no submission may degrade into
+		// `reconciliation_capacity`.
+		//
+		// Honest bound on what this proves: on this in-process host path an anonymous
+		// submission is not reconciliation-tracked (`bus/index.ts:2891,5685`
+		// `trackReconciliation = false`), so there is no anonymous reservation to
+		// leak. Mutation probes that disabled the release call entirely left this
+		// sweep green. It is therefore a bounded non-regression over the real abort
+		// path, NOT proof of an anonymous reservation release. Identified-ref release
+		// is proven by step 3 and step 7 instead.
 		for (let attempt = 0; attempt <= PROMPT_ADMISSION_CAPACITY; attempt++) {
 			const anonymous = await request({
 				type: "control_request",
 				id: `missing-model-anonymous-${attempt}`,
-				operation: "turn.prompt",
+				operation: "turn.abort_and_prompt",
 				input: { text: `anonymous ${attempt}` },
 			});
-			expect(anonymous).toMatchObject({ ok: false, error: { code: MISSING_MODEL_CODE } });
+			expect(anonymous).toMatchObject({
+				ok: false,
+				error: { code: MISSING_MODEL_CODE, message: MISSING_MODEL_PUBLIC_MESSAGE },
+			});
+			expect(anonymous.result).toBeUndefined();
 		}
+		// Every swept submission ran the real abort prelude as well.
+		expect(aborts).toBe(1 + PROMPT_ADMISSION_CAPACITY + 1);
 
 		// 6. Nothing was admitted anywhere: no provider stream, no live user turn, no
 		// committed transcript message, across every rejected submission.
@@ -8986,8 +9002,9 @@ test("a missing-model preflight is rejected, leaks nothing, and releases its adm
 		expect(session.isStreaming).toBe(false);
 		expect(session.agent.state.messages.filter(message => message.role === "user")).toEqual([]);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "message")).toEqual([]);
-		// Every submission reached the live producer: 3 identified ones (prompt,
-		// same-ref retry, abort_and_prompt) plus the whole anonymous capacity sweep.
+		// Every submission reached the live producer: 3 leading ones (prompt,
+		// same-ref retry, abort_and_prompt) plus the 257-request anonymous
+		// abort_and_prompt sweep.
 		expect(produced).toHaveLength(3 + PROMPT_ADMISSION_CAPACITY + 1);
 
 		// 7. Recovery closes the loop: with a model resolved, the SAME clientRef is
@@ -9010,11 +9027,13 @@ test("a missing-model preflight is rejected, leaks nothing, and releases its adm
 			},
 		});
 		await waitFor(() => streamCalls === 1, "recovered prompt reaches the provider");
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	} finally {
+		// Stop the production host and the live session even when an assertion above
+		// throws, so a failing run never leaks the endpoint or the session runtime.
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 		await session.dispose();
 	}
-	// The capacity sweep is 257 sequential real round trips; the default 5s budget
+	// The abort_and_prompt sweep is 257 sequential real round trips; the default 5s budget
 	// is not enough for a full production host + live session per request.
 }, 60_000);
 
