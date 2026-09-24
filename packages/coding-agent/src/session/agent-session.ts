@@ -24024,7 +24024,7 @@ export class AgentSession {
 		// retry ceiling forbids another attempt.
 		let credentialRotated = false;
 		let quotaCredentialMark: "rotated" | "alternate" | "exhausted" | "unchanged" | undefined;
-		if (canRotateCodexCredential && trigger.class === "credential") {
+		if (canRotateCodexCredential && trigger.class === "credential" && !providerRetryCeilingReached) {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
 			credentialRotated = mark === "rotated" || (managedFallback && mark === "alternate");
@@ -24146,10 +24146,10 @@ export class AgentSession {
 		) {
 			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
 		}
-		// Credential rotation is unbounded: a fresh credential is a different
-		// retry dimension from transient-error backoff, so it overrides maxRetries
-		// exhaustion and forces an immediate same-model retry.
-		if (credentialRotated) {
+		// A fresh credential normally has its own retry dimension, but never
+		// override an explicit provider retry ceiling with a restored same-model
+		// entry.
+		if (credentialRotated && !providerRetryCeilingReached) {
 			// Do not rewind when the controller already chose retry: it still points
 			// at the current model. Rewind only after an actual model advance.
 			if (
