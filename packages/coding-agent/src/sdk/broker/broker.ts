@@ -1314,6 +1314,7 @@ const BROKER_LIVENESS_GRACE_MS = 60_000;
 const BROKER_LIVENESS_TTL_MULTIPLIER = 4;
 const BROKER_SETTLEMENT_MS = 2_000;
 const BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS = 1_000;
+const BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
 	now(): number;
@@ -4258,10 +4259,12 @@ export class Broker {
 		this.#completionTask = (async () => {
 			const recordWrite = Promise.withResolvers<boolean>();
 			const recordWriteController = new AbortController();
+			const recordWriteTimeoutMs =
+				reason === "signal" ? BROKER_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS : BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS;
 			const recordWriteTimer = setTimeout(() => {
 				recordWriteController.abort();
 				recordWrite.resolve(false);
-			}, BROKER_EXIT_RECORD_WRITE_TIMEOUT_MS);
+			}, recordWriteTimeoutMs);
 			void writeBrokerExitRecord(this.settings.agentDir, exitRecord, recordWriteController.signal).then(
 				() => recordWrite.resolve(true),
 				() => recordWrite.resolve(false),

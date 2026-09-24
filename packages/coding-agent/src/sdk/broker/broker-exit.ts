@@ -1,7 +1,21 @@
 import { randomUUID } from "node:crypto";
-import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { isCompiledBinary } from "@gajae-code/utils/env";
+import type {
+	BrokerExitWriterTestBarrier,
+	BrokerExitWriterWorkerRequest,
+	BrokerExitWriterWorkerResponse,
+} from "./broker-exit-writer-worker";
+
+export type { BrokerExitWriterTestBarrier } from "./broker-exit-writer-worker";
+
+let writerBarrierForTest: BrokerExitWriterTestBarrier | undefined;
+
+/** Install a worker-only deterministic commit barrier for publication-fence tests. */
+export function setBrokerExitWriterBarrierForTest(barrier?: BrokerExitWriterTestBarrier): void {
+	writerBarrierForTest = barrier;
+}
 
 export type BrokerExitMode = "owned-root" | "lost-root";
 export type BrokerFenceReason = "suspect-unpublished" | "observation-ambiguous" | "heartbeat-ambiguous";
@@ -52,6 +66,8 @@ export type BrokerStartupExitWriteStatus =
 const BROKER_EXIT_FILE = "broker.exit.json";
 const BROKER_STARTUP_EXIT_FILE = "broker.startup-exit.json";
 const MAX_BROKER_EXIT_RECORD_BYTES = 1_024;
+// `writtenAt` is the persisted generation; sequence same-path writes even within one clock tick.
+const lastWriteGenerationByPath = new Map<string, number>();
 const EXIT_REASONS = new Set<BrokerExitReason>([
 	"ownership-fence-expired",
 	"publication-liveness-timeout",
@@ -146,11 +162,150 @@ function isBrokerStartupExitRecord(value: unknown): value is BrokerStartupExitRe
 	);
 }
 
+/** Return only the generation of a currently supported structured exit record. */
+export function brokerExitRecordGeneration(value: unknown): number | undefined {
+	if (isBrokerExitRecord(value)) return value.writtenAt;
+	if (isBrokerStartupExitRecord(value)) return value.writtenAt;
+	return undefined;
+}
+
+async function runBrokerExitWriterWorker(
+	request: Omit<BrokerExitWriterWorkerRequest, "cancellation" | "testBarrier">,
+	signal: AbortSignal | undefined,
+	onDispatched: () => void,
+): Promise<void> {
+	if (signal?.aborted) throw new Error("SDK broker exit record write was aborted.");
+	const worker = isCompiledBinary()
+		? new Worker("./packages/coding-agent/src/sdk/broker/broker-exit-writer-worker.ts", { type: "module" })
+		: new Worker(new URL("./broker-exit-writer-worker.ts", import.meta.url).href, { type: "module" });
+	const cancellation = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+	const cancellationView = new Int32Array(cancellation);
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	let settled = false;
+	let workerFinished = false;
+	const removeListeners = (): void => {
+		worker.removeEventListener("message", onMessage);
+		worker.removeEventListener("error", onError);
+		worker.removeEventListener("messageerror", onMessageError);
+		worker.removeEventListener("close", onClose);
+		worker.removeEventListener("exit", onExit);
+		signal?.removeEventListener("abort", onAbort);
+	};
+	const sendCancellation = (): void => {
+		Atomics.store(cancellationView, 0, 1);
+		(worker as Worker & { unref?: () => void }).unref?.();
+		try {
+			worker.postMessage({ type: "decision", decision: "cancel" });
+		} catch {
+			// The shared cancellation flag remains observable when the worker returns
+			// from a synchronous native commit, even if its message loop is blocked.
+		}
+	};
+	const fail = (error: Error): void => {
+		if (settled) return;
+		settled = true;
+		sendCancellation();
+		reject(error);
+	};
+	const abortError = (): Error => new Error("SDK broker exit record write was aborted.");
+	const onAbort = (): void => fail(abortError());
+	const onMessage: EventListener = event => {
+		const response = (event as MessageEvent<BrokerExitWriterWorkerResponse>).data;
+		if (response?.type === "publication-ready") {
+			if (settled || signal?.aborted) {
+				sendCancellation();
+				return;
+			}
+			try {
+				worker.postMessage({ type: "decision", decision: "accept" });
+				settled = true;
+				signal?.removeEventListener("abort", onAbort);
+				resolve();
+			} catch (error) {
+				fail(error instanceof Error ? error : new Error(String(error)));
+			}
+			return;
+		}
+		if (response?.type === "result") {
+			workerFinished = true;
+			if (response.result === "superseded")
+				fail(new Error("SDK broker exit record was superseded by a newer record."));
+			else if (response.result === "cancelled" && !settled) fail(abortError());
+			removeListeners();
+			return;
+		}
+		if (response?.type === "error") {
+			workerFinished = true;
+			const failure = new Error(response.message);
+			if (response.name) failure.name = response.name;
+			if (response.stack) failure.stack = response.stack;
+			fail(failure);
+			removeListeners();
+			return;
+		}
+		fail(new Error("SDK broker exit writer worker returned an invalid response."));
+	};
+	const onError: EventListener = () => {
+		workerFinished = true;
+		fail(new Error("SDK broker exit writer worker failed."));
+		removeListeners();
+	};
+	const onMessageError: EventListener = () => {
+		workerFinished = true;
+		fail(new Error("SDK broker exit writer worker message failed."));
+		removeListeners();
+	};
+	const onClose: EventListener = () => {
+		workerFinished = true;
+		if (!settled) fail(new Error("SDK broker exit writer worker closed before responding."));
+		removeListeners();
+	};
+	const onExit: EventListener = () => {
+		workerFinished = true;
+		if (!settled) fail(new Error("SDK broker exit writer worker exited before responding."));
+		removeListeners();
+	};
+	worker.addEventListener("message", onMessage);
+	worker.addEventListener("error", onError);
+	worker.addEventListener("messageerror", onMessageError);
+	worker.addEventListener("close", onClose);
+	worker.addEventListener("exit", onExit);
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		if (signal?.aborted) {
+			worker.terminate();
+			onAbort();
+		} else {
+			worker.postMessage({ ...request, cancellation, testBarrier: writerBarrierForTest });
+			onDispatched();
+		}
+	} catch (error) {
+		worker.terminate();
+		fail(error instanceof Error ? error : new Error(String(error)));
+		removeListeners();
+	}
+	try {
+		await promise;
+	} finally {
+		if (workerFinished) removeListeners();
+	}
+}
+
 async function writeAtomicExitRecord(destination: string, record: object, signal?: AbortSignal): Promise<void> {
-	const serialized = JSON.stringify(record);
+	const requestedGeneration = (record as { writtenAt?: unknown }).writtenAt;
+	if (!Number.isSafeInteger(requestedGeneration) || (requestedGeneration as number) <= 0)
+		throw new Error("SDK broker exit record generation is invalid.");
+	const previousGeneration = lastWriteGenerationByPath.get(destination);
+	if (previousGeneration === Number.MAX_SAFE_INTEGER)
+		throw new Error("SDK broker exit record generation is exhausted.");
+	const generation = Math.max(requestedGeneration as number, (previousGeneration ?? 0) + 1);
+	const serialized = JSON.stringify(
+		generation === requestedGeneration ? record : { ...record, writtenAt: generation },
+	);
 	if (typeof serialized !== "string") throw new Error("SDK broker exit record could not be serialized.");
 	if (Buffer.byteLength(serialized, "utf8") > MAX_BROKER_EXIT_RECORD_BYTES)
 		throw new Error("SDK broker exit record exceeds its size bound.");
+	lastWriteGenerationByPath.set(destination, generation);
 	const throwIfAborted = (): void => {
 		if (signal?.aborted) throw new Error("SDK broker exit record write was aborted.");
 	};
@@ -159,7 +314,7 @@ async function writeAtomicExitRecord(destination: string, record: object, signal
 	const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
 	throwIfAborted();
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	let published = false;
+	let workerDispatched = false;
 	try {
 		throwIfAborted();
 		const handle = await fs.open(temporary, "wx", 0o600);
@@ -172,11 +327,15 @@ async function writeAtomicExitRecord(destination: string, record: object, signal
 			await handle.close();
 		}
 		throwIfAborted();
-		// A synchronous commit point prevents a timed-out async writer from renaming late.
-		syncFs.renameSync(temporary, destination);
-		published = true;
+		await runBrokerExitWriterWorker(
+			{ destinationPath: destination, temporaryPath: temporary, generation: generation as number },
+			signal,
+			() => {
+				workerDispatched = true;
+			},
+		);
 	} finally {
-		if (!published) await fs.rm(temporary, { force: true }).catch(() => {});
+		if (!workerDispatched) await fs.rm(temporary, { force: true }).catch(() => {});
 	}
 }
 
