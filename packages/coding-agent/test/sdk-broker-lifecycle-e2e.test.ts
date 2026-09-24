@@ -1997,6 +1997,99 @@ test("session host keeps rollback unproven when MCP data moves beyond its exact 
 	}
 });
 
+test.skipIf(process.platform === "win32")(
+	"session host canonicalizes a symlinked TMPDIR before capturing MCP ownership",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-mcp-tmpdir-symlink-"));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const realTempDirectory = path.join(root, "temp-real");
+		const linkedTempDirectory = path.join(root, "temp-link");
+		const sessionId = "mcp-tmpdir-symlink";
+		const effectMarker = "mcp-tmpdir-symlink-marker";
+		const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+		const names = [
+			"TMPDIR",
+			"GJC_AGENT_DIR",
+			"GJC_STATE_ROOT",
+			"GJC_LIFECYCLE_REQUEST_ID",
+			"GJC_SDK_LIFECYCLE_REQUEST",
+			"GJC_SDK_TEST_IN_MEMORY_SESSION",
+		] as const;
+		const previous = names.map(name => process.env[name]);
+		let sessionManager: SessionManager | undefined;
+		let mcpConfigPath: string | undefined;
+		try {
+			await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.mkdir(realTempDirectory);
+			await fs.symlink(realTempDirectory, linkedTempDirectory, "dir");
+			await fs.writeFile(
+				path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+				JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+			);
+			process.env.TMPDIR = linkedTempDirectory;
+			process.env.GJC_AGENT_DIR = agentDir;
+			process.env.GJC_STATE_ROOT = stateRoot;
+			process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+			process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+			const request: SessionLifecycleLaunchRequest = {
+				operation: "session.create",
+				sessionId,
+				cwd: root,
+				stateRoot,
+				effectMarker,
+				mcpServers: [{ type: "http", name: "fixture", url: "https://example.invalid/mcp" }],
+				...deadlines,
+			};
+			process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify(request);
+			const parsed = await lifecycleArgs(request, root, agentDir);
+			sessionManager = SessionManager.inMemory(root);
+			const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+
+			await expect(
+				runSessionHost({
+					cwd: root,
+					now: () => 1_000,
+					sleep: async ms => {
+						if (ms > 0) await new Promise<void>(() => {});
+					},
+					processIncarnation: () => "test-incarnation",
+					openLifecycleSessionManager: async () => ({ parsed, sessionManager }),
+					createLifecycleAgentSession: async (options, owner) => {
+						if (!owner) throw new Error("Expected lifecycle startup owner.");
+						if (!options?.mcpConfigPath) throw new Error("Expected temporary MCP config.");
+						mcpConfigPath = options.mcpConfigPath;
+						return {
+							capability: owner.capability,
+							rollback: owner.rollback,
+							failure: owner.capability.normalizeFailure(
+								"registration",
+								"failed",
+								"controlled startup failure after canonical MCP path",
+							),
+							cleanupComplete: true,
+						};
+					},
+				}),
+			).rejects.toThrow("controlled startup failure after canonical MCP path");
+
+			expect(mcpConfigPath).toBeDefined();
+			expect(path.dirname(path.dirname(mcpConfigPath!))).toBe(realTempDirectory);
+			await expect(fs.stat(path.dirname(mcpConfigPath!))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await Bun.file(failurePath).exists()).toBe(true);
+		} finally {
+			await sessionManager?.close().catch(() => {});
+			names.forEach((name, index) => {
+				const value = previous[index];
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			});
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
 test("session host snapshots and removes a partial MCP config after write failure", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-mcp-partial-write-"));
 	const agentDir = path.join(root, "agent");
