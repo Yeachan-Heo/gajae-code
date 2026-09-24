@@ -319,12 +319,15 @@ describe("default launch worktrees", () => {
 		const missingTarget = path.join(path.dirname(repo), "private-missing-cold-storage-target");
 		await fs.symlink(missingTarget, bucket, process.platform === "win32" ? "junction" : "dir");
 
+		let caught: unknown;
 		let message = "";
 		try {
 			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
 		} catch (error) {
+			caught = error;
 			message = error instanceof Error ? error.message : String(error);
 		}
+		expect(asLaunchWorktreeGuardError(caught)?.code).toBe("worktree_bucket_broken_symlink");
 		expect(message).toContain("worktree_bucket_broken_symlink");
 		expect(message).toContain("platform-appropriate filesystem tools");
 		expect(message).toContain("GJC did not delete or replace the entry");
@@ -395,12 +398,15 @@ describe("default launch worktrees", () => {
 		await Bun.write(target, "preserve-me\n");
 		await fs.symlink(target, bucket, "file");
 
+		let caught: unknown;
 		let message = "";
 		try {
 			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
 		} catch (error) {
+			caught = error;
 			message = error instanceof Error ? error.message : String(error);
 		}
+		expect(asLaunchWorktreeGuardError(caught)?.code).toBe("worktree_bucket_not_directory");
 		expect(message).toMatch(/worktree_bucket_not_directory[\s\S]*symbolic link whose target is not a directory/);
 		expect(message).not.toContain(target);
 		expect(await Bun.file(target).text()).toBe("preserve-me\n");
@@ -412,12 +418,15 @@ describe("default launch worktrees", () => {
 		const bucket = path.join(repo, ".worktrees");
 		await Bun.write(bucket, "not-a-directory\n");
 
+		let caught: unknown;
 		let message = "";
 		try {
 			prepareLaunchWorktree(repo, ["--worktree", "feature/demo"]);
 		} catch (error) {
+			caught = error;
 			message = error instanceof Error ? error.message : String(error);
 		}
+		expect(asLaunchWorktreeGuardError(caught)?.code).toBe("worktree_bucket_not_directory");
 		expect(message).toMatch(/worktree_bucket_not_directory[\s\S]*not a directory/);
 		expect(message).toContain("platform-appropriate filesystem tools");
 		expect(message).not.toMatch(/`?rm\s/);
