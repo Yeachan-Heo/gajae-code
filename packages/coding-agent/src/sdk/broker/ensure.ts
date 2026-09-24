@@ -82,7 +82,6 @@ const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 const BROKER_SESSION_ENV_NAMES = new Set([
-	// Keep GJC_SESSION_ values that are user configuration (budget/GC policy).
 	"GJC_SESSION_FILE",
 	"GJC_SESSION_ID",
 	"GJC_SESSION_CWD",
@@ -97,7 +96,13 @@ const BROKER_SESSION_ENV_NAMES = new Set([
 	"GJC_SDK_LIFECYCLE_REQUEST",
 	"GJC_STATE_ROOT",
 ]);
+const BROKER_SESSION_ENV_PRESERVED_NAMES = new Set([
+	"GJC_SESSION_CONTEXT_BUDGET_BYTES",
+	"GJC_SESSION_MEMORY_GC_STRATEGY",
+	"GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE",
+]);
 const BROKER_SESSION_ENV_PREFIXES = [
+	"GJC_SESSION_",
 	"GJC_COORDINATOR_SESSION_",
 	"GJC_COORDINATOR_SIDECAR_",
 	"GJC_TMUX_OWNER_",
@@ -489,6 +494,7 @@ function brokerSpawnEnvironment(command: SdkInternalSpawnCommand, override?: Nod
 	// the broker's process.env into unrelated session hosts. Keep user tmux
 	// configuration (for example GJC_TMUX_COMMAND and GJC_TMUX_PROFILE) intact.
 	for (const name of Object.keys(environment)) {
+		if (BROKER_SESSION_ENV_PRESERVED_NAMES.has(name)) continue;
 		if (BROKER_SESSION_ENV_NAMES.has(name) || BROKER_SESSION_ENV_PREFIXES.some(prefix => name.startsWith(prefix)))
 			delete environment[name];
 	}
