@@ -2338,19 +2338,34 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).stopReason).toBe("error");
 	}, 300000);
 	it("reports coordinator sidecar failures through the retry-test persistence drain", async () => {
-		const failure = new Error("injected coordinator sidecar failure");
-		let injected = false;
+		const failures = [
+			new Error("injected fire-and-forget sidecar failure"),
+			new Error("injected queued sidecar failure"),
+		];
+		let nextFailure = 0;
+		let agentStartEvent: AgentSessionEvent | undefined;
 		session = buildBareRetrySession({ responses: [{ content: ["completed"] }] });
+		session.subscribe(event => {
+			if (event.type === "agent_start") agentStartEvent = event;
+		});
 		__sessionStateSidecarTestHooks.beforePersistFromEvent = eventType => {
-			if (injected || eventType !== "agent_start") return;
-			injected = true;
-			throw failure;
+			if (eventType !== "agent_start" || nextFailure >= failures.length) return;
+			throw failures[nextFailure++];
 		};
 
 		await session.prompt("surface sidecar persistence failure");
 		await session.waitForIdle();
 
-		expect(injected).toBe(true);
+		expect(nextFailure).toBe(1);
+		await expect(session.awaitCoordinatorRuntimeStatePersistenceForTests()).rejects.toThrow(
+			"Coordinator runtime-state persistence failed during test",
+		);
+		const event = agentStartEvent;
+		if (!event) throw new Error("Expected agent_start event for queued persistence failure test");
+		await expect(session.queueCoordinatorRuntimeStatePersistForTests(event, Promise.resolve())).rejects.toBe(
+			failures[1],
+		);
+		expect(nextFailure).toBe(2);
 		await expect(session.awaitCoordinatorRuntimeStatePersistenceForTests()).rejects.toThrow(
 			"Coordinator runtime-state persistence failed during test",
 		);
