@@ -10,12 +10,12 @@ import {
 	controlRequest,
 	controlSocketPathIsBindable,
 	isConfirmedStop,
-	kevControlAlive,
 	KEV_COMMIT_LINE,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
 	kevControl,
+	kevControlAlive,
 	SERVICE_SHIM_FILE,
 	SUPERVISOR_FILE,
 } from "./kev-supervisor";
