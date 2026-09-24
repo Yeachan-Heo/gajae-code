@@ -275,8 +275,12 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
 			GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
 			GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
 			GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
 			GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
 			GJC_TMUX_SESSION: "tui-tmux-session",
 			GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
 			GJC_TMUX_LAUNCHED: "1",
@@ -284,11 +288,13 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 			GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
 			GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
 			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
 			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
 			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
 			GJC_STATE_ROOT: "/tui/.gjc/state",
 			TMUX: "/tmp/tmux,1234,0",
 			TMUX_PANE: "%7",
+			GJC_MOUSE: "1",
 			GJC_TMUX_COMMAND: "custom-tmux",
 			GJC_TMUX_PROFILE: "1",
 			OWNED_SENTINEL: "kept",
@@ -305,8 +311,12 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		"GJC_COORDINATOR_SESSION_ID",
 		"GJC_COORDINATOR_SESSION_STATE_FILE",
 		"GJC_COORDINATOR_SESSION_BRANCH",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
 		"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
 		"GJC_COORDINATOR_SIDECAR_SIGNING_KEY",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
 		"GJC_TMUX_SESSION",
 		"GJC_TMUX_ACTIVE_SESSION",
 		"GJC_TMUX_LAUNCHED",
@@ -314,6 +324,7 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 		"GJC_TMUX_OWNER_STATE_DIR",
 		"GJC_TMUX_OWNER_SERVER_KEY",
 		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
 		"GJC_LIFECYCLE_REQUEST_ID",
 		"GJC_SDK_LIFECYCLE_REQUEST",
 		"GJC_STATE_ROOT",
@@ -326,7 +337,8 @@ it("strips inherited TUI session identity from a cold-started broker", () => {
 	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
 	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
 	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
-	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBe("tui-custom-session-marker");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
+	expect(environment.GJC_MOUSE).toBe("1");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
 });
 
@@ -344,13 +356,19 @@ it("strips inherited session markers from compiled broker environments", () => {
 			GJC_SESSION_MEMORY_GC_STRATEGY: "async",
 			GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE: "enabled",
 			GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+			GJC_COORDINATOR_SESSION_LAUNCH_ID: "tui-launch-id",
+			GJC_COORDINATOR_SESSION_READINESS_FILE: "/tmp/tui-readiness.json",
+			GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL: "https://example.invalid/tui-key",
+			GJC_COORDINATOR_SIDECAR_KEY_ID: "tui-key-id",
 			GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
 			GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+			GJC_MANAGED_OWNER_CHILD_TOKEN: "tui-child-token",
 			GJC_LIFECYCLE_REQUEST_ID: "tui-lifecycle-request",
 			GJC_SDK_LIFECYCLE_REQUEST: "tui-lifecycle-payload",
 			GJC_STATE_ROOT: "/tui/.gjc/state",
 			GJC_TMUX_COMMAND: "custom-tmux",
 			GJC_TMUX_PROFILE: "1",
+			GJC_MOUSE: "1",
 			PI_COMPILED: "1",
 			GJC_COMPILED: "1",
 		},
@@ -365,8 +383,13 @@ it("strips inherited session markers from compiled broker environments", () => {
 		"GJC_SESSION_PROMPT_ACCEPTED_JSON",
 		"GJC_SESSION_WORKTREE_BASELINE_DIRTY",
 		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_LAUNCH_ID",
+		"GJC_COORDINATOR_SESSION_READINESS_FILE",
+		"GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL",
+		"GJC_COORDINATOR_SIDECAR_KEY_ID",
 		"GJC_TMUX_OWNER_GENERATION",
 		"GJC_MANAGED_OWNER_RUN_ID",
+		"GJC_MANAGED_OWNER_CHILD_TOKEN",
 		"GJC_LIFECYCLE_REQUEST_ID",
 		"GJC_SDK_LIFECYCLE_REQUEST",
 		"GJC_STATE_ROOT",
@@ -377,9 +400,10 @@ it("strips inherited session markers from compiled broker environments", () => {
 	expect(environment.GJC_SESSION_CONTEXT_BUDGET_BYTES).toBe("1073741824");
 	expect(environment.GJC_SESSION_MEMORY_GC_STRATEGY).toBe("async");
 	expect(environment.GJC_SESSION_MEMORY_SECONDARY_ARTIFACT_MODE).toBe("enabled");
-	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBe("tui-custom-session-marker");
+	expect(environment.GJC_SESSION_CUSTOM_MARKER).toBeUndefined();
 	expect(environment.PI_COMPILED).toBe("1");
 	expect(environment.GJC_COMPILED).toBe("1");
+	expect(environment.GJC_MOUSE).toBe("1");
 });
 
 it("fails closed when compiled marker evidence disagrees", () => {
