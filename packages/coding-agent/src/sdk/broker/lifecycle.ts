@@ -1464,6 +1464,7 @@ const lifecycleMarkerPath = (root: string, id: string) => path.join(root, "sdk",
 const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.ready.json`);
 const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>
 	path.join(root, "sdk", `${id}.lifecycle.failure.${effectMarker}.json`);
+const lifecycleFailurePromotionPath = (failurePath: string) => `${failurePath}.promoting`;
 type EffectMarker = { pid: number; effectMarker: string; incarnation: string };
 type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
@@ -1774,6 +1775,40 @@ type LifecyclePublicationIdentity = {
 	sha256: string;
 };
 
+async function captureOpenedLifecycleFileIdentity(
+	handle: fs.FileHandle,
+): Promise<LifecyclePublicationIdentity & { nlink: bigint }> {
+	const stat = await handle.stat({ bigint: true });
+	if (
+		!stat.isFile() ||
+		stat.nlink !== 1n ||
+		stat.size > BigInt(MAX_LIFECYCLE_METADATA_BYTES) ||
+		!Number.isSafeInteger(Number(stat.size))
+	)
+		throw new Error("Lifecycle temporary file identity is invalid.");
+	const contents = Buffer.alloc(Number(stat.size));
+	const { bytesRead } = await handle.read(contents, 0, contents.length, 0);
+	if (bytesRead !== contents.length) throw new Error("Lifecycle temporary file changed during identity capture.");
+	const current = await handle.stat({ bigint: true });
+	if (
+		!current.isFile() ||
+		current.dev !== stat.dev ||
+		current.ino !== stat.ino ||
+		current.nlink !== stat.nlink ||
+		current.size !== stat.size ||
+		current.mtimeNs !== stat.mtimeNs
+	)
+		throw new Error("Lifecycle temporary file changed during identity capture.");
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: createHash("sha256").update(contents).digest("hex"),
+		nlink: stat.nlink,
+	};
+}
+
 function removeLifecyclePublicationFile(
 	file: string,
 	identity: LifecyclePublicationIdentity,
@@ -1831,6 +1866,7 @@ export async function writeSessionLifecycleReady(
 	let publicationAttempted = false;
 	let published = false;
 	let directoryChanged = false;
+	let retainedPublicationPath: string | undefined;
 	const parentStillOwned = (): boolean => {
 		const current = lifecycleParentIdentity(directory);
 		return current !== undefined && current.dev === parent.dev && current.ino === parent.ino;
@@ -1838,24 +1874,16 @@ export async function writeSessionLifecycleReady(
 	try {
 		handle = await fs.open(
 			temporary,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
 			0o600,
 		);
 		temporaryCreatedByUs = true;
 		directoryChanged = true;
 		await handle.writeFile(contents);
 		await handle.sync();
-		const stat = await handle.stat({ bigint: true });
-		if (!stat.isFile() || stat.nlink !== 1n)
-			throw new Error("Lifecycle readiness temporary file identity is invalid.");
-		publicationIdentity = {
-			dev: stat.dev,
-			ino: stat.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			sha256: createHash("sha256").update(contents).digest("hex"),
-			nlink: stat.nlink,
-		};
+		publicationIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		if (publicationIdentity.sha256 !== createHash("sha256").update(contents).digest("hex"))
+			throw new Error("Lifecycle readiness temp contents changed during startup.");
 		await handle.close();
 		handle = undefined;
 		if (!publicationIdentity) throw new Error("Lifecycle readiness temporary file identity is unavailable.");
@@ -1863,23 +1891,15 @@ export async function writeSessionLifecycleReady(
 		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before publication.");
 		placeholderHandle = await fs.open(
 			readyPath,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
 			0o600,
 		);
 		placeholderCreatedByUs = true;
 		directoryChanged = true;
 		await placeholderHandle.sync();
-		const placeholderStat = await placeholderHandle.stat({ bigint: true });
-		if (!placeholderStat.isFile() || placeholderStat.nlink !== 1n || placeholderStat.size !== 0n)
+		placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
+		if (placeholderIdentity.size !== 0n || placeholderIdentity.nlink !== 1n)
 			throw new Error("Lifecycle readiness placeholder identity is invalid.");
-		placeholderIdentity = {
-			dev: placeholderStat.dev,
-			ino: placeholderStat.ino,
-			size: placeholderStat.size,
-			mtimeNs: placeholderStat.mtimeNs,
-			sha256: createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
-			nlink: placeholderStat.nlink,
-		};
 		await placeholderHandle.close();
 		placeholderHandle = undefined;
 		if (!parentStillOwned()) throw new Error("Lifecycle readiness directory identity changed before commit.");
@@ -1899,8 +1919,10 @@ export async function writeSessionLifecycleReady(
 				parentIno: parentIdentity.ino,
 			},
 		);
-		if (!publication.ok || publication.retainedPlaceholderPath || publication.retainedUnknownPath)
+		if (!publication.ok || publication.retainedPlaceholderPath || publication.retainedUnknownPath) {
+			retainedPublicationPath = publication.retainedPlaceholderPath ?? publication.retainedUnknownPath;
 			throw new Error(`Lifecycle readiness atomic publication failed: ${publication.code ?? "unknown"}.`);
+		}
 		published = true;
 		temporaryCreatedByUs = false;
 		placeholderCreatedByUs = false;
@@ -1910,6 +1932,20 @@ export async function writeSessionLifecycleReady(
 		onPublished?.();
 	} catch (error) {
 		const cleanupErrors: unknown[] = [];
+		if (temporaryCreatedByUs && !publicationIdentity && handle) {
+			try {
+				publicationIdentity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
+		if (placeholderCreatedByUs && !placeholderIdentity && placeholderHandle) {
+			try {
+				placeholderIdentity = await captureOpenedLifecycleFileIdentity(placeholderHandle);
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
 		if (handle) {
 			try {
 				await handle.close();
@@ -1917,32 +1953,32 @@ export async function writeSessionLifecycleReady(
 				cleanupErrors.push(cleanupError);
 			}
 		}
+		if (placeholderHandle) {
+			try {
+				await placeholderHandle.close();
+			} catch (cleanupError) {
+				cleanupErrors.push(cleanupError);
+			}
+		}
 		const parentIsStillOwned = parentStillOwned();
 		if (!parentIsStillOwned)
 			cleanupErrors.push(new Error("Lifecycle readiness temporary parent identity changed during publication."));
-		if (parentIsStillOwned && published) {
-			if (!publicationIdentity || !removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity))
-				cleanupErrors.push(new Error("The exact lifecycle ready marker could not be revoked."));
-		} else if (parentIsStillOwned) {
-			if (publicationAttempted && publicationIdentity) {
-				if (!removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity))
-					cleanupErrors.push(new Error("The exact lifecycle readiness publication could not be revoked."));
-			}
-			if (placeholderCreatedByUs) {
-				if (!placeholderIdentity || !removeLifecyclePublicationFile(readyPath, placeholderIdentity, parentIdentity))
-					cleanupErrors.push(new Error("The exact lifecycle readiness placeholder could not be removed."));
-			}
+		if (retainedPublicationPath)
+			cleanupErrors.push(new Error("Native readiness publication retained an unresolved path."));
+		if (parentIsStillOwned) {
+			let readyPathRemoved = false;
+			if ((published || publicationAttempted) && publicationIdentity)
+				readyPathRemoved = removeOwnedLifecycleReadyMarker(root, id, publicationIdentity, parentIdentity);
+			if (!readyPathRemoved && placeholderCreatedByUs && placeholderIdentity)
+				readyPathRemoved = removeLifecyclePublicationFile(readyPath, placeholderIdentity, parentIdentity);
+			if ((published || publicationAttempted || placeholderCreatedByUs) && !readyPathRemoved)
+				cleanupErrors.push(new Error("Lifecycle readiness authority could not be exactly revoked."));
 			if (temporaryCreatedByUs) {
-				if (publicationIdentity) {
-					if (!removeLifecyclePublicationFile(temporary, publicationIdentity, parentIdentity))
-						cleanupErrors.push(new Error("The exact lifecycle readiness temp file could not be removed."));
-				} else {
-					try {
-						await fs.rm(temporary, { force: true });
-					} catch (cleanupError) {
-						cleanupErrors.push(cleanupError);
-					}
-				}
+				if (
+					!publicationIdentity ||
+					!removeLifecyclePublicationFile(temporary, publicationIdentity, parentIdentity, true)
+				)
+					cleanupErrors.push(new Error("The exact lifecycle readiness temp file could not be removed."));
 			}
 		}
 		if (directoryChanged && parentIsStillOwned) {
@@ -2090,14 +2126,8 @@ function removeOwnedFailurePublicationFile(
 	}
 }
 
-async function replaceOwnedFailureReceiptWithIncomplete(
-	directory: string,
-	target: string,
-	artifact: LifecycleFailureArtifact,
-	expectedDestination: LifecyclePublicationIdentity,
-	parent: { dev: bigint; ino: bigint },
-): Promise<boolean> {
-	const incomplete: LifecycleFailureArtifact = {
+function incompleteFailureArtifact(artifact: LifecycleFailureArtifact): LifecycleFailureArtifact {
+	return {
 		...artifact,
 		rollback: {
 			endpointGeneration: artifact.rollback.endpointGeneration,
@@ -2107,34 +2137,98 @@ async function replaceOwnedFailureReceiptWithIncomplete(
 			brokerRegistrationReleased: false,
 		},
 	};
-	const bytes = Buffer.from(canonicalJson(incomplete), "utf8");
-	const temporary = path.join(directory, `.${artifact.effectMarker}.lifecycle.failure.incomplete.${randomUUID()}.tmp`);
+}
+
+function hasCompleteFailureRollback(rollback: SdkStartupRollbackResult): boolean {
+	return rollback.fenced && rollback.runtimeRemoved && rollback.hostStopped && rollback.brokerRegistrationReleased;
+}
+
+type LifecycleFailurePromotionFence = { path: string; identity: LifecyclePublicationIdentity };
+
+async function writeLifecycleFailurePromotionFence(
+	target: string,
+	artifact: LifecycleFailureArtifact,
+	artifactBytes: Buffer,
+	parent: { dev: bigint; ino: bigint },
+	parentStillOwned: () => boolean,
+): Promise<LifecycleFailurePromotionFence> {
+	const fencePath = lifecycleFailurePromotionPath(target);
+	const bytes = Buffer.from(
+		canonicalJson({
+			pid: artifact.pid,
+			effectMarker: artifact.effectMarker,
+			incarnation: artifact.incarnation,
+			artifactDigest: createHash("sha256").update(artifactBytes).digest("hex"),
+		}),
+		"utf8",
+	);
 	let handle: fs.FileHandle | undefined;
-	let replaced = false;
+	let createdByUs = false;
+	let identity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
+	try {
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed before promotion fencing.");
+		handle = await fs.open(
+			fencePath,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
+			0o600,
+		);
+		createdByUs = true;
+		await handle.writeFile(bytes);
+		await handle.sync();
+		identity = await captureOpenedLifecycleFileIdentity(handle);
+		if (identity.sha256 !== createHash("sha256").update(bytes).digest("hex"))
+			throw new Error("Lifecycle failure receipt promotion fence changed during setup.");
+		await handle.close();
+		handle = undefined;
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion fencing.");
+		return { path: fencePath, identity };
+	} catch (error) {
+		if (handle && createdByUs && !identity) {
+			try {
+				identity = await captureOpenedLifecycleFileIdentity(handle);
+			} catch {
+				// Keep an unidentifiable fence in place so readers fail closed.
+			}
+		}
+		if (handle) await handle.close().catch(() => {});
+		if (createdByUs && identity) removeLifecyclePublicationFile(fencePath, identity, parent);
+		throw error;
+	}
+}
+
+async function replaceOwnedFailureReceipt(
+	directory: string,
+	target: string,
+	replacement: LifecycleFailureArtifact,
+	expectedDestination: LifecyclePublicationIdentity,
+	parent: { dev: bigint; ino: bigint },
+): Promise<boolean> {
+	const bytes = Buffer.from(canonicalJson(replacement), "utf8");
+	const temporary = path.join(directory, `.${replacement.effectMarker}.lifecycle.failure.replace.${randomUUID()}.tmp`);
+	let handle: fs.FileHandle | undefined;
+	let temporaryCreatedByUs = false;
+	let sourceIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
 	try {
 		handle = await fs.open(
 			temporary,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
 			0o600,
 		);
+		temporaryCreatedByUs = true;
 		await handle.writeFile(bytes);
 		await handle.sync();
-		const stat = await handle.stat({ bigint: true });
-		if (!stat.isFile() || stat.nlink !== 1n) return false;
+		sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		if (sourceIdentity.sha256 !== createHash("sha256").update(bytes).digest("hex"))
+			throw new Error("Replacement lifecycle failure receipt temp changed during publication.");
 		await handle.close();
 		handle = undefined;
 		const result = nativeLifecycle().exactReplacePath(
 			temporary,
 			target,
 			{
-				dev: stat.dev,
-				ino: stat.ino,
-				nlink: stat.nlink,
+				...sourceIdentity,
 				parentDev: parent.dev,
 				parentIno: parent.ino,
-				size: stat.size,
-				mtimeNs: stat.mtimeNs,
-				sha256: createHash("sha256").update(bytes).digest("hex"),
 			},
 			{
 				...expectedDestination,
@@ -2142,17 +2236,22 @@ async function replaceOwnedFailureReceiptWithIncomplete(
 				parentIno: parent.ino,
 			},
 		);
-		if (!result.ok || result.retainedPlaceholderPath) return false;
-		replaced = true;
-		await fs.rm(temporary, { force: true });
-		await syncDirectory(directory);
+		if (!result.ok || result.retainedPlaceholderPath || result.retainedUnknownPath)
+			throw new Error(`Lifecycle failure receipt replacement failed: ${result.code ?? "unknown"}.`);
 		return true;
-	} catch {
-		return false;
-	} finally {
-		await handle?.close().catch(() => {});
-		if (!replaced) await fs.rm(temporary, { force: true }).catch(() => {});
+	} catch {}
+	if (handle && temporaryCreatedByUs && !sourceIdentity) {
+		try {
+			sourceIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		} catch {
+			// Without descriptor identity, leave the temporary pathname untouched.
+		}
 	}
+	if (handle) await handle.close().catch(() => {});
+	if (!temporaryCreatedByUs || !sourceIdentity) return false;
+	removeLifecyclePublicationFile(temporary, sourceIdentity, parent, true);
+	await syncDirectory(directory).catch(() => {});
+	return false;
 }
 
 /** Writes bounded startup diagnostics. The child stamps its own pid; the broker may stamp a proven child identity. */
@@ -2186,12 +2285,23 @@ export async function writeSessionLifecycleFailure(
 		rollback,
 		...(transcript ? { transcript } : {}),
 	};
-	const bytes = Buffer.from(canonicalJson(artifact), "utf8");
-	if (bytes.length > MAX_LIFECYCLE_METADATA_BYTES)
+	const completeRollback = hasCompleteFailureRollback(rollback);
+	// This path has no supported Windows parent-directory durability barrier.
+	// Keep the receipt incomplete there rather than treating a file flush as a
+	// durable namespace commit.
+	const completeRollbackPromotionAvailable = process.platform !== "win32";
+	const stagedArtifact = completeRollback ? incompleteFailureArtifact(artifact) : artifact;
+	const stagedBytes = Buffer.from(canonicalJson(stagedArtifact), "utf8");
+	const finalBytes = Buffer.from(canonicalJson(artifact), "utf8");
+	if (stagedBytes.length > MAX_LIFECYCLE_METADATA_BYTES || finalBytes.length > MAX_LIFECYCLE_METADATA_BYTES)
 		throw new Error("Lifecycle startup failure exceeds the metadata size ceiling.");
 	const parent = lifecycleParentIdentity(directory);
 	if (!parent) throw new Error("Lifecycle failure receipt parent identity is unavailable.");
 	const parentIdentity = { dev: BigInt(parent.dev), ino: BigInt(parent.ino) };
+	const parentStillOwned = (): boolean => {
+		const current = lifecycleParentIdentity(directory);
+		return current !== undefined && current.dev === parent.dev && current.ino === parent.ino;
+	};
 	const target = lifecycleFailurePath(root, id, effectMarker);
 	const temporary = path.join(directory, `.${id}.lifecycle.failure.${effectMarker}.${randomUUID()}.tmp`);
 	let handle: fs.FileHandle | undefined;
@@ -2199,72 +2309,134 @@ export async function writeSessionLifecycleFailure(
 	let temporaryIdentity: LifecyclePublicationIdentity | undefined;
 	let published = false;
 	let directoryChanged = false;
+	let targetIdentity: LifecyclePublicationIdentity | undefined;
+	let existingFinal = false;
+	let promotionFence: LifecycleFailurePromotionFence | undefined;
 	try {
 		handle = await fs.open(
 			temporary,
-			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_RDWR,
 			0o600,
 		);
 		temporaryCreatedByUs = true;
-		await handle.writeFile(bytes);
+		directoryChanged = true;
+		await handle.writeFile(stagedBytes);
 		await handle.sync();
-		const stat = await handle.stat({ bigint: true });
-		if (!stat.isFile() || stat.nlink !== 1n)
-			throw new Error("Lifecycle failure receipt temporary file identity is invalid.");
-		temporaryIdentity = {
-			dev: stat.dev,
-			ino: stat.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			sha256: createHash("sha256").update(bytes).digest("hex"),
-		};
+		temporaryIdentity = await captureOpenedLifecycleFileIdentity(handle);
+		if (temporaryIdentity.sha256 !== createHash("sha256").update(stagedBytes).digest("hex"))
+			throw new Error("Lifecycle failure receipt temp contents changed during startup.");
 		await handle.close();
 		handle = undefined;
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent identity changed before publication.");
 		try {
 			await fs.link(temporary, target);
 			published = true;
+			targetIdentity = temporaryIdentity;
 			directoryChanged = true;
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent identity changed after publication.");
 		} catch (writeError) {
 			if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent identity changed during collision check.");
 			const existing = await readLifecycleFailureArtifact(target, artifact);
-			if (!existing?.bytes.equals(bytes)) throw new Error("Lifecycle startup failure artifact collision.");
+			if (existing?.bytes.equals(finalBytes)) {
+				existingFinal = true;
+				targetIdentity = existing.identity;
+			} else if (existing?.bytes.equals(stagedBytes)) {
+				targetIdentity = existing.identity;
+			} else {
+				throw new Error("Lifecycle startup failure artifact collision.");
+			}
 		}
-		await fs.rm(temporary, { force: true });
+		if (!removeLifecyclePublicationFile(temporary, temporaryIdentity, parentIdentity, true))
+			throw new Error("The exact lifecycle failure temporary file could not be removed.");
 		directoryChanged = true;
 		await syncDirectory(directory);
+		if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent identity changed after staging sync.");
+		if (completeRollback && completeRollbackPromotionAvailable && !existingFinal) {
+			if (!targetIdentity) throw new Error("Lifecycle failure receipt promotion lacks exact staging identity.");
+			promotionFence = await writeLifecycleFailurePromotionFence(
+				target,
+				artifact,
+				finalBytes,
+				parentIdentity,
+				parentStillOwned,
+			);
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion fencing.");
+			const promoted = await replaceOwnedFailureReceipt(directory, target, artifact, targetIdentity, parentIdentity);
+			if (!promoted) {
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				let safeIncompleteState = current?.bytes.equals(stagedBytes) === true;
+				if (current?.bytes.equals(finalBytes)) {
+					safeIncompleteState = await replaceOwnedFailureReceipt(
+						directory,
+						target,
+						stagedArtifact,
+						current.identity,
+						parentIdentity,
+					);
+					if (!safeIncompleteState)
+						safeIncompleteState = removeOwnedFailurePublicationFile(target, current.identity, parentIdentity);
+				}
+				if (!safeIncompleteState)
+					throw new LifecycleFailurePublicationCleanupError(
+						new Error("Failed complete rollback publication could not be downgraded or revoked."),
+					);
+				throw new LifecycleFailurePublicationCleanupError(
+					new Error("Complete rollback receipt promotion was not durably confirmed."),
+				);
+			}
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned()) throw new Error("Lifecycle failure receipt parent changed after promotion sync.");
+			if (!removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity))
+				throw new LifecycleFailurePublicationCleanupError(
+					new Error("The durable failure receipt promotion fence could not be removed."),
+				);
+			promotionFence = undefined;
+			directoryChanged = true;
+			await syncDirectory(directory);
+			if (!parentStillOwned())
+				throw new Error("Lifecycle failure receipt parent changed after promotion fence removal.");
+		}
 	} catch (error) {
 		const cleanupErrors: unknown[] = [];
-		if (handle) {
+		if (temporaryCreatedByUs && !temporaryIdentity && handle) {
 			try {
-				await handle.close();
+				temporaryIdentity = await captureOpenedLifecycleFileIdentity(handle);
 			} catch (cleanupError) {
 				cleanupErrors.push(cleanupError);
 			}
 		}
+		if (handle) await handle.close().catch(cleanupError => cleanupErrors.push(cleanupError));
 		if (temporaryCreatedByUs && temporaryIdentity) {
-			if (published && !removeOwnedFailurePublicationFile(target, temporaryIdentity, parentIdentity)) {
-				const downgraded = await replaceOwnedFailureReceiptWithIncomplete(
-					directory,
-					target,
-					artifact,
-					temporaryIdentity,
-					parentIdentity,
-				);
-				if (!downgraded)
-					cleanupErrors.push(
-						new Error("The published lifecycle failure receipt could not be revoked or downgraded."),
+			if (published) {
+				const current = await readLifecycleFailureArtifact(target, artifact, true);
+				if (current?.bytes.equals(finalBytes) && !existingFinal) {
+					const downgraded = await replaceOwnedFailureReceipt(
+						directory,
+						target,
+						stagedArtifact,
+						current.identity,
+						parentIdentity,
 					);
+					if (!downgraded && !removeOwnedFailurePublicationFile(target, current.identity, parentIdentity))
+						cleanupErrors.push(
+							new Error("The all-true lifecycle failure receipt could not be downgraded or revoked."),
+						);
+				} else if (current?.bytes.equals(stagedBytes) && !existingFinal) {
+					if (!removeOwnedFailurePublicationFile(target, current.identity, parentIdentity))
+						cleanupErrors.push(new Error("The incomplete lifecycle failure receipt could not be revoked."));
+				}
 			}
 			if (!removeOwnedFailurePublicationFile(temporary, temporaryIdentity, parentIdentity))
 				cleanupErrors.push(new Error("The exact lifecycle failure temporary file could not be removed."));
 			directoryChanged = true;
 		} else if (temporaryCreatedByUs) {
-			try {
-				await fs.rm(temporary, { force: true });
-				directoryChanged = true;
-			} catch (cleanupError) {
-				cleanupErrors.push(cleanupError);
-			}
+			cleanupErrors.push(new Error("Lifecycle failure receipt temp identity was unavailable for cleanup."));
 		}
 		if (directoryChanged) {
 			try {
@@ -2273,15 +2445,71 @@ export async function writeSessionLifecycleFailure(
 				cleanupErrors.push(cleanupError);
 			}
 		}
+		if (promotionFence) {
+			const current = await readLifecycleFailureArtifact(target, artifact, true);
+			const targetAbsent = (() => {
+				try {
+					fsSync.lstatSync(target);
+					return false;
+				} catch (error) {
+					return (error as NodeJS.ErrnoException).code === "ENOENT";
+				}
+			})();
+			if (!targetAbsent && !current?.bytes.equals(stagedBytes)) {
+				cleanupErrors.push(
+					new Error("Lifecycle failure promotion fence retained because canonical state is unresolved."),
+				);
+			} else {
+				let canonicalStateSynced = false;
+				try {
+					await syncDirectory(directory);
+					canonicalStateSynced = true;
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+				if (canonicalStateSynced) {
+					if (removeLifecyclePublicationFile(promotionFence.path, promotionFence.identity, parentIdentity)) {
+						promotionFence = undefined;
+						try {
+							await syncDirectory(directory);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+						}
+					} else {
+						cleanupErrors.push(new Error("Lifecycle failure promotion fence could not be exactly removed."));
+					}
+				} else {
+					cleanupErrors.push(
+						new Error("Lifecycle failure promotion fence retained without durable canonical state."),
+					);
+				}
+			}
+		}
 		if (cleanupErrors.length > 0)
 			throw new LifecycleFailurePublicationCleanupError(new AggregateError([error, ...cleanupErrors]));
 		throw error;
 	}
 }
 
+function lifecycleFailurePromotionIsPending(file: string, parentIdentity: { dev: string; ino: string }): boolean {
+	const parentPath = path.dirname(file);
+	const before = lifecycleParentIdentity(parentPath);
+	if (!before || before.dev !== parentIdentity.dev || before.ino !== parentIdentity.ino) return true;
+	let pending: boolean;
+	try {
+		fsSync.lstatSync(lifecycleFailurePromotionPath(file));
+		pending = true;
+	} catch (error) {
+		pending = (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+	const after = lifecycleParentIdentity(parentPath);
+	return pending || !after || after.dev !== parentIdentity.dev || after.ino !== parentIdentity.ino;
+}
+
 async function readLifecycleFailureArtifact(
 	file: string,
 	expected: EffectMarker,
+	allowPromotionFence = false,
 ): Promise<
 	| {
 			artifact: LifecycleFailureArtifact;
@@ -2293,6 +2521,9 @@ async function readLifecycleFailureArtifact(
 > {
 	let handle: fs.FileHandle | undefined;
 	try {
+		const parentPath = path.dirname(file);
+		const parentIdentity = lifecycleParentIdentity(parentPath);
+		if (!parentIdentity) return undefined;
 		handle = await fs.open(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile() || stat.nlink !== 1n || stat.size > 4096n) return undefined;
@@ -2305,6 +2536,21 @@ async function readLifecycleFailureArtifact(
 			!isLifecycleFailureArtifact(value) ||
 			!sameEffectMarker(value, expected) ||
 			canonicalJson(value) !== decodeLifecycleUtf8(raw)
+		)
+			return undefined;
+		// A complete rollback receipt on Windows lacks a durable directory-entry
+		// commit witness because Node cannot flush the containing directory here.
+		if (process.platform === "win32" && hasCompleteFailureRollback(value.rollback)) return undefined;
+		const parentAfterRead = lifecycleParentIdentity(parentPath);
+		if (!parentAfterRead || parentAfterRead.dev !== parentIdentity.dev || parentAfterRead.ino !== parentIdentity.ino)
+			return undefined;
+		const promotionPending = lifecycleFailurePromotionIsPending(file, parentIdentity);
+		const parentAfterFence = lifecycleParentIdentity(parentPath);
+		if (
+			!parentAfterFence ||
+			parentAfterFence.dev !== parentIdentity.dev ||
+			parentAfterFence.ino !== parentIdentity.ino ||
+			(!allowPromotionFence && promotionPending)
 		)
 			return undefined;
 		return {
