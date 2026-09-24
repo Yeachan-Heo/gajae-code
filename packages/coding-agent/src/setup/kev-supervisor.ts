@@ -18,6 +18,8 @@ export const SERVICE_SHIM_FILE = "kev-service.py";
 export const CONTROL_FILE = "control.sock";
 /** Names the inherited pipe the service watches; kept out of argv so ownership text stays fixed. */
 export const WATCH_FD_ENV = "GJC_KEV_WATCH_FD";
+/** Second stdin line, written only once the ownership record is durable. */
+export const KEV_COMMIT_LINE = "start";
 /** macOS `sun_path` is 104 bytes including the terminator; bind must never silently truncate. */
 export const CONTROL_SOCKET_PATH_MAX = 103;
 /** Longer than the supervisor's terminate grace so a legitimate slow shutdown is still observed. */
@@ -216,6 +218,9 @@ MAX_REQUEST = 256 * 1024
 MAX_RESPONSE = 64 * 1024
 SUN_PATH_MAX = 103
 TOKEN_LENGTH = 64
+# Second stdin line. The caller sends it only after the ownership record is on
+# disk, so nothing this supervisor starts can outlive an unrecorded start.
+COMMIT_LINE = "${KEV_COMMIT_LINE}"
 INFER_TIMEOUT_SECONDS = 60.0
 # Fixed: callers choose neither host, port nor path, so this channel can only ever
 # reach the server this supervisor started.
@@ -364,10 +369,6 @@ def main(argv):
     if len(socket_path.encode("utf-8")) > SUN_PATH_MAX:
         fail("control socket path is too long for AF_UNIX")
     token = sys.stdin.readline().strip()
-    try:
-        sys.stdin.close()
-    except OSError:
-        pass
     if len(token) != TOKEN_LENGTH:
         fail("control token was not delivered on stdin")
 
@@ -385,6 +386,20 @@ def main(argv):
         listener.settimeout(0.25)
     finally:
         os.umask(previous_umask)
+
+    # Commit barrier. The caller writes this line only once the ownership record
+    # is durable, and it holds the other end of this pipe. A caller that dies
+    # first — SIGKILL included — closes stdin, the read below returns EOF, and
+    # nothing is ever spawned. Without it a start that was never recorded could
+    # leave a detached supervisor and server that no later command can find.
+    commit = sys.stdin.readline()
+    try:
+        sys.stdin.close()
+    except OSError:
+        pass
+    if commit.strip() != COMMIT_LINE:
+        cleanup(listener, socket_path)
+        return 0
 
     # The child inherits the read end and this process keeps the write end open
     # without ever writing to it. Whatever ends this process — clean exit, crash,

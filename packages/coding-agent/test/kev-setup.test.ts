@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,6 +9,7 @@ import {
 	controlInferRequest,
 	controlRequest,
 	controlSocketPathIsBindable,
+	KEV_COMMIT_LINE,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
@@ -131,6 +133,7 @@ async function fixture() {
 	const spawned: string[][] = [];
 	const killedHandles: number[] = [];
 	const control: Array<{ socket: string; request: Record<string, unknown> }> = [];
+	const commits: Array<{ recordExists: boolean }> = [];
 	/** Stand-in for the real Python supervisor: only a matching token moves its child. */
 	const supervisor = {
 		pid: undefined as number | undefined,
@@ -163,6 +166,11 @@ async function fixture() {
 			supervisor.running = true;
 			return {
 				pid,
+				commit() {
+					// Record what the record looked like at the moment the supervisor was
+					// released, so a test can prove the ordering rather than the call.
+					commits.push({ recordExists: fsSync.existsSync(path.join(root, "server.json")) });
+				},
 				unref() {},
 				kill() {
 					killedHandles.push(pid);
@@ -190,7 +198,20 @@ async function fixture() {
 		readyTimeoutMs: 1,
 		stopTimeoutMs: 1,
 	};
-	return { root, base, stateDir, snapshot, calls, processes, spawned, killedHandles, control, supervisor, deps };
+	return {
+		root,
+		base,
+		stateDir,
+		snapshot,
+		calls,
+		processes,
+		spawned,
+		killedHandles,
+		control,
+		commits,
+		supervisor,
+		deps,
+	};
 }
 
 async function privateJson(file: string, value: unknown): Promise<void> {
@@ -440,6 +461,27 @@ describe("Kev lifecycle", () => {
 		expect(await runKevSetup("stop", {}, f.deps)).toMatchObject({ state: "stopped" });
 	});
 
+	test("the supervisor is released to start only after the record is durable", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		await runKevSetup("start", {}, f.deps);
+		// One commit, and server.json already existed when it happened. A commit
+		// before publication would leave a running service no command can find.
+		expect(f.commits).toEqual([{ recordExists: true }]);
+	});
+
+	test("a start that cannot publish its record never releases the supervisor", async () => {
+		const f = await fixture();
+		await runKevSetup("install", { root: f.root }, f.deps);
+		// Publication fails: server.json's parent is replaced by a file, so the
+		// atomic write cannot land.
+		f.deps.inspect = () => undefined;
+		await expect(runKevSetup("start", {}, f.deps)).rejects.toThrow("process identity");
+		expect(f.commits).toEqual([]);
+		expect(f.killedHandles).toEqual([42]);
+		expect(await Bun.file(path.join(f.root, "server.json")).exists()).toBe(false);
+	});
+
 	test("an unconfirmed child exit is never acknowledged as a stop", async () => {
 		// The port is free and the supervisor answered — but it never reaped its
 		// child, so nothing here has proven the service is gone.
@@ -579,6 +621,84 @@ describe("Kev lifecycle lock", () => {
 const python = Bun.which("python3");
 
 describe.skipIf(!python)("Kev supervisor process", () => {
+	/**
+	 * A stand-in caller: it launches the supervisor with stdin as a pipe, writes
+	 * the token, optionally commits, then sleeps holding the pipe open. Killing it
+	 * is what a `gjc` process dying mid-start looks like to the supervisor.
+	 */
+	function callerSource(supervisorScript: string, socketPath: string, port: number, token: string, commit: boolean) {
+		const childArgs = JSON.stringify([python!, "-c", "import time; time.sleep(120)"]);
+		const argv = JSON.stringify([python!, supervisorScript, "--socket", socketPath, "--port", String(port), "--"]);
+		return [
+			"import json, subprocess, sys, time",
+			`argv = json.loads(${JSON.stringify(argv)}) + json.loads(${JSON.stringify(childArgs)})`,
+			"child = subprocess.Popen(argv, stdin=subprocess.PIPE)",
+			`child.stdin.write(b"${token}\\n")`,
+			...(commit ? [`child.stdin.write(b"${KEV_COMMIT_LINE}\\n")`] : []),
+			"child.stdin.flush()",
+			"sys.stdout.write(str(child.pid) + chr(10))",
+			"sys.stdout.flush()",
+			"time.sleep(120)",
+		].join("\n");
+	}
+
+	async function runCaller(base: string, socketPath: string, port: number, token: string, commit: boolean) {
+		const supervisorScript = path.join(base, "supervisor.py");
+		await Bun.write(supervisorScript, KEV_SUPERVISOR_SOURCE);
+		await fs.chmod(supervisorScript, 0o600);
+		const caller = Bun.spawn([python!, "-c", callerSource(supervisorScript, socketPath, port, token, commit)], {
+			cwd: base,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		spawnedPids.push(caller.pid);
+		const reader = caller.stdout.getReader();
+		const announced = await reader.read();
+		await reader.cancel().catch(() => undefined);
+		const supervisorPid = Number(new TextDecoder().decode(announced.value).trim());
+		spawnedPids.push(supervisorPid);
+		return { caller, supervisorPid };
+	}
+
+	test("a caller killed before committing leaves nothing running", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-commit-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+		expect(port).toBeDefined();
+		const token = "f".repeat(64);
+
+		const { caller, supervisorPid } = await runCaller(base, socketPath, port!, token, false);
+		// The supervisor is up and blocked on the commit line; it has started nothing.
+		expect(await until(() => pathExists(socketPath))).toBe(true);
+		expect(loopbackPortIsFree(port!)).toBe(true);
+
+		nativeKill(caller.pid, "SIGKILL");
+		await caller.exited;
+		// Losing the caller closes stdin, so the supervisor exits without spawning.
+		expect(await until(() => processIsGone(supervisorPid))).toBe(true);
+		expect(await until(async () => !(await pathExists(socketPath)))).toBe(true);
+		expect(loopbackPortIsFree(port!)).toBe(true);
+	}, 60_000);
+
+	test("the same caller that commits does start the service", async () => {
+		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-commit-ok-"));
+		roots.push(base);
+		await fs.chmod(base, 0o700);
+		const socketPath = path.join(base, "control.sock");
+		const port = reservedLoopbackPort();
+		expect(port).toBeDefined();
+		const token = "e".repeat(64);
+
+		const { supervisorPid } = await runCaller(base, socketPath, port!, token, true);
+		expect(await until(() => pathExists(socketPath))).toBe(true);
+		const started = await kevControl(socketPath, controlRequest("status", token));
+		expect(started).toMatchObject({ ok: true, state: "running" });
+		spawnedPids.push(started!.pid!);
+		expect(processIsGone(supervisorPid)).toBe(false);
+	}, 60_000);
+
 	test("a SIGKILLed supervisor takes its server down and frees the port", async () => {
 		const base = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-kev-crash-"));
 		roots.push(base);
@@ -617,7 +737,7 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
 		);
 		spawnedPids.push(supervisor.pid);
-		supervisor.stdin.write(`${token}\n`);
+		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
 		supervisor.stdin.end();
 
 		expect(await until(() => pathExists(socketPath))).toBe(true);
@@ -668,7 +788,7 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 			{ cwd: base, stdin: "pipe", stdout: "ignore", stderr: "pipe" },
 		);
 		spawnedPids.push(supervisor.pid);
-		supervisor.stdin.write(`${token}\n`);
+		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
 		supervisor.stdin.end();
 		expect(await until(() => pathExists(socketPath))).toBe(true);
 		const started = await kevControl(socketPath, controlRequest("status", token));
@@ -714,7 +834,7 @@ describe.skipIf(!python)("Kev supervisor process", () => {
 			{ stdin: "pipe", stdout: "pipe", stderr: "pipe" },
 		);
 		spawnedPids.push(supervisor.pid);
-		supervisor.stdin.write(`${token}\n`);
+		supervisor.stdin.write(`${token}\n${KEV_COMMIT_LINE}\n`);
 		supervisor.stdin.end();
 
 		for (let attempt = 0; attempt < 200; attempt++) {

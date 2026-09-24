@@ -10,6 +10,7 @@ import {
 	controlRequest,
 	controlSocketPathIsBindable,
 	isConfirmedStop,
+	KEV_COMMIT_LINE,
 	KEV_SERVICE_SHIM_SOURCE,
 	KEV_SUPERVISOR_SOURCE,
 	type KevControlReply,
@@ -80,6 +81,12 @@ export interface KevSpawnOptions extends KevCommandOptions {
 }
 export interface KevChild {
 	pid: number;
+	/**
+	 * Release the supervisor to start the service. Called only after the ownership
+	 * record is durable; until then the supervisor is blocked on stdin, so a caller
+	 * that dies leaves nothing running.
+	 */
+	commit(): void;
 	unref(): void;
 	kill(): void;
 }
@@ -478,11 +485,17 @@ function spawnDefault(argv: string[], options: KevSpawnOptions): KevChild {
 		stderr: options.logFd,
 	});
 	// The token travels on stdin only: argv and the environment are readable by
-	// any local process, and the log file would persist it on disk.
+	// any local process, and the log file would persist it on disk. stdin stays
+	// open afterwards — it is the commit barrier, and closing it without a commit
+	// is exactly how a dead caller tells the supervisor to start nothing.
 	child.stdin.write(`${options.token}\n`);
-	child.stdin.end();
+	child.stdin.flush();
 	return {
 		pid: child.pid,
+		commit: () => {
+			child.stdin.write(`${KEV_COMMIT_LINE}\n`);
+			child.stdin.end();
+		},
 		unref: () => child.unref(),
 		kill: () => {
 			child.kill("SIGTERM");
@@ -566,6 +579,10 @@ async function startKev(root: string, options: KevSetupOptions, deps: KevSetupDe
 		};
 		await writePrivate(path.join(root, SERVICE_FILE), record);
 		published = true;
+		// Only now may the supervisor start anything. Everything above is
+		// recoverable by a later command; a service started before this point
+		// would not be.
+		child.commit();
 		child.unref();
 		const deadline = Date.now() + (deps.readyTimeoutMs ?? 30_000);
 		do {
