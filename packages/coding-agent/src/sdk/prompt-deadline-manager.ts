@@ -111,6 +111,10 @@ export class PromptDeadlineManager {
 		correlation: InvocationCorrelation,
 		isCurrent: () => boolean,
 	) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
+	readonly #onDeadlinePublishTerminal?: (
+		correlation: InvocationCorrelation,
+		isCurrent: () => boolean,
+	) => boolean | Promise<boolean>;
 	readonly #onDeadlineExceeded?: (
 		correlation: InvocationCorrelation,
 		signal: AbortSignal,
@@ -129,6 +133,10 @@ export class PromptDeadlineManager {
 			correlation: InvocationCorrelation,
 			isCurrent: () => boolean,
 		) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
+		onDeadlinePublishTerminal?: (
+			correlation: InvocationCorrelation,
+			isCurrent: () => boolean,
+		) => boolean | Promise<boolean>;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
 		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
@@ -159,6 +167,7 @@ export class PromptDeadlineManager {
 		this.#onExpired = options.onExpired;
 		this.#onDeadlineStarted = options.onDeadlineStarted;
 		this.#onDeadlineTerminalization = options.onDeadlineTerminalization;
+		this.#onDeadlinePublishTerminal = options.onDeadlinePublishTerminal;
 		this.#onDeadlineExceeded = options.onDeadlineExceeded;
 		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
 	}
@@ -308,7 +317,15 @@ export class PromptDeadlineManager {
 		}) as PromptDeadlineOutcome;
 		let winner: SdkPromptTerminalOutcome = outcome;
 		try {
-			const claimed = await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			const claimed =
+				"listDeadlineRecoveryPendingPrompts" in this.#reconciliation
+					? await (this.#reconciliation as InvocationReconciliation).claimPendingOutcome(
+							"prompt",
+							correlation,
+							outcome,
+							lease.acceptedAt + lease.maxMs,
+						)
+					: await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
 			if (claimed !== undefined) winner = claimed;
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
@@ -367,15 +384,37 @@ export class PromptDeadlineManager {
 		// while the bounded git operation runs and renews the lease.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
 		if (this.#pendingTerminalTransitions.has(key)) {
-			this.#deadlineTerminalizationConfirmed.add(key);
 			const failureReason = this.#pendingTerminalFailureReasons.get(key);
-			try {
-				if (failureReason !== undefined) {
+			if (failureReason !== undefined) {
+				try {
 					await this.#reconciliation.noteTransition("prompt", correlation, {
 						type: "agent_failed",
 						error: Object.assign(new Error(failureReason.message), { code: failureReason.code }),
 					} as never);
+					this.#pendingTerminalFailureReasons.delete(key);
+				} catch {
+					this.#retry(key);
+					return;
 				}
+			}
+			if (this.#deadlineDeferredTerminalTransitions.has(key) && this.#onDeadlinePublishTerminal !== undefined) {
+				let published = false;
+				try {
+					published = await this.#onDeadlinePublishTerminal(correlation, () => {
+						const current = this.#leases.get(key);
+						return (
+							current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
+						);
+					});
+				} catch {}
+				if (!published) {
+					if (this.#backOffIfSuperseded(key, lease, generation)) return;
+					this.#recoverUncertainty(key, correlation, lease, lease.generation);
+					return;
+				}
+			}
+			this.#deadlineTerminalizationConfirmed.add(key);
+			try {
 				await this.#reconciliation.noteTransition("prompt", correlation, {
 					type: "agent_end",
 					...this.#pendingTerminalEvidence.get(key),
@@ -384,7 +423,6 @@ export class PromptDeadlineManager {
 				this.#retry(key);
 				return;
 			}
-			if (this.#backOffIfSuperseded(key, lease, generation)) return;
 			this.#expiryRetries.delete(key);
 			try {
 				this.#onExpired?.(correlation);
