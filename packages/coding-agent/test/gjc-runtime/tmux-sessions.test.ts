@@ -278,13 +278,69 @@ describe("GJC tmux session management", () => {
 		]);
 	});
 
-	it("still rejects malformed tmux session rows that break field alignment", () => {
-		spyOn(Bun, "spawnSync").mockReturnValue(
-			spawnResult(0, "foreign session:glyph\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\t\t$1\textra"),
-		);
+	it("skips a tabbed foreign session name before parsing managed rows", () => {
+		const env = { GJC_TMUX_COMMAND: "tmux-test" };
+		const foreignRow = [
+			"foreign\tname",
+			"1",
+			"0",
+			"1770000000",
+			"1",
+			"root",
+			"0",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"",
+			"$1",
+		].join("\t");
+		const managedRow = [
+			"gajae_code_visible",
+			"1",
+			"0",
+			"1770000000",
+			"1",
+			"root",
+			"1",
+			"",
+			"",
+			"",
+			"",
+			"session-visible",
+			"",
+			"generation-visible",
+			"",
+			"",
+			"$2",
+		].join("\t");
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation(command => {
+			const commandArgv = spawnArgv(command);
+			if (commandArgv.includes("list-sessions"))
+				return spawnResult(
+					0,
+					commandArgv.at(-1) === "#{session_name}"
+						? "foreign\tname\ngajae_code_visible\n"
+						: `${foreignRow}\n${managedRow}`,
+				);
+			if (commandArgv.includes("show-options")) {
+				const option = commandArgv.at(-1);
+				const value =
+					option === "@gjc-project" ? "/repo" : option === "@gjc-session-state-file" ? "/state/marker" : "";
+				return spawnResult(0, `${value}\n`);
+			}
+			return spawnResult(0, "");
+		});
 		clearPsmuxDetectionCache();
 
-		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow("gjc_tmux_session_row_malformed");
+		expect(listGjcTmuxSessions(env).map(session => session.name)).toEqual(["gajae_code_visible"]);
+		expect(() => statusGjcTmuxSession("gajae_code_missing", env)).toThrow(
+			"gjc_tmux_session_not_found:gajae_code_missing",
+		);
 	});
 
 	it("returns an empty list when tmux has no server", () => {

@@ -347,8 +347,13 @@ function isSafeGjcTmuxSessionName(name: string): boolean {
 }
 
 function parseSessionLine(line: string, validateName = true): GjcTmuxSessionStatus | null {
-	const fields = line.split("\t");
-	if (fields.length > 17) throw new Error("gjc_tmux_session_row_malformed");
+	let fields = line.split("\t");
+	if (fields.length > 17) {
+		// Path-valued options are not in this row. Surplus leading columns therefore
+		// belong to an untrusted session name; reassemble it before the GJC-name filter.
+		const nameFieldCount = fields.length - 16;
+		fields = [fields.slice(0, nameFieldCount).join("\t"), ...fields.slice(nameFieldCount)];
+	}
 	while (fields.length < 17) fields.push("");
 	const [
 		name = "",
@@ -515,10 +520,9 @@ function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env, validateN
 	const listed = runListSessions("#{session_name}", env);
 	return listed.lines.map(line => {
 		// psmux may ignore `-F` and return its prose shape. runListSessions
-		// synthesizes a tabular row for that case; only unwrap that known shape,
-		// while rejecting literal tabs from a native provider's session name.
+		// synthesizes a tabular row for that case. Native session names stay raw
+		// here so an unsafe foreign name cannot break a managed-name lookup.
 		const columns = line.split("\t");
-		if (!listed.synthetic && columns.length > 1) throw new Error("gjc_tmux_session_row_malformed");
 		const name = listed.synthetic ? (columns[0] ?? line) : line;
 		if (validateNames) assertSafeGjcTmuxSessionName(name);
 		return name;
