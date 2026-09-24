@@ -324,7 +324,7 @@ export class LaunchWorktreeGuardError extends Error {
 	readonly code: string;
 
 	constructor(code: string, message: string) {
-		super(message);
+		super(safeLaunchDiagnostic(message));
 		this.name = "LaunchWorktreeGuardError";
 		this.code = code;
 	}
@@ -339,12 +339,12 @@ export class LaunchWorktreeGuardError extends Error {
  */
 function launchGuard(code: string, detail?: string, ...lines: string[]): LaunchWorktreeGuardError {
 	const head = detail ? `${code}:${detail}` : code;
-	return new LaunchWorktreeGuardError(code, safeLaunchDiagnostic([head, ...lines].join("\n")));
+	return new LaunchWorktreeGuardError(code, [head, ...lines].join("\n"));
 }
 
 /** Guard whose message is a code line followed by explanatory lines. */
 function launchGuardLines(code: string, ...lines: string[]): LaunchWorktreeGuardError {
-	return new LaunchWorktreeGuardError(code, safeLaunchDiagnostic([code, ...lines].join("\n")));
+	return new LaunchWorktreeGuardError(code, [code, ...lines].join("\n"));
 }
 
 function safeLaunchDiagnostic(message: string): string {

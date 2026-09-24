@@ -966,6 +966,24 @@ describe("launch guard classification", () => {
 		expect(asLaunchWorktreeGuardError(guard)).toBe(guard);
 	});
 
+	it("sanitizes direct-constructor diagnostics", () => {
+		const secret = "DirectConstructorSecret123";
+		const guard = new LaunchWorktreeGuardError(
+			"worktree_dirty",
+			`Bearer ${secret}\u001b]52;c;forged\u0007${"界".repeat(20_000)}`,
+		);
+
+		expect(guard.name).toBe("LaunchWorktreeGuardError");
+		expect(guard.code).toBe("worktree_dirty");
+		expect(guard.message).not.toContain(secret);
+		expect(guard.message).toContain("«redacted-auth»");
+		expect(guard.message).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F]/u);
+		expect(guard.message).toContain("\\u001b");
+		expect(guard.message).toContain("\\u0007");
+		expect(Buffer.byteLength(guard.message, "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(guard.message).toContain("[launch diagnostic truncated]");
+	});
+
 	it("classifies path conflicts on the cancellable preparation path", async () => {
 		const repo = await createRepo("gjc-cancellable-guard-");
 		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "occupied" });
