@@ -4139,9 +4139,8 @@ export class AgentSession {
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
 		const queued = this.#coordinatorPersistQueue.then(run, run);
-		void queued.catch(error => {
-			this.#coordinatorPersistFailuresForTests?.push(error);
-		});
+		const testFailures = this.#coordinatorPersistFailuresForTests;
+		if (testFailures) void queued.catch(error => testFailures.push(error));
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
 	}
