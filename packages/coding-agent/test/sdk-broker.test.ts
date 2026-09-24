@@ -34,6 +34,7 @@ import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	setLifecycleCommandResolverForTest,
 	terminalUncertainStartupMessage,
 	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
@@ -250,6 +251,55 @@ it("never lets the master capability cross into a cold-started broker", () => {
 	});
 	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
 	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
+	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
+it("strips inherited TUI session identity from a cold-started broker", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {});
+	const environment = brokerSpawnEnvironmentForTest(command, {
+		PATH: process.env.PATH,
+		GJC_SESSION_ID: "tui-session",
+		GJC_SESSION_CWD: "/tui/workspace",
+		GJC_COORDINATOR_SESSION_ID: "tui-coordinator-session",
+		GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/tui-state.json",
+		GJC_COORDINATOR_SESSION_BRANCH: "tui-branch",
+		GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED: "true",
+		GJC_COORDINATOR_SIDECAR_SIGNING_KEY: "tui-signing-key",
+		GJC_TMUX_SESSION: "tui-tmux-session",
+		GJC_TMUX_ACTIVE_SESSION: "tui-tmux-session",
+		GJC_TMUX_LAUNCHED: "1",
+		GJC_TMUX_OWNER_GENERATION: "tui-owner-generation",
+		GJC_TMUX_OWNER_STATE_DIR: "/tmp/tui-owner-state",
+		GJC_TMUX_OWNER_SERVER_KEY: "tui-server-key",
+		GJC_MANAGED_OWNER_RUN_ID: "tui-owner-run",
+		TMUX: "/tmp/tmux,1234,0",
+		TMUX_PANE: "%7",
+		GJC_TMUX_COMMAND: "custom-tmux",
+		GJC_TMUX_PROFILE: "1",
+		OWNED_SENTINEL: "kept",
+	});
+
+	for (const name of [
+		"GJC_SESSION_ID",
+		"GJC_SESSION_CWD",
+		"GJC_COORDINATOR_SESSION_ID",
+		"GJC_COORDINATOR_SESSION_STATE_FILE",
+		"GJC_COORDINATOR_SESSION_BRANCH",
+		"GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED",
+		"GJC_COORDINATOR_SIDECAR_SIGNING_KEY",
+		"GJC_TMUX_SESSION",
+		"GJC_TMUX_ACTIVE_SESSION",
+		"GJC_TMUX_LAUNCHED",
+		"GJC_TMUX_OWNER_GENERATION",
+		"GJC_TMUX_OWNER_STATE_DIR",
+		"GJC_TMUX_OWNER_SERVER_KEY",
+		"GJC_MANAGED_OWNER_RUN_ID",
+		"TMUX",
+		"TMUX_PANE",
+	])
+		expect(environment[name]).toBeUndefined();
+	expect(environment.GJC_TMUX_COMMAND).toBe("custom-tmux");
+	expect(environment.GJC_TMUX_PROFILE).toBe("1");
 	expect(environment.OWNED_SENTINEL).toBe("kept");
 });
 
@@ -2486,6 +2536,52 @@ describe("SDK broker identity and discovery", () => {
 		} finally {
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("ignores terminal legacy rows for fresh creates but keeps live legacy rows ambiguous", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
+		const broker = new Broker({ agentDir: path.join(root, "agent") });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(broker, () => {
+			launchAttempts += 1;
+			return { file: path.join(root, "missing-gjc"), args: [] };
+		});
+		try {
+			await broker.start();
+			for (const [identity, state] of [
+				["legacy-terminal-ok", "terminal_ok"],
+				["legacy-terminal-error", "terminal_error"],
+			] as const) {
+				await broker.ledger.begin(identity, `legacy-request-${identity}`);
+				await broker.ledger.transition(identity, state, {
+					response:
+						state === "terminal_ok"
+							? { ok: true, result: { sessionId: identity } }
+							: { ok: false, error: { code: "fixture_error", message: "legacy terminal error" } },
+				});
+				expect(broker.ledger.get(identity)?.operationKey).toBeUndefined();
+			}
+
+			await expect(
+				broker.handleRequest("session.create", { cwd: root }, "fresh-after-upgrade"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "spawn_failed" },
+			});
+			expect(launchAttempts).toBe(1);
+
+			await broker.ledger.begin("legacy-in-flight", "legacy-request-in-flight");
+			await expect(broker.handleRequest("session.create", { cwd: root }, "fresh-with-live-legacy")).resolves.toEqual(
+				{
+					ok: false,
+					error: { code: "idempotency_conflict", message: "legacy lifecycle request has an ambiguous target" },
+				},
+			);
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 	it("binds session.delete to the requested session header and configured storage root", async () => {
