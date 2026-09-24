@@ -119,6 +119,12 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getPendingNextTurnMessagesForTests": "read-only test seam, not a user-facing SDK control seam",
 	"agent_session:queueCoordinatorRuntimeStatePersistForTests":
 		"test-only coordinator persistence ordering seam, not a user-facing SDK control seam",
+	"agent_session:trackCoordinatorRuntimeStatePersistenceFailuresForTests":
+		"test-only coordinator persistence failure observation seam, not a user-facing SDK control seam",
+	"agent_session:setCoordinatorRuntimeStateFileForTests":
+		"test-only coordinator runtime state file setup seam, not a user-facing SDK control seam",
+	"agent_session:getCoordinatorRuntimeStateFileForTests":
+		"read-only test-only coordinator runtime state file accessor, not a user-facing SDK control seam",
 	"agent_session:awaitCoordinatorRuntimeStatePersistenceForTests":
 		"test-only coordinator persistence drain barrier, not a user-facing SDK control seam",
 	"agent_session:parkAgentEndForCoordinatorPersistForTests":

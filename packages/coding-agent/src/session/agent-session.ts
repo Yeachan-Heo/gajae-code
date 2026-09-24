@@ -3633,6 +3633,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#coordinatorRuntimeStateFileOverrideForTests: string | undefined = undefined;
 	#unregisterBeforeMoveListener?: () => void;
 	#unregisterMoveAbortListener?: () => void;
 	#unregisterMovePublicationListener?: () => void;
@@ -4138,6 +4139,8 @@ export class AgentSession {
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
 		const queued = this.#coordinatorPersistQueue.then(run, run);
+		const testFailures = this.#coordinatorPersistFailuresForTests;
+		if (testFailures) void queued.catch(error => testFailures.push(error));
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
 	}
@@ -6910,6 +6913,7 @@ export class AgentSession {
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+	#coordinatorPersistFailuresForTests: unknown[] | undefined;
 
 	#recordPostPublicationOutcome(
 		context: CoordinatorRuntimeStatePersistContext,
@@ -6975,6 +6979,9 @@ export class AgentSession {
 	 */
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
+		if (this.#coordinatorRuntimeStateFileOverrideForTests) {
+			return this.#coordinatorRuntimeStateFileOverrideForTests;
+		}
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
 		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
@@ -7055,6 +7062,7 @@ export class AgentSession {
 					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
 				);
 				if (propagateFailure) throw error;
+				this.#coordinatorPersistFailuresForTests?.push(error);
 				return;
 			}
 		}
@@ -10152,6 +10160,20 @@ export class AgentSession {
 		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
 	}
 
+	/** Bind coordinator runtime-state persistence to this session in tests. */
+	setCoordinatorRuntimeStateFileForTests(stateFile: string): void {
+		if (!path.isAbsolute(stateFile)) {
+			throw new Error("Coordinator runtime-state test path must be absolute.");
+		}
+		this.#coordinatorRuntimeStateFileOverrideForTests = path.resolve(stateFile);
+		this.#registerRuntimeStateFinalizer();
+	}
+
+	/** Read the test-only coordinator runtime-state path bound to this session. */
+	getCoordinatorRuntimeStateFileForTests(): string | undefined {
+		return this.#coordinatorRuntimeStateFileOverrideForTests;
+	}
+
 	trackPostPromptTaskForTests(task: Promise<void>): void {
 		this.#trackPostPromptTask(task, this.#selectionFenceGeneration);
 	}
@@ -10594,6 +10616,11 @@ export class AgentSession {
 		});
 	}
 
+	/** Enable sidecar write failure reporting for retry-test teardown. */
+	trackCoordinatorRuntimeStatePersistenceFailuresForTests(): void {
+		this.#coordinatorPersistFailuresForTests = [];
+	}
+
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
 		// A terminal abort can schedule a preserved follow-up as a fresh turn after
@@ -10616,6 +10643,11 @@ export class AgentSession {
 		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
+		const failures = this.#coordinatorPersistFailuresForTests;
+		if (failures && failures.length > 0) {
+			this.#coordinatorPersistFailuresForTests = [];
+			throw new AggregateError(failures, "Coordinator runtime-state persistence failed during test");
+		}
 	}
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
 		this.#agentEventAdmission.set(event, {
