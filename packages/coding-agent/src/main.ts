@@ -35,6 +35,11 @@ import {
 	ModelProfileCredentialError,
 } from "./config/model-profile-activation";
 import { UnknownModelProfileError } from "./config/model-profile-contract";
+import {
+	type ModelProfileOwnershipMarker,
+	readDurableModelProfileOwnership,
+	resolveEffectiveModelProfileMarker,
+} from "./config/model-profile-ownership";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
 	parseModelString,
@@ -473,13 +478,14 @@ type StartupModelProfileArgs = {
 	startupThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
 	preferCachedModels?: boolean;
 	preferCachedDefaultProfile?: boolean;
+	hasExistingSession?: boolean;
 };
 
 function staleDefaultProfileMessage(error: UnknownModelProfileError, profileCatalogRefreshUnavailable = false): string {
 	const refreshNotice = profileCatalogRefreshUnavailable
 		? " The online profile catalog could not be refreshed; continuing with the last accepted catalog."
 		: "";
-	return `Configured modelProfile.default is stale: unknown model profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI. To clear it, remove modelProfile.default from the project's .gjc/config.yml or .gjc/settings.json if set there, or run gjc config reset modelProfile.default for the global setting.${refreshNotice}`;
+	return `Configured model-profile ownership references unknown profile ${JSON.stringify(error.details.requestedProfile)}. Select a replacement in the UI or run gjc config reset modelProfile.default to clear global ownership.${refreshNotice}`;
 }
 
 async function applyStartupModelProfilesWithPolicy(
@@ -496,6 +502,9 @@ async function applyStartupModelProfilesWithPolicy(
 			tolerateCredentialError?: boolean;
 			tolerateUnknownDefault?: boolean;
 			runtimeBindingsOnly?: boolean;
+			ownershipMarker?: ModelProfileOwnershipMarker;
+			commitOwnershipMarker?: boolean;
+			emitOwnershipEvent?: boolean;
 		} = {},
 	): Promise<boolean> => {
 		try {
@@ -509,7 +518,13 @@ async function applyStartupModelProfilesWithPolicy(
 			} else {
 				await activateModelProfile(
 					{ session: args.session, modelRegistry: args.modelRegistry, settings: args.settings, profileName },
-					{ persistDefault, thinkingLevelOverride: options.thinkingLevelOverride },
+					{
+						persistDefault,
+						thinkingLevelOverride: options.thinkingLevelOverride,
+						ownershipMarker: options.ownershipMarker,
+						commitOwnershipMarker: options.commitOwnershipMarker,
+						emitOwnershipEvent: options.emitOwnershipEvent,
+					},
 				);
 			}
 			return true;
@@ -542,7 +557,16 @@ async function applyStartupModelProfilesWithPolicy(
 	// override it. startupModel covers the eager path; session.model covers the
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
-	const defaultProfile = args.settings.get("modelProfile.default");
+	const defaultProfile =
+		args.parsedArgs.mpreset !== undefined
+			? undefined
+			: (() => {
+					const marker = resolveEffectiveModelProfileMarker(
+						args.session.getModelProfileOwnershipMarker(),
+						readDurableModelProfileOwnership(args.settings),
+					);
+					return marker.kind === "profile" ? marker.profile : undefined;
+				})();
 	const preferCachedProfiles =
 		(args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined) ||
 		(args.preferCachedDefaultProfile === true && defaultProfile !== undefined);
@@ -557,7 +581,10 @@ async function applyStartupModelProfilesWithPolicy(
 					tolerateCredentialError: tolerateDefaultProfileFailure,
 					tolerateUnknownDefault:
 						allowMissingDefault && (onUnknownDefault !== undefined || tolerateDefaultProfileFailure),
-					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain(),
+					runtimeBindingsOnly: args.session.hasRecoveredDefaultFallbackChain() || args.hasExistingSession === true,
+					ownershipMarker: args.session.getModelProfileOwnershipMarker() ?? { kind: "inherit" },
+					commitOwnershipMarker: false,
+					emitOwnershipEvent: false,
 				})) && applied;
 		}
 		if (args.parsedArgs.mpreset) {
@@ -603,8 +630,6 @@ async function applyStartupModelProfilesWithPolicy(
 			persistAsSessionDefault: true,
 			cause: "startup-override",
 		});
-		const selector = `${explicitModel.provider}/${explicitModel.id}`;
-		args.session.setConfiguredModelChain("default", [selector], "startup-override", undefined, true);
 		args.session.seedDefaultFallbackResolution(0, []);
 	} else if (args.parsedArgs.thinking && args.session.model) {
 		await args.session.setModelTemporary(args.session.model, args.parsedArgs.thinking, { cause: "startup-override" });
@@ -1919,7 +1944,11 @@ export async function runRootCommand(
 		process.exit(1);
 	}
 
-	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
+	const startupOwnershipMarker = resolveEffectiveModelProfileMarker(
+		bareResumeSessionManager?.getModelProfileOwnershipMarker(),
+		readDurableModelProfileOwnership(settingsInstance),
+	);
+	const hasRootStartupProfile = parsedArgs.mpreset !== undefined || startupOwnershipMarker.kind === "profile";
 	const startupModelSelectors = resolveStartupModelRefreshSelectors(
 		{
 			model: parsedArgs.model,
@@ -2074,6 +2103,12 @@ export async function runRootCommand(
 			rootStartupCacheAdmissionAttempted = true;
 		},
 	};
+	sessionOptions.deferModelProfileActivation = true;
+	if (parsedArgs.mpreset !== undefined) {
+		sessionOptions.modelProfileOwnershipMarker = parsedArgs.default
+			? { kind: "inherit" }
+			: { kind: "profile", profile: parsedArgs.mpreset };
+	}
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
@@ -2146,6 +2181,7 @@ export async function runRootCommand(
 				}
 			: undefined,
 	});
+	const hasExistingSession = Boolean(sessionManager && sessionManager.getBranch().length > 0);
 
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
@@ -2212,6 +2248,7 @@ export async function runRootCommand(
 				initialMessage,
 				initialMessages: parsedArgs.messages,
 				resumeAction: bareResumeAction,
+				hasExistingSession,
 			};
 			if (isInteractive && parsedArgs.mpreset) {
 				const ready = Promise.withResolvers<void>();

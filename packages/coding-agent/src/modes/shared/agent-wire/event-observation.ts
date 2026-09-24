@@ -225,6 +225,21 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: true,
 				coalesceKey: null,
 			});
+		case "profile_ownership_changed":
+			return obs(event, {
+				kind: "rpc_profile_ownership_changed",
+				signal: event.outcome === "failed" ? "error" : null,
+				evidence: {
+					transitionId: str(event.transitionId) ?? null,
+					source: str(event.source) ?? null,
+					outcome: str(event.outcome) ?? null,
+					observedDurableVersion: num(event.observedDurableVersion) ?? null,
+					committedDurableVersion: num(event.committedDurableVersion) ?? null,
+				},
+				severity: event.outcome === "failed" ? "critical" : "info",
+				semantic: true,
+				coalesceKey: null,
+			});
 		case "ttsr_triggered":
 			return obs(event, {
 				kind: "rpc_ttsr",

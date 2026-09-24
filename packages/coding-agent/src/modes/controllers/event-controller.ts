@@ -191,6 +191,7 @@ export class EventController {
 			subagent_steer_message: e => this.#handleSubagentSteerMessage(e),
 			notice: e => this.#handleNotice(e),
 			model_fallback_switched: e => this.#handleModelFallbackSwitched(e),
+			profile_ownership_changed: async () => {},
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;

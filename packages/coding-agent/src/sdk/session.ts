@@ -59,8 +59,20 @@ import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
-import { ModelProfileCredentialError, resolveMissingSessionModelRecovery } from "../config/model-profile-activation";
+import {
+	activateModelProfile,
+	applyModelProfileRuntimeBindings,
+	ModelProfileCredentialError,
+	resolveMissingSessionModelRecovery,
+} from "../config/model-profile-activation";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import {
+	InvalidModelProfileOwnershipError,
+	type ModelProfileOwnershipMarker,
+	readDurableModelProfileOwnership,
+	resolveEffectiveModelProfileMarker,
+	validateModelProfileOwnershipMarker,
+} from "../config/model-profile-ownership";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
@@ -485,6 +497,10 @@ export interface CreateAgentSessionOptions {
 	modelPattern?: string;
 	/** Active profile inherited by a nested SDK/subagent session. */
 	activeModelProfile?: string;
+	/** Explicit session ownership marker for SDK hosts that create or replace a session decision. */
+	modelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
+	/** @internal The first-party CLI applies startup profiles after constructing the session. */
+	deferModelProfileActivation?: boolean;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -2040,6 +2056,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 		const existingBranch = logger.time("getSessionBranch", () => sessionManager.getBranch());
 		const hasExistingSession = existingBranch.length > 0;
+		const requestedOwnershipMarker =
+			options.modelProfileOwnershipMarker ??
+			(options.activeModelProfile === undefined
+				? undefined
+				: { kind: "profile" as const, profile: options.activeModelProfile });
+		if (requestedOwnershipMarker && !validateModelProfileOwnershipMarker(requestedOwnershipMarker)) {
+			throw new InvalidModelProfileOwnershipError();
+		}
+		let sessionOwnershipMarker = requestedOwnershipMarker ??
+			existingSession.modelProfileOwnershipMarker ?? { kind: "inherit" as const };
+		const durableModelProfileOwnership = readDurableModelProfileOwnership(settings);
+		let effectiveOwnershipMarker = resolveEffectiveModelProfileMarker(
+			sessionOwnershipMarker,
+			durableModelProfileOwnership,
+		);
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
@@ -2142,7 +2173,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					model: options.modelPattern ?? (options.model ? formatModelString(options.model) : undefined),
 					credential: options.credentialSelector ? "session" : undefined,
 					resume: hasExistingSession,
-					hasStartupProfile: Boolean(options.activeModelProfile || settings.get("modelProfile.default")),
+					hasStartupProfile: effectiveOwnershipMarker.kind === "profile",
 				},
 				settings,
 			);
@@ -2155,17 +2186,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			usageOrder: settings.getStorage()?.getModelUsageOrder(),
 		};
 		const persistedProfiles = modelRegistry.getModelProfiles();
-		const resolvedInheritedProfileName = options.activeModelProfile
-			? resolveModelProfileName(options.activeModelProfile, persistedProfiles)
-			: undefined;
-		const acceptedInheritedProfileName =
-			resolvedInheritedProfileName && persistedProfiles.has(resolvedInheritedProfileName)
-				? resolvedInheritedProfileName
-				: undefined;
-		const inheritedProfileOwnsDefault = acceptedInheritedProfileName
-			? resolveProfileBindings(persistedProfiles.get(acceptedInheritedProfileName)!).defaultSelector !== undefined
+		if (requestedOwnershipMarker?.kind === "profile" && !options.deferModelProfileActivation) {
+			sessionOwnershipMarker = {
+				kind: "profile",
+				profile: resolveModelProfileName(requestedOwnershipMarker.profile, persistedProfiles),
+			};
+		}
+		effectiveOwnershipMarker = resolveEffectiveModelProfileMarker(
+			sessionOwnershipMarker,
+			durableModelProfileOwnership,
+		);
+		const ownershipProfileName =
+			effectiveOwnershipMarker.kind === "profile" ? effectiveOwnershipMarker.profile : undefined;
+		const ownershipProfile = ownershipProfileName ? persistedProfiles.get(ownershipProfileName) : undefined;
+		const ownershipProfileOwnsDefault = ownershipProfile
+			? resolveProfileBindings(ownershipProfile).defaultSelector !== undefined
 			: false;
-		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = inheritedProfileOwnsDefault
+		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = ownershipProfileOwnsDefault
 			? { aliasIntent: "preset-equivalent" }
 			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
@@ -2189,32 +2226,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 		const persistedDefaultChain = existingSession.configuredModelChains.default;
+		const profileChainMatchesOwnership =
+			effectiveOwnershipMarker.kind === "profile" &&
+			persistedDefaultChain?.origin === "profile-activation" &&
+			persistedDefaultChain.identity === effectiveOwnershipMarker.profile;
+		const hasSessionConcreteModelChoice =
+			persistedDefaultChain?.origin === "model_selection" || persistedDefaultChain?.origin === "startup-override";
+		const useEffectiveProfileDefault =
+			effectiveOwnershipMarker.kind === "profile" && !hasSessionConcreteModelChoice && !profileChainMatchesOwnership;
 		const defaultModelEntries =
-			resumeModelBehavior === "useCurrentDefault"
+			resumeModelBehavior === "useCurrentDefault" ||
+			effectiveOwnershipMarker.kind === "cleared" ||
+			useEffectiveProfileDefault
 				? []
 				: persistedDefaultChain?.entries && persistedDefaultChain.entries.length > 0
 					? persistedDefaultChain.entries
 					: existingSession.models.default
 						? [existingSession.models.default]
 						: [];
-		const persistedProfileName =
-			persistedDefaultChain?.origin === "profile-activation" ? persistedDefaultChain.identity : undefined;
-		const resolvedPersistedProfileName = persistedProfileName
-			? resolveModelProfileName(persistedProfileName, persistedProfiles)
-			: undefined;
-		const acceptedPersistedProfileName =
-			resolvedPersistedProfileName &&
-			persistedProfiles.has(resolvedPersistedProfileName) &&
-			(!acceptedInheritedProfileName || acceptedInheritedProfileName === resolvedPersistedProfileName) &&
-			resumeModelBehavior !== "useCurrentDefault"
-				? resolvedPersistedProfileName
-				: undefined;
-		const persistedProfileOwnsDefault = acceptedPersistedProfileName
-			? resolveProfileBindings(persistedProfiles.get(acceptedPersistedProfileName)!).defaultSelector !== undefined
-			: false;
-		let startupActiveModelProfile =
-			acceptedInheritedProfileName ??
-			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
+		const persistedProfileOwnsDefault = ownershipProfileOwnsDefault;
+		const startupActiveModelProfile = ownershipProfileName;
 		let savedDefaultWasUnresolved = false;
 		let deferredMissingSessionRecovery = false;
 		let retainedRecoveryBindingsAfterLateRestore = false;
@@ -2252,11 +2283,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					model = undefined;
 				}
 				savedDefaultWasUnresolved = !model;
-				if (!model && resumeModelBehavior !== "useCurrentDefault") {
+				if (!model && resumeModelBehavior !== "useCurrentDefault" && ownershipProfileName !== undefined) {
 					try {
 						const recovery = await resolveMissingSessionModelRecovery({
 							modelRegistry,
 							settings,
+							profileName: ownershipProfileName,
 							defaultEntries: defaultModelEntries,
 							skips: restoredDefaultResolution.skips,
 							savedDefault: existingSession.models.default,
@@ -2270,9 +2302,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						) {
 							model = recovery.model;
 							recoveredSessionDefault = recovery;
-							startupActiveModelProfile = undefined;
 							modelFallbackMessage =
-								"Saved session model is no longer registered; restored the durable default preset instead.";
+								"Saved session model is no longer registered; restored the active ownership profile at runtime.";
 						}
 					} catch {
 						deferredMissingSessionRecovery = true;
@@ -4253,17 +4284,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					thinkingLevel = resolveThinkingLevelForModel(model, thinkingLevel);
 				}
 				recoveredSessionDefault = undefined;
-				startupActiveModelProfile =
-					acceptedInheritedProfileName ??
-					(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 				modelFallbackMessage = undefined;
-			} else if (deferredMissingSessionRecovery) {
+			} else if (deferredMissingSessionRecovery && ownershipProfileName !== undefined) {
 				const hadProvisionalRecovery = recoveredSessionDefault !== undefined;
 				let lateRecoveryAccepted = false;
 				try {
 					const recovery = await resolveMissingSessionModelRecovery({
 						modelRegistry,
 						settings,
+						profileName: ownershipProfileName,
 						defaultEntries: defaultModelEntries,
 						skips: restoredAfterExtensions.skips,
 						savedDefault: existingSession.models.default,
@@ -4290,9 +4319,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							thinkingLevel = resolveThinkingLevelForModel(model, recoveredLevel);
 						}
 						recoveredSessionDefault = recovery;
-						startupActiveModelProfile = undefined;
 						modelFallbackMessage =
-							"Saved session model is no longer registered; restored the durable default preset instead.";
+							"Saved session model is no longer registered; restored the active ownership profile at runtime.";
 						lateRecoveryAccepted = true;
 					}
 				} catch (error) {
@@ -4305,7 +4333,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (!lateRecoveryAccepted && hadProvisionalRecovery) {
 					model = undefined;
 					recoveredSessionDefault = undefined;
-					startupActiveModelProfile = undefined;
 					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 				}
 			}
@@ -4655,11 +4682,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		// Re-resolved per prompt build so a profile activated after session start is
-		// reflected on the next refresh. Vendor-separated worker roles imply eager
-		// delegation unless `task.eager` is configured explicitly.
+		// Agent construction uses the already-resolved session/durable owner marker.
+		// Later explicit profile activations refresh this decision through the live
+		// AgentSession. Vendor-separated worker roles imply eager delegation unless
+		// `task.eager` is configured explicitly.
 		const resolveEagerTasks = (): boolean => {
-			const profileName = startupActiveModelProfile ?? settings.get("modelProfile.default");
+			const profileName = startupActiveModelProfile;
 			const resolvedProfileName = profileName ? resolveModelProfileName(profileName, persistedProfiles) : undefined;
 			return resolveEagerTaskDelegation({
 				settings,
@@ -5412,6 +5440,48 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		if (!options.deferModelProfileActivation && !options.parentTaskPrefix) {
+			if (requestedOwnershipMarker?.kind === "cleared") {
+				await session.commitModelProfileOwnershipMarker({ kind: "cleared" });
+				session.emitProfileOwnershipChanged({
+					type: "profile_ownership_changed",
+					transitionId: globalThis.crypto.randomUUID(),
+					source: "session",
+					oldMarker: existingSession.modelProfileOwnershipMarker ?? { kind: "inherit" },
+					newMarker: { kind: "cleared" },
+					oldSessionId: session.sessionId,
+					sessionId: session.sessionId,
+					observedDurableVersion: durableModelProfileOwnership.version,
+					outcome: "committed",
+				});
+			} else if (ownershipProfileName !== undefined) {
+				const explicitSessionSelection = requestedOwnershipMarker?.kind === "profile";
+				if (hasExistingSession && !explicitSessionSelection) {
+					await applyModelProfileRuntimeBindings({
+						session,
+						modelRegistry,
+						settings,
+						profileName: ownershipProfileName,
+					});
+				} else {
+					await activateModelProfile(
+						{ session, modelRegistry, settings, profileName: ownershipProfileName },
+						{
+							ownershipMarker: sessionOwnershipMarker,
+							commitOwnershipMarker: explicitSessionSelection,
+							emitOwnershipEvent: explicitSessionSelection,
+						},
+					);
+				}
+				if (hasExplicitModel && model) {
+					await session.setModelTemporary(model, thinkingLevel, {
+						persistAsSessionDefault: true,
+						cause: "startup-override",
+					});
+					session.seedDefaultFallbackResolution(0, []);
+				}
+			}
+		}
 		const cleanupOwnedManager = cleanupOwnedMcpManager;
 		const sessionOwnedMcpManager = ownsMcpManager ? mcpManager : undefined;
 		if (cleanupOwnedManager && cleanupOwnedMcpManagerOwner !== sessionOwnedMcpManager) {

@@ -18,6 +18,7 @@ import {
 } from "../config/autorouting-contract";
 import { loadEffectiveModelProfiles } from "../config/model-preset-registry";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import { commitDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import { ModelsConfigFile } from "../config/model-registry";
 import {
 	getDefault,
@@ -228,7 +229,7 @@ function getTypeDisplay(def: CliSettingDef): string {
 // Schema-Driven Value Parsing
 // =============================================================================
 
-function parseAndSetValue(path: SettingPath, rawValue: string): void {
+function parseSettingValue(path: SettingPath, rawValue: string): unknown {
 	const schemaType = getType(path);
 	let parsedValue: unknown;
 
@@ -304,7 +305,7 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 		throw new Error(`Invalid value for ${path}: ${issues.map(issue => `${issue.path}: ${issue.detail}`).join("; ")}`);
 	}
 
-	settings.set(path, parsedValue as SettingValue<typeof path>);
+	return parsedValue;
 }
 
 // =============================================================================
@@ -491,15 +492,42 @@ async function handleSet(
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
 		process.exit(1);
 	}
+	if (def.path === "modelProfile.ownership") {
+		console.error(chalk.red("modelProfile.ownership is managed internally; set modelProfile.default instead."));
+		process.exit(1);
+	}
 
+	let parsedValue: unknown;
 	try {
-		parseAndSetValue(def.path, value);
+		parsedValue = parseSettingValue(def.path, value);
 	} catch (err) {
 		console.error(chalk.red(String(err)));
 		process.exit(1);
 	}
 
-	await persistOrExit();
+	if (def.path === "modelProfile.default") {
+		try {
+			if (typeof parsedValue === "string" && parsedValue.trim() !== "") {
+				const profileName = resolveModelProfileName(
+					parsedValue.trim(),
+					loadEffectiveModelProfiles(ModelsConfigFile.load()?.profiles),
+				);
+				if (!profileName) throw new Error(`Unknown model profile "${parsedValue}".`);
+				await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: profileName }, [], () => {
+					if (!loadEffectiveModelProfiles(ModelsConfigFile.load()?.profiles).has(profileName))
+						throw new Error(`Model profile "${profileName}" was removed before the durable switch committed.`);
+				});
+			} else {
+				await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+			}
+		} catch (err) {
+			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+			process.exit(1);
+		}
+	} else {
+		settings.set(def.path, parsedValue as SettingValue<typeof def.path>);
+		await persistOrExit();
+	}
 
 	const newValue = settings.get(def.path);
 	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
@@ -524,13 +552,25 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
 		process.exit(1);
 	}
+	if (def.path === "modelProfile.ownership") {
+		console.error(chalk.red("modelProfile.ownership is managed internally; reset modelProfile.default instead."));
+		process.exit(1);
+	}
 
 	const path = def.path as SettingPath;
 	const defaultValue = getDefault(path);
-	if (defaultValue === undefined) settings.unset(path);
-	else settings.set(path, defaultValue as SettingValue<typeof path>);
-
-	await persistOrExit();
+	if (path === "modelProfile.default") {
+		try {
+			await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		} catch (err) {
+			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+			process.exit(1);
+		}
+	} else {
+		if (defaultValue === undefined) settings.unset(path);
+		else settings.set(path, defaultValue as SettingValue<typeof path>);
+		await persistOrExit();
+	}
 
 	if (flags.json) {
 		console.log(JSON.stringify({ key: def.path, value: defaultValue }));

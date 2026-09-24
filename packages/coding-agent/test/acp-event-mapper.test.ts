@@ -238,6 +238,35 @@ describe("ACP event mapper", () => {
 		});
 	});
 
+	it("maps model-profile ownership transitions into bounded ACP metadata", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "profile_ownership_changed",
+				transitionId: "profile-transition-1",
+				source: "durable",
+				oldMarker: { kind: "profile", profile: "profile-a" },
+				newMarker: { kind: "cleared" },
+				oldSessionId: "session-old",
+				sessionId: "session-new",
+				observedDurableVersion: 4,
+				committedDurableVersion: 5,
+				outcome: "committed",
+			} as AgentSessionEvent,
+			"session-new",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		expect(updates[0]!.update._meta).toEqual({
+			gjcModelProfileOwnershipChanged: true,
+			gjcModelProfileTransitionId: "profile-transition-1",
+			gjcModelProfileOwnershipSource: "durable",
+			gjcModelProfileOwnershipOutcome: "committed",
+			gjcModelProfileObservedDurableVersion: 4,
+			gjcModelProfileCommittedDurableVersion: 5,
+		});
+	});
+
 	it("maps automatic compaction lifecycle events to ACP session metadata", () => {
 		const start = mapAgentSessionEventToAcpSessionUpdates(
 			{ type: "auto_compaction_start", reason: "threshold", action: "context-full" } as AgentSessionEvent,

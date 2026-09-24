@@ -80,16 +80,15 @@ describe("AgentSession model-change causes", () => {
 	});
 	test("runExtensionSetModel passes user-selection cause", async () => {
 		const model = { provider: "p", id: "m" } as unknown as Model;
-		const calls: Array<{ role?: string; cause?: string }> = [];
-		const materialized: Model[] = [];
+		const calls: Array<{ persistAsSessionDefault?: boolean; cause?: string }> = [];
 		const session = {
 			modelRegistry: { getApiKey: async () => "key" },
-			setModel: async (_model: Model, role?: string, options?: { cause?: string }) => {
-				calls.push({ role, cause: options?.cause });
-			},
-			materializeActiveDefaultModelProfileAssignment: (selected: Model) => {
-				materialized.push(selected);
-				return true;
+			setModelTemporary: async (
+				_model: Model,
+				_thinkingLevel?: undefined,
+				options?: { persistAsSessionDefault?: boolean; cause?: string },
+			) => {
+				calls.push({ persistAsSessionDefault: options?.persistAsSessionDefault, cause: options?.cause });
 			},
 		};
 
@@ -97,8 +96,7 @@ describe("AgentSession model-change causes", () => {
 
 		expect(ok).toBe(true);
 		expect(calls).toHaveLength(1);
-		expect(calls[0]).toEqual({ role: "default", cause: "user-selection" });
-		expect(materialized).toEqual([model]);
+		expect(calls[0]).toEqual({ persistAsSessionDefault: true, cause: "user-selection" });
 	});
 
 	test("runExtensionSetModel returns false without an API key and does not set the model", async () => {
@@ -106,7 +104,7 @@ describe("AgentSession model-change causes", () => {
 		let setModelCalled = false;
 		const session = {
 			modelRegistry: { getApiKey: async () => undefined },
-			setModel: async () => {
+			setModelTemporary: async () => {
 				setModelCalled = true;
 			},
 		};

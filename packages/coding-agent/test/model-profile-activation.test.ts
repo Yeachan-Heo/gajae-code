@@ -11,18 +11,22 @@ import {
 	ModelProfileUnknownProviderError,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
-	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
 	resolveModelProfileDefaultChain,
-	restoreMaterializedModelProfileForDeletion,
 	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
-
+import {
+	ModelProfileApplyCommittedError,
+	ModelProfileOwnershipConflictError,
+	type ModelProfileOwnershipMarker,
+	type ProfileOwnershipChangedEvent,
+	readDurableModelProfileOwnership,
+} from "../src/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
-import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
@@ -150,6 +154,8 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 
 function fakeSession(initial = model("provider-a", "initial")) {
 	let activeModelProfile: string | undefined;
+	let installedModelRoles: readonly string[] = [];
+	let installedAgentOverrides: readonly string[] = [];
 	return {
 		model: initial as Model | undefined,
 		thinkingLevel: ThinkingLevel.Low as ThinkingLevel | undefined,
@@ -204,6 +210,17 @@ function fakeSession(initial = model("provider-a", "initial")) {
 		},
 		getSessionDefaultModelSelector() {
 			return this.resumeDefaultSelectors.at(-1);
+		},
+		getProfileInstalledOverrideKeys() {
+			return { modelRoles: installedModelRoles, agentModelOverrides: installedAgentOverrides };
+		},
+		noteProfileInstalledOverrides(modelRoles: readonly string[], agentModelOverrides: readonly string[]) {
+			installedModelRoles = [...modelRoles];
+			installedAgentOverrides = [...agentModelOverrides];
+		},
+		clearProfileInstalledOverrides() {
+			installedModelRoles = [];
+			installedAgentOverrides = [];
 		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
@@ -357,7 +374,7 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("materialization resolves a bare assignment against the profile-activation catalog, not the broadened general one", () => {
+	test("materialization resolves a bare assignment against the profile-activation catalog, not the broadened general one", async () => {
 		const opus5 = model("anthropic", "claude-opus-5");
 		const opus46 = model("anthropic", "claude-opus-4-6");
 		const baseRegistry = fakeRegistry();
@@ -377,8 +394,9 @@ describe("model profile activation", () => {
 		const session = fakeSession();
 		session.modelRegistry = registry;
 		const settings = Settings.isolated({ "modelProfile.default": "live-narrow" });
+		session.setActiveModelProfile("live-narrow");
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([["default", "opus"]]),
@@ -1333,15 +1351,15 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("CAS failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
+			"CAS failed",
 		);
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
 	});
 
-	test("rollback restores the previous live model even when its credentials are unavailable", async () => {
+	test("committed activation fails closed and restores the previous live model even when its credentials are unavailable", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-credential-rollback-");
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		try {
@@ -1363,13 +1381,21 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("forward flush failed"));
+			const originalOverride = settings.override.bind(settings);
+			settings.override = ((path: never, value: never) => {
+				if (path === "modelRoles") throw new Error("runtime apply failed");
+				return originalOverride(path, value);
+			}) as typeof settings.override;
 
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"forward flush failed",
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toBeInstanceOf(
+				ModelProfileApplyCommittedError,
 			);
 			expect(session.model).toBe(previousModel);
-			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+			expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+				version: 1,
+				marker: { kind: "profile", profile: "profile-a" },
+			});
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
@@ -1386,16 +1412,16 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("CAS failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
+			"CAS failed",
 		);
 		expect(session.model).toBeUndefined();
 		expect(session.resumeDefaultSelectors).toEqual([]);
 	});
 
-	test("does not disturb the old session when target authentication fails before mutation", async () => {
+	test("fails closed when target authentication fails after durable ownership commits", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-pre-mutation-");
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		try {
@@ -1418,12 +1444,16 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"No API key for provider-a/default",
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toBeInstanceOf(
+				ModelProfileApplyCommittedError,
 			);
 			expect(session.model).toBe(previousModel);
 			expect(append).not.toHaveBeenCalled();
-			expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+			expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+			expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+				version: 1,
+				marker: { kind: "profile", profile: "profile-a" },
+			});
 		} finally {
 			await manager.close();
 			tempDir.removeSync();
@@ -1461,12 +1491,16 @@ describe("model profile activation", () => {
 				settings,
 				profileName: profile.name,
 			});
-			vi.spyOn(settings, "flushOrThrow").mockImplementationOnce(async () => {
-				expect(agent.appendOnlyContext).toBeDefined();
-				throw new Error("forward flush failed");
-			});
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"forward flush failed",
+			const originalOverride = settings.override.bind(settings);
+			settings.override = ((path: never, value: never) => {
+				if (path === "modelRoles") {
+					expect(agent.appendOnlyContext).toBeDefined();
+					throw new Error("runtime apply failed");
+				}
+				return originalOverride(path, value);
+			}) as typeof settings.override;
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toBeInstanceOf(
+				ModelProfileApplyCommittedError,
 			);
 			expect(session.model).toBeUndefined();
 			expect(agent.appendOnlyContext).toBeUndefined();
@@ -1476,7 +1510,7 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("reports a second settings flush failure without claiming durable recovery", async () => {
+	test("rejects a stale durable ownership version before runtime activation", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
 		const prepared = await prepareModelProfileActivation({
@@ -1485,33 +1519,54 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		const firstFailure = new Error("forward secret-settings-value");
-		const secondFailure = new Error("rollback secret-settings-value");
-		const flush = vi
-			.spyOn(settings, "flushOrThrow")
-			.mockRejectedValueOnce(firstFailure)
-			.mockRejectedValueOnce(secondFailure);
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(
+			new ModelProfileOwnershipConflictError(0, 1),
+		);
 
-		let failure: unknown;
-		try {
-			await applyPreparedModelProfileActivation(prepared, { persistDefault: true });
-		} catch (error) {
-			failure = error;
-		}
-		expect(failure).toBeInstanceOf(AggregateError);
-		const aggregate = failure as AggregateError;
-		expect((aggregate.errors as Error[]).map(stage => stage.cause)).toEqual([firstFailure, secondFailure]);
-		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
-		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
-		expect(aggregate.message).toContain("Prior state may be unverified");
-		expect(aggregate.message).not.toContain("secret-settings-value");
-		expect(flush).toHaveBeenCalledTimes(2);
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: 0,
+			actualVersion: 1,
+		});
 		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 0,
+			marker: { kind: "profile", profile: "old-profile" },
+		});
 		expect(session.model?.id).toBe("initial");
 	});
 
-	test("labels independent rollback failures without exposing error contents", async () => {
+	test("revalidates the selected profile under the durable commit lock", async () => {
 		const session = fakeSession();
+		const registry = Object.assign(fakeRegistry(), {
+			assertCurrentModelProfileExists: () => {
+				throw new Error("profile disappeared before durable commit");
+			},
+		});
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: registry,
+			settings,
+			profileName: "profile-a",
+		});
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"profile disappeared before durable commit",
+		);
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 0,
+			marker: { kind: "inherit" },
+		});
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
+	test("keeps a committed durable version and fails closed when runtime rollback is incomplete", async () => {
+		const ownershipEvents: ProfileOwnershipChangedEvent[] = [];
+		const session = Object.assign(fakeSession(), {
+			emitProfileOwnershipChanged: (event: ProfileOwnershipChangedEvent) => ownershipEvents.push(event),
+		});
 		session.setConfiguredModelChain("default", ["provider-c/default"]);
 		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
 		const prepared = await prepareModelProfileActivation({
@@ -1520,13 +1575,12 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		const original = new Error("forward flush token-secret-123");
+		const original = new Error("runtime token-secret-123");
 		const modelRollback = new Error("rollback model token-secret-123");
-		const rollbackFlush = new Error("rollback flush token-secret-123");
-		const flush = vi
-			.spyOn(settings, "flushOrThrow")
-			.mockRejectedValueOnce(original)
-			.mockRejectedValueOnce(rollbackFlush);
+		session.setModelTemporary = async (_model, _thinkingLevel, options) => {
+			options?.onMutationStarted?.();
+			throw original;
+		};
 		session.restoreModelSelectionForRollback = async () => {
 			throw modelRollback;
 		};
@@ -1537,57 +1591,89 @@ describe("model profile activation", () => {
 		} catch (error) {
 			failure = error;
 		}
-		expect(failure).toBeInstanceOf(AggregateError);
-		const aggregate = failure as AggregateError;
-		const stages = aggregate.errors as Error[];
-		expect(stages.map(stage => stage.cause)).toEqual([original, modelRollback, rollbackFlush]);
-		expect(stages.map(stage => stage.message)).toEqual([
-			"forward settings flush (settings write failed)",
-			"restore live model (operation failed)",
-			"restore settings flush (settings write failed)",
-		]);
-		expect(aggregate.message).toContain("forward settings flush (settings write failed)");
-		expect(aggregate.message).toContain("restore live model (operation failed)");
-		expect(aggregate.message).toContain("restore settings flush (settings write failed)");
-		expect(aggregate.message).toContain("Prior state may be unverified");
-		expect(aggregate.message).not.toContain("token-secret-123");
-		expect(flush).toHaveBeenCalledTimes(2);
-		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
+		expect(failure).toBeInstanceOf(ModelProfileApplyCommittedError);
+		const committedError = failure as ModelProfileApplyCommittedError;
+		expect(committedError.cause).toBeInstanceOf(AggregateError);
+		expect(committedError.message).not.toContain("token-secret-123");
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 1,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
 		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
-		// The failed live-model restore leaves a different runtime model despite the restored settings.
-		expect(session.model?.id).toBe("default");
+		expect(session.model?.id).toBe("initial");
+		expect(ownershipEvents).toHaveLength(1);
+		expect(ownershipEvents[0]).toMatchObject({ source: "durable", outcome: "failed", committedDurableVersion: 1 });
 	});
 
-	test("rolls back partial synchronous persistent writes before durable flush", async () => {
+	test("durable profile activation preserves ordinary role baselines", async () => {
 		const session = fakeSession();
-		const settings = Settings.isolated();
-		settings.set("modelRoles", { default: "provider-c/default" });
-		settings.set("task.agentModelOverrides", { executor: "provider-c/executor" });
-		settings.set("modelProfile.default", "old-profile");
-		const prepared = await prepareModelProfileActivation({
-			session,
-			modelRegistry: fakeRegistry(),
-			settings,
-			profileName: "profile-a",
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-c/default" },
+			"task.agentModelOverrides": { executor: "provider-c/executor" },
 		});
-		const originalSet = settings.set.bind(settings);
-		let rejected = false;
-		settings.set = ((path: never, value: never) => {
-			if (path === "task.agentModelOverrides" && !rejected) {
-				rejected = true;
-				throw new Error("set failed");
-			}
-			return originalSet(path, value);
-		}) as typeof settings.set;
-
-		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"set failed",
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ persistDefault: true },
 		);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/default" });
 		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ executor: "provider-c/executor" });
-		expect(settings.getGlobal("modelProfile.default")).toBe("old-profile");
-		expect(session.model?.id).toBe("initial");
-		expect(session.resumeDefaultSelectors).toEqual([]);
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 1,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
+	});
+
+	test("emits the durable ownership event only after CAS, runtime install, and session marker commit", async () => {
+		const order: string[] = [];
+		const events: ProfileOwnershipChangedEvent[] = [];
+		let sessionMarker: ModelProfileOwnershipMarker | undefined;
+		const session = Object.assign(fakeSession(), {
+			getModelProfileOwnershipMarker: () => sessionMarker,
+			commitModelProfileOwnershipMarker: async (marker: ModelProfileOwnershipMarker) => {
+				sessionMarker = marker;
+				order.push("session-marker");
+			},
+			emitProfileOwnershipChanged: (event: ProfileOwnershipChangedEvent) => {
+				order.push("event");
+				events.push(event);
+			},
+		});
+		const settings = Settings.isolated();
+		const originalCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
+		settings.commitAtomicBatchWithCurrent = async buildPatches => {
+			const receipt = await originalCommit(buildPatches);
+			order.push("durable-cas");
+			return receipt;
+		};
+		const originalOverride = settings.override.bind(settings);
+		settings.override = ((settingPath: never, value: never) => {
+			if (settingPath === "modelRoles" || settingPath === "task.agentModelOverrides") {
+				order.push(`runtime:${String(settingPath)}`);
+			}
+			return originalOverride(settingPath, value);
+		}) as typeof settings.override;
+
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+
+		expect(order.indexOf("durable-cas")).toBeLessThan(order.indexOf("runtime:modelRoles"));
+		expect(order.indexOf("runtime:task.agentModelOverrides")).toBeLessThan(order.indexOf("session-marker"));
+		expect(order.indexOf("session-marker")).toBeLessThan(order.indexOf("event"));
+		expect(sessionMarker).toEqual({ kind: "inherit" });
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			type: "profile_ownership_changed",
+			source: "durable",
+			oldMarker: { kind: "inherit" },
+			newMarker: { kind: "inherit" },
+			observedDurableVersion: 0,
+			committedDurableVersion: 1,
+			outcome: "committed",
+		});
 	});
 
 	test("rollback from an unconfigured session restores its concrete chain without inventing a resume default", async () => {
@@ -1609,10 +1695,14 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+			const originalOverride = settings.override.bind(settings);
+			settings.override = ((settingPath: never, value: never) => {
+				if (settingPath === "modelRoles") throw new Error("runtime apply failed");
+				return originalOverride(settingPath, value);
+			}) as typeof settings.override;
 
-			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-				"flush failed",
+			await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toBeInstanceOf(
+				ModelProfileApplyCommittedError,
 			);
 			expect(manager.buildSessionContext().configuredModelChains.default?.entries).toEqual(["provider-c/default"]);
 
@@ -1874,6 +1964,57 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
+	test("replacing a profile drops omitted role bindings back to ordinary baselines", async () => {
+		const profileA: ModelProfileDefinition = {
+			name: "profile-a",
+			requiredProviders: [],
+			modelMapping: {
+				default: "provider-a/default",
+				executor: "provider-b/executor",
+				architect: "provider-a/architect",
+			},
+			source: "user",
+		};
+		const profileB: ModelProfileDefinition = {
+			name: "profile-b",
+			requiredProviders: [],
+			modelMapping: {
+				default: "provider-c/default",
+				critic: "provider-a/architect",
+			},
+			source: "user",
+		};
+		const ordinaryRoles = { default: "provider-c/default" };
+		const ordinaryAgentOverrides = {
+			executor: "provider-c/executor",
+			architect: "provider-c/architect",
+			critic: "provider-c/architect",
+		};
+		const settings = Settings.isolated({
+			modelRoles: ordinaryRoles,
+			"task.agentModelOverrides": ordinaryAgentOverrides,
+		});
+		const session = fakeSession();
+		const registry = fakeRegistry({ profiles: [profileA, profileB] });
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profileA.name });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-b/executor",
+			architect: "provider-a/architect",
+			critic: "provider-c/architect",
+		});
+
+		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: profileB.name });
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "provider-c/executor",
+			architect: "provider-c/architect",
+			critic: "provider-a/architect",
+		});
+		expect(settings.getGlobal("modelRoles")).toEqual(ordinaryRoles);
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual(ordinaryAgentOverrides);
+		expect(session.getActiveModelProfile()).toBe(profileB.name);
+	});
+
 	test("re-applies eager delegation after a successful activation but not after rollback", async () => {
 		const session = Object.assign(fakeSession(), { syncEagerDelegation: vi.fn(async () => {}) });
 		await activateModelProfile({
@@ -1892,10 +2033,10 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("CAS failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
+			"CAS failed",
 		);
 		expect(rollbackSession.syncEagerDelegation).not.toHaveBeenCalled();
 	});
@@ -1923,7 +2064,7 @@ describe("model profile activation", () => {
 
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -1943,7 +2084,7 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("materializing one profile assignment concretizes every remaining bare alias before clearing ownership", () => {
+	test("materializing one profile assignment concretizes every remaining bare alias before clearing ownership", async () => {
 		const selected = model("provider-b", "shared-model");
 		const registry = {
 			getAvailable: () => [selected],
@@ -1959,7 +2100,7 @@ describe("model profile activation", () => {
 			architect: ["shared-model", "provider-c/architect"],
 		});
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -1975,35 +2116,42 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("materialization restores settings and ownership when chain persistence fails", async () => {
-		const session = fakeSession();
+	test("materialization fails closed without compensating a committed ownership clear", async () => {
+		let ownershipFailure: ModelProfileApplyCommittedError | undefined;
+		const session = Object.assign(fakeSession(), {
+			markModelProfileOwnershipFailed: (error: ModelProfileApplyCommittedError) => {
+				ownershipFailure = error;
+			},
+		});
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 		const previousRoles = settings.get("modelRoles");
 		const previousOverrides = settings.get("task.agentModelOverrides");
-		const setConfiguredModelChain = session.setConfiguredModelChain.bind(session);
-		let calls = 0;
-		session.setConfiguredModelChain = (role: string, entries: readonly string[]) => {
-			calls++;
-			if (calls === 1) throw new Error("persist failed");
-			setConfiguredModelChain(role, entries);
+		session.setConfiguredModelChain = () => {
+			throw new Error("runtime apply failed");
 		};
 
-		expect(() =>
+		await expect(
 			materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "executor",
 				selector: "provider-c/executor",
 			}),
-		).toThrow("persist failed");
-		expect(settings.get("modelProfile.default")).toBe("profile-a");
-		expect(settings.get("modelRoles")).toEqual(previousRoles);
-		expect(settings.get("task.agentModelOverrides")).toEqual(previousOverrides);
+		).rejects.toBeInstanceOf(ModelProfileApplyCommittedError);
+		expect(ownershipFailure?.code).toBe("model_profile_apply_committed");
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 1,
+			marker: { kind: "cleared" },
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.getOverride("modelRoles")).toEqual(previousRoles);
+		expect(settings.getOverride("task.agentModelOverrides")).toEqual(previousOverrides);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
-	test("materialization restores canonical affinity when concretization mutates before persistence fails", () => {
+	test("materialization preserves the committed clear but restores runtime affinity after apply failure", async () => {
 		const selected = model("provider-b", "shared-model");
 		const session = fakeSession();
 		const sticky = new Map([[session.sessionId, "provider-a/shared-model"]]);
@@ -2034,15 +2182,19 @@ describe("model profile activation", () => {
 		settings.override("modelRoles", { default: "shared-model" });
 		settings.override("task.agentModelOverrides", { executor: "shared-model" });
 
-		expect(() =>
+		await expect(
 			materializeActiveModelProfileAssignment({
 				session,
 				settings,
 				role: "executor",
 				selector: "provider-c/executor",
 			}),
-		).toThrow("persist failed");
+		).rejects.toBeInstanceOf(ModelProfileApplyCommittedError);
 		expect(sticky.get(session.sessionId)).toBe("provider-a/shared-model");
+		expect(settings.get("modelProfile.ownership")).toMatchObject({
+			version: 1,
+			marker: { kind: "cleared" },
+		});
 	});
 
 	test("materializing a non-default role persists only the concrete active default", async () => {
@@ -2063,7 +2215,7 @@ describe("model profile activation", () => {
 		session.model = model("provider-b", "executor");
 		session.thinkingLevel = undefined;
 
-		materializeActiveModelProfileAssignment({
+		await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "executor",
@@ -2073,137 +2225,13 @@ describe("model profile activation", () => {
 		expect(settings.get("modelRoles").default).toBe("provider-b/executor");
 	});
 
-	test("profile deletion materializes the complete default fallback chain", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-chain-profile",
-			requiredProviders: [],
-			modelMapping: { default: ["provider-a/default:high", "provider-b/executor", "provider-c/default"] },
-			source: "user",
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-		await materializeModelProfileForDeletion({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [profile] }),
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("modelRoles").default).toEqual([
-			"provider-a/default:high",
-			"provider-b/executor",
-			"provider-c/default",
-		]);
-	});
-
-	test("profile deletion concretizes bare aliases before clearing ownership", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-alias-profile",
-			requiredProviders: [],
-			modelMapping: { default: "default", executor: "executor" },
-			source: "user",
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-		await materializeModelProfileForDeletion({
-			session: fakeSession(),
-			modelRegistry: fakeRegistry({ profiles: [profile] }),
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("modelRoles").default).toBe("provider-a/default");
-		expect(settings.get("task.agentModelOverrides").executor).toBe("provider-b/executor");
-	});
-
-	test("profile deletion uses an authenticated available alias variant and preserves a partial profile default chain", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-partial-alias-profile",
-			requiredProviders: [],
-			modelMapping: { executor: ["glm-5.2:low", "kimi-k3"] },
-			source: "user",
-		};
-		const unavailable = model("alpha", "zai/glm-5.2");
-		const available = model("beta", "zai/glm-5.2");
-		const baseRegistry = fakeRegistry({ profiles: [profile] });
-		const registry = {
-			...baseRegistry,
-			getAll: () => [unavailable, available],
-			getAvailable: () => [available],
-			getApiKeyForProvider: async (provider: string) => (provider === "beta" ? "key-beta" : undefined),
-			lookupAliasExists: (alias: string) => alias === "glm-5.2" || alias === "kimi-k3",
-			resolveModelByLookupAlias: (alias: string, options?: { candidates?: readonly Model[] }) =>
-				alias === "glm-5.2" ? options?.candidates?.[0] : undefined,
-		};
-		const session = fakeSession();
-		session.configuredModelChains.set("default", ["provider-c/default"]);
-		const settings = Settings.isolated({
-			"modelProfile.default": profile.name,
-			modelRoles: { default: "provider-c/default" },
-		});
-
-		await materializeModelProfileForDeletion({
-			session,
-			modelRegistry: registry as unknown as ModelRegistry,
-			settings,
-			profileName: profile.name,
-		});
-
-		expect(settings.get("task.agentModelOverrides").executor).toEqual(["beta/zai/glm-5.2:low"]);
-		expect(settings.get("modelRoles").default).toBe("provider-c/default");
-		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default"]);
-	});
-
-	test("profile deletion retains ownership when a bare alias loses authentication during concretization", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "delete-alias-auth-race",
-			requiredProviders: [],
-			modelMapping: { executor: "glm-5.2" },
-			source: "user",
-		};
-		const available = model("beta", "zai/glm-5.2");
-		const baseRegistry = fakeRegistry({ profiles: [profile] });
-		const getApiKeyForProvider = vi
-			.fn(async (): Promise<string | undefined> => "key-beta")
-			.mockResolvedValueOnce("key-beta")
-			.mockResolvedValueOnce(undefined);
-		const session = fakeSession();
-		const sticky = new Map([[session.sessionId, "alpha/zai/glm-5.2"]]);
-		const registry = {
-			...baseRegistry,
-			getAll: () => [available],
-			getAvailable: () => [available],
-			getApiKeyForProvider,
-			lookupAliasExists: (alias: string) => alias === "glm-5.2",
-			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
-				options?.candidates?.[0],
-			getSessionCanonicalVariant: (id: string) => sticky.get(id),
-			clearCanonicalVariant: (id: string) => sticky.delete(id),
-			restoreSessionCanonicalVariant: (id: string, selector: string) => {
-				sticky.set(id, selector);
-				return true;
-			},
-		};
-		const settings = Settings.isolated({ "modelProfile.default": profile.name });
-
-		await expect(
-			materializeModelProfileForDeletion({
-				session,
-				modelRegistry: registry as unknown as ModelRegistry,
-				settings,
-				profileName: profile.name,
-			}),
-		).rejects.toThrow("could not concretize authenticated selector: glm-5.2");
-		expect(settings.get("modelProfile.default")).toBe(profile.name);
-		expect(session.getActiveModelProfile()).toBeUndefined();
-		expect(sticky.get(session.sessionId)).toBe("alpha/zai/glm-5.2");
-	});
-
 	test("materializing a default override stores the selected default and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
 
 		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
 
-		const materialized = materializeActiveModelProfileAssignment({
+		const materialized = await materializeActiveModelProfileAssignment({
 			session,
 			settings,
 			role: "default",
@@ -2232,7 +2260,7 @@ describe("model profile activation", () => {
 			originalSetActiveModelProfile(name);
 		};
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: new Map([
@@ -2279,11 +2307,11 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("batch materialization is inactive without an active profile", () => {
+	test("batch materialization is inactive without an active profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "task.agentModelOverrides": { critic: "provider-a/old-critic" } });
 
-		const materialized = materializeActiveModelProfileAssignments({
+		const materialized = await materializeActiveModelProfileAssignments({
 			session,
 			settings,
 			assignments: { executor: "provider-c/executor:low" },
@@ -2294,34 +2322,27 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
-	test("--default persists profile default, clears persisted assignments, and flushes", async () => {
+	test("--default commits profile ownership without materializing profile roles", async () => {
 		const session = fakeSession();
-		const settings = Settings.isolated();
-		const setCalls: string[] = [];
-		const originalSet = settings.set.bind(settings);
-		settings.set = ((path: never, value: never) => {
-			setCalls.push(path);
-			return originalSet(path, value);
-		}) as typeof settings.set;
-		let flushCount = 0;
-		settings.flushOrThrow = async () => {
-			flushCount += 1;
-		};
+		const settings = Settings.isolated({
+			modelRoles: { default: "provider-c/default" },
+			"task.agentModelOverrides": { critic: "provider-c/critic" },
+		});
 
 		await activateModelProfile(
 			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
 			{ persistDefault: true },
 		);
 
-		expect(setCalls).toEqual([
-			"modelRoles",
-			"task.agentModelOverrides",
-			"defaultThinkingLevel",
-			"modelProfile.default",
-		]);
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "provider-c/default" });
+		expect(settings.getGlobal("task.agentModelOverrides")).toEqual({ critic: "provider-c/critic" });
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
-		expect(flushCount).toBe(1);
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 1,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
@@ -2516,10 +2537,10 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("CAS failed"));
 
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
+			"CAS failed",
 		);
 
 		expect(session.model?.id).toBe("initial");
@@ -2999,70 +3020,15 @@ describe("preset-equivalent profile activation", () => {
 		expect(clearCanonicalVariant).toHaveBeenCalledWith(session.sessionId);
 		expect(sticky.has(session.sessionId)).toBe(false);
 
-		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockRejectedValueOnce(new Error("CAS failed"));
 		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
-			"flush failed",
+			"CAS failed",
 		);
 
 		// Rollback restores the exact pre-clear sticky selector, not the
 		// transient live model's (absent) canonical identity.
 		expect(session.model).toBe(transientModel);
 		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
-	});
-
-	// A successful materialize clears the sticky during prepare; restoring the
-	// materialization must return the prior sticky via the snapshot's closure.
-	test("deletion restore returns the prior sticky canonical variant", async () => {
-		const profile: ModelProfileDefinition = {
-			name: "preset-profile",
-			requiredProviders: [],
-			modelMapping: { default: "opus" },
-			source: "user",
-		};
-		const { registry, sticky } = stickyAliasRegistry({ profiles: [profile] });
-		const session = fakeSession();
-		const fallbackRuntimeState = {
-			chain: {
-				role: "default",
-				entries: ["provider-a/opus-real", "provider-b/opus-real"],
-				origin: "runtime",
-				explicitHead: true,
-			},
-			controller: {
-				activeIndex: 1,
-				attemptsUsed: 2,
-				totalAttemptsUsed: 3,
-				attemptStarted: true,
-				restoredEntryIndices: [0],
-				tried: [{ selector: "provider-a/opus-real", triggerClass: "rate_limit", reason: "retry" }],
-				skips: [{ selector: "provider-b/opus-real", reason: "unauthenticated" }],
-				exhaustedForTurn: true,
-			},
-			exhaustedLastTurn: true,
-		} satisfies DefaultFallbackRuntimeState;
-		const restoreDefaultFallbackRuntimeState = vi.fn();
-		const sessionWithFallback = Object.assign(session, {
-			getDefaultFallbackRuntimeState: () => fallbackRuntimeState,
-			restoreDefaultFallbackRuntimeState,
-		});
-		const settings = Settings.isolated();
-		// A prior explicit selection made provider-a sticky for the session.
-		sticky.set(session.sessionId, "provider-a/opus-real");
-
-		const snapshot = await materializeModelProfileForDeletion({
-			session: sessionWithFallback,
-			modelRegistry: registry,
-			settings,
-			profileName: profile.name,
-		});
-		// Materialization invalidated the sticky during prepare.
-		expect(sticky.has(session.sessionId)).toBe(false);
-
-		await restoreMaterializedModelProfileForDeletion({ settings, session: sessionWithFallback, snapshot });
-
-		// The snapshot's internal closure restored the exact pre-clear sticky.
-		expect(sticky.get(session.sessionId)).toBe("provider-a/opus-real");
-		expect(restoreDefaultFallbackRuntimeState).toHaveBeenCalledWith(fallbackRuntimeState);
 	});
 
 	test("successful activation leaves the new model sticky", async () => {
