@@ -35,7 +35,7 @@ describe("OpenAI Codex defaults", () => {
 		const model = getBundledModel("openai-codex", "gpt-6-astra");
 
 		expect(model).toMatchObject({
-			name: "GPT-6-Astra",
+			name: "GPT-6 Astra",
 			api: "openai-codex-responses",
 			reasoning: true,
 			input: ["text", "image"],
