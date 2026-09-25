@@ -1404,11 +1404,7 @@ function attachStartupCleanupDiagnostic(primary: unknown, cleanup: unknown): unk
 			// Frozen errors retain their original message in this typed wrapper.
 		}
 	}
-	const wrapped = new AggregateError(
-		[primary, cleanup],
-		primary instanceof Error ? primary.message : String(primary),
-		{ cause: primary },
-	);
+	const wrapped = new AggregateError([primary, cleanup], safeErrorDescription(primary), { cause: primary });
 	Object.defineProperty(wrapped, "startupCleanupDiagnostic", {
 		value: diagnostic,
 		enumerable: false,

@@ -438,6 +438,39 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
+	it("preserves cleanup diagnostics when the startup error is a hostile proxy", async () => {
+		const dirs = makeDirs("reload-hostile-error");
+		const cleanupError = new Error("owned auth storage close failed");
+		const reloadError = new Proxy(new Error("initial reload failed"), {
+			defineProperty() {
+				throw new Error("hostile defineProperty trap");
+			},
+			getPrototypeOf() {
+				throw new Error("hostile getPrototypeOf trap");
+			},
+		});
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw cleanupError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) return;
+		expect(thrown.errors).toEqual([reloadError, cleanupError]);
+		expect(thrown.message).toContain("initial reload failed");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
 	it("cleans an abandoned credential listener without closing caller-owned storage", async () => {
 		const dirs = makeDirs("settings-failure");
 		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
