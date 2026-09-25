@@ -47,7 +47,7 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `gitSha` is the full checked-out `HEAD` when Git is available, with `GITHUB_SHA` used only as a fallback; `gitDirty` explicitly marks tracked or untracked worktree changes so local evidence cannot silently masquerade as a clean commit. The runner captures SHA and the complete porcelain worktree fingerprint before and after the workloads and rejects any in-flight source-state change.
 - Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 
-`hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry is `CPU-self-time confirmed` because no profiler artifacts have been captured yet.
+`hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry there is `CPU-self-time confirmed` because the base runner attaches no profiler. Profiler-backed reclassifications for the agent-session hotspots come from `bench/agent-session-profile.ts` (see [Agent-session profiler evidence](#agent-session-profiler-evidence-5942)).
 
 ## Privacy rules
 
@@ -84,6 +84,52 @@ The base runner attaches no profiler (`profilerSelfTime.profiler: "none"`), so i
 2. Record it in the fixture's `profilerSelfTime` as `{ profiler, artifactPath, samples }`.
 3. Set the hotspot classification to `CPU-self-time confirmed` with `evidenceClass: "profiler-self-time"` and the artifact in `artifactRefs`.
 4. `validatePerfCorpusReport()` will then accept the claim.
+
+`bench/agent-session-profile.ts` automates this for the `memory-agent-session-lifecycle` fixture. Its report's `profilerSelfTime` drops into that fixture and its `hotspotClassifications` validate against it.
+
+## Agent-session profiler evidence (#5942)
+
+The `short`/`soak` corpus reported an agent-session RSS slope of 28.8 MB/s and a heap slope of 14.8 MB/s (153 → 244 MB), but had no profiler evidence. `bench/agent-session-profile.ts` runs the same `createSessionWorkload()` in two equal phases:
+
+1. **Memory phase, unprofiled.** A forced full GC runs every `--sample-interval-ms` (default 1000). Each sample records pre-GC RSS and heap, then post-GC RSS, `heapUsed`, external bytes, and the live JSC object count. V8 heap snapshots are taken after warm-up (at 1/4 of the run) and at the end. The CPU profiler stays detached because its sample buffer lives on the JS heap.
+2. **CPU phase.** The inspector CPU profiler samples every 500 µs and writes a `.cpuprofile`.
+
+Retention is judged from the **snapshot-reachable self size** and the live object count across the steady-state window. It is never judged from RSS, which keeps allocator pages already released, or from `heapUsed` alone. JSC `heapUsed` can step up by a heap block without any new reachable objects.
+
+```bash
+bun --smol packages/coding-agent/bench/agent-session-profile.ts [--duration-ms 30000] [--out artifacts/perf/agent-session-profile]
+```
+
+The output directory holds `agent-session-lifecycle.cpuprofile`, `agent-session-lifecycle.{early,late}.heapsnapshot`, and `agent-session-profile.json`. That directory is `artifacts/` by default, which is gitignored; artifacts are regenerated, not committed.
+
+### Recorded result
+
+- Measurement: commit `547d76da26b1`, clean worktree, Bun 1.4.0, linux-x64, `--duration-ms 30000`, three independent runs. Each run did 2.35–2.59 M appends and profiled about 30 s of CPU.
+- **Verdict: `bounded-high-water` in 3/3 runs. No retention site exists.**
+  - Snapshot-reachable heap grew only 24.27–24.35 → 24.85 MiB (+0.50 to +0.59 MiB) across the steady-state window.
+  - The live object count *fell* by 969–1,657 objects.
+  - Outside the snapshot sample, post-GC RSS plateaued at about 190–220 MB and ended at 202–214 MB. The steady-state RSS slope was 0.68–1.09 MB/s, flat within noise.
+  - The peak RSS of about 460 MB appears at the early-snapshot sample. It is the snapshot's own serialization, not workload growth.
+- **Slope explanation.** The 28.8 MB/s corpus slope comes from its 1 s soak window. RSS climbs about 70 MB in the first ~500 ms as the allocator reaches its high-water mark, then stops. A longer window drives the slope toward zero. Pre-GC heap churns between about 18 and 32 MB within each 128-entry session, and a GC returns it.
+- **CPU.** Inclusive / self shares of profiled time across the three runs:
+  - `getEntries`: 46.7–48.6% / 0%
+  - `#appendEntry`: 30.8–32.0% / 0.4–2.6%
+  - `Object.entries`: 29.6–38.4% / 29.6–38.4%, called from `jsonLikeValueExceedsCacheLimit`'s `visit`, `stripUndefinedPlainObjectFields`, `externalizeResidentValueSync`, `cloneJsonSemantic`, and `materializeResidentValueSync`
+  - `visit` in `jsonLikeValueExceedsCacheLimit`: 16.5–17.8% / 1.3–1.9%
+  - `Buffer.byteLength`: 6.3–9.3% / 6.3–9.3%
+
+Reclassification of the agent-session hotspots from that evidence (threshold: ≥5% of profiled time inclusive):
+
+| Hotspot | Status | Evidence |
+|---|---|---|
+| M01 `#appendEntry` retention | `CPU-self-time confirmed` (CPU); memory retention **not** confirmed | 30.8–32.0% inclusive; reachable heap bounded |
+| M02 `getEntries()` copy | `CPU-self-time confirmed` (CPU); memory retention **not** confirmed | 46.7–48.6% inclusive; cost is the per-entry `Object.entries` walk, not retained copies |
+| M03 `buildDisplaySessionContext` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| M04 `AppendOnlyLog` + `cloneJson` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| M05 `captureState`/`restoreState` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| H10 replay equality | `needs-trace-coverage` | symbol absent from this fixture's profile |
+
+The CPU confirmation does not justify a memory rewrite. The measured cost is JSON-shape walking (`Object.entries`, `Buffer.byteLength`) on the append and materialize paths. Any optimization there needs a same-host before/after run of this tool, and byte-parity gates still apply.
 
 ## Threshold-promotion process
 
