@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { installGjcBundle, loadAlwaysOnPluginTools, renderSkillAdvertisement } from "../src/extensibility/gjc-plugins";
+import { hashStableFile } from "../src/extensibility/gjc-plugins/runtime-adapters";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
@@ -226,5 +227,34 @@ export default pi => ({ name: "late_tool", label: "Late", description: "late", p
 
 		const after = await renderSkillAdvertisement({ cwd, skillName: "ralplan", phase: "planner" });
 		expect(after).toBe("");
+	});
+});
+
+describe("startup Node authority hashing (#5941)", () => {
+	test("hashes a multi-chunk file to its exact SHA-256 while following symlinks", async () => {
+		const cwd = await mkCwd();
+		// Larger than one 1 MiB read chunk and not chunk-aligned, so digest continuity is exercised.
+		const bytes = new Uint8Array(3 * 1024 * 1024 + 17);
+		for (let index = 0; index < bytes.length; index++) bytes[index] = (index * 31 + 7) & 0xff;
+		const target = path.join(cwd, "node");
+		await Bun.write(target, bytes);
+		const link = path.join(cwd, "node-link");
+		await fs.symlink(target, link);
+
+		const expected = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+		expect(await hashStableFile(target, "Node", bytes.length)).toBe(expected);
+		expect(await hashStableFile(link, "Node", bytes.length)).toBe(expected);
+	});
+
+	test("rejects files over the byte limit and non-regular files", async () => {
+		const cwd = await mkCwd();
+		const target = path.join(cwd, "node");
+		await Bun.write(target, new Uint8Array(4096));
+		await expect(hashStableFile(target, "Initial Node executable", 4095)).rejects.toThrow(
+			"Initial Node executable exceeds its byte limit",
+		);
+		await expect(hashStableFile(cwd, "Initial Node executable", 4096)).rejects.toThrow(
+			"Initial Node executable is not a regular file",
+		);
 	});
 });
