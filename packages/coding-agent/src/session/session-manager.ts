@@ -18426,7 +18426,9 @@ export class SessionManager {
 	}
 
 	appendModelProfileOwnershipMarker(marker: ModelProfileOwnershipMarker): string {
-		return this.appendCustomEntry(MODEL_PROFILE_OWNERSHIP_ENTRY, marker);
+		const validated = validateModelProfileOwnershipMarker(marker);
+		if (!validated) throw new InvalidModelProfileOwnershipError();
+		return this.appendCustomEntry(MODEL_PROFILE_OWNERSHIP_ENTRY, validated);
 	}
 
 	getModelProfileOwnershipMarker(): ModelProfileOwnershipMarker | undefined {
