@@ -234,7 +234,10 @@ describe("issue #5802: coordinator env isolation at the bash boundary", () => {
 			});
 			const output = textOf(result);
 
-			await fs.access(path.join(fixtureDir, "target", "debug", "deps"));
+			// The compiled rlib is the artifact every Cargo release writes to the
+			// target dir; `target/debug/deps` is a build-dir detail that
+			// nightly-2026-08-12 no longer creates for a leaf library crate.
+			await fs.access(path.join(fixtureDir, "target", "debug", "libbash_minimizer_fixture.rlib"));
 			expect(nativeCommand).toBe(command);
 			expect(nativeUnsetEnv).toEqual(coordinatorOnlyEnvNames);
 			expect(nativeMinimizer).toEqual({

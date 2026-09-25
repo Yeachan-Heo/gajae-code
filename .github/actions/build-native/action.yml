@@ -37,7 +37,7 @@ runs:
    steps:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-           toolchain: nightly-2026-04-29
+           toolchain: nightly-2026-08-12
            components: ${{ inputs.rust_checks == 'true' && 'clippy, rustfmt' || '' }}
            targets: ${{ inputs.target }}
       - name: Prepend rustup toolchain bin to PATH

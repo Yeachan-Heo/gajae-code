@@ -153,7 +153,7 @@ fn reserve_directed_frame(counter: &AtomicUsize) -> bool {
 
 fn reserve_directed_frames(counter: &AtomicUsize, count: usize) -> bool {
 	counter
-		.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+		.try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
 			queued
 				.checked_add(count)
 				.filter(|next| *next <= MAX_QUEUED_DIRECTED_FRAMES)
@@ -4787,8 +4787,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -4830,8 +4829,7 @@ mod tests {
 				"threadId": "11",
 				"question": "What changed?",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4884,9 +4882,7 @@ mod tests {
 				"question": "wrong token",
 			}),
 		] {
-			ws.send(Message::Text(frame.to_string().into()))
-				.await
-				.unwrap();
+			ws.send(Message::Text(frame.to_string())).await.unwrap();
 		}
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(300), inbound.recv())
@@ -4921,8 +4917,7 @@ mod tests {
 				"threadId": "11",
 				"reason": "daemon_shutdown",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4957,8 +4952,7 @@ mod tests {
 				"question": "strict",
 				"unexpected": true,
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -4973,8 +4967,7 @@ mod tests {
 				"threadId": "11",
 				"question": "strict",
 			})
-			.to_string()
-			.into(),
+			.to_string(),
 		))
 		.await
 		.unwrap();
@@ -5004,8 +4997,7 @@ mod tests {
 				thread_id:  Some("topic-1".into()),
 				command:    serde_json::json!({ "name": "context" }),
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -5041,8 +5033,7 @@ mod tests {
 				thread_id:  None,
 				images:     vec![],
 			}))
-			.unwrap()
-			.into(),
+			.unwrap(),
 		))
 		.await
 		.unwrap();
@@ -5175,7 +5166,7 @@ mod tests {
 		wait_for_clients(&handle, 2).await;
 
 		oversized
-			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1).into()))
+			.send(Message::Text("x".repeat(REQUEST_FRAME_BYTES + 1)))
 			.await
 			.expect("send oversized text frame");
 		match tokio::time::timeout(std::time::Duration::from_secs(2), oversized.next())
@@ -5191,9 +5182,7 @@ mod tests {
 
 		healthy
 			.send(Message::Text(
-				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() }))
-					.unwrap()
-					.into(),
+				serde_json::to_string(&ClientMessage::Ping(Ping { nonce: "healthy".into() })).unwrap(),
 			))
 			.await
 			.expect("send healthy request");
@@ -5210,7 +5199,7 @@ mod tests {
 		next_server_hello(&mut ws).await;
 		wait_for_clients(&handle, 1).await;
 
-		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec().into()))
+		ws.send(Message::Binary(br#"{"type":"ping"}"#.to_vec()))
 			.await
 			.expect("send binary protocol frame");
 		let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())

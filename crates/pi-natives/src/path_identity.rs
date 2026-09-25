@@ -878,7 +878,7 @@ impl NativeExactUnlinkResult {
 }
 
 #[cfg(any(windows, test))]
-/// STATUS_SHARING_VIOLATION: a concurrent handle denies the share mode this
+/// `STATUS_SHARING_VIOLATION`: a concurrent handle denies the share mode this
 /// open requested. This is the Windows transient conflict issue #4330 exists
 /// for: another holder without delete sharing makes the exact-replace
 /// destination `NtCreateFile` fail before any namespace mutation, and the
@@ -940,7 +940,7 @@ fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Res
 
 #[cfg(any(windows, test))]
 /// Path-free, hex-formatted Windows NTSTATUS evidence for a pre-mutation
-/// failure, e.g. `0xC0000043` for STATUS_SHARING_VIOLATION.
+/// failure, e.g. `0xC0000043` for `STATUS_SHARING_VIOLATION`.
 fn native_windows_error_code(status: i32) -> String {
 	format!("0x{status:08X}")
 }
@@ -7141,7 +7141,7 @@ pub(crate) mod platform {
 									== expected_child.size.parse().ok().unwrap_or(u64::MAX)
 								&& stat_mtime_ns(&commit_stat)
 									== expected_child.mtime_ns.parse().ok().unwrap_or(i128::MIN)
-								&& digest_fd(writable).ok().is_some_and(|digest| {
+								&& digest_fd(writable).is_ok_and(|digest| {
 									expected_child
 										.sha256
 										.as_deref()
