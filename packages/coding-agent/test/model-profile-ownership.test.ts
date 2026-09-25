@@ -16,6 +16,7 @@ import {
 	validateDurableModelProfileOwnership,
 } from "../src/config/model-profile-ownership";
 import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
+import { validateSettingPatch } from "../src/config/settings-schema";
 import { SessionManager } from "../src/session/session-manager";
 
 const inherit: ModelProfileOwnershipMarker = { kind: "inherit" };
@@ -122,6 +123,21 @@ describe("model-profile ownership contract", () => {
 		expect(readDurableModelProfileOwnership(settings)).toEqual(next);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "updated/default" });
 		expect(settings.getGlobal("modelProfile.default")).not.toBeUndefined();
+	});
+
+	it("rejects invalid markers before durable ownership writes", async () => {
+		const settings = Settings.isolated();
+		await expect(commitDurableModelProfileOwnership(settings, { kind: "profile", profile: " " })).rejects.toThrow(
+			InvalidModelProfileOwnershipError,
+		);
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 0, marker: inherit });
+	});
+
+	it("keeps the legacy profile projection patchable until transaction routing lands", () => {
+		expect(validateSettingPatch({ "modelProfile.default": "codex-medium" })).toEqual([]);
+		expect(
+			validateSettingPatch({ "modelProfile.ownership": { schemaVersion: 1, version: 1, marker: profileA } }),
+		).toHaveLength(1);
 	});
 
 	it("rejects extra patches that could overwrite the owner record or its projection", async () => {

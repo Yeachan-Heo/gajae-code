@@ -190,24 +190,14 @@ export function readDurableModelProfileOwnership(
 export function readDurableModelProfileOwnershipFromRaw(
 	raw: Readonly<Record<string, unknown>>,
 ): DurableModelProfileOwnership {
-	const nested = (path: string): unknown => {
-		const dotted = raw[path];
-		if (dotted !== undefined) return dotted;
-		let current: unknown = raw;
-		for (const segment of path.split(".")) {
-			if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
-			current = (current as Record<string, unknown>)[segment];
-		}
-		return current;
-	};
-	const configured = nested("modelProfile.ownership");
+	const configured = rawValueAtPath(raw, "modelProfile.ownership");
 	if (configured !== undefined) {
 		const validated = validateDurableModelProfileOwnership(configured);
 		if (!validated) throw new InvalidModelProfileOwnershipError();
-		assertLegacyDefaultMatchesOwnership(validated.marker, nested("modelProfile.default"));
+		assertLegacyDefaultMatchesOwnership(validated.marker, rawValueAtPath(raw, "modelProfile.default"));
 		return validated;
 	}
-	const legacyProfile = nested("modelProfile.default");
+	const legacyProfile = rawValueAtPath(raw, "modelProfile.default");
 	return {
 		schemaVersion: 1,
 		version: 0,
@@ -252,6 +242,8 @@ export async function commitDurableModelProfileOwnershipWithResult(
 	validateCurrent?: () => Promise<void> | void,
 	observedOwnership?: DurableModelProfileOwnership,
 ): Promise<DurableModelProfileOwnershipCommit> {
+	const requestedMarker = validateModelProfileOwnershipMarker(marker);
+	if (!requestedMarker) throw new InvalidModelProfileOwnershipError();
 	if (extraPatches.some(patch => OWNERSHIP_PROJECTION_PATHS.has(patch.path))) {
 		throw new Error("Durable ownership extra patches cannot target modelProfile.ownership or modelProfile.default.");
 	}
@@ -266,18 +258,18 @@ export async function commitDurableModelProfileOwnershipWithResult(
 		await validateCurrent?.();
 		if (
 			actual.version > 0 &&
-			markersEqual(actual.marker, marker) &&
+			markersEqual(actual.marker, requestedMarker) &&
 			extraPatchesAlreadyApplied(current, extraPatches)
 		) {
 			result = actual;
 			return [];
 		}
-		result = nextDurableModelProfileOwnership(actual, marker);
+		result = nextDurableModelProfileOwnership(actual, requestedMarker);
 		wrote = true;
 		return [
 			{ path: "modelProfile.ownership", op: "set", value: result },
-			marker.kind === "profile"
-				? { path: "modelProfile.default", op: "set", value: marker.profile }
+			requestedMarker.kind === "profile"
+				? { path: "modelProfile.default", op: "set", value: requestedMarker.profile }
 				: { path: "modelProfile.default", op: "unset" },
 			...extraPatches,
 		];
