@@ -23184,6 +23184,8 @@ export class AgentSession {
 				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
 			},
 			onManagedAttemptAccepted: () => {
+				const acceptedSelector = controller.currentSelector();
+				if (acceptedSelector) this.#modelRegistry.closeSelectorCircuit(acceptedSelector);
 				controller.resetAttemptBudget();
 				this.#escapedNonAsciiManagedRetries = 0;
 				this.#overflowMaintenanceAttempts = 0;
@@ -23204,10 +23206,12 @@ export class AgentSession {
 			if (controller.chain.entries.length > 1) await this.#advanceDefaultFallback(controller, "new_turn", 0);
 			return;
 		}
+		const head = controller.chain.entries[0] ?? "";
 		if (
 			this.settings.get("retry.fallbackRevertPolicy") === "cooldown-expiry" &&
 			controller.activeIndex > 0 &&
-			this.#modelRegistry.getSelectorSuppressionStatus(controller.chain.entries[0] ?? "") === "expired"
+			(this.#modelRegistry.getSelectorSuppressionStatus(head) === "expired" ||
+				this.#modelRegistry.isSelectorCircuitHalfOpen(head))
 		) {
 			controller.resetForNewTurn();
 		}
@@ -23680,6 +23684,16 @@ export class AgentSession {
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
+			// Skip an entry whose circuit is open (it recently failed out of a chain
+			// in this or a sibling session). The final entry always stays eligible so
+			// an all-open chain degrades to probing rather than refusing the turn.
+			if (
+				controller.activeIndex < controller.chain.entries.length - 1 &&
+				this.#modelRegistry.isSelectorCircuitOpen(selector)
+			) {
+				controller.onResolutionSkip("circuit_open");
+				continue;
+			}
 			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
 			const profileResolution = profileAliasIntent
 				? await (async () => {
@@ -24474,6 +24488,21 @@ export class AgentSession {
 			) {
 				outcome = "retry";
 			}
+		}
+		// An entry that failed out of the chain opens its circuit so later turns,
+		// chain restarts, and sibling sessions sharing this registry skip it
+		// instead of re-spending its whole attempt budget on a known-bad route.
+		// A rate limit with a typed Retry-After already scheduled the entry's
+		// return via selector suppression above; the provider's own hint outranks
+		// the local cooldown.
+		const suppressedByRetryAfter = trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined;
+		const circuitCooldownMs = this.settings.get("fallback.circuitCooldownMs");
+		if (managedFallback && outcome !== "retry" && failedSelector && !suppressedByRetryAfter && circuitCooldownMs > 0) {
+			this.#modelRegistry.openSelectorCircuit(
+				failedSelector,
+				circuitCooldownMs,
+				this.settings.get("fallback.circuitMaxCooldownMs"),
+			);
 		}
 		if (outcome === "advance") {
 			this.#providerRetryMaxAttempts = undefined;

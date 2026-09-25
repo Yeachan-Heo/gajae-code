@@ -1081,19 +1081,58 @@ export interface ModelChainResolutionOptions {
 	signal?: AbortSignal;
 }
 
-export async function resolveModelChainWithAuth(
-	modelPatterns: readonly string[],
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
-	settings?: Settings,
-	sessionId?: string,
-	options?: ModelChainResolutionOptions,
-): Promise<{
+type ChainResolutionRegistry = ModelLookupRegistry &
+	Pick<ModelRegistry, "getApiKey"> &
+	Partial<Pick<ModelRegistry, "isSelectorCircuitOpen">>;
+
+interface ModelChainResolution {
 	model?: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel: boolean;
 	activeIndex: number;
 	skips: Array<{ selector: string; reason: string }>;
-}> {
+}
+
+export async function resolveModelChainWithAuth(
+	modelPatterns: readonly string[],
+	modelRegistry: ChainResolutionRegistry,
+	settings?: Settings,
+	sessionId?: string,
+	options?: ModelChainResolutionOptions,
+): Promise<ModelChainResolution> {
+	// A managed chain skips entries whose fallback circuit is open (they recently
+	// failed out of a chain). When every remaining entry is open, resolve again
+	// from the first open entry so the chain degrades to probing instead of
+	// refusing the turn outright.
+	const skipOpenCircuits = options?.managedFallback === true && modelPatterns.length > 1;
+	const resolution = await resolveModelChainEntries(modelPatterns, modelRegistry, settings, sessionId, options, 0, {
+		skipOpenCircuits,
+	});
+	const { firstOpenCircuit, ...result } = resolution;
+	if (result.model || firstOpenCircuit === undefined) return result;
+	const { firstOpenCircuit: _unused, ...probe } = await resolveModelChainEntries(
+		modelPatterns,
+		modelRegistry,
+		settings,
+		sessionId,
+		options,
+		firstOpenCircuit.index,
+		{ skipOpenCircuits: false },
+	);
+	return probe.model
+		? { ...probe, skips: [...result.skips.slice(0, firstOpenCircuit.skipCount), ...probe.skips] }
+		: result;
+}
+
+async function resolveModelChainEntries(
+	modelPatterns: readonly string[],
+	modelRegistry: ChainResolutionRegistry,
+	settings: Settings | undefined,
+	sessionId: string | undefined,
+	options: ModelChainResolutionOptions | undefined,
+	startIndex: number,
+	circuitPolicy: { skipOpenCircuits: boolean },
+): Promise<ModelChainResolution & { firstOpenCircuit?: { index: number; skipCount: number } }> {
 	const availableModels = modelRegistry.getAvailable();
 	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
 	const skips: Array<{ selector: string; reason: string }> = [];
@@ -1101,8 +1140,14 @@ export async function resolveModelChainWithAuth(
 	const canonicalSessionId =
 		options?.canonicalSessionId === null ? undefined : (options?.canonicalSessionId ?? sessionId);
 	const credentialSessionId = options?.credentialSessionId ?? sessionId;
-	for (let activeIndex = 0; activeIndex < modelPatterns.length; activeIndex += 1) {
+	let firstOpenCircuit: { index: number; skipCount: number } | undefined;
+	for (let activeIndex = startIndex; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
+		if (circuitPolicy.skipOpenCircuits && modelRegistry.isSelectorCircuitOpen?.(selector)) {
+			firstOpenCircuit ??= { index: activeIndex, skipCount: skips.length };
+			skips.push({ selector, reason: "circuit_open" });
+			continue;
+		}
 		const suffix = splitSelectorThinkingSuffix(selector);
 		const aliasSelector = suffix.thinkingLevel ? suffix.selector : selector;
 		const aliasKey = aliasSelector.includes("/") ? undefined : getFinalSlashSegmentAliasKey(aliasSelector);
@@ -1146,7 +1191,7 @@ export async function resolveModelChainWithAuth(
 			if (stickySessionId) modelRegistry.clearCanonicalVariant?.(stickySessionId);
 		}
 	}
-	return { explicitThinkingLevel: false, activeIndex: modelPatterns.length, skips };
+	return { explicitThinkingLevel: false, activeIndex: modelPatterns.length, skips, firstOpenCircuit };
 }
 export function isExplicitProviderModelSelector(pattern: string): boolean {
 	const normalized = pattern.trim();

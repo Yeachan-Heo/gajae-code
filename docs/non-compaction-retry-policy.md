@@ -198,6 +198,8 @@ The standard retry controls are defined in the settings schema under `retry`:
 
 Fallback candidates are configured as ordered selector arrays on preset `model_mapping` roles, top-level `modelRoles`, or `task.agentModelOverrides`; `fallback.maxAttempts` controls the total request-time attempts per concrete entry. Resolution-time unavailable, unauthenticated, and unknown entries advance immediately without consuming that budget.
 
+An entry that fails out of a managed chain (advance or exhaustion) opens a circuit in the shared model registry, so later turns, chain restarts, and sibling sessions such as subagents skip it without spending its attempt budget again. The cooldown starts at `fallback.circuitCooldownMs` (default 60s) and doubles on each consecutive open up to `fallback.circuitMaxCooldownMs` (default 30m); an accepted response on the entry closes the circuit and resets the escalation. After the cooldown the circuit is half-open: with `retry.fallbackRevertPolicy: cooldown-expiry` the next turn probes the head again. A rate limit carrying a typed Retry-After uses selector suppression instead of the circuit. The last chain entry is never skipped, and a chain whose entries are all open still probes the first one. Set `fallback.circuitCooldownMs: 0` to disable the breaker.
+
 On settings load, a source-aware one-shot migration still reads legacy `retry.fallbackChains` and combines the effective role chain with its ordered, deduplicated legacy tail into the corresponding role array. The legacy key is ignored after migration; it is not a retry configuration surface.
 
 Programmatic toggles in session:
