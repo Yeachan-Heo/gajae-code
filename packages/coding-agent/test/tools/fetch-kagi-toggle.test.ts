@@ -241,6 +241,52 @@ describe("read tool URL handling", () => {
 		expect(textBlock?.type).toBe("text");
 		expect(textBlock?.text).toContain("displayed at 1000x500");
 	});
+	it("rasterizes fetched SVG responses to PNG before image resizing", async () => {
+		const svgBytes = fs.readFileSync(path.join(import.meta.dir, "../../../natives/test/fixtures/svg/geometry.svg"));
+		const session = createSession();
+		const tool = new ReadTool(session);
+		let resizeInput: { mimeType: string; bytes: Buffer } | undefined;
+		const resizeSpy = vi.spyOn(imageResize, "resizeImage").mockImplementation(async image => {
+			resizeInput = { mimeType: image.mimeType, bytes: Buffer.from(image.data, "base64") };
+			return {
+				buffer: new Uint8Array([1, 2, 3]),
+				mimeType: "image/png",
+				originalWidth: 17,
+				originalHeight: 11,
+				width: 17,
+				height: 11,
+				wasResized: false,
+				get data() {
+					return "aW1hZ2U=";
+				},
+			};
+		});
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+			ok: true,
+			status: 200,
+			contentType: "image/svg+xml",
+			finalUrl: "https://example.com/geometry.svg",
+			content: "",
+		});
+		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({ ok: true, buffer: svgBytes });
+		const markitSpy = vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({
+			ok: false,
+			content: "",
+			error: "markit unavailable",
+		});
+
+		const result = await tool.execute("fetch-svg", { path: "https://example.com/geometry.svg" });
+		const imageBlock = result.content.find(
+			(content): content is { type: "image"; data: string; mimeType: string } => content.type === "image",
+		);
+
+		expect(resizeSpy).toHaveBeenCalledTimes(1);
+		expect(markitSpy).not.toHaveBeenCalled();
+		expect(resizeInput?.mimeType).toBe("image/png");
+		expect(resizeInput?.bytes.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+		expect(result.details?.method).toBe("image");
+		expect(imageBlock?.mimeType).toBe("image/png");
+	});
 
 	it("keeps markit extracted text for image responses", async () => {
 		const session = createSession();

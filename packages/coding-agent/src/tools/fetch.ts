@@ -15,6 +15,7 @@ import { CachedOutputBlock } from "../tui/output-block";
 import { renderStatusLine } from "../tui/status-line";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
+import { rasterizeSvgInputBytes } from "../utils/image-loading";
 import { INSANE_NOTES } from "../web/insane/bridge";
 import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import {
@@ -107,8 +108,9 @@ const IMAGE_MIME_BY_EXTENSION = new Map<string, string>([
 	[".jpeg", "image/jpeg"],
 	[".gif", "image/gif"],
 	[".webp", "image/webp"],
+	[".svg", "image/svg+xml"],
 ]);
-const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]);
 const MAX_INLINE_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024;
 const MAX_INLINE_IMAGE_OUTPUT_BYTES = 300 * 1024;
 
@@ -861,22 +863,24 @@ async function renderUrl(
 			const binary = dispositionBinary ?? (await fetchBinary(finalUrl, timeout, signal));
 			if (binary.ok) {
 				notes.push("Fetched image binary");
-				const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
 				let convertedText: string | null = null;
-				const converted = await convertWithMarkit(binary.buffer, conversionExtension, timeout, signal);
-				if (converted.ok) {
-					// See the non-empty conversion note near the document path
-					// below (#5433): short conversions still beat raw fallback.
-					if (converted.content.trim().length > 0) {
-						notes.push("Converted with markit");
-						convertedText = converted.content;
+				if (imageMimeType !== "image/svg+xml") {
+					const conversionExtension = getExtensionHint(finalUrl, binary.contentDisposition) || extHint;
+					const converted = await convertWithMarkit(binary.buffer, conversionExtension, timeout, signal);
+					if (converted.ok) {
+						// See the non-empty conversion note near the document path
+						// below (#5433): short conversions still beat raw fallback.
+						if (converted.content.trim().length > 0) {
+							notes.push("Converted with markit");
+							convertedText = converted.content;
+						} else {
+							notes.push("markit conversion produced no usable output");
+						}
+					} else if (converted.error) {
+						notes.push(`markit conversion failed: ${converted.error}`);
 					} else {
-						notes.push("markit conversion produced no usable output");
+						notes.push("markit conversion failed");
 					}
-				} else if (converted.error) {
-					notes.push(`markit conversion failed: ${converted.error}`);
-				} else {
-					notes.push("markit conversion failed");
 				}
 
 				if (binary.buffer.byteLength > MAX_INLINE_IMAGE_SOURCE_BYTES) {
@@ -897,9 +901,15 @@ async function renderUrl(
 						notes,
 					};
 				}
+				const imageBytes =
+					imageMimeType === "image/svg+xml" ? await rasterizeSvgInputBytes(binary.buffer) : binary.buffer;
 
 				const resized = await resizeImage(
-					{ type: "image", data: Buffer.from(binary.buffer).toBase64(), mimeType: imageMimeType },
+					{
+						type: "image",
+						data: Buffer.from(imageBytes).toBase64(),
+						mimeType: imageMimeType === "image/svg+xml" ? "image/png" : imageMimeType,
+					},
 					{ maxBytes: MAX_INLINE_IMAGE_OUTPUT_BYTES },
 				);
 				const isDecodedImage =

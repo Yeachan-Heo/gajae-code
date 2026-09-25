@@ -26,6 +26,8 @@ html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
 image.workspace = true
+png.workspace = true
+resvg.workspace = true
 # Feature activation only (see workspace manifest): zune-jpeg needs `log` to compile.
 zune-jpeg.workspace = true
 # Upstream pinning only (see workspace manifest): tinyvec 1.13.0 is broken.

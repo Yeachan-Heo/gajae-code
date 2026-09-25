@@ -190,6 +190,7 @@ const requiredGeneratedBindingSymbols = [
 	"NativePublishDiagnostic",
 	"NativePublishSyncFailure",
 	"openRecoveryFsRoot",
+	"rasterizeSvg",
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
