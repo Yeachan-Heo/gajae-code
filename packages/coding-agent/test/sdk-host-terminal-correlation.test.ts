@@ -102,7 +102,7 @@ test("disowned SDK steering cohorts share streams and terminals without adopting
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey: async () => "test-key", getAuthStorageOwner: () => undefined } as never,
+		modelRegistry: { getApiKey: async () => "test-key", getAuthStorageOwner: () => undefined, getModelProfiles: () => new Map() } as never,
 		extensionRunner: {
 			hasHandlers: () => true,
 			emitBeforeAgentStart: async () => undefined,
