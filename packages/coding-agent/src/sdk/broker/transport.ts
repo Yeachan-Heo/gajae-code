@@ -144,6 +144,10 @@ export class BrokerTransport {
 			sendError(socket, frame.id, "invalid_input", "idempotencyKey must be a string");
 			return;
 		}
+		if (!this.#broker.ownsDiscovery) {
+			sendError(socket, frame.id, "unavailable", "broker publication is unavailable");
+			return;
+		}
 		if (frame.operation === "broker.shutdown") {
 			const action = brokerShutdownSendAction(
 				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
@@ -161,6 +165,6 @@ export class BrokerTransport {
 		}
 	}
 	#scheduleStopAfterShutdownResponse(): void {
-		setTimeout(() => void this.#broker.stop(), 25);
+		setTimeout(() => void this.#broker.stop({ kind: "shutdown-request" }), 25);
 	}
 }

@@ -7,6 +7,7 @@ import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
 import { SdkClient } from "../client/client";
+import { type BrokerStartupExitRecord, clearBrokerStartupExitRecord, readBrokerStartupExitRecord } from "./broker-exit";
 import {
 	type BrokerDiscovery,
 	brokerProcessIncarnation,
@@ -35,6 +36,13 @@ function brokerStartupFailureReason(marker: BrokerStartupFailureMarker | undefin
 	if (!marker) return "Detached SDK broker exited before publishing discovery.";
 	if (marker.cleanupCommand && marker.reason.endsWith(": ")) return `${marker.reason}${marker.cleanupCommand}`;
 	return marker.reason;
+}
+
+function brokerStartupExitReason(record: BrokerStartupExitRecord | undefined): string | undefined {
+	if (!record) return undefined;
+	if (record.reason === "startup-deadline")
+		return `SDK broker startup exceeded its ${record.timeoutMs}ms fence deadline.`;
+	return `SDK broker startup interrupted by ${record.signal} before readiness.`;
 }
 
 export function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
@@ -683,7 +691,9 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		spawnLog = await openBrokerSpawnLog(settings.agentDir);
 		// A stale marker must never be misattributed to this spawn; clear it first.
+		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
+		const childSpawnedAt = Date.now();
 		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 			detached: true,
 			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
@@ -752,6 +762,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			}
 		}
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
+		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		const trustedMarker =
 			marker &&
 			child.pid !== undefined &&
@@ -759,6 +770,13 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			marker.pid === child.pid &&
 			marker.incarnation === childIncarnation
 				? marker
+				: undefined;
+		const trustedStartupExitRecord =
+			startupExitRecord &&
+			child.pid !== undefined &&
+			startupExitRecord.pid === child.pid &&
+			startupExitRecord.writtenAt >= childSpawnedAt
+				? startupExitRecord
 				: undefined;
 		const startupLockPath = path.join(settings.agentDir, "sdk", STARTUP_LOCK_TARGET_NAME);
 		let startupFenceContention =
@@ -810,9 +828,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
-						exitCode: child.exitCode,
-						signal: child.signalCode,
-						reason: brokerStartupFailureReason(trustedMarker),
+						exitCode: child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null,
+						signal: child.signalCode ?? trustedStartupExitRecord?.signal ?? null,
+						reason:
+							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
 					})
 				: discoveryError
