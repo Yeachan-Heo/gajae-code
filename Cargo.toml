@@ -48,6 +48,12 @@ codegen-units = 16
 incremental = true
 strip = false
 
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+strip = false
+
 [profile.dev]
 opt-level = 0
 lto = false
