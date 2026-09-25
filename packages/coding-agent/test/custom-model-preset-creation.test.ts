@@ -8,6 +8,7 @@ import {
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
+import { commitDurableModelProfileOwnership } from "@gajae-code/coding-agent/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
@@ -173,7 +174,7 @@ describe("custom model preset creation", () => {
 
 	it("deletes only the selected custom preset", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
-		const registry = new ModelRegistry(authStorage, modelsPath);
+		const registry = new ModelRegistry(authStorage, modelsPath, Settings.isolated());
 		await registry.saveCustomModelProfile("first", {
 			display_name: "first",
 			required_providers: ["my-oai"],
@@ -202,9 +203,32 @@ describe("custom model preset creation", () => {
 		expect(parsed.profiles.second?.display_name).toBe("second");
 	});
 
+	it("requires durable ownership replacement before deleting its profile", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const settings = Settings.isolated({ "modelProfile.default": "first" });
+		const registry = new ModelRegistry(authStorage, modelsPath, settings);
+		await registry.saveCustomModelProfile("first", {
+			display_name: "first",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		});
+		const originalConfig = await Bun.file(modelsPath).text();
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "first" });
+
+		await expect(registry.deleteCustomModelProfile("first")).rejects.toThrow(
+			"Choose a replacement profile before deleting the active profile",
+		);
+		expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+		expect(registry.getModelProfile("first")).toBeDefined();
+
+		await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		await registry.deleteCustomModelProfile("first");
+		expect(registry.getModelProfile("first")).toBeUndefined();
+	});
+
 	it("rejects empty rename input and built-in delete without mutating config", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
-		const registry = new ModelRegistry(authStorage, modelsPath);
+		const registry = new ModelRegistry(authStorage, modelsPath, Settings.isolated());
 		await registry.saveCustomModelProfile("my-fast", {
 			display_name: "my-fast",
 			required_providers: ["my-oai"],
