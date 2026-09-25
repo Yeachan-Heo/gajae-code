@@ -39,9 +39,29 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		rationale: "Tree-sitter parsing and summarization hot paths shared by native code.",
 	},
 	{
+		dir: "crates/pi-diff",
+		packageName: "pi-diff",
+		rationale: "Vendored upstream Rust diff primitives behind the native addon boundary.",
+	},
+	{
+		dir: "crates/pi-edit",
+		packageName: "pi-edit",
+		rationale: "Native edit matcher and replace engine behind the coding-agent edit tool.",
+	},
+	{
 		dir: "crates/pi-iso",
 		packageName: "pi-iso",
 		rationale: "Native filesystem isolation backends such as clone, reflink, overlay, and ProjFS.",
+	},
+	{
+		dir: "crates/pi-vfs",
+		packageName: "pi-vfs",
+		rationale: "Vendored upstream filesystem abstraction behind the native addon boundary.",
+	},
+	{
+		dir: "crates/pi-walker",
+		packageName: "pi-walker",
+		rationale: "Vendored upstream filesystem traversal infrastructure behind the native addon boundary.",
 	},
 	{
 		dir: "crates/gjc-sdk",
