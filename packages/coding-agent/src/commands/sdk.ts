@@ -697,7 +697,14 @@ export async function runSessionHost(
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
 			if (options.processLocalOnly || options.readinessPublication) return;
-			if (!cleanupLateResult) {
+			// Wait for the late stage to complete or timeout, even if there's no cleanup callback.
+			// This ensures that stages like applyModelProfiles get a chance to finish before
+			// we proceed with session disposal and rollback.
+			const stageCompleted = await Promise.race([
+				lateStage.then(() => true),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+			]);
+			if (!stageCompleted) {
 				constructionCleanupComplete = false;
 				return;
 			}
@@ -705,6 +712,9 @@ export async function runSessionHost(
 				.then(async late => {
 					if ("error" in late) {
 						constructionCleanupComplete = false;
+						return;
+					}
+					if (!cleanupLateResult) {
 						return;
 					}
 					try {
@@ -719,11 +729,7 @@ export async function runSessionHost(
 				.catch(() => {
 					constructionCleanupComplete = false;
 				});
-			const cleanupCompleted = await Promise.race([
-				cleanup.then(() => true),
-				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
-			]);
-			if (!cleanupCompleted) constructionCleanupComplete = false;
+			await cleanup;
 		};
 		if ("failure" in result) {
 			await cleanupLateStage(pending);
