@@ -282,6 +282,7 @@ napi-derive = "3"
 # Terminal & PTY
 # ──────────────────────────────────────────────────────────────────────────────
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+clipboard-win = "5.4"
 icy_sixel = "0.7"
 portable-pty = "0.9"
 

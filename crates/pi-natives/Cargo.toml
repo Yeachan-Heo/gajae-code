@@ -25,7 +25,7 @@ grep-searcher.workspace = true
 html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["bmp"] }
 # Feature activation only (see workspace manifest): zune-jpeg needs `log` to compile.
 zune-jpeg.workspace = true
 # Upstream pinning only (see workspace manifest): tinyvec 1.13.0 is broken.
@@ -62,6 +62,7 @@ libc.workspace = true
 sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
+clipboard-win.workspace = true
 winreg.workspace = true
 windows-sys.workspace = true
 

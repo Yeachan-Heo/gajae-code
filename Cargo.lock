@@ -2408,6 +2408,7 @@ dependencies = [
  "arboard",
  "ast-grep-core",
  "clap",
+ "clipboard-win",
  "dashmap",
  "find-msvc-tools",
  "gjc-sdk",
