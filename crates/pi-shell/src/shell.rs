@@ -3498,4 +3498,28 @@ mod tests {
 			"a live child must appear in the observed descendant set",
 		);
 	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cd_physical_mode_supports_exit_on_failed_resolution() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+		let command = format!("cd -P -e {} && printf cd-e-ok", quote_arg(&cwd));
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command, ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("cd -Pe should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "cd-e-ok");
+	}
 }
