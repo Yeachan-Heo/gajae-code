@@ -4376,11 +4376,11 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
-		if (path === "modelProfile.default" || path === "modelProfile.ownership") {
+		// Keep the legacy projection writable until every durable writer uses ownership CAS.
+		if (path === "modelProfile.ownership") {
 			issues.push({
 				path,
-				detail:
-					"Model-profile ownership is managed separately; use model.profile.set for a session selection or gjc config set/reset for durable ownership.",
+				detail: "The versioned model-profile ownership record is internal and cannot be patched generically.",
 			});
 			continue;
 		}
