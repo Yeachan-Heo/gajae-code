@@ -1803,6 +1803,7 @@ export async function writeSessionLifecycleReady(
 	id: string,
 	effectMarker: string,
 	canPublish: () => boolean = () => true,
+	onPublishing?: (revoke: () => boolean) => void,
 	onPublished?: () => void,
 ): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
@@ -1826,6 +1827,7 @@ export async function writeSessionLifecycleReady(
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
 		fsSync.renameSync(temporary, lifecycleReadyPath(root, id));
 		published = true;
+		onPublishing?.(() => removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation));
 		await syncDirectory(directory);
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
 		onPublished?.();
@@ -1834,7 +1836,7 @@ export async function writeSessionLifecycleReady(
 			throw new LifecycleReadinessCleanupError(error);
 		throw error;
 	} finally {
-		await fs.rm(temporary, { force: true });
+		if (!published) await fs.rm(temporary, { force: true });
 	}
 }
 
