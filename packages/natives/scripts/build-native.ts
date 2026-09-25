@@ -295,6 +295,7 @@ if (!cargoPathResolution) {
 	);
 }
 Bun.env.PATH = cargoPathResolution.pathValue;
+Bun.env.PCRE2_SYS_STATIC = "1";
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
