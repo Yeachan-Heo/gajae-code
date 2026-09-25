@@ -917,9 +917,9 @@ test("session host publishes SIGTERM failure without waiting for hung readiness 
 					.find(listener => !previousSigtermListeners.includes(listener));
 				if (!startupSignal) throw new Error("Readiness publication has no owner-bound SIGTERM handler.");
 				startupSignal.call(process, "SIGTERM");
-				onPublishing(() => {
-					syncFs.rmSync(readyPath, { force: true });
-					readinessMarkerRevoked = !syncFs.existsSync(readyPath);
+				onPublishing(async () => {
+					await fs.rm(readyPath, { force: true });
+					readinessMarkerRevoked = !(await Bun.file(readyPath).exists());
 					return readinessMarkerRevoked;
 				});
 				await releaseLateReadiness.promise;
@@ -1029,6 +1029,68 @@ test("session host publishes SIGTERM failure without waiting for hung MCP config
 		await expect(fs.stat(configDirectory)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		releaseLateConfigWrite.resolve();
+		await startup?.catch(() => {});
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host preserves pre-session absence when theme initialization is interrupted", async () => {
+	const fixture = await createSessionHostFixture("theme-interruption", "theme-interruption-marker");
+	const { root, failurePath, readyPath } = fixture;
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const themeStarted = Promise.withResolvers<void>();
+	const releaseLateTheme = Promise.withResolvers<void>();
+	const neverDeadline = Promise.withResolvers<void>();
+	let startup: Promise<void> | undefined;
+	try {
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async () => await neverDeadline.promise,
+			processIncarnation: () => "test-incarnation",
+			initTheme: async () => {
+				themeStarted.resolve();
+				const startupSignal = process
+					.listeners("SIGTERM")
+					.find(listener => !previousSigtermListeners.includes(listener));
+				if (!startupSignal) throw new Error("Theme initialization has no owner-bound SIGTERM handler.");
+				startupSignal.call(process, "SIGTERM");
+				await releaseLateTheme.promise;
+			},
+		});
+
+		const reachedTheme = await Promise.race([
+			themeStarted.promise.then(() => true),
+			startup.then(
+				() => false,
+				() => false,
+			),
+			Bun.sleep(1_500).then(() => false),
+		]);
+		expect(reachedTheme).toBe(true);
+		const outcome = await Promise.race([
+			startup.then(
+				() => ({ kind: "resolved" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_500).then(() => ({ kind: "timed_out" as const })),
+		]);
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind !== "rejected") return;
+		expect(outcome.error).toMatchObject({ phase: "startup", reason: "failed" });
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+		};
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: true,
+			runtimeRemoved: true,
+			hostStopped: true,
+			brokerRegistrationReleased: true,
+		});
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		releaseLateTheme.resolve();
 		await startup?.catch(() => {});
 		await fixture.restore();
 	}
