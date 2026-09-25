@@ -132,8 +132,7 @@
         "cancelled": false,
         "timedOut": false
       }
-    }
-,
+    },
     {
       "id": "declare-local-inherit",
       "command": "x=outer; f() { local -I x; printf '%s' \"$x\"; }; f",
@@ -143,8 +142,7 @@
         "cancelled": false,
         "timedOut": false
       }
-    }
-,
+    },
     {
       "id": "complete-default-missing",
       "command": "complete -p -D",
@@ -160,6 +158,16 @@
       "command": "complete -A file",
       "result": {
         "output": "",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "mapfile-callbacks",
+      "command": "callback() { printf 'cb:%s:%s\\n' $1 $2; }; mapfile -t -C callback -c 1 arr < packages/natives/test/fixtures/goldens/shell/mapfile-input.txt; printf 'values:%s,%s' ${arr[0]} ${arr[1]}",
+      "result": {
+        "output": "error: mapfile: not yet implemented: mapfile -C/-c is not yet implemented\nvalues:,",
         "exitCode": 0,
         "cancelled": false,
         "timedOut": false

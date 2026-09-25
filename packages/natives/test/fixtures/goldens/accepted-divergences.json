@@ -335,6 +335,26 @@
       },
       "reason": "Pinned upstream distinguishes registration actions from printing the completion table and rejects an action without a target as invalid usage."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "mapfile-callbacks",
+      "fields": {
+        "before": {
+          "output": "error: mapfile: not yet implemented: mapfile -C/-c is not yet implemented\nvalues:,",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "cb:0:one\ncb:1:two\nvalues:one,two",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream invokes mapfile callbacks for each configured entry group before assigning that entry to the target array."
+    }
   ],
   "nonAdoptions": [
     {

@@ -1,5 +1,6 @@
 import { expect, setDefaultTimeout, test } from "bun:test";
 import { readFile } from "node:fs/promises";
+import * as path from "node:path";
 import { executeShell } from "../native/index.js";
 
 setDefaultTimeout(30_000);
@@ -24,6 +25,7 @@ const shellGolden = JSON.parse(
 const acceptedDivergences = JSON.parse(
 	await readFile(`${import.meta.dir}/fixtures/goldens/accepted-divergences.json`, "utf8"),
 ) as { schema: number; divergences: AcceptedShellDivergence[] };
+const repoRoot = path.resolve(import.meta.dir, "../../..");
 
 test("Phase 3 shell output matches the pre-sync golden or an accepted upstream improvement", async () => {
 	expect(shellGolden.schemaVersion).toBe(1);
@@ -39,7 +41,7 @@ test("Phase 3 shell output matches the pre-sync golden or an accepted upstream i
 
 	for (const { id, command, result: baseline } of shellGolden.cases) {
 		let output = "";
-		const result = await executeShell({ command, timeoutMs: 5_000 }, (error, chunk) => {
+		const result = await executeShell({ command, cwd: repoRoot, timeoutMs: 5_000 }, (error, chunk) => {
 			if (error) throw error;
 			output += chunk;
 		});
