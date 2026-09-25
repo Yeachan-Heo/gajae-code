@@ -1,6 +1,7 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as childProcess from "node:child_process";
 import { createHmac } from "node:crypto";
+import type { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -121,6 +122,48 @@ async function reapLinuxAdoptedZombies(excludedPid: number | undefined): Promise
 	}
 }
 
+/**
+ * Reap adopted zombies only when the kernel reports a child state change.
+ *
+ * As the Linux child subreaper, the supervisor inherits orphaned descendants
+ * and must reap them, but a full `/proc` sweep is expensive. Polling it on a
+ * short interval kept every idle supervisor busy (issue #5972), so sweeps are
+ * driven by SIGCHLD instead. At most one sweep runs at a time; a SIGCHLD that
+ * arrives mid-sweep schedules exactly one follow-up so a zombie created after
+ * its `/proc` entry was passed is never missed. Returns the unsubscribe hook.
+ */
+export function startLinuxAdoptedZombieReaper(
+	excludedPid: number | undefined,
+	reap: (excludedPid: number | undefined) => Promise<void> = reapLinuxAdoptedZombies,
+	signals: Pick<EventEmitter, "on" | "off"> = process,
+): () => void {
+	if (process.platform !== "linux") return () => undefined;
+	let running = false;
+	let rerun = false;
+	let stopped = false;
+	const sweep = (): void => {
+		if (stopped) return;
+		if (running) {
+			rerun = true;
+			return;
+		}
+		running = true;
+		void reap(excludedPid)
+			.catch(() => undefined)
+			.finally(() => {
+				running = false;
+				if (!rerun) return;
+				rerun = false;
+				sweep();
+			});
+	};
+	signals.on("SIGCHLD", sweep);
+	return () => {
+		stopped = true;
+		signals.off("SIGCHLD", sweep);
+	};
+}
+
 function signalFromExit(code: number | null, signal: NodeJS.Signals | null): NodeJS.Signals | null {
 	if (signal) return signal;
 	if (code === null || code <= 128) return null;
@@ -210,8 +253,7 @@ export async function runBashShellSupervisor(): Promise<void> {
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
 	});
-	const zombieReaper = setInterval(() => void reapLinuxAdoptedZombies(worker.pid), 25);
-	zombieReaper.unref();
+	const stopZombieReaper = startLinuxAdoptedZombieReaper(worker.pid);
 	const pendingRuns: number[] = [];
 	let terminating = false;
 	let protocolToken: string | undefined;
@@ -315,7 +357,7 @@ export async function runBashShellSupervisor(): Promise<void> {
 		);
 	});
 	worker.once("exit", async (code, signal) => {
-		clearInterval(zombieReaper);
+		stopZombieReaper();
 		const resultSignal = signalFromExit(code, signal);
 		if (code === 0 && resultSignal === null) {
 			await reapLinuxSubreaperChildren();
