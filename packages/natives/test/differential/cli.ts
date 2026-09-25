@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 import * as path from "node:path";
 import { diffLinesDifferential } from "./cases/diff-lines";
+import { editFuzzyDifferential } from "./cases/edit-fuzzy";
 import { recordGoldens, verifyDifferential } from "./harness";
+import type { DifferentialDefinition } from "./harness";
 
 export function parseDiffcheckArgs(args: readonly string[]): { module: string; record: boolean; goldenPath?: string } {
 	let module = "diff-lines";
@@ -21,7 +23,7 @@ export function parseDiffcheckArgs(args: readonly string[]): { module: string; r
 			module = arg;
 		}
 	}
-	if (module !== "diff-lines") throw new Error(`unknown differential module ${module}`);
+	if (module !== "diff-lines" && module !== "edit-fuzzy") throw new Error(`unknown differential module ${module}`);
 	return { module, record, goldenPath };
 }
 
@@ -41,18 +43,28 @@ export async function diffcheck(
 		parsed.goldenPath ?? path.join(import.meta.dir, "golden", `${parsed.module}.jsonl`),
 	);
 	try {
-		if (parsed.record) {
-			const records = await recordGoldens(diffLinesDifferential, goldenPath);
-			console.log(JSON.stringify({ module: parsed.module, mode: "record", total: records.length, goldenPath }));
-			return 0;
-		}
-		const report = await verifyDifferential(diffLinesDifferential, goldenPath);
-		console.log(JSON.stringify({ module: parsed.module, mode: "verify", ...report }));
-		return report.unlisted.length === 0 && report.stale.length === 0 ? 0 : 1;
+		return parsed.module === "edit-fuzzy"
+			? await runDifferential(editFuzzyDifferential, parsed, goldenPath)
+			: await runDifferential(diffLinesDifferential, parsed, goldenPath);
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
 		return 1;
 	}
+}
+
+async function runDifferential<Input, Output>(
+	definition: DifferentialDefinition<Input, Output>,
+	parsed: ReturnType<typeof parseDiffcheckArgs>,
+	goldenPath: string,
+): Promise<number> {
+	if (parsed.record) {
+		const records = await recordGoldens(definition, goldenPath);
+		console.log(JSON.stringify({ module: parsed.module, mode: "record", total: records.length, goldenPath }));
+		return 0;
+	}
+	const report = await verifyDifferential(definition, goldenPath);
+	console.log(JSON.stringify({ module: parsed.module, mode: "verify", ...report }));
+	return report.unlisted.length === 0 && report.stale.length === 0 ? 0 : 1;
 }
 
 if (import.meta.main) process.exit(await diffcheck(Bun.argv.slice(2)));
