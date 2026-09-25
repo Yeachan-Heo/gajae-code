@@ -238,7 +238,7 @@ jobs:
          - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
            if: ${{ matrix.rust }}
            with:
-              toolchain: nightly-2026-04-29
+              toolchain: nightly-2026-08-12
          - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
            if: ${{ matrix.nextest }}
            with:

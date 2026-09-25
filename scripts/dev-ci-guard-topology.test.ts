@@ -322,7 +322,7 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
 		expect(source).toContain("No authoritative terminal-green dev base selected");
 		expect(source).toContain("Provision pinned Rust toolchain for canary native build");
-		expect(source).toContain("toolchain: nightly-2026-04-29");
+		expect(source).toContain("toolchain: nightly-2026-08-12");
 		expect(source).toContain("Run risk-selected canaries in the materialized merge");
 	});
 
