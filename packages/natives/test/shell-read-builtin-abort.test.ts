@@ -49,3 +49,16 @@ test("read builtin timeout exits above the signal-status range", async () => {
 	expect(result.timedOut).toBe(false);
 	expect(result.exitCode).toBeGreaterThan(128);
 });
+
+test("read builtin tolerates readline flags on redirected input", async () => {
+	for (const command of ["printf '' | read -e value", "printf '' | read -i seed value"]) {
+		let output = "";
+		const result = await executeShell({ command, timeoutMs: SHELL_STARTUP_LIMIT_MS }, (error, chunk) => {
+			if (error) throw error;
+			output += chunk;
+		});
+
+		expect(result).toMatchObject({ exitCode: 1, cancelled: false, timedOut: false });
+		expect(output).toBe("");
+	}
+});

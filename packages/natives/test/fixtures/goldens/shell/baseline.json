@@ -33,5 +33,26 @@
         "timedOut": false
       }
     }
+,
+    {
+      "id": "read-e-redirected-input",
+      "command": "printf '' | read -e value",
+      "result": {
+        "output": "error: read: not yet implemented: read -e\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "read-i-redirected-input",
+      "command": "printf '' | read -i seed value",
+      "result": {
+        "output": "error: read: not yet implemented: read -i\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
   ]
 }

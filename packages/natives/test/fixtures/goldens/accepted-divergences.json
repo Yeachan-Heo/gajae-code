@@ -82,6 +82,45 @@
       },
       "reason": "Pinned upstream treats keypad digit keycodes as text even when the terminal omits the NumLock modifier bit."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "read-e-redirected-input",
+      "fields": {
+        "before": {
+          "output": "error: read: not yet implemented: read -e\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream accepts the readline flag on non-terminal input and falls back to the ordinary read path, returning the shell's EOF status instead of an unsupported-option error."
+    },
+    {
+      "module": "shell",
+      "caseId": "read-i-redirected-input",
+      "fields": {
+        "before": {
+          "output": "error: read: not yet implemented: read -i\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream treats initial text as a readline-only option; without an interactive terminal, the option is ignored and the ordinary read path returns EOF."
+    }
   ],
   "nonAdoptions": [
     {
