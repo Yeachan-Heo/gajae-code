@@ -183,8 +183,9 @@ describe("inline-result backstop (Finding 12)", () => {
 		expect(saved).toHaveLength(0);
 	});
 
-	test("read-range window metadata (rangeBase: window) with nextOffset survives backstop truncation (#5966 blocker item 2)", async () => {
+	test("read-range window metadata with nextOffset survives backstop truncation (#5966 blocker item 2)", async () => {
 		// Simulate a read tool that returns a 20KB window of a 3000-line file, with nextOffset indicator.
+		// The detection is based on nextOffset presence, not rangeBase (which is not set for explicit ranges).
 		const windowText = bigText(20);
 		const textWithOffset = `${windowText}\n\n[2700 more lines in file. Use :304 to continue]`;
 		const saved: Array<{ content: string; toolType: string }> = [];
@@ -196,7 +197,7 @@ describe("inline-result backstop (Finding 12)", () => {
 					meta: {
 						// Simulate read tool's window metadata:
 						// totalLines = file lines (3000), totalBytes = window bytes
-						// rangeBase: "window" indicates this is tool-owned window metadata, not from spill
+						// nextOffset: indicates tool-owned window, not from spill
 						truncation: {
 							direction: "tail",
 							truncatedBy: "lines",
@@ -205,7 +206,7 @@ describe("inline-result backstop (Finding 12)", () => {
 							outputLines: 303, // shown window
 							outputBytes: Buffer.byteLength(textWithOffset, "utf-8"),
 							shownRange: { start: 1, end: 303 },
-							rangeBase: "window", // KEY: tool-owned window, not from spill
+							nextOffset: 304, // KEY: marks this as tool-owned window, not from spill
 						},
 					},
 				},
@@ -223,12 +224,12 @@ describe("inline-result backstop (Finding 12)", () => {
 		expect(saved).toHaveLength(1);
 		expect(Buffer.byteLength(saved[0]!.content, "utf-8")).toBeGreaterThan(12 * 1024);
 		expect(saved[0]!.content).toContain("Use :304 to continue"); // the nextOffset is preserved in the saved artifact
-		// The truncation metadata should now reflect the WINDOW dimensions (after backstop truncation),
-		// NOT the 3000-line file dimensions, because rangeBase: "window" indicates tool-owned metadata.
-		// This prevents mixing file lines with window bytes.
+		// The truncation metadata should preserve the file line count from the original window,
+		// NOT the backstop truncation's reduced line count.
+		// The nextOffset must survive so the model can request the next page.
 		const truncMeta = result.details?.meta?.truncation;
-		expect(truncMeta?.rangeBase).toBeUndefined(); // backstop doesn't inherit rangeBase from tool-owned window
-		expect(truncMeta?.totalLines).toBeLessThanOrEqual(303); // window lines after backstop truncation
+		expect(truncMeta?.nextOffset).toBe(304); // pagination hint survives backstop
+		expect(truncMeta?.totalLines).toBe(3000); // file lines preserved, not mixed with window lines
 		expect(truncMeta?.totalBytes).toBeGreaterThan(12 * 1024); // artifact size
 		expect(truncMeta?.artifactId).toBe("art-1");
 	});
@@ -279,5 +280,83 @@ describe("inline-result backstop (Finding 12)", () => {
 		expect(truncMeta?.totalLines).toBe(3200); // preserved from spill
 		expect(truncMeta?.totalBytes).toBe(full.length); // preserved from spill
 		expect(truncMeta?.artifactId).toBe("art-full-output"); // the original artifact
+	});
+
+	test("explicit read range (no rangeBase) with nextOffset survives backstop truncation (#5966 blocker)", async () => {
+		// The real read tool produces nextOffset for explicit ranges like :1-300,
+		// WITHOUT setting rangeBase: "window" (only set for pagination scrolling).
+		// The backstop must preserve nextOffset so pagination hints survive.
+		const windowText = bigText(20);
+		const textWithOffset = `${windowText}\n\n[2700 more lines in file. Use :304 to continue]`;
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("read", {
+				content: [{ type: "text", text: textWithOffset }],
+				details: {
+					meta: {
+						// Simulate real read tool for explicit range :1-300:
+						// totalLines = file lines (3000), totalBytes = window bytes
+						// nextOffset = pagination hint, rangeBase is UNDEFINED (not "window")
+						truncation: {
+							direction: "tail",
+							truncatedBy: "lines",
+							totalLines: 3000, // full file
+							totalBytes: 3000 * 128, // full file ~384KB
+							outputLines: 303, // shown window
+							outputBytes: Buffer.byteLength(textWithOffset, "utf-8"),
+							shownRange: { start: 1, end: 303 },
+							nextOffset: 304, // pagination hint - this triggers tool-owned window detection
+							// NO rangeBase here - this is the real read tool for explicit ranges
+						},
+					},
+				},
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c7", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		// The backstop should cap at 12KB
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(12 * 1024);
+		// The artifact holds the full 20KB window (the original input to backstop)
+		expect(saved).toHaveLength(1);
+		expect(Buffer.byteLength(saved[0]!.content, "utf-8")).toBeGreaterThan(12 * 1024);
+		expect(saved[0]!.content).toContain("Use :304 to continue"); // nextOffset text preserved
+		// The nextOffset should be preserved in metadata so the notice can reference it
+		const truncMeta = result.details?.meta?.truncation;
+		expect(truncMeta?.nextOffset).toBe(304); // CRITICAL: must survive backstop
+		// Since nextOffset was detected, the window totals (file-relative lines) should be kept
+		expect(truncMeta?.totalLines).toBe(3000); // NOT mixed with window lines
+		expect(truncMeta?.artifactId).toBe("art-1");
+	});
+
+	test("content block order is preserved when truncating (text then image stays text then image)", async () => {
+		const textLarge = bigText(15); // large text that will be truncated
+		const imageData =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="; // 1x1 PNG
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("fetch", {
+				content: [
+					{ type: "text", text: textLarge },
+					{ type: "image", data: imageData, mimeType: "image/png" },
+				],
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c8", {}, undefined, undefined, ctx);
+
+		// Verify content block order: text first, then image
+		expect(result.content).toHaveLength(2);
+		expect(result.content[0]?.type).toBe("text"); // text is first
+		expect(result.content[1]?.type).toBe("image"); // image is second
+		// The image data should be preserved exactly
+		if (result.content[1]?.type === "image") {
+			expect(result.content[1].data).toBe(imageData);
+		}
 	});
 });

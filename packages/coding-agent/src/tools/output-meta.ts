@@ -926,14 +926,24 @@ async function spillLargeResultToArtifact(
 				maxLines: tailLines,
 			});
 
-	// Replace text blocks with single truncated block, keep images
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
@@ -1059,34 +1069,49 @@ async function enforceInlineResultBackstop(
 		truncated = truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 	}
 
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
 
 	// If a prior truncation exists from spillLargeResultToArtifact (not from tool-owned window
-	// metadata like read's rangeBase: "window"), preserve its totals instead of using the
+	// metadata like read with explicit ranges), preserve its totals instead of using the
 	// intermediate truncated view's totals. The intermediate view was already truncated by the
 	// spill step, so its totalLines/totalBytes do not reflect the original full output.
 	// Tool-owned windows have different semantics: totalLines is file-relative but totalBytes
-	// are window-relative, so we must keep them as-is. We only update outputLines/outputBytes
-	// to reflect the new backstop truncation level.
+	// are window-relative, and they include a nextOffset for pagination. We must keep them as-is
+	// and only update outputLines/outputBytes to reflect the new backstop truncation level.
 	const priorTruncation = existingMeta?.truncation;
-	const isToolOwnedWindow = priorTruncation?.rangeBase === "window";
-	const realTotalLines = !isToolOwnedWindow
-		? (priorTruncation?.totalLines ?? truncated.totalLines)
-		: truncated.totalLines;
-	const realTotalBytes = !isToolOwnedWindow
-		? (priorTruncation?.totalBytes ?? truncated.totalBytes)
-		: truncated.totalBytes;
+	// Detect tool-owned window metadata by checking for nextOffset (present in read windows).
+	// The read tool produces nextOffset for pagination, which must survive the backstop.
+	const isToolOwnedWindow = priorTruncation?.nextOffset !== undefined;
+	// Preserve prior totals when they exist (either from spill or tool-owned window).
+	// The backstop's truncated view has reduced totalLines/totalBytes that don't reflect
+	// the original full output or window.
+	const realTotalLines = priorTruncation?.totalLines ?? truncated.totalLines;
+	const realTotalBytes = priorTruncation?.totalBytes ?? truncated.totalBytes;
 	const elidedLines = Math.max(0, realTotalLines - outputLines);
 	const elidedBytes = Math.max(0, realTotalBytes - outputBytes);
+
+	const nextOffsetProp =
+		isToolOwnedWindow && priorTruncation?.nextOffset !== undefined ? { nextOffset: priorTruncation.nextOffset } : {};
 
 	const truncationMeta: TruncationMeta =
 		truncated.truncatedBy === "middle"
@@ -1103,6 +1128,7 @@ async function enforceInlineResultBackstop(
 					elidedLines,
 					elidedBytes,
 					artifactId,
+					...nextOffsetProp,
 				}
 			: {
 					direction: "tail",
@@ -1114,6 +1140,7 @@ async function enforceInlineResultBackstop(
 					maxBytes: maxInlineBytes,
 					shownRange: { start: realTotalLines - outputLines + 1, end: realTotalLines },
 					artifactId,
+					...nextOffsetProp,
 				};
 
 	const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };
