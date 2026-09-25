@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/appearance.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain std::sync::mpsc instead of adding flume and profile the public appearance operations.
+
 //! macOS appearance detection via CoreFoundation.
 //!
 //! Provides synchronous dark/light detection and a long-lived observer
@@ -396,6 +399,7 @@ mod platform {
 #[napi(js_name = "detectMacOSAppearance")]
 #[allow(clippy::missing_const_for_fn, reason = "napi macro is incompatible with const fn")]
 pub fn detect_macos_appearance() -> Option<MacOSAppearance> {
+	let _profile = crate::prof::profile_region("appearance.detect");
 	#[cfg(target_os = "macos")]
 	{
 		Some(platform::detect_appearance())
@@ -430,6 +434,7 @@ impl MacAppearanceObserver {
 		#[napi(ts_arg_type = "(err: null | Error, appearance: MacOSAppearance) => void")]
 		callback: napi::threadsafe_function::ThreadsafeFunction<MacOSAppearance>,
 	) -> napi::Result<Self> {
+		let _profile = crate::prof::profile_region("appearance.observer.start");
 		#[cfg(target_os = "macos")]
 		{
 			Ok(Self { inner: Some(platform::ObserverInner::start(callback)) })
@@ -444,6 +449,7 @@ impl MacAppearanceObserver {
 	#[napi]
 	#[allow(clippy::missing_const_for_fn, reason = "napi macro is incompatible with const fn")]
 	pub fn stop(&mut self) {
+		let _profile = crate::prof::profile_region("appearance.observer.stop");
 		#[cfg(target_os = "macos")]
 		if let Some(inner) = &mut self.inner {
 			inner.stop();

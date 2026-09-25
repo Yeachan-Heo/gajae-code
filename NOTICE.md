@@ -16,6 +16,7 @@ The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` sour
 - `crates/pi-natives/src/clipboard.rs`
 - `crates/pi-natives/src/power.rs`
 - `crates/pi-natives/src/prof.rs`
+- `crates/pi-natives/src/appearance.rs`
 
 ## MuPDF WebAssembly
 
