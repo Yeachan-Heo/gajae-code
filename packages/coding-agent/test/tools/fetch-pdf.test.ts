@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as url from "node:url";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { loadReadUrlCacheEntry, readUrlCacheTestHooks } from "@gajae-code/coding-agent/tools/fetch";
@@ -33,10 +32,6 @@ function pdfFixture(text: string): string {
 	return `${pdf}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
 }
 
-const mupdfModulePath = Bun.resolveSync(
-	"mupdf",
-	path.dirname(url.fileURLToPath(new URL("../../vendor/markit-ai/dist/index.js", import.meta.url))),
-);
 
 describe("PDF URL source-text inspection", () => {
 	let server: Bun.Server<undefined>;
@@ -112,8 +107,7 @@ describe("PDF URL source-text inspection", () => {
 				} catch (error) {
 					rendered = String(error);
 				}
-				expect(rendered).toContain("MuPDF");
-				expect(rendered).not.toContain(path.dirname(mupdfModulePath));
+				expect(rendered).toContain("PDF conversion failed");
 				expect(rendered).not.toContain(path.resolve(import.meta.dir, "../../../.."));
 				expect(rendered).not.toContain("build-time provenance");
 			}
@@ -162,7 +156,7 @@ describe("PDF URL source-text inspection", () => {
 			contentDisposition = disposition;
 			const binaryFetch = vi.spyOn(scrapers, "fetchBinary");
 			const result = await loadReadUrlCacheEntry(session, { path: new URL(route, server.url).href });
-			expect(result.details.method).toBe("markit");
+			expect(result.details.method).toBe("pdf");
 			expect(result.output).toContain("Dummy PDF file");
 			expect(result.output).not.toContain("%PDF-");
 			expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);
@@ -180,10 +174,9 @@ describe("PDF URL source-text inspection", () => {
 				body = payload;
 				const result = await loadReadUrlCacheEntry(session, { path: new URL(route, server.url).href });
 				expect(result.details.method).toBe("failed");
-				expect(result.details.notes.join("\n")).toMatch(/markit conversion (failed: .+|produced no usable output)/);
+				expect(result.details.notes.join("\n")).toMatch(/PDF conversion (failed: .+|produced no usable output)/);
 				expect(result.output).not.toContain("%PDF-");
 				expect(result.output).not.toContain("malformed payload");
-				expect(result.output).not.toContain(path.dirname(mupdfModulePath));
 				expect(result.output).not.toContain("build-time provenance");
 				expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);
 			});
@@ -292,7 +285,7 @@ describe("PDF URL source-text inspection", () => {
 			path: new URL("document", server.url).href,
 		});
 		expect(result.details?.method).toBe("failed");
-		expect(result.details?.notes).toContain("markit conversion failed: PDF decoder: missing cross-reference table");
+		expect(result.details?.notes).toContain("PDF conversion failed: PDF decoder: missing cross-reference table");
 		expect(result.content.some(item => item.type === "text" && item.text.includes("%PDF-"))).toBe(false);
 	});
 
@@ -300,7 +293,7 @@ describe("PDF URL source-text inspection", () => {
 		vi.spyOn(scrapers, "convertWithMarkit").mockResolvedValue({ ok: true, content: " \n\t" });
 		const result = await loadReadUrlCacheEntry(session, { path: new URL("document", server.url).href });
 		expect(result.details.method).toBe("failed");
-		expect(result.details.notes).toContain("markit conversion produced no usable output");
+		expect(result.details.notes).toContain("PDF conversion produced no usable output");
 		expect(result.output).not.toContain("%PDF-");
 	});
 
@@ -309,7 +302,7 @@ describe("PDF URL source-text inspection", () => {
 		contentDisposition = "attachment; filename=report.pdf";
 		const binaryFetch = vi.spyOn(scrapers, "fetchBinary").mockResolvedValue({ ok: false, error: "HTTP 503" });
 		const result = await loadReadUrlCacheEntry(session, { path: new URL("document", server.url).href });
-		expect(result.details.method).toBe("markit");
+		expect(result.details.method).toBe("pdf");
 		expect(result.output).toContain("Dummy PDF file");
 		expect(binaryFetch).not.toHaveBeenCalled();
 		expect(result.output).not.toContain("%PDF-");
@@ -336,7 +329,7 @@ describe("PDF URL source-text inspection", () => {
 			const target = new URL("download", server.url).href;
 			const result = await loadReadUrlCacheEntry(session, { path: target });
 			expect(result.details.method).toBe("failed");
-			expect(result.details.notes.join("\n")).toMatch(/markit conversion (failed: .+|produced no usable output)/);
+			expect(result.details.notes.join("\n")).toMatch(/PDF conversion (failed: .+|produced no usable output)/);
 			expect(result.output).not.toContain("%PDF-");
 			expect(result.output).not.toContain("malformed payload");
 			expect(binaryFetch).not.toHaveBeenCalled();
@@ -409,7 +402,7 @@ describe("PDF URL source-text inspection", () => {
 			const result = await new ReadTool(session).execute("read-image-url-pdf", {
 				path: new URL("photo.png", server.url).href,
 			});
-			expect(result.details?.method).toBe("markit");
+			expect(result.details?.method).toBe("pdf");
 			expect(result.content.some(item => item.type === "text" && item.text.includes("Dummy PDF file"))).toBe(true);
 			expect(result.content.some(item => item.type === "image")).toBe(false);
 			expect(binaryFetch).toHaveBeenCalledTimes(expectedClassificationFetches);

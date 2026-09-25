@@ -318,7 +318,7 @@ describe("installed ooo bridge flow", () => {
 				await Bun.write(path.join(root, nativeName), await Bun.file(nativeSource).arrayBuffer());
 				const fixture = path.resolve(import.meta.dirname, "fixtures/ooo-bridge-compiled-loader.ts");
 				const compile = Bun.spawn(
-					[process.execPath, "build", fixture, "--compile", "--external", "mupdf", "--outfile", executable],
+					[process.execPath, "build", fixture, "--compile", "--outfile", executable],
 					{
 						cwd: path.resolve(import.meta.dirname, "../../.."),
 						stdout: "pipe",

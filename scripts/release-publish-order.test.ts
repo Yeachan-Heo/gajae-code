@@ -516,13 +516,16 @@ describe("native release binary coverage", () => {
 	test("release publication preserves stable tags while admitting verified nightly runs", async () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const native = workflowJob(workflow, "native");
-		const mupdfSource = workflowJob(workflow, "mupdf_source");
 		const binaries = workflowJob(workflow, "binaries");
 		const prepare = workflowJob(workflow, "release_prepare");
 		const publish = workflowJob(workflow, "publish");
 		const finalize = workflowJob(workflow, "release_finalize");
+		const patterns = await Bun.file(path.join(repoRoot, "scripts/agpl-removal-patterns.json")).json();
 
-		for (const job of [mupdfSource, native, binaries]) {
+		for (const token of patterns.tokens as Array<{ value: string }>) {
+			expect(workflow.toLowerCase()).not.toContain(token.value.toLowerCase());
+		}
+		for (const job of [native, binaries]) {
 			expect(job).toContain("startsWith(github.ref, 'refs/tags/v')");
 			expect(job).toContain("inputs.rehearsal == 'tag-build-verify'");
 			expect(job).toContain("inputs.rehearsal == 'nightly-release'");
@@ -532,12 +535,11 @@ describe("native release binary coverage", () => {
 		expect(workflow).not.toContain("release_source_verify");
 		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
 
-		expect(mupdfSource).toContain("needs: [release_metadata]");
 		expect(native).toContain("needs: [release_metadata]");
-		expect(binaries).toContain("needs: [native, release_metadata, mupdf_source]");
+		expect(binaries).toContain("needs: [native, release_metadata]");
 		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
-		expect(finalize).toContain("needs: [publish, release_metadata, mupdf_source]");
+		expect(finalize).toContain("needs: [publish, release_metadata]");
 
 		expect(prepare).toContain("--prepare-evidence --evidence-dir");
 		expect(prepare).toContain("Persist pre-publication package evidence");
@@ -551,9 +553,6 @@ describe("native release binary coverage", () => {
 		expect(finalize).toContain("gajae-release-binaries-v1.json");
 		expect(finalize).toContain("gajae-release-binaries.sha256");
 		expect(finalize).toContain("Publish binary checksum manifest");
-		expect(finalize).toContain("mupdf-release-materials/mupdf-source.tar.gz");
-		expect(finalize).toContain("mupdf-release-materials/mupdf-provenance.json");
-		expect(finalize).toContain("mupdf-release-materials/mupdf-built.wasm");
 		expect(finalize.indexOf("Publish binary checksum manifest")).toBeLessThan(finalize.indexOf("Create GitHub Release"));
 		expect(finalize).toContain("gajae-release-packages-v1.json");
 		expect(finalize).toContain("gajae-release-channel-v1.json");
