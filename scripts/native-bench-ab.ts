@@ -9,9 +9,12 @@ export const RSS_SCENARIOS = ["S1", "S2", "S3", "S4", "S5", "S7"] as const;
 export const DEFAULT_BLOCKS = 15;
 export const DEFAULT_ITERATIONS = 200;
 export const BOOTSTRAP_RESAMPLES = 10_000;
+export const MAX_RSS_SAMPLER_ATTEMPTS = 3;
+export const HOST_TOO_NOISY_EXIT_CODE = 3;
 
 export type BenchStatus = "measured" | "skipped" | "error";
 export type Verdict = "PASS" | "FAIL" | "INCONCLUSIVE";
+
 export interface BenchCase {
 	id: string;
 	status: BenchStatus;
@@ -181,6 +184,59 @@ export function assertBaselineIdentity(baseSha: string, headSha: string, allowBa
 	}
 	if (calibrate && baseSha !== headSha) throw new BenchError("BaselineIdentityMismatch", "--calibrate requires --base to resolve to HEAD");
 }
+
+export interface CpuLoadSnapshot {
+	loadAverage1m: number;
+	physicalCores: number;
+}
+
+export function assertCpuLoadWithinLimit(loadAverage1m: number, physicalCores: number): void {
+	if (!Number.isFinite(loadAverage1m) || loadAverage1m < 0 || !Number.isInteger(physicalCores) || physicalCores < 1) {
+		throw new BenchError("HostLoadUnavailable", "could not determine a valid 1-minute load average and physical core count");
+	}
+	// Reject above 0.5 runnable tasks per physical core so host contention cannot weaken the benchmark thresholds.
+	const maximumLoad = physicalCores * 0.5;
+	if (loadAverage1m > maximumLoad) {
+		throw new BenchError(
+			"HostTooNoisy",
+			`1-minute load average ${loadAverage1m.toFixed(2)} exceeds 50% of ${physicalCores} physical cores (${maximumLoad.toFixed(2)}); rerun on a quieter host`,
+		);
+	}
+}
+
+function parsePhysicalCoreCount(value: string): number | undefined {
+	const count = Number(value.trim());
+	return Number.isInteger(count) && count > 0 ? count : undefined;
+}
+
+async function getPhysicalCoreCount(): Promise<number> {
+	if (process.platform === "darwin") {
+		const result = Bun.spawnSync(["sysctl", "-n", "hw.physicalcpu"], { stdout: "pipe", stderr: "pipe" });
+		if (result.exitCode === 0) {
+			const count = parsePhysicalCoreCount(result.stdout.toString());
+			if (count) return count;
+		}
+	}
+	if (process.platform === "linux") {
+		const cpuInfo = await fs.readFile("/proc/cpuinfo", "utf8").catch(() => "");
+		const physicalCoreIds = new Set<string>();
+		for (const cpu of cpuInfo.split(/\n\s*\n/)) {
+			const physicalId = /^physical id\s*:\s*(\d+)$/m.exec(cpu)?.[1] ?? "0";
+			const coreId = /^core id\s*:\s*(\d+)$/m.exec(cpu)?.[1];
+			if (coreId !== undefined) physicalCoreIds.add(`${physicalId}:${coreId}`);
+		}
+		if (physicalCoreIds.size > 0) return physicalCoreIds.size;
+	}
+	// Fallback on platforms that do not expose physical CPU topology.
+	return Math.max(1, os.cpus().length);
+}
+
+export async function cpuLoadPreflight(): Promise<CpuLoadSnapshot> {
+	const loadAverage1m = os.loadavg()[0] ?? 0;
+	const physicalCores = await getPhysicalCoreCount();
+	assertCpuLoadWithinLimit(loadAverage1m, physicalCores);
+	return { loadAverage1m, physicalCores };
+}
 export function assessLatencyCase(
 	id: string,
 	baseBlocks: readonly number[],
@@ -312,10 +368,41 @@ export function parseRssCapture(json: string, scenarioIds: readonly string[]): R
 		const scenario = byId.get(id);
 		if (!scenario || scenario.status !== "measured") throw new BenchError("RssScenarioNotMeasured", `${id} status must be measured`);
 		const median = scenario.rssBytes?.stableTree?.median;
-		if (typeof median !== "number" || !Number.isFinite(median) || median <= 0) throw new BenchError("RssMetricMissing", `${id} stableTree median is missing or invalid`);
+		if (typeof median !== "number" || !Number.isFinite(median)) throw new BenchError("RssMetricMissing", `${id} stableTree median is missing or invalid`);
+		if (median === 0) throw new BenchError("RssSamplerUnavailable", `${id} stableTree sampler returned a zero reading`);
+		if (median < 0) throw new BenchError("RssMetricMissing", `${id} stableTree median is missing or invalid`);
+
 		values[id] = median;
 	}
 	return values;
+}
+
+export async function retryRssSampler<T>(capture: () => Promise<T>): Promise<T> {
+	let lastError: BenchError | undefined;
+	for (let attempt = 1; attempt <= MAX_RSS_SAMPLER_ATTEMPTS; attempt += 1) {
+		try {
+			return await capture();
+		} catch (error) {
+			if (!(error instanceof BenchError) || error.code !== "RssSamplerUnavailable") throw error;
+			lastError = error;
+		}
+	}
+	throw new BenchError(
+		"HostTooNoisy",
+		`RSS sampler returned zero readings in ${MAX_RSS_SAMPLER_ATTEMPTS} attempts; rerun on a quieter host. Last reading: ${lastError?.message ?? "unavailable"}`,
+	);
+}
+
+export async function requireRssBuildArtifact(root: string, side: "base" | "head"): Promise<string> {
+	const binaryPath = path.join(root, "packages", "coding-agent", "dist", "gjc");
+	const artifact = await fs.stat(binaryPath).catch(() => undefined);
+	if (!artifact?.isFile() || (artifact.mode & 0o111) === 0) {
+		throw new BenchError(
+			"BuildArtifactMissing",
+			`Compiled RSS artifact for ${side} is missing or not executable: ${binaryPath}. Build it with: bun --cwd=packages/coding-agent run build`,
+		);
+	}
+	return binaryPath;
 }
 
 function makeLatencyResult(baseReports: BenchAdapterReport[], headReports: BenchAdapterReport[], caseIds: readonly string[]): LatencyCaseResult[] {
@@ -369,26 +456,56 @@ async function collectLatencyRound(
 	return { base, head, cases, verdict: assessLatencyRound(cases) };
 }
 
-async function captureRssOnce(root: string, ids: readonly string[]): Promise<Record<string, number>> {
-	const result = await runJsonCommand(["bun", "scripts/verify-rss-checkpoints.ts", "--all", "--json"], root);
-	if (result.code !== 0) throw new BenchError("RssCaptureFailed", result.stderr || result.stdout);
-	return parseRssCapture(result.stdout, ids);
+async function runRssCheckpointCommand<T>(root: string, command: string[], failureCode: string, parse: (stdout: string) => T): Promise<T> {
+	return retryRssSampler(async () => {
+		const result = await runJsonCommand(command, root);
+		const output = result.stderr || result.stdout;
+		if (result.code !== 0) {
+			if (output.includes("BuildArtifactMissing")) throw new BenchError("BuildArtifactMissing", output);
+			if (output.includes("RssSamplerUnavailable")) throw new BenchError("RssSamplerUnavailable", output);
+			throw new BenchError(failureCode, output);
+		}
+		return parse(result.stdout);
+	});
+}
+
+async function captureRss(root: string, ids: readonly string[]): Promise<Record<string, number>> {
+	return runRssCheckpointCommand(
+		root,
+		["bun", "scripts/verify-rss-checkpoints.ts", "--all", "--json"],
+		"RssCaptureFailed",
+		stdout => parseRssCapture(stdout, ids),
+	);
+}
+
+async function buildRssArtifact(root: string, side: "base" | "head"): Promise<string> {
+	const build = await runJsonCommand(["bun", "--cwd=packages/coding-agent", "run", "build"], root);
+	if (build.code !== 0) {
+		try {
+			await requireRssBuildArtifact(root, side);
+		} catch (error) {
+			if (error instanceof BenchError && error.code === "BuildArtifactMissing") {
+				throw new BenchError("BuildArtifactMissing", `${error.message}; ${side} build failed: ${build.stderr || build.stdout}`);
+			}
+			throw error;
+		}
+		throw new BenchError("RssBuildFailed", `${side}: ${build.stderr || build.stdout}`);
+	}
+	return requireRssBuildArtifact(root, side);
 }
 
 async function runRssGate(baseRoot: string, headRoot: string, ids: readonly string[]): Promise<{ verdict: Verdict; scenarios: Record<string, { verdict: Verdict; ci: ConfidenceInterval; base: number[]; head: number[] }>; legacyEnvelope: { baselinePath: string; regressions: number } }> {
 	if (ids.length === 0) return { verdict: "PASS", scenarios: {}, legacyEnvelope: { baselinePath: "", regressions: 0 } };
-	const baseBuild = await runJsonCommand(["bun", "--cwd=packages/coding-agent", "run", "build"], baseRoot);
-	if (baseBuild.code !== 0) throw new BenchError("RssBuildFailed", `base: ${baseBuild.stderr || baseBuild.stdout}`);
-	const headBuild = await runJsonCommand(["bun", "--cwd=packages/coding-agent", "run", "build"], headRoot);
-	if (headBuild.code !== 0) throw new BenchError("RssBuildFailed", `head: ${headBuild.stderr || headBuild.stdout}`);
+	await buildRssArtifact(baseRoot, "base");
+	await buildRssArtifact(headRoot, "head");
 	let count = 5;
 	let result: ReturnType<typeof compareRssCaptures> | undefined;
 	for (let attempt = 0; attempt < 2; attempt += 1) {
 		const base: Record<string, number[]> = Object.fromEntries(ids.map(id => [id, [] as number[]]));
 		const head: Record<string, number[]> = Object.fromEntries(ids.map(id => [id, [] as number[]]));
 		for (let capture = 0; capture < count; capture += 1) {
-			const baseCapture = await captureRssOnce(baseRoot, ids);
-			const headCapture = await captureRssOnce(headRoot, ids);
+			const baseCapture = await captureRss(baseRoot, ids);
+			const headCapture = await captureRss(headRoot, ids);
 			for (const id of ids) {
 				base[id]?.push(baseCapture[id] ?? 0);
 				head[id]?.push(headCapture[id] ?? 0);
@@ -407,17 +524,21 @@ async function runRssGate(baseRoot: string, headRoot: string, ids: readonly stri
 async function runLegacyRssEnvelope(baseRoot: string, headRoot: string): Promise<{ baselinePath: string; regressions: number }> {
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-native-ab-rss-"));
 	try {
-		const baseRun = await runJsonCommand(["bun", "scripts/verify-rss-checkpoints.ts", "--all", "--write-baseline", "--json"], baseRoot);
-		if (baseRun.code !== 0) throw new BenchError("RssBaselineFailed", baseRun.stderr || baseRun.stdout);
-		const baseReport = JSON.parse(baseRun.stdout) as { outputPath?: string; metadata?: { gitCommit?: string } };
+		const baseReport = await runRssCheckpointCommand(
+			baseRoot,
+			["bun", "scripts/verify-rss-checkpoints.ts", "--all", "--write-baseline", "--json"],
+			"RssBaselineFailed",
+			stdout => JSON.parse(stdout) as { outputPath?: string; metadata?: { gitCommit?: string } },
+		);
 		if (!baseReport.outputPath || !baseReport.metadata?.gitCommit) throw new BenchError("RssBaselineInvalid", "base RSS baseline report lacks outputPath or commit identity");
 		const baselinePath = path.join(tempRoot, "rss-base.json");
 		await fs.copyFile(baseReport.outputPath, baselinePath);
-		const headRun = await runJsonCommand([
-			"bun", "scripts/verify-rss-checkpoints.ts", "--all", "--compare", "--baseline", baselinePath, "--allow-baseline-drift", "--json",
-		], headRoot);
-		if (headRun.code !== 0) throw new BenchError("RssLegacyCompareFailed", headRun.stderr || headRun.stdout);
-		const headReport = JSON.parse(headRun.stdout) as { regressions?: unknown[] };
+		const headReport = await runRssCheckpointCommand(
+			headRoot,
+			["bun", "scripts/verify-rss-checkpoints.ts", "--all", "--compare", "--baseline", baselinePath, "--allow-baseline-drift", "--json"],
+			"RssLegacyCompareFailed",
+			stdout => JSON.parse(stdout) as { regressions?: unknown[] },
+		);
 		const regressions = headReport.regressions?.length;
 		if (regressions === undefined) throw new BenchError("RssLegacyCompareInvalid", "head RSS compare report is missing regressions");
 		return { baselinePath, regressions };
@@ -451,6 +572,14 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 	const baseSha = await resolveCommit(repoRoot, options.base);
 	const headSha = await resolveCommit(repoRoot, "HEAD");
 	assertBaselineIdentity(baseSha, headSha, options.allowBaselineDrift, options.calibrate);
+	const hostLoad = await cpuLoadPreflight();
+	const host = {
+		platform: platform(),
+		arch: process.arch,
+		bun: Bun.version,
+		loadAverage1m: hostLoad.loadAverage1m,
+		physicalCores: hostLoad.physicalCores,
+	};
 	await buildNative(repoRoot);
 	if (options.suite === "rss") {
 		const scenarios = options.rss.length ? options.rss : [...RSS_SCENARIOS];
@@ -462,7 +591,7 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 				suite: options.suite,
 				baseSha,
 				headSha,
-				host: { platform: platform(), arch: process.arch, bun: Bun.version },
+				host,
 				...(await runRss(repoRoot)),
 			};
 		}
@@ -472,7 +601,7 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 			suite: options.suite,
 			baseSha,
 			headSha,
-			host: { platform: platform(), arch: process.arch, bun: Bun.version },
+			host,
 			...(await runRss(baseRoot)),
 		}));
 	}
@@ -504,7 +633,7 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 			suite: options.suite,
 			baseSha,
 			headSha,
-			host: { platform: platform(), arch: process.arch, bun: Bun.version },
+			host,
 			...result,
 		};
 	}
@@ -514,20 +643,26 @@ export async function runNativeBenchAb(repoRoot: string, options: ParsedOptions)
 		suite: options.suite,
 		baseSha,
 		headSha,
-		host: { platform: platform(), arch: process.arch, bun: Bun.version },
+		host,
 		...(await run(baseRoot)),
 	}));
 }
 
-export function formatBenchError(error: unknown): { schema: string; verdict: "FAIL" | "ERROR"; error: string; message: string } {
+export function formatBenchError(error: unknown): { schema: string; verdict: "FAIL" | "ERROR" | "HostTooNoisy"; error: string; message: string } {
 	const code = error instanceof BenchError ? error.code : "UnexpectedError";
 	const failCodes = new Set(["SkippedCase", "MissingCase", "UnexpectedCase", "EmptySamples", "RssScenarioNotMeasured"]);
 	return {
 		schema: BENCH_SCHEMA,
-		verdict: failCodes.has(code) ? "FAIL" : "ERROR",
+		verdict: code === "HostTooNoisy" ? "HostTooNoisy" : failCodes.has(code) ? "FAIL" : "ERROR",
 		error: code,
 		message: error instanceof Error ? error.message : String(error),
 	};
+}
+
+export function benchExitCode(verdict: unknown): number {
+	if (verdict === "PASS") return 0;
+	if (verdict === "HostTooNoisy") return HOST_TOO_NOISY_EXIT_CODE;
+	return 2;
 }
 
 export async function main(args = process.argv.slice(2)): Promise<number> {
@@ -536,11 +671,11 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
 		const options = parseNativeBenchOptions(args);
 		const report = await runNativeBenchAb(repoRoot, options);
 		console.log(JSON.stringify(report));
-		return report.verdict === "PASS" ? 0 : 2;
+		return benchExitCode(report.verdict);
 	} catch (error) {
 		const report = formatBenchError(error);
 		console.log(JSON.stringify(report));
-		return 2;
+		return benchExitCode(report.verdict);
 	}
 }
 

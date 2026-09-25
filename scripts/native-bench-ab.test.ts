@@ -7,13 +7,18 @@ import {
 	assessLatencyRound,
 	finalVerdictAfterReruns,
 	assertBaselineIdentity,
+	assertCpuLoadWithinLimit,
+	benchExitCode,
 	parseNativeBenchOptions,
 	parseRssCapture,
+	requireRssBuildArtifact,
+	retryRssSampler,
 	validateBenchAdapter,
 	withDetachedWorktree,
 	BenchError,
 	formatBenchError,
 	BENCH_SCHEMA,
+	MAX_RSS_SAMPLER_ATTEMPTS,
 } from "./native-bench-ab";
 
 const tempRoots: string[] = [];
@@ -60,6 +65,49 @@ describe("native bench A/B contract", () => {
 		expect(formatBenchError(new BenchError("RssScenarioNotMeasured", "scenario deferred")).verdict).toBe("FAIL");
 		expect(formatBenchError(new BenchError("MissingCase", "case omitted")).verdict).toBe("FAIL");
 		expect(formatBenchError(new BenchError("SkippedCase", "case skipped")).verdict).toBe("FAIL");
+	});
+
+	test("CPU load saturation reports HostTooNoisy with a distinct exit code", () => {
+		expect(assertCpuLoadWithinLimit(2, 4)).toBeUndefined();
+		expect(() => assertCpuLoadWithinLimit(2.01, 4)).toThrow("exceeds 50% of 4 physical cores");
+		expect(formatBenchError(new BenchError("HostTooNoisy", "load limit exceeded"))).toMatchObject({
+			verdict: "HostTooNoisy",
+			error: "HostTooNoisy",
+		});
+		expect(benchExitCode("HostTooNoisy")).toBe(3);
+		expect(benchExitCode("FAIL")).toBe(2);
+	});
+
+	test("reports BuildArtifactMissing when the RSS binary is absent for a side", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-native-ab-artifact-test-"));
+		tempRoots.push(root);
+		const error = await requireRssBuildArtifact(root, "base").catch(value => value);
+		expect(error).toMatchObject({
+			code: "BuildArtifactMissing",
+			message: expect.stringContaining("Compiled RSS artifact for base is missing"),
+		});
+	});
+
+	test("retries transient zero RSS readings and uses the later measurement", async () => {
+		let attempts = 0;
+		const capture = await retryRssSampler(async () => {
+			attempts += 1;
+			if (attempts < 3) throw new BenchError("RssSamplerUnavailable", "zero RSS reading");
+			return { S1: 4_000_000 };
+		});
+		expect(attempts).toBe(3);
+		expect(capture).toEqual({ S1: 4_000_000 });
+	});
+
+	test("exhausted zero RSS retries return HostTooNoisy, not FAIL", async () => {
+		let attempts = 0;
+		const zero = JSON.stringify({ scenarios: [{ id: "S1", status: "measured", rssBytes: { stableTree: { median: 0 } } }] });
+		const error = await retryRssSampler(async () => {
+			attempts += 1;
+			return parseRssCapture(zero, ["S1"]);
+		}).catch(value => value);
+		expect(attempts).toBe(MAX_RSS_SAMPLER_ATTEMPTS);
+		expect(formatBenchError(error)).toMatchObject({ verdict: "HostTooNoisy", error: "HostTooNoisy" });
 	});
 
 	test("validates adapter schema and requires every declared measured case", () => {
