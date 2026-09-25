@@ -556,7 +556,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
-	readonly #promptPrefixTracker = new PromptPrefixTracker();
+	#promptPrefixTracker = new PromptPrefixTracker();
 	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
 
 	get intentTracing(): boolean {
@@ -1663,6 +1663,9 @@ export class Agent {
 		this.#state.error = undefined;
 		this.#steeringQueue = [];
 		this.#followUpQueue = [];
+		// A reset starts a new provider cache lineage (/new, context clear, handoff):
+		// its first request must report `initial`, not a mutation of the old session.
+		this.#promptPrefixTracker = new PromptPrefixTracker();
 	}
 
 	/** Send a prompt with an AgentMessage */

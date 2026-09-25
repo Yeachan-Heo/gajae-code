@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Agent } from "@gajae-code/agent-core/agent";
 import { agentLoopContinue } from "@gajae-code/agent-core/agent-loop";
 import { PromptPrefixTracker } from "@gajae-code/agent-core/prompt-prefix-telemetry";
 import type { AgentContext, AgentLoopConfig, AgentMessage, StreamFn } from "@gajae-code/agent-core/types";
@@ -150,6 +151,27 @@ describe("agent loop prompt-prefix telemetry", () => {
 		context.messages.push(createUserMessage("third"));
 		const mutatedTurn = await run(context, config);
 		expect(mutatedTurn.promptPrefix).toMatchObject({ change: "system", messages: 5, reusedMessages: 3 });
+	});
+
+	it("starts a new prefix lineage after Agent.reset()", async () => {
+		const mock = createMockModel({ responses: Array.from({ length: 3 }, () => ({ content: ["ack"] })) });
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["s"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const lastPrefix = () =>
+			(agent.state.messages.findLast(m => m.role === "assistant") as AssistantMessage | undefined)?.promptPrefix;
+
+		await agent.prompt("old session");
+		expect(lastPrefix()?.change).toBe("initial");
+		await agent.prompt("old session follow-up");
+		expect(lastPrefix()?.change).toBe("append");
+
+		// /new, context clear, and handoff reuse the Agent through reset(): the first
+		// request of the successor is a cold start, not a client-side rewrite.
+		agent.reset();
+		await agent.prompt("new session");
+		expect(lastPrefix()).toMatchObject({ change: "initial", previousMessages: 0, reusedMessages: 0 });
 	});
 
 	it("leaves assistant messages untouched when no tracker is configured", async () => {
