@@ -29,12 +29,10 @@ import { CURATED_TIER_MAP } from "../../config/autorouting-tier-map";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
 	activateModelProfile,
-	type MaterializeModelProfileForDeletionResult,
 	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
-	materializeModelProfileForDeletion,
-	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
+import { ModelProfileReplacementRequiredError } from "../../config/model-profile-ownership";
 import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
@@ -1750,7 +1748,7 @@ export class SelectorController {
 		const profileLabel = profile ? formatModelProfileDisplayLabel(profile) : profileName;
 		const confirmed = await this.ctx.showHookConfirm(
 			`Delete custom model preset: ${profileLabel}`,
-			"This removes the preset entry after preserving current role model settings when this preset is active/default.",
+			"Saved sessions keep references to deleted presets and will fail closed until an explicit replacement is selected.",
 		);
 		if (!confirmed) {
 			this.ctx.showStatus("Preset delete cancelled.");
@@ -1759,8 +1757,6 @@ export class SelectorController {
 		}
 
 		const activeProfile = this.ctx.session.getActiveModelProfile?.();
-		const defaultProfile = this.ctx.settings.get("modelProfile.default");
-		let snapshot: MaterializeModelProfileForDeletionResult | undefined;
 		let deletedProfile: ModelProfileConfig | undefined;
 		const refreshSelectorState = (refreshedProfileName?: string): void => {
 			modelSelector.refreshRoleAssignments({
@@ -1772,14 +1768,7 @@ export class SelectorController {
 			modelSelector.refreshPresetProfiles(refreshedProfileName);
 		};
 		try {
-			if (activeProfile === profileName || defaultProfile === profileName) {
-				snapshot = await materializeModelProfileForDeletion({
-					session: this.ctx.session,
-					modelRegistry: this.ctx.session.modelRegistry,
-					settings: this.ctx.settings,
-					profileName,
-				});
-			}
+			if (activeProfile === profileName) throw new ModelProfileReplacementRequiredError(profileName);
 			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
 			await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 			await this.ctx.notifyConfigChanged?.();
@@ -1794,21 +1783,6 @@ export class SelectorController {
 					await this.ctx.session.modelRegistry.refresh("offline", this.ctx.session.credentialSessionId);
 				} catch (restoreErr) {
 					presetRestoreError = restoreErr;
-				}
-			}
-			if (snapshot) {
-				try {
-					await restoreMaterializedModelProfileForDeletion({
-						settings: this.ctx.settings,
-						session: this.ctx.session,
-						snapshot,
-					});
-				} catch (restoreErr) {
-					refreshSelectorState(deletedProfile ? profileName : undefined);
-					this.ctx.showError(
-						`Preset delete failed and settings rollback failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`,
-					);
-					return;
 				}
 			}
 			if (deletedProfile) refreshSelectorState(profileName);

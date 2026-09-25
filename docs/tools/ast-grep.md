@@ -7,7 +7,7 @@
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/ast-grep.md`
 - Key collaborators:
   - `crates/pi-natives/src/ast.rs` — native scan, parse, match engine
-  - `crates/pi-natives/src/language/mod.rs` — language aliases and extension inference
+  - `crates/pi-ast/src/language/mod.rs` — language aliases and extension inference
   - `packages/coding-agent/src/tools/path-utils.ts` — path/glob parsing and multi-path resolution
   - `packages/coding-agent/src/tools/render-utils.ts` — parse-error dedupe and display caps
   - `packages/coding-agent/src/tools/match-line-format.ts` — anchor-prefixed match rendering
@@ -30,7 +30,7 @@ Pattern grammar and language support exposed to the model:
 - Metavariable names must be uppercase and must stand for whole AST nodes, not partial tokens or string fragments.
 - Reusing the same metavariable requires identical code at each occurrence.
 - Patterns must parse as one valid AST node for the inferred target language.
-- Supported canonical languages come from `SupportLang::all_langs()` in `crates/pi-natives/src/language/mod.rs`: `astro`, `bash`, `c`, `cmake`, `cpp`, `csharp`, `dart`, `clojure`, `css`, `diff`, `dockerfile`, `elixir`, `erlang`, `go`, `graphql`, `haskell`, `hcl`, `html`, `ini`, `java`, `javascript`, `json`, `just`, `julia`, `kotlin`, `lua`, `make`, `markdown`, `nix`, `objc`, `ocaml`, `odin`, `perl`, `php`, `powershell`, `protobuf`, `python`, `r`, `regex`, `ruby`, `rust`, `scala`, `solidity`, `sql`, `starlark`, `svelte`, `swift`, `toml`, `tlaplus`, `tsx`, `typescript`, `verilog`, `vue`, `xml`, `yaml`, `zig`.
+- Supported canonical languages come from `SupportLang::all_langs()` in `crates/pi-ast/src/language/mod.rs`: `astro`, `bash`, `c`, `cmake`, `cpp`, `csharp`, `dart`, `clojure`, `css`, `diff`, `dockerfile`, `elixir`, `erlang`, `go`, `graphql`, `haskell`, `hcl`, `html`, `ini`, `java`, `javascript`, `json`, `just`, `julia`, `kotlin`, `lua`, `make`, `markdown`, `nix`, `objc`, `ocaml`, `odin`, `perl`, `php`, `powershell`, `protobuf`, `python`, `r`, `regex`, `ruby`, `rust`, `scala`, `solidity`, `sql`, `starlark`, `svelte`, `swift`, `toml`, `tlaplus`, `tsx`, `typescript`, `verilog`, `vue`, `xml`, `yaml`, `zig`.
 
 ## Outputs
 - Single-shot tool result.

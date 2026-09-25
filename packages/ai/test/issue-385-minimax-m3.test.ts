@@ -15,7 +15,7 @@ describe("MiniMax M3 support (issue #385)", () => {
 			expect(model.provider).toBe(provider);
 			expect(model.name).toBe("MiniMax-M3");
 			expect(model.contextWindow).toBe(1_000_000);
-			expect(model.maxTokens).toBe(128_000);
+			expect(model.maxTokens).toBe(512_000);
 			expect(model.input).toContain("text");
 			expect(model.input).toContain("image");
 		}

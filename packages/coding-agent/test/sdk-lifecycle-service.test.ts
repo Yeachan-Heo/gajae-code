@@ -15,6 +15,7 @@ import {
 	type SessionLifecycleClientRequestOptions,
 	type SessionLifecycleOperation,
 	SessionLifecycleService,
+	type SessionListTarget,
 	type SessionReconcileUncertainTarget,
 	validateSessionLifecycleMutationRequest,
 } from "../src/sdk/lifecycle";
@@ -302,7 +303,6 @@ describe("SessionLifecycleService", () => {
 					indexSeq: 7,
 					sessions: [{ sessionId: "first", live: true }],
 					warnings: ["first-page-warning"],
-					savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
 					continuationCursor: "page-2",
 				},
 			},
@@ -337,13 +337,164 @@ describe("SessionLifecycleService", () => {
 					},
 				],
 				warnings: ["first-page-warning"],
-				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
 			},
 		});
 		expect(client.calls).toEqual([
 			{ operation: "session.list", input: {}, options: {} },
 			{ operation: "session.list", input: { cursor: "page-2" }, options: {} },
 		]);
+	});
+	it("preserves savedSession only for its exact requested target", async () => {
+		const { service, client } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
+			},
+		});
+		const result = await service.list({
+			actor,
+			capability: "session.list",
+			target: { cwd: "/repo", resolveSessionId: "saved" },
+		});
+		expect(result).toMatchObject({ ok: true, result: { savedSession: { id: "saved" } } });
+		expect(client.calls.map(call => call.input)).toEqual([{ cwd: "/repo", resolveSessionId: "saved" }]);
+	});
+	it("rejects saved-session results that do not match the requested resolver ID", async () => {
+		for (const result of [
+			{
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSession: { id: "other", path: "/other.jsonl", identity: savedTranscriptIdentity },
+			},
+			{
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSessionOmission: { sessionId: "other", reason: "candidate_not_found" },
+			},
+		]) {
+			const { service } = serviceWith({ ok: true, result });
+			expect(
+				await service.list({
+					actor,
+					capability: "session.list",
+					target: { cwd: "/repo", resolveSessionId: "saved" },
+				}),
+			).toMatchObject({
+				ok: false,
+				certainty: "uncertain",
+				error: { code: "malformed_response" },
+			});
+		}
+
+		const unrequested = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [],
+				warnings: [],
+				savedSessionOmission: { sessionId: "saved", reason: "candidate_not_found" },
+			},
+		});
+		expect(await unrequested.service.list({ actor, capability: "session.list" })).toMatchObject({
+			ok: false,
+			certainty: "uncertain",
+			error: { code: "malformed_response" },
+		});
+	});
+	it("rejects mixed scope, exact path, and cursor list targets", async () => {
+		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const scope = {
+			version: 1 as const,
+			requested: "global" as const,
+			requestAnchor: { cwd: anchor.cwd, worktreeRoot: anchor.worktreeRoot },
+		};
+		for (const target of [
+			{ cwd: "", resolveSessionId: "saved" },
+			{ cwd: "/repo", resolveSessionId: "saved", cursor: "page-2" },
+			{ cursor: "" },
+			{ scope, cwd: "/repo", resolveSessionId: "saved" },
+			{ scope, resolveSessionId: "saved" },
+		]) {
+			const { service, client } = serviceWith();
+			expect(await service.list({ actor, capability: "session.list", target })).toMatchObject({
+				ok: false,
+				certainty: "terminal",
+				error: { code: "invalid_request" },
+			});
+			expect(client.calls).toEqual([]);
+		}
+		const malformedCursor = serviceWith();
+		expect(
+			await malformedCursor.service.list({
+				actor,
+				capability: "session.list",
+				target: { cursor: 5 } as unknown as SessionListTarget,
+			}),
+		).toMatchObject({
+			ok: false,
+			certainty: "terminal",
+			error: { code: "invalid_request" },
+		});
+		expect(malformedCursor.client.calls).toEqual([]);
+
+		const paginated = serviceWith();
+		paginated.client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "saved" }],
+					warnings: [],
+					continuationCursor: "page-2",
+					savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
+				},
+			},
+			{ ok: true, result: { indexSeq: 7, sessions: [], warnings: [] } },
+		);
+		expect(
+			await paginated.service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: false,
+			certainty: "uncertain",
+			error: { code: "malformed_response" },
+		});
+	});
+	it("traverses a cwd-filtered session list across cursor pages", async () => {
+		const { service, client } = serviceWith();
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [{ sessionId: "first" }],
+					warnings: [],
+					continuationCursor: "page-2",
+				},
+			},
+			{ ok: true, result: { indexSeq: 7, sessions: [{ sessionId: "second" }], warnings: [] } },
+		);
+
+		expect(
+			await service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo" },
+			}),
+		).toMatchObject({
+			ok: true,
+			operation: "session.list",
+			result: { sessions: [{ sessionId: "first" }, { sessionId: "second" }] },
+		});
+		expect(client.calls.map(call => call.input)).toEqual([{ cwd: "/repo" }, { cwd: "/repo", cursor: "page-2" }]);
 	});
 	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
 		const { service, client } = serviceWith();
@@ -476,6 +627,97 @@ describe("SessionLifecycleService", () => {
 			result: { indexSeq: 7, sessions: [], warnings: [] },
 		});
 	});
+	it("preserves safe correlated savedSession omission diagnostics and rejects malformed details", async () => {
+		const omission = {
+			sessionId: "saved",
+			reason: "candidate_invalid",
+			detailCode: "source_changed",
+		} as const;
+		const { service } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSessionOmission: omission,
+			},
+		});
+		expect(
+			await service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: true,
+			result: { savedSessionOmission: omission },
+		});
+		const nonDirectoryCandidate = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "saved" }],
+				warnings: [],
+				savedSessionOmission: { ...omission, detailCode: "cwd_not_directory" },
+			},
+		});
+		expect(
+			await nonDirectoryCandidate.service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: true,
+			result: { savedSessionOmission: { ...omission, detailCode: "cwd_not_directory" } },
+		});
+
+		for (const savedSessionOmission of [
+			{ ...omission, detailCode: "/private/session.jsonl" },
+			{ ...omission, detailCode: "token_secret" },
+			{ ...omission, debugPath: "/private/session.jsonl" },
+			{ sessionId: "saved", reason: "candidate_ambiguous", candidateCount: 2, detailCode: "cwd_missing" },
+			{ sessionId: "saved", reason: "candidate_ambiguous", candidateCount: 1 },
+			{ sessionId: "saved", reason: "identity_incomplete", missingIdentityFields: [] },
+		]) {
+			const invalid = serviceWith({
+				ok: true,
+				result: { indexSeq: 7, sessions: [], warnings: [], savedSessionOmission },
+			});
+			expect(
+				await invalid.service.list({
+					actor,
+					capability: "session.list",
+					target: { cwd: "/repo", resolveSessionId: "saved" },
+				}),
+			).toMatchObject({
+				ok: false,
+				certainty: "uncertain",
+				error: { code: "malformed_response" },
+			});
+		}
+		const contradictory = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [],
+				warnings: [],
+				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
+				savedSessionOmission: omission,
+			},
+		});
+		expect(
+			await contradictory.service.list({
+				actor,
+				capability: "session.list",
+				target: { cwd: "/repo", resolveSessionId: "saved" },
+			}),
+		).toMatchObject({
+			ok: false,
+			certainty: "uncertain",
+			error: { code: "malformed_response" },
+		});
+	});
 	it("rejects present malformed session.list savedSession identities", async () => {
 		for (const savedSession of [
 			undefined,
@@ -494,7 +736,13 @@ describe("SessionLifecycleService", () => {
 				ok: true,
 				result: { indexSeq: 7, sessions: [], warnings: [], savedSession },
 			});
-			expect(await service.list({ actor, capability: "session.list" })).toMatchObject({
+			expect(
+				await service.list({
+					actor,
+					capability: "session.list",
+					target: { cwd: "/repo", resolveSessionId: "saved" },
+				}),
+			).toMatchObject({
 				ok: false,
 				certainty: "uncertain",
 				error: { code: "malformed_response" },

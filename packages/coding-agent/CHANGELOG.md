@@ -2,6 +2,88 @@
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-09-24
+
+### Fixed
+
+- Keep a sealed run's exact resource leases live after a bounded abort wait returns `resources_pending`, so a later tracked tool settlement can clear the ledger instead of leaving a stale quarantine tombstone. `AgentSession.abortPromptAndWait` can re-read the retained proof after the cancellation domain is released, while unknown handles remain `unknown_run`. Continue to report pending work until its tracked promise settles; terminal events and abort acknowledgements do not prove physical settlement (#5401).
+
+- Let fresh coordinator-MCP `session.create` requests proceed past unrelated completed metadata-free legacy rows while preserving live and uncertain fences. Exact target-derived terminal legacy create retries can still migrate/replay before the key is reused for another target. Old target-bound rows do not retain a recoverable caller key, so a same-key request for a different target may be admitted as fresh; after that request adopts the key, later target changes conflict with the new indexed row. Key-only legacy create conflicts and non-create target-key conflicts remain protected.
+- Scrub TUI/session identity and lifecycle markers from detached broker startup while preserving supported session budget/memory settings, explicit tmux session names, and user tmux configuration.
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- Added opt-in native managed task DAGs through authenticated Broker `task.dag` operations, with private durable domain state, resource reservations, native launch and seed fencing, recovery, shared-runner verification, and byte-bound predecessor invalidation. This coordinates enrolled managed tasks only, not arbitrary external processes.
+
+- Show per-agent role input/output usage and cost in `gjc stats --summary`.
+
+- `gjc setup provider --preset ionet` (aliases: `io-net`, `io-intelligence`): OpenAI-compatible custom provider for IO Intelligence by io.net (`IONET_API_KEY`, live `/models` discovery, `org/name` model ids, `max_tokens` output-limit field).
+
+- `anthropic/claude-opus-5-5` is curated as the rank-1 `strong` autorouting tier at `high` effort, demoting `anthropic/claude-opus-5` to rank 2 and `anthropic/claude-opus-4-8` to rank 3; Anthropic reports Opus 5.5 at Fable 5.1-level quality for ~40% less compute per task, so it dominates the model it displaces on both axes. The remaining 341 new catalog keys from the same regeneration are recorded in `TIER_MAP_SKIP_LIST` as uncurated, keeping the tier-map gate authoritative rather than widening it.
+
+### Fixed
+
+- Recover uncertain ACP `turn.abort` dispatches with bounded exact-kind/correlation `turn.result` reads without replaying mutations. Report `terminal_ok`/`end_turn` results with a missing receipt as `prompt_failed` while prompt settlement is pending; a later owner-only lookup does not turn an already reported `terminal_uncertain` prompt into success. Keep unresolved ownership fenced across transport reattachment and overlapping acknowledged cancels until exact terminal proof or session retirement, without asserting that pending tool resources physically settled (#5401).
+
+- Reclaim interrupted managed enrollment per control root, preserving other roots and their native identities during restart recovery.
+
+- Hardened enrollment recovery, cross-root idempotency, cancellation, and verification so interrupted or uncertain managed task lifetimes remain fail-closed.
+- Bound owner validation subprocesses to owner shutdown and rejected private durable publication beneath unsafe roots.
+- Serialized owner submission, recovery, observation, and finalization against retirement so lifecycle writes and receipts cannot outlive owner authority.
+
+- Coordinator compaction now ages answered question receipts from a coordinator-local persistence timestamp instead of the remote-supplied `resolved_at`, so a stale or hostile remote value can no longer retire a freshly completed answer receipt. The remote value is still preserved in the safe receipt and API response metadata (#5701).
+
+- Keep MCP tools that become plugin-mandatory during cwd rescope or owned-manager replacement out of persisted user selection, while preserving unrelated selected tools.
+
+- Disconnect expired MCP startup connections without losing cached tools, the config and source metadata needed to reconnect them, their manager catalog during asynchronous cleanup, or the session-owned manager required to reconnect them; keep remote error response text out of persisted startup failure logs, including failures reported after startup returns; back session-owned conventional autoload managers, including managers rebuilt after cwd rescope, with their profile-specific persistent tool cache restricted to non-shadowed conventional servers; keep a mixed plugin/conventional manager frozen against config reloads while published cached conventional tools retain reconnect access, and refresh conventional cache/publication scope on rediscovery; publish plugin MCP tools that complete after cached fallback startup as always-on tools, rebuilding discovery entries when plugin tool snapshots change; seal fully connected ordinary tools synchronously.
+
+- Failed authenticated plugin MCP launches now report a session-visible startup diagnostic with the reason, and unavailable plugin tools are excluded from the active tool inventory (#5794).
+
+- Dead-owner SDK session lock acquisition failures now identify guarded-removal refusals and provide a platform-specific manual cleanup command when the same dead owner still holds the lock at exhaustion; broker startup also preserves its bounded discovery recovery when that startup lock disappears before the failure marker is examined (#5827).
+
+- Prompt-deadline autosaves no longer stage volatile state under the active SDK broker's `sdk` directory (#5840).
+
+- PDF conversion diagnostics are sanitized in linear time. The path-redaction rule in `sanitizeMuPdfDiagnostic` restarted its prefix run at every offset of a long separator-free message before failing to find a `/`, `\`, `%2f`, or `%5c`, which is quadratic in the message length: 12.5k/25k/50k/100k characters cost 207ms/832ms/3.3s/13.3s. A MuPDF diagnostic is derived from the document being converted, and `normalizeError` applies this once per link in the error's cause chain, so a malformed PDF read through the `read` tool could stall the conversion. The prefix run is now boundary anchored; redaction output is unchanged.
+
+- Interactive startup now opens the TUI with repair guidance when the persisted default model profile has been removed; explicit unknown profiles and noninteractive startup remain strict (#5845).
+
+- Failed default model-profile activation now restores the prior live model even when its credentials have since become unavailable, and reports redacted failure stages when rollback remains incomplete (#5846).
+
+- Keep running canonical sub-sessions synchronized with their inherited MCP manager's tool catalog, including additions, renames, and removals, without transferring manager ownership or plugin mandatory authority.
+
+- Restore the session-family `--agent-dir` position and accept `--repo` on exact-session CLI commands; successful calls warn that `--repo` is ignored, while failed `--json` calls preserve the empty-stderr error contract (#5862).
+
+- Restored fail-soft startup for plugin MCP connection failures when owned-manager cleanup also fails, with sanitized diagnostics and a single cleanup attempt (#5864).
+
+- The status-line usage segment now reflects the active OpenAI Codex OAuth credential instead of whichever account report arrives first (#5871).
+
+- Preserve inherited MCP startup snapshots while wiring live catalog updates, and keep successfully connected tools plus current GJC runtime evidence when plugin cleanup fails.
+
+- Keep dispatched SDK lifecycle requests uncertain when their response times out, so callers do not treat an unknown outcome as terminal (#5885).
+
+- Coordinator `gjc_coordinator_start_session` now binds recovered creation intents using the same timestamp-insensitive semantic digest as its WAL, so retries after interrupted creation succeed without weakening conflicts for changed launch inputs (#5899).
+
+- Bash-tool children no longer inherit coordinator-only session and sidecar environment markers; explicit tool env overrides and each child’s `GJC_SESSION_ID` remain intact (#5802).
+
+- Resolve cached dynamic LiteLLM models consistently for repeated delegated-agent launches, including recovery from stale parent registries.
+
+- The SDK broker starts again on macOS and Windows. Managed task DAG enrollment recovery took its Linux-only private durable lock even when no enrollment index existed, so every non-Linux broker failed startup with "Broker cannot establish complete managed enrollment membership." An absent index now reads as empty off Linux; a present index still fails closed.
+
+- `/model` opens about twice as fast on large catalogs: profile-activation availability now resolves each provider's discovery-evidence freshness (which scans the catalog for the provider base URL) once per provider instead of once per model, which made each open quadratic in catalog size (4,822 models: 2.0–2.5s → about 1.0s per open).
+- `/resume` no longer SHA-256-hashes every (legacy, v2) transcript pair while deciding which legacy sessions are already migrated; a receipt is rejected on its recorded source/destination paths and source digest before any transcript is read (589 sessions: 10.4–12.3s → 6.2–7.2s per open).
+
+- SDK-owned fresh sessions now await configured startup-model provider discovery before model admission, matching CLI startup behavior so discoverable defaults work without an explicit model selector (#5843).
+
+- `gjc sdk serve --stdio` now relays supported mid-turn session events without claiming optional capabilities the downstream client did not negotiate. Observer delivery is limited to connections that explicitly negotiated both turn streaming and session-host observation.
+
+- The `subagent` await panel again shows each running child's tool count, current context usage, and a live "last activity" age, which were dropped when the await progress payload was narrowed.
+
+### Improved
+
+- Reduced fetch-tool startup work by loading site-specific scraper handlers only when a non-raw fetch dispatches special URL handling. The startup-import probe now verifies dispatch still works and allows a cold Bun child import up to 30 seconds under CI shard contention.
+
 ## [0.17.4] - 2026-09-23
 
 ### Changed

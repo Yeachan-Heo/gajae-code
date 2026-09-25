@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- Add default/executor/planner/architect/critic usage totals to the stats summary and JSON output, attributing existing persisted subagent identities and leaving legacy sessions without identity metadata as `unknown`.
+
 ## [0.17.4] - 2026-09-23
 
 ## [0.17.3] - 2026-09-22

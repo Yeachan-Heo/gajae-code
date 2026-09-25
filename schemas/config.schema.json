@@ -453,6 +453,75 @@
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
 				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"schemaVersion": {
+							"type": "integer",
+							"const": 1
+						},
+						"version": {
+							"type": "integer",
+							"minimum": 0,
+							"maximum": 9007199254740991
+						},
+						"marker": {
+							"type": "object",
+							"oneOf": [
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "inherit"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "cleared"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "profile"
+										},
+										"profile": {
+											"type": "string",
+											"minLength": 1
+										}
+									},
+									"required": [
+										"kind",
+										"profile"
+									],
+									"additionalProperties": false
+								}
+							]
+						}
+					},
+					"required": [
+						"schemaVersion",
+						"version",
+						"marker"
+					],
+					"additionalProperties": false
+				},
 				"proxyProvider": {
 					"type": "string",
 					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."
@@ -1010,6 +1079,21 @@
 					"type": "boolean",
 					"description": "Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 					"default": false
+				},
+				"delegationHint": {
+					"type": "object",
+					"properties": {
+						"mode": {
+							"type": "string",
+							"enum": [
+								"off",
+								"hint"
+							],
+							"description": "Opt in to transient local-only Kev advice after observable edit activity. Notices never alter prompts, task arguments, or saved sessions.",
+							"default": "off"
+						}
+					},
+					"additionalProperties": false
 				},
 				"simple": {
 					"type": "string",

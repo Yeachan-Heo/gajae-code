@@ -20,7 +20,7 @@ It reflects the current implementation, including partial semantics and metadata
 - [`../src/sdk/session.ts`](../packages/coding-agent/src/sdk/session.ts)
 - [`../src/system-prompt.ts`](../packages/coding-agent/src/system-prompt.ts)
 - [`../src/internal-urls/rule-protocol.ts`](../packages/coding-agent/src/internal-urls/rule-protocol.ts)
-- [`../src/utils/frontmatter.ts`](../packages/coding-agent/src/utils/frontmatter.ts)
+- [`packages/utils/src/frontmatter.ts`](../packages/utils/src/frontmatter.ts)
 
 ## 1. Canonical rule shape
 

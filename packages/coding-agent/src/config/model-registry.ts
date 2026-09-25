@@ -87,6 +87,11 @@ import {
 	refreshModelPresetRegistry,
 	refreshModelPresetRegistryInBackground,
 } from "./model-preset-registry";
+import {
+	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnershipFromRaw,
+	UnresolvedModelProfileOwnershipError,
+} from "./model-profile-ownership";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
 
@@ -1747,6 +1752,7 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
+	#ownershipSettings: Pick<Settings, "commitAtomicBatchWithCurrent"> | undefined;
 	readonly #authStorageConfigOwner: object = {};
 	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
@@ -1795,10 +1801,15 @@ export class ModelRegistry {
 	constructor(
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
-		registrySettings?: Pick<Settings, "get" | "getGlobal">,
+		registrySettings?: Pick<Settings, "get" | "getGlobal"> & Partial<Pick<Settings, "commitAtomicBatchWithCurrent">>,
 		modelPresetRegistryDependencies: ModelPresetRegistryDependencies = {},
 	) {
 		this.#settings = registrySettings ?? settings;
+		this.#ownershipSettings = registrySettings
+			? typeof registrySettings.commitAtomicBatchWithCurrent === "function"
+				? (registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent">)
+				: undefined
+			: settings;
 		const configuredAgentDir = path.resolve(modelPresetRegistryDependencies.agentDir ?? getAgentDir());
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
 		this.#modelPresetRegistryAgentDir = modelPresetRegistryDependencies.agentDir
@@ -2560,12 +2571,20 @@ export class ModelRegistry {
 		for (const providerConfig of this.#discoveryManager.providers) {
 			if (providerId && providerConfig.provider !== providerId) continue;
 			let expectedProvenance: string | undefined;
+			let effectiveConfig: DiscoveryProviderConfig | undefined;
+			let expectedAuthGeneration: string | undefined;
+			let expectedEndpoint: string | undefined;
 			try {
-				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				const effectiveAuthGeneration =
+					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider);
+				const effectiveEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? "");
+				expectedAuthGeneration = effectiveAuthGeneration;
+				expectedEndpoint = effectiveEndpoint;
 				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
 					effectiveConfig,
-					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider),
-					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
+					effectiveAuthGeneration,
+					effectiveEndpoint,
 				);
 			} catch {
 				// A context that cannot be fully derived cannot vouch for a cache row.
@@ -2574,6 +2593,30 @@ export class ModelRegistry {
 			const models = publishDiscoveryState
 				? this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance)
 				: this.#readCachedDiscoverableModels(providerConfig, expectedProvenance);
+			if (publishDiscoveryState) {
+				const cache =
+					effectiveConfig !== undefined
+						? readModelCache<Api>(effectiveConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath)
+						: null;
+				if (
+					effectiveConfig !== undefined &&
+					expectedAuthGeneration !== undefined &&
+					expectedEndpoint !== undefined &&
+					expectedProvenance !== undefined &&
+					cache?.fresh === true &&
+					cache.authoritative === true &&
+					cache.dynamicModelIds !== undefined &&
+					cache.dynamicModelProvenance === expectedProvenance
+				) {
+					this.#configuredDiscoveryEvidence.set(effectiveConfig.provider, {
+						authGeneration: expectedAuthGeneration,
+						endpoint: expectedEndpoint,
+						modelIds: new Set(cache.dynamicModelIds),
+					});
+				} else {
+					this.#configuredDiscoveryEvidence.delete(providerConfig.provider);
+				}
+			}
 			// Cache rows persist sanitized transport metadata (no headers), so a
 			// rebooted registry re-derives the provider transport override from the
 			// same source the live publish path uses — mirroring the cached
@@ -2973,6 +3016,18 @@ export class ModelRegistry {
 		return new Map(this.#modelProfiles);
 	}
 
+	assertCurrentModelProfileExists(name: string): void {
+		const loaded = this.#modelsConfigFile.tryLoad();
+		if (loaded.status === "error") {
+			throw new Error(
+				`Cannot validate durable model-profile ownership because ${this.#modelsConfigFile.path()} is invalid.`,
+			);
+		}
+		if (mergeModelProfiles(loaded.value?.profiles).has(name)) return;
+		if (this.#modelProfiles.get(name)?.source === "registry") return;
+		throw new UnresolvedModelProfileOwnershipError(name);
+	}
+
 	getModelProfile(name: string): ModelProfileDefinition | undefined {
 		return this.#modelProfiles.get(name);
 	}
@@ -3058,20 +3113,36 @@ export class ModelRegistry {
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
-		const nextProfiles = { ...(current.profiles ?? {}) };
-		delete nextProfiles[normalizedName];
-		const checkedConfig = ModelsConfigSchema.safeParse({
-			...current,
-			profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
-		});
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
+		const ownershipSettings = this.#ownershipSettings;
+		if (!ownershipSettings) {
+			throw new Error("Profile deletion requires a settings store with ownership transaction support.");
 		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		return profile;
+		let deletedProfile: ModelProfileConfig | undefined;
+		await ownershipSettings.commitAtomicBatchWithCurrent(async currentSettings => {
+			const durableOwnership = readDurableModelProfileOwnershipFromRaw(currentSettings);
+			if (durableOwnership.marker.kind === "profile" && durableOwnership.marker.profile === normalizedName) {
+				throw new ModelProfileReplacementRequiredError(normalizedName);
+			}
+			const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
+			const nextProfiles = { ...(current.profiles ?? {}) };
+			delete nextProfiles[normalizedName];
+			const checkedConfig = ModelsConfigSchema.safeParse({
+				...current,
+				profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+			});
+			if (!checkedConfig.success) {
+				const first = checkedConfig.error.issues[0];
+				const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+				throw new Error(
+					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
+				);
+			}
+			await this.#writeCheckedModelsConfig(checkedConfig.data);
+			deletedProfile = profile;
+			return [];
+		});
+		if (!deletedProfile) throw new Error(`Model profile "${normalizedName}" was not deleted.`);
+		return deletedProfile;
 	}
 
 	#loadCustomProfileForMutation(
@@ -3306,16 +3377,24 @@ export class ModelRegistry {
 			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
 				this.#effectiveDiscoveryProviderConfig(provider).baseUrl ?? "",
 			);
+			const authoritativeState =
+				state !== undefined &&
+				state.error === undefined &&
+				!state.stale &&
+				((state.status === "ok" && discovery.fetched) ||
+					state.status === "empty" ||
+					(state.status === "ok" && !discovery.fetched));
 			if (
 				evidence !== undefined &&
-				(state?.status === "ok" || state?.status === "empty") &&
-				discovery.fetched &&
+				authoritativeState &&
 				currentAuthGeneration === evidence.authGeneration &&
 				currentEndpoint === evidence.endpoint
 			) {
 				this.#configuredDiscoveryEvidence.set(provider.provider, evidence);
 			} else if (
-				(state?.status !== "cached" && !(state?.status === "ok" && !discovery.fetched)) ||
+				(state?.status !== "cached" &&
+					state?.status !== "empty" &&
+					!(state?.status === "ok" && !discovery.fetched)) ||
 				state.error !== undefined ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.authGeneration !== currentAuthGeneration ||
 				this.#configuredDiscoveryEvidence.get(provider.provider)?.endpoint !== currentEndpoint

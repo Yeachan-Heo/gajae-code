@@ -1,7 +1,6 @@
 import { type AnimationRegistration, registerAnimationCallback } from "../animation-scheduler";
 import { isRemoteTerminalSession, isUnderTerminalMultiplexer } from "../terminal-capabilities";
 import type { TUI } from "../tui";
-import { sliceByColumn, visibleWidth } from "../utils";
 import { Text } from "./text";
 
 const SPINNER_ADVANCE_MS = 80;
@@ -67,14 +66,8 @@ export class Loader extends Text {
 	}
 
 	render(width: number): string[] {
-		const lines = ["", ...super.render(width)];
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (visibleWidth(line) > width) {
-				lines[i] = sliceByColumn(line, 0, width, true);
-			}
-		}
-		return lines;
+		// Leading blank is the spacer; Text already fits each row to `width`.
+		return ["", ...super.render(width)];
 	}
 
 	start() {

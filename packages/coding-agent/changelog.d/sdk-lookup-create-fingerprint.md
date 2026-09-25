@@ -1,0 +1,3 @@
+### Fixed
+
+- `session.lookup` for a `session.create` now recovers the recorded outcome when the lookup target matches the create target. The broker fingerprinted the raw lookup target while the create path fingerprinted its normalized input (resolved `cwd` plus the derived `stateRoot`), so every lookup reported `idempotency_conflict` and callers could not reconcile a lost create acknowledgement. Lookup targets now pass through the same normalization before fingerprinting; a genuinely different target still conflicts, and an invalid lookup target is rejected as `invalid_input`. Create rows recorded before target-bound identities, which carry a raw-target fingerprint, stay recoverable: lookup falls back to the raw fingerprint only for that exact legacy identity (#5933).

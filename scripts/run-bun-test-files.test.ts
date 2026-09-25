@@ -123,7 +123,7 @@ describe("fresh-process test harness contracts", () => {
 			"test",
 			"--timeout=30000",
 			"--preload",
-			"./scripts/test-preload.ts",
+			"./scripts/test-preload-after-all.ts",
 			"./packages/coding-agent/test/path with spaces.test.ts",
 		]);
 		expect(spec.cwd).toBe("/repo root");
@@ -175,7 +175,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-contamination-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		await Bun.write(
 			path.join(root, "tests", "01-leak.test.ts"),
@@ -192,6 +192,45 @@ describe("fresh-process test harness contracts", () => {
 		expect(
 			await runHarness({ root: "tests", testTimeoutMs: 30_000, fileTimeoutMs: 30_000, concurrency: 1 }, undefined, root),
 		).toBe(0);
+	});
+
+	test("GJC_TEST_KEEP_TMP preserves isolated state inside the fresh-process sandbox", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-keep-sandbox-"));
+		tempDirs.push(root);
+		await fs.mkdir(path.join(root, "tests"), { recursive: true });
+		await Bun.write(path.join(root, "tests", "fixture.test.ts"), "test('fixture', () => {});\n");
+		let sandbox: string | undefined;
+		let retainedState: string | undefined;
+		const runner: TestProcessRunner = async spec => {
+			sandbox = spec.sandbox;
+			expect(spec.env.GJC_TEST_KEEP_TMP).toBe("1");
+			const isolatedAgentDir = path.join(spec.env.TMPDIR!, "gjc-test-agent-debug");
+			await fs.mkdir(isolatedAgentDir);
+			retainedState = path.join(isolatedAgentDir, "state.json");
+			await Bun.write(retainedState, "fixture state");
+			return { exitCode: 1, timedOut: false };
+		};
+		const priorKeepTmp = process.env.GJC_TEST_KEEP_TMP;
+		process.env.GJC_TEST_KEEP_TMP = "1";
+		let exitCode = 0;
+		try {
+			try {
+				exitCode = await runHarness(
+					{ root: "tests", testTimeoutMs: 30_000, fileTimeoutMs: 30_000, concurrency: 1 },
+					runner,
+					root,
+				);
+			} finally {
+				if (priorKeepTmp === undefined) delete process.env.GJC_TEST_KEEP_TMP;
+				else process.env.GJC_TEST_KEEP_TMP = priorKeepTmp;
+			}
+			expect(exitCode).toBe(1);
+			expect(sandbox).toBeDefined();
+			expect(retainedState).toBeDefined();
+			expect(await Bun.file(retainedState!).text()).toBe("fixture state");
+		} finally {
+			if (sandbox) await fs.rm(sandbox, { recursive: true, force: true });
+		}
 	});
 
 	test("the two exact shard-6 regression files receive distinct process specs", async () => {
@@ -234,7 +273,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-parallel-timing-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		await Bun.write(
 			path.join(root, "tests", "first.test.ts"),
@@ -265,7 +304,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-timeout-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
@@ -298,7 +337,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-clean-exit-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
@@ -329,7 +368,7 @@ describe("fresh-process test harness contracts", () => {
 		const root = await fs.mkdtemp(path.join(import.meta.dir, ".run-bun-test-signal-"));
 		tempDirs.push(root);
 		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
-		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await Bun.write(path.join(root, "scripts", "test-preload-after-all.ts"), "export {};\n");
 		await fs.mkdir(path.join(root, "tests"), { recursive: true });
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(

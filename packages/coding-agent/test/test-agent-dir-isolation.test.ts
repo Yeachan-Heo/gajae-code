@@ -6,9 +6,11 @@
  * because importing the preload would apply its environment mutations.
  */
 import { describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getDefaultSafeCleanupWorld, registerOwnedDeletionRoot, safeRmSync } from "../../../scripts/safe-cleanup";
 import {
 	decideAgentDirIsolation,
 	defaultAgentDirFor,
@@ -225,9 +227,123 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		}
 	}, 30_000);
 
-	test("an explicit trusted non-default pin survives the real preload", async () => {
-		const pinned = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-pinned-"));
+	test.skipIf(process.platform === "win32")(
+		"fails closed when os.tmpdir is the filesystem root",
+		() => {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
+				env: {
+					...process.env,
+					TMPDIR: "/",
+					TMP: "/",
+					TEMP: "/",
+					GJC_CODING_AGENT_DIR: "",
+					PI_CODING_AGENT_DIR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).not.toBe(0);
+			expect(probe.stderr.toString()).toContain("directly under the filesystem root");
+			expect(probe.stdout.toString().trim()).toBe("");
+		},
+		30_000,
+	);
+
+	test("rolls back agent isolation when log isolation fails before the afterAll bridge loads", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-init-failure-"));
+		const tempRoot = path.join(root, "tmp");
+		const testPath = path.join(root, "init-failure.test.ts");
+		const bridge = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
+		await fs.promises.mkdir(tempRoot);
+		await fs.promises.writeFile(path.join(root, ".env"), "GJC_LOG_DIR=$HOME/.gjc/logs\n");
+		await fs.promises.writeFile(testPath, 'import { test } from "bun:test"; test("preload must fail", () => {});\n');
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			HOME: os.homedir(),
+			TMPDIR: tempRoot,
+			TMP: tempRoot,
+			TEMP: tempRoot,
+			GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+			PI_CODING_AGENT_DIR: "",
+			GJC_CONFIG_DIR: "",
+			PI_CONFIG_DIR: "",
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+		};
+		delete childEnv.GJC_LOG_DIR;
+		delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+		delete childEnv.GJC_TEST_KEEP_TMP;
+		delete childEnv.XDG_STATE_HOME;
+
 		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "test", "--parallel=1", "--preload", bridge, testPath],
+				cwd: root,
+				env: childEnv,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).not.toBe(0);
+			expect(probe.stderr.toString()).toContain("Test log-directory isolation failed (dynamic)");
+			expect(
+				fs
+					.readdirSync(tempRoot)
+					.filter(name => name.startsWith("gjc-test-agent-") || name.startsWith("gjc-test-logs-")),
+			).toEqual([]);
+		} finally {
+			safeRmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("GJC_TEST_KEEP_TMP preserves earlier roots when later preload setup fails", async () => {
+		const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-debug-init-failure-"));
+		const tempRoot = path.join(root, "tmp");
+		const testPath = path.join(root, "debug-init-failure.test.ts");
+		const bridge = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
+		await fs.promises.mkdir(tempRoot);
+		await fs.promises.writeFile(path.join(root, ".env"), "GJC_LOG_DIR=$HOME/.gjc/logs\n");
+		await fs.promises.writeFile(testPath, 'import { test } from "bun:test"; test("preload must fail", () => {});\n');
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			HOME: os.homedir(),
+			TMPDIR: tempRoot,
+			TMP: tempRoot,
+			TEMP: tempRoot,
+			GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+			PI_CODING_AGENT_DIR: "",
+			GJC_CONFIG_DIR: "",
+			PI_CONFIG_DIR: "",
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			GJC_TEST_KEEP_TMP: "1",
+		};
+		delete childEnv.GJC_LOG_DIR;
+		delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+		delete childEnv.XDG_STATE_HOME;
+
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "test", "--parallel=1", "--preload", bridge, testPath],
+				cwd: root,
+				env: childEnv,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).not.toBe(0);
+			expect(probe.stderr.toString()).toContain("Test log-directory isolation failed (dynamic)");
+			const retainedAgentDirs = fs.readdirSync(tempRoot).filter(name => name.startsWith("gjc-test-agent-"));
+			expect(retainedAgentDirs).toHaveLength(1);
+			expect(fs.statSync(path.join(tempRoot, retainedAgentDirs[0]!)).isDirectory()).toBe(true);
+		} finally {
+			safeRmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("an explicit trusted non-default pin survives the real preload", async () => {
+		const pinned = path.join(os.tmpdir(), `gjc-test-agent-${crypto.randomUUID()}`);
+		const sentinel = path.join(pinned, "owned-marker");
+		try {
+			await fs.promises.mkdir(pinned);
+			await fs.promises.writeFile(sentinel, "keep this explicit pin");
 			const probe = Bun.spawnSync({
 				cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
 				env: { ...process.env, GJC_CODING_AGENT_DIR: pinned, PI_CODING_AGENT_DIR: "" },
@@ -236,6 +352,8 @@ describe("preload fail-closed behavior (real preload path)", () => {
 			});
 			expect(probe.exitCode).toBe(0);
 			expect(probe.stdout.toString().trim()).toBe(pinned);
+			expect(fs.statSync(pinned).isDirectory()).toBe(true);
+			expect(await fs.promises.readFile(sentinel, "utf8")).toBe("keep this explicit pin");
 		} finally {
 			await fs.promises.rm(pinned, { recursive: true, force: true });
 		}
@@ -254,6 +372,279 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		expect(adopted).not.toBe(defaultAgentDir);
 		expect(path.basename(adopted).startsWith("gjc-test-agent-")).toBe(true);
 		await fs.promises.rm(adopted, { recursive: true, force: true });
+	}, 30_000);
+
+	test("removes isolated temp dirs between files after writing to the log sink", async () => {
+		const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-exit-cleanup-"));
+		const preload = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
+		const loggerModule = path.resolve(import.meta.dir, "../../utils/src/logger.ts");
+		const reportPath = path.join(tempRoot, "cleanup-report.json");
+		const testPath = path.join(tempRoot, "01-preload-cleanup.test.ts");
+		const boundaryTestPath = path.join(tempRoot, "02-preload-cleanup-boundary.test.ts");
+		const testSource = `
+import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as logger from ${JSON.stringify(loggerModule)};
+
+const agentDir = process.env.GJC_CODING_AGENT_DIR!;
+const logDir = process.env.GJC_LOG_DIR!;
+const reportPath = process.env.GJC_TEST_PRELOAD_CLEANUP_REPORT!;
+
+test("isolated directories and log sink are live before file completion", async () => {
+	const tempRoot = path.resolve(os.tmpdir());
+	for (const [dir, prefix] of [[agentDir, "gjc-test-agent-"], [logDir, "gjc-test-logs-"]] as const) {
+		expect(path.dirname(path.resolve(dir))).toBe(tempRoot);
+		expect(path.basename(dir).startsWith(prefix)).toBe(true);
+		expect(fs.statSync(dir).isDirectory()).toBe(true);
+	}
+
+	const marker = "test-preload-log-sink-" + process.pid;
+	logger.info(marker, { issue: "5852" });
+	const deadline = Date.now() + 5000;
+	let logContents = "";
+	while (Date.now() < deadline && !logContents.includes(marker)) {
+		for (const entry of fs.readdirSync(logDir)) {
+			if (!entry.startsWith("gjc.") || !entry.endsWith(".log")) continue;
+			const contents = fs.readFileSync(path.join(logDir, entry), "utf8");
+			if (contents.includes(marker)) {
+				logContents = contents;
+				break;
+			}
+		}
+		if (!logContents.includes(marker)) await Bun.sleep(50);
+	}
+	expect(logContents).toContain(marker);
+	await Bun.write(reportPath, JSON.stringify({ agentDir, logDir, marker, logContents }));
+});
+`;
+		const boundaryTestSource = `
+import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const report = JSON.parse(fs.readFileSync(${JSON.stringify(reportPath)}, "utf8")) as {
+	agentDir: string;
+	logDir: string;
+};
+const agentDir = process.env.GJC_CODING_AGENT_DIR!;
+const logDir = process.env.GJC_LOG_DIR!;
+
+test("the prior file's directories are removed and the next isolate gets fresh roots", () => {
+	expect(fs.existsSync(report.agentDir)).toBe(false);
+	expect(fs.existsSync(report.logDir)).toBe(false);
+	for (const [dir, previous, prefix] of [
+		[agentDir, report.agentDir, "gjc-test-agent-"],
+		[logDir, report.logDir, "gjc-test-logs-"],
+	] as const) {
+		expect(dir).not.toBe(previous);
+		expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
+		expect(path.basename(dir)).toMatch(new RegExp("^" + prefix));
+		expect(fs.statSync(dir).isDirectory()).toBe(true);
+	}
+});
+`;
+		await Promise.all([
+			fs.promises.writeFile(testPath, testSource),
+			fs.promises.writeFile(boundaryTestPath, boundaryTestSource),
+		]);
+
+		const childEnv: Record<string, string | undefined> = {
+			...process.env,
+			HOME: os.homedir(),
+			GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+			PI_CODING_AGENT_DIR: "",
+			GJC_CONFIG_DIR: "",
+			PI_CONFIG_DIR: "",
+			GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			GJC_TEST_PRELOAD_CLEANUP_REPORT: reportPath,
+		};
+		delete childEnv.GJC_LOG_DIR;
+		delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+		delete childEnv.GJC_TEST_KEEP_TMP;
+		delete childEnv.XDG_STATE_HOME;
+
+		try {
+			const child = Bun.spawn(
+				[process.execPath, "test", "--parallel=1", "--preload", preload, testPath, boundaryTestPath],
+				{
+					cwd: tempRoot,
+					env: childEnv,
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect(exitCode, `nested bun test failed:\n${stdout}\n${stderr}`).toBe(0);
+
+			const report = JSON.parse(await fs.promises.readFile(reportPath, "utf8")) as {
+				agentDir: string;
+				logDir: string;
+				marker: string;
+				logContents: string;
+			};
+			expect(report.logContents).toContain(report.marker);
+			expect(report.logContents).toContain('"level":"info"');
+			for (const dir of [report.agentDir, report.logDir]) {
+				expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
+				expect(fs.existsSync(dir), `temporary directory survived child exit: ${dir}`).toBe(false);
+			}
+		} finally {
+			await fs.promises.rm(tempRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("GJC_TEST_KEEP_TMP=1 preserves isolated directories for debugging", async () => {
+		const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-keep-cleanup-"));
+		const bridge = path.resolve(import.meta.dir, "../../../scripts/test-preload-after-all.ts");
+		const testPath = path.join(tempRoot, "keep-temp.test.ts");
+		const reportPath = path.join(tempRoot, "keep-temp-report.json");
+		const testSource = `
+import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const agentDir = process.env.GJC_CODING_AGENT_DIR!;
+const logDir = process.env.GJC_LOG_DIR!;
+await Bun.write(${JSON.stringify(reportPath)}, JSON.stringify({ agentDir, logDir }));
+
+test("isolated directories remain available after this test file", () => {
+	for (const [dir, prefix] of [[agentDir, "gjc-test-agent-"], [logDir, "gjc-test-logs-"]] as const) {
+		expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
+		expect(path.basename(dir)).toMatch(new RegExp("^" + prefix));
+		expect(fs.statSync(dir).isDirectory()).toBe(true);
+		fs.writeFileSync(path.join(dir, "debug-marker"), "preserve failing fixture state");
+	}
+});
+`;
+		await fs.promises.writeFile(testPath, testSource);
+		let isolatedDirs: string[] = [];
+		try {
+			const childEnv: Record<string, string | undefined> = {
+				...process.env,
+				HOME: os.homedir(),
+				GJC_CODING_AGENT_DIR: path.join(os.homedir(), ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: "",
+				GJC_CONFIG_DIR: "",
+				PI_CONFIG_DIR: "",
+				GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+				GJC_TEST_KEEP_TMP: "1",
+			};
+			delete childEnv.GJC_LOG_DIR;
+			delete childEnv.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+			delete childEnv.XDG_STATE_HOME;
+
+			const child = Bun.spawn([process.execPath, "test", "--parallel=1", "--preload", bridge, testPath], {
+				cwd: tempRoot,
+				env: childEnv,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			const report = JSON.parse(await fs.promises.readFile(reportPath, "utf8")) as {
+				agentDir: string;
+				logDir: string;
+			};
+			isolatedDirs = [report.agentDir, report.logDir];
+			expect(exitCode, `nested bun test failed:\n${stdout}\n${stderr}`).toBe(0);
+			for (const [dir, prefix] of [
+				[report.agentDir, "gjc-test-agent-"],
+				[report.logDir, "gjc-test-logs-"],
+			] as const) {
+				expect(path.dirname(path.resolve(dir))).toBe(path.resolve(os.tmpdir()));
+				expect(path.basename(dir)).toMatch(new RegExp("^" + prefix));
+				expect(fs.existsSync(path.join(dir, "debug-marker"))).toBe(true);
+			}
+		} finally {
+			try {
+				for (const dir of isolatedDirs) {
+					if (fs.existsSync(dir)) safeRmSync(dir, { recursive: true, force: true });
+				}
+			} finally {
+				safeRmSync(tempRoot, { recursive: true, force: true });
+			}
+		}
+	}, 30_000);
+
+	test("cleans isolated dirs when os.tmpdir is nested under the real home", async () => {
+		const defaultWorld = getDefaultSafeCleanupWorld();
+		const trustedHome = defaultWorld.homeAliases[0] ?? os.homedir();
+		const ownedRoot = path.join(trustedHome, `.gjc-test-preload-tmp-${crypto.randomUUID()}`);
+		const forgetOwnedRoot = registerOwnedDeletionRoot(ownedRoot);
+		fs.mkdirSync(ownedRoot, { mode: 0o700 });
+		const tempRoot = path.join(ownedRoot, "tmp");
+		fs.mkdirSync(tempRoot, { mode: 0o700 });
+		const retainedMarker = path.join(tempRoot, "retain-this-sibling.txt");
+		fs.writeFileSync(retainedMarker, "only the isolated child directories may be removed");
+		try {
+			expect(
+				defaultWorld.allowedRoots.some(root => {
+					const relative = path.relative(root, tempRoot);
+					return (
+						relative === "" ||
+						(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+					);
+				}),
+			).toBe(false);
+
+			const env: Record<string, string | undefined> = {
+				...process.env,
+				HOME: trustedHome,
+				TMPDIR: tempRoot,
+				TMP: tempRoot,
+				TEMP: tempRoot,
+				GJC_CODING_AGENT_DIR: path.join(trustedHome, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: "",
+				GJC_CONFIG_DIR: "",
+				PI_CONFIG_DIR: "",
+				GJC_TEST_PRELOAD_PROFILE_AUTHORITY: "default",
+			};
+			delete env.GJC_LOG_DIR;
+			delete env.GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE;
+			delete env.XDG_STATE_HOME;
+
+			const probe = Bun.spawnSync({
+				cmd: [
+					process.execPath,
+					"--preload",
+					preload,
+					"-e",
+					"console.log(JSON.stringify({ agentDir: process.env.GJC_CODING_AGENT_DIR, logDir: process.env.GJC_LOG_DIR }))",
+				],
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode, `nested-home preload failed:\n${probe.stderr.toString()}`).toBe(0);
+			const dirs = JSON.parse(probe.stdout.toString().trim()) as { agentDir: string; logDir: string };
+			for (const [dir, prefix] of [
+				[dirs.agentDir, "gjc-test-agent-"],
+				[dirs.logDir, "gjc-test-logs-"],
+			] as const) {
+				expect(path.dirname(path.resolve(dir))).toBe(path.resolve(tempRoot));
+				expect(path.basename(dir).startsWith(prefix)).toBe(true);
+				expect(fs.existsSync(dir)).toBe(false);
+			}
+			expect(fs.existsSync(tempRoot)).toBe(true);
+			expect(fs.readFileSync(retainedMarker, "utf8")).toBe("only the isolated child directories may be removed");
+		} finally {
+			try {
+				await fs.promises.rm(ownedRoot, { recursive: true, force: true });
+			} finally {
+				forgetOwnedRoot();
+			}
+		}
 	}, 30_000);
 
 	test("strips ambient provider environment in the real preload", async () => {

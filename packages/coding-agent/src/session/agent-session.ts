@@ -400,7 +400,11 @@ import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
 import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
-import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
+import {
+	formatNoCredentialOnboardingError,
+	formatNoModelOnboardingError,
+	NoModelSelectedError,
+} from "../setup/model-onboarding-guidance";
 import {
 	isCanonicalGjcWorkflowSkill,
 	isWorkflowContinuationInert,
@@ -409,6 +413,7 @@ import {
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
+import { DelegationHintController } from "../task/delegation-hint";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -3678,6 +3683,7 @@ export class AgentSession {
 	/** Idempotent unregister handle for this session's resource-GC registration. */
 	#unregisterResourceGc?: () => void;
 	#unregisterRuntimeStateFinalizer?: () => void;
+	#coordinatorRuntimeStateFileOverrideForTests: string | undefined = undefined;
 	#unregisterBeforeMoveListener?: () => void;
 	#unregisterMoveAbortListener?: () => void;
 	#unregisterMovePublicationListener?: () => void;
@@ -3703,6 +3709,7 @@ export class AgentSession {
 		);
 	}
 	#unregisterSessionMemorySettings?: () => void;
+	#unregisterDelegationHintSettings?: () => void;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -3884,6 +3891,7 @@ export class AgentSession {
 
 	// TTSR manager for time-traveling stream rules
 	#ttsrManager: TtsrManager | undefined = undefined;
+	#delegationHint: DelegationHintController;
 	#pendingTtsrInjections: Rule[] = [];
 	/** Per-tool TTSR rules whose `interruptMode` opted out of aborting the stream.
 	 *  These are folded into the matched tool call's `toolResult` content as an
@@ -4276,6 +4284,8 @@ export class AgentSession {
 
 	#appendCoordinatorPersist(run: () => Promise<void>): Promise<void> {
 		const queued = this.#coordinatorPersistQueue.then(run, run);
+		const testFailures = this.#coordinatorPersistFailuresForTests;
+		if (testFailures) void queued.catch(error => testFailures.push(error));
 		this.#coordinatorPersistQueue = queued.catch(() => {});
 		return queued;
 	}
@@ -5932,20 +5942,32 @@ export class AgentSession {
 		this.#credentialStoreIdentity = config.credentialStoreIdentity;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
+		this.#delegationHint = new DelegationHintController({
+			getMode: () => this.settings.get("task.delegationHint.mode"),
+			getAutoroutingEnabled: () => this.settings.getEffectiveAutorouting().active,
+			getAutoroutingTiers: () => this.settings.get("task.autorouting.tiers"),
+			notify: message => this.emitNotice("info", message, "delegation-hint"),
+		});
+		this.#unregisterDelegationHintSettings = this.settings.onChanged(settingPath => {
+			if (settingPath === "task.delegationHint.mode") {
+				this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			}
+		});
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
-		this.agent.afterToolCall = ctx => {
+		this.agent.afterToolCall = (ctx, signal) => {
 			const ownership = this.#toolLifecycleOwnership.get(ctx.toolCall);
 			if (!ownership) {
 				this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 				return undefined;
 			}
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, ownership.endpointId, ownership.binding);
+			this.#observeDelegationHint(ctx, signal);
 			if (
 				ctx.result.details &&
 				typeof ctx.result.details === "object" &&
 				typeof (ctx.result.details as { cancellation?: unknown }).cancellation === "string"
 			) {
-				if (this.#perToolTtsrInjections.get(ctx.toolCall.id) === ownership?.rules) {
+				if (this.#perToolTtsrInjections.get(ctx.toolCall.id) === ownership.rules) {
 					this.#perToolTtsrInjections.delete(ctx.toolCall.id);
 				}
 				return undefined;
@@ -7290,6 +7312,7 @@ export class AgentSession {
 
 	/** Serializes sidecar writes in publication order, independent of write latency. */
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+	#coordinatorPersistFailuresForTests: unknown[] | undefined;
 
 	#recordPostPublicationOutcome(
 		context: CoordinatorRuntimeStatePersistContext,
@@ -7355,6 +7378,9 @@ export class AgentSession {
 	 */
 	#runtimeStateMarkerFile(input: { sessionId: string; cwd: string }): string | null {
 		if (!input.sessionId.trim()) return null;
+		if (this.#coordinatorRuntimeStateFileOverrideForTests) {
+			return this.#coordinatorRuntimeStateFileOverrideForTests;
+		}
 		const pinned = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		if (this.taskDepth > 0) return sessionRuntimeStatePath(input.cwd, input.sessionId);
 		return pinned || sessionRuntimeStatePath(input.cwd, input.sessionId);
@@ -7435,6 +7461,7 @@ export class AgentSession {
 					{ event: event.type, ...(attempt > 0 ? { retries: attempt } : {}) },
 				);
 				if (propagateFailure) throw error;
+				this.#coordinatorPersistFailuresForTests?.push(error);
 				return;
 			}
 		}
@@ -7460,10 +7487,17 @@ export class AgentSession {
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
+			const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
+			this.#delegationHint.setEnabled(delegationHintEnabled);
+			if (delegationHintEnabled) this.#delegationHint.onTurnStart();
 			this.#extensionTurnGeneration++;
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
+		}
+		if (event.type === "message_end" && event.message.role === "user") {
+			this.#delegationHint.setEnabled(this.settings.get("task.delegationHint.mode") === "hint");
+			this.#delegationHint.onUserMessage();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -10008,6 +10042,44 @@ export class AgentSession {
 		// cancelled or policy-blocked calls must remain eligible on a later turn.
 	}
 
+	/** `afterToolCall` hook: feed the advisory delegation-hint controller; never alters the tool result. */
+	#observeDelegationHint(ctx: AfterToolCallContext, signal: AbortSignal | undefined): void {
+		const delegationHintEnabled = this.settings.get("task.delegationHint.mode") === "hint";
+		this.#delegationHint.setEnabled(delegationHintEnabled);
+		if (!delegationHintEnabled) return;
+		try {
+			this.#delegationHint.observeAfterToolCall(
+				{
+					toolName: ctx.toolCall.name,
+					args: ctx.args,
+					isError: ctx.isError,
+					resultError: ctx.result.isError === true,
+					getRemainingContextRatio: () => {
+						const percent = this.getContextUsage()?.percent;
+						return typeof percent === "number" && Number.isFinite(percent)
+							? Math.min(1, Math.max(0, 1 - percent / 100))
+							: undefined;
+					},
+					getActivePlanStepCount: () => {
+						// Tasks within a phase are peers; do not combine separate ordered phases.
+						return this.getTodoPhases().reduce(
+							(largestPhase, phase) =>
+								Math.max(
+									largestPhase,
+									phase.tasks.filter(task => task.status === "pending" || task.status === "in_progress")
+										.length,
+								),
+							0,
+						);
+					},
+				},
+				signal,
+			);
+		} catch {
+			// Advisory inference never overrides an executed tool result.
+		}
+	}
+
 	/** `afterToolCall` hook: fold any per-tool TTSR reminders into the result. */
 	#ttsrAfterToolCall(ctx: AfterToolCallContext, expectedRules: Rule[] | undefined): AfterToolCallResult | undefined {
 		const rules = this.#perToolTtsrInjections.get(ctx.toolCall.id);
@@ -11260,6 +11332,20 @@ export class AgentSession {
 		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
 	}
 
+	/** Bind coordinator runtime-state persistence to this session in tests. */
+	setCoordinatorRuntimeStateFileForTests(stateFile: string): void {
+		if (!path.isAbsolute(stateFile)) {
+			throw new Error("Coordinator runtime-state test path must be absolute.");
+		}
+		this.#coordinatorRuntimeStateFileOverrideForTests = path.resolve(stateFile);
+		this.#registerRuntimeStateFinalizer();
+	}
+
+	/** Read the test-only coordinator runtime-state path bound to this session. */
+	getCoordinatorRuntimeStateFileForTests(): string | undefined {
+		return this.#coordinatorRuntimeStateFileOverrideForTests;
+	}
+
 	trackPostPromptTaskForTests(task: Promise<void>): void {
 		this.#trackPostPromptTask(task, this.#selectionFenceGeneration);
 	}
@@ -11440,6 +11526,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		if (ownerTerminalContextFromEnvironment() === null) this.#unregisterRuntimeStateFinalizer?.();
 		this.#unregisterRuntimeStateFinalizer = undefined;
 		this.#unregisterBeforeMoveListener?.();
@@ -11551,6 +11639,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterDelegationHintSettings?.();
+		this.#unregisterDelegationHintSettings = undefined;
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).
@@ -11702,6 +11792,11 @@ export class AgentSession {
 		});
 	}
 
+	/** Enable sidecar write failure reporting for retry-test teardown. */
+	trackCoordinatorRuntimeStatePersistenceFailuresForTests(): void {
+		this.#coordinatorPersistFailuresForTests = [];
+	}
+
 	/** Test seam: await all currently admitted coordinator sidecar writes. */
 	async awaitCoordinatorRuntimeStatePersistenceForTests(): Promise<void> {
 		// A terminal abort can schedule a preserved follow-up as a fresh turn after
@@ -11724,6 +11819,11 @@ export class AgentSession {
 		}
 		await this.#coordinatorPersistQueue;
 		await this.#drainUnbarrieredCoordinatorPersists();
+		const failures = this.#coordinatorPersistFailuresForTests;
+		if (failures && failures.length > 0) {
+			this.#coordinatorPersistFailuresForTests = [];
+			throw new AggregateError(failures, "Coordinator runtime-state persistence failed during test");
+		}
 	}
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
 		this.#agentEventAdmission.set(event, {
@@ -15095,7 +15195,7 @@ export class AgentSession {
 
 			// Validate model
 			if (!this.model) {
-				throw new Error(formatNoModelOnboardingError());
+				throw new NoModelSelectedError();
 			}
 
 			// Validate API key
@@ -18136,6 +18236,16 @@ export class AgentSession {
 					...(registeredScope ? { terminalScope: registeredScope } : {}),
 				};
 			}
+			const retainedProof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+			if (
+				retainedProof.status === "settled" ||
+				(retainedProof.status === "unfenced" && retainedProof.reason !== "unknown_run")
+			) {
+				return {
+					...retainedProof,
+					...(registeredScope ? { terminalScope: registeredScope } : {}),
+				};
+			}
 			return {
 				status: "unfenced",
 				reason: "unknown_run",
@@ -18145,9 +18255,17 @@ export class AgentSession {
 		}
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
 		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
-		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
+		if (proof.status === "unfenced" && proof.reason !== "resources_pending") {
+			this.agent.resourceLedger.quarantine(handle);
+		}
 		// The run's agent_end (if any) consumed the disposition; a settled or
-		// already-ended run must not leave it for an unrelated later exit.
+		// already-ended run must not leave it for an unrelated later exit. A
+		// `resources_pending` proof is different: the run is already sealed, and
+		// the ledger still owns exact promises for the outstanding resources.
+		// Keep that sealed accounting live so a later resolution of those exact
+		// tracked promises can remove its entries; this ledger proof does not
+		// establish that an OS process or remote tool stopped. Quarantining here
+		// would freeze a stale tombstone even after every tracked promise completed.
 		this.#disownedSteeringDisposition = undefined;
 		// Rearm surviving owned-completion follow-ups once the abort has
 		// settled: the aborted loop exits before polling the follow-up queue,

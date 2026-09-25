@@ -380,6 +380,9 @@ jobs:
         run: |
           head="$(git rev-parse HEAD)"
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - name: Fetch exact workflow-dispatch base
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: git fetch --no-tags origin "$GITHUB_BASE_SHA"
       - name: Verify PR head contains exact base
         if: ${{ github.event_name == 'pull_request' }}
         shell: bash
@@ -405,7 +408,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       # Released CHANGELOG sections are append-only. These files have no
       # `merge=union` driver, so a rebase conflicts here for real and a bad
       # resolution can silently drop the whole file — which is exactly what
@@ -557,7 +560,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - name: Prepend rustup toolchain bin to PATH
         shell: bash
         run: |
@@ -655,7 +658,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - name: Cache bun dependencies
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -692,7 +695,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - name: Prepend rustup toolchain bin to PATH
         shell: bash
         run: |
@@ -769,7 +772,7 @@ jobs:
       - run: bun scripts/ci-dev-affected.ts --validate-plan
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           shared-key: dev-affected-native-linux-x64
@@ -830,7 +833,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           shared-key: dev-affected-darwin-arm64-tab-worker
@@ -929,7 +932,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         if: ${{ matrix.rust }}
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
         if: ${{ matrix.nextest }}
         with:
@@ -1190,7 +1193,7 @@ jobs:
           bun-version: "1.4.0"
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           shared-key: dev-state-gates-native-linux-x64
@@ -1376,7 +1379,7 @@ jobs:
         if: ${{ env.CI_VI_REQUIRED == 'true' }}
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
-          toolchain: nightly-2026-04-29
+          toolchain: nightly-2026-08-12
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         if: ${{ env.CI_VI_REQUIRED == 'true' }}
         with:

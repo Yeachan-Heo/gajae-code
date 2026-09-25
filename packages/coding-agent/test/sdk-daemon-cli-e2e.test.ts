@@ -4,7 +4,8 @@ import { closeSync, openSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { Broker } from "../src/sdk/broker/broker";
+import { PUBLIC_COMMAND_DIAGNOSTICS } from "../src/cli/public-command-errors";
+import { Broker, normalizeBrokerInput } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
@@ -173,6 +174,7 @@ describe("SDK session CLI", () => {
 	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
 	// test can prove a raw coordinate claim really was transmitted.
 	let lastReplayPayload = "";
+	let forcedJobsQueryFailure: { code: string; message: string; details?: unknown } | undefined;
 
 	beforeEach(async () => {
 		endpointConnections = 0;
@@ -204,6 +206,7 @@ describe("SDK session CLI", () => {
 		finalCheckpointLiveEvents = [];
 		cursorlessCheckpointRequests = 0;
 		lastReplayPayload = "";
+		forcedJobsQueryFailure = undefined;
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		await initializeTestRepository(root);
 		agentDir = path.join(root, "agent");
@@ -369,6 +372,17 @@ describe("SDK session CLI", () => {
 						}
 					}
 					if (frame.type === "query_request") {
+						if (frame.query === "runtime.jobs.list" && forcedJobsQueryFailure) {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: false,
+									error: forcedJobsQueryFailure,
+								}),
+							);
+							return;
+						}
 						if (frame.query === "session.metadata") {
 							socket.send(
 								JSON.stringify({
@@ -678,6 +692,38 @@ describe("SDK session CLI", () => {
 		]);
 		expect(credentialFlag.exitCode).toBe(2);
 		expect(`${credentialFlag.stdout}\n${credentialFlag.stderr}`).not.toContain("session-token");
+	}, 60_000);
+	it("renders resource_gone diagnostics on the live raw-query route without echoing host details", async () => {
+		const secret = "host-controlled-resource-gone-secret";
+		forcedJobsQueryFailure = {
+			code: "resource_gone",
+			message: `broker message ${secret}`,
+			details: { token: secret, endpoint: `https://${secret}.invalid` },
+		};
+
+		const result = await runCli(root, agentDir, [
+			"query",
+			"live",
+			"--query",
+			"runtime.jobs.list",
+			"--json-input",
+			"{}",
+		]);
+		const output = JSON.parse(result.stdout) as {
+			diagnostics?: Array<{ code: string; message: string }>;
+			error?: { code?: string; references?: Array<{ kind: string; value: string }> };
+		};
+
+		expect(result.exitCode, `stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(result.stderr).toBe("");
+		expect(output).toMatchObject({
+			schema: "gjc.command-error",
+			version: 1,
+			ok: false,
+			error: { code: "operation_failed", references: [{ kind: "sessionId", value: "live" }] },
+			diagnostics: [{ code: "sdk_resource_gone", message: PUBLIC_COMMAND_DIAGNOSTICS.sdk_resource_gone }],
+		});
+		expect(result.stdout).not.toContain(secret);
 	}, 60_000);
 	it("returns malformed scoped broker rows in the JSON search envelope", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
@@ -2145,8 +2191,11 @@ describe("SDK session CLI", () => {
 		const target = { cwd: root };
 		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, "session.create");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.create", idempotencyKey);
+		// A real session.create persists the fingerprint of its normalized input.
+		const normalized = normalizeBrokerInput("session.create", target);
+		if (!("input" in normalized)) throw new Error("Expected a valid create target fixture");
 		const fingerprint = createHash("sha256")
-			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.update(JSON.stringify({ operation: "session.create", input: normalized.input }))
 			.digest("hex");
 		const begun = await broker.ledger.begin(identity, `test-${requestKey}`, {
 			operationKey: `session.create\0${idempotencyKey}`,
@@ -2213,7 +2262,13 @@ describe("SDK session CLI", () => {
 			status: "conflict",
 			request: { operation: "session.create", requestKey },
 			certainty: "uncertain",
-			error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			// The broker's own conflict text never reaches CLI output: this route bypasses the
+			// public error envelope, so the message is the fixed, cause-neutral public text.
+			error: {
+				code: "idempotency_conflict",
+				message:
+					"The broker reported an idempotency conflict. Reconcile existing lifecycle state before deciding whether another request is safe.",
+			},
 		});
 		expect(operations).toEqual(["session.lookup", "session.lookup", "session.lookup"]);
 	}, 60_000);

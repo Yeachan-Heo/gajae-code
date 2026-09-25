@@ -479,6 +479,42 @@ catch (error) { console.log(JSON.stringify({ buffer: { ok: false, content: "", e
 		expect(sanitizeMuPdfDiagnostic("CompileError: invalid WASM")).toBe("CompileError: invalid WASM");
 	});
 
+	it("sanitizes a large path-free diagnostic in linear time", () => {
+		// The prefix run was unbounded, so `[^\s"\'`]*` restarted at every offset of
+		// a long slash-free run before failing to find a separator: 12.5k/25k/50k/100k
+		// characters cost 207ms/832ms/3.3s/13.3s. A MuPDF diagnostic is derived from
+		// the document being converted, and `normalizeError` runs this once per link
+		// in the cause chain.
+		for (const body of ["x".repeat(100_000), "ab1".repeat(33_000)]) {
+			const startedAt = performance.now();
+			const output = sanitizeMuPdfDiagnostic(body);
+			const elapsedMs = performance.now() - startedAt;
+
+			expect(output).toBe(body);
+			// Linear scanning lands under a millisecond; the budget is loose so it
+			// fails only on quadratic scanning.
+			expect(elapsedMs).toBeLessThan(1_000);
+		}
+	});
+
+	it("still redacts path-bearing fields after the boundary anchor", () => {
+		for (const [input, expected] of [
+			["error opening /usr/local/share/x.pdf", "error opening [path redacted]"],
+			["error opening ./relative path/x.pdf", "error opening [path redacted]"],
+			["failed C:\\Users\\bob\\x.pdf", "failed [path redacted]"],
+			["url %2fetc%2fpasswd", "url [path redacted]"],
+			["url %5cUsers%5cbob%5cx.pdf", "url [path redacted]"],
+			['cannot load "/Users/alice/My Docs/a.pdf"', 'cannot load "[path redacted]"'],
+			["cannot load '/tmp/a.pdf'", "cannot load '[path redacted]'"],
+			["cannot load `/tmp/a.pdf`", "cannot load `[path redacted]`"],
+			["error opening /var/cache/mupdf", "error opening [path redacted]"],
+		]) {
+			expect(sanitizeMuPdfDiagnostic(input)).toBe(expected);
+		}
+		// A message with no separator is untouched.
+		expect(sanitizeMuPdfDiagnostic("CompileError: invalid WASM")).toBe("CompileError: invalid WASM");
+	});
+
 	for (const channel of ["source", "release", "dev"] as const) {
 		it(`${channel} converts short PDFs and diagnoses failures without a runtime dependency install`, async () => {
 			const buildDir = await fs.mkdtemp(path.join(repoRoot, ".mupdf-packaging-"));

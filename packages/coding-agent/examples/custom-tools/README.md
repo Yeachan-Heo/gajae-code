@@ -40,7 +40,7 @@ Then in gjc:
 
 ## Writing Custom Tools
 
-See [docs/custom-tools.md](../../docs/custom-tools.md) for full documentation.
+See [docs/codegraph-custom-tool.md](../../../../docs/codegraph-custom-tool.md#2-add-the-custom-tool) for how tools are discovered and loaded.
 
 ### Key Points
 

@@ -11,14 +11,12 @@
   - `packages/coding-agent/src/task/agents.ts` — bundled agent definitions and frontmatter parsing.
   - `packages/coding-agent/src/task/executor.ts` — create child sessions, run subagents, collect output.
   - `packages/coding-agent/src/task/parallel.ts` — concurrency-limited scheduling and async semaphore.
-  - `packages/coding-agent/src/task/isolation-backend.ts` — isolation backend resolution and platform fallback.
-  - `packages/coding-agent/src/task/worktree.ts` — worktree / FUSE / ProjFS setup, patch capture, branch merge.
+  - `packages/coding-agent/src/task/worktree.ts` — isolation backend resolution and platform fallback (`parseIsolationMode()`, `ensureIsolation()` over the native `isoResolve()`), worktree / FUSE / ProjFS setup, patch capture, branch merge.
   - `packages/coding-agent/src/task/output-manager.ts` — session-scoped `agent://` id allocation.
   - `packages/coding-agent/src/task/simple-mode.ts` — `default` / `schema-free` / `independent` field gating.
   - `packages/coding-agent/src/internal-urls/agent-protocol.ts` — resolve `agent://<id>` to saved subagent output.
   - `packages/coding-agent/src/tools/index.ts` — tool registration and recursion-depth gating.
   - `packages/coding-agent/src/sdk/session.ts` — child-session router/tool wiring and per-subagent `AgentOutputManager`.
-  - `docs/task-agent-discovery.md` — deeper discovery and precedence notes.
   - `docs/handoff-generation-pipeline.md` — session artifact/handoff persistence patterns used by the wider session layer.
 
 ## Inputs

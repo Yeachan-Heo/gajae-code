@@ -7,7 +7,7 @@
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/ast-edit.md`
 - Key collaborators:
   - `crates/pi-natives/src/ast.rs` — native rewrite planning and file mutation
-  - `crates/pi-natives/src/language/mod.rs` — language aliases and extension inference
+  - `crates/pi-ast/src/language/mod.rs` — language aliases and extension inference
   - `packages/coding-agent/src/tools/path-utils.ts` — path/glob parsing and multi-path resolution
   - `packages/coding-agent/src/tools/resolve.ts` — preview/apply queueing
   - `packages/coding-agent/src/tools/render-utils.ts` — parse-error dedupe and display caps
