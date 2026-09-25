@@ -103,7 +103,6 @@ function redactConfigValue(path: string, value: unknown, showSecrets?: boolean):
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
 	if (path === "modelProfile.ownership") return undefined;
-	if (path === "modelProfile.default" && settings.getGlobal("modelProfile.ownership") !== undefined) return undefined;
 	if (!(path in SETTINGS_SCHEMA)) return undefined;
 	const key = path as SettingPath;
 	const ui = getUi(key);
@@ -546,6 +545,23 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 		process.exit(1);
 	}
 
+	// Special handling for modelProfile.default: allow reset even when ownership is set
+	if (key === "modelProfile.default") {
+		const defaultValue = getDefault(key as SettingPath);
+		try {
+			await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		} catch (err) {
+			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+			process.exit(1);
+		}
+		if (flags.json) {
+			console.log(JSON.stringify({ key, value: defaultValue }));
+		} else {
+			console.log(chalk.green(`${theme.status.success} Reset ${key} to ${formatValue(defaultValue)}`));
+		}
+		return;
+	}
+
 	const def = findSettingDef(key);
 	if (!def) {
 		console.error(chalk.red(`Unknown setting: ${key}`));
@@ -559,18 +575,9 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 
 	const path = def.path as SettingPath;
 	const defaultValue = getDefault(path);
-	if (path === "modelProfile.default") {
-		try {
-			await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
-		} catch (err) {
-			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
-			process.exit(1);
-		}
-	} else {
-		if (defaultValue === undefined) settings.unset(path);
-		else settings.set(path, defaultValue as SettingValue<typeof path>);
-		await persistOrExit();
-	}
+	if (defaultValue === undefined) settings.unset(path);
+	else settings.set(path, defaultValue as SettingValue<typeof path>);
+	await persistOrExit();
 
 	if (flags.json) {
 		console.log(JSON.stringify({ key: def.path, value: defaultValue }));

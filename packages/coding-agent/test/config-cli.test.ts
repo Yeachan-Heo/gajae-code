@@ -91,7 +91,7 @@ describe("config CLI schema coverage", () => {
 		expect(plainModelRolesLine).not.toContain("[object Object]");
 	});
 
-	it("blocks generic writes to ownership state and its versioned projection", async () => {
+	it("blocks generic writes to ownership state", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new Error("process.exit");
 		}) as never);
@@ -101,9 +101,6 @@ describe("config CLI schema coverage", () => {
 		settings.set("modelProfile.default", "profile-a");
 		await expect(
 			runConfigCommand({ action: "set", key: "modelProfile.ownership", value: "{}", flags: { json: true } }),
-		).rejects.toThrow("process.exit");
-		await expect(
-			runConfigCommand({ action: "reset", key: "modelProfile.default", flags: { json: true } }),
 		).rejects.toThrow("process.exit");
 	});
 
