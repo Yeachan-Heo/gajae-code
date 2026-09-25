@@ -64,6 +64,11 @@ const legacyAllowlist = [
 		path: /^docs\/(tools\/|skills\/|extension-loading|plugin-manager-installer-plumbing|natives-(addon-loader-runtime|architecture|build-release-debugging)|notebook-tool-runtime)/,
 		rationale: "Reference docs may name retained internal protocols, artifacts, and compatibility paths without presenting them as the current product brand.",
 	},
+	{
+		name: "rust-porting-upstream-provenance",
+		path: /^(docs\/rust-porting-inventory\.md|docs\/rust-porting\/[^/]+|scripts\/verify-rust-porting-inventory(\.test)?\.ts)$/,
+		rationale: "The Rust porting inventory must name the upstream repository and pinned commit that vendored code is copied from (MIT attribution).",
+	},
 
 	{
 		name: "legacy-runtime-root-scripts",
