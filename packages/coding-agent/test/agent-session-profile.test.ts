@@ -11,6 +11,7 @@ import {
 	heapSnapshotReachableBytes,
 	reclassifyAgentSessionHotspots,
 	summarizeCpuProfile,
+	validateCaptureOptions,
 } from "../bench/agent-session-profile";
 import {
 	type PerfCorpusReport,
@@ -162,41 +163,51 @@ describe("reclassifyAgentSessionHotspots", () => {
 		census(20 << 20),
 		census(20 << 20),
 	);
+	const sm = "packages/coding-agent/src/session/session-manager.ts";
 	const samples = [
-		{
-			symbol: "getEntries (packages/coding-agent/src/session/session-manager.ts:19501)",
-			selfTimeMs: 2,
-			totalTimeMs: 450,
-		},
-		{
-			symbol: "#appendEntry (packages/coding-agent/src/session/session-manager.ts:18028)",
-			selfTimeMs: 1,
-			totalTimeMs: 30,
-		},
+		// M02: expensive subtree, cheap own frames -> inclusive path cost only.
+		{ symbol: `getEntries (${sm}:19501)`, selfTimeMs: 2, totalTimeMs: 450 },
+		{ symbol: `#getMaterializedEntriesInternal (${sm}:19474)`, selfTimeMs: 1, totalTimeMs: 330 },
+		// M01: self time split across two owning symbols; only the sum crosses 5%.
+		{ symbol: `#appendEntry (${sm}:18028)`, selfTimeMs: 20, totalTimeMs: 300 },
+		{ symbol: `#appendEntryWithinPersistenceFence (${sm}:18032)`, selfTimeMs: 35, totalTimeMs: 290 },
+		// M05: exercised, but negligible either way.
+		{ symbol: `captureState (${sm}:8354)`, selfTimeMs: 1, totalTimeMs: 10 },
 		{ symbol: "getEntriesCount (packages/coding-agent/src/session/other.ts:1)", selfTimeMs: 900, totalTimeMs: 900 },
 	];
 	const byId = new Map(
 		reclassifyAgentSessionHotspots(samples, 1_000, retention, "artifacts/p.cpuprofile").map(c => [c.hotspotId, c]),
 	);
 
-	test("confirms a hotspot at or above the CPU share threshold and anchors it to the exact sample symbol", () => {
-		expect(byId.get("M02")).toMatchObject({
+	test("confirms self time summed across owning symbols and anchors every matched symbol", () => {
+		expect(byId.get("M01")).toMatchObject({
 			status: "CPU-self-time confirmed",
 			evidenceClass: "profiler-self-time",
-			artifactRefs: [samples[0].symbol, "artifacts/p.cpuprofile"],
+			artifactRefs: [samples[2].symbol, samples[3].symbol, "artifacts/p.cpuprofile"],
 		});
-		expect(byId.get("M02")?.notes).toContain("RSS growth is allocator high-water");
+		expect(byId.get("M01")?.notes).toContain("5.5% self / 30.0% inclusive");
+		expect(byId.get("M01")?.notes).toContain("fixture RSS growth is allocator high-water");
 	});
 
-	test("demotes an exercised hotspot below the threshold to not-visible", () => {
-		expect(byId.get("M01")).toMatchObject({
+	test("never confirms self time for a wrapper whose cost sits in callees", () => {
+		expect(byId.get("M02")).toMatchObject({
+			status: "covered-current",
+			evidenceClass: "profiler-self-time",
+			artifactRefs: [samples[0].symbol, samples[1].symbol, "artifacts/p.cpuprofile"],
+		});
+		expect(byId.get("M02")?.notes).toContain("0.3% self / 45.0% inclusive");
+		expect(byId.get("M02")?.notes).toContain("inclusive path cost only");
+	});
+
+	test("demotes an exercised hotspot below the threshold both ways to not-visible", () => {
+		expect(byId.get("M05")).toMatchObject({
 			status: "not-visible",
-			artifactRefs: [samples[1].symbol, "artifacts/p.cpuprofile"],
+			artifactRefs: [samples[4].symbol, "artifacts/p.cpuprofile"],
 		});
 	});
 
 	test("marks unexercised hotspots needs-trace-coverage without matching prefix-similar symbols", () => {
-		for (const id of ["M03", "M04", "M05", "H10"]) {
+		for (const id of ["M03", "M04", "H10"]) {
 			expect(byId.get(id)).toMatchObject({
 				status: "needs-trace-coverage",
 				artifactRefs: ["artifacts/p.cpuprofile"],
@@ -206,6 +217,35 @@ describe("reclassifyAgentSessionHotspots", () => {
 
 	test("every classification passes the corpus classification validator", () => {
 		for (const classification of byId.values()) expect(validateHotspotClassification(classification)).toEqual([]);
+	});
+});
+
+describe("validateCaptureOptions", () => {
+	test("accepts the default cadence", () => {
+		expect(validateCaptureOptions({ durationMs: 30_000, sampleIntervalMs: 1_000 })).toEqual([]);
+	});
+
+	test("rejects an interval that leaves fewer than two steady-state samples", () => {
+		expect(validateCaptureOptions({ durationMs: 8_000, sampleIntervalMs: 3_000 })).toEqual([]);
+		expect(validateCaptureOptions({ durationMs: 8_000, sampleIntervalMs: 3_001 })).toEqual([
+			"sampleIntervalMs 3001 leaves fewer than two steady-state samples in 8000 ms; use at most 3000",
+		]);
+		expect(validateCaptureOptions({ durationMs: 2_000, sampleIntervalMs: 5_000 })).toHaveLength(1);
+	});
+
+	test("rejects non-integer and out-of-range values", () => {
+		expect(validateCaptureOptions({ durationMs: 1_999, sampleIntervalMs: 100 })).toEqual([
+			"durationMs must be an integer >= 2000, got 1999",
+		]);
+		expect(validateCaptureOptions({ durationMs: Number.NaN, sampleIntervalMs: 49 })).toHaveLength(2);
+	});
+
+	test("capture fails fast before running the workload", async () => {
+		const outDir = path.join(os.tmpdir(), `gjc-agent-session-profile-rejected-${process.pid}`);
+		await expect(captureAgentSessionProfile({ outDir, durationMs: 2_000, sampleIntervalMs: 2_000 })).rejects.toThrow(
+			"fewer than two steady-state samples",
+		);
+		expect(await fs.exists(outDir)).toBe(false);
 	});
 });
 
@@ -231,6 +271,8 @@ describe("captureAgentSessionProfile", () => {
 		}
 		expect(report.gcSamples.length).toBeGreaterThanOrEqual(3);
 		expect(report.iterations).toBeGreaterThan(0);
+		expect(report.sampleIntervalMs).toBe(200);
+		expect(report.command).toContain("--duration-ms 2000 --sample-interval-ms 200");
 		expect(["bounded-high-water", "reachable-retention"]).toContain(report.retention.verdict);
 		const profiledSymbols = (report.profilerSelfTime.samples ?? []).map(sample => sample.symbol);
 		expect(profiledSymbols.some(symbol => symbol.startsWith("getEntries ("))).toBe(true);

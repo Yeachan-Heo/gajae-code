@@ -97,8 +97,8 @@ export const AGENT_SESSION_HOTSPOT_SYMBOLS: Readonly<Record<string, readonly str
 	H10: ["messagesChanged"],
 };
 
-/** Minimum inclusive share of profiled time before a symbol counts as a CPU hotspot. */
-export const CONFIRMED_TOTAL_TIME_FRACTION = 0.05;
+/** Minimum share of profiled time a hotspot's own frames (self time) must carry to be CPU-self-time confirmed. */
+export const CONFIRMED_SELF_TIME_FRACTION = 0.05;
 /** Reachable growth across the steady-state window tolerated as noise: max(1 MiB, 5% of the window start). */
 const RETAINED_HEAP_ABSOLUTE_TOLERANCE_BYTES = 1024 * 1024;
 const RETAINED_RELATIVE_TOLERANCE = 0.05;
@@ -211,19 +211,30 @@ export function analyzeRetention(samples: readonly GcSample[], early: HeapCensus
 	};
 }
 
-function hotspotSample(hotspotId: string, samples: readonly ProfilerSelfTimeSample[]): ProfilerSelfTimeSample | undefined {
+function hotspotSamples(hotspotId: string, samples: readonly ProfilerSelfTimeSample[]): ProfilerSelfTimeSample[] {
 	const names = AGENT_SESSION_HOTSPOT_SYMBOLS[hotspotId] ?? [];
 	return samples
 		.filter(sample => names.some(name => sample.symbol === name || sample.symbol.startsWith(`${name} (`)))
-		.sort((a, b) => (b.totalTimeMs ?? 0) - (a.totalTimeMs ?? 0))[0];
+		.sort((a, b) => (b.totalTimeMs ?? 0) - (a.totalTimeMs ?? 0) || a.symbol.localeCompare(b.symbol));
+}
+
+function percent(fraction: number): string {
+	return `${(fraction * 100).toFixed(1)}%`;
 }
 
 /**
- * Reclassify the agent-session hotspots from captured evidence. A hotspot whose
- * owning symbol carries at least {@link CONFIRMED_TOTAL_TIME_FRACTION} of the
- * profiled time is `CPU-self-time confirmed` and references that exact sample
- * symbol; an exercised hotspot below the threshold is `not-visible`; a hotspot
- * whose symbols never appear was not exercised and `needs-trace-coverage`.
+ * Reclassify the agent-session hotspots from captured evidence. Only time spent
+ * in the hotspot's own frames counts toward `CPU-self-time confirmed`: when its
+ * owning symbols' combined self time reaches {@link CONFIRMED_SELF_TIME_FRACTION}
+ * of the profiled time, the hotspot is confirmed and references those exact
+ * sample symbols. A hotspot whose cost is inclusive-only (spent in callees) is
+ * `covered-current` with the path cost in its notes; an exercised hotspot below
+ * the threshold either way is `not-visible`; a hotspot whose symbols never
+ * appear was not exercised and `needs-trace-coverage`.
+ *
+ * The retention verdict describes this fixture only. It never clears a
+ * hotspot's memory behavior, because the fixture resets its session every 128
+ * entries and appends payloads below the resident-blob externalization size.
  */
 export function reclassifyAgentSessionHotspots(
 	samples: readonly ProfilerSelfTimeSample[],
@@ -233,14 +244,15 @@ export function reclassifyAgentSessionHotspots(
 ): HotspotClassification[] {
 	const retentionNote =
 		retention.verdict === "bounded-high-water"
-			? `reachable heap bounded (${formatBytes(retention.reachableBytesGrowth)} over ${Math.round(retention.steadyStateWindowMs)} ms steady state); RSS growth is allocator high-water`
-			: `reachable heap retained ${formatBytes(retention.reachableBytesGrowth)}; growing types: ${retention.growingObjectTypes
+			? `fixture reachable heap bounded (${formatBytes(retention.reachableBytesGrowth)} over ${Math.round(retention.steadyStateWindowMs)} ms steady state); fixture RSS growth is allocator high-water`
+			: `fixture reachable heap retained ${formatBytes(retention.reachableBytesGrowth)}; growing types: ${retention.growingObjectTypes
 					.slice(0, 3)
 					.map(growth => growth.type)
 					.join(", ")}`;
+	const profiled = Math.max(profiledMs, 1e-6);
 	return Object.keys(AGENT_SESSION_HOTSPOT_SYMBOLS).map(hotspotId => {
-		const sample = hotspotSample(hotspotId, samples);
-		if (!sample) {
+		const matched = hotspotSamples(hotspotId, samples);
+		if (matched.length === 0) {
 			return {
 				hotspotId,
 				status: "needs-trace-coverage",
@@ -249,23 +261,34 @@ export function reclassifyAgentSessionHotspots(
 				notes: "owning symbols absent from the agent-session-lifecycle CPU profile; this fixture does not exercise the path",
 			};
 		}
-		const share = (sample.totalTimeMs ?? 0) / Math.max(profiledMs, 1e-6);
-		const measured = `${(share * 100).toFixed(1)}% total / ${sample.selfTimeMs.toFixed(1)} ms self`;
-		if (share < CONFIRMED_TOTAL_TIME_FRACTION) {
+		const selfShare = matched.reduce((sum, sample) => sum + sample.selfTimeMs, 0) / profiled;
+		const inclusiveShare = Math.max(...matched.map(sample => sample.totalTimeMs ?? 0)) / profiled;
+		const artifactRefs = [...matched.map(sample => sample.symbol), cpuProfileRef];
+		const measured = `${percent(selfShare)} self / ${percent(inclusiveShare)} inclusive of agent-session-lifecycle CPU`;
+		if (selfShare >= CONFIRMED_SELF_TIME_FRACTION) {
 			return {
 				hotspotId,
-				status: "not-visible",
+				status: "CPU-self-time confirmed",
 				evidenceClass: "profiler-self-time",
-				artifactRefs: [sample.symbol, cpuProfileRef],
-				notes: `profiled below the ${CONFIRMED_TOTAL_TIME_FRACTION * 100}% threshold (${measured}); ${retentionNote}`,
+				artifactRefs,
+				notes: `${measured}; ${retentionNote}`,
+			};
+		}
+		if (inclusiveShare >= CONFIRMED_SELF_TIME_FRACTION) {
+			return {
+				hotspotId,
+				status: "covered-current",
+				evidenceClass: "profiler-self-time",
+				artifactRefs,
+				notes: `${measured}; inclusive path cost only, self time is below ${percent(CONFIRMED_SELF_TIME_FRACTION)} and sits in callees; ${retentionNote}`,
 			};
 		}
 		return {
 			hotspotId,
-			status: "CPU-self-time confirmed",
+			status: "not-visible",
 			evidenceClass: "profiler-self-time",
-			artifactRefs: [sample.symbol, cpuProfileRef],
-			notes: `${measured} of agent-session-lifecycle CPU; ${retentionNote}`,
+			artifactRefs,
+			notes: `${measured}; below ${percent(CONFIRMED_SELF_TIME_FRACTION)} both self and inclusive; ${retentionNote}`,
 		};
 	});
 }
@@ -285,6 +308,7 @@ export interface AgentSessionProfileReport {
 	bunVersion: string;
 	command: string;
 	durationMs: number;
+	sampleIntervalMs: number;
 	iterations: number;
 	profiledMs: number;
 	artifacts: { cpuProfile: string; earlyHeapSnapshot: string; lateHeapSnapshot: string };
@@ -298,10 +322,35 @@ export interface AgentSessionProfileReport {
 /** Top symbols by total time, plus any symbol a classification references. */
 const REPORTED_SYMBOL_COUNT = 40;
 
-interface CaptureOptions {
+export interface CaptureOptions {
 	outDir: string;
 	durationMs: number;
 	sampleIntervalMs: number;
+}
+
+/**
+ * Reject capture options that cannot yield the evidence the report claims: the
+ * steady-state window after warm-up (the last 3/4 of the run) must hold at least
+ * two periodic samples, and the post-warm-up snapshot must fall inside the run.
+ */
+export function validateCaptureOptions(options: Pick<CaptureOptions, "durationMs" | "sampleIntervalMs">): string[] {
+	const errors: string[] = [];
+	if (!Number.isSafeInteger(options.durationMs) || options.durationMs < 2_000) {
+		errors.push(`durationMs must be an integer >= 2000, got ${options.durationMs}`);
+	}
+	if (!Number.isSafeInteger(options.sampleIntervalMs) || options.sampleIntervalMs < 50) {
+		errors.push(`sampleIntervalMs must be an integer >= 50, got ${options.sampleIntervalMs}`);
+	}
+	if (errors.length === 0 && options.sampleIntervalMs * 2 > (options.durationMs * 3) / 4) {
+		errors.push(
+			`sampleIntervalMs ${options.sampleIntervalMs} leaves fewer than two steady-state samples in ${options.durationMs} ms; use at most ${Math.floor((options.durationMs * 3) / 8)}`,
+		);
+	}
+	return errors;
+}
+
+function captureCommand(options: Pick<CaptureOptions, "durationMs" | "sampleIntervalMs">): string {
+	return `bun --smol packages/coding-agent/bench/agent-session-profile.ts --duration-ms ${options.durationMs} --sample-interval-ms ${options.sampleIntervalMs}`;
 }
 
 function gcSample(startedAt: number, iterations: number): GcSample {
@@ -328,6 +377,8 @@ async function writeHeapCensus(snapshotPath: string): Promise<HeapCensus> {
 }
 
 export async function captureAgentSessionProfile(options: CaptureOptions): Promise<AgentSessionProfileReport> {
+	const optionErrors = validateCaptureOptions(options);
+	if (optionErrors.length > 0) throw new Error(optionErrors.join("; "));
 	const repositoryRoot = path.resolve(import.meta.dir, "../../..");
 	const git = resolveGitProvenance();
 	await fs.mkdir(options.outDir, { recursive: true });
@@ -349,10 +400,15 @@ export async function captureAgentSessionProfile(options: CaptureOptions): Promi
 		memoryWorkload.run(1);
 		iterations++;
 		const elapsedMs = performance.now() - startedAt;
+		if (!early && elapsedMs >= earlySnapshotAtMs) {
+			samples.push(gcSample(startedAt, iterations));
+			early = await writeHeapCensus(artifacts.earlyHeapSnapshot);
+			nextSampleAtMs = performance.now() - startedAt + options.sampleIntervalMs;
+			continue;
+		}
 		if (elapsedMs < nextSampleAtMs) continue;
 		nextSampleAtMs = elapsedMs + options.sampleIntervalMs;
 		samples.push(gcSample(startedAt, iterations));
-		if (!early && elapsedMs >= earlySnapshotAtMs) early = await writeHeapCensus(artifacts.earlyHeapSnapshot);
 	}
 	samples.push(gcSample(startedAt, iterations));
 	const late = await writeHeapCensus(artifacts.lateHeapSnapshot);
@@ -390,8 +446,9 @@ export async function captureAgentSessionProfile(options: CaptureOptions): Promi
 		platform: process.platform,
 		arch: process.arch,
 		bunVersion: Bun.version,
-		command: `bun --smol packages/coding-agent/bench/agent-session-profile.ts --duration-ms ${options.durationMs}`,
+		command: captureCommand(options),
 		durationMs: options.durationMs,
+		sampleIntervalMs: options.sampleIntervalMs,
 		iterations,
 		profiledMs,
 		artifacts: {
@@ -425,15 +482,17 @@ function parseArgs(argv: readonly string[]): CaptureOptions {
 		const value = argv[index + 1];
 		if (arg === "--out" && value) {
 			options.outDir = path.resolve(value);
-		} else if (arg === "--duration-ms" && value && Number.isSafeInteger(Number(value)) && Number(value) >= 2_000) {
+		} else if (arg === "--duration-ms" && value) {
 			options.durationMs = Number(value);
-		} else if (arg === "--sample-interval-ms" && value && Number.isSafeInteger(Number(value)) && Number(value) >= 50) {
+		} else if (arg === "--sample-interval-ms" && value) {
 			options.sampleIntervalMs = Number(value);
 		} else {
-			throw new Error(`invalid argument ${arg}${value === undefined ? "" : ` ${value}`}; expected --out <dir>, --duration-ms <>=2000>, --sample-interval-ms <>=50>`);
+			throw new Error(`invalid argument ${arg}; expected --out <dir>, --duration-ms <n>, --sample-interval-ms <n>`);
 		}
 		index++;
 	}
+	const errors = validateCaptureOptions(options);
+	if (errors.length > 0) throw new Error(errors.join("; "));
 	return options;
 }
 
