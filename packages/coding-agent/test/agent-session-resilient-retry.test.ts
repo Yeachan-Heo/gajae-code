@@ -24,7 +24,6 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
-import { GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "../src/gjc-runtime/session-state-sidecar";
 
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
