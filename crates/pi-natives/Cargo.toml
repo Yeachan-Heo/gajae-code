@@ -57,6 +57,10 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 xxhash-rust.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+log.workspace = true
+zbus.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 sha2 = { workspace = true, features = ["asm"] }
@@ -64,7 +68,7 @@ sha2 = { workspace = true, features = ["asm"] }
 [target.'cfg(windows)'.dependencies]
 clipboard-win.workspace = true
 winreg.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Power"] }
 
 [build-dependencies]
 # Transitive-only pin: see find-msvc-tools in the root workspace manifest.

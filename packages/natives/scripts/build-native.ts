@@ -193,6 +193,7 @@ const requiredGeneratedBindingSymbols = [
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
+	"PowerAssertion",
 	"currentExecutablePath",
 ] as const;
 

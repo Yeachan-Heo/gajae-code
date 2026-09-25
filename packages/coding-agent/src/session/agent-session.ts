@@ -188,7 +188,7 @@ export interface ForkContextSeedOptions {
 
 import type { AuthCredentialSelector } from "@gajae-code/ai/core";
 import { isFoundryEnabled } from "@gajae-code/ai/utils/foundry";
-import type { MacOSPowerAssertion } from "@gajae-code/natives";
+import type { PowerAssertion } from "@gajae-code/natives";
 import {
 	$pickCredentialEnv,
 	extractRetryHint,
@@ -2699,7 +2699,7 @@ export class AgentSession {
 	// off (or, on rollback, the restored predecessor mid-transition).
 	#handoffTransitionActive = false;
 
-	#powerAssertion: MacOSPowerAssertion | undefined;
+	#powerAssertion: PowerAssertion | undefined;
 	#powerAssertionLoad?: Promise<void>;
 	#powerAssertionGeneration = 0;
 
@@ -3991,7 +3991,13 @@ export class AgentSession {
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
 	#acquirePowerAssertion(): void {
-		if (process.platform !== "darwin") return;
+		if (
+			process.platform !== "darwin" &&
+			process.platform !== "linux" &&
+			process.platform !== "win32"
+		) {
+			return;
+		}
 		if (this.#powerAssertion || this.#powerAssertionLoad) return;
 		const idle = this.settings.get("power.preventIdleSleep");
 		const system = this.settings.get("power.preventSystemSleep");
@@ -4002,13 +4008,13 @@ export class AgentSession {
 		let cancelledByGeneration = false;
 		this.#powerAssertionLoad = Promise.resolve()
 			.then(() => {
-				const { MacOSPowerAssertion } = require("@gajae-code/natives") as Pick<
+				const { PowerAssertion } = require("@gajae-code/natives") as Pick<
 					typeof import("@gajae-code/natives"),
-					"MacOSPowerAssertion"
+					"PowerAssertion"
 				>;
 				cancelledByGeneration = generation !== this.#powerAssertionGeneration;
 				if (this.#powerAssertion || cancelledByGeneration || this.#livePromptsInFlight() === 0) return;
-				this.#powerAssertion = MacOSPowerAssertion.start({
+				this.#powerAssertion = PowerAssertion.start({
 					reason: "Gajae Code agent session",
 					idle,
 					system,
@@ -4017,7 +4023,7 @@ export class AgentSession {
 				});
 			})
 			.catch(error => {
-				logger.warn("Failed to acquire macOS power assertion", { error: String(error) });
+				logger.warn("Failed to acquire native power assertion", { error: String(error) });
 			})
 			.finally(() => {
 				this.#powerAssertionLoad = undefined;
@@ -4034,7 +4040,7 @@ export class AgentSession {
 		try {
 			assertion.stop();
 		} catch (error) {
-			logger.warn("Failed to release macOS power assertion", { error: String(error) });
+			logger.warn("Failed to release native power assertion", { error: String(error) });
 		}
 	}
 

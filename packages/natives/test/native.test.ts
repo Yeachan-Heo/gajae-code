@@ -14,7 +14,7 @@ import {
 	initNativeCrashDiagnostics,
 	invalidateFsScanCache,
 	listWorkspace,
-	MacOSPowerAssertion,
+	PowerAssertion,
 	Process,
 	ProcessStatus,
 	PtySession,
@@ -709,11 +709,18 @@ describe("pi-natives", () => {
 		});
 	});
 
-	describe("MacOSPowerAssertion", () => {
-		it("should create a stoppable power assertion handle", () => {
-			const assertion = MacOSPowerAssertion.start({ reason: "pi-natives test" });
-			assertion.stop();
-			assertion.stop();
+	describe("PowerAssertion", () => {
+		it("creates a stoppable handle or reports an unavailable Linux login1 service", () => {
+			try {
+				const assertion = PowerAssertion.start({ reason: "pi-natives test" });
+				assertion.stop();
+				assertion.stop();
+			} catch (error) {
+				if (process.platform !== "linux") throw error;
+				expect(String(error)).toMatch(
+					/Unable to connect to the system bus|login1 Inhibit failed|Invalid login1 inhibitor response/,
+				);
+			}
 		});
 	});
 });

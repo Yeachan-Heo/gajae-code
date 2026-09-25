@@ -1,5 +1,5 @@
 import type { WindowsJobMemoryProbeResult } from "@gajae-code/natives";
-import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } from "@gajae-code/natives";
+import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines, PowerAssertion } from "@gajae-code/natives";
 import { loadNative as loadNativeBindings } from "../../../natives/native/loader-state.js";
 
 export type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
@@ -43,5 +43,8 @@ export async function runNativeSmokeTest(): Promise<void> {
 	}
 	if (typeof h02ScoreSequenceFuzzy !== "function" || typeof h01FindBestFuzzyMatch !== "function") {
 		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
+	}
+	if (typeof PowerAssertion?.start !== "function") {
+		throw new Error("smoke-test: PowerAssertion export missing from embedded addon");
 	}
 }
