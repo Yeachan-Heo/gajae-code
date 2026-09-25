@@ -1,7 +1,12 @@
 /**
  * Tool wrapper - wraps tools with hook callbacks for interception.
  */
-import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import {
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolUpdateCallback,
+	ToolCallBlockedError,
+} from "@gajae-code/agent-core";
 import type { Static, TSchema } from "@gajae-code/ai/core";
 import { applyToolProxy } from "../tool-proxy";
 import type { HookRunner } from "./runner";
@@ -50,8 +55,7 @@ export class HookToolWrapper<TParameters extends TSchema = TSchema, TDetails = u
 				})) as ToolCallEventResult | undefined;
 
 				if (callResult?.block) {
-					const reason = callResult.reason || "Tool execution was blocked by a hook";
-					throw new Error(reason);
+					throw new ToolCallBlockedError(callResult.reason || "Tool execution was blocked by a hook");
 				}
 			} catch (err) {
 				// Hook error or block - throw to mark as error

@@ -14,6 +14,7 @@
  * - `embedded:gjc/skill-fragments/<parent>/<fragment>.md` — bundled fragment
  */
 import { BUNDLED_GJC_SKILL_CATALOG, type BundledGjcSkillCatalogEntry } from "../defaults/gjc-skills.generated";
+import { ToolError } from "../tools/tool-errors";
 import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
 
 const GJC_NAMESPACE = "gjc";
@@ -43,7 +44,7 @@ export class EmbeddedProtocolHandler implements ProtocolHandler {
 	async resolve(url: InternalUrl): Promise<InternalResource> {
 		const namespace = (url.rawHost || url.hostname || "").toLowerCase();
 		if (namespace !== GJC_NAMESPACE) {
-			throw new Error(
+			throw new ToolError(
 				`Unknown embedded namespace: ${namespace || "(empty)"}\nOnly embedded:${GJC_NAMESPACE}/... is resolvable.`,
 			);
 		}
@@ -56,17 +57,17 @@ export class EmbeddedProtocolHandler implements ProtocolHandler {
 		}
 		const relativePath = normalizeRelativePath(rawRelativePath);
 		if (!relativePath) {
-			throw new Error(
+			throw new ToolError(
 				`embedded:${GJC_NAMESPACE}/ URL requires a bundled resource path, e.g. embedded:${GJC_NAMESPACE}/skills/ultragoal/SKILL.md`,
 			);
 		}
 		if (relativePath.split("/").includes("..")) {
-			throw new Error("Path traversal (..) is not allowed in embedded: URLs");
+			throw new ToolError("Path traversal (..) is not allowed in embedded: URLs");
 		}
 
 		const entry = findCatalogEntry(relativePath);
 		if (!entry) {
-			throw new Error(
+			throw new ToolError(
 				`Unknown embedded resource: embedded:${GJC_NAMESPACE}/${relativePath}\nAvailable: ${availablePaths()}`,
 			);
 		}

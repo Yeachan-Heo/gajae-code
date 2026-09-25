@@ -1,7 +1,12 @@
 /**
  * Tool wrappers for extensions.
  */
-import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
+import {
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolUpdateCallback,
+	ToolCallBlockedError,
+} from "@gajae-code/agent-core";
 import {
 	type ImageContent,
 	type Static,
@@ -142,8 +147,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 				if (signal?.aborted) throw toolAbortReason(signal, "Tool call aborted during Function Hook mediation");
 				if (callResult?.block) {
-					const reason = callResult.reason || "Tool execution was blocked by an extension";
-					throw new Error(reason);
+					throw new ToolCallBlockedError(callResult.reason || "Tool execution was blocked by an extension");
 				}
 			} catch (err) {
 				if (err instanceof Error) {
