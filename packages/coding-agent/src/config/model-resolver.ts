@@ -1075,15 +1075,20 @@ export function resolveModelOverride(
  */
 export interface ModelChainResolutionOptions {
 	managedFallback?: boolean;
+	/** Session that claims a half-open entry's probe lease when resolution selects it. */
+	circuitProbeOwner?: string;
 	aliasIntent?: "preset-equivalent" | "reject";
 	canonicalSessionId?: string | null;
 	credentialSessionId?: string;
 	signal?: AbortSignal;
 }
 
-type ChainResolutionRegistry = ModelLookupRegistry &
-	Pick<ModelRegistry, "getApiKey"> &
-	Partial<Pick<ModelRegistry, "isSelectorCircuitOpen">>;
+/**
+ * Chain resolution must see fallback circuit state: adapters that wrap the
+ * registry are required to forward it so managed resolution never selects an
+ * entry whose circuit is open.
+ */
+export type ChainResolutionRegistry = ModelLookupRegistry & Pick<ModelRegistry, "getApiKey" | "isSelectorCircuitOpen">;
 
 interface ModelChainResolution {
 	model?: Model<Api>;
@@ -1143,7 +1148,7 @@ async function resolveModelChainEntries(
 	let firstOpenCircuit: { index: number; skipCount: number } | undefined;
 	for (let activeIndex = startIndex; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
-		if (circuitPolicy.skipOpenCircuits && modelRegistry.isSelectorCircuitOpen?.(selector)) {
+		if (circuitPolicy.skipOpenCircuits && modelRegistry.isSelectorCircuitOpen(selector, options?.circuitProbeOwner)) {
 			firstOpenCircuit ??= { index: activeIndex, skipCount: skips.length };
 			skips.push({ selector, reason: "circuit_open" });
 			continue;
@@ -1243,7 +1248,7 @@ export function isExplicitProviderModelOverride(modelPatterns: readonly string[]
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
 	parentActiveModelPattern: string | undefined,
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
+	modelRegistry: ChainResolutionRegistry,
 	settings?: Settings,
 	authSessionId?: string,
 	options?: ModelChainResolutionOptions,

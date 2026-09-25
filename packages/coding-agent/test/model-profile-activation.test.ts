@@ -145,6 +145,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 
@@ -1649,6 +1650,7 @@ describe("model profile activation", () => {
 				modelRegistry: {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
+					isSelectorCircuitOpen: () => false,
 				} as unknown as ModelRegistry,
 			});
 			configuringSession.setConfiguredModelChain(
@@ -1671,6 +1673,7 @@ describe("model profile activation", () => {
 				modelRegistry: {
 					getAvailable: () => [head, fallback],
 					getApiKey: async () => kNoAuth,
+					isSelectorCircuitOpen: () => false,
 				} as unknown as ModelRegistry,
 			});
 			try {
@@ -2561,6 +2564,7 @@ function stubXiaomiRegistry(
 	| "resolveCanonicalModel"
 	| "getCanonicalVariants"
 	| "getCanonicalId"
+	| "isSelectorCircuitOpen"
 > {
 	const profiles = mergeModelProfiles();
 	const xiaomiProviders = ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"];
@@ -2579,6 +2583,7 @@ function stubXiaomiRegistry(
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: (item: Model) => item.id,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 

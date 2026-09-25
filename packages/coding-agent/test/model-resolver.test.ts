@@ -30,7 +30,11 @@ test("skips a Cursor chain head during managed auth-aware resolution", async () 
 	const cursor = { ...mockModels[0], api: "cursor-agent", provider: "cursor" } as Model;
 	const resolution = await resolveModelChainWithAuth(
 		["cursor/claude-sonnet-4-5", "openai/gpt-4o"],
-		{ getAvailable: () => [cursor, mockModels[1]], getApiKey: async () => "key" } as never,
+		{
+			getAvailable: () => [cursor, mockModels[1]],
+			getApiKey: async () => "key",
+			isSelectorCircuitOpen: () => false,
+		} as never,
 		undefined,
 		undefined,
 		{ managedFallback: true },

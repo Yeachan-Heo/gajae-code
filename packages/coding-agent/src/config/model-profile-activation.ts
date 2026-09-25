@@ -96,6 +96,7 @@ export interface PrepareModelProfileActivationOptions {
 		| "resolveCanonicalModel"
 		| "getCanonicalVariants"
 		| "getCanonicalId"
+		| "isSelectorCircuitOpen"
 	> &
 		Partial<
 			Pick<
@@ -874,7 +875,8 @@ export async function resolveModelProfileDefaultChain(options: {
 			resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 			lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 			clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
-		} as ModelRegistry,
+			isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen.bind(options.modelRegistry),
+		},
 		options.settings as Settings,
 		options.credentialSessionId,
 		{
@@ -1070,6 +1072,7 @@ async function resolveAndClampSelectorValue(
 					resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 					lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 					clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
+					isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen.bind(options.modelRegistry),
 				},
 				options.settings,
 				options.credentialSessionId,
@@ -1199,6 +1202,7 @@ async function concretizeProfileSelectorValue(
 							),
 							lookupAliasExists: prepared.modelRegistry.lookupAliasExists?.bind(prepared.modelRegistry),
 							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
+							isSelectorCircuitOpen: prepared.modelRegistry.isSelectorCircuitOpen.bind(prepared.modelRegistry),
 						},
 						prepared.settings as Settings,
 						credentialSessionId,
@@ -1447,7 +1451,8 @@ export async function prepareModelProfileActivation(
 				resolveModelByLookupAlias: options.modelRegistry.resolveModelByLookupAlias?.bind(options.modelRegistry),
 				lookupAliasExists: options.modelRegistry.lookupAliasExists?.bind(options.modelRegistry),
 				clearCanonicalVariant: options.modelRegistry.clearCanonicalVariant?.bind(options.modelRegistry),
-			} as ModelRegistry,
+				isSelectorCircuitOpen: options.modelRegistry.isSelectorCircuitOpen.bind(options.modelRegistry),
+			},
 			options.settings as Settings,
 			credentialSessionId,
 			{
