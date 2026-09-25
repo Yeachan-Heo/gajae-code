@@ -380,6 +380,9 @@ jobs:
         run: |
           head="$(git rev-parse HEAD)"
           test "$head" = "$CI_DEV_SOURCE_SHA" || { echo "Checked-out SHA $head does not match $CI_DEV_SOURCE_SHA"; exit 1; }
+      - name: Fetch exact workflow-dispatch base
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: git fetch --no-tags origin "$GITHUB_BASE_SHA"
       - name: Verify PR head contains exact base
         if: ${{ github.event_name == 'pull_request' }}
         shell: bash
