@@ -10,6 +10,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import * as pythonTranscript from "../../src/gjc-runtime/python-transcript";
 import { sessionIpykernelsArtifactsDir, sessionIpykernelsDir } from "../../src/gjc-runtime/session-layout";
 import { BUILTIN_TOOL_DESCRIPTORS, createTools, type ToolSession } from "../../src/tools";
 import { PYTHON_TOOL_NAME, pythonKernelOwnerId } from "../../src/tools/python";
@@ -373,9 +374,13 @@ describe("builtin session Python tool", () => {
 			options?.onKernelStart?.("k1");
 			return pythonResult({ output: "execution output" });
 		});
-		const appendSpy = vi.spyOn(fs, "appendFile").mockImplementation(async filePath => {
-			if (String(filePath).endsWith("transcript.jsonl")) throw new Error("simulated transcript disk failure");
-			return undefined;
+		const appendSpy = vi.fn(async () => {
+			throw new Error("simulated transcript disk failure");
+		});
+		vi.spyOn(pythonTranscript, "openPythonKernelTranscript").mockReturnValue({
+			dir: "python-transcript-failure",
+			kernelInstanceId: "kernel-transcript-failure",
+			append: appendSpy,
 		});
 		const tool = await loadPythonTool({ cwd });
 

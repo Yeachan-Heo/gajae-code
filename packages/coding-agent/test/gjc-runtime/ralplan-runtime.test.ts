@@ -1082,7 +1082,7 @@ describe("native gjc ralplan runtime — duplicate --write guard", () => {
 		// exactly one row survives regardless of the race.
 		const results = await Promise.all(Array.from({ length: 6 }, () => runNativeRalplanCommand([...args], root)));
 		for (const result of results) {
-			expect(result.status).toBe(0);
+			expect(result.status, result.stderr).toBe(0);
 		}
 
 		const indexLines = (await fs.readFile(path.join(runDir(root, "race-run"), "index.jsonl"), "utf-8"))

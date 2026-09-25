@@ -11,6 +11,8 @@ import {
 	beginWorkflowTransactionJournal,
 	createJsonNoClobber,
 	updateWorkflowTransactionJournal,
+	withWorkflowStateLock,
+	writeArtifact,
 	writeJsonAtomic,
 } from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 
@@ -24,6 +26,18 @@ async function tempDir(): Promise<string> {
 
 async function modeOf(filePath: string): Promise<number> {
 	return (await fs.stat(filePath)).mode & 0o777;
+}
+
+async function preparePrivateParent(root: string, directory: string): Promise<void> {
+	const gjcRoot = path.join(root, ".gjc");
+	await fs.mkdir(gjcRoot, { recursive: true });
+	let current = gjcRoot;
+	await fs.chmod(current, 0o700);
+	for (const segment of path.relative(gjcRoot, directory).split(path.sep).filter(Boolean)) {
+		current = path.join(current, segment);
+		await fs.mkdir(current, { recursive: true });
+		await fs.chmod(current, 0o700);
+	}
 }
 
 afterEach(async () => {
@@ -137,7 +151,7 @@ describe("state-writer hard-link append confinement", () => {
 		const root = await tempDir();
 		const externalPath = path.join(root, "external-ledger.jsonl");
 		const targetPath = path.join(root, ".gjc", "_session-hardlink", "logs", "events.jsonl");
-		await fs.mkdir(path.dirname(targetPath), { recursive: true });
+		await preparePrivateParent(root, path.dirname(targetPath));
 		await fs.writeFile(externalPath, "outside\n", { mode: 0o644 });
 		await fs.link(externalPath, targetPath);
 
@@ -154,7 +168,7 @@ describe("state-writer hard-link append confinement", () => {
 		const sessionId = "hardlink-audit";
 		const externalPath = path.join(root, "external-audit.jsonl");
 		const targetPath = auditPath(root, sessionId);
-		await fs.mkdir(path.dirname(targetPath), { recursive: true });
+		await preparePrivateParent(root, path.dirname(targetPath));
 		await fs.writeFile(externalPath, "outside audit\n", { mode: 0o644 });
 		await fs.link(externalPath, targetPath);
 
@@ -172,5 +186,40 @@ describe("state-writer hard-link append confinement", () => {
 		expect(await fs.readFile(externalPath, "utf8")).toBe("outside audit\n");
 		expect((await fs.stat(externalPath)).nlink).toBe(2);
 		if (process.platform !== "win32") expect(await modeOf(externalPath)).toBe(0o644);
+	});
+});
+
+describe("state-writer symlink-parent confinement", () => {
+	it("refuses artifact, JSON, append, no-clobber, and lock operations through linked .gjc parents", async () => {
+		const root = await tempDir();
+		const outside = path.join(root, "outside");
+		const linkedState = path.join(root, ".gjc", "_session-link", "state");
+		const linkedSpecs = path.join(root, ".gjc", "_session-link", "specs");
+		await fs.mkdir(outside);
+		await fs.mkdir(path.dirname(linkedState), { recursive: true });
+		await fs.chmod(path.join(root, ".gjc"), 0o700);
+		await fs.chmod(path.dirname(linkedState), 0o700);
+		await fs.symlink(outside, linkedState, process.platform === "win32" ? "junction" : "dir");
+		await fs.symlink(outside, linkedSpecs, process.platform === "win32" ? "junction" : "dir");
+
+		await expect(
+			writeArtifact(".gjc/_session-link/specs/crystal.md", "private Crystal\n", {
+				cwd: root,
+				audit: { category: "artifact", verb: "write", owner: "gjc-runtime", sessionId: "writer-link" },
+			}),
+		).rejects.toThrow();
+		await expect(
+			writeJsonAtomic(".gjc/_session-link/state/state.json", { private: true }, { cwd: root }),
+		).rejects.toThrow();
+		await expect(
+			appendJsonl(".gjc/_session-link/state/events.jsonl", { event: "private" }, { cwd: root }),
+		).rejects.toThrow();
+		await expect(
+			createJsonNoClobber(".gjc/_session-link/state/claim.json", { private: true }, { cwd: root }),
+		).rejects.toThrow();
+		await expect(
+			withWorkflowStateLock(".gjc/_session-link/state/locked.json", async () => {}, { cwd: root }),
+		).rejects.toThrow();
+		expect(await fs.readdir(outside)).toEqual([]);
 	});
 });
