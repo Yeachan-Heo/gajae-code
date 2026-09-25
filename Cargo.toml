@@ -177,6 +177,8 @@ too_many_lines = "allow"     # Arbitrary limits don't account for necessary comp
 # Internal Libraries
 # ──────────────────────────────────────────────────────────────────────────────
 pi-ast = { path = "crates/pi-ast" }
+pi-diff = { path = "crates/pi-diff" }
+pi-edit = { path = "crates/pi-edit" }
 pi-iso = { path = "crates/pi-iso" }
 pi-shell = { path = "crates/pi-shell" }
 pi-vfs = { path = "crates/pi-vfs" }
@@ -207,6 +209,7 @@ toml = "1.1"
 anyhow = "1.0"
 bytes = "1"
 futures-util = "0.3"
+thiserror = "2"
 tokio-tungstenite = "0.24"
 
 # ──────────────────────────────────────────────────────────────────────────────

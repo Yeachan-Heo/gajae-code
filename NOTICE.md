@@ -16,6 +16,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - `pi-ast` — MIT-licensed AST language, pattern, and structural-summary support from oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1, vendored under `crates/pi-ast` with its upstream license retained.
 - `crates/pi-ast/src/block.rs` is vendored from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1` as a Rust-only pi-edit dependency; no `blockRange` N-API export is added.
 - `pi-vfs` and `pi-walker` are MIT-licensed crates vendored at `a85bd5228d9f0f619deade1db78fa49420a721e1`; their retained license texts are in `crates/pi-vfs/LICENSE` and `crates/pi-walker/LICENSE`.
+- `crates/pi-edit` is the MIT-licensed crate vendored at `a85bd5228d9f0f619deade1db78fa49420a721e1`; see `crates/pi-edit/LICENSE`. Local matcher bindings do not expose upstream descriptions, grammars, or sloppy mode; GJC prompts and grammars remain authoritative.
 
 ## Vendored Rust from oh-my-pi @ a85bd522
 

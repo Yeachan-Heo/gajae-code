@@ -1,5 +1,13 @@
 import * as path from "node:path";
-import { EditMatchError, findMatch, seekSequence } from "../../../../coding-agent/src/edit/modes/replace";
+import type {
+	FuzzyMatch,
+	MatchOutcome,
+	SequenceMatchStrategy,
+	SequenceSearchResult,
+} from "../../../../coding-agent/src/edit/modes/replace";
+import { EditMatchError } from "../../../../coding-agent/src/edit/modes/replace";
+import type { EditFindMatchResult } from "../../../native/index.js";
+import { editFindMatch, editSeekSequence } from "../../../native/index.js";
 import type { DifferentialCase } from "../harness";
 import { defineDifferential } from "../harness";
 
@@ -27,31 +35,26 @@ interface ErrorStrings {
 }
 
 export interface EditFuzzyOutput {
-	strict: Awaited<ReturnType<typeof findMatch>>;
-	fuzzy: Awaited<ReturnType<typeof findMatch>>;
-	sequence: Awaited<ReturnType<typeof seekSequence>>;
+	strict: MatchOutcome;
+	fuzzy: MatchOutcome;
+	sequence: SequenceSearchResult;
 	strictError: string | null;
 	fuzzyError: string | null;
 	missing: {
-		strict: Awaited<ReturnType<typeof findMatch>>;
-		fuzzy: Awaited<ReturnType<typeof findMatch>>;
+		strict: MatchOutcome;
+		fuzzy: MatchOutcome;
 		errors: ErrorStrings;
 	};
 }
 
-function formatOccurrenceError(pathname: string, result: Awaited<ReturnType<typeof findMatch>>): string {
+function formatOccurrenceError(pathname: string, result: MatchOutcome): string {
 	const occurrences = result.occurrences ?? 0;
 	const more = occurrences > MAX_RECORDED_MATCHES ? ` (showing first ${MAX_RECORDED_MATCHES} of ${occurrences})` : "";
 	const previews = result.occurrencePreviews?.join("\n\n") ?? "";
 	return `Found ${occurrences} occurrences in ${pathname}${more}:\n\n${previews}\n\nAdd more context lines to disambiguate.`;
 }
 
-function formatFindError(
-	pathname: string,
-	target: string,
-	result: Awaited<ReturnType<typeof findMatch>>,
-	allowFuzzy: boolean,
-): string | null {
+function formatFindError(pathname: string, target: string, result: MatchOutcome, allowFuzzy: boolean): string | null {
 	if (result.occurrences && result.occurrences > 1) return formatOccurrenceError(pathname, result);
 	if (result.match) return null;
 	return EditMatchError.formatMessage(pathname, target, result.closest, {
@@ -61,11 +64,17 @@ function formatFindError(
 	});
 }
 
-async function loadEditBenchmarkCases(): Promise<{ cases: DifferentialCase<EditFuzzyInput>[]; inputs: Map<string, BenchmarkMatcherInput>; archiveSha256: string }> {
+async function loadEditBenchmarkCases(): Promise<{
+	cases: DifferentialCase<EditFuzzyInput>[];
+	inputs: Map<string, BenchmarkMatcherInput>;
+	archiveSha256: string;
+}> {
 	const archiveBytes = new Uint8Array(await Bun.file(benchmarkArchive).arrayBuffer());
 	const archive = new Bun.Archive(archiveBytes);
 	const archivedFiles = await archive.files();
-	const files = new Map([...archivedFiles].map(([name, contents]) => [name.replaceAll("\\", "/").replace(/^\.\//, ""), contents]));
+	const files = new Map(
+		[...archivedFiles].map(([name, contents]) => [name.replaceAll("\\", "/").replace(/^\.\//, ""), contents]),
+	);
 	const taskIds = [...files.keys()]
 		.map(file => /^fixtures\/([^/]+)\/metadata\.json$/.exec(file)?.[1])
 		.filter((taskId): taskId is string => taskId !== undefined)
@@ -86,8 +95,7 @@ async function loadEditBenchmarkCases(): Promise<{ cases: DifferentialCase<EditF
 			if (typeof metadata.file_path !== "string" || typeof metadata.original_snippet !== "string") {
 				throw new Error(`Incomplete edit-benchmark matcher metadata for ${taskId}`);
 			}
-			const fileName = path.posix.basename(metadata.file_path);
-			const inputPath = `fixtures/${taskId}/input/${fileName}`;
+			const inputPath = `fixtures/${taskId}/input/${path.posix.basename(metadata.file_path)}`;
 			const inputFile = files.get(inputPath);
 			if (!inputFile) throw new Error(`Missing edit-benchmark input ${inputPath}`);
 			const target = metadata.original_snippet;
@@ -113,25 +121,55 @@ function matcherInput(input: EditFuzzyInput): BenchmarkMatcherInput {
 	return matcherInput;
 }
 
+function mapNativeMatch(match: EditFindMatchResult["matched"]): FuzzyMatch | undefined {
+	return match
+		? {
+				actualText: match.actualText,
+				startIndex: match.startIndex,
+				startLine: match.startLine,
+				confidence: match.confidence,
+			}
+		: undefined;
+}
+
+function mapNativeMatchOutcome(result: EditFindMatchResult): MatchOutcome {
+	const match = mapNativeMatch(result.matched);
+	const closest = mapNativeMatch(result.closest);
+	return {
+		...(match ? { match } : {}),
+		...(closest ? { closest } : {}),
+		...(result.occurrences != null ? { occurrences: result.occurrences } : {}),
+		...(result.occurrenceLines != null ? { occurrenceLines: result.occurrenceLines } : {}),
+		...(result.occurrencePreviews != null ? { occurrencePreviews: result.occurrencePreviews } : {}),
+		...(result.fuzzyMatches != null ? { fuzzyMatches: result.fuzzyMatches } : {}),
+		...(result.dominantFuzzy != null ? { dominantFuzzy: result.dominantFuzzy } : {}),
+	};
+}
+
 function evaluate(input: EditFuzzyInput): EditFuzzyOutput {
 	const fixture = matcherInput(input);
-	const strict = findMatch(fixture.content, fixture.target, { allowFuzzy: false, threshold: DEFAULT_THRESHOLD });
-	const fuzzy = findMatch(fixture.content, fixture.target, { allowFuzzy: true, threshold: DEFAULT_THRESHOLD });
-	const missingStrict = findMatch(fixture.content, fixture.missingTarget, {
-		allowFuzzy: false,
-		threshold: DEFAULT_THRESHOLD,
-	});
-	const missingFuzzy = findMatch(fixture.content, fixture.missingTarget, {
-		allowFuzzy: true,
-		threshold: DEFAULT_THRESHOLD,
-	});
-	const sequence = seekSequence(
+	const strict = mapNativeMatchOutcome(editFindMatch(fixture.content, fixture.target, false, DEFAULT_THRESHOLD));
+	const fuzzy = mapNativeMatchOutcome(editFindMatch(fixture.content, fixture.target, true, DEFAULT_THRESHOLD));
+	const missingStrict = mapNativeMatchOutcome(
+		editFindMatch(fixture.content, fixture.missingTarget, false, DEFAULT_THRESHOLD),
+	);
+	const missingFuzzy = mapNativeMatchOutcome(
+		editFindMatch(fixture.content, fixture.missingTarget, true, DEFAULT_THRESHOLD),
+	);
+	const sequenceResult = editSeekSequence(
 		fixture.content.split("\n"),
 		fixture.target.split("\n"),
 		fixture.line,
 		false,
-		{ allowFuzzy: true },
+		true,
 	);
+	const sequence: SequenceSearchResult = {
+		index: sequenceResult.index,
+		confidence: sequenceResult.confidence,
+		...(sequenceResult.matchCount != null ? { matchCount: sequenceResult.matchCount } : {}),
+		...(sequenceResult.matchIndices ? { matchIndices: sequenceResult.matchIndices } : {}),
+		...(sequenceResult.strategy ? { strategy: sequenceResult.strategy as SequenceMatchStrategy } : {}),
+	};
 	return {
 		strict,
 		fuzzy,
@@ -149,16 +187,8 @@ function evaluate(input: EditFuzzyInput): EditFuzzyOutput {
 	};
 }
 
-const tsBaselines = new WeakMap<EditFuzzyInput, EditFuzzyOutput>();
-for (const testCase of benchmark.cases) tsBaselines.set(testCase.input, evaluate(testCase.input));
-
 export const editFuzzyDifferential = defineDifferential<EditFuzzyInput, EditFuzzyOutput>({
 	module: "edit-fuzzy",
 	cases: benchmark.cases,
-	reference: input => {
-		const baseline = tsBaselines.get(input);
-		if (!baseline) throw new Error("Edit-fuzzy TS golden input is not registered");
-		return baseline;
-	},
 	native: evaluate,
 });

@@ -2731,6 +2731,25 @@ name = "pi-diff"
 version = "0.17.6"
 
 [[package]]
+name = "pi-edit"
+version = "0.17.6"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "pi-ast",
+ "pi-diff",
+ "pi-walker",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "xutf",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "pi-iso"
 version = "0.17.6"
 dependencies = [
@@ -2774,6 +2793,7 @@ dependencies = [
  "phf 0.14.0",
  "pi-ast",
  "pi-diff",
+ "pi-edit",
  "pi-iso",
  "pi-shell",
  "pi-vfs",

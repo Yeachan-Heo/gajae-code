@@ -1092,6 +1092,35 @@ export interface DoctorLinkSwapResult {
   code?: string
 }
 
+export declare function editFindMatch(content: string, target: string, allowFuzzy: boolean, threshold?: number | undefined | null): EditFindMatchResult
+
+export interface EditFindMatchResult {
+  matched?: EditFuzzyMatch
+  closest?: EditFuzzyMatch
+  occurrences?: number
+  occurrenceLines?: Array<number>
+  occurrencePreviews?: Array<string>
+  fuzzyMatches?: number
+  dominantFuzzy?: boolean
+}
+
+export interface EditFuzzyMatch {
+  actualText: string
+  startIndex: number
+  startLine: number
+  confidence: number
+}
+
+export declare function editSeekSequence(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean, allowFuzzy: boolean): EditSeekSequenceResult
+
+export interface EditSeekSequenceResult {
+  index?: number
+  confidence: number
+  matchCount?: number
+  matchIndices?: Array<number>
+  strategy?: string
+}
+
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
   /** Use a single Unicode ellipsis character ("…"). */

@@ -42,6 +42,7 @@ parking_lot.workspace = true
 phf.workspace = true
 pi-ast.workspace = true
 pi-diff = { path = "../pi-diff" }
+pi-edit.workspace = true
 pi-iso.workspace = true
 pi-shell.workspace = true
 pi-vfs.workspace = true

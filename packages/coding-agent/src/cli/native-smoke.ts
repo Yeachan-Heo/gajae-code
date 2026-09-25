@@ -22,6 +22,19 @@ interface NativeSmokePatchHunk {
 interface NativeSmokeBindings {
 	h01FindBestFuzzyMatch?: unknown;
 	h02ScoreSequenceFuzzy?: unknown;
+	editFindMatch?: (
+		content: string,
+		target: string,
+		allowFuzzy: boolean,
+		threshold?: number | null,
+	) => { matched?: { actualText: string; startIndex: number; startLine: number; confidence: number } };
+	editSeekSequence?: (
+		lines: string[],
+		pattern: string[],
+		start: number,
+		eof: boolean,
+		allowFuzzy: boolean,
+	) => { index?: number; confidence: number; strategy?: string };
 	h06FormatHashLines(text: string, startLine?: number): string;
 	diffLines(oldText: string, newText: string): NativeSmokeDiffChange[];
 	diffLineRuns(oldText: string, newText: string): NativeSmokeDiffRun[];
@@ -78,6 +91,15 @@ export async function runNativeSmokeTest(): Promise<void> {
 	}
 	if (typeof native.h02ScoreSequenceFuzzy !== "function" || typeof native.h01FindBestFuzzyMatch !== "function") {
 		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
+	}
+	if (typeof native.editFindMatch !== "function" || typeof native.editSeekSequence !== "function") {
+		throw new Error("smoke-test: native pi-edit matcher exports missing from embedded addon");
+	}
+	if (native.editFindMatch("alpha", "alpha", false, 0.95).matched?.actualText !== "alpha") {
+		throw new Error("smoke-test: editFindMatch returned an unexpected result");
+	}
+	if (native.editSeekSequence(["before", "target"], ["target"], 0, false, true).index !== 1) {
+		throw new Error("smoke-test: editSeekSequence returned an unexpected result");
 	}
 
 	const oldText = "old word\n";
