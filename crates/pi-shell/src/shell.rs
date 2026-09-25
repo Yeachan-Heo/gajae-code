@@ -3568,4 +3568,36 @@ mod tests {
 		assert_eq!(result.exit_code, Some(0));
 		assert_eq!(output, "outer");
 	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_changed_reports_completed_jobs() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: "python3 -c 'import time; time.sleep(0.1)' & sleep 0.3; jobs -n".to_string(),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Done"), "changed-job output: {output:?}");
+		assert!(output.contains("python3"), "changed-job command: {output:?}");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_long_includes_running_pid_and_command() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: "python3 -c 'import time; time.sleep(30)' & jobs -l".to_string(),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Running"), "job state output: {output:?}");
+		assert!(output.contains("python3"), "job command output: {output:?}");
+	}
 }
