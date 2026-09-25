@@ -12,6 +12,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 
 The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` source pinned to `a85bd5228d9f0f619deade1db78fa49420a721e1`; each source file carries its own attribution and local-modification header.
 - `crates/pi-natives/src/html.rs`
+- `crates/pi-natives/src/sixel.rs`
 
 ## MuPDF WebAssembly
 

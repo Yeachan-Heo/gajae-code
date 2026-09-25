@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/sixel.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: tag the public encoder with profile_region; do not expose upstream decoding without a GJC consumer.
+
 //! SIXEL terminal-image encoding.
 //!
 //! Decodes an encoded image (PNG, JPEG, WebP, GIF), resizes to the target
@@ -27,6 +30,7 @@ pub fn encode_sixel(
 	target_width_px: u32,
 	target_height_px: u32,
 ) -> Result<String> {
+	let _profile = crate::prof::profile_region("sixel.encode");
 	if target_width_px == 0 || target_height_px == 0 {
 		return Err(Error::from_reason("Target SIXEL dimensions must be greater than zero"));
 	}
