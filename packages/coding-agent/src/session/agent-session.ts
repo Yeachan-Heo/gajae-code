@@ -118,6 +118,7 @@ import {
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
+	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
@@ -3473,6 +3474,13 @@ export class AgentSession {
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
 		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
+		this.#managedFallbackTriedCredentialRows.clear();
+		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
+		this.#managedFallbackQuotaCeilingModels.clear();
+		this.#managedFallbackActiveCredentialRows.clear();
+		this.#managedFallbackNextCredentialOverride = undefined;
+		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 		this.#codexCredentialModelUnavailableRetried = false;
 	}
 
@@ -3512,6 +3520,22 @@ export class AgentSession {
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
 	#providerRetryMaxAttempts: number | undefined;
+	/** Actual managed upstream requests for the current model entry, including credential rotations. */
+	#managedFallbackProviderAttemptCount = 0;
+	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
+	#managedFallbackTriedCredentialRowsGeneration = -1;
+	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
+	/** Stored credential captured after a managed request resolves its API key, before failure handling mutates assignment. */
+	#managedFallbackActiveCredentialRows = new Map<string, { credentialKind: string; rowId: number }>();
+	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
+	#managedFallbackNextCredentialOverride:
+		| { modelKey: string; storageProvider: string; rowId: number }
+		| undefined;
+	#restoreManagedFallbackGetApiKey: (() => void) | undefined;
+	/** Credential kinds with a quota/rate-limit failure for each canonical model identity this prompt. */
+	#managedFallbackQuotaFailedModelCredentialKinds = new Map<string, Set<string>>();
+	/** Models whose quota/rate-limit attempt reached its provider ceiling without an AuthStorage mark. */
+	#managedFallbackQuotaCeilingModels = new Set<string>();
 	/** One content-free retry is allowed after Codex says the active account lacks the model. */
 	#codexCredentialModelUnavailableRetried = false;
 	#retryAttempt = 0;
@@ -5395,6 +5419,50 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		const originalGetApiKey = this.agent.getApiKey;
+		if (originalGetApiKey) {
+			const invokeOriginalGetApiKey = originalGetApiKey.bind(this.agent);
+			const managedGetApiKey = async (provider: string): Promise<string | undefined> => {
+				const override = this.#managedFallbackNextCredentialOverride;
+				const model = this.model;
+				const controller = this.#defaultFallbackController;
+				const storageProvider = resolveOAuthStorageProvider(provider);
+				const modelKey =
+					model && storageProvider === resolveOAuthStorageProvider(model.provider)
+						? this.#managedFallbackCanonicalModelKey(model)
+						: undefined;
+				const shouldCapture =
+					model !== undefined &&
+					modelKey !== undefined &&
+					controller !== undefined &&
+					controller.chain.entries.length > 1;
+				if (shouldCapture && modelKey) this.#managedFallbackActiveCredentialRows.delete(modelKey);
+				if (
+					override &&
+					model &&
+					storageProvider === override.storageProvider &&
+					modelKey === override.modelKey
+				) {
+					this.#managedFallbackNextCredentialOverride = undefined;
+					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
+						credentialSelector: { kind: "id", value: String(override.rowId) },
+					});
+					if (!isAuthenticated(apiKey)) {
+						throw new Error("Selected managed fallback credential is no longer available");
+					}
+					if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+					return apiKey;
+				}
+				const apiKey = await invokeOriginalGetApiKey(provider);
+				if (shouldCapture && model && isAuthenticated(apiKey))
+					this.#captureManagedFallbackActiveCredential(model);
+				return apiKey;
+			};
+			this.agent.getApiKey = managedGetApiKey;
+			this.#restoreManagedFallbackGetApiKey = () => {
+				if (this.agent.getApiKey === managedGetApiKey) this.agent.getApiKey = originalGetApiKey;
+			};
+		}
 		if (config.providerSessionState) {
 			this.#providerSessionState = config.providerSessionState;
 		}
@@ -7909,6 +7977,7 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this.#providerRetryMaxAttempts = undefined;
+					this.#managedFallbackProviderAttemptCount = 0;
 				}
 			}
 
@@ -10252,6 +10321,9 @@ export class AgentSession {
 
 	async #dispose(): Promise<void> {
 		const disposeFailures: Array<{ label: string; error: unknown; critical: boolean }> = [];
+		this.#restoreManagedFallbackGetApiKey?.();
+		this.#restoreManagedFallbackGetApiKey = undefined;
+		this.#managedFallbackNextCredentialOverride = undefined;
 		const awaitDisposeStep = async <T>(
 			label: string,
 			operation: Promise<T>,
@@ -18235,6 +18307,8 @@ export class AgentSession {
 			{ role: "default", entries: [...entries], origin: "runtime", identity, explicitHead: true },
 			this.settings.get("fallback.maxAttempts"),
 		);
+		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 		this.#defaultFallbackExhaustedLastTurn = false;
 		this.#seedDefaultFallbackResolutionForController(
 			this.#defaultFallbackController,
@@ -23049,6 +23123,7 @@ export class AgentSession {
 			fallbackManaged: true,
 			nextFallbackAttempt: model => {
 				controller.onAttemptStarted();
+				this.#managedFallbackProviderAttemptCount++;
 				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
 			},
 			onManagedAttemptAccepted: () => {
@@ -23155,6 +23230,8 @@ export class AgentSession {
 			return existing;
 		}
 		this.#defaultFallbackController = new FallbackChainController(chain, this.settings.get("fallback.maxAttempts"));
+		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 		return this.#defaultFallbackController;
 	}
 
@@ -23540,6 +23617,8 @@ export class AgentSession {
 			!transitionStillOwned()
 		)
 			return await rollbackCancelled();
+		this.#managedFallbackNextCredentialOverride = undefined;
+		this.#managedFallbackActiveCredentialRows.clear();
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
@@ -23615,27 +23694,100 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const keyResult = await (async () => {
-				try {
-					return await awaitWithCancellation(
-						this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId),
-					);
-				} catch (error) {
-					await rollbackCancelled();
-					throw error;
-				}
-			})();
-			if (keyResult.kind === "aborted") return await rollbackCancelled();
-			const key = keyResult.value;
-			if (
-				cancellationSignal.aborted ||
-				(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
-				!transitionStillOwned()
-			)
-				return await rollbackCancelled();
-			if (!isAuthenticated(key) && key !== kNoAuth) {
-				controller.onResolutionSkip("unauthenticated");
+			this.#ensureManagedFallbackCredentialTrackingGeneration();
+			const canonicalModelKey = this.#managedFallbackCanonicalModelKey(resolvedModel);
+			if (this.#managedFallbackQuotaCeilingModels.has(canonicalModelKey)) {
+				controller.onResolutionSkip("same_model_provider_retry_ceiling");
 				continue;
+			}
+			const failedCredentialKinds = this.#managedFallbackQuotaFailedModelCredentialKinds.get(canonicalModelKey);
+			let selectedUntriedCredential = false;
+			let selectedCredentialRowId: number | undefined;
+			if (failedCredentialKinds !== undefined) {
+				const authStorage = this.#modelRegistry.authStorage;
+				const storageProvider = resolveOAuthStorageProvider(resolvedModel.provider);
+				const inventory = authStorage.listCredentialInventory(storageProvider);
+				candidateRows: for (const credentialKind of failedCredentialKinds) {
+					const triedRows = this.#managedFallbackTriedRows(resolvedModel, credentialKind);
+					for (const credential of inventory) {
+						if (
+							credential.provider !== storageProvider ||
+							credential.credentialKind !== credentialKind ||
+							triedRows.has(credential.id) ||
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+						)
+							continue;
+						let credentialKeyResult:
+							| { kind: "resolved"; value: string | undefined }
+							| { kind: "aborted" };
+						try {
+							credentialKeyResult = await awaitWithCancellation(
+								this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId, {
+									credentialSelector: { kind: "id", value: String(credential.id) },
+								}),
+							);
+						} catch (error) {
+							if (authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)) {
+								await rollbackCancelled();
+								throw error;
+							}
+							continue;
+						}
+						if (credentialKeyResult.kind === "aborted") return await rollbackCancelled();
+						if (
+							cancellationSignal.aborted ||
+							(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+							!transitionStillOwned()
+						)
+							return await rollbackCancelled();
+						if (!isAuthenticated(credentialKeyResult.value)) continue;
+						const selectedRowId = authStorage.getSessionCredentialRowId(
+							resolvedModel.provider,
+							this.credentialSessionId,
+						);
+						const selectedKind = authStorage.getSessionCredentialType(
+							resolvedModel.provider,
+							this.credentialSessionId,
+						);
+						if (
+							selectedRowId !== credential.id ||
+							selectedKind !== credentialKind ||
+							!authStorage.isCredentialAvailable(resolvedModel.provider, credential.id)
+						)
+							continue;
+						selectedCredentialRowId = selectedRowId;
+						selectedUntriedCredential = true;
+						break candidateRows;
+					}
+				}
+				if (!selectedUntriedCredential) {
+					controller.onResolutionSkip("same_model_credentials_exhausted");
+					continue;
+				}
+			}
+			if (!selectedUntriedCredential) {
+				const keyResult = await (async () => {
+					try {
+						return await awaitWithCancellation(
+							this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId),
+						);
+					} catch (error) {
+						await rollbackCancelled();
+						throw error;
+					}
+				})();
+				if (keyResult.kind === "aborted") return await rollbackCancelled();
+				const key = keyResult.value;
+				if (
+					cancellationSignal.aborted ||
+					(abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch) ||
+					!transitionStillOwned()
+				)
+					return await rollbackCancelled();
+				if (!isAuthenticated(key) && key !== kNoAuth) {
+					controller.onResolutionSkip("unauthenticated");
+					continue;
+				}
 			}
 			const from =
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
@@ -23664,6 +23816,13 @@ export class AgentSession {
 				!transitionStillOwned()
 			)
 				return await rollbackCancelled();
+			if (selectedCredentialRowId !== undefined && this.#restoreManagedFallbackGetApiKey) {
+				this.#managedFallbackNextCredentialOverride = {
+					modelKey: canonicalModelKey,
+					storageProvider: resolveOAuthStorageProvider(resolvedModel.provider),
+					rowId: selectedCredentialRowId,
+				};
+			}
 			return true;
 		}
 		return false;
@@ -23732,6 +23891,62 @@ export class AgentSession {
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
+	#managedFallbackCanonicalModelKey(model: Model): string {
+		return JSON.stringify([resolveOAuthStorageProvider(model.provider), model.id]);
+	}
+
+	#ensureManagedFallbackCredentialTrackingGeneration(): void {
+		if (this.#managedFallbackTriedCredentialRowsGeneration === this.#promptGeneration) return;
+		this.#managedFallbackTriedCredentialRows.clear();
+		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
+		this.#managedFallbackQuotaCeilingModels.clear();
+		this.#managedFallbackActiveCredentialRows.clear();
+		this.#managedFallbackNextCredentialOverride = undefined;
+		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
+	}
+
+	#managedFallbackTriedRows(model: Model, credentialKind: string): Set<number> {
+		this.#ensureManagedFallbackCredentialTrackingGeneration();
+		const key = JSON.stringify([resolveOAuthStorageProvider(model.provider), model.id, credentialKind]);
+		let rowIds = this.#managedFallbackTriedCredentialRows.get(key);
+		if (!rowIds) {
+			rowIds = new Set<number>();
+			this.#managedFallbackTriedCredentialRows.set(key, rowIds);
+		}
+		return rowIds;
+	}
+
+	#trackManagedFallbackCredential(model: Model, credentialKind: string, rowId?: number): void {
+		this.#ensureManagedFallbackCredentialTrackingGeneration();
+		const modelKey = this.#managedFallbackCanonicalModelKey(model);
+		let credentialKinds = this.#managedFallbackQuotaFailedModelCredentialKinds.get(modelKey);
+		if (!credentialKinds) {
+			credentialKinds = new Set<string>();
+			this.#managedFallbackQuotaFailedModelCredentialKinds.set(modelKey, credentialKinds);
+		}
+		credentialKinds.add(credentialKind);
+		if (rowId !== undefined) this.#managedFallbackTriedRows(model, credentialKind).add(rowId);
+	}
+
+	#captureManagedFallbackActiveCredential(model: Model): void {
+		const modelKey = this.#managedFallbackCanonicalModelKey(model);
+		const authStorage = this.#modelRegistry.authStorage;
+		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
+		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
+		if (rowId !== undefined && credentialKind !== undefined)
+			this.#managedFallbackActiveCredentialRows.set(modelKey, { credentialKind, rowId });
+	}
+
+	#hasManagedFallbackCredentialPin(provider: string): boolean {
+		const authStorage = this.#modelRegistry.authStorage;
+		return (
+			authStorage.hasRuntimeApiKey(provider) ||
+			authStorage.hasRuntimeCredentialSelector(provider) ||
+			authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) ||
+			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
+		);
+	}
+
 	/**
 	 * Marks the credential that just failed and reports whether the session
 	 * actually moved to a DIFFERENT stored credential.
@@ -23748,16 +23963,19 @@ export class AgentSession {
 	 *    would hide an authorization defect and cycle through healthy rows.
 	 * 3. Auth failures retain their existing key-change proof. Quota, rate-limit
 	 *    and OAuth account-model rejections mark before resolving and require two known,
-	 *    different stored row IDs before reporting rotation. This is mark-time
-	 *    identity, not dispatch-bound attribution across shared sessions.
+	 *    different stored row IDs before reporting rotation. If a same-kind peer remains
+	 *    but the pre-mark row identity is unknown, return `alternate` so managed fallback
+	 *    can retry the model without claiming a proven row rotation.
 	 */
 	async #markFailedCredential(trigger: {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
-	}): Promise<"rotated" | "exhausted" | "unchanged"> {
+		trackSameTurnRows?: boolean;
+	}): Promise<"rotated" | "alternate" | "exhausted" | "unchanged"> {
+		const model = this.model;
 		if (
-			!this.model ||
+			!model ||
 			(trigger.class !== "auth" &&
 				trigger.class !== "quota" &&
 				trigger.class !== "rate_limit" &&
@@ -23769,14 +23987,9 @@ export class AgentSession {
 		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return "unchanged";
 
 		const authStorage = this.#modelRegistry.authStorage;
-		const provider = this.model.provider;
+		const provider = model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (
-			authStorage.hasRuntimeApiKey(provider) ||
-			authStorage.hasRuntimeCredentialSelector(provider) ||
-			authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) ||
-			authStorage.hasConfigApiKey(provider, this.#modelRegistry.getAuthStorageOwner())
-		) {
+		if (this.#hasManagedFallbackCredentialPin(provider)) {
 			return "unchanged";
 		}
 
@@ -23787,20 +24000,68 @@ export class AgentSession {
 				authStorage.getSessionCredentialType(provider, credentialSessionId) !== "oauth"
 			)
 				return "unchanged";
-			const before = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			const remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+			const modelKey = this.#managedFallbackCanonicalModelKey(model);
+			const dispatchedCredential = trigger.trackSameTurnRows
+				? this.#managedFallbackActiveCredentialRows.get(modelKey)
+				: undefined;
+			// Retain this snapshot through mark/result policy; the mark can mutate
+			// assignments before fallback decides whether the typed pool is exhausted.
+			const before =
+				dispatchedCredential?.rowId ?? authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+			const beforeKind = trigger.trackSameTurnRows
+				? (dispatchedCredential?.credentialKind ??
+					authStorage.getSessionCredentialType(provider, credentialSessionId))
+				: undefined;
+			// A visited row remains excluded even when marking fails or a concurrent
+			// credential insertion resets AuthStorage's session assignment/backoff.
+			if (trigger.trackSameTurnRows && beforeKind !== undefined)
+				this.#trackManagedFallbackCredential(model, beforeKind, before);
+			const markResult = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				// Account-model rejection retains default backoff, not response retry-after.
 				...(trigger.class === "credential" ? {} : { retryAfterMs: trigger.retryAfterMs }),
 				owner: this.#modelRegistry.getAuthStorageOwner(),
 				...(before === undefined ? {} : { rowId: before }),
 			});
-			if (!remaining) return "exhausted";
-			await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
-			const after = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
-			if (before !== undefined && after !== undefined && before !== after) return "rotated";
-			return "unchanged";
+			const { state, failedRowId, credentialKind, remainingCredentialIds } = markResult;
+			const trackedCredentialKind = credentialKind ?? beforeKind;
+			const triedRows =
+				trigger.trackSameTurnRows && trackedCredentialKind !== undefined
+					? this.#managedFallbackTriedRows(model, trackedCredentialKind)
+					: undefined;
+			if (trigger.trackSameTurnRows && trackedCredentialKind !== undefined) {
+				this.#trackManagedFallbackCredential(model, trackedCredentialKind, failedRowId);
+			}
+			if (remainingCredentialIds.length === 0) return state === "marked" ? "exhausted" : "unchanged";
+			if (credentialKind === undefined) return "unchanged";
+			for (const peerId of remainingCredentialIds) {
+				if (triedRows?.has(peerId)) continue;
+				if (!authStorage.isCredentialAvailable(provider, peerId)) continue;
+				let peerApiKey: string | undefined;
+				try {
+					peerApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId, {
+						credentialSelector: { kind: "id", value: String(peerId) },
+					});
+				} catch (error) {
+					if (authStorage.isCredentialAvailable(provider, peerId)) throw error;
+					continue;
+				}
+				if (!isAuthenticated(peerApiKey)) continue;
+				const selectedRowId = authStorage.getSessionCredentialRowId(provider, credentialSessionId);
+				const selectedKind = authStorage.getSessionCredentialType(provider, credentialSessionId);
+				if (
+					selectedRowId === peerId &&
+					selectedKind === credentialKind &&
+					authStorage.isCredentialAvailable(provider, peerId)
+				) {
+					triedRows?.add(selectedRowId);
+					return state === "marked" && before !== undefined && before === failedRowId && selectedRowId !== before
+						? "rotated"
+						: "alternate";
+				}
+			}
+			return triedRows ? (state === "marked" ? "exhausted" : "unchanged") : "exhausted";
 		}
-		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
+		const activeApiKey = await this.#modelRegistry.getApiKey(model, credentialSessionId);
 
 		if (!isAuthenticated(activeApiKey)) return "unchanged";
 		const remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
@@ -23810,7 +24071,7 @@ export class AgentSession {
 		if (!remaining) return "unchanged";
 
 		// (3) Distinct-row proof.
-		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+		if ((await this.#modelRegistry.getApiKey(model, credentialSessionId)) !== activeApiKey) {
 			return "rotated";
 		}
 		return remaining ? "unchanged" : "exhausted";
@@ -23978,17 +24239,31 @@ export class AgentSession {
 				: false;
 		}
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const providerAttemptsUsed = managedFallback
+			? Math.max(this.#managedFallbackProviderAttemptCount, controller.attemptsUsed || 1)
+			: attemptsUsed;
 		const providerRetryCeilingReached =
-			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
+			providerRetryMaxAttempts !== undefined && providerAttemptsUsed >= providerRetryMaxAttempts;
+		if (
+			managedFallback &&
+			providerRetryCeilingReached &&
+			(trigger.class === "quota" || trigger.class === "rate_limit") &&
+			this.model
+		) {
+			this.#ensureManagedFallbackCredentialTrackingGeneration();
+			this.#managedFallbackQuotaCeilingModels.add(this.#managedFallbackCanonicalModelKey(this.model));
+		}
 		// Credential rotation: a content-free quota/rate-limit failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
-		// extension lifecycle participation. Mark the failed credential and
-		// retry with the next stored credential of the same provider.
+		// extension lifecycle participation. Mark it before managed fallback
+		// policy decides whether to retry or advance, unless an explicit provider
+		// retry ceiling forbids another attempt.
 		let credentialRotated = false;
-		if (canRotateCodexCredential && trigger.class === "credential") {
+		let quotaCredentialMark: "rotated" | "alternate" | "exhausted" | "unchanged" | undefined;
+		if (canRotateCodexCredential && trigger.class === "credential" && !providerRetryCeilingReached) {
 			const mark = await this.#markFailedCredential(trigger);
 			this.#codexCredentialModelUnavailableRetried = true;
-			credentialRotated = mark === "rotated";
+			credentialRotated = mark === "rotated" || (managedFallback && mark === "alternate");
 			if (!credentialRotated && !managedFallback) {
 				return managedOutcome
 					? {
@@ -23999,14 +24274,16 @@ export class AgentSession {
 			}
 		}
 		if (
-			!managedFallback &&
-			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
-			const mark = await this.#markFailedCredential(trigger);
-			credentialRotated = mark === "rotated";
-			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
+			quotaCredentialMark = await this.#markFailedCredential({
+				...trigger,
+				trackSameTurnRows: managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+			});
+			credentialRotated =
+				quotaCredentialMark === "rotated" || (managedFallback && quotaCredentialMark === "alternate");
+			if (quotaCredentialMark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 
 		// A content-free credential rotation is inherently replay-safe: no partial
@@ -24055,10 +24332,44 @@ export class AgentSession {
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (managedFallback) {
+		if (
+			managedFallback &&
+			(quotaCredentialMark === "rotated" || quotaCredentialMark === "alternate") &&
+			!providerRetryCeilingReached
+		) {
+			// A credential retry is a separate dimension from model fallback
+			// attempts. Leave the controller on the current entry and refund its
+			// provisional request charge so every same-kind account is tried first.
+			controller.discardStartedAttempt();
+			outcome = "retry";
+		} else if (managedFallback) {
 			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
 			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
+			}
+			if (quotaCredentialMark === "exhausted" && outcome === "retry" && this.model) {
+				const failedProvider = this.model.provider;
+				const authStorage = this.#modelRegistry.authStorage;
+				// A same-turn row insertion resets AuthStorage's session assignment;
+				// use the dispatched request's kind rather than that now-missing pointer.
+				const dispatchedCredential = this.#managedFallbackActiveCredentialRows.get(
+					this.#managedFallbackCanonicalModelKey(this.model),
+				);
+				const credentialKind =
+					dispatchedCredential?.credentialKind ??
+					authStorage.getSessionCredentialType(failedProvider, this.credentialSessionId);
+				const storageProvider = resolveOAuthStorageProvider(failedProvider);
+				const activeCredentialCount =
+					credentialKind === undefined
+						? 0
+						: authStorage
+								.listCredentialInventory(storageProvider)
+								.filter(credential => !credential.disabled && credential.credentialKind === credentialKind)
+								.length;
+				// An exhausted typed pool should not spend the remaining model retry
+				// budget on the account that just failed. With only one active row of
+				// this credential kind, retain the existing configured retry behavior.
+				if (activeCredentialCount > 1) outcome = controller.advance() ? "advance" : "exhausted";
 			}
 			// The one content-free account retry was already spent: never spend
 			// another same-model attempt on a third account, advance instead.
@@ -24085,39 +24396,39 @@ export class AgentSession {
 		) {
 			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
 		}
-		// Credential rotation is unbounded: a fresh credential is a different
-		// retry dimension from transient-error backoff, so it overrides maxRetries
-		// exhaustion and forces an immediate same-model retry.
-		if (
-			managedFallback &&
-			!providerRetryCeilingReached &&
-			outcome === "advance" &&
-			(trigger.class === "quota" || trigger.class === "rate_limit")
-		) {
-			const mark = await this.#markFailedCredential(trigger);
-			credentialRotated = mark === "rotated";
-			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
-		}
-		if (credentialRotated) {
-			// A rotation only becomes a same-model retry if the controller can
-			// actually be rewound. `restorePreviousEntryForRetry()` refuses once an
-			// entry's restore budget is consumed or attempts are exhausted; ignoring
-			// that would force `outcome = "retry"` while `activeIndex` stays on the
-			// next entry and `this.model` stays on the previous one — splitting
-			// attempt attribution, exhaustion, and sticky selection across two models.
-			if (!managedFallback || controller.restorePreviousEntryForRetry()) {
+		// A fresh credential normally has its own retry dimension, but never
+		// override an explicit provider retry ceiling with a restored same-model
+		// entry.
+		if (credentialRotated && !providerRetryCeilingReached) {
+			// Do not rewind when the controller already chose retry: it still points
+			// at the current model. Rewind only after an actual model advance.
+			if (
+				!managedFallback ||
+				outcome === "retry" ||
+				(outcome === "advance" && controller.restorePreviousEntryForRetry())
+			) {
 				outcome = "retry";
 			}
 		}
 		if (outcome === "advance") {
 			this.#providerRetryMaxAttempts = undefined;
+			this.#managedFallbackProviderAttemptCount = 0;
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				let errorMessage = this.#fallbackExhaustionError(controller);
-				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+				if (
+					!providerRetryCeilingReached &&
+					(trigger.class === "quota" || trigger.class === "rate_limit")
+				) {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
-						const mark = await this.#markFailedCredential(trigger);
+						const mark =
+							quotaCredentialMark ??
+							(await this.#markFailedCredential({
+								...trigger,
+								trackSameTurnRows:
+									managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+							}));
 						if (mark === "exhausted") {
 							this.#stampQuotaRetryableAt(message);
 							errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
@@ -24160,14 +24471,18 @@ export class AgentSession {
 				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
 			if (retryCancelled()) return;
-			let quotaPoolExhausted = false;
+			let quotaPoolExhausted = quotaCredentialMark === "exhausted";
 			if (
 				managedFallback &&
 				!credentialRotated &&
+				quotaCredentialMark === undefined &&
 				!providerRetryCeilingReached &&
 				!(this.#isCodexCredentialModelUnavailable(message) && this.#codexCredentialModelUnavailableRetried)
 			) {
-				const mark = await this.#markFailedCredential(trigger);
+				const mark = await this.#markFailedCredential({
+					...trigger,
+					trackSameTurnRows: managedFallback && (trigger.class === "quota" || trigger.class === "rate_limit"),
+				});
 				if (mark === "rotated") credentialRotated = true;
 				quotaPoolExhausted = mark === "exhausted";
 			}
@@ -24587,6 +24902,7 @@ export class AgentSession {
 			if (!this.#isInterruptedRetryTail(lastMsg)) return false;
 			this.#retryAttempt = 0;
 			this.#providerRetryMaxAttempts = undefined;
+			this.#managedFallbackProviderAttemptCount = 0;
 			this.#scheduleAgentContinue({ delayMs: 1 });
 			return true;
 		}
@@ -24606,6 +24922,7 @@ export class AgentSession {
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
 		this.#providerRetryMaxAttempts = undefined;
+		this.#managedFallbackProviderAttemptCount = 0;
 
 		// Re-attempt the turn
 		this.#scheduleAgentContinue({ delayMs: 1 });
