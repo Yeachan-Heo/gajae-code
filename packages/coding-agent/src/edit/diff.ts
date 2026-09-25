@@ -8,6 +8,7 @@
 import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
+import { ToolError } from "../tools/tool-errors";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
 import { adjustIndentation, normalizeToLF, stripBom } from "./normalize";
 import { readEditFileText } from "./read-file";
@@ -724,7 +725,7 @@ export function parseDiffHunks(diff: string): DiffHunk[] {
  */
 export function replaceText(content: string, oldText: string, newText: string, options: ReplaceOptions): ReplaceResult {
 	if (oldText.length === 0) {
-		throw new Error("oldText must not be empty.");
+		throw new ToolError("oldText must not be empty.");
 	}
 	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
 	let normalizedContent = normalizeToLF(content);
@@ -780,7 +781,7 @@ export function replaceText(content: string, oldText: string, newText: string, o
 	});
 
 	if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-		throw new Error(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
+		throw new ToolError(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
 	}
 
 	if (!matchOutcome.match) {
