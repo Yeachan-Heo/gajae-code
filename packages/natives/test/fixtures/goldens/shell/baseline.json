@@ -133,5 +133,16 @@
         "timedOut": false
       }
     }
+,
+    {
+      "id": "declare-local-inherit",
+      "command": "x=outer; f() { local -I x; printf '%s' \"$x\"; }; f",
+      "result": {
+        "output": "error: local: not yet implemented: declare -I\nouter",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
   ]
 }

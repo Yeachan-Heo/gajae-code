@@ -3545,4 +3545,27 @@ mod tests {
 		assert_eq!(result.exit_code, Some(0));
 		assert_eq!(output, "kept|unset");
 	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn declare_local_inherit_copies_outer_value() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"x=outer; f() { local -I x; printf '%s' "$x"; }; f"#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("local -I should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "outer");
+	}
 }

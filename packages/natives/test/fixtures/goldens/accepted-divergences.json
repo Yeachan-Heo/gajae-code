@@ -276,6 +276,26 @@
       },
       "reason": "Pinned upstream reports each `command -V` operand independently while retaining success when at least one command resolves."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "declare-local-inherit",
+      "fields": {
+        "before": {
+          "output": "error: local: not yet implemented: declare -I\nouter",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "outer",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `local -I` by copying a visible variable's value and attributes into the new local binding instead of reporting the unsupported option."
+    }
   ],
   "nonAdoptions": [
     {
