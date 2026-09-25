@@ -1265,6 +1265,12 @@ export class SelectorController {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
 	}
 
+	#effectiveModelProfileNameForCurrentSession(): string | undefined {
+		const marker = this.ctx.session.getEffectiveModelProfileOwnershipMarker?.();
+		if (marker) return marker.kind === "profile" ? marker.profile : undefined;
+		return this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default");
+	}
+
 	#captureDefaultAssignmentRollback(): DefaultAssignmentRollbackSnapshot {
 		return {
 			model: this.ctx.session.model,
@@ -2852,7 +2858,7 @@ export class SelectorController {
 									}
 								}
 								assignmentMutationStarted = true;
-								materializedProfile = materializeActiveModelProfileAssignments({
+								materializedProfile = await materializeActiveModelProfileAssignments({
 									session: this.ctx.session,
 									settings: this.ctx.settings,
 									assignments,
@@ -2959,7 +2965,7 @@ export class SelectorController {
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
 							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							const materializedProfile = materializeActiveModelProfileAssignments({
+							const materializedProfile = await materializeActiveModelProfileAssignments({
 								session: this.ctx.session,
 								settings: this.ctx.settings,
 								assignments,
