@@ -168,7 +168,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 async function printStatsSummary(): Promise<void> {
 	const { getDashboardStats } = await import("@gajae-code/stats");
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder, byAgent } = stats;
+	const { overall, failures, byModel, byFolder, byAgent } = stats;
 
 	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
 
@@ -186,6 +186,15 @@ async function printStatsSummary(): Promise<void> {
 	if (overall.avgTokensPerSecond !== null) {
 		console.log(`  Avg Tokens/s: ${overall.avgTokensPerSecond.toFixed(1)}`);
 	}
+
+	console.log(chalk.bold("\nProvider Failures:"));
+	console.log(
+		`  Error+Abort Share: ${formatPercent(failures.failureShare)} (${formatNumber(failures.erroredRequests)} errors, ${formatNumber(failures.abortedRequests)} aborts)`,
+	);
+	console.log(`  Failed Duration: ${formatDuration(failures.failedDurationMs)}`);
+	console.log(
+		`  Post-Failure Full-Miss Tokens: ${formatNumber(failures.postFailureFullMissTokens)} (${formatNumber(failures.postFailureFullMissRequests)}/${formatNumber(failures.postFailureRequests)} requests)`,
+	);
 
 	if (byModel.length > 0) {
 		console.log(chalk.bold("\nBy Model:"));

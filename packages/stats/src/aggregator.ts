@@ -7,6 +7,7 @@ import {
 	getBehaviorOverall,
 	getBehaviorTimeSeries,
 	getCostTimeSeries,
+	getFailureReport,
 	getFileOffset,
 	getMessageById,
 	getMessageCount,
@@ -366,6 +367,7 @@ export async function getDashboardStats(range?: string | null): Promise<Dashboar
 
 	return {
 		overall: getOverallStats(cutoff ?? undefined),
+		failures: getFailureReport(cutoff ?? undefined),
 		byModel: getStatsByModel(cutoff ?? undefined),
 		byFolder: getStatsByFolder(cutoff ?? undefined),
 		byAgent: getStatsByAgent(cutoff ?? undefined),
