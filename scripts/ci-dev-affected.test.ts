@@ -1359,6 +1359,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/natives/test/walker-pool-unavailable.test.ts",
 			"packages/natives/test/walker-pool-unavailable.windows.test.ts",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
+			"packages/natives/test/windows-shell-path.windows.test.ts",
 			"packages/natives/test/windows-runtime-install.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);

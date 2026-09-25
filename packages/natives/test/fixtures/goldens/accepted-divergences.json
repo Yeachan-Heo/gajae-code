@@ -82,6 +82,279 @@
       },
       "reason": "Pinned upstream treats keypad digit keycodes as text even when the terminal omits the NumLock modifier bit."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "read-e-redirected-input",
+      "fields": {
+        "before": {
+          "output": "error: read: not yet implemented: read -e\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream accepts the readline flag on non-terminal input and falls back to the ordinary read path, returning the shell's EOF status instead of an unsupported-option error."
+    },
+    {
+      "module": "shell",
+      "caseId": "read-i-redirected-input",
+      "fields": {
+        "before": {
+          "output": "error: read: not yet implemented: read -i\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream treats initial text as a readline-only option; without an interactive terminal, the option is ignored and the ordinary read path returns EOF."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "jobs-list-changed",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs -n\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `jobs -n` by polling changed jobs instead of returning the fork's unsupported-option error."
+    },
+    {
+      "module": "shell",
+      "caseId": "jobs-list-pids",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs -l\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `jobs -l` and emits the PID column when managed jobs exist; an empty job table remains silent."
+    },
+    {
+      "module": "shell",
+      "caseId": "jobs-missing-spec",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs with job specs\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "jobs: no such job: %99999\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream resolves job specifications and reports missing jobs with the shell-compatible diagnostic and non-zero status."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "enable-shared-object-unsupported",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -f\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "enable: cannot open shared object missing.so: dynamic loading is not supported\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports dynamic loading as an ordinary builtin error with an explicit unsupported-platform explanation."
+    },
+    {
+      "module": "shell",
+      "caseId": "enable-remove-built-in",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -d\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "echo: not dynamically loaded\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream distinguishes static builtins from builtins that could be removed from a dynamically loaded object."
+    },
+    {
+      "module": "shell",
+      "caseId": "enable-remove-missing-built-in",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -d\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "missing: not a shell builtin\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports the named object as not a builtin when no dynamically loaded command exists to remove."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "command-v-multiple",
+      "fields": {
+        "before": {
+          "output": "true\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "true\necho\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream resolves every operand to `command -v` and emits each found builtin rather than stopping at the first name."
+    },
+    {
+      "module": "shell",
+      "caseId": "command-V-found-and-missing",
+      "fields": {
+        "before": {
+          "output": "true is a shell builtin\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "true is a shell builtin\ncommand: nonexistent: not found\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports each `command -V` operand independently while retaining success when at least one command resolves."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "declare-local-inherit",
+      "fields": {
+        "before": {
+          "output": "error: local: not yet implemented: declare -I\nouter",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "outer",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `local -I` by copying a visible variable's value and attributes into the new local binding instead of reporting the unsupported option."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "complete-default-missing",
+      "fields": {
+        "before": {
+          "output": "error: complete: not yet implemented: special spec not found\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "complete: _DefaultCmD_: no completion specification\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream names the absent default-completion target and returns the ordinary non-zero status rather than an unimplemented sentinel."
+    },
+    {
+      "module": "shell",
+      "caseId": "complete-action-needs-command",
+      "fields": {
+        "before": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "complete: invalid usage\n",
+          "exitCode": 2,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream distinguishes registration actions from printing the completion table and rejects an action without a target as invalid usage."
+    }
+,
+    {
+      "module": "shell",
+      "caseId": "mapfile-callbacks",
+      "fields": {
+        "before": {
+          "output": "error: mapfile: not yet implemented: mapfile -C/-c is not yet implemented\nvalues:,",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "cb:0:one\ncb:1:two\nvalues:one,two",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream invokes mapfile callbacks for each configured entry group before assigning that entry to the target array."
+    }
   ],
   "nonAdoptions": [
     {

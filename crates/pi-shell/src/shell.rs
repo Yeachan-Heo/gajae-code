@@ -1,3 +1,9 @@
+// Vendored from
+// can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-shell/
+// src/shell.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil
+// Labs, Inc. Modified for gajae-code: yes, 3-way reconciled cwd handling and
+// output decoding; retained local process, cancellation, HMAC, minimizer, and
+// output-budget hardening.
 //! Runtime-agnostic brush shell execution.
 
 use std::{
@@ -5,7 +11,6 @@ use std::{
 	fmt::Write as _,
 	fs,
 	io::{self, Write},
-	str,
 	sync::{
 		Arc, Mutex as StdMutex,
 		atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -14,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Error, Result};
-use brush_builtins::{BuiltinSet, default_builtins};
+use brush_builtins::{BuiltinSet, ShellBuilderExt};
 use brush_core::{
 	ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
 	ExternalProcessObserver, ProcessGroupPolicy, ProfileLoadBehavior, RcLoadBehavior,
@@ -39,7 +44,9 @@ use tokio_util::sync::CancellationToken;
 use crate::windows::configure_windows_path;
 use crate::{
 	cancel::{AbortReason, AbortToken, CancelToken},
-	minimizer, process,
+	minimizer,
+	output_decode::{OutputDecoder, decode_bytes},
+	process,
 };
 
 struct ShellSessionCore {
@@ -737,7 +744,7 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 		.contained_process_group(config.contained_process_group)
 		.profile(ProfileLoadBehavior::Skip)
 		.rc(RcLoadBehavior::Skip)
-		.builtins(default_builtins(BuiltinSet::BashMode))
+		.default_builtins(BuiltinSet::BashMode)
 		.build()
 		.await
 		.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
@@ -841,6 +848,27 @@ async fn source_snapshot(
 	Ok(())
 }
 
+fn shell_working_dir_matches(shell: &BrushShell, cwd: &str) -> bool {
+	let requested = std::path::Path::new(cwd);
+	let current = shell.working_dir();
+	if pi_vfs::is_virtual_path(requested) {
+		return current == requested;
+	}
+	if !requested.is_absolute() {
+		return false;
+	}
+	current == requested
+}
+
+async fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> Result<()> {
+	if shell_working_dir_matches(shell, cwd) {
+		return Ok(());
+	}
+	shell
+		.set_working_dir(cwd)
+		.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))
+}
+
 async fn run_shell_command(
 	session: &mut ShellSessionCore,
 	options: &ShellRunConfig,
@@ -848,10 +876,7 @@ async fn run_shell_command(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		session
-			.shell
-			.set_working_dir(cwd)
-			.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
 	}
 
 	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
@@ -1084,10 +1109,7 @@ async fn run_shell_command_streams(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		session
-			.shell
-			.set_working_dir(cwd)
-			.map_err(|err| Error::msg(format!("Failed to set cwd: {err}")))?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
 	}
 
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
@@ -1777,10 +1799,9 @@ async fn read_output(
 	activity: mpsc::Sender<()>,
 	budget: OutputBudget,
 ) {
-	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
-	let mut buf = vec![0u8; BUF + 4]; // +4 for max UTF-8 char
-	let mut it = 0;
+	let mut buf = vec![0u8; BUF];
+	let mut decoder = OutputDecoder::new();
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
@@ -1800,7 +1821,7 @@ async fn read_output(
 			}) else {
 				break;
 			};
-			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf[it..BUF])) {
+			match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut buf)) {
 				Ok(Ok(0)) => break,
 				Ok(Ok(n)) => n,
 				Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1810,72 +1831,28 @@ async fn read_output(
 		};
 		#[cfg(not(unix))]
 		let n = {
-			let read_future = reader.read(&mut buf[it..BUF]);
+			let read_future = reader.read(&mut buf);
 			tokio::pin!(read_future);
 			match tokio::select! {
 				res = &mut read_future => res,
 				() = cancel_token.cancelled() => break,
 			} {
-				Ok(0) => break, // EOF
+				Ok(0) => break,
 				Ok(n) => n,
 				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
 				Err(_) => break,
 			}
 		};
-		if n > 0 {
-			let _ = activity.try_send(());
-		}
-		it += n;
-
-		// Consume as much of `pending` as is decodable *right now*.
-		while it > 0 {
-			let pending = &buf[..it];
-			match str::from_utf8(pending) {
-				Ok(text) => {
-					emit_chunk(text, on_chunk.as_ref(), &budget);
-					it = 0;
-					break;
-				},
-				Err(err) => {
-					let p = err.valid_up_to();
-					if p > 0 {
-						// SAFETY: [..p] is guaranteed valid UTF-8 by valid_up_to().
-						let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-						emit_chunk(text, on_chunk.as_ref(), &budget);
-						// copy p..it to the beginning of the buffer
-						buf.copy_within(p..it, 0);
-						it -= p;
-					}
-
-					match err.error_len() {
-						Some(p) => {
-							// Invalid byte sequence: emit replacement and drop those bytes.
-							emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
-							// copy p..it to the beginning of the buffer
-							buf.copy_within(p..it, 0);
-							it -= p;
-							// continue loop in case more bytes remain after the
-							// invalid sequence
-						},
-						None => {
-							// Incomplete UTF-8 sequence at end: keep bytes for next read.
-							break;
-						},
-					}
-				},
-			}
+		let _ = activity.try_send(());
+		let text = decoder.push(&buf[..n]);
+		if !text.is_empty() {
+			emit_chunk(&text, on_chunk.as_ref(), &budget);
 		}
 	}
 
-	// Flush whatever is left at EOF (including an incomplete final sequence).
-	for chunk in buf[..it].utf8_chunks() {
-		let valid = chunk.valid();
-		if !valid.is_empty() {
-			emit_chunk(valid, on_chunk.as_ref(), &budget);
-		}
-		if !chunk.invalid().is_empty() {
-			emit_chunk(REPLACEMENT, on_chunk.as_ref(), &budget);
-		}
+	let text = decoder.finish();
+	if !text.is_empty() {
+		emit_chunk(&text, on_chunk.as_ref(), &budget);
 	}
 }
 
@@ -1887,15 +1864,11 @@ async fn read_output_buffered(
 	max_capture_bytes: usize,
 	budget: OutputBudget,
 ) -> BufferedOutput {
-	const REPLACEMENT: &str = "\u{FFFD}";
 	const BUF: usize = 65536;
 	let mut buf = vec![0u8; BUF];
 	let mut captured = Vec::new();
 	let mut exceeded = false;
-	// Pending bytes from a prior read that ended mid-UTF-8 sequence. We hold
-	// them back so we emit only valid UTF-8 to the streaming callback while
-	// still capturing every byte into `captured` for post-processing.
-	let mut pending = Vec::<u8>::new();
+	let mut decoder = OutputDecoder::new();
 
 	#[cfg(unix)]
 	let Ok(reader) = register_nonblocking_pipe(reader) else {
@@ -1937,13 +1910,9 @@ async fn read_output_buffered(
 				Err(_) => break,
 			}
 		};
-		if n > 0 {
-			let _ = activity.try_send(());
-		}
-		// Once `exceeded`, the post-process minimizer is bypassed (see the
-		// `!output.exceeded` gate at the call site), so further appends just
-		// grow `captured` without serving any purpose. Stop accumulating to
-		// bound peak memory on commands that produce very large output.
+		let _ = activity.try_send(());
+
+		// Once exceeded, further capture would only increase peak memory.
 		if !exceeded {
 			if captured.len().saturating_add(n) > max_capture_bytes {
 				exceeded = true;
@@ -1952,52 +1921,22 @@ async fn read_output_buffered(
 			}
 		}
 
-		// Stream whatever is validly decodable *right now* to the callback,
-		// carrying incomplete trailing UTF-8 bytes over to the next iteration.
-		if let Some(cb) = on_chunk.as_ref() {
-			pending.extend_from_slice(&buf[..n]);
-			while !pending.is_empty() {
-				match str::from_utf8(&pending) {
-					Ok(text) => {
-						emit_chunk(text, Some(cb), &budget);
-						pending.clear();
-						break;
-					},
-					Err(err) => {
-						let p = err.valid_up_to();
-						if p > 0 {
-							// SAFETY: [..p] is valid UTF-8 per valid_up_to().
-							let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-							emit_chunk(text, Some(cb), &budget);
-							pending.drain(..p);
-						}
-						match err.error_len() {
-							Some(skip) => {
-								emit_chunk(REPLACEMENT, Some(cb), &budget);
-								pending.drain(..skip);
-							},
-							None => break,
-						}
-					},
-				}
-			}
+		let text = decoder.push(&buf[..n]);
+		if !text.is_empty()
+			&& let Some(cb) = on_chunk.as_ref()
+		{
+			emit_chunk(&text, Some(cb), &budget);
 		}
 	}
 
-	// Flush any trailing bytes the streaming decoder held back at EOF.
-	if let Some(cb) = on_chunk.as_ref() {
-		for chunk in pending.utf8_chunks() {
-			let valid = chunk.valid();
-			if !valid.is_empty() {
-				emit_chunk(valid, Some(cb), &budget);
-			}
-			if !chunk.invalid().is_empty() {
-				emit_chunk(REPLACEMENT, Some(cb), &budget);
-			}
-		}
+	let text = decoder.finish();
+	if !text.is_empty()
+		&& let Some(cb) = on_chunk.as_ref()
+	{
+		emit_chunk(&text, Some(cb), &budget);
 	}
 
-	BufferedOutput { text: String::from_utf8_lossy(&captured).into_owned(), exceeded }
+	BufferedOutput { text: decode_bytes(&captured), exceeded }
 }
 
 #[cfg(unix)]
@@ -3564,5 +3503,107 @@ mod tests {
 			observed_pids.contains(&child_pid),
 			"a live child must appear in the observed descendant set",
 		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn cd_physical_mode_supports_exit_on_failed_resolution() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+		let command = format!("cd -P -e {} && printf cd-e-ok", quote_arg(&cwd));
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command, ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("cd -Pe should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "cd-e-ok");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn unset_name_reference_removes_the_reference_not_its_target() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"declare target=kept; declare -n reference=target; unset -n reference; printf '%s|%s' "$target" "${reference-unset}""#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("unset -n should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "kept|unset");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn declare_local_inherit_copies_outer_value() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"x=outer; f() { local -I x; printf '%s' "$x"; }; f"#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("local -I should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "outer");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_changed_reports_completed_jobs() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: "python3 -c 'import time; time.sleep(0.1)' & sleep 0.3; jobs -n".to_string(),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Done"), "changed-job output: {output:?}");
+		assert!(output.contains("python3"), "changed-job command: {output:?}");
+	}
+
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn jobs_list_long_includes_running_pid_and_command() {
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+		let shell = Shell::new(None);
+		let (result, output) = run_and_capture(&shell, ShellRunOptions {
+			command: "python3 -c 'import time; time.sleep(30)' & jobs -l".to_string(),
+			..Default::default()
+		})
+		.await;
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(output.contains("Running"), "job state output: {output:?}");
+		assert!(output.contains("python3"), "job command output: {output:?}");
 	}
 }

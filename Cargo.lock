@@ -2863,6 +2863,7 @@ dependencies = [
  "hmac",
  "libc",
  "os_pipe",
+ "pi-vfs",
  "regex",
  "serde",
  "serde_json",
