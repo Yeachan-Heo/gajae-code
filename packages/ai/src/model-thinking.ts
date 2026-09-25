@@ -78,7 +78,7 @@ const ALIBABA_DEEPSEEK_V4_PINNED_NAMES: Record<string, string> = {
 	"deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
 };
 const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
-const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GROK_4_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GROK_4_20_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
 const GROK_4_20_REASONING_MODEL_IDS = new Set([
 	"grok-4.20-0309-reasoning",
@@ -922,7 +922,13 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
 	const grokGeneration = parseDirectXaiReasoningEffortGeneration(model);
 	if (grokGeneration !== undefined) {
-		if (grokGeneration.major === 4 && grokGeneration.minor === 6) return GROK_4_6_EFFORTS;
+		if (
+			grokGeneration.major === 4 &&
+			grokGeneration.minor >= 6 &&
+			!GROK_4_20_REASONING_MODEL_IDS.has(model.id)
+		) {
+			return GROK_4_6_PLUS_EFFORTS;
+		}
 		if (GROK_4_20_REASONING_MODEL_IDS.has(model.id)) {
 			return GROK_4_20_EFFORTS;
 		}

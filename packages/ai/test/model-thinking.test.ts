@@ -89,6 +89,11 @@ describe("model thinking metadata", () => {
 			api: "openai-completions",
 			provider: "xai",
 		});
+		const grok47 = createModel({
+			id: "grok-4.7",
+			api: "openai-completions",
+			provider: "xai",
+		});
 		const grok45Preview = createModel({
 			id: "grok-4.5-preview",
 			api: "openai-completions",
@@ -115,6 +120,7 @@ describe("model thinking metadata", () => {
 			minLevel: Effort.Low,
 			maxLevel: Effort.XHigh,
 		});
+		expect(grok47.thinking).toEqual(grok46.thinking);
 		expect(grok45Preview.thinking).toEqual(grok45.thinking);
 		expect(grok5.thinking).toEqual(grok45.thinking);
 		expect(grok420.thinking).toEqual({
@@ -127,6 +133,8 @@ describe("model thinking metadata", () => {
 		expect(() => requireSupportedEffort(grok46, Effort.Minimal)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok46, Effort.Max)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok5, Effort.XHigh)).toThrow(/not supported/);
+		expect(requireSupportedEffort(grok47, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(() => requireSupportedEffort(grok47, Effort.Max)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok420, Effort.XHigh)).toThrow(/not supported/);
 	});
 
@@ -426,10 +434,11 @@ describe("generated model policies", () => {
 		expect(nonReasoning[0]?.thinking).toBeUndefined();
 	});
 
-	it("derives conservative thinking config for future direct xAI generations with catalog reasoning", () => {
+	it("advertises xhigh for direct grok-4.7, matching the xAI reasoning contract", () => {
 		const model = createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai" });
 
-		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High });
+		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh });
+		expect(getSupportedEfforts(model)).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh]);
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {
