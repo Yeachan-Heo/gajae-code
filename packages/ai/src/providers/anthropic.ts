@@ -371,7 +371,8 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
 	generatedCacheBudget: GeneratedCacheBudget;
-	warnedUnknownLongCacheRetention: boolean;
+	/** `provider\0model` keys already warned about a long cache-retention downgrade. */
+	warnedUnknownLongCacheRetention: Set<string>;
 	thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope;
 	thinkingReplayRepairAttempts: number;
 	thinkingReplayRejectedPayload?: AnthropicPayloadFingerprint;
@@ -400,14 +401,14 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
 		generatedCacheBudget: 2,
-		warnedUnknownLongCacheRetention: false,
+		warnedUnknownLongCacheRetention: new Set(),
 		thinkingReplayRepairScope: "none",
 		thinkingReplayRepairAttempts: 0,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
 			state.generatedCacheBudget = 2;
-			state.warnedUnknownLongCacheRetention = false;
+			state.warnedUnknownLongCacheRetention.clear();
 			state.thinkingReplayRepairScope = "none";
 			state.thinkingReplayRepairAttempts = 0;
 			state.thinkingReplayRejectedPayload = undefined;
@@ -2003,13 +2004,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					generatedCacheBudget,
 				);
 				let nextParams = builtParams.params;
+				const longCacheWarningKey = `${model.provider}\0${model.id}`;
 				if (
 					builtParams.warnUnknownLongCacheRetention &&
 					!warnedUnknownLongCacheRetention &&
-					!providerSessionState?.warnedUnknownLongCacheRetention
+					!providerSessionState?.warnedUnknownLongCacheRetention.has(longCacheWarningKey)
 				) {
 					warnedUnknownLongCacheRetention = true;
-					if (providerSessionState) providerSessionState.warnedUnknownLongCacheRetention = true;
+					providerSessionState?.warnedUnknownLongCacheRetention.add(longCacheWarningKey);
 					logger.warn(
 						'Anthropic-compatible endpoint has unknown long cache-retention support; omitting ttl (default ~5m). Set compat.supportsLongCacheRetention: true to opt into ttl: "1h".',
 						{ provider: model.provider, model: model.id },

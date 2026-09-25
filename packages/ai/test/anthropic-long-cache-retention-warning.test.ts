@@ -84,6 +84,24 @@ describe("anthropic long cache-retention downgrade warning (#5944)", () => {
 		expect(downgradeWarnings(warn.mock.calls)).toHaveLength(2);
 	});
 
+	it("warns separately for each compatible provider/model sharing one provider session", async () => {
+		const warn = vi.spyOn(logger, "warn");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const otherProvider = { ...proxyModel, provider: "other-anthropic", baseUrl: "https://other.example.test" };
+		const otherModel = { ...proxyModel, id: "claude-opus-4-1" };
+
+		await capturePayload(proxyModel, { providerSessionState });
+		await capturePayload(otherProvider, { providerSessionState });
+		await capturePayload(otherModel, { providerSessionState });
+		await capturePayload(otherProvider, { providerSessionState });
+
+		expect(downgradeWarnings(warn.mock.calls).map(call => call[1])).toEqual([
+			{ provider: "corp-anthropic", model: "claude-sonnet-4-5" },
+			{ provider: "other-anthropic", model: "claude-sonnet-4-5" },
+			{ provider: "corp-anthropic", model: "claude-opus-4-1" },
+		]);
+	});
+
 	it("stays silent when support is declared, retention is short, or no marker is generated", async () => {
 		const warn = vi.spyOn(logger, "warn");
 
