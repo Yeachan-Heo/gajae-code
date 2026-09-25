@@ -190,7 +190,7 @@ async function payload(root: string, archive: string, extra: string[] = []) {
 	return scan(root, "--payload", ["--tarball", archive, "--binary", "artifacts/gjc.bin", "--prose-root", ".", ...extra]);
 }
 
-async function compileFixture(root: string, source: string, files: Record<string, string>): Promise<string> {
+async function compileFixture(root: string, source: string, files: Record<string, string | Uint8Array>): Promise<string> {
 	const sourcePath = path.join(root, "entry.ts");
 	await Bun.write(sourcePath, source);
 	await writeFiles(root, files);
@@ -251,8 +251,8 @@ describe("scoped active PDF dependency reference audit", () => {
 		for (const [file, content] of cases) {
 			const root = await makeGitRoot({ [file]: content });
 			const result = scan(root, "--active-refs");
-			expect(result.exitCode).toBe(2, file);
-			expect(result.report.status).toBe("FAIL", file);
+			expect(result.exitCode).toBe(2);
+			expect(result.report.status).toBe("FAIL");
 		}
 	});
 

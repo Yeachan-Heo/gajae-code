@@ -2,8 +2,8 @@
 import * as path from "node:path";
 import { diffLinesDifferential } from "./cases/diff-lines";
 import { editFuzzyDifferential } from "./cases/edit-fuzzy";
-import { recordGoldens, verifyDifferential } from "./harness";
 import type { DifferentialDefinition } from "./harness";
+import { recordGoldens, verifyDifferential } from "./harness";
 
 export function parseDiffcheckArgs(args: readonly string[]): { module: string; record: boolean; goldenPath?: string } {
 	let module = "diff-lines";

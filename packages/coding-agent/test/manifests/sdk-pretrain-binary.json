@@ -26,7 +26,7 @@
     "dependencyInstall": ["bun", "install", "--offline", "--frozen-lockfile"],
     "nativeBuild": ["bun", "--cwd=packages/natives", "run", "build"],
     "nativeEmbed": ["bun", "--cwd=packages/natives", "run", "embed:native"],
-    "compile": ["bun", "build", "--compile", "--minify", "--no-compile-autoload-bunfig", "--no-compile-autoload-dotenv", "--no-compile-autoload-tsconfig", "--no-compile-autoload-package-json", "--keep-names", "--define", "process.env.PI_COMPILED=\"true\"", "--define", "process.env.GJC_BUILD_CHANNEL=\"dev\"", "--root", "../..", "./src/cli.ts", "./src/notifications/telegram-daemon-cli.ts", "--outfile", "dist/gjc-rollback"],
+    "compile": ["bun", "build", "--external", "mupdf", "--compile", "--minify", "--no-compile-autoload-bunfig", "--no-compile-autoload-dotenv", "--no-compile-autoload-tsconfig", "--no-compile-autoload-package-json", "--keep-names", "--define", "process.env.PI_COMPILED=\"true\"", "--define", "process.env.GJC_BUILD_CHANNEL=\"dev\"", "--root", "../..", "./src/cli.ts", "./src/notifications/telegram-daemon-cli.ts", "--outfile", "dist/gjc-rollback"],
     "sign": {
       "darwin": ["codesign", "--force", "--sign", "-", "dist/gjc-rollback"],
       "linux": [],
@@ -37,5 +37,5 @@
 
   "productCommand": ["{executable}", "notify", "daemon-internal", "--owner-id", "{ownerId}", "--agent-dir", "{agentDir}"],
   "shutdownCommand": ["{executable}", "daemon", "stop", "telegram", "--json", "--graceful-timeout-ms", "5000"],
-  "notes": "The rollback proof creates an isolated detached worktree at baseRef, installs that tree's locked dependencies offline, compiles the old CLI plus Telegram daemon entrypoint, resolves the host executable path (Bun appends .exe on Windows), applies host-appropriate signing (macOS ad-hoc codesign; no signing needed on Linux/Windows compiled binaries), hashes its exact executable bytes, and invokes only that executable. The preload deterministically intercepts only Telegram API fetches."
+  "notes": "The rollback proof creates an isolated detached worktree at baseRef, installs that tree's locked dependencies offline, compiles the old CLI plus Telegram daemon entrypoint, resolves the host executable path (Bun appends .exe on Windows), applies host-appropriate signing (macOS ad-hoc codesign; no signing needed on Linux/Windows compiled binaries), hashes its exact executable bytes, and invokes only that executable. The preload deterministically intercepts only Telegram API fetches. The pretrain compile externalizes its historical CJS PDF dependency because Bun 1.4 cannot bundle the transitive top-level-await module; the isolated worktree still installs that dependency, and rollback proof never invokes PDF conversion."
 }

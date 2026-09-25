@@ -1,5 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {

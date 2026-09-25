@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { FileType, glob, type GlobMatch, type GlobOptions } from "../native/index.js";
+import { FileType, type GlobMatch, type GlobOptions, glob } from "../native/index.js";
 
 type GoldenScenario = { matchCount: number; sha256: string };
 type GlobGolden = {
@@ -36,10 +36,7 @@ async function createFixtureTree() {
 	await fs.writeFile(path.join(fixtureRoot, "node_modules", "pkg", "index.js"), "module\n");
 	await fs.writeFile(path.join(fixtureRoot, "visible-target.txt"), "target\n");
 	for (let index = 0; index < 512; index++) {
-		await fs.writeFile(
-			path.join(fixtureRoot, "large", `item-${String(index).padStart(3, "0")}.txt`),
-			"x\n",
-		);
+		await fs.writeFile(path.join(fixtureRoot, "large", `item-${String(index).padStart(3, "0")}.txt`), "x\n");
 	}
 	if (process.platform !== "win32") {
 		await fs.symlink("visible-target.txt", path.join(fixtureRoot, "link-file"));

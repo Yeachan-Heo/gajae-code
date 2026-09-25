@@ -60,7 +60,10 @@ function normalizeResult(result: GrepResult) {
 	};
 }
 
-async function captureGrepCases(): Promise<{ archiveSha256: string; cases: Array<{ id: string; output: GrepOutput }> }> {
+async function captureGrepCases(): Promise<{
+	archiveSha256: string;
+	cases: Array<{ id: string; output: GrepOutput }>;
+}> {
 	const outputs: Array<{ id: string; output: GrepOutput }> = [];
 	for (const testCase of cases) {
 		try {
@@ -117,7 +120,7 @@ describe("grep upstream re-sync", () => {
 		expect([...acceptedById.keys()].sort()).toEqual(["pcre2-lookahead"]);
 		for (const testCase of output.cases) {
 			const baseline = baselineById.get(testCase.id);
-			expect(baseline).not.toBeUndefined();
+			if (baseline === undefined) throw new Error(`Missing pre-sync grep case ${testCase.id}`);
 			expect(testCase.output).toEqual(acceptedById.get(testCase.id) ?? baseline);
 		}
 	});

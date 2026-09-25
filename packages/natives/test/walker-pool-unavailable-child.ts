@@ -123,7 +123,13 @@ if (warmup.totalMatches !== 1) throw new Error(`warmup glob returned ${warmup.to
 const statusAfterWarmup = walkerPoolStatus();
 const before = await threadSnapshot();
 await fs.writeFile(readyFile, JSON.stringify({ rss: process.memoryUsage().rss }));
-while (!(await fs.stat(startFile).then(() => true, () => false))) await Bun.sleep(5);
+while (
+	!(await fs.stat(startFile).then(
+		() => true,
+		() => false,
+	))
+)
+	await Bun.sleep(5);
 
 const result = await glob({
 	path: root,

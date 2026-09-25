@@ -317,14 +317,11 @@ describe("installed ooo bridge flow", () => {
 				const nativeSource = path.resolve(import.meta.dirname, `../../natives/native/${nativeName}`);
 				await Bun.write(path.join(root, nativeName), await Bun.file(nativeSource).arrayBuffer());
 				const fixture = path.resolve(import.meta.dirname, "fixtures/ooo-bridge-compiled-loader.ts");
-				const compile = Bun.spawn(
-					[process.execPath, "build", fixture, "--compile", "--outfile", executable],
-					{
-						cwd: path.resolve(import.meta.dirname, "../../.."),
-						stdout: "pipe",
-						stderr: "pipe",
-					},
-				);
+				const compile = Bun.spawn([process.execPath, "build", fixture, "--compile", "--outfile", executable], {
+					cwd: path.resolve(import.meta.dirname, "../../.."),
+					stdout: "pipe",
+					stderr: "pipe",
+				});
 				const [compileExit, compileStderr] = await Promise.all([
 					compile.exited,
 					new Response(compile.stderr).text(),
