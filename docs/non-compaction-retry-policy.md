@@ -176,7 +176,7 @@ On `auto_retry_end`, it restores prior `Esc` handler and clears loader state.
 
 ## Streaming and prompt completion behavior
 
-`prompt()` ultimately waits on `#waitForRetry()` after `agent.prompt(...)` returns.
+A prompt's full settlement (`#settleEndedInFlight(..., "full")`) awaits `#waitForPostPromptRecovery()` after the agent run ends. That helper loops until `#retryPromise`, the TTSR resume promise, and outstanding post-prompt recovery tasks have all settled.
 
 Effect:
 
