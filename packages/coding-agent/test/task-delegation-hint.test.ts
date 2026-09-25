@@ -98,6 +98,16 @@ describe("task delegation decision hint", () => {
 				const payload = JSON.parse(String(init?.body));
 				expect(payload.model).toBe(KEV_SYSTEMONE_MODEL);
 				expect(payload.messages[1].content).toContain('"noul":"should delegate"');
+				expect(JSON.parse(payload.messages[1].content).metrics).toEqual({
+					toolCount: 4,
+					editCount: 2,
+					fileCount: 3,
+					packageCount: 2,
+					verificationCount: 1,
+					consecutiveEdits: 2,
+					activePlanStepCount: 4,
+					remainingContextRatio: 0.625,
+				});
 				expect(JSON.stringify(payload)).not.toContain("private assignment text");
 				expect(JSON.stringify(payload)).not.toContain("/synthetic/");
 			}),
@@ -109,6 +119,8 @@ describe("task delegation decision hint", () => {
 			packageCount: 2,
 			verificationCount: 1,
 			consecutiveEdits: 2,
+			activePlanStepCount: 4,
+			remainingContextRatio: 0.625,
 		};
 		expect(await fetcher(metrics, ["fast", "strong"])).toEqual({ noul: true, pDelegate: 0.05, choice: "strong" });
 		expect(called).toBe(true);
@@ -122,6 +134,7 @@ describe("task delegation decision hint", () => {
 			packageCount: 0,
 			verificationCount: 0,
 			consecutiveEdits: 0,
+			activePlanStepCount: 0,
 		};
 		const noTier = createKevDecisionFetcher(fixtureFetch({ noul: true, p_delegate: 0.7, choice: null }));
 		expect(await noTier(metrics, [])).toEqual({ noul: true, pDelegate: 0.7, choice: null });
@@ -132,6 +145,42 @@ describe("task delegation decision hint", () => {
 		expect(await extraKey(metrics, ["strong"])).toBeUndefined();
 		const badProbability = createKevDecisionFetcher(fixtureFetch({ ...positiveDecision, p_delegate: 1.1 }));
 		expect(await badProbability(metrics, ["strong"])).toBeUndefined();
+	});
+
+	it("omits unknown context ratios and bounds numeric signals before serialization", async () => {
+		let requestMetrics: Record<string, unknown> | undefined;
+		const fetcher = createKevDecisionFetcher(
+			fixtureFetch(positiveDecision, (_input, init) => {
+				const payload = JSON.parse(String(init?.body));
+				requestMetrics = JSON.parse(payload.messages[1].content).metrics;
+			}),
+		);
+		const metrics: DelegationHintMetrics = {
+			toolCount: 0,
+			editCount: 0,
+			fileCount: 0,
+			packageCount: 0,
+			verificationCount: 0,
+			consecutiveEdits: 0,
+			activePlanStepCount: 10_001,
+			remainingContextRatio: 1.5,
+		};
+		await fetcher(metrics, []);
+		expect(requestMetrics).toMatchObject({ activePlanStepCount: 10_000, remainingContextRatio: 1 });
+
+		await fetcher({ ...metrics, activePlanStepCount: 3, remainingContextRatio: Number.NaN }, []);
+		expect(requestMetrics).toEqual({
+			toolCount: 0,
+			editCount: 0,
+			fileCount: 0,
+			packageCount: 0,
+			verificationCount: 0,
+			consecutiveEdits: 0,
+			activePlanStepCount: 3,
+		});
+
+		await fetcher({ ...metrics, activePlanStepCount: 3, remainingContextRatio: -0.25 }, []);
+		expect(requestMetrics).toMatchObject({ remainingContextRatio: 0 });
 	});
 
 	it("fires only for observable multi-file activity and shows an ephemeral user notice", async () => {
@@ -149,7 +198,13 @@ describe("task delegation decision hint", () => {
 		});
 		hint.onTurnStart();
 		for (const path of ["/synthetic/packages/alpha/a.ts", "/synthetic/packages/alpha/b.ts"]) {
-			hint.observeAfterToolCall({ toolName: "edit", args: edit(path), isError: false });
+			hint.observeAfterToolCall({
+				toolName: "edit",
+				args: edit(path),
+				isError: false,
+				getActivePlanStepCount: () => 2,
+				getRemainingContextRatio: () => 0.35,
+			});
 		}
 		await flushTurn();
 		expect(requestMetrics).toBeUndefined();
@@ -157,7 +212,13 @@ describe("task delegation decision hint", () => {
 
 		const editArgs = edit("/synthetic/packages/beta/c.ts");
 		const before = structuredClone(editArgs);
-		hint.observeAfterToolCall({ toolName: "edit", args: editArgs, isError: false });
+		hint.observeAfterToolCall({
+			toolName: "edit",
+			args: editArgs,
+			isError: false,
+			getActivePlanStepCount: () => 2,
+			getRemainingContextRatio: () => 0.35,
+		});
 		await flushTurn();
 		expect(editArgs).toEqual(before);
 		expect(requestMetrics).toEqual({
@@ -167,10 +228,14 @@ describe("task delegation decision hint", () => {
 			packageCount: 2,
 			verificationCount: 0,
 			consecutiveEdits: 3,
+			activePlanStepCount: 2,
+			remainingContextRatio: 0.35,
 		});
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain("task(executor, tier=strong)");
 		expect(notices[0]).toContain("p_delegate=0.05");
+		expect(notices[0]).toContain("active_plan_steps=2");
+		expect(notices[0]).toContain("remaining_context_ratio=0.35");
 		expect(notices[0]).not.toContain("/synthetic/");
 	});
 
@@ -209,10 +274,112 @@ describe("task delegation decision hint", () => {
 			packageCount: 3,
 			verificationCount: 0,
 			consecutiveEdits: 1,
+			activePlanStepCount: 0,
 		});
 		expect(sent).not.toContain("packages/alpha");
 		expect(sent).not.toContain("private patch body");
 		expect(notices).toHaveLength(1);
+	});
+
+	it("classifies a successful todo plan with three active steps and ignores failed writes", async () => {
+		let requestMetrics: Record<string, unknown> | undefined;
+		let requests = 0;
+		let sent = "";
+		const hint = controller({
+			mode: "hint",
+			fetcher: fixtureFetch(positiveDecision, (_input, init) => {
+				requests++;
+				const payload = JSON.parse(String(init?.body));
+				requestMetrics = JSON.parse(payload.messages[1].content).metrics;
+				sent = JSON.stringify(payload);
+			}),
+		});
+		hint.onTurnStart();
+		hint.observeAfterToolCall({
+			toolName: "todo_write",
+			args: { content: "private plan text" },
+			isError: false,
+			getActivePlanStepCount: () => 2,
+		});
+		await flushTurn();
+		expect(requests).toBe(0);
+
+		hint.observeAfterToolCall({
+			toolName: "todo_write",
+			args: { content: "private plan text" },
+			isError: false,
+			getActivePlanStepCount: () => 3,
+			getRemainingContextRatio: () => 0.4,
+		});
+		await flushTurn();
+		expect(requests).toBe(1);
+		expect(requestMetrics).toMatchObject({
+			toolCount: 2,
+			editCount: 0,
+			activePlanStepCount: 3,
+			remainingContextRatio: 0.4,
+		});
+		expect(sent).not.toContain("private plan text");
+
+		for (const failure of [{ isError: true }, { isError: false, resultError: true }]) {
+			const failedHint = controller({
+				mode: "hint",
+				fetcher: fixtureFetch(positiveDecision, () => requests++),
+			});
+			failedHint.onTurnStart();
+			failedHint.observeAfterToolCall({
+				toolName: "todo_write",
+				args: {},
+				getActivePlanStepCount: () => 3,
+				...failure,
+			});
+			await flushTurn();
+		}
+		expect(requests).toBe(1);
+	});
+
+	it("reads context usage only when an observable classification trigger fires", async () => {
+		let contextReads = 0;
+		let planReads = 0;
+		let requests = 0;
+		const hint = controller({
+			mode: "hint",
+			fetcher: fixtureFetch(positiveDecision, () => requests++),
+		});
+		const signalGetters = {
+			getActivePlanStepCount: () => {
+				planReads++;
+				return 0;
+			},
+			getRemainingContextRatio: () => {
+				contextReads++;
+				return 0.4;
+			},
+		};
+		hint.onTurnStart();
+		hint.observeAfterToolCall({ toolName: "read", args: {}, isError: false, ...signalGetters });
+		expect(planReads).toBe(0);
+		expect(contextReads).toBe(0);
+		for (let index = 0; index < 2; index++) {
+			hint.observeAfterToolCall({
+				toolName: "edit",
+				args: edit("/synthetic/one/file.ts"),
+				isError: false,
+				...signalGetters,
+			});
+		}
+		expect(planReads).toBe(2);
+		expect(contextReads).toBe(0);
+
+		hint.observeAfterToolCall({
+			toolName: "edit",
+			args: edit("/synthetic/one/file.ts"),
+			isError: false,
+			...signalGetters,
+		});
+		expect(contextReads).toBe(1);
+		await flushTurn();
+		expect(requests).toBe(1);
 	});
 
 	it("keeps the tier suggestion absent when no autorouting tier is configured", async () => {
@@ -305,6 +472,7 @@ describe("task delegation decision hint", () => {
 			packageCount: 0,
 			verificationCount: 0,
 			consecutiveEdits: 0,
+			activePlanStepCount: 0,
 		};
 		const invalid = createKevDecisionFetcher(fixtureFetch({ noul: true, p_delegate: 2, choice: "strong" }));
 		expect(await invalid(metrics, ["strong"])).toBeUndefined();

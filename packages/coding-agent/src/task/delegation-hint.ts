@@ -21,8 +21,9 @@ const MIN_TURNS_BETWEEN_HINTS = 3;
 const MIN_FILES_TO_CLASSIFY = 3;
 const MIN_PACKAGES_TO_CLASSIFY = 2;
 const MIN_EDITS_WITHOUT_VERIFICATION = 3;
+const MIN_ACTIVE_PLAN_STEPS_TO_CLASSIFY = 3;
 const SYSTEM_INSTRUCTIONS =
-	'Classify only the aggregate numeric metrics provided. Return exactly one JSON object with the keys "noul", "p_delegate", and "choice". "noul" is a boolean meaning whether the agent should delegate; "p_delegate" is a number from 0 to 1; "choice" must be one of the supplied tiers, or null when no tiers are available. Do not request or infer from raw paths, source text, assignments, prompts, or session content.';
+	'Classify only the aggregate numeric metrics provided. activePlanStepCount is the number of active peer tasks in the largest explicit plan phase; remainingContextRatio is the remaining fraction of the context window. Return exactly one JSON object with the keys "noul", "p_delegate", and "choice". "noul" is a boolean meaning whether the agent should delegate; "p_delegate" is a number from 0 to 1; "choice" must be one of the supplied tiers, or null when no tiers are available. Do not request or infer from raw paths, source text, assignments, prompts, or session content.';
 
 type Tier = AutoroutingTier;
 
@@ -33,6 +34,10 @@ export interface DelegationHintMetrics {
 	packageCount: number;
 	verificationCount: number;
 	consecutiveEdits: number;
+	/** Pending/in-progress peer tasks in the largest explicit plan phase. */
+	activePlanStepCount: number;
+	/** Remaining fraction of the context window, omitted when usage is unknown. */
+	remainingContextRatio?: number;
 }
 
 export interface KevDecision {
@@ -61,7 +66,12 @@ function boundedCount(value: number): number {
 	return Number.isFinite(value) ? Math.min(MAX_COUNTER, Math.max(0, Math.floor(value))) : 0;
 }
 
+function boundedRatio(value: number | undefined): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : undefined;
+}
+
 function normalizeMetrics(metrics: DelegationHintMetrics): DelegationHintMetrics {
+	const remainingContextRatio = boundedRatio(metrics.remainingContextRatio);
 	return {
 		toolCount: boundedCount(metrics.toolCount),
 		editCount: boundedCount(metrics.editCount),
@@ -69,6 +79,8 @@ function normalizeMetrics(metrics: DelegationHintMetrics): DelegationHintMetrics
 		packageCount: boundedCount(metrics.packageCount),
 		verificationCount: boundedCount(metrics.verificationCount),
 		consecutiveEdits: boundedCount(metrics.consecutiveEdits),
+		activePlanStepCount: boundedCount(metrics.activePlanStepCount),
+		...(remainingContextRatio === undefined ? {} : { remainingContextRatio }),
 	};
 }
 
@@ -352,19 +364,21 @@ function isVerificationCommand(command: unknown): boolean {
 	return typeof command === "string" && /\b(test|check|lint|build|verify|typecheck)\b/iu.test(command);
 }
 
-function shouldClassify(metrics: DelegationHintMetrics): boolean {
+function shouldClassify(metrics: DelegationHintMetrics, successfulTodoWrite: boolean): boolean {
 	return (
 		metrics.fileCount >= MIN_FILES_TO_CLASSIFY ||
 		metrics.packageCount >= MIN_PACKAGES_TO_CLASSIFY ||
-		metrics.consecutiveEdits >= MIN_EDITS_WITHOUT_VERIFICATION
+		metrics.consecutiveEdits >= MIN_EDITS_WITHOUT_VERIFICATION ||
+		(successfulTodoWrite && metrics.activePlanStepCount >= MIN_ACTIVE_PLAN_STEPS_TO_CLASSIFY)
 	);
 }
 
 function decisionHintMessage(decision: KevDecision, metrics: DelegationHintMetrics): string {
 	const suggestedTask = decision.choice ? `task(executor, tier=${decision.choice})` : "task(executor)";
+	const remainingContextRatio = metrics.remainingContextRatio?.toFixed(2) ?? "unknown";
 	return [
 		`Local delegation hint: consider ${suggestedTask} (advisory; it will not change model input or routing).`,
-		`p_delegate=${decision.pDelegate.toFixed(2)}; trigger: tools=${metrics.toolCount}, successful_edits=${metrics.editCount}, files=${metrics.fileCount}, packages=${metrics.packageCount}, verification_activity=${metrics.verificationCount}, consecutive_edits_without_verification=${metrics.consecutiveEdits}.`,
+		`p_delegate=${decision.pDelegate.toFixed(2)}; trigger: tools=${metrics.toolCount}, successful_edits=${metrics.editCount}, files=${metrics.fileCount}, packages=${metrics.packageCount}, verification_activity=${metrics.verificationCount}, consecutive_edits_without_verification=${metrics.consecutiveEdits}, active_plan_steps=${metrics.activePlanStepCount}, remaining_context_ratio=${remainingContextRatio}.`,
 	].join(" ");
 }
 
@@ -384,6 +398,7 @@ export class DelegationHintController {
 	#editCount = 0;
 	#verificationCount = 0;
 	#consecutiveEdits = 0;
+	#activePlanStepCount = 0;
 	#lastHintTurn = Number.NEGATIVE_INFINITY;
 	#lastRequestTurn = Number.NEGATIVE_INFINITY;
 	#enabled = false;
@@ -411,6 +426,7 @@ export class DelegationHintController {
 		this.#editCount = 0;
 		this.#verificationCount = 0;
 		this.#consecutiveEdits = 0;
+		this.#activePlanStepCount = 0;
 		this.#files.clear();
 		this.#packages.clear();
 	}
@@ -429,6 +445,8 @@ export class DelegationHintController {
 			args: Record<string, unknown>;
 			isError: boolean;
 			resultError?: boolean;
+			getActivePlanStepCount?: () => number;
+			getRemainingContextRatio?: () => number | undefined;
 		},
 		signal?: AbortSignal,
 	): void {
@@ -442,24 +460,34 @@ export class DelegationHintController {
 				return;
 			}
 			if (EDIT_TOOLS.has(input.toolName)) this.#consecutiveEdits = boundedCount(this.#consecutiveEdits + 1);
-			if (!EDIT_TOOLS.has(input.toolName) || input.isError || input.resultError === true) return;
-			this.#editCount = boundedCount(this.#editCount + 1);
-			for (const path of stringsFromPathFields(input.args)) {
-				if (this.#files.size < MAX_TRACKED_FILES)
-					this.#files.add(crypto.createHash("sha256").update(path).digest("hex"));
-				const packageName = packageFromPath(path);
-				if (packageName && this.#packages.size < MAX_TRACKED_PACKAGES) {
-					this.#packages.add(crypto.createHash("sha256").update(packageName).digest("hex"));
+			const successfulEdit = EDIT_TOOLS.has(input.toolName) && !input.isError && input.resultError !== true;
+			const successfulTodoWrite = input.toolName === "todo_write" && !input.isError && input.resultError !== true;
+			if (!successfulEdit && !successfulTodoWrite) return;
+			this.#activePlanStepCount = boundedCount(input.getActivePlanStepCount?.() ?? 0);
+			if (successfulEdit) {
+				this.#editCount = boundedCount(this.#editCount + 1);
+				for (const path of stringsFromPathFields(input.args)) {
+					if (this.#files.size < MAX_TRACKED_FILES)
+						this.#files.add(crypto.createHash("sha256").update(path).digest("hex"));
+					const packageName = packageFromPath(path);
+					if (packageName && this.#packages.size < MAX_TRACKED_PACKAGES) {
+						this.#packages.add(crypto.createHash("sha256").update(packageName).digest("hex"));
+					}
 				}
 			}
-			const metrics = this.#metrics();
+			const baseMetrics = this.#metrics();
 			if (
-				!shouldClassify(metrics) ||
+				!shouldClassify(baseMetrics, successfulTodoWrite) ||
 				this.#turnIndex - this.#lastRequestTurn < MIN_TURNS_BETWEEN_HINTS ||
 				this.#shownSignatures.size >= MAX_HINT_SIGNATURES
 			) {
 				return;
 			}
+			const remainingContextRatio = boundedRatio(input.getRemainingContextRatio?.());
+			const metrics = {
+				...baseMetrics,
+				...(remainingContextRatio === undefined ? {} : { remainingContextRatio }),
+			};
 			this.#lastRequestTurn = this.#turnIndex;
 			const requestTurn = this.#turnIndex;
 			const requestGeneration = this.#inputGeneration;
@@ -500,6 +528,7 @@ export class DelegationHintController {
 			packageCount: this.#packages.size,
 			verificationCount: this.#verificationCount,
 			consecutiveEdits: this.#consecutiveEdits,
+			activePlanStepCount: this.#activePlanStepCount,
 		};
 	}
 
@@ -532,6 +561,8 @@ export class DelegationHintController {
 				metrics.packageCount,
 				metrics.verificationCount,
 				metrics.consecutiveEdits,
+				metrics.activePlanStepCount,
+				metrics.remainingContextRatio,
 				decision.choice,
 			]);
 			if (this.#shownSignatures.has(signature) || this.#shownSignatures.size >= MAX_HINT_SIGNATURES) return;
