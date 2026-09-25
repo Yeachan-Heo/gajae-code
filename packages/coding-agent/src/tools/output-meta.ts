@@ -1069,29 +1069,43 @@ async function enforceInlineResultBackstop(
 
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+
+	// If a prior truncation exists (from spillLargeResultToArtifact), preserve its totals
+	// instead of using the intermediate truncated view's totals. The intermediate view was
+	// already truncated by the spill step, so its totalLines/totalBytes do not reflect the
+	// original full output. We only update outputLines/outputBytes to reflect the new
+	// backstop truncation level.
+	const priorTruncation = existingMeta?.truncation;
+	const realTotalLines = priorTruncation?.totalLines ?? truncated.totalLines;
+	const realTotalBytes = priorTruncation?.totalBytes ?? truncated.totalBytes;
+	const elidedLines = Math.max(0, realTotalLines - outputLines);
+	const elidedBytes = Math.max(0, realTotalBytes - outputBytes);
+
 	const truncationMeta: TruncationMeta =
 		truncated.truncatedBy === "middle"
 			? {
 					direction: "middle",
 					truncatedBy: "middle",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					elidedLines: truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines),
-					elidedBytes: truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes),
+					headRange: undefined,
+					tailRange: undefined,
+					elidedLines,
+					elidedBytes,
 					artifactId,
 				}
 			: {
 					direction: "tail",
 					truncatedBy: truncated.truncatedBy ?? "bytes",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					shownRange: { start: truncated.totalLines - outputLines + 1, end: truncated.totalLines },
+					shownRange: { start: realTotalLines - outputLines + 1, end: realTotalLines },
 					artifactId,
 				};
 
