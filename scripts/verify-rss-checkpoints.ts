@@ -884,13 +884,19 @@ function memoryDistribution(samples: ProcessSample[], phase: "barrierMemory" | "
 	const keys: Array<keyof MemorySnapshot> = ["heapUsed", "heapTotal", "external", "arrayBuffers"];
 	return Object.fromEntries(keys.map(key => [key, sampleDistribution(samples.map(sample => sample[phase][key]))])) as Record<keyof MemorySnapshot, Distribution>;
 }
-function maxRssCommand(command: string[]): string[] {
+/**
+ * Wrap `command` in the platform max-RSS sampler. On Linux, GNU time writes its report to
+ * `reportPath` rather than stderr: the measured Bun child shares time's stderr pipe and
+ * flips it to O_NONBLOCK, so time's own report write fails with EAGAIN and time exits 1
+ * even though the measured command succeeded.
+ */
+export function maxRssCommand(command: string[], reportPath: string): string[] {
 	if (process.platform === "darwin") return ["/usr/bin/time", "-l", ...command];
-	if (process.platform === "linux") return ["/usr/bin/time", "-v", ...command];
+	if (process.platform === "linux") return ["/usr/bin/time", "-v", "-o", reportPath, ...command];
 	throw new CheckpointError("RssSamplerUnavailable", `Stable RSS sampling is unsupported on ${process.platform}.`);
 }
 
-function parseMaxRssBytes(stderr: string): number | undefined {
+export function parseMaxRssBytes(stderr: string): number | undefined {
 	for (const line of stderr.split(/\r?\n/)) {
 		const darwin = /^(?:\s*)(\d+)\s+maximum resident set size\s*$/.exec(line);
 		if (darwin) return Number(darwin[1]);
@@ -911,7 +917,8 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 	const processEnv = options.memoryProbeFile
 		? { ...env, GJC_RSS_MEMORY_PROBE: options.memoryProbeFile, ...(options.cleanupFile ? { GJC_RSS_CLEANUP_FILE: options.cleanupFile } : {}) }
 		: env;
-	const proc = Bun.spawn(maxRssCommand(command), { cwd, env: processEnv, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const timeReportPath = path.join(os.tmpdir(), `gjc-rss-time-${process.pid}-${crypto.randomUUID()}.txt`);
+	const proc = Bun.spawn(maxRssCommand(command, timeReportPath), { cwd, env: processEnv, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 	const stdoutPromise = new Response(proc.stdout).text();
 	const stderrPromise = new Response(proc.stderr).text();
 
@@ -981,6 +988,10 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 		await Promise.race([exitPromise, sleep(1_000)]);
 	}
 	let exitCode = await exitPromise;
+	// Absent on darwin, where `time -l` still reports on stderr.
+	const timeReportFile = Bun.file(timeReportPath);
+	const timeReport = (await timeReportFile.exists()) ? await timeReportFile.text() : "";
+	await fs.rm(timeReportPath, { force: true });
 	const finalUsage = treeUsage(proc.pid);
 	for (const pid of finalUsage.childPids) observedChildPids.add(pid);
 	if (exitRssBytes === 0 && finalUsage.rssBytes > 0) exitRssBytes = finalUsage.rssBytes;
@@ -1001,7 +1012,8 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 	if (options.barrierFile && !barrierReached) {
 		throw new CheckpointError("ScenarioBarrierMissing", `Scenario ${command[0]} exited without explicit barrier ${options.barrierFile}.`);
 	}
-	const [, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+	const [, childStderr] = await Promise.all([stdoutPromise, stderrPromise]);
+	const stderr = childStderr + timeReport;
 	const stableRssBytes = parseMaxRssBytes(stderr) ?? 0;
 	const stableTreeRssBytes = Math.max(barrierRssBytes, exitRssBytes);
 	if (stableTreeRssBytes <= 0 || !Number.isFinite(stableTreeRssBytes)) {
