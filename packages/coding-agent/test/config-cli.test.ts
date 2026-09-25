@@ -90,18 +90,21 @@ describe("config CLI schema coverage", () => {
 		expect(plainModelRolesLine).not.toContain("[object Object]");
 	});
 
-	it("hides the internal ownership record from generic config reads and writes", async () => {
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+	it("blocks generic writes to ownership state and its versioned projection", async () => {
 		vi.spyOn(process, "exit").mockImplementation(((): never => {
 			throw new Error("process.exit");
 		}) as never);
-
-		await runConfigCommand({ action: "list", flags: { json: true } });
-		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).not.toHaveProperty("modelProfile.ownership");
+		await runConfigCommand({ action: "get", key: "modelProfile.default", flags: { json: true } });
+		const ownerRecord = { schemaVersion: 1, version: 1, marker: { kind: "profile", profile: "profile-a" } } as const;
+		settings.set("modelProfile.ownership", ownerRecord as never);
+		settings.set("modelProfile.default", "profile-a");
 		await expect(
 			runConfigCommand({ action: "set", key: "modelProfile.ownership", value: "{}", flags: { json: true } }),
 		).rejects.toThrow("process.exit");
-		expect(settings.getGlobal("modelProfile.ownership")).toBeUndefined();
+		await expect(
+			runConfigCommand({ action: "reset", key: "modelProfile.default", flags: { json: true } }),
+		).rejects.toThrow("process.exit");
+		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
 	});
 
 	it("sets and gets record settings as JSON objects", async () => {
