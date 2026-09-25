@@ -1,19 +1,19 @@
 import { describe, expect, it } from "bun:test";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	Ellipsis,
 	extractSegments,
-	matchesKey as matchesNativeKey,
 	matchesKittySequence,
 	matchesLegacySequence,
-	parseKey as parseNativeKey,
+	matchesKey as matchesNativeKey,
 	parseKittySequence,
+	parseKey as parseNativeKey,
 	sliceWithWidth,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@gajae-code/natives";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 
 const GOLDEN_ROOT = join(import.meta.dir, "../../natives/test/fixtures/goldens");
 const RECORD_GOLDENS = process.env.GJC_RECORD_TEXT_KEYS_GOLDENS === "1";
@@ -124,12 +124,12 @@ function captureText(): unknown[] {
 		wraps: wrapWidths.map(width => ({ width, lines: wrapTextWithAnsi(text, width, tabWidth) })),
 		truncations: [0, 1, 3, 8].flatMap(width =>
 			[Ellipsis.Unicode, Ellipsis.Ascii, Ellipsis.Omit].flatMap(ellipsis =>
-			[false, true].map(pad => ({
-				width,
-				ellipsis,
-				pad,
-				text: truncateToWidth(text, width, ellipsis, pad, tabWidth),
-			})),
+				[false, true].map(pad => ({
+					width,
+					ellipsis,
+					pad,
+					text: truncateToWidth(text, width, ellipsis, pad, tabWidth),
+				})),
 			),
 		),
 		slice: sliceWithWidth(text, 1, 5, false, tabWidth),
@@ -167,7 +167,8 @@ function applyGoldenPatch(record: Record<string, unknown>, path: string, value: 
 	if (!key || !parent || typeof parent !== "object") throw new Error(`Invalid golden patch path ${path}`);
 	if (Array.isArray(parent)) {
 		const index = Number(key);
-		if (!Number.isInteger(index) || index < 0 || index >= parent.length) throw new Error(`Invalid golden patch index ${path}`);
+		if (!Number.isInteger(index) || index < 0 || index >= parent.length)
+			throw new Error(`Invalid golden patch index ${path}`);
 		parent[index] = value;
 	} else {
 		if (!Object.hasOwn(parent, key)) throw new Error(`Unknown golden patch field ${path}`);
@@ -195,7 +196,10 @@ async function assertGolden(name: "text" | "keys", actual: unknown[]): Promise<v
 		return;
 	}
 
-	const golden = JSON.parse(await readFile(path, "utf8")) as { schema: number; corpus: Array<Record<string, unknown> & { id: string }> };
+	const golden = JSON.parse(await readFile(path, "utf8")) as {
+		schema: number;
+		corpus: Array<Record<string, unknown> & { id: string }>;
+	};
 	const acceptedPath = join(GOLDEN_ROOT, "accepted-divergences.json");
 	const accepted = JSON.parse(await readFile(acceptedPath, "utf8")) as {
 		schema: number;
@@ -217,7 +221,8 @@ async function assertGolden(name: "text" | "keys", actual: unknown[]): Promise<v
 			throw new Error(`Invalid accepted divergence ${name}/${divergence.caseId}`);
 		}
 		for (const [field, value] of Object.entries(divergence.fields ?? {})) {
-			if (!Object.hasOwn(record, field)) throw new Error(`Unknown divergence field ${field} in ${name}/${divergence.caseId}`);
+			if (!Object.hasOwn(record, field))
+				throw new Error(`Unknown divergence field ${field} in ${name}/${divergence.caseId}`);
 			record[field] = value;
 		}
 		for (const patch of divergence.patches ?? []) applyGoldenPatch(record, patch.path, patch.value);

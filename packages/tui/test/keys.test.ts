@@ -229,21 +229,21 @@ describe("Alt+I protocol symmetry", () => {
 		setKittyProtocolActive(false);
 	});
 
-it.each([
-	{ data: "\x1bb", navigation: "alt+left", literal: "alt+b" },
-	{ data: "\x1bf", navigation: "alt+right", literal: "alt+f" },
-])("uses legacy $navigation alias only when Kitty mode is off", ({ data, navigation, literal }) => {
-	for (const kitty of [false, true]) {
-		setKittyProtocolActive(kitty);
-		expect(parseKey(data)).toBe(kitty ? literal : navigation);
-		expect(matchesKey(data, navigation)).toBe(!kitty);
-		expect(matchesKey(data, literal)).toBe(kitty);
-		for (const otherNavigation of ["alt+left", "alt+right", "alt+up", "alt+down"] as const) {
-			expect(matchesKey(data, otherNavigation)).toBe(!kitty && otherNavigation === navigation);
+	it.each([
+		{ data: "\x1bb", navigation: "alt+left", literal: "alt+b" },
+		{ data: "\x1bf", navigation: "alt+right", literal: "alt+f" },
+	])("uses legacy $navigation alias only when Kitty mode is off", ({ data, navigation, literal }) => {
+		for (const kitty of [false, true]) {
+			setKittyProtocolActive(kitty);
+			expect(parseKey(data)).toBe(kitty ? literal : navigation);
+			expect(matchesKey(data, navigation)).toBe(!kitty);
+			expect(matchesKey(data, literal)).toBe(kitty);
+			for (const otherNavigation of ["alt+left", "alt+right", "alt+up", "alt+down"] as const) {
+				expect(matchesKey(data, otherNavigation)).toBe(!kitty && otherNavigation === navigation);
+			}
 		}
-	}
-	setKittyProtocolActive(false);
-});
+		setKittyProtocolActive(false);
+	});
 
 	it.each([
 		{ data: "\x1bp", literal: "alt+p" },
@@ -256,33 +256,33 @@ it.each([
 		}
 		setKittyProtocolActive(false);
 	});
-it.each([
-	{ data: "\x1bP", expected: "alt+shift+p" },
-	{ data: "\x1bN", expected: "alt+shift+n" },
-])("preserves mixed-mode $data as literal $expected", ({ data, expected }) => {
-	for (const kitty of [false, true]) {
-		setKittyProtocolActive(kitty);
-		expect(parseKey(data)).toBe(expected);
-		expect(matchesKey(data, expected)).toBe(true);
-	}
-	setKittyProtocolActive(false);
-});
+	it.each([
+		{ data: "\x1bP", expected: "alt+shift+p" },
+		{ data: "\x1bN", expected: "alt+shift+n" },
+	])("preserves mixed-mode $data as literal $expected", ({ data, expected }) => {
+		for (const kitty of [false, true]) {
+			setKittyProtocolActive(kitty);
+			expect(parseKey(data)).toBe(expected);
+			expect(matchesKey(data, expected)).toBe(true);
+		}
+		setKittyProtocolActive(false);
+	});
 
-it.each([
-	{ data: "\x1bB", navigation: "alt+left", literal: "alt+shift+b" },
-	{ data: "\x1bF", navigation: "alt+right", literal: "alt+shift+f" },
-])("uses legacy $navigation alias for $data only when Kitty mode is off", ({ data, navigation, literal }) => {
-	setKittyProtocolActive(false);
-	expect(parseKey(data)).toBe(navigation);
-	expect(matchesKey(data, navigation)).toBe(true);
-	expect(matchesKey(data, literal)).toBe(false);
+	it.each([
+		{ data: "\x1bB", navigation: "alt+left", literal: "alt+shift+b" },
+		{ data: "\x1bF", navigation: "alt+right", literal: "alt+shift+f" },
+	])("uses legacy $navigation alias for $data only when Kitty mode is off", ({ data, navigation, literal }) => {
+		setKittyProtocolActive(false);
+		expect(parseKey(data)).toBe(navigation);
+		expect(matchesKey(data, navigation)).toBe(true);
+		expect(matchesKey(data, literal)).toBe(false);
 
-	setKittyProtocolActive(true);
-	expect(parseKey(data)).toBe(literal);
-	expect(matchesKey(data, navigation)).toBe(false);
-	expect(matchesKey(data, literal)).toBe(true);
-	setKittyProtocolActive(false);
-});
+		setKittyProtocolActive(true);
+		expect(parseKey(data)).toBe(literal);
+		expect(matchesKey(data, navigation)).toBe(false);
+		expect(matchesKey(data, literal)).toBe(true);
+		setKittyProtocolActive(false);
+	});
 
 	it.each([
 		{ data: "\x1b[98;3u", expected: "alt+b" },
