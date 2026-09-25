@@ -54,5 +54,36 @@
         "timedOut": false
       }
     }
+,
+    {
+      "id": "jobs-list-changed",
+      "command": "jobs -n",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs -n\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "jobs-list-pids",
+      "command": "jobs -l",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs -l\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "jobs-missing-spec",
+      "command": "jobs %99999",
+      "result": {
+        "output": "error: jobs: not yet implemented: jobs with job specs\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
   ]
 }

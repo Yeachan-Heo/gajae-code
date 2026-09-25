@@ -121,6 +121,64 @@
       },
       "reason": "Pinned upstream treats initial text as a readline-only option; without an interactive terminal, the option is ignored and the ordinary read path returns EOF."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "jobs-list-changed",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs -n\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `jobs -n` by polling changed jobs instead of returning the fork's unsupported-option error."
+    },
+    {
+      "module": "shell",
+      "caseId": "jobs-list-pids",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs -l\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream implements `jobs -l` and emits the PID column when managed jobs exist; an empty job table remains silent."
+    },
+    {
+      "module": "shell",
+      "caseId": "jobs-missing-spec",
+      "fields": {
+        "before": {
+          "output": "error: jobs: not yet implemented: jobs with job specs\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "jobs: no such job: %99999\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream resolves job specifications and reports missing jobs with the shell-compatible diagnostic and non-zero status."
+    }
   ],
   "nonAdoptions": [
     {
