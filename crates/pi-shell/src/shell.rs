@@ -3522,4 +3522,27 @@ mod tests {
 		assert_eq!(result.exit_code, Some(0));
 		assert_eq!(output, "cd-e-ok");
 	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn unset_name_reference_removes_the_reference_not_its_target() {
+		#[cfg(unix)]
+		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
+
+		let command = r#"declare target=kept; declare -n reference=target; unset -n reference; printf '%s|%s' "$target" "${reference-unset}""#;
+		let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+		let result = execute_shell(
+			ShellExecuteOptions { command: command.to_string(), ..Default::default() },
+			Some(tx),
+			CancelToken::default(),
+		)
+		.await
+		.expect("unset -n should execute");
+		let mut output = String::new();
+		while let Some(chunk) = rx.recv().await {
+			output.push_str(&chunk);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert_eq!(output, "kept|unset");
+	}
 }
