@@ -52,6 +52,43 @@ export declare class ComputerController {
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
 
+/**
+ * Incrementally ingests old/new text and computes an exact line diff on a
+ * worker thread once both sides finish.
+ *
+ * Complete lines are observable during ingestion. Only equal leading lines
+ * are declared stable before EOF; future input can change Myers alignment
+ * after the first mismatch.
+ */
+export declare class DiffStream {
+  /** Create an empty two-sided stream. */
+  constructor()
+  /** Append a JavaScript text chunk to one side. */
+  push(side: DiffSide, chunk: string): DiffStreamProgress
+  /** Append a UTF-8 subprocess/file chunk without a JS string conversion. */
+  pushBytes(side: DiffSide, chunk: Uint8Array): DiffStreamProgress
+  /** Mark one side complete; an unfinished final line then becomes visible. */
+  finishSide(side: DiffSide): DiffStreamProgress
+  /** Mark one side too large and complete without further ingestion. */
+  markTooLarge(side: DiffSide): DiffStreamProgress
+  /** Current ingestion state. */
+  progress(): DiffStreamProgress
+  /** Complete display lines from `from`, excluding newline terminators. */
+  lines(side: DiffSide, from: number, limit?: number | undefined | null): Array<string>
+  /** Snapshot all ingested text for one side. */
+  text(side: DiffSide): string
+  /**
+   * Read a filesystem path directly into one side on the native worker pool.
+   *
+   * JavaScript can poll [`DiffStream::progress`] and [`DiffStream::lines`]
+   * while this promise is pending; file bytes never need to cross into JS
+   * and back into the differ.
+   */
+  openFile(side: DiffSide, path: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<DiffStreamProgress>
+  /** Compute exact Myers runs and unified hunks off the JavaScript thread. */
+  finish(context?: number | undefined | null): Promise<DiffStreamResult>
+}
+
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -913,11 +950,94 @@ export interface DependentIdleDeliveryResult {
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
 
+/** One jsdiff change object: a run of added, removed, or common tokens. */
+export interface DiffChange {
+  /** Joined token text for this run (lines keep their `
+  ` terminators). */
+  value: string
+  /** Number of tokens in this run. */
+  count: number
+  /** True when this run exists only in the new text. */
+  added: boolean
+  /** True when this run exists only in the old text. */
+  removed: boolean
+}
+
 /**
- * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old,
- * new)` with default options. Returns ordered `{added, removed, value}` parts.
+ * Diff `oldText.split("
+")` against `newText.split("
+")` with jsdiff
+ * `diffArrays` semantics (exact code-unit equality, empty lines preserved),
+ * returning only run lengths.
+ *
+ * Callers that map line numbers — like hashline recovery — need the counts,
+ * not another copy of the text.
  */
-export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
+export declare function diffLineRuns(oldText: string, newText: string): Array<DiffRun>
+
+/**
+ * Line diff with jsdiff `diffLines(oldText, newText)` semantics (default
+ * options). Change values keep line terminators, and common runs are joined
+ * from the new text.
+ */
+export declare function diffLines(oldText: string, newText: string): Array<DiffChange>
+
+/** A change run without its token text, for callers that only need counts. */
+export interface DiffRun {
+  /** Number of tokens in this run. */
+  count: number
+  /** True when this run exists only in the new text. */
+  added: boolean
+  /** True when this run exists only in the old text. */
+  removed: boolean
+}
+
+/** One side of a streamed line diff. */
+export declare enum DiffSide {
+  /** Original/base text. */
+  Old = 'Old',
+  /** Updated/target text. */
+  New = 'New'
+}
+
+/** Observable ingestion state for [`DiffStream`]. */
+export interface DiffStreamProgress {
+  /** Complete old-side lines available for rendering. */
+  oldLines: number
+  /** Complete new-side lines available for rendering. */
+  newLines: number
+  /** Leading complete lines proven equal on both sides. */
+  stableCommonLines: number
+  /** Whether old-side ingestion has finished. */
+  oldDone: boolean
+  /** Whether new-side ingestion has finished. */
+  newDone: boolean
+  /** Whether either side contains a NUL byte/code unit. */
+  binary: boolean
+  /** Whether either native file exceeded its caller-provided size limit. */
+  tooLarge: boolean
+}
+
+/** Exact line-diff output produced when a [`DiffStream`] finishes. */
+export interface DiffStreamResult {
+  /** Line-token Myers runs used to align the complete files. */
+  runs: Array<DiffRun>
+  /** Unified hunks for the requested context. */
+  hunks: Array<PatchHunk>
+  /** Whether the old text ends in a newline. */
+  oldEndsNewline: boolean
+  /** Whether the new text ends in a newline. */
+  newEndsNewline: boolean
+}
+
+/**
+ * Word diff with jsdiff `diffWords(oldText, newText)` semantics (default
+ * options).
+ *
+ * Tokens carry surrounding whitespace, equality ignores it, and the
+ * post-pass dedupes whitespace across change boundaries.
+ */
+export declare function diffWords(oldText: string, newText: string): Array<DiffChange>
 
 export interface DoctorJournalCreateResult {
   authority?: DoctorJournalAuthority
@@ -1647,16 +1767,6 @@ export interface KnownGoodFrameStats {
 }
 
 /**
- * One diff component, mirroring jsdiff's change object (sans `count`, which
- * the TS `generateDiffString` formatter does not consume).
- */
-export interface LineDiffPart {
-  added: boolean
-  removed: boolean
-  value: string
-}
-
-/**
  * Publish a staged regular file under a destination name that must not already
  * exist, using `linkat(2)` instead of a rename flag. This is the stand-in for
  * `rename_no_replace_path` on filesystems that implement no rename flag at all
@@ -2206,6 +2316,23 @@ export declare function parseKey(data: string, kittyProtocolActive: boolean): st
  */
 export declare function parseKittySequence(data: string): ParsedKittyResult | null
 
+/** One hunk of a unified diff, matching jsdiff `structuredPatch` hunks. */
+export interface PatchHunk {
+  /** 1-based first line of the hunk in the old text. */
+  oldStart: number
+  /** Number of old-text lines covered by the hunk. */
+  oldLines: number
+  /** 1-based first line of the hunk in the new text. */
+  newStart: number
+  /** Number of new-text lines covered by the hunk. */
+  newLines: number
+  /**
+   * Hunk body: `+`/`-`/` `-prefixed lines without trailing newlines, plus
+   * `\ No newline at end of file` markers where applicable.
+   */
+  lines: Array<string>
+}
+
 /**
  * Opaque in-process presentation capability.
  *
@@ -2604,6 +2731,13 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  * changes are rejected rather than followed.
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
+
+/**
+ * Unified-diff hunks with jsdiff
+ * `structuredPatch(_, _, oldText, newText, _, _, { context }).hunks`
+ * semantics. `context` defaults to 4 like jsdiff.
+ */
+export declare function structuredPatchHunks(oldText: string, newText: string, context?: number | undefined | null): Array<PatchHunk>
 
 export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 

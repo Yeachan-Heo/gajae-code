@@ -2408,6 +2408,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-diff"
+version = "0.17.6"
+
+[[package]]
 name = "pi-iso"
 version = "0.17.6"
 dependencies = [
@@ -2448,6 +2452,7 @@ dependencies = [
  "parking_lot",
  "phf 0.14.0",
  "pi-ast",
+ "pi-diff",
  "pi-iso",
  "pi-shell",
  "portable-pty",

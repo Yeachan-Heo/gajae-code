@@ -43,7 +43,8 @@
 	"devDependencies": {
 		"@napi-rs/cli": "catalog:",
 		"@types/bun": "catalog:",
-		"@types/ws": "catalog:"
+		"@types/ws": "catalog:",
+		"diff": "catalog:"
 	},
 	"engines": {
 		"bun": ">=1.4.0"

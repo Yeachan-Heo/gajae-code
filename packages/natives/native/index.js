@@ -18,6 +18,7 @@ nativeBindings.initNativeCrashDiagnostics?.();
 // --- generated native exports (do not edit) ---
 // classes
 export const ComputerController = nativeBindings.ComputerController;
+export const DiffStream = nativeBindings.DiffStream;
 export const DoctorJournalAuthority = nativeBindings.DoctorJournalAuthority;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const MacOSPowerAssertion = nativeBindings.MacOSPowerAssertion;
@@ -43,7 +44,9 @@ export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
 export const currentExecutablePath = nativeBindings.currentExecutablePath;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
+export const diffLineRuns = nativeBindings.diffLineRuns;
 export const diffLines = nativeBindings.diffLines;
+export const diffWords = nativeBindings.diffWords;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
@@ -100,6 +103,7 @@ export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
+export const structuredPatchHunks = nativeBindings.structuredPatchHunks;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
@@ -119,6 +123,10 @@ export const AstMatchStrictness = {
 	Relaxed: "relaxed",
 	Signature: "signature",
 	Template: "template",
+};
+export const DiffSide = {
+	Old: "Old",
+	New: "New",
 };
 export const Ellipsis = {
 	Unicode: 0,

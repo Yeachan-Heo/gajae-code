@@ -1,6 +1,7 @@
 import * as Diff from "diff";
 import { generateDiffString } from "../edit/diff";
 import type { FileReadCache } from "../edit/file-read-cache";
+import { getNativeDiffBindings } from "../internal/native-diff";
 import { HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { computeLineHash } from "./hash";
@@ -93,7 +94,13 @@ export function tryRecoverHashlineWithCache(args: HashlineRecoveryArgs): Hashlin
 	}
 	if (applied.lines === previousText) return null;
 
-	const patch = Diff.structuredPatch("file", "file", previousText, applied.lines, "", "", { context: 3 });
+	const patch = {
+		oldFileName: "file",
+		newFileName: "file",
+		oldHeader: "",
+		newHeader: "",
+		hunks: getNativeDiffBindings().structuredPatchHunks(previousText, applied.lines, 3),
+	};
 	const merged = Diff.applyPatch(currentText, patch, { fuzzFactor: HASHLINE_RECOVERY_FUZZ_FACTOR });
 	if (typeof merged !== "string" || merged === currentText) return null;
 

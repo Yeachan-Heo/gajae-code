@@ -39,6 +39,7 @@ napi-derive.workspace = true
 parking_lot.workspace = true
 phf.workspace = true
 pi-ast.workspace = true
+pi-diff = { path = "../pi-diff" }
 pi-iso.workspace = true
 pi-shell.workspace = true
 portable-pty.workspace = true
