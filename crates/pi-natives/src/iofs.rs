@@ -1,5 +1,7 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/iofs.rs @ a85bd5228d9f619deade1db78fa49420a721e1
-// Modified for gajae-code: yes — walker pool diagnostic and private JsString conversion until 2.1 integration
+// Source: oh-my-pi `crates/pi-natives/src/iofs.rs`
+// Pinned revision: a85bd5228d9f0f619deade1db78fa49420a721e1 (MIT).
+// Gajae-Code modifications: walker pool diagnostics; string conversion via
+// crate::js.
 //! N-API filesystem DTOs and conversion helpers.
 //!
 //! `pi-walker` owns traversal and cache policy. This module keeps only the
@@ -132,8 +134,8 @@ pub fn walker_pool_status() -> String {
 pub fn invalidate_fs_scan_cache(path: Option<JsString>) -> Result<()> {
 	match path {
 		Some(path) => {
-			let utf8 = path.into_utf8()?;
-			pi_walker::invalidate_path_string(utf8.as_str()?);
+			let path = crate::js::into_string(path)?;
+			pi_walker::invalidate_path_string(&path);
 		},
 		None => pi_walker::invalidate_all(),
 	}

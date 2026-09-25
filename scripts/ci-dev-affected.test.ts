@@ -900,7 +900,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const vendored = await runScript(["--matrix-json"], "crates/brush-core-vendored/src/lib.rs");
 		expect(vendored.exitCode).toBe(0);
 		const vendoredKeys = (JSON.parse(vendored.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key);
-		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(5);
+		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(8);
 		expect(vendoredKeys.some(key => key.includes("brush"))).toBe(false);
 	});
 
@@ -929,7 +929,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			expect(exitCode).toBe(0);
 			const entries = JSON.parse(stdout.trim()) as Array<{ key: string }>;
 			expect(entries.filter(entry => entry.key.startsWith("ts-build:")).map(entry => entry.key)).toHaveLength(2);
-			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(5);
+			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(8);
 			expect(entries.filter(entry => entry.key === "native-linux-x64")).toHaveLength(1);
 		}
 	});

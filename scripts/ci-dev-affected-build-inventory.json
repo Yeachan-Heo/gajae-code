@@ -7,9 +7,12 @@
   "cargo": [
     { "id": "gjc-sdk", "name": "gjc-sdk", "manifestPath": "crates/gjc-sdk/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-ast", "name": "pi-ast", "manifestPath": "crates/pi-ast/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-diff", "name": "pi-diff", "manifestPath": "crates/pi-diff/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-iso", "name": "pi-iso", "manifestPath": "crates/pi-iso/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-natives", "name": "pi-natives", "manifestPath": "crates/pi-natives/Cargo.toml", "supported": true, "nativeAddonSource": true },
-    { "id": "pi-shell", "name": "pi-shell", "manifestPath": "crates/pi-shell/Cargo.toml", "supported": true, "nativeAddonSource": false }
+    { "id": "pi-shell", "name": "pi-shell", "manifestPath": "crates/pi-shell/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-vfs", "name": "pi-vfs", "manifestPath": "crates/pi-vfs/Cargo.toml", "supported": true, "nativeAddonSource": false },
+    { "id": "pi-walker", "name": "pi-walker", "manifestPath": "crates/pi-walker/Cargo.toml", "supported": true, "nativeAddonSource": false }
   ],
   "emergency": {
     "cargoWorkspaceBuild": {
