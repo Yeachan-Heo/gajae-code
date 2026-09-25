@@ -72,11 +72,13 @@ impl From<pi_ast::summary::SummaryResult> for SummaryResult {
 pub fn summarize_code(options: SummaryOptions) -> task::Promise<SummaryResult> {
 	task::blocking("summarize_code", (), move |_| {
 		pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
-			code:              options.code,
-			lang:              options.lang,
-			path:              options.path,
-			min_body_lines:    options.min_body_lines,
-			min_comment_lines: options.min_comment_lines,
+			code:               options.code,
+			lang:               options.lang,
+			path:               options.path,
+			min_body_lines:     options.min_body_lines,
+			min_comment_lines:  options.min_comment_lines,
+			unfold_until_lines: None,
+			unfold_limit_lines: None,
 		})
 		.map(Into::into)
 		.map_err(|error| Error::from_reason(error.to_string()))

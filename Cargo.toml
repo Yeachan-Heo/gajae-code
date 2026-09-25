@@ -345,8 +345,11 @@ tree-sitter-css = "0.25"
 tree-sitter-dart = "0.2"
 tree-sitter-diff = "0.1"
 tree-sitter-dockerfile = { version = "0.2.0", package = "tree-sitter-dockerfile-updated" }
+# Added for the full-langs AST grammar set at the pi-ast pin.
+tree-sitter-elisp = "1.7.2"
 tree-sitter-elixir = "0.3"
 tree-sitter-erlang = "0.16.0"
+tree-sitter-fortran = "0.6.0"
 tree-sitter-go = "0.25"
 tree-sitter-graphql = "0.1.0"
 tree-sitter-haskell = "0.23"

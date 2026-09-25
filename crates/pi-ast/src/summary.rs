@@ -1,13 +1,14 @@
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/summary.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: gated extended grammars behind full-langs and retained Perl summary elision.
 //! Structural source summaries powered by tree-sitter.
 
 use std::{collections::BTreeSet, path::Path};
 
-use anyhow::{Result, anyhow};
-use ast_grep_core::tree_sitter::LanguageExt;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
-use crate::{language::SupportLang, ops};
+use crate::{language::SupportLang, parse_cache::parse_cached};
 
 const DEFAULT_MIN_BODY_LINES: u32 = 4;
 const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
@@ -15,15 +16,26 @@ const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryOptions {
 	/// Source code to summarize.
-	pub code:              String,
+	pub code:               String,
 	/// Language alias (e.g. "rust", "typescript") used before path inference.
-	pub lang:              Option<String>,
+	pub lang:               Option<String>,
 	/// File path used to infer language by extension when `lang` is omitted.
-	pub path:              Option<String>,
+	pub path:               Option<String>,
 	/// Minimum total node lines before eliding a body/literal node.
-	pub min_body_lines:    Option<u32>,
+	pub min_body_lines:     Option<u32>,
 	/// Minimum total comment lines before eliding a multiline block comment.
-	pub min_comment_lines: Option<u32>,
+	pub min_comment_lines:  Option<u32>,
+	/// Target visible-line count for BFS unfold. Starting from every elidable
+	/// span folded, this progressively reveals outer-then-inner spans until
+	/// the visible line count meets the target. `None` or `0` disables BFS
+	/// and keeps only the outermost elisions (every nested span stays hidden
+	/// behind its parent).
+	pub unfold_until_lines: Option<u32>,
+	/// Hard ceiling for BFS unfold. If a candidate unfold would push the
+	/// visible count past this value, revert that step and stop. Defaults
+	/// to `unfold_until_lines * 2` when omitted (with `unfold_until_lines`
+	/// itself as the floor so a single threshold also works).
+	pub unfold_limit_lines: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +70,98 @@ struct LineSpan {
 	end:   u32,
 }
 
+impl LineSpan {
+	const fn lines(self) -> u32 {
+		self.end.saturating_sub(self.start).saturating_add(1)
+	}
+}
+
+/// One elidable region plus its directly-nested elidable descendants. The
+/// forest is built by AST traversal in source order, so `children` reflects
+/// the structural hierarchy: a child's span is always strictly contained
+/// within its parent's.
+#[derive(Debug)]
+struct SpanNode {
+	span:     LineSpan,
+	children: Vec<usize>,
+}
+
+/// Flat arena of elidable spans organized as a forest. `roots` lists the
+/// topmost spans — anything whose AST ancestors held no elidable container.
+#[derive(Debug, Default)]
+struct ElidableForest {
+	nodes: Vec<SpanNode>,
+	roots: Vec<usize>,
+}
+
+impl ElidableForest {
+	fn push(&mut self, parent: Option<usize>, span: LineSpan) -> usize {
+		let idx = self.nodes.len();
+		self.nodes.push(SpanNode { span, children: Vec::new() });
+		match parent {
+			Some(p) => self.nodes[p].children.push(idx),
+			None => self.roots.push(idx),
+		}
+		idx
+	}
+}
+
+/// BFS unfold. Start with every root span folded (matches the legacy
+/// outermost-only behavior) and progressively replace folded spans with
+/// their elidable children, breadth-first, until the visible line count
+/// reaches `unfold_until`. A candidate unfold whose revealed lines would
+/// push the visible count past `unfold_limit` is skipped — that span stays
+/// folded and its subtree is not explored — while the BFS keeps unfolding
+/// the remaining queued siblings. A single oversized, un-unfoldable leaf
+/// (e.g. a `<style>` raw-text block) therefore no longer aborts the whole
+/// pass and starve its siblings. `unfold_until == 0` short-circuits to the
+/// legacy behavior.
+fn select_folded_spans(
+	forest: &ElidableForest,
+	total_lines: u32,
+	unfold_until: u32,
+	unfold_limit: u32,
+) -> Vec<LineSpan> {
+	use std::collections::{HashSet, VecDeque};
+
+	let nodes = &forest.nodes;
+	let mut folded: HashSet<usize> = forest.roots.iter().copied().collect();
+	if unfold_until == 0 || folded.is_empty() {
+		return folded.into_iter().map(|i| nodes[i].span).collect();
+	}
+
+	let folded_line_total: u32 = folded.iter().map(|&i| nodes[i].span.lines()).sum();
+	let mut visible = total_lines.saturating_sub(folded_line_total);
+	let mut queue: VecDeque<usize> = forest.roots.iter().copied().collect();
+
+	while let Some(idx) = queue.pop_front() {
+		if visible >= unfold_until {
+			break;
+		}
+		if !folded.contains(&idx) {
+			continue;
+		}
+		let node = &nodes[idx];
+		let child_line_total: u32 = node.children.iter().map(|&c| nodes[c].span.lines()).sum();
+		// Unfolding swaps the parent's span for its children's, so the visible
+		// gain is the difference between them. `saturating_sub` keeps the math
+		// honest if children somehow over-cover (they shouldn't by construction).
+		let revealed = node.span.lines().saturating_sub(child_line_total);
+		let new_visible = visible.saturating_add(revealed);
+		if new_visible > unfold_limit {
+			continue;
+		}
+		folded.remove(&idx);
+		for &c in &node.children {
+			folded.insert(c);
+			queue.push_back(c);
+		}
+		visible = new_visible;
+	}
+
+	folded.into_iter().map(|i| nodes[i].span).collect()
+}
+
 pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 	let source = options.code;
 	let total_lines = count_lines(&source);
@@ -65,15 +169,11 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 		return Ok(unparsed_result(source, total_lines));
 	}
 
-	let Some(language) = resolve_language(options.lang.as_deref(), options.path.as_deref())? else {
+	let Some(language) = resolve_language(options.lang.as_deref(), options.path.as_deref()) else {
 		return Ok(unparsed_result(source, total_lines));
 	};
 
-	let mut parser = Parser::new();
-	parser
-		.set_language(&language.get_ts_language())
-		.map_err(|err| anyhow!("Failed to load tree-sitter language: {err}"))?;
-	let Some(tree) = parser.parse(&source, None) else {
+	let Some(tree) = parse_cached(&source, language)? else {
 		return Ok(unparsed_result(source, total_lines));
 	};
 	let root = tree.root_node();
@@ -89,8 +189,13 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 		.min_comment_lines
 		.unwrap_or(DEFAULT_MIN_COMMENT_LINES)
 		.max(4);
-	let mut spans = Vec::new();
-	collect_elisions(root, language, min_body_lines, min_comment_lines, &mut spans);
+	let unfold_until = options.unfold_until_lines.unwrap_or(0);
+	let unfold_limit = options
+		.unfold_limit_lines
+		.unwrap_or_else(|| unfold_until.saturating_mul(2));
+	let mut forest = ElidableForest::default();
+	collect_elidable_tree(root, None, language, min_body_lines, min_comment_lines, &mut forest);
+	let spans = select_folded_spans(&forest, total_lines, unfold_until, unfold_limit);
 	let spans = normalize_spans(spans, total_lines);
 	let segments = build_segments(&source, total_lines, &spans);
 
@@ -103,14 +208,15 @@ pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 	})
 }
 
-fn resolve_language(lang: Option<&str>, path: Option<&str>) -> Result<Option<SupportLang>> {
+pub(crate) fn resolve_language(lang: Option<&str>, path: Option<&str>) -> Option<SupportLang> {
 	if let Some(lang) = lang.map(str::trim).filter(|lang| !lang.is_empty()) {
-		return ops::resolve_supported_lang(lang).map(Some);
+		return SupportLang::from_alias(lang);
 	}
-	let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
-		return Ok(None);
-	};
-	Ok(SupportLang::from_path(Path::new(path)))
+	let path = path?.trim();
+	if path.is_empty() {
+		return None;
+	}
+	SupportLang::from_path(Path::new(path))
 }
 
 fn unparsed_result(source: String, total_lines: u32) -> SummaryResult {
@@ -135,12 +241,13 @@ fn count_lines(source: &str) -> u32 {
 	}
 }
 
-fn collect_elisions(
+fn collect_elidable_tree(
 	node: Node<'_>,
+	elidable_parent: Option<usize>,
 	language: SupportLang,
 	min_body_lines: u32,
 	min_comment_lines: u32,
-	spans: &mut Vec<LineSpan>,
+	forest: &mut ElidableForest,
 ) {
 	let total_lines = node_line_count(node);
 	if is_comment_kind(language, node.kind()) {
@@ -148,18 +255,22 @@ fn collect_elisions(
 			let start_line = node_start_line(node) + 2;
 			let end_line = node_end_line(node).saturating_sub(1);
 			if start_line <= end_line {
-				spans.push(LineSpan { start: start_line, end: end_line });
+				forest.push(elidable_parent, LineSpan { start: start_line, end: end_line });
 			}
 		}
 		return;
 	}
 
+	let mut current_parent = elidable_parent;
 	if is_elidable_kind(language, node.kind()) && total_lines >= min_body_lines {
 		let start_line = node_start_line(node) + 1;
 		let end_line = node_end_line(node).saturating_sub(1);
 		if start_line <= end_line {
-			spans.push(LineSpan { start: start_line, end: end_line });
-			return;
+			// Unlike the legacy outermost-only collector, we DO recurse into
+			// the elided node so nested elisions are recorded as children.
+			// The BFS unfold pass decides which level actually fires.
+			current_parent =
+				Some(forest.push(elidable_parent, LineSpan { start: start_line, end: end_line }));
 		}
 	}
 
@@ -182,17 +293,31 @@ fn collect_elisions(
 			run_last = Some(child);
 			run_count += 1;
 		} else {
-			flush_groupable_run(run_first, run_last, run_count, min_body_lines, spans);
+			flush_groupable_run(
+				run_first,
+				run_last,
+				run_count,
+				min_body_lines,
+				forest,
+				current_parent,
+			);
 			run_first = None;
 			run_last = None;
 			run_count = 0;
 		}
 	}
-	flush_groupable_run(run_first, run_last, run_count, min_body_lines, spans);
+	flush_groupable_run(run_first, run_last, run_count, min_body_lines, forest, current_parent);
 
 	for index in 0..child_count {
 		if let Some(child) = node.child(index) {
-			collect_elisions(child, language, min_body_lines, min_comment_lines, spans);
+			collect_elidable_tree(
+				child,
+				current_parent,
+				language,
+				min_body_lines,
+				min_comment_lines,
+				forest,
+			);
 		}
 	}
 }
@@ -202,7 +327,8 @@ fn flush_groupable_run(
 	last: Option<Node<'_>>,
 	count: u32,
 	min_body_lines: u32,
-	spans: &mut Vec<LineSpan>,
+	forest: &mut ElidableForest,
+	parent: Option<usize>,
 ) {
 	if count < 2 {
 		return;
@@ -224,11 +350,11 @@ fn flush_groupable_run(
 	let start = first_content_end.saturating_add(1);
 	let end = last_start.saturating_sub(1);
 	if start <= end {
-		spans.push(LineSpan { start, end });
+		forest.push(parent, LineSpan { start, end });
 	}
 }
 
-fn node_start_line(node: Node<'_>) -> u32 {
+pub(crate) fn node_start_line(node: Node<'_>) -> u32 {
 	node
 		.start_position()
 		.row
@@ -250,7 +376,7 @@ fn node_end_line(node: Node<'_>) -> u32 {
 /// When that byte is a newline, the resulting position lands at column 0 of
 /// the next row, which makes the naive `row + 1` answer one greater than the
 /// row of the last visible content. This helper subtracts that off.
-fn node_content_end_line(node: Node<'_>) -> u32 {
+pub(crate) fn node_content_end_line(node: Node<'_>) -> u32 {
 	let pos = node.end_position();
 	let row = if pos.column == 0 && pos.row > 0 {
 		pos.row - 1
@@ -272,6 +398,8 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Rust => kind == "block_comment",
 		SupportLang::Python => kind == "comment",
 		SupportLang::Go => kind == "comment",
+		#[cfg(feature = "full-langs")]
+		SupportLang::Fortran => kind == "comment",
 		SupportLang::Java => kind == "block_comment",
 		SupportLang::C | SupportLang::Cpp => kind == "comment",
 		#[cfg(feature = "full-langs")]
@@ -287,6 +415,8 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Scala => kind == "block_comment",
 		#[cfg(feature = "full-langs")]
 		SupportLang::Lua => kind == "comment",
+		#[cfg(feature = "full-langs")]
+		SupportLang::EmacsLisp => kind == "comment",
 		_ => false,
 	}
 }
@@ -548,6 +678,18 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "tuple"
 		),
 		#[cfg(feature = "full-langs")]
+		SupportLang::EmacsLisp => matches!(
+			kind,
+			"function_definition"
+				| "macro_definition"
+				| "special_form"
+				| "list" | "vector"
+				| "hash_table"
+				| "bytecode"
+				| "string_text_properties"
+				| "string"
+		),
+		#[cfg(feature = "full-langs")]
 		SupportLang::Clojure => {
 			matches!(kind, "list_lit" | "map_lit" | "vec_lit" | "set_lit" | "str_lit")
 		},
@@ -631,6 +773,8 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Make => kind == "recipe",
 		#[cfg(feature = "full-langs")]
 		SupportLang::Just => kind == "recipe_body",
+		#[cfg(feature = "full-langs")]
+		SupportLang::Fortran => false,
 		// Skip: data formats with no closing-token anchor (Yaml mappings,
 		// Toml tables, Ini sections), the diff format whose informational
 		// content IS the lines inside hunks, and the leaf-token-only Regex
@@ -673,19 +817,11 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		#[cfg(feature = "full-langs")]
 		SupportLang::Proto => kind == "import",
 		#[cfg(feature = "full-langs")]
-		SupportLang::Perl => kind == "use_statement",
+		SupportLang::Fortran => kind == "use_statement",
 		// Languages where imports either have no run pattern, are wrapped in a
 		// single AST node already covered by `is_elidable_kind` (Kotlin's
 		// `import_list`, Haskell's `imports`), or live inside a too-generic
 		// container (Powershell `statement_list`).
-		SupportLang::Ruby
-		| SupportLang::Bash
-		| SupportLang::Html
-		| SupportLang::Css
-		| SupportLang::Json
-		| SupportLang::Markdown
-		| SupportLang::Yaml
-		| SupportLang::Toml => false,
 		#[cfg(feature = "full-langs")]
 		SupportLang::Kotlin
 		| SupportLang::Haskell
@@ -693,6 +829,7 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		| SupportLang::Lua
 		| SupportLang::Elixir
 		| SupportLang::Erlang
+		| SupportLang::EmacsLisp
 		| SupportLang::Clojure
 		| SupportLang::Sql
 		| SupportLang::Zig
@@ -715,6 +852,7 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		| SupportLang::Ini
 		| SupportLang::Diff
 		| SupportLang::Regex => false,
+		_ => false,
 	}
 }
 
@@ -802,11 +940,13 @@ mod tests {
 
 	fn summarize(code: &str, path: &str) -> SummaryResult {
 		summarize_code(SummaryOptions {
-			code:              code.to_string(),
-			lang:              None,
-			path:              Some(path.to_string()),
-			min_body_lines:    None,
-			min_comment_lines: None,
+			code:               code.to_string(),
+			lang:               None,
+			path:               Some(path.to_string()),
+			min_body_lines:     None,
+			min_comment_lines:  None,
+			unfold_until_lines: None,
+			unfold_limit_lines: None,
 		})
 		.expect("summary succeeds")
 	}
@@ -888,6 +1028,52 @@ mod tests {
 		);
 	}
 
+	#[cfg(feature = "full-langs")]
+	#[test]
+	fn summarizes_fortran_program() {
+		let result = summarize("program hello\n  print *, 'hi'\nend program hello\n", "fixture.f90");
+
+		assert!(result.parsed);
+		assert_eq!(result.language.as_deref(), Some("fortran"));
+		assert!(!result.segments.is_empty());
+	}
+
+	#[cfg(feature = "full-langs")]
+	#[test]
+	fn summarizes_emacs_lisp_defun_body() {
+		let code = "(defun greet (name)\n  \"Doc.\"\n  (let ((message (format \"Hello %s\" \
+		            name)))\n    (message \"%s\" message)\n    message)\n)\n";
+		let result = summarize(code, "fixture.el");
+
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(result.language.as_deref(), Some("emacs-lisp"));
+		assert_eq!(segment_kinds(&result), vec!["kept", "elided", "kept"]);
+	}
+
+	#[cfg(feature = "full-langs")]
+	#[test]
+	fn summarizes_emacs_lisp_special_form() {
+		let code =
+			"(let ((count 0))\n  (setq count (1+ count))\n  (setq count (1+ count))\n  count\n)\n";
+		let result = summarize(code, "fixture.el");
+
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(segment_kinds(&result), vec!["kept", "elided", "kept"]);
+	}
+
+	#[cfg(feature = "full-langs")]
+	#[test]
+	fn summarizes_perl_subroutine_block() {
+		let code = "sub greet {\n    my $name = \"world\";\n    my $label = uc($name);\n    print \
+		            $label;\n}\n";
+		let result = summarize(code, "fixture.pl");
+
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(result.language.as_deref(), Some("perl"));
+	}
 	#[test]
 	fn min_body_lines_controls_short_body_elision() {
 		let code = "function small() {\n\treturn 1;\n}\n";
@@ -896,11 +1082,13 @@ mod tests {
 		assert!(!default_result.elided);
 
 		let override_result = summarize_code(SummaryOptions {
-			code:              code.to_string(),
-			lang:              Some("typescript".to_string()),
-			path:              None,
-			min_body_lines:    Some(3),
-			min_comment_lines: None,
+			code:               code.to_string(),
+			lang:               Some("typescript".to_string()),
+			path:               None,
+			min_body_lines:     Some(3),
+			min_comment_lines:  None,
+			unfold_until_lines: None,
+			unfold_limit_lines: None,
 		})
 		.expect("summary succeeds");
 		assert!(override_result.elided);
@@ -1087,5 +1275,161 @@ mod tests {
 			.expect("elided segment");
 		assert_eq!(elided.start_line, 2);
 		assert_eq!(elided.end_line, 4);
+	}
+
+	fn summarize_with_unfold(code: &str, path: &str, until: u32, limit: u32) -> SummaryResult {
+		summarize_code(SummaryOptions {
+			code:               code.to_string(),
+			lang:               None,
+			path:               Some(path.to_string()),
+			min_body_lines:     None,
+			min_comment_lines:  None,
+			unfold_until_lines: Some(until),
+			unfold_limit_lines: Some(limit),
+		})
+		.expect("summary succeeds")
+	}
+
+	#[test]
+	fn bfs_unfold_reveals_nested_json_when_root_collapses() {
+		// Top-level JSON object: legacy outermost-only collector emits one big
+		// elision covering lines 2..=N which the renderer collapses to a
+		// useless `{ .. }`. BFS unfold should peel the root open so individual
+		// keys stay visible and only their nested values fold.
+		let body = (0..30)
+			.map(|i| format!("\t\"key{i}\": {i}"))
+			.collect::<Vec<_>>()
+			.join(",\n");
+		let nested = "\t\"deps\": {\n\t\t\"a\": 1,\n\t\t\"b\": 2,\n\t\t\"c\": 3,\n\t\t\"d\": 4\n\t}";
+		let code = format!("{{\n{body},\n{nested}\n}}\n");
+
+		let legacy = summarize_with_unfold(&code, "pkg.json", 0, 0);
+		assert!(legacy.elided);
+		// Legacy emits a single span spanning every line except the braces.
+		let legacy_kept_lines: u32 = legacy
+			.segments
+			.iter()
+			.filter(|s| s.kind == "kept")
+			.map(|s| s.end_line - s.start_line + 1)
+			.sum();
+		assert_eq!(legacy_kept_lines, 2);
+
+		// With BFS, the root unfolds and nested `deps` stays elided.
+		let unfolded = summarize_with_unfold(&code, "pkg.json", 20, 100);
+		assert!(unfolded.elided, "deps body should remain elided");
+		let kept_text = unfolded
+			.segments
+			.iter()
+			.filter(|s| s.kind == "kept")
+			.filter_map(|s| s.text.as_deref())
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(kept_text.contains("\"key0\""));
+		assert!(kept_text.contains("\"key29\""));
+		assert!(kept_text.contains("\"deps\""));
+		// The nested object's inner lines must not appear in kept content.
+		assert!(!kept_text.contains("\"a\": 1"));
+	}
+
+	#[test]
+	fn bfs_unfold_stops_when_visible_already_exceeds_target() {
+		// 10 small functions: legacy visible count is signature + close brace
+		// per function plus blank separators = 30 lines. Setting unfold_until
+		// below that initial count short-circuits BFS so every body stays
+		// folded — same as the legacy outermost-only collector.
+		let code = (0..10)
+			.map(|i| {
+				format!(
+					"export function fn{i}(): number {{\n\tconst a = {i};\n\tconst b = {i};\n\tconst c \
+					 = {i};\n\treturn a + b + c;\n}}"
+				)
+			})
+			.collect::<Vec<_>>()
+			.join("\n\n");
+
+		let result = summarize_with_unfold(&code, "fixture.ts", 10, 100);
+		assert!(result.elided);
+		let elided_count = result
+			.segments
+			.iter()
+			.filter(|s| s.kind == "elided")
+			.count();
+		assert_eq!(elided_count, 10);
+	}
+
+	#[test]
+	fn bfs_unfold_reverts_when_next_step_overflows_limit() {
+		// A single huge body whose unfold would massively overshoot the limit
+		// must stay folded — the BFS should detect overflow and abort.
+		let body = (0..40)
+			.map(|i| format!("\tconst x{i} = {i};"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let code = format!("export function big(): void {{\n{body}\n}}\n");
+		// unfold_until = 10, unfold_limit = 30. Initial visible is just the
+		// signature + closing brace = 2 lines; unfolding the body adds 40
+		// (no nested elidable children) → would overflow the limit, so the
+		// BFS reverts and leaves the body folded.
+		let result = summarize_with_unfold(&code, "big.ts", 10, 30);
+		// Exactly one elided segment for the function body.
+		assert_eq!(
+			result
+				.segments
+				.iter()
+				.filter(|s| s.kind == "elided")
+				.count(),
+			1
+		);
+	}
+
+	#[test]
+	fn bfs_unfold_skips_unfoldable_leaf_and_continues_to_siblings() {
+		// Repro for the "useless HTML summary" report: a big <style> raw-text
+		// block (no elidable children) sits before a structured <body>. The
+		// style block's only unfold candidate is its entire 120-line body,
+		// which overflows unfold_limit. The BFS must SKIP it (leave it folded)
+		// and keep unfolding the sibling <body>/<div> subtree, instead of
+		// aborting the whole pass and collapsing the body into one dead `...`.
+		let css = (0..120)
+			.map(|i| format!("\t.rule{i} {{ color: #{i:06x}; }}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let sections = (0..6)
+			.map(|i| {
+				format!(
+					"<section class=\"sec{i}\">\n<h2>Heading {i}</h2>\n<p>para a {i}</p>\n<p>para b \
+					 {i}</p>\n<p>para c {i}</p>\n</section>"
+				)
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		let code = format!(
+			"<!doctype html>\n<html \
+			 lang=\"en\">\n<head>\n<title>T</title>\n<style>\n{css}\n</style>\n</head>\n<body>\n<div \
+			 class=\"page\">\n{sections}\n</div>\n</body>\n</html>\n"
+		);
+
+		let result = summarize_with_unfold(&code, "page.html", 50, 100);
+		assert!(result.parsed);
+		assert!(result.elided);
+		let kept_text = result
+			.segments
+			.iter()
+			.filter(|s| s.kind == "kept")
+			.filter_map(|s| s.text.as_deref())
+			.collect::<Vec<_>>()
+			.join("\n");
+		// The body div was unfolded: its child <section> structure is visible.
+		assert!(
+			kept_text.contains("<section class=\"sec0\">"),
+			"body div should unfold to show sections"
+		);
+		assert!(
+			kept_text.contains("<section class=\"sec5\">"),
+			"all sibling sections should surface"
+		);
+		// The <style> raw text stays folded as one elided span — no CSS interior
+		// leaks into kept content.
+		assert!(!kept_text.contains(".rule0 {"), "oversized style body must stay folded");
 	}
 }

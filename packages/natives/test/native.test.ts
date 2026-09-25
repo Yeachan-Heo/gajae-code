@@ -15,6 +15,7 @@ import {
 	invalidateFsScanCache,
 	listWorkspace,
 	MacOSPowerAssertion,
+	nativeBuildInfo,
 	Process,
 	ProcessStatus,
 	PtySession,
@@ -87,6 +88,9 @@ describe("pi-natives", () => {
 		};
 	});
 
+	it("reports the language set compiled into this addon", () => {
+		expect(nativeBuildInfo().languageSet).toBe(Bun.env.PI_NATIVE_FULL_LANGS === "1" ? "full" : "default");
+	});
 	it("keeps native crash diagnostics opt-in", () => {
 		delete process.env.GJC_NATIVE_CRASH_DIAGNOSTICS;
 		expect(initNativeCrashDiagnostics()).toBe(false);
