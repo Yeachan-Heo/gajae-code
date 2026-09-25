@@ -15,7 +15,7 @@ import {
 	Text,
 	TUI,
 } from "@gajae-code/tui";
-import { ImageProtocol } from "@gajae-code/tui/terminal-capabilities";
+import { ImageProtocol, TERMINAL } from "@gajae-code/tui/terminal-capabilities";
 import { GOLDEN_BASELINE_ENV } from "./render-goldens-env";
 import { defaultEditorTheme, defaultMarkdownTheme } from "./test-themes";
 import { VirtualTerminal } from "./virtual-terminal";
@@ -75,7 +75,9 @@ class MutableLinesComponent implements Component {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		return this.#lines.map(line => line.slice(0, width));
+		// Image escape lines pass through whole, mirroring production components:
+		// clipping a SIXEL/iTerm2 payload to the cell width drops its terminator.
+		return this.#lines.map(line => (TERMINAL.isImageLine(line) ? line : line.slice(0, width)));
 	}
 }
 

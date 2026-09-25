@@ -243,12 +243,12 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 			.get("Pos")
 			.and_then(|pos| pos.get("Line"))
 			.and_then(|v| v.as_u64())
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let col_no = issue
 			.get("Pos")
 			.and_then(|pos| pos.get("Column"))
 			.and_then(|v| v.as_u64())
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let linter = issue
 			.get("FromLinter")
 			.and_then(|v| v.as_str())

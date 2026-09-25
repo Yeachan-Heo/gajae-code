@@ -114,7 +114,7 @@ impl ExternalProcessObserver for CommandProcessObserver {
 				"darwinUniqueId": darwin_unique_id,
 				"signature": signature,
 			});
-			let published = ledger.file.lock().ok().is_some_and(|mut file| {
+			let published = ledger.file.lock().is_ok_and(|mut file| {
 				writeln!(file, "{record}")
 					.and_then(|()| file.flush())
 					.is_ok()
@@ -1315,7 +1315,7 @@ async fn read_output_bytes(
 		if let Some(sink) = sink.as_ref() {
 			let allowed = budget
 				.remaining
-				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
 					Some(remaining.saturating_sub(buf.len()))
 				})
 				.unwrap_or(0)
@@ -2047,7 +2047,7 @@ fn emit_chunk(text: &str, callback: Option<&mpsc::UnboundedSender<String>>, budg
 	if let Some(callback) = callback {
 		let allowed = budget
 			.remaining
-			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+			.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
 				Some(remaining.saturating_sub(text.len()))
 			})
 			.unwrap_or(0)
@@ -3031,7 +3031,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn timeout_builtin_reaps_reparented_same_group_grandchild_and_preserves_sibling() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3068,6 +3068,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(sibling_alive, "timeout killed unrelated sibling {sibling_pid}; output={output:?}");
 
 		// SIGKILL delivery to the reparented grandchild can lag under CI load, so
@@ -3095,7 +3096,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn contained_timeout_freezes_group_before_term_handler_can_escape() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3150,6 +3151,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"contained timeout killed unrelated sibling {sibling_pid}; output={output:?}"
@@ -3160,7 +3162,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread")]
 	async fn cancelled_command_reaps_reparented_same_group_grandchild() {
 		let _process_test_guard = PROCESS_TEST_LOCK.lock().await;
-		let sibling = std::process::Command::new("sleep")
+		let mut sibling = std::process::Command::new("sleep")
 			.arg("30")
 			.spawn()
 			.expect("spawn unrelated sibling");
@@ -3187,10 +3189,10 @@ mod tests {
 				// Wait for BOTH markers: the grandchild and parent lines race on the
 				// pipe, so returning as soon as `grandchild=` appears can leave the
 				// not-yet-read `parent=` chunk pending and flake the parent assertion.
-				if let Some(pid) = parse_marker_pid(&output, "grandchild=") {
-					if parse_marker_pid(&output, "parent=").is_some() {
-						return pid;
-					}
+				if let Some(pid) = parse_marker_pid(&output, "grandchild=")
+					&& parse_marker_pid(&output, "parent=").is_some()
+				{
+					return pid;
 				}
 			}
 		})
@@ -3243,6 +3245,7 @@ mod tests {
 			.is_some_and(|process| process.status() == process::ProcessStatus::Running);
 		let _ = process::Process::from_pid(sibling_pid)
 			.map(|process| process.kill_tree(Some(process::KILL_SIGNAL)));
+		let _ = sibling.wait();
 		assert!(
 			sibling_alive,
 			"cancellation killed unrelated sibling {sibling_pid}; output={output:?}"
