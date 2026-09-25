@@ -31,7 +31,8 @@ describe("HTML re-sync differential goldens", () => {
 				await expect(conversion).rejects.toThrow(golden.expectedError);
 				return;
 			}
-			expect(await conversion).toBe(golden.expectedLines?.join("\n"));
+			if (golden.expectedLines === undefined) throw new Error(`Golden ${golden.name} has no expected output`);
+			expect(await conversion).toBe(golden.expectedLines.join("\n"));
 		});
 	}
 });

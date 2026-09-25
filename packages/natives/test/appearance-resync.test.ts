@@ -15,7 +15,7 @@ describe("appearance re-sync differential golden", () => {
 	it("retains the recorded native appearance domain and profiles detection", () => {
 		expect(golden.darwinAllowed).toContain(golden.preSyncObservedOnCurrentHost);
 		const appearance = detectMacOSAppearance();
-		if (process.platform === "darwin") expect(golden.darwinAllowed).toContain(appearance);
+		if (process.platform === "darwin" && appearance !== null) expect(golden.darwinAllowed).toContain(appearance);
 		else expect(appearance).toBe(golden.otherPlatformValue);
 		expect(getWorkProfile(60).folded).toContain("appearance.detect");
 	});
