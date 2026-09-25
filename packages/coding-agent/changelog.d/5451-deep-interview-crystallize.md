@@ -12,4 +12,4 @@
 - Ordinary approval audit validation reads a bounded tail so append-only growth does not permanently block consent (#5451).
 - JSONL and audit appenders refuse hard-linked files before changing permissions or writing, while concurrent first-time JSONL appends retry exclusive-create races without dropping records (#5451).
 - Deep Interview consumes transcript bytes from the descriptor validated against managed-session identity, and project-local `.gjc` paths are no longer accepted as transcripts by container name alone (#5451).
-- `.gjc` artifact, state, append, delete, and lock parent operations now use the managed filesystem authority or Linux retained directory descriptors; symlinked project-state parents fail closed instead of redirecting writes outside the project (#5451).
+- `.gjc` artifact, state, append, delete, and lock parent operations now use the managed filesystem authority or Linux retained directory descriptors; symlinked project-state parents fail closed instead of redirecting writes outside the project, and private-durable callers retain their configured parent-mode contract (#5451).

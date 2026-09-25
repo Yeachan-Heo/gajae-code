@@ -307,8 +307,6 @@ async function appendPrivate(
 ): Promise<void> {
 	if (process.platform === "linux") {
 		const cwd = path.resolve(options.cwd ?? process.cwd());
-		const parentStore = openManagedWriterDirectory(path.dirname(filePath), cwd);
-		parentStore.close();
 		const privateOptions: StateWriterOptions = {
 			cwd,
 			privateDurable: { directory: path.dirname(filePath) },
@@ -581,6 +579,14 @@ function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 
 async function atomicRemove(filePath: string, cwd = process.cwd()): Promise<boolean> {
 	if (process.platform === "linux") {
+		try {
+			await fs.lstat(filePath);
+		} catch (error) {
+			if (isErrno(error, "ENOENT")) return false;
+			throw error;
+		}
+		const parentStore = openManagedWriterDirectory(path.dirname(filePath), cwd);
+		parentStore.close();
 		const stateOptions: StateWriterOptions = {
 			cwd: path.resolve(cwd),
 			privateDurable: { directory: path.dirname(filePath) },
