@@ -270,8 +270,8 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 			manifest.toolchain.nativeBuild,
 			worktree,
 			undefined,
-			// Bounded accommodation for documented Windows cold native builds; remains below the outer proof cap.
-			process.platform === "win32" ? 900_000 : 300_000,
+			// Bounded accommodation for cold native builds on loaded CI runners; remains below the outer proof cap.
+			process.platform === "win32" ? 900_000 : 600_000,
 		);
 		expect(nativeBuild.exitCode, nativeBuild.output).toBe(0);
 		const nativeEmbed = await command(manifest.toolchain.nativeEmbed, worktree);

@@ -1201,20 +1201,25 @@ function isValidPersistedReducerState(value: ReducerState): boolean {
 }
 
 function isProviderStateEntry(entry: SessionEntry): boolean {
-	return [
-		"thinking_level_change",
-		"model_change",
-		"configured_model_chain",
-		"service_tier_change",
-		"mcp_tool_selection",
-		"discovered_builtin_tool_selection",
-		"mode_change",
-		"ttsr_injection",
-	].includes(entry.type);
+	return (
+		(entry.type === "custom" && entry.customType === MODEL_PROFILE_OWNERSHIP_ENTRY) ||
+		[
+			"thinking_level_change",
+			"model_change",
+			"configured_model_chain",
+			"service_tier_change",
+			"mcp_tool_selection",
+			"discovered_builtin_tool_selection",
+			"mode_change",
+			"ttsr_injection",
+		].includes(entry.type)
+	);
 }
 
 function providerStateEntryKey(entry: SessionEntry): string | undefined {
 	if (!isProviderStateEntry(entry)) return undefined;
+	if (entry.type === "custom" && entry.customType === MODEL_PROFILE_OWNERSHIP_ENTRY)
+		return `${entry.type}:${entry.customType}`;
 	return entry.type === "configured_model_chain" ? `${entry.type}:${entry.role}` : entry.type;
 }
 /** Map a session entry to its rolling-tail record kind. */
@@ -3220,6 +3225,9 @@ function cloneSessionContext(context: SessionContext): SessionContext {
 		...context,
 		messages,
 		models: { ...context.models },
+		modelProfileOwnershipMarker: context.modelProfileOwnershipMarker
+			? { ...context.modelProfileOwnershipMarker }
+			: undefined,
 		configuredModelChains: Object.fromEntries(
 			Object.entries(context.configuredModelChains ?? {}).map(([role, chain]) => [
 				role,
@@ -6077,7 +6085,6 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 					changed = true;
 					return [];
 				}
-
 				return [
 					(async () => {
 						if (

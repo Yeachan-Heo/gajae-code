@@ -1,4 +1,5 @@
 import * as util from "node:util";
+import { resolveModelProfileName } from "./model-profile-contract";
 import type { SettingsAtomicPatch } from "./settings";
 
 export type ModelProfileOwnershipMarker =
@@ -228,8 +229,9 @@ export function resolveOwnedModelProfileName(
 	profiles: ReadonlyMap<string, unknown>,
 ): string | undefined {
 	if (marker.kind !== "profile") return undefined;
-	if (!profiles.has(marker.profile)) throw new UnresolvedModelProfileOwnershipError(marker.profile);
-	return marker.profile;
+	const resolvedName = resolveModelProfileName(marker.profile, profiles);
+	if (!profiles.has(resolvedName)) throw new UnresolvedModelProfileOwnershipError(marker.profile);
+	return resolvedName;
 }
 
 export function nextDurableModelProfileOwnership(
