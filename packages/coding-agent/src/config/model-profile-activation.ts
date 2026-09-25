@@ -1953,6 +1953,311 @@ export async function applyPreparedModelProfileActivation(
 	}
 }
 
+async function concretizeProfileSelectorValue(
+	selectorValue: ModelSelectorValue,
+	prepared: PreparedModelProfileActivation,
+): Promise<ModelSelectorValue> {
+	const candidates = prepared.modelRegistry.getAvailable?.() ?? prepared.modelRegistry.getAll();
+	const credentialSessionId = prepared.session.credentialSessionId ?? prepared.session.sessionId;
+	const concrete = await Promise.all(
+		normalizeModelSelectorValue(selectorValue).map(async selector => {
+			const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
+			const resolved = bareAlias
+				? await resolveModelChainWithAuth(
+						[selector],
+						{
+							getAvailable: () => candidates,
+							getApiKey: model =>
+								prepared.modelRegistry.getApiKeyForProvider(model.provider, credentialSessionId, model.baseUrl),
+							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel.bind(prepared.modelRegistry),
+							resolveModelByLookupAlias: prepared.modelRegistry.resolveModelByLookupAlias?.bind(
+								prepared.modelRegistry,
+							),
+							lookupAliasExists: prepared.modelRegistry.lookupAliasExists?.bind(prepared.modelRegistry),
+							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
+						},
+						prepared.settings as Settings,
+						credentialSessionId,
+						{
+							managedFallback: true,
+							aliasIntent: "preset-equivalent",
+							canonicalSessionId: prepared.session.sessionId,
+							credentialSessionId,
+						},
+					)
+				: resolveModelRoleValue(selector, candidates, {
+						settings: prepared.settings as Settings,
+						modelRegistry: prepared.modelRegistry,
+						sessionId: prepared.session.sessionId,
+						credentialSessionId,
+						aliasIntent: "preset-equivalent",
+					});
+			if (!resolved.model) {
+				if (bareAlias) return undefined;
+				return selector;
+			}
+			const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
+			return resolved.explicitThinkingLevel && resolved.thinkingLevel
+				? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
+				: concreteSelector;
+		}),
+	);
+	const resolvedConcrete = concrete.filter((selector): selector is string => selector !== undefined);
+	if (resolvedConcrete.length === 0) {
+		throw new Error(
+			`Model profile deletion could not concretize authenticated selector: ${normalizeModelSelectorValue(selectorValue)[0]}`,
+		);
+	}
+	return resolvedConcrete.length === 1 && typeof selectorValue === "string" ? resolvedConcrete[0]! : resolvedConcrete;
+}
+
+export interface MaterializeModelProfileForDeletionResult {
+	modelRoles: Record<string, ModelSelectorValue>;
+	agentModelOverrides: Record<string, ModelSelectorValue>;
+	previousModelRoles: Record<string, ModelSelectorValue>;
+	previousAgentModelOverrides: Record<string, ModelSelectorValue>;
+	previousPersistedModelRoles: Record<string, ModelSelectorValue> | undefined;
+	previousPersistedAgentModelOverrides: Record<string, ModelSelectorValue> | undefined;
+	previousModelRolesOverride: Record<string, ModelSelectorValue> | undefined;
+	previousAgentModelOverridesOverride: Record<string, ModelSelectorValue> | undefined;
+	previousDefaultProfileOverride: string | undefined;
+	previousDefaultProfile: string | undefined;
+	previousPersistedDefaultProfile: string | undefined;
+	previousActiveModelProfile: string | undefined;
+	previousDefaultChainState: ConfiguredModelChainState | undefined;
+	previousDefaultFallbackRuntimeState: DefaultFallbackRuntimeState | undefined;
+	/**
+	 * Restores the session sticky canonical variant that was snapshotted before
+	 * materialization cleared it. Internal closure capturing the registry,
+	 * session, and exact pre-clear selector — avoids threading a registry
+	 * through the restore options. Optional so callers that never materialized
+	 * (or use a registry without sticky support) can still restore settings.
+	 */
+	restoreSessionCanonicalVariant?: () => void;
+}
+
+export async function materializeModelProfileForDeletion(
+	options: PrepareModelProfileActivationOptions & {
+		settings: Pick<Settings, "clearOverride" | "flushOrThrow" | "get" | "getGlobal" | "override" | "set" | "unset">;
+	},
+): Promise<MaterializeModelProfileForDeletionResult> {
+	const prepared = await prepareModelProfileActivation(options);
+	const previousDefaultProfile = prepared.settings.get("modelProfile.default");
+	const previousPersistedDefaultProfile = prepared.settings.getGlobal("modelProfile.default");
+	const concretizeForDeletion = async (selector: ModelSelectorValue): Promise<ModelSelectorValue> => {
+		try {
+			return await concretizeProfileSelectorValue(selector, prepared);
+		} catch (error) {
+			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant);
+			throw error;
+		}
+	};
+	const concreteDefaultChain =
+		prepared.defaultChain.length > 0
+			? normalizeModelSelectorValue(await concretizeForDeletion(prepared.defaultChain))
+			: [];
+	const concreteModelRoles: Record<string, ModelSelectorValue> = {};
+	for (const [role, selector] of Object.entries(prepared.modelRoles)) {
+		concreteModelRoles[role] = await concretizeForDeletion(selector);
+	}
+	const concreteAgentModelOverrides: Record<string, ModelSelectorValue> = {};
+	for (const [role, selector] of Object.entries(prepared.agentModelOverrides)) {
+		concreteAgentModelOverrides[role] = await concretizeForDeletion(selector);
+	}
+	const nextModelRoles = {
+		...prepared.previousModelRoles,
+		...(concreteDefaultChain.length > 0
+			? {
+					default: concreteDefaultChain.length === 1 ? concreteDefaultChain[0] : [...concreteDefaultChain],
+				}
+			: {}),
+		...concreteModelRoles,
+	};
+	const nextAgentModelOverrides = {
+		...prepared.previousAgentModelOverrides,
+		...concreteAgentModelOverrides,
+	};
+	let defaultChainChanged = false;
+
+	try {
+		prepared.settings.set("modelRoles", nextModelRoles);
+		prepared.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
+		prepared.settings.unset("modelProfile.default");
+		prepared.settings.clearOverride("modelProfile.default");
+		prepared.settings.override("modelRoles", nextModelRoles);
+		prepared.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
+		prepared.session.setActiveModelProfile?.(undefined);
+		if (prepared.defaultChain.length > 0) {
+			defaultChainChanged = true;
+			prepared.session.setConfiguredModelChain(
+				"default",
+				concreteDefaultChain,
+				"profile-deletion-materialized",
+				undefined,
+				true,
+			);
+		}
+		await prepared.settings.flushOrThrow();
+		prepared.session.clearProfileInstalledOverrides?.();
+	} catch (error) {
+		const previousChain = prepared.previousDefaultChainState;
+		const rollbackErrors: unknown[] = [];
+		const restore = (action: () => void): void => {
+			try {
+				action();
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		};
+		restore(() =>
+			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
+		);
+		if (defaultChainChanged) {
+			restore(() =>
+				prepared.session.setConfiguredModelChain(
+					"default",
+					previousChain?.entries ?? prepared.previousDefaultChain ?? [],
+					previousChain?.origin ?? "rollback",
+					previousChain?.identity,
+					previousChain?.explicitHead ?? true,
+				),
+			);
+		}
+		if (prepared.previousDefaultFallbackRuntimeState) {
+			restore(() =>
+				prepared.session.restoreDefaultFallbackRuntimeState?.(prepared.previousDefaultFallbackRuntimeState!),
+			);
+		}
+		restore(() =>
+			prepared.previousPersistedModelRoles === undefined
+				? prepared.settings.unset("modelRoles")
+				: prepared.settings.set("modelRoles", prepared.previousPersistedModelRoles),
+		);
+		restore(() =>
+			prepared.previousPersistedAgentModelOverrides === undefined
+				? prepared.settings.unset("task.agentModelOverrides")
+				: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
+		);
+		restore(() => prepared.settings.set("modelProfile.default", previousPersistedDefaultProfile));
+		restore(() =>
+			prepared.previousModelRolesOverride === undefined
+				? prepared.settings.clearOverride("modelRoles")
+				: prepared.settings.override("modelRoles", prepared.previousModelRolesOverride),
+		);
+		restore(() =>
+			prepared.previousAgentModelOverridesOverride === undefined
+				? prepared.settings.clearOverride("task.agentModelOverrides")
+				: prepared.settings.override("task.agentModelOverrides", prepared.previousAgentModelOverridesOverride),
+		);
+		restore(() =>
+			prepared.previousDefaultProfileOverride === undefined
+				? prepared.settings.clearOverride("modelProfile.default")
+				: prepared.settings.override("modelProfile.default", prepared.previousDefaultProfileOverride),
+		);
+		restore(() => prepared.session.setActiveModelProfile?.(prepared.previousActiveModelProfile));
+		try {
+			await prepared.settings.flushOrThrow();
+		} catch (rollbackError) {
+			rollbackErrors.push(rollbackError);
+		}
+		if (rollbackErrors.length > 0) {
+			throw new AggregateError(
+				[error, ...rollbackErrors],
+				"Profile deletion materialization failed and rollback was incomplete",
+			);
+		}
+		throw error;
+	}
+
+	return {
+		modelRoles: nextModelRoles,
+		agentModelOverrides: nextAgentModelOverrides,
+		previousModelRoles: prepared.previousModelRoles,
+		previousAgentModelOverrides: prepared.previousAgentModelOverrides,
+		previousPersistedModelRoles: prepared.previousPersistedModelRoles,
+		previousPersistedAgentModelOverrides: prepared.previousPersistedAgentModelOverrides,
+		previousModelRolesOverride: prepared.previousModelRolesOverride,
+		previousAgentModelOverridesOverride: prepared.previousAgentModelOverridesOverride,
+		previousDefaultProfileOverride: prepared.previousDefaultProfileOverride,
+		previousDefaultProfile,
+		previousPersistedDefaultProfile,
+		previousActiveModelProfile: prepared.previousActiveModelProfile,
+		previousDefaultChainState: prepared.previousDefaultChainState,
+		previousDefaultFallbackRuntimeState: prepared.previousDefaultFallbackRuntimeState,
+		restoreSessionCanonicalVariant: () =>
+			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
+	};
+}
+
+export async function restoreMaterializedModelProfileForDeletion(options: {
+	settings: Pick<Settings, "clearOverride" | "flushOrThrow" | "override" | "set" | "unset">;
+	session: Pick<
+		ModelProfileActivationSession,
+		"setActiveModelProfile" | "setConfiguredModelChain" | "restoreDefaultFallbackRuntimeState"
+	>;
+	snapshot: MaterializeModelProfileForDeletionResult;
+}): Promise<void> {
+	const restoreErrors: unknown[] = [];
+	const restore = (action: () => void): void => {
+		try {
+			action();
+		} catch (error) {
+			restoreErrors.push(error);
+		}
+	};
+	restore(() => options.snapshot.restoreSessionCanonicalVariant?.());
+	const previousChain = options.snapshot.previousDefaultChainState;
+	restore(() =>
+		options.session.setConfiguredModelChain(
+			"default",
+			previousChain?.entries ?? [],
+			previousChain?.origin ?? "rollback",
+			previousChain?.identity,
+			previousChain?.explicitHead ?? true,
+		),
+	);
+	if (options.snapshot.previousDefaultFallbackRuntimeState) {
+		restore(() =>
+			options.session.restoreDefaultFallbackRuntimeState?.(options.snapshot.previousDefaultFallbackRuntimeState!),
+		);
+	}
+	restore(() =>
+		options.snapshot.previousPersistedModelRoles === undefined
+			? options.settings.unset("modelRoles")
+			: options.settings.set("modelRoles", options.snapshot.previousPersistedModelRoles),
+	);
+	restore(() =>
+		options.snapshot.previousPersistedAgentModelOverrides === undefined
+			? options.settings.unset("task.agentModelOverrides")
+			: options.settings.set("task.agentModelOverrides", options.snapshot.previousPersistedAgentModelOverrides),
+	);
+	restore(() => options.settings.set("modelProfile.default", options.snapshot.previousPersistedDefaultProfile));
+	restore(() =>
+		options.snapshot.previousModelRolesOverride === undefined
+			? options.settings.clearOverride("modelRoles")
+			: options.settings.override("modelRoles", options.snapshot.previousModelRolesOverride),
+	);
+	restore(() =>
+		options.snapshot.previousAgentModelOverridesOverride === undefined
+			? options.settings.clearOverride("task.agentModelOverrides")
+			: options.settings.override("task.agentModelOverrides", options.snapshot.previousAgentModelOverridesOverride),
+	);
+	restore(() =>
+		options.snapshot.previousDefaultProfileOverride === undefined
+			? options.settings.clearOverride("modelProfile.default")
+			: options.settings.override("modelProfile.default", options.snapshot.previousDefaultProfileOverride),
+	);
+	restore(() => options.session.setActiveModelProfile?.(options.snapshot.previousActiveModelProfile));
+	try {
+		await options.settings.flushOrThrow();
+	} catch (error) {
+		restoreErrors.push(error);
+	}
+	if (restoreErrors.length > 0) {
+		throw new AggregateError(restoreErrors, "Failed to fully restore materialized model profile deletion state");
+	}
+}
+
 export async function activateModelProfile(
 	options: PrepareModelProfileActivationOptions,
 	applyOptions: ApplyModelProfileActivationOptions = {},
