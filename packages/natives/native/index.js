@@ -102,6 +102,7 @@ export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermis
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
+export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
 export const structuredPatchHunks = nativeBindings.structuredPatchHunks;

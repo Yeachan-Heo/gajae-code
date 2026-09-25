@@ -2566,6 +2566,7 @@ dependencies = [
  "unicode-width",
  "windows-sys 0.61.2",
  "winreg 0.56.0",
+ "xutf",
  "xxhash-rust",
  "zune-jpeg",
 ]
@@ -5161,6 +5162,13 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+]
+
+[[package]]
+name = "xutf"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "990cc0159ef1d38b900524ac2308778ce60de2d32af70f40a71517c6b299fe8a"
 
 [[package]]
 name = "xxhash-rust"

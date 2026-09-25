@@ -2644,6 +2644,8 @@ export interface SearchResult {
   error?: string
 }
 
+export declare function setHangulCompatJamoWidthOverride(value: number): void
+
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
   /** Command string to execute in the shell. */
