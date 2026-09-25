@@ -3551,6 +3551,13 @@ export class AgentSession {
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
 	#fallbackInvocationId = 0;
+	/** Credential rows tried by managed fallback for each canonical model and credential kind. */
+	#managedFallbackActiveCredentialRows = new Map<string, Map<string, Set<number>>>();
+	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
+	#managedFallbackNextCredentialOverride:
+		| { modelKey: string; storageProvider: string; rowId: number; credentialKind: string }
+		| undefined;
+	#restoreManagedFallbackGetApiKey: (() => void) | undefined;
 	// Todo completion reminder state
 	#todoReminderCount = 0;
 	#deepInterviewUserIntentEpoch = 0;
@@ -22829,6 +22836,67 @@ export class AgentSession {
 			!authStorage.hasSessionCredentialSelector(provider, this.credentialSessionId) &&
 			!authStorage.hasConfigApiKey(provider, owner)
 		);
+	}
+
+	/**
+	 * Resolve an available, untried same-kind stored row for a managed fallback
+	 * request. With `rowId`, only that exact row is considered. Returns undefined
+	 * when no such row resolves to an authenticated key bound to this session.
+	 */
+	async #resolveManagedFallbackCredentialRow(
+		model: Model,
+		credentialKind: string,
+		rowId?: number,
+	): Promise<string | undefined> {
+		const authStorage = this.#modelRegistry.authStorage;
+		const storageProvider = resolveOAuthStorageProvider(model.provider);
+		const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
+		for (const credential of authStorage.listCredentialInventory(storageProvider)) {
+			if (
+				(rowId !== undefined && credential.id !== rowId) ||
+				credential.provider !== storageProvider ||
+				credential.credentialKind !== credentialKind ||
+				(rowId === undefined && triedRows.has(credential.id)) ||
+				!authStorage.isCredentialAvailable(model.provider, credential.id)
+			)
+				continue;
+			let apiKey: string | undefined;
+			try {
+				apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
+					credentialSelector: { kind: "id", value: String(credential.id) },
+				});
+			} catch (error) {
+				if (authStorage.isCredentialAvailable(model.provider, credential.id)) throw error;
+				continue;
+			}
+			if (
+				isAuthenticated(apiKey) &&
+				authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId) === credential.id &&
+				authStorage.getSessionCredentialType(model.provider, this.credentialSessionId) === credentialKind &&
+				authStorage.isCredentialAvailable(model.provider, credential.id)
+			)
+				return apiKey;
+		}
+		return undefined;
+	}
+
+	#managedFallbackCanonicalModelKey(model: Model): string {
+		return `${model.provider}/${model.id}`;
+	}
+
+	#managedFallbackTriedRows(model: Model, credentialKind: string): Set<number> {
+		const modelKey = this.#managedFallbackCanonicalModelKey(model);
+		let credentialKindMap = this.#managedFallbackActiveCredentialRows.get(modelKey);
+		if (!credentialKindMap) {
+			credentialKindMap = new Map();
+			this.#managedFallbackActiveCredentialRows.set(modelKey, credentialKindMap);
+		}
+		let rowSet = credentialKindMap.get(credentialKind);
+		if (!rowSet) {
+			rowSet = new Set();
+			credentialKindMap.set(credentialKind, rowSet);
+		}
+		return rowSet;
 	}
 
 	#isRetryableError(message: AssistantMessage): boolean {
