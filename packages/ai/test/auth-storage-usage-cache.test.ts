@@ -728,6 +728,32 @@ describe("AuthStorage usage cache: credential selection across processes (#5939)
 		}
 	});
 
+	it("cache-only probe mode never calls a store's network usage hook (broker-backed runs)", async () => {
+		let hookCalls = 0;
+		const store: AuthCredentialStore = {
+			...makeStore([oauthRow(1, "a@example.com"), oauthRow(2, "b@example.com")]),
+			// RemoteAuthCredentialStore implements this by fetching the broker's /v1/usage.
+			getUsageReport: async () => {
+				hookCalls += 1;
+				return makeReport("a@example.com");
+			},
+		};
+		const storage = new AuthStorage(store, { usageProviderResolver: anthropicOnly });
+		await storage.reload();
+		try {
+			storage.setUsageProbeMode("cache-only");
+			expect(await storage.getApiKey("anthropic", "broker-print")).toMatch(/^oat-/);
+			expect(hookCalls).toBe(0);
+
+			// Network mode still routes ranking through the store hook.
+			storage.setUsageProbeMode("network");
+			await storage.getApiKey("anthropic", "broker-interactive");
+			expect(hookCalls).toBeGreaterThan(0);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("re-probes after a credential change instead of reusing the old report", async () => {
 		const { root, dbPath } = await openSharedDb("pi-ai-usage-5939-invalidate-");
 		let calls = 0;

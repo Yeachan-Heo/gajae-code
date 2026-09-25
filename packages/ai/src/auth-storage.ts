@@ -4446,14 +4446,16 @@ export class AuthStorage {
 		// when present: the broker already aggregates usage from a less-throttled
 		// IP, and falling back to the local per-credential fetch would defeat the
 		// whole point of routing through it.
-		const storeHook = this.#store.getUsageReport?.bind(this.#store);
-		if (storeHook) {
-			return storeHook(provider, credential, options?.signal);
-		}
+		// Cache-only mode must precede the store hook: a remote store's hook
+		// fetches the broker's /v1/usage, which can probe upstream providers.
 		if (this.#usageProbeMode === "cache-only") {
 			const request = this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl);
 			const cached = this.#usageCache.get<UsageReport | null>(this.#buildUsageReportCacheKey(request));
 			return cached && cached.expiresAt > Date.now() ? cached.value : null;
+		}
+		const storeHook = this.#store.getUsageReport?.bind(this.#store);
+		if (storeHook) {
+			return storeHook(provider, credential, options?.signal);
 		}
 		return raceUsageWithSignal(
 			this.#fetchUsageCached(
