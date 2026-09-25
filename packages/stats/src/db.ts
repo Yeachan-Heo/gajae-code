@@ -12,6 +12,7 @@ import type {
 	CacheMissAttribution,
 	CacheMissCause,
 	CostTimeSeriesPoint,
+	FailureReport,
 	FolderStats,
 	MessageStats,
 	ModelPerformancePoint,
@@ -501,6 +502,76 @@ export function getOverallStats(cutoff?: number): AggregatedStats {
 	const rows = hasCutoff ? stmt.all(cutoff) : stmt.all();
 	return buildAggregatedStats(rows as any[]);
 }
+/**
+ * Prompts shorter than this cannot be prefix-cached by the major providers, so a
+ * zero cache read on them is not evidence of a lost cache.
+ */
+const MIN_CACHEABLE_INPUT_TOKENS = 2048;
+
+/**
+ * Provider-failure cost over a window. A post-failure request is the first
+ * non-failed request after one or more errored/aborted requests in the same
+ * session; it is a full miss when it read nothing from cache on a cacheable prompt.
+ */
+export function getFailureReport(cutoff?: number): FailureReport {
+	const empty: FailureReport = {
+		totalRequests: 0,
+		erroredRequests: 0,
+		abortedRequests: 0,
+		failureShare: 0,
+		failedDurationMs: 0,
+		postFailureRequests: 0,
+		postFailureFullMissRequests: 0,
+		postFailureFullMissTokens: 0,
+	};
+	if (!db) return empty;
+	const hasCutoff = cutoff !== undefined && cutoff > 0;
+	const row = db
+		.prepare(`
+		WITH ordered AS (
+			SELECT
+				stop_reason,
+				duration,
+				input_tokens,
+				cache_read_tokens,
+				LAG(stop_reason) OVER (PARTITION BY session_file ORDER BY timestamp, id) AS previous_stop_reason
+			FROM messages
+			${hasCutoff ? "WHERE timestamp >= ?" : ""}
+		),
+		classified AS (
+			SELECT
+				*,
+				stop_reason IN ('error', 'aborted') AS failed,
+				stop_reason NOT IN ('error', 'aborted') AND previous_stop_reason IN ('error', 'aborted') AS post_failure
+			FROM ordered
+		)
+		SELECT
+			COUNT(*) AS total_requests,
+			SUM(stop_reason = 'error') AS errored_requests,
+			SUM(stop_reason = 'aborted') AS aborted_requests,
+			SUM(CASE WHEN failed THEN COALESCE(duration, 0) ELSE 0 END) AS failed_duration_ms,
+			SUM(post_failure) AS post_failure_requests,
+			SUM(post_failure AND cache_read_tokens = 0 AND input_tokens >= ${MIN_CACHEABLE_INPUT_TOKENS}) AS full_miss_requests,
+			SUM(CASE WHEN post_failure AND cache_read_tokens = 0 AND input_tokens >= ${MIN_CACHEABLE_INPUT_TOKENS} THEN input_tokens ELSE 0 END) AS full_miss_tokens
+		FROM classified
+	`)
+		.get(...(hasCutoff ? [cutoff] : [])) as Record<string, number | null> | null;
+	if (!row) return empty;
+	const totalRequests = row.total_requests ?? 0;
+	const erroredRequests = row.errored_requests ?? 0;
+	const abortedRequests = row.aborted_requests ?? 0;
+	return {
+		totalRequests,
+		erroredRequests,
+		abortedRequests,
+		failureShare: totalRequests > 0 ? (erroredRequests + abortedRequests) / totalRequests : 0,
+		failedDurationMs: row.failed_duration_ms ?? 0,
+		postFailureRequests: row.post_failure_requests ?? 0,
+		postFailureFullMissRequests: row.full_miss_requests ?? 0,
+		postFailureFullMissTokens: row.full_miss_tokens ?? 0,
+	};
+}
+
 /**
  * Get stats grouped by model.
  */
