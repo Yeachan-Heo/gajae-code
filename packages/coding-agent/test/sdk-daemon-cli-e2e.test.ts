@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { PUBLIC_COMMAND_DIAGNOSTICS } from "../src/cli/public-command-errors";
-import { Broker } from "../src/sdk/broker/broker";
+import { Broker, normalizeBrokerInput } from "../src/sdk/broker/broker";
 import { deriveIdempotencyIdentity } from "../src/sdk/broker/identity";
 import { resolveScopeRequest, scopeRequestV1 } from "../src/sdk/broker/session-scope";
 import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
@@ -2191,8 +2191,11 @@ describe("SDK session CLI", () => {
 		const target = { cwd: root };
 		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, "session.create");
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.create", idempotencyKey);
+		// A real session.create persists the fingerprint of its normalized input.
+		const normalized = normalizeBrokerInput("session.create", target);
+		if (!("input" in normalized)) throw new Error("Expected a valid create target fixture");
 		const fingerprint = createHash("sha256")
-			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.update(JSON.stringify({ operation: "session.create", input: normalized.input }))
 			.digest("hex");
 		const begun = await broker.ledger.begin(identity, `test-${requestKey}`, {
 			operationKey: `session.create\0${idempotencyKey}`,

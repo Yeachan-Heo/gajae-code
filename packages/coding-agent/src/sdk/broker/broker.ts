@@ -4626,10 +4626,14 @@ export class Broker {
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);
 			if (isBrokerResponse(lookup)) return lookup;
+			// The ledger fingerprint covers the normalized mutation input, so the
+			// lookup target must pass through the same normalization to match it.
+			const lookupTarget = normalizeBrokerInput(lookup.operation, lookup.target);
+			if (isBrokerResponse(lookupTarget)) return lookupTarget;
 			return await this.#lookupLifecycle(
 				lookup.operation,
 				idempotencyKey,
-				lifecycleFingerprint(lookup.operation, lookup.target),
+				lifecycleFingerprint(lookup.operation, lookupTarget.input),
 			);
 		}
 		const normalization = normalizeBrokerInput(operation, input);

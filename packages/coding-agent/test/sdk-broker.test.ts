@@ -2680,6 +2680,67 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("public session.lookup recovers a recorded create for the identical target and conflicts for a different one", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-create-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const otherCwd = path.join(root, "other-workspace");
+		await fs.mkdir(cwd, { recursive: true });
+		await fs.mkdir(otherCwd, { recursive: true });
+		const broker = new Broker({ agentDir });
+		let launchAttempts = 0;
+		setLifecycleCommandResolverForTest(broker, () => {
+			launchAttempts += 1;
+			return { file: path.join(root, "missing-gjc"), args: [] };
+		});
+		const key = "lost-create-ack";
+		const target = { cwd, readinessTimeoutMs: 10_000 };
+		try {
+			await broker.start();
+			const created = await broker.handleRequest("session.create", { ...target }, key);
+			expect(created).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
+			expect(launchAttempts).toBe(1);
+
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual(created);
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, cwd: otherCwd } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, readinessTimeoutMs: 20_000 } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target, stateRoot: path.join(otherCwd, ".gjc", "state") } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "invalid_input", message: "stateRoot must be the default .gjc/state for cwd." },
+			});
+			expect(launchAttempts).toBe(1);
+		} finally {
+			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 	it("ignores unrelated terminal legacy rows but keeps reused and live create keys fenced", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-legacy-create-"));
 		const agentDir = path.join(root, "agent");
