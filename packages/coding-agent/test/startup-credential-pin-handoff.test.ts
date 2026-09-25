@@ -1,6 +1,7 @@
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
+import type { UsageProvider } from "@gajae-code/ai/usage";
 import { hookFetch, TempDir } from "@gajae-code/utils";
 import type { Args } from "../src/cli/args";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -202,6 +203,46 @@ describe("startup credential pin handoff", () => {
 			expect(discoveredSnapshot).toBe(startupSnapshot);
 			expect(sessionOptionsSeen?.startupAuthConfig).toBe(startupSnapshot);
 			expect(sessionOptionsSeen?.modelRegistryStartupMutation?.owner).toBe("cli-root");
+		} finally {
+			authStorage.close();
+		}
+	});
+
+	test("print runs select credentials without probing provider usage (#5939)", async () => {
+		using tempDir = TempDir.createSync("@gjc-print-usage-probe-");
+		let probes = 0;
+		const probe: UsageProvider = {
+			id: "anthropic",
+			fetchUsage: async () => {
+				probes += 1;
+				return null; // the endpoint answered 429
+			},
+		};
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"), {
+			usageProviderResolver: provider => (provider === "anthropic" ? probe : undefined),
+		});
+		const expires = Date.now() + 3_600_000;
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "print-a", refresh: "refresh-a", expires, email: "a@example.test" },
+			{ type: "oauth", access: "print-b", refresh: "refresh-b", expires, email: "b@example.test" },
+		]);
+		using _blockedFetch = hookFetch(() => new Response("offline", { status: 503 }));
+		try {
+			await runRootCommand(rootArgs(), [], {
+				discoverAuthStorage: async () => authStorage,
+				createAgentSession: async () => fakeSessionResult(),
+				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+				suppressProcessExit: true,
+				initTheme: async () => {},
+				readPipedInput: async () => undefined,
+				runStartupCredentialAutoImportIfNeeded: async () => undefined,
+				runPrintMode: async () => {
+					// Model dispatch resolves a key through credential ranking.
+					expect(await authStorage.getApiKey("anthropic", "print-session")).toMatch(/^print-/);
+				},
+				quit: async () => {},
+			});
+			expect(probes).toBe(0);
 		} finally {
 			authStorage.close();
 		}
