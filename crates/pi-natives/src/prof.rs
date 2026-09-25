@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/prof.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain the optional flamegraph feature and guard nested profile_region stack behavior.
+
 //! Always-on circular buffer profiler for work scheduling.
 //!
 //! Samples are continuously collected into a fixed-size circular buffer.
@@ -252,4 +255,28 @@ pub fn get_work_profile(last_seconds: f64) -> WorkProfile {
 
 	let total_ms = samples.iter().map(|s| (s.duration_us as f64) * 0.001).sum();
 	WorkProfile { folded, summary, svg, total_ms, sample_count: samples.len() as u32 }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{PROFILE_BUFFER, profile_region};
+
+	#[test]
+	fn records_nested_profile_region_stacks() {
+		const OUTER: &str = "prof_test.outer";
+		const INNER: &str = "prof_test.inner";
+
+		let outer = profile_region(OUTER);
+		{
+			let _inner = profile_region(INNER);
+		}
+		drop(outer);
+
+		let samples = PROFILE_BUFFER.lock().get_since(0);
+		assert!(samples.iter().any(|sample| {
+			sample.stack.len() == 2
+				&& sample.stack.first() == Some(&OUTER)
+				&& sample.stack.last() == Some(&INNER)
+		}));
+	}
 }

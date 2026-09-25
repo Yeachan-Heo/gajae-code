@@ -1,0 +1,6 @@
+{
+	"expectedStacks": [
+		"html_to_markdown",
+		"sixel.encode"
+	]
+}
