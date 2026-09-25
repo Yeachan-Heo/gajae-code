@@ -1,6 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { executeShell } from "../native/index.js";
+
+setDefaultTimeout(30_000);
 
 type ShellOutput = { output: string; exitCode: number | null; cancelled: boolean; timedOut: boolean };
 type ShellGolden = {

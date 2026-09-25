@@ -144,5 +144,26 @@
         "timedOut": false
       }
     }
+,
+    {
+      "id": "complete-default-missing",
+      "command": "complete -p -D",
+      "result": {
+        "output": "error: complete: not yet implemented: special spec not found\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "complete-action-needs-command",
+      "command": "complete -A file",
+      "result": {
+        "output": "",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
   ]
 }

@@ -296,6 +296,45 @@
       },
       "reason": "Pinned upstream implements `local -I` by copying a visible variable's value and attributes into the new local binding instead of reporting the unsupported option."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "complete-default-missing",
+      "fields": {
+        "before": {
+          "output": "error: complete: not yet implemented: special spec not found\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "complete: _DefaultCmD_: no completion specification\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream names the absent default-completion target and returns the ordinary non-zero status rather than an unimplemented sentinel."
+    },
+    {
+      "module": "shell",
+      "caseId": "complete-action-needs-command",
+      "fields": {
+        "before": {
+          "output": "",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "complete: invalid usage\n",
+          "exitCode": 2,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream distinguishes registration actions from printing the completion table and rejects an action without a target as invalid usage."
+    }
   ],
   "nonAdoptions": [
     {
