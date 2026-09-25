@@ -30,8 +30,13 @@ interface PromptPrefixObservation {
 	messageRoles: Message["role"][];
 }
 
+/** Tool schemas can carry bigint bounds (e.g. 64-bit integer limits), which plain JSON.stringify rejects. */
+function bigintSafe(_key: string, value: unknown): unknown {
+	return typeof value === "bigint" ? `${value}n` : value;
+}
+
 function hashJson(value: unknown): bigint {
-	return Bun.hash.xxHash64(JSON.stringify(value) ?? "null");
+	return Bun.hash.xxHash64(JSON.stringify(value, bigintSafe) ?? "null");
 }
 
 /**
@@ -42,8 +47,25 @@ function hashJson(value: unknown): bigint {
 export class PromptPrefixTracker {
 	#previous: PromptPrefixObservation | undefined;
 
-	/** Record the exact provider-visible request and classify it against the previous one. */
+	/**
+	 * Record the exact provider-visible request and classify it against the previous one.
+	 * Telemetry must never fail a turn: an unhashable request yields `undefined` and
+	 * resets the lineage so the next request is reported as `initial`.
+	 */
 	observe(
+		model: Pick<Model, "provider" | "id">,
+		context: Context,
+		options: PromptPrefixRequestOptions = {},
+	): PromptPrefixTelemetry | undefined {
+		try {
+			return this.#observe(model, context, options);
+		} catch {
+			this.#previous = undefined;
+			return undefined;
+		}
+	}
+
+	#observe(
 		model: Pick<Model, "provider" | "id">,
 		context: Context,
 		options: PromptPrefixRequestOptions = {},

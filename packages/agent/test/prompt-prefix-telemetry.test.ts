@@ -21,8 +21,8 @@ describe("PromptPrefixTracker", () => {
 
 	it("classifies a pure append as prefix-preserving and keeps a stable hash for identical requests", () => {
 		const tracker = new PromptPrefixTracker();
-		const initial = tracker.observe(model, request([first]));
-		const appended = tracker.observe(model, request([first, reply, second]));
+		const initial = tracker.observe(model, request([first]))!;
+		const appended = tracker.observe(model, request([first, reply, second]))!;
 
 		expect(initial).toMatchObject({ change: "initial", messages: 1, reusedMessages: 0, previousMessages: 0 });
 		expect(appended).toMatchObject({ change: "append", messages: 3, reusedMessages: 1, previousMessages: 1 });
@@ -31,7 +31,23 @@ describe("PromptPrefixTracker", () => {
 
 		const replay = new PromptPrefixTracker();
 		replay.observe(model, request([first]));
-		expect(replay.observe(model, request([first, reply, second])).hash).toBe(appended.hash);
+		expect(replay.observe(model, request([first, reply, second]))?.hash).toBe(appended.hash);
+	});
+
+	it("hashes tool schemas with bigint bounds and never throws on unserializable requests", () => {
+		const tracker = new PromptPrefixTracker();
+		const bigintTool = {
+			...tool,
+			parameters: { type: "object", properties: { n: { type: "integer", maximum: 2n ** 63n } } },
+		} as unknown as Tool;
+		expect(tracker.observe(model, request([first], { tools: [bigintTool] }))?.change).toBe("initial");
+		expect(tracker.observe(model, request([first, second], { tools: [bigintTool] }))?.change).toBe("append");
+
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		expect(tracker.observe(model, request([first], { tools: [cyclic as unknown as Tool] }))).toBeUndefined();
+		// The lineage restarts after an unhashable request.
+		expect(tracker.observe(model, request([first]))?.change).toBe("initial");
 	});
 
 	it("attributes the first mutated layer in provider cache order", () => {
@@ -39,10 +55,10 @@ describe("PromptPrefixTracker", () => {
 		tracker.observe(model, request([first]));
 
 		const system = tracker.observe(model, request([first, second], { systemPrompt: ["Changed."] }));
-		expect(system.change).toBe("system");
+		expect(system?.change).toBe("system");
 		// Tools precede the system prompt in the cached prefix, so a combined change is attributed to tools.
 		const tools = tracker.observe(model, request([first, second], { systemPrompt: ["Other."], tools: [] }));
-		expect(tools.change).toBe("tools");
+		expect(tools?.change).toBe("tools");
 		const switched = tracker.observe({ provider: "openai", id: "gpt" }, request([first, second], { tools: [] }));
 		expect(switched).toMatchObject({ change: "model", reusedMessages: 0 });
 	});
@@ -56,9 +72,9 @@ describe("PromptPrefixTracker", () => {
 		expect(forced).toMatchObject({ change: "options", reusedMessages: 1 });
 		// A prompt-layer rewrite still takes precedence over an option change.
 		const rewritten = tracker.observe(model, request([second]), { toolChoice: "auto" });
-		expect(rewritten.change).toBe("messages");
+		expect(rewritten?.change).toBe("messages");
 		// Same options again with an appended suffix is a pure append.
-		expect(tracker.observe(model, request([second, reply]), { toolChoice: "auto" }).change).toBe("append");
+		expect(tracker.observe(model, request([second, reply]), { toolChoice: "auto" })?.change).toBe("append");
 	});
 
 	it("records how far the message prefix survived and which role was rewritten", () => {
