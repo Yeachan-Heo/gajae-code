@@ -5,9 +5,11 @@
  * used when not in patch mode.
  */
 
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import { getNativeDiffBindings } from "../internal/native-diff";
 
 import { resolveToCwd } from "../tools/path-utils";
+import { ToolError } from "../tools/tool-errors";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
 import { adjustIndentation, normalizeToLF, stripBom } from "./normalize";
 import { readEditFileText } from "./read-file";
@@ -38,6 +40,8 @@ export class ParseError extends Error {
 	) {
 		super(lineNumber !== undefined ? `Line ${lineNumber}: ${message}` : message);
 		this.name = "ParseError";
+		// A malformed patch or diff hunk is the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 
@@ -45,6 +49,8 @@ export class ApplyPatchError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "ApplyPatchError";
+		// A patch that does not apply is the tool answering the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 
@@ -671,7 +677,7 @@ export async function replaceText(
 	options: ReplaceOptions,
 ): Promise<ReplaceResult> {
 	if (oldText.length === 0) {
-		throw new Error("oldText must not be empty.");
+		throw new ToolError("oldText must not be empty.");
 	}
 	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
 	let normalizedContent = normalizeToLF(content);
@@ -727,7 +733,7 @@ export async function replaceText(
 	});
 
 	if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-		throw new Error(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
+		throw new ToolError(formatOccurrenceMatchError(matchOutcome.occurrences, matchOutcome.occurrencePreviews));
 	}
 
 	if (!matchOutcome.match) {

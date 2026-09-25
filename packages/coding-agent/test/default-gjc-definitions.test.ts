@@ -80,15 +80,18 @@ describe("default GJC definitions", () => {
 
 		expect(skills).toEqual(expected);
 		expect(workflowDefinitions).toHaveLength(4);
-		expect(definitions).toHaveLength(10);
+		expect(definitions).toHaveLength(13);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
 		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
-		expect(fragmentDefinitions).toHaveLength(6);
+		expect(fragmentDefinitions).toHaveLength(9);
 		expect(fragmentDefinitions.map(definition => definition.parentSkillName).sort()).toEqual([
 			"autoresearch",
 			"autoresearch",
 			"deep-interview",
 			"deep-interview",
+			"ultragoal",
+			"ultragoal",
+			"ultragoal",
 			"ultragoal",
 			"ultragoal",
 		]);
@@ -98,6 +101,9 @@ describe("default GJC definitions", () => {
 			"skill-fragments/deep-interview/auto-answer-uncertain.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/boundary-cohort-gate.md",
+			"skill-fragments/ultragoal/cross-repository-succession.md",
+			"skill-fragments/ultragoal/terminal-critic-gate.md",
 			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const autoresearch = workflowDefinitions.find(definition => definition.name === "autoresearch");
@@ -140,10 +146,19 @@ describe("default GJC definitions", () => {
 				.map(skill => skill.name)
 				.sort(),
 		).toEqual([...DEFAULT_GJC_DEFINITION_NAMES].sort());
-		expect(fragments).toHaveLength(2);
-		expect(fragments.map(fragment => fragment.kind)).toEqual(["skill-fragment", "skill-fragment"]);
+		expect(fragments).toHaveLength(5);
+		expect(fragments.map(fragment => fragment.kind)).toEqual([
+			"skill-fragment",
+			"skill-fragment",
+			"skill-fragment",
+			"skill-fragment",
+			"skill-fragment",
+		]);
 		expect(fragments.map(fragment => fragment.relativePath).sort()).toEqual([
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/boundary-cohort-gate.md",
+			"skill-fragments/ultragoal/cross-repository-succession.md",
+			"skill-fragments/ultragoal/terminal-critic-gate.md",
 			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
 		const cleaner = fragments.find(fragment => fragment.relativePath.endsWith("ai-slop-cleaner.md"))!;
@@ -152,6 +167,30 @@ describe("default GJC definitions", () => {
 		const contracts = fragments.find(fragment => fragment.relativePath.endsWith("validation-batch-contracts.md"))!;
 		expect(contracts.content).toContain("never user-facing");
 		expect(contracts.content).toContain("fails closed");
+	});
+
+	it("keeps moved ultragoal sections summarized and points to their fragments without bloating the skill", async () => {
+		const ultragoal = await Bun.file(
+			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
+		).text();
+
+		for (const [heading, pointer] of [
+			["## Boundary completion cohort gate", "embedded:gjc/skill-fragments/ultragoal/boundary-cohort-gate.md"],
+			["## Terminal critic gate", "embedded:gjc/skill-fragments/ultragoal/terminal-critic-gate.md"],
+			["## Cross-repository succession", "embedded:gjc/skill-fragments/ultragoal/cross-repository-succession.md"],
+		] as const) {
+			expect(ultragoal).toContain(heading);
+			expect(ultragoal).toContain(pointer);
+		}
+		expect(ultragoal.length).toBeLessThan(40_000);
+
+		// The cohort summary must keep the fragment's applicability: boundary-only,
+		// never per intermediate story.
+		const cohortStart = ultragoal.indexOf("## Boundary completion cohort gate");
+		const cohortEnd = ultragoal.indexOf("\n## ", cohortStart + 1);
+		const cohortSummary = ultragoal.slice(cohortStart, cohortEnd === -1 ? undefined : cohortEnd);
+		expect(cohortSummary).toContain("the run's final required goal, or an explicit validation batch's final member");
+		expect(cohortSummary).toContain("Intermediate stories use the lightweight `deferredToBatch` checkpoint");
 	});
 
 	it("authors the ai-slop-cleaner fragment with the mandated report labels and full taxonomy", () => {
@@ -191,11 +230,11 @@ describe("default GJC definitions", () => {
 	});
 
 	it("wires the ai-slop-cleaner into the ultragoal completion gate before verification and red-team", () => {
-		const ultragoal = getDefaultGjcDefinitions().find(
-			definition => definition.kind === "skill" && definition.name === "ultragoal",
+		const boundaryCohortGate = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("boundary-cohort-gate.md"),
 		);
-		if (!ultragoal) throw new Error("missing bundled ultragoal skill");
-		const content = ultragoal.content;
+		if (!boundaryCohortGate) throw new Error("missing bundled ultragoal boundary cohort gate fragment");
+		const content = boundaryCohortGate.content;
 
 		const sectionStart = content.indexOf("## Boundary completion cohort gate");
 		expect(sectionStart).toBeGreaterThanOrEqual(0);
@@ -424,6 +463,11 @@ Project executor override body.
 		const ultragoal = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
+		const boundaryCohortGate = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("boundary-cohort-gate.md"),
+		);
+		if (!boundaryCohortGate) throw new Error("missing bundled ultragoal boundary cohort gate fragment");
+		const cohortGate = boundaryCohortGate.content;
 
 		// A: create-goals granularity — merge validation-coupled stories, fan out executor slices.
 		expect(ultragoal).toContain("validation-coupled");
@@ -438,17 +482,17 @@ Project executor override body.
 		expect(ultragoal).toContain("### Validation batches (explicit phase/module boundaries)");
 		expect(ultragoal).toContain("## Boundary completion cohort gate");
 		expect(ultragoal).toContain("gjc ultragoal quality-gate validate");
-		expect(ultragoal).toContain(
+		expect(cohortGate).toContain(
 			"reports **all** structural, evidence, surface, cohort, and declaration errors in one run",
 		);
-		expect(ultragoal).toContain("strictly read-only");
-		expect(ultragoal).toContain("once per boundary generation");
-		expect(ultragoal).toContain("iteration.reviewCohort");
-		expect(ultragoal).toContain("Join before repairing");
-		expect(ultragoal).toContain("one consolidated blocker batch");
-		expect(ultragoal).toContain("one new generation");
-		expect(ultragoal).toContain("delta-only");
-		expect(ultragoal).toContain("scopeExpansion");
+		expect(cohortGate).toContain("strictly read-only");
+		expect(cohortGate).toContain("once per boundary generation");
+		expect(cohortGate).toContain("iteration.reviewCohort");
+		expect(cohortGate).toContain("Join before repairing");
+		expect(cohortGate).toContain("one consolidated blocker batch");
+		expect(cohortGate).toContain("one new generation");
+		expect(cohortGate).toContain("delta-only");
+		expect(cohortGate).toContain("scopeExpansion");
 		expect(ultragoal).toMatch(/advisory.*canonical review is the boundary cohort gate/s);
 		expect(ultragoal).toContain("once per boundary");
 		expect(ultragoal).toContain("deferredToBatch.ranLanes");
@@ -498,6 +542,10 @@ Project executor override body.
 		const ultragoal = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
+		const terminalCriticGate = getEmbeddedDefaultGjcSkillFragments("ultragoal").find(fragment =>
+			fragment.relativePath.endsWith("terminal-critic-gate.md"),
+		);
+		if (!terminalCriticGate) throw new Error("missing bundled ultragoal terminal critic gate fragment");
 
 		// Same-domain executor/architect reuse instead of fresh spawns.
 		expect(ultragoal).toContain("### Subagent reuse and resumption (token efficiency)");
@@ -513,9 +561,9 @@ Project executor override body.
 		);
 
 		// Terminal critic resumption on iteration.
-		expect(ultragoal).toContain("resume the prior terminal-critic subagent when resumable");
-		expect(ultragoal).toContain("a prior `ITERATE` is never carried forward as pre-judged");
-		expect(ultragoal).toContain("fall back to a fresh `critic` spawn with the full context bundle");
+		expect(terminalCriticGate.content).toContain("resume the prior terminal-critic subagent when resumable");
+		expect(terminalCriticGate.content).toContain("a prior `ITERATE` is never carried forward as pre-judged");
+		expect(terminalCriticGate.content).toContain("fall back to a fresh `critic` spawn with the full context bundle");
 	});
 
 	it("routes simple clear implementation requests directly without contradictory workflow escalation", async () => {
@@ -700,10 +748,26 @@ Project executor override body.
 		const bundledDeepInterview = getEmbeddedDefaultGjcSkills().find(skill => skill.name === "deep-interview");
 		if (!bundledDeepInterview) throw new Error("missing bundled deep-interview skill");
 
-		expect(initial.written).toBe(10);
-		expect(initial.total).toBe(10);
+		expect(initial.written).toBe(13);
+		expect(initial.total).toBe(13);
 		expect(initial.skipped).toBe(0);
-		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(6);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(9);
+		expect(
+			initial.files
+				.filter(file => file.kind === "skill-fragment")
+				.map(file => path.relative(targetRoot, file.path).split(path.sep).join("/"))
+				.sort(),
+		).toEqual([
+			"skill-fragments/autoresearch/auto-critic.md",
+			"skill-fragments/autoresearch/auto-iterate.md",
+			"skill-fragments/deep-interview/auto-answer-uncertain.md",
+			"skill-fragments/deep-interview/lateral-review-panel.md",
+			"skill-fragments/ultragoal/ai-slop-cleaner.md",
+			"skill-fragments/ultragoal/boundary-cohort-gate.md",
+			"skill-fragments/ultragoal/cross-repository-succession.md",
+			"skill-fragments/ultragoal/terminal-critic-gate.md",
+			"skill-fragments/ultragoal/validation-batch-contracts.md",
+		]);
 		expect(installedDeepInterview).toBe(bundledDeepInterview.content);
 
 		const installedAutoAnswerFragment = await Bun.file(
@@ -713,15 +777,15 @@ Project executor override body.
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(10);
+		expect(skipped.skipped).toBe(13);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(9);
+		expect(check.matching).toBe(12);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(10);
+		expect(forced.written).toBe(13);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
 		expect(
 			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
@@ -795,25 +859,25 @@ Project executor override body.
 		// No files on disk yet: refreshOnly must not create any (opt-in preserved).
 		const untouched = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(untouched.written).toBe(0);
-		expect(untouched.missing).toBe(10);
+		expect(untouched.missing).toBe(13);
 		expect(await Bun.file(deepInterviewSkillPath).exists()).toBe(false);
 
 		// User opted in, then a local file went stale relative to the embedded default.
 		const installed = await installDefaultGjcDefinitions({ targetRoot });
 		const canonicalDeepInterview = await Bun.file(deepInterviewSkillPath).text();
-		expect(installed.written).toBe(10);
+		expect(installed.written).toBe(13);
 		await Bun.write(deepInterviewSkillPath, "stale content");
 
 		const refreshed = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(refreshed.written).toBe(1);
-		expect(refreshed.matching).toBe(9);
+		expect(refreshed.matching).toBe(12);
 		expect(refreshed.missing).toBe(0);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(canonicalDeepInterview);
 
 		// Second refresh is a no-op once everything matches.
 		const stable = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(stable.written).toBe(0);
-		expect(stable.matching).toBe(10);
+		expect(stable.matching).toBe(13);
 	});
 
 	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
@@ -925,7 +989,7 @@ Project executor override body.
 		expect(await jsonProc.exited).toBe(0);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
-		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 10 });
+		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 13 });
 	});
 });
 

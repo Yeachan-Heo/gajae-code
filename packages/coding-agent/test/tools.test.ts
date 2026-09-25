@@ -1915,14 +1915,28 @@ function b() {
 			}
 		}, 15_000);
 
-		it("should throw error when cwd does not exist", async () => {
+		it("should throw an actionable error when cwd does not exist", async () => {
 			const nonexistentCwd = "/this/directory/definitely/does/not/exist/12345";
 
 			const bashToolWithBadCwd = new BashTool(createTestToolSession(nonexistentCwd));
 
 			await expect(bashToolWithBadCwd.execute("test-call-11", { command: "echo test" })).rejects.toThrow(
-				/Working directory does not exist/,
+				/Working directory does not exist: .*Pass an existing directory as `cwd`.*the command was not run/,
 			);
+		});
+
+		it("runs a leading `cd` with a redirect verbatim instead of lifting it into cwd", async () => {
+			const result = await bashTool.execute("test-call-cd-redirect", {
+				command: "cd /this/directory/definitely/does/not/exist/12345 2>/dev/null && echo moved || echo stayed",
+			});
+			expect(getTextOutput(result)).toContain("stayed");
+		});
+
+		it("lifts a quoted single-word leading `cd` into cwd", async () => {
+			const spaced = path.join(testDir, "dir with space");
+			fs.mkdirSync(spaced);
+			const result = await bashTool.execute("test-call-cd-quoted", { command: `cd "${spaced}" && pwd` });
+			expect(getTextOutput(result).trim()).toBe(spaced);
 		});
 
 		it("should not pull cwd from a later-line `&&` when the command is multiline", async () => {

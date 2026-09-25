@@ -196,8 +196,20 @@ type CommandAliasTarget = { extensionPath: string; commandName: string };
 
 export type FunctionHookDispatchResult<TEvent extends ExtensionEvent> =
 	| { action: "continue"; event: TEvent; transformed?: boolean }
-	| { action: "deny"; reason: string }
+	| { action: "deny"; reason: string; failed?: true }
 	| { action: "return"; value: unknown };
+
+/**
+ * `tool_result` mediation outcomes the runner synthesized from a failing or
+ * malformed hook rather than from an extension's own decision. Callers use
+ * {@link isFailedToolResultMediation} to keep those classified as faults.
+ */
+const failedToolResultMediations = new WeakSet<ToolResultEventResult>();
+
+/** True when a `tool_result` mediation result reports a hook failure, not an extension verdict. */
+export function isFailedToolResultMediation(result: ToolResultEventResult): boolean {
+	return failedToolResultMediations.has(result);
+}
 
 export type FunctionHookAuditSink = (record: FunctionHookAuditRecord) => void;
 
@@ -980,7 +992,7 @@ export class ExtensionRunner {
 			event.type === "before_provider_request" ||
 			event.type.startsWith("session_before_")
 		) {
-			return { action: "deny", reason };
+			return { action: "deny", reason, failed: true };
 		}
 		return { action: "continue", event };
 	}
@@ -1104,7 +1116,8 @@ export class ExtensionRunner {
 				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
 				let nextReturnValue: FunctionHookResult | undefined;
 				const failureResult = async (reason: string): Promise<FunctionHookDispatchResult<TEvent>> => {
-					if (functionHookDenyAllowed(currentEvent, effectiveGrant)) return { action: "deny", reason };
+					if (functionHookDenyAllowed(currentEvent, effectiveGrant))
+						return { action: "deny", reason, failed: true };
 					if (wildcard) {
 						if (nextPromise) return await nextPromise;
 						return await invoke(index + 1, currentEvent, downstreamRemoved, chainSignal);
@@ -1521,11 +1534,13 @@ export class ExtensionRunner {
 			},
 		);
 		if (functionDispatch.action === "deny") {
-			return {
+			const denied: ToolResultEventResult = {
 				content: [{ type: "text", text: functionDispatch.reason }],
 				details: event.details,
 				isError: true,
 			};
+			if (functionDispatch.failed) failedToolResultMediations.add(denied);
+			return denied;
 		}
 		if (functionDispatch.action === "return") return functionDispatch.value as ToolResultEventResult;
 		if (functionDispatch.transformed !== true) return undefined;

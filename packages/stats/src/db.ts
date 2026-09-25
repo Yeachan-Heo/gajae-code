@@ -9,6 +9,8 @@ import type {
 	BehaviorModelStats,
 	BehaviorOverallStats,
 	BehaviorTimeSeriesPoint,
+	CacheMissAttribution,
+	CacheMissCause,
 	CostTimeSeriesPoint,
 	FolderStats,
 	MessageStats,
@@ -16,6 +18,7 @@ import type {
 	ModelStats,
 	ModelTimeSeriesPoint,
 	ParsedMessageStats,
+	PromptPrefixChange,
 	TimeSeriesPoint,
 	UserMessageLink,
 	UserMessageStats,
@@ -153,6 +156,14 @@ export async function initDb(): Promise<Database> {
 	}
 	if (!messageColumns.some(column => column.name === "agent")) {
 		db.exec("ALTER TABLE messages ADD COLUMN agent TEXT NOT NULL DEFAULT 'unknown'");
+	}
+	// Prompt-prefix telemetry (#5946). Sessions written before it carry no
+	// fingerprint, so older rows stay NULL and are excluded from attribution.
+	if (!messageColumns.some(column => column.name === "prefix_change")) {
+		db.exec("ALTER TABLE messages ADD COLUMN prefix_change TEXT");
+	}
+	if (!messageColumns.some(column => column.name === "prefix_diverged_role")) {
+		db.exec("ALTER TABLE messages ADD COLUMN prefix_diverged_role TEXT");
 	}
 	db.exec("CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent)");
 	db.exec("UPDATE messages SET premium_requests = 0 WHERE premium_requests IS NULL");
@@ -357,8 +368,9 @@ export function insertMessageStats(stats: ParsedMessageStats[]): number {
 			session_file, entry_id, agent, folder, model, provider, api, timestamp,
 			duration, ttft, stop_reason, error_message,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
-			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total,
+			prefix_change, prefix_diverged_role
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(session_file, entry_id) DO UPDATE SET
 			agent = excluded.agent,
 			premium_requests = MAX(messages.premium_requests, excluded.premium_requests)
@@ -393,6 +405,8 @@ export function insertMessageStats(stats: ParsedMessageStats[]): number {
 				cost.cacheRead,
 				cost.cacheWrite,
 				cost.total,
+				s.promptPrefix?.change ?? null,
+				s.promptPrefix?.divergedRole ?? null,
 			);
 			if (result.changes > 0) inserted++;
 		}
@@ -712,6 +726,75 @@ export function getModelPerformanceSeries(
 		avgTtft: row.avg_ttft,
 		avgTokensPerSecond: row.avg_tokens_per_second,
 	}));
+}
+
+/** Minimum prompt size (input + cache read + cache write) for a request to count as a prefix miss. */
+const PREFIX_MISS_MIN_PROMPT_TOKENS = 4096;
+/** A request whose cache read covers less than this share of its prompt lost its prefix. */
+const PREFIX_MISS_MAX_CACHED_SHARE = 0.1;
+const CLIENT_PREFIX_CHANGES: readonly PromptPrefixChange[] = ["tools", "system", "messages", "options"];
+
+/**
+ * Attribute prompt-cache prefix misses to their client-side cause using the
+ * per-request prompt-prefix telemetry. Requests without telemetry, the first
+ * request of each agent, and provider/model pairs that never reported a cache
+ * read (no usable prompt-cache telemetry, e.g. local backends) are excluded.
+ */
+export function getCacheMissAttribution(cutoff?: number): CacheMissAttribution {
+	const empty: CacheMissAttribution = {
+		trackedRequests: 0,
+		prefixMisses: 0,
+		clientCausedMisses: 0,
+		providerSideMisses: 0,
+		modelSwitchMisses: 0,
+		clientCausedShare: 0,
+		byCause: [],
+	};
+	if (!db) return empty;
+	const hasCutoff = cutoff !== undefined && cutoff > 0;
+	const stmt = db.prepare(`
+		SELECT
+			prefix_change,
+			prefix_diverged_role,
+			COUNT(*) as requests,
+			SUM(CASE
+				WHEN input_tokens + cache_read_tokens + cache_write_tokens >= ?
+					AND cache_read_tokens < ? * (input_tokens + cache_read_tokens + cache_write_tokens)
+				THEN 1 ELSE 0 END) as misses
+		FROM messages
+		WHERE prefix_change IS NOT NULL AND prefix_change <> 'initial'
+			AND (provider, model) IN (
+				SELECT provider, model FROM messages GROUP BY provider, model HAVING SUM(cache_read_tokens) > 0
+			)
+		${hasCutoff ? "AND timestamp >= ?" : ""}
+		GROUP BY prefix_change, prefix_diverged_role
+	`);
+	const params = [PREFIX_MISS_MIN_PROMPT_TOKENS, PREFIX_MISS_MAX_CACHED_SHARE];
+	const rows = (hasCutoff ? stmt.all(...params, cutoff) : stmt.all(...params)) as Array<{
+		prefix_change: PromptPrefixChange;
+		prefix_diverged_role: string | null;
+		requests: number;
+		misses: number;
+	}>;
+	if (rows.length === 0) return empty;
+
+	const result = { ...empty };
+	const byCause: CacheMissCause[] = [];
+	for (const row of rows) {
+		result.trackedRequests += row.requests;
+		result.prefixMisses += row.misses;
+		if (row.prefix_change === "append") result.providerSideMisses += row.misses;
+		else if (row.prefix_change === "model") result.modelSwitchMisses += row.misses;
+		else if (CLIENT_PREFIX_CHANGES.includes(row.prefix_change)) {
+			result.clientCausedMisses += row.misses;
+			if (row.misses > 0)
+				byCause.push({ change: row.prefix_change, divergedRole: row.prefix_diverged_role, misses: row.misses });
+		}
+	}
+	byCause.sort((a, b) => b.misses - a.misses || a.change.localeCompare(b.change));
+	result.byCause = byCause;
+	result.clientCausedShare = result.prefixMisses > 0 ? result.clientCausedMisses / result.prefixMisses : 0;
+	return result;
 }
 
 /**

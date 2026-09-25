@@ -29,6 +29,15 @@ const EMPTY_DASHBOARD: DashboardStats = {
 	modelSeries: [],
 	modelPerformanceSeries: [],
 	costSeries: [],
+	cacheMissAttribution: {
+		trackedRequests: 0,
+		prefixMisses: 0,
+		clientCausedMisses: 0,
+		providerSideMisses: 0,
+		modelSwitchMisses: 0,
+		clientCausedShare: 0,
+		byCause: [],
+	},
 };
 
 describe("stats server request policy", () => {

@@ -13,12 +13,14 @@ Pick by how many notifications you need:
 - Watch a directory for file changes (`fswatch -r dist/`).
 - Track output from any long-running script you point it at.
 
+`monitor` is not a scheduler. Do not use `sleep N; command` to run something later; use `cron` for delayed or recurring work.
+
 ## Inputs
 
 - `command` (required): shell command to run as a background monitor. Stdout is captured line-by-line; persistent notifications are coalesced before delivery.
 - `kind` (required): one of `"log"`, `"poll"`, `"watch"`, `"other"`. Describes the monitoring strategy so listings can surface useful categories.
 - `description` (required): short human-readable description of what is being monitored. Appears in task listings.
-- `timeout` (optional): maximum wall-clock seconds the monitor may run before automatic shutdown. Omit for the session lifetime.
+- `timeout` (optional): maximum wall-clock seconds the monitor may run before automatic shutdown, from 1 to 3600. Larger values are rejected. Omit for the session lifetime.
 - `persistent` (optional, default `false`): keep the monitor running past the current turn. Persistent monitors survive until session end or until cancelled via `job`.
 
 ## Output

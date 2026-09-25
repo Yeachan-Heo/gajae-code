@@ -339,12 +339,12 @@ describe("read tool URL handling", () => {
 		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
 			ok: true,
 			status: 200,
-			contentType: "image/svg+xml",
-			finalUrl: "https://example.com/image.svg",
-			content: "<svg></svg>",
+			contentType: "image/bmp",
+			finalUrl: "https://example.com/image.bmp",
+			content: "unsupported bitmap response",
 		});
 
-		const result = await tool.execute("fetch-image-unsupported", { path: "https://example.com/image.svg" });
+		const result = await tool.execute("fetch-image-unsupported", { path: "https://example.com/image.bmp" });
 		const imageBlock = result.content.find(content => content.type === "image");
 		const textBlock = result.content.find(content => content.type === "text");
 
@@ -352,7 +352,7 @@ describe("read tool URL handling", () => {
 		expect(fetchBinarySpy).not.toHaveBeenCalled();
 		expect(imageBlock).toBeUndefined();
 		expect(textBlock?.type).toBe("text");
-		expect(textBlock?.text).toContain("<svg></svg>");
+		expect(textBlock?.text).toContain("unsupported bitmap response");
 	});
 
 	it("uses binary conversion fallback for unsupported image MIME when extension is convertible", async () => {

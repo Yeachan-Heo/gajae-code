@@ -20,6 +20,7 @@ import type {
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptMinter, AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
+import type { PromptPrefixTracker } from "./prompt-prefix-telemetry";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { AgentTelemetryConfig } from "./telemetry";
 
@@ -481,6 +482,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * `_i` intent fields.
 	 */
 	appendOnlyContext?: AppendOnlyContextManager;
+	/**
+	 * Fingerprints every provider request against the previous one from the same
+	 * agent and stamps the result on the assistant message as `promptPrefix`.
+	 */
+	promptPrefixTracker?: PromptPrefixTracker;
 
 	/**
 	 * Inspect assistant streaming events before they are published to the outer agent event stream.

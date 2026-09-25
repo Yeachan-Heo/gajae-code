@@ -242,7 +242,7 @@ describe("AgentSession managed fallback cancellation completion", () => {
 		const markUsageLimitReached = vi.spyOn(authStorage, "markUsageLimitReached").mockImplementation(async () => {
 			markStarted.resolve();
 			await releaseMark.promise;
-			return false;
+			return { state: "not-marked", remainingCredentialIds: [] };
 		});
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));

@@ -1,6 +1,9 @@
 /** Lines of context shown either side of a hash mismatch. */
 export const MISMATCH_CONTEXT = 2;
 
+/** Lines searched either side of a stale anchor for where its content moved. */
+export const MISMATCH_RELOCATE_WINDOW = 20;
+
 /** Filler hash used for the interior of a multi-line range; not validated. */
 export const RANGE_INTERIOR_HASH = "**";
 

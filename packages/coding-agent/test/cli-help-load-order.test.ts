@@ -39,7 +39,56 @@ function itWithTempRoot(name: string, prefix: string, run: (root: string) => Pro
 	);
 }
 
+/**
+ * Every module reachable from `entry` through static imports only (dynamic `import()`
+ * edges excluded). The bundler runs in a child Bun so the test runner's own module
+ * resolution state cannot leak into the graph.
+ */
+async function eagerModuleGraph(entry: string): Promise<string[]> {
+	const script = `
+const entry = process.argv[1];
+const result = await Bun.build({ entrypoints: [entry], target: "bun", metafile: true, external: ["mupdf"] });
+if (!result.success || !result.metafile) { for (const log of result.logs) console.error(String(log)); process.exit(1); }
+const inputs = result.metafile.inputs;
+const start = Object.keys(inputs).find(input => require("node:path").resolve(input) === entry);
+if (!start) { console.error("entry missing from metafile"); process.exit(1); }
+const reached = new Set([start]);
+const queue = [start];
+for (let current = queue.shift(); current !== undefined; current = queue.shift()) {
+	for (const edge of inputs[current]?.imports ?? []) {
+		if (edge.kind === "dynamic-import" || reached.has(edge.path)) continue;
+		reached.add(edge.path);
+		queue.push(edge.path);
+	}
+}
+process.stdout.write(JSON.stringify([...reached]));
+`;
+	const proc = Bun.spawn([process.execPath, "-e", script, entry], { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, exitCode] = await Promise.all([
+		readStream(proc.stdout as ReadableStream<Uint8Array>),
+		readStream(proc.stderr as ReadableStream<Uint8Array>),
+		proc.exited,
+	]);
+	expect(exitCode, stderr).toBe(0);
+	return JSON.parse(stdout) as string[];
+}
+
 describe("CLI help load order", () => {
+	it("keeps provider SDKs out of the eager startup graph that every gjc invocation evaluates (#5941)", async () => {
+		// cli-main.ts is statically loaded by every ordinary gjc invocation, including
+		// --help and --version. Reaching the @gajae-code/ai barrel here evaluated every
+		// provider SDK (~550 modules) before argv was even parsed.
+		const graph = await eagerModuleGraph(cliMainPath);
+		const offenders = graph.filter(
+			input =>
+				input.endsWith(path.join("packages", "ai", "src", "core.ts")) ||
+				input.endsWith(path.join("packages", "ai", "src", "index.ts")) ||
+				/node_modules\/(openai|@anthropic-ai\/sdk|@google\/genai|beautiful-mermaid)\//.test(input),
+		);
+		expect(offenders).toEqual([]);
+		expect(graph.length).toBeLessThan(150);
+	}, 60_000);
+
 	it("keeps model preset command out of the eager CLI module graph", async () => {
 		const source = await fs.readFile(cliMainPath, "utf8");
 		expect(source).not.toContain('import ModelPresets from "./commands/model-presets"');

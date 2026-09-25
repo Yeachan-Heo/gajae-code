@@ -36,13 +36,36 @@ describe("AuthStorage api-key usage-limit fallback", () => {
 
 		const sessionId = "zai-api-key-usage-limit-session";
 		const firstKey = await authStorage.getApiKey("zai", sessionId);
+		const failedRowId = authStorage.getSessionCredentialRowId("zai", sessionId)!;
 
-		const switched = await authStorage.markUsageLimitReached("zai", sessionId, { retryAfterMs: 60_000 });
+		const result = await authStorage.markUsageLimitReached("zai", sessionId, { retryAfterMs: 60_000 });
 		const retryKey = await authStorage.getApiKey("zai", sessionId);
 
-		expect(switched).toBe(true);
+		expect(result).toEqual({
+			state: "marked",
+			failedRowId,
+			credentialKind: "api_key",
+			remainingCredentialIds: store!
+				.listAuthCredentials("zai")
+				.filter(row => row.id !== failedRowId)
+				.map(row => row.id),
+		});
 		expect(retryKey).toBeDefined();
 		expect(retryKey).not.toBe(firstKey);
 		expect(new Set([firstKey, retryKey]).size).toBe(2);
+	});
+
+	it("reports a blocked row unavailable while an unblocked same-kind peer remains available", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const sessionId = "zai-api-key-availability-session";
+		await authStorage.getApiKey("zai", sessionId);
+		const failedRowId = authStorage.getSessionCredentialRowId("zai", sessionId)!;
+		const peerRowId = store.listAuthCredentials("zai").find(row => row.id !== failedRowId)!.id;
+
+		await authStorage.markUsageLimitReached("zai", sessionId, { retryAfterMs: 60_000 });
+
+		expect(authStorage.isCredentialAvailable("zai", failedRowId)).toBe(false);
+		expect(authStorage.isCredentialAvailable("zai", peerRowId)).toBe(true);
 	});
 });

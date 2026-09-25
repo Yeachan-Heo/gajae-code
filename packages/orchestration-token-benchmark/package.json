@@ -20,7 +20,11 @@
 		"fix": "biome check --write --unsafe .",
 		"fmt": "biome format --write .",
 		"start": "bun run src/index.ts",
-		"bench:live": "bun run src/live-runner.ts"
+		"bench:live": "bun run src/live-runner.ts",
+		"bench:tool-results:live": "bun run src/tool-result-ab-live.ts"
+	},
+	"dependencies": {
+		"@gajae-code/coding-agent": "catalog:"
 	},
 	"devDependencies": {
 		"@types/bun": "catalog:"

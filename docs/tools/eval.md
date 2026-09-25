@@ -14,13 +14,15 @@
   - `packages/coding-agent/src/eval/js/index.ts` — JS backend adapter
   - `packages/coding-agent/src/eval/js/executor.ts` — JS execution + output sink
   - `packages/coding-agent/src/eval/js/context-manager.ts` — persistent VM contexts, prelude, tool bridge
-  - `packages/coding-agent/src/eval/js/prelude.txt` — JS global helpers
+  - `packages/coding-agent/src/eval/js/shared/prelude.txt` — JS global helpers
   - `packages/coding-agent/src/eval/py/index.ts` — Python backend adapter
   - `packages/coding-agent/src/eval/py/executor.ts` — kernel session retention, reset, cleanup
-  - `packages/coding-agent/src/eval/py/kernel.ts` — Jupyter gateway/kernel protocol, display capture
+  - `packages/coding-agent/src/eval/py/kernel.ts` — runner subprocess lifecycle, NDJSON framing, interrupt/shutdown
+  - `packages/coding-agent/src/eval/py/runner.py` — NDJSON runner executed by the kernel subprocess
+  - `packages/coding-agent/src/eval/py/display.ts` — MIME bundle to text/structured output mapping
   - `packages/coding-agent/src/eval/py/prelude.py` — Python helper functions and status events
   - `packages/coding-agent/src/session/streaming-output.ts` — truncation, artifacts, streamed chunks
-  - `docs/python-repl.md` — Python kernel/gateway internals
+  - `docs/python-repl.md` — Python runner and kernel internals
 
 ## Inputs
 
@@ -34,7 +36,7 @@ Each `EvalCellInput` (from `evalCellSchema` in `packages/coding-agent/src/tools/
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `language` | `"py" \| "js"` | Yes | Backend selector. `"py"` maps to the IPython/Jupyter kernel (`python` backend); `"js"` maps to the persistent JavaScript VM. |
+| `language` | `"py" \| "js"` | Yes | Backend selector. `"py"` maps to the persistent Python subprocess runner (`python` backend); `"js"` maps to the persistent JavaScript VM. |
 | `code` | `string` | Yes | Cell body, verbatim. JSON-encoded — embed newlines, quotes, and indentation directly; no fences, no headers. |
 | `title` | `string` | No | Short label rendered in the transcript (e.g. `"imports"`, `"load config"`). |
 | `timeout` | `integer` | No | Per-cell timeout in seconds, clamped to `1..600`. Defaults to 30 when omitted. |
@@ -114,16 +116,16 @@ Side-channel artifacts:
 
 Backend choice is **explicit per cell** — there is no auto-detection.
 
-- `language: "py"` → Python (IPython/Jupyter) backend
+- `language: "py"` → Python (subprocess runner) backend
 - `language: "js"` → JavaScript VM backend
 
 If the requested backend is disabled or unavailable, the tool throws `ToolError` for that cell. The caller chooses; the tool does not silently substitute.
 
 ### JavaScript runtime
 
-Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packages/coding-agent/src/eval/js/prelude.txt`.
+Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packages/coding-agent/src/eval/js/shared/prelude.txt`.
 
-- Persistent `vm.Context` instances keyed by `js:${sessionId}` in `vmContexts`
+- Persistent `vm.Context` instances keyed by `js:${sessionId}` in the `sessions` map of `context-manager.ts`
 - `reset: true` calls `resetVmContext(sessionKey)` before the cell executes
 - Top-level `await` and bare `return` are supported by wrapping code in an async IIFE when `wrapCode()` sees `await` or `return`
 - Top-level static `import ... from ...` and dynamic `import(...)` calls are routed through `rewriteImports()`, which sends them via `__gjc_import__` so the specifier resolves against the session cwd
@@ -142,27 +144,25 @@ Implemented in `packages/coding-agent/src/eval/js/context-manager.ts` and `packa
 
 ### Python runtime
 
-Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding-agent/src/eval/py/kernel.ts`, and `packages/coding-agent/src/eval/py/prelude.py`. See `docs/python-repl.md` for gateway and kernel details.
+Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding-agent/src/eval/py/kernel.ts`, and `packages/coding-agent/src/eval/py/prelude.py`. See `docs/python-repl.md` for runner and kernel details.
 
 - Default mode is retained `session` kernels keyed by `python:${sessionId}`
 - Optional `python.kernelMode = "per-call"` creates a fresh kernel for each cell and shuts it down afterward
 - `reset: true` disposes the retained kernel for that session before the cell runs; later Python cells in the same tool call reuse the fresh kernel
 - Startup path:
   - availability check
-  - create/connect kernel
+  - spawn `python -u runner.py` as its own process group
   - initialize cwd / env / `sys.path`
   - execute `PYTHON_PRELUDE`
-- Python cells run inside IPython/Jupyter, so top-level `await` works; the prompt warns not to use `asyncio.run(...)`
-- The Python prelude defines synchronous helpers with the same surface as JS (except `tool.<name>` exists only in JS)
-- `display(value)` wraps dict/list/tuple values in `IPython.display.JSON`; rich display MIME bundles are preserved
-- Kernel `display_data` / `execute_result` messages map to:
-  - `application/x-gjc-status` → status event
-  - `image/png` → image output
+- The runner compiles cells with `PyCF_ALLOW_TOP_LEVEL_AWAIT` on a persistent event loop, so top-level `await` works; the prompt warns not to use `asyncio.run(...)`
+- The Python prelude defines synchronous helpers with the same surface as JS. When the host tool bridge starts, `tool.<name>(args)` is also available in Python (via the `PI_TOOL_BRIDGE_*` environment variables)
+- `display(value)` turns plain dict/list/tuple values into an `application/json` + `text/plain` bundle; objects with `_repr_*_` methods keep their rich MIME bundles
+- Runner `display` / `result` frames map through `renderKernelDisplay()` (`packages/coding-agent/src/eval/py/display.ts`) to:
+  - `application/x-gjc-status` → status event (no text)
+  - `image/png` / `image/jpeg` → image output
   - `application/json` → JSON output
-  - `text/markdown` → markdown output
-  - `text/plain` → text output
-  - `text/html` → HTML converted to markdown with `htmlToBasicMarkdown()`
-- Interactive stdin is rejected: `input_request` sends an empty reply, marks `stdinRequested`, and the executor returns exit code `1`
+  - text, by precedence: `text/markdown` (markdown output) > `text/plain` > `text/html` converted to markdown with `htmlToBasicMarkdown()`
+- Interactive stdin is not supported: the runner does not forward `input()` prompts, so a cell that calls `input()` blocks until it is cancelled or times out
 
 ### Multi-language call behavior
 
@@ -187,12 +187,12 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
   - `session.assertEvalExecutionAllowed?.()` can block execution.
   - `session.trackEvalExecution?.(...)` can register cancellable eval work.
   - `session.getSessionFile?.()` and `session.getEvalKernelOwnerId?.()` influence kernel reuse and artifact lookup.
-  - JS VM contexts persist in `vmContexts` across eval calls until reset/disposal.
-  - Python retained kernels persist in `kernelSessions` until reset, eviction, idle cleanup, or owner cleanup.
+  - JS VM contexts persist in the `sessions` map of `context-manager.ts` across eval calls until reset/disposal.
+  - Python retained kernels persist in the executor's `sessions` map until reset, owner cleanup (`disposeKernelSessionsByOwner()`), or process shutdown (`disposeAllKernelSessions()`). There is no idle eviction or session cap.
 - User-visible prompts / interactive UI
   - none; stdin requests are rejected programmatically
 - Background work / cancellation
-  - Python retained kernels have heartbeat and idle cleanup timers.
+  - Python kernels have no heartbeat or idle timers. A dead retained kernel is detected with `isAlive()` when the next cell runs and is replaced.
   - Cancellation interrupts a running Python kernel and aborts JS promise waits.
 
 ## Limits & Caps
@@ -204,13 +204,11 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 - Output truncation window: 50KB default (`DEFAULT_MAX_BYTES` in `packages/coding-agent/src/session/streaming-output.ts`)
 - Output line cap inside truncation helpers: 3000 lines (`DEFAULT_MAX_LINES` in `packages/coding-agent/src/session/streaming-output.ts`)
 - Streaming tail buffer for live updates: `DEFAULT_MAX_BYTES * 2` = 100KB (`packages/coding-agent/src/tools/eval.ts`)
-- Python retained kernel idle timeout: 5 minutes (`IDLE_TIMEOUT_MS` in `packages/coding-agent/src/eval/py/executor.ts`)
-- Python retained kernel cap: 4 sessions (`MAX_KERNEL_SESSIONS` in `packages/coding-agent/src/eval/py/executor.ts`)
-- Python retained kernel cleanup sweep: every 30s (`CLEANUP_INTERVAL_MS` in `packages/coding-agent/src/eval/py/executor.ts`)
-- Python owner-cleanup shutdown wait: 2000ms (`OWNER_CLEANUP_KERNEL_SHUTDOWN_TIMEOUT_MS` in `packages/coding-agent/src/eval/py/executor.ts`)
-- Python heartbeat interval: 5s (`ensureKernelHeartbeat()` in `packages/coding-agent/src/eval/py/executor.ts`)
-- Python external gateway availability check timeout: 5s (`AbortSignal.timeout(5000)` in `packages/coding-agent/src/eval/py/kernel.ts`)
-- Python auto-restart budget: one restart per retained session before hard failure (`restartCount > 1` in `packages/coding-agent/src/eval/py/executor.ts`)
+- Python kernel startup budget: 10s shared by the init script and prelude (`STARTUP_TIMEOUT_MS` in `packages/coding-agent/src/eval/py/kernel.ts`)
+- Python interrupt escalation: if the runner has not finished 5s after `SIGINT`, the kernel is shut down and the cell is marked as kernel-killed (`INTERRUPT_ESCALATION_MS` in `packages/coding-agent/src/eval/py/kernel.ts`)
+- Python shutdown: `{"type":"exit"}`, then `SIGTERM`, then `SIGKILL`, waiting 1s per step by default (`SHUTDOWN_GRACE_MS` in `packages/coding-agent/src/eval/py/kernel.ts`)
+- Python dead-kernel recovery: a retained kernel found dead before a cell runs is replaced; a non-cancellation failure that leaves it dead is replaced and the cell is retried once (`executeOnSession()` in `packages/coding-agent/src/eval/py/executor.ts`)
+- Retained Python kernels have no idle timeout, session cap, or heartbeat
 
 ## Errors
 
@@ -222,7 +220,7 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
   - Python kernel unavailable and a `py` cell is requested
 - JS runtime exceptions are converted into text output plus `exitCode: 1`; cancellations return `cancelled: true` and may append `Command timed out`.
 - Python execution errors from the kernel become text output and `exitCode: 1`; later cells are skipped.
-- Python stdin requests are treated as errors with the message `Kernel requested stdin; interactive input is not supported.`
+- Python timeouts annotate the output: `eval cell timed out after <n>s; kernel interrupted but remains running. ...`, or, when the kernel ignored the interrupt and was killed, a notice that it will be recreated on the next call (`formatKernelTimeoutAnnotation()` in `packages/coding-agent/src/eval/py/executor.ts`).
 - Cancellation is returned, not thrown, once backend execution has started. The tool formats it as a cell failure and sets `details.isError = true`.
 - If output truncates, the tool still succeeds; truncation is surfaced through `details.meta` and artifact-backed full output when available.
 
@@ -230,9 +228,9 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 
 - Backend selection is now strictly explicit per cell: `language` must be `"py"` or `"js"`. The previous `*** Cell` header parser, the `eval.lark` constrained grammar, and the sniffer-based fallback have all been removed.
 - `EvalTool.customFormat` no longer exists. Tool calls flow through the standard JSON schema; there is no Lark-constrained sampling path.
-- `tool.<name>()` exists only in JS. Python prelude helpers do not call back into the full tool registry.
+- `tool.<name>()` exists in JS, and in Python when the host tool bridge starts. The other Python prelude helpers work on the filesystem directly.
 - JS helper paths reject protocol URIs (`://`) in `resolvePath()`; the JS prelude is filesystem-only unless the code calls `tool.read(...)` or another tool explicitly.
-- Python helper `output(...)` depends on `GJC_SESSION_FILE`; it fails outside a session-backed run.
+- Python helper `output(...)` reads `PI_ARTIFACTS_DIR`, falling back to `PI_SESSION_FILE`, and raises `No session - output artifacts unavailable` when neither is set. The `eval` Python backend (`packages/coding-agent/src/eval/py/index.ts`) currently passes neither.
 - `display()` can produce text and structured outputs from the same value; the renderer prefers markdown over `text/plain` when both exist.
 - JS static imports are rewritten only at top level. Nested imports stay invalid and surface normal JS syntax/runtime errors.
 - `EvalTool` is `concurrency = "exclusive"`, so eval calls do not overlap within a session.

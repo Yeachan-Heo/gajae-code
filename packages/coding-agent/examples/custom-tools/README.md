@@ -10,32 +10,22 @@ Each example uses the `subdirectory/index.ts` structure required for tool discov
 
 Minimal example showing the basic structure of a custom tool.
 
-### todo/
-
-Full-featured example demonstrating:
-
-- `onSession` for state reconstruction from session history
-- Custom `renderCall` and `renderResult`
-- Proper branching support via details storage
-- State management without external files
-
 ## Usage
 
-```bash
-# Test directly (can point to any .ts file)
-gjc --tool examples/custom-tools/todo/index.ts
+GJC discovers custom tools from `tools/<name>/index.ts` in its config directories. Copy the example folder into one of them:
 
-# Or copy entire folder to tools directory for persistent use
-cp -r todo ~/.gjc/agent/tools/
+```bash
+# All projects
+mkdir -p ~/.gjc/agent/tools && cp -r hello ~/.gjc/agent/tools/
+
+# Current project only
+mkdir -p .gjc/tools && cp -r hello .gjc/tools/
 ```
 
 Then in gjc:
 
 ```
-> add a todo "test custom tools"
-> list todos
-> toggle todo #1
-> clear todos
+> greet Alice with the hello tool
 ```
 
 ## Writing Custom Tools
@@ -78,7 +68,7 @@ export default factory;
 **Custom rendering:**
 
 ```typescript
-renderCall(args, theme) {
+renderCall(args, _options, theme) {
   return new Text(
     theme.fg("toolTitle", theme.bold("my_tool ")) + args.action,
     0, 0  // No padding - Box handles it

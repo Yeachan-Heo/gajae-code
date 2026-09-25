@@ -80,7 +80,7 @@ Warnings:
    - turns `≔A..B` with no payload into one `delete` edit per line in the range; a blank-in-place edit requires one explicit empty payload line
 6. `applyHashlineEdits()` in `packages/coding-agent/src/hashline/apply.ts` validates every referenced anchor before mutating anything. Each anchor hash is recomputed from current file content with `computeLineHash()`.
 7. If any anchor hash differs, `applyHashlineEdits()` throws `HashlineMismatchError`. `execute.ts` catches only that class and calls `tryRecoverHashlineWithCache()`.
-8. Recovery replays the edits against the most recent cached read/search snapshot for that path (`packages/coding-agent/src/edit/file-read-cache.ts`), then 3-way merges the result onto current disk content using `Diff.applyPatch(..., { fuzzFactor: 3 })` in `packages/coding-agent/src/hashline/recovery.ts`. On success the edit proceeds with a warning; on failure the original mismatch error is re-thrown.
+8. Recovery replays the edits against each retained snapshot generation for that path, newest first (`packages/coding-agent/src/edit/file-read-cache.ts`), then 3-way merges the result onto current disk content using `Diff.applyPatch(..., { fuzzFactor: 0 })` in `packages/coding-agent/src/hashline/recovery.ts`. Older generations cover a follow-up edit that reuses anchors from the original read after this session's own edit shifted lines. A generation is used only if every anchored line is in it with a matching hash, every replayed hunk's context comes from lines that snapshot actually observed, and each hunk's old side occurs exactly once in the live file. On success the edit proceeds with a warning; on failure the original mismatch error is re-thrown.
 9. Before splicing lines, `absorbReplacementBoundaryDuplicates()` normalizes some malformed-but-recoverable ranges:
    - duplicate prefix/suffix lines adjacent to a replacement can be absorbed by widening the delete range
    - pure inserts can auto-drop duplicated leading/trailing payload lines when `edit.hashlineAutoDropPureInsertDuplicates` is enabled
@@ -90,7 +90,7 @@ Warnings:
 12. The edited text is restored to the original BOM and line ending style with helpers from `packages/coding-agent/src/edit/normalize.ts` and persisted via `serializeEditFileText()` in `packages/coding-agent/src/edit/read-file.ts`.
 13. The writethrough callback from `createLspWritethrough()` may format the file and fetch diagnostics. Late diagnostics are queued back into session state as a hidden deferred message by `EditTool.#injectLateDiagnostics()` in `packages/coding-agent/src/edit/index.ts`.
 14. `invalidateFsScanAfterWrite()` calls `invalidateFsScanCache(path)` so filesystem-backed tools do not serve stale scan results.
-15. The session file-read cache is refreshed with the post-edit file text via `recordContiguous()`, making the just-written content the new recovery base for subsequent stale-anchor merges.
+15. The session file-read cache is refreshed with the post-edit file text via `recordFull()`, making the just-written content the newest recovery generation while the pre-edit view is kept behind it.
 16. The final response is built from a unified diff (`generateDiffString()`), a compact preview, and any accumulated warnings.
 
 ## Modes / Variants
@@ -175,8 +175,9 @@ export const done = true;
 - Default `edit.mode` is `auto` (model-family routing); `hashline` (`DEFAULT_EDIT_MODE`) is the fallback for unknown models, in `packages/coding-agent/src/utils/edit-mode.ts`.
 - Anchor hashes are always 2 lowercase letters from a stable 647-entry bigram table (`HL_BIGRAMS_COUNT`) in `packages/coding-agent/src/hashline/hash.ts`.
 - The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/coding-agent/src/hashline/constants.ts`.
-- Stale-anchor recovery uses `fuzzFactor: 3` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.
-- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
+- Stale-anchor recovery uses `fuzzFactor: 0` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.
+- The mismatch report searches 20 lines either side of a stale anchor for where its content moved (`MISMATCH_RELOCATE_WINDOW`).
+- The per-session read cache keeps at most 30 paths (`MAX_PATHS_PER_SESSION`) and 4 snapshot generations per path (`MAX_GENERATIONS_PER_PATH`) in `packages/coding-agent/src/edit/file-read-cache.ts`.
 - Hashline streaming chunk defaults are 200 lines or 64 KiB per chunk (`packages/coding-agent/src/hashline/types.ts`, consumed by `packages/coding-agent/src/hashline/stream.ts`).
 - `HL_OP_INSERT_BEFORE` is `«`, `HL_OP_INSERT_AFTER` is `»`, `HL_OP_REPLACE` is `≔`, `HL_OP_CHARS` is `«»≔`, `HL_FILE_PREFIX` is `§`, and `HL_BODY_SEP` is `|` (`packages/coding-agent/src/hashline/hash.ts`).
 
@@ -187,6 +188,8 @@ export const done = true;
   - `Input header "§" is empty; provide a file path.`
 - Bad anchor token:
   - `line N: expected a full anchor such as "119sr"; got "...".`
+- Line number without a hash (`≔16`, `≔23-25`, `≔23..25`):
+  - `line N: anchor "16" is missing its hash; ...` followed by `The edit was NOT applied. Current anchors for <path>:` and the current `LINEhh|TEXT` lines for the referenced span (spans over 20 lines keep the first 19 and the last line; line text is column-bounded like `read` output). A reference past EOF reports `Line N does not exist`. The edit is never applied on a line number alone.
 - Bad range syntax:
   - `line N: explicit ranges are required for replacement...`
   - `line N: range must include exactly two full anchors separated by "..".`
@@ -204,7 +207,7 @@ export const done = true;
   - `File not found: <path>`
 - Out-of-range anchor:
   - `Line N does not exist (file has M lines)`
-- Stale anchors throw `HashlineMismatchError`. The error message contains re-read guidance and reprints nearby current file lines as `LINEhh|TEXT`; mismatched lines are marked `*`. `displayMessage` renders the same information in a code-frame style.
+- Stale anchors throw `HashlineMismatchError`. The error message contains re-read guidance and reprints nearby current file lines as `LINEhh|TEXT`; mismatched lines are marked `*`. When a stale anchor's hash matches exactly one line within 20 lines, the header adds `Likely moved (marked >; verify the content before reusing): 2ab -> 3ab.` and that line is shown marked `>`; the edit is still not applied. `displayMessage` renders the same information in a code-frame style.
 - No-op edit:
   - `Edits to <path> resulted in no changes being made.`
 - Recovery failure is silent internally: if cache-based merge cannot prove a valid result, the original mismatch error is surfaced unchanged.

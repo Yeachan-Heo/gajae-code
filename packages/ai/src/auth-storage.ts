@@ -117,6 +117,20 @@ export type OAuthCredential = {
 
 export type AuthCredential = ApiKeyCredential | OAuthCredential;
 
+export type UsageLimitMarkResult =
+	| {
+			state: "marked";
+			failedRowId: number;
+			credentialKind: "oauth" | "api_key";
+			remainingCredentialIds: readonly number[];
+	  }
+	| {
+			state: "not-marked";
+			failedRowId?: number;
+			credentialKind?: "oauth" | "api_key";
+			remainingCredentialIds: readonly number[];
+	  };
+
 export interface MCPOAuthRefreshClient {
 	clientId?: string;
 	clientSecret?: string;
@@ -669,6 +683,18 @@ export interface CredentialDisabledEvent {
  */
 export type CredentialRankingMode = "balanced" | "earliest-reset";
 
+/**
+ * Whether credential selection may probe provider usage endpoints.
+ *
+ * - `network` (default): ranking and quota checks fetch usage when the shared
+ *   cache has no fresh report.
+ * - `cache-only`: ranking and quota checks read only fresh reports another
+ *   process already cached in agent.db and never call the provider. Used by
+ *   short-lived non-interactive runs (`gjc -p`) that never display usage.
+ *   Explicit `fetchUsageReports()` calls are unaffected.
+ */
+export type UsageProbeMode = "network" | "cache-only";
+
 export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
@@ -961,6 +987,13 @@ const USAGE_LAST_GOOD_RETENTION_MS = 24 * 60 * 60_000;
  * on the next poll.
  */
 const USAGE_FAILURE_BACKOFF_MS = 10_000;
+/**
+ * Cool-down after a usage fetch fails for a credential with no last-good
+ * value. The failure is persisted in the shared agent.db cache so sibling
+ * processes (short-lived `gjc -p` runs, SDK hosts) and repeated credential
+ * selection in one process do not re-probe a rate-limited endpoint (#5939).
+ */
+const USAGE_FAILURE_NEGATIVE_TTL_MS = 60_000;
 // Bumped from 3s — Anthropic model usage retries up to 3 times with exponential backoff
 // (~3.5s total worst case); a tight per-request budget aborts retries mid-cycle.
 const DEFAULT_USAGE_REQUEST_TIMEOUT_MS = 10_000;
@@ -1431,6 +1464,7 @@ export class AuthStorage {
 	#usageRequestTimeoutMs: number;
 	#usageFetchLeaseMs: number;
 	#credentialRankingMode: CredentialRankingMode = "balanced";
+	#usageProbeMode: UsageProbeMode = "network";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
@@ -1505,6 +1539,11 @@ export class AuthStorage {
 				debug: (message, meta) => logger.debug(message, meta),
 				warn: (message, meta) => logger.warn(message, meta),
 			} satisfies UsageLogger);
+	}
+
+	/** Select whether credential selection may probe provider usage endpoints. */
+	setUsageProbeMode(mode: UsageProbeMode): void {
+		this.#usageProbeMode = mode;
 	}
 
 	/**
@@ -2179,6 +2218,26 @@ export class AuthStorage {
 		return this.#getStoredCredentials(storageProvider)[session.index]?.id;
 	}
 
+	/** Whether an enabled stored row is currently available outside quota backoff. */
+	isCredentialAvailable(provider: string, rowId: number): boolean {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const entries = this.#getStoredCredentials(storageProvider);
+		const index = entries.findIndex(entry => entry.id === rowId);
+		if (index === -1) return false;
+
+		const inventory = this.#store.listCredentialInventory?.(storageProvider);
+		if (inventory) {
+			const row = inventory.find(candidate => candidate.id === rowId);
+			if (!row || row.disabled) return false;
+		}
+
+		const entry = entries[index];
+		return (
+			entry !== undefined &&
+			!this.#isCredentialBlocked(this.#getProviderTypeKey(storageProvider, entry.credential.type), index)
+		);
+	}
+
 	/**
 	 * Force a running session's OAuth credential for a provider to a specific
 	 * stored row, independent of quota/rate-limit state. Used for a mid-session
@@ -2432,6 +2491,7 @@ export class AuthStorage {
 	 * @param credentials - Array of stored credentials to cache
 	 */
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
+		const loaded = this.#data.has(provider);
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
 		const identityOrderChanged =
@@ -2458,7 +2518,11 @@ export class AuthStorage {
 			this.#data.set(provider, credentials);
 		}
 		if (identityOrderChanged) this.#resetProviderAssignments(storageProvider);
-		if (!tokenRotationOnly) this.#invalidateUsageCacheForProvider(storageProvider);
+		// The persisted usage cache is keyed by credential identity and shared with
+		// sibling processes through agent.db. A first load of a provider's rows is
+		// not a configuration change; purging there made every new process discard
+		// its peers' reports and re-fetch provider usage at startup (#5939).
+		if (!tokenRotationOnly && loaded) this.#invalidateUsageCacheForProvider(storageProvider);
 		if (tokenRotationOnly) this.#bumpGeneration("oauth-token-rotation");
 		else this.#bumpGeneration("credentials", provider);
 	}
@@ -4088,29 +4152,27 @@ export class AuthStorage {
 		if (inFlight) return inFlight;
 
 		const promise = (async () => {
-			const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
-			if (this.#getProviderGeneration(provider) !== credentialGeneration) return null;
-			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
-			if (report !== null) {
-				// Success: stagger per-credential cache expiry so all accounts don't
-				// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
-				// per source IP regardless of account, and synchronized 5-credential
-				// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
-				// times decorrelate within a few cycles.
-				this.#usageCache.set(cacheKey, { value: report, expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter });
-				return report;
+			// Cross-process single flight: the lease owner fetches; peers wait for
+			// the owner's cached outcome instead of issuing their own request.
+			// `undefined` means the store has no lease support: fetch locally.
+			const leaseClaim = this.#tryAcquireUsageFetchLease(cacheKey);
+			if (leaseClaim === false) {
+				const shared = await this.#waitForUsageReportFromPeer(cacheKey);
+				if (!shared.leaseAcquired) return shared.value;
 			}
-			// Failure: cache the LAST GOOD value (if any) with a short jittered TTL
-			// so the credential cools down briefly without dropping out of the
-			// report. If we never had a good value, return null this cycle and
-			// don't write — let the next poll retry.
-			const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
-			if (lastGood !== null) {
-				const backoffJitter = USAGE_FAILURE_BACKOFF_MS * (Math.random() * 0.5 - 0.25);
-				const coolDown = Date.now() + USAGE_FAILURE_BACKOFF_MS + backoffJitter;
-				this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
+			const leaseOwned = leaseClaim !== undefined;
+			try {
+				return await this.#fetchAndCacheUsageReport(
+					request,
+					cacheKey,
+					provider,
+					credentialGeneration,
+					timeoutMs,
+					logDetails,
+				);
+			} finally {
+				if (leaseOwned) this.#releaseUsageFetchLease(cacheKey);
 			}
-			return lastGood;
 		})().finally(() => {
 			if (this.#usageRequestInFlight.get(cacheKey) === promise) {
 				this.#usageRequestInFlight.delete(cacheKey);
@@ -4119,6 +4181,72 @@ export class AuthStorage {
 
 		this.#usageRequestInFlight.set(cacheKey, promise);
 		return promise;
+	}
+
+	/**
+	 * Wait while a peer process holds the per-credential usage lease. Returns the
+	 * peer's cached outcome, or reports that this process now owns the lease.
+	 * If the peer neither publishes nor releases in time, serve the last-good
+	 * value (or null) rather than piling another request onto the endpoint.
+	 */
+	async #waitForUsageReportFromPeer(
+		cacheKey: string,
+	): Promise<{ value: UsageReport | null; leaseAcquired: false } | { leaseAcquired: true }> {
+		const deadline = Date.now() + this.#usageFetchLeaseMs;
+		while (Date.now() < deadline) {
+			await Bun.sleep(USAGE_FETCH_WAIT_POLL_MS);
+			const cached = this.#usageCache.get<UsageReport | null>(cacheKey);
+			if (cached && cached.expiresAt > Date.now()) return { value: cached.value, leaseAcquired: false };
+			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return { leaseAcquired: true };
+		}
+		return { value: this.#readRetainedLastGoodUsage(cacheKey), leaseAcquired: false };
+	}
+
+	/**
+	 * Last successful report for a credential, if it is still inside the last-good
+	 * retention window. Age is measured from the report's own `fetchedAt`, which
+	 * failure cool-down rewrites never change, so repeated failures cannot keep an
+	 * old (possibly exhausted) report alive past retention. Rows survive process
+	 * startup (#5939) and expired rows are not swept, so this bound is enforced
+	 * on read.
+	 */
+	#readRetainedLastGoodUsage(cacheKey: string): UsageReport | null {
+		const report = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+		if (!report) return null;
+		const fetchedAt = Number.isFinite(report.fetchedAt) ? report.fetchedAt : 0;
+		return fetchedAt + USAGE_LAST_GOOD_RETENTION_MS > Date.now() ? report : null;
+	}
+
+	async #fetchAndCacheUsageReport(
+		request: UsageRequestDescriptor,
+		cacheKey: string,
+		provider: string,
+		credentialGeneration: number,
+		timeoutMs: number | undefined,
+		logDetails: boolean,
+	): Promise<UsageReport | null> {
+		const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
+		if (this.#getProviderGeneration(provider) !== credentialGeneration) return null;
+		if (report !== null) {
+			// Success: stagger per-credential cache expiry so all accounts don't
+			// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
+			// per source IP regardless of account, and synchronized 5-credential
+			// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
+			// times decorrelate within a few cycles.
+			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
+			this.#usageCache.set(cacheKey, { value: report, expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter });
+			return report;
+		}
+		// Failure: cache the LAST GOOD value (if any) with a short jittered TTL
+		// so the credential cools down briefly without dropping out of the
+		// report. Without a previous value, persist the failure itself for a
+		// longer cool-down so neither this process nor its siblings re-probe a
+		// rate-limited endpoint on every credential selection.
+		const lastGood = this.#readRetainedLastGoodUsage(cacheKey);
+		const backoffMs = lastGood !== null ? USAGE_FAILURE_BACKOFF_MS : USAGE_FAILURE_NEGATIVE_TTL_MS;
+		const backoffJitter = backoffMs * (Math.random() * 0.5 - 0.25);
+		this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: Date.now() + backoffMs + backoffJitter });
+		return lastGood;
 	}
 
 	#captureUsageProviderGenerations(requests: ReadonlyArray<UsageRequestDescriptor>): Map<string, number> {
@@ -4367,6 +4495,10 @@ export class AuthStorage {
 		// when present: the broker already aggregates usage from a less-throttled
 		// IP, and falling back to the local per-credential fetch would defeat the
 		// whole point of routing through it.
+		// Cache-only mode must precede the store hook: a remote store's hook
+		// fetches the broker's /v1/usage, which can probe upstream providers.
+		if (this.#usageProbeMode === "cache-only")
+			return this.#peekFreshUsageReport(provider, credential, options?.baseUrl);
 		const storeHook = this.#store.getUsageReport?.bind(this.#store);
 		if (storeHook) {
 			return storeHook(provider, credential, options?.signal);
@@ -4378,6 +4510,24 @@ export class AuthStorage {
 			),
 			options?.signal,
 		);
+	}
+
+	/**
+	 * Zero-network usage lookup for `cache-only` ranking. Remote (broker) stores
+	 * keep reports in their presentation cache rather than the local usage map,
+	 * so consult that first; accept only fresh entries either way.
+	 */
+	#peekFreshUsageReport(provider: Provider, credential: OAuthCredential, baseUrl?: string): UsageReport | null {
+		const now = Date.now();
+		const request = this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+		const credentialId = this.#findStoredCredentialIdForUsageCredential(provider, request.credential);
+		if (credentialId !== undefined) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			const presentation = this.#store.peekCachedUsagePresentation?.(storageProvider, credentialId);
+			if (presentation && presentation.freshUntil > now) return presentation.usage;
+		}
+		const cached = this.#usageCache.get<UsageReport | null>(this.#buildUsageReportCacheKey(request));
+		return cached && cached.expiresAt > now ? cached.value : null;
 	}
 
 	async fetchUsageReports(options?: {
@@ -4844,16 +4994,19 @@ export class AuthStorage {
 	/**
 	 * Marks the explicit stored row, or the session row captured at entry, as usage-limited.
 	 * Re-finds that same row after the usage lookup; a vanished row marks nothing.
-	 * Returns whether another credential of the same type remains unblocked.
+	 * Returns whether the row was marked and the IDs of remaining unblocked peers
+	 * with the same credential type.
 	 */
 	async markUsageLimitReached(
 		provider: string,
 		sessionId: string | undefined,
 		options?: { retryAfterMs?: number; baseUrl?: string; signal?: AbortSignal; owner?: object; rowId?: number },
-	): Promise<boolean> {
+	): Promise<UsageLimitMarkResult> {
 		provider = resolveOAuthStorageProvider(provider);
 		const ownerOverride = this.#configOverrideRegistration(provider, options?.owner);
-		if (ownerOverride && !ownerOverride.envSourced) return false;
+		if (ownerOverride && !ownerOverride.envSourced) {
+			return { state: "not-marked", remainingCredentialIds: [] };
+		}
 		const entries = this.#getStoredCredentials(provider);
 		const sessionCredential = this.#getSessionCredential(provider, sessionId);
 		const initial =
@@ -4862,7 +5015,9 @@ export class AuthStorage {
 				: sessionCredential
 					? entries[sessionCredential.index]
 					: undefined;
-		if (!initial) return false;
+		if (!initial) return { state: "not-marked", remainingCredentialIds: [] };
+		const failedRowId = initial.id;
+		const credentialKind = initial.credential.type;
 		const now = Date.now();
 		let blockedUntil = now + (options?.retryAfterMs ?? AuthStorage.#defaultBackoffMs);
 
@@ -4876,20 +5031,38 @@ export class AuthStorage {
 
 		// Never consult the possibly reassigned sticky pointer after the await.
 		const current = this.#getStoredCredentials(provider);
-		const targetIndex = current.findIndex(entry => entry.id === initial.id);
+		const targetIndex = current.findIndex(entry => entry.id === failedRowId);
 		const target = current[targetIndex];
-		if (!target) return false;
-		const providerKey = this.#getProviderTypeKey(provider, target.credential.type);
+		const inventory = this.#store.listCredentialInventory?.(provider);
+		const enabledIds = inventory ? new Set(inventory.filter(row => !row.disabled).map(row => row.id)) : undefined;
+		const remainingCredentialIds = (): number[] => {
+			return this.#getStoredCredentials(provider)
+				.map((entry, index) => ({ entry, index }))
+				.filter(
+					candidate =>
+						candidate.entry.credential.type === credentialKind &&
+						candidate.entry.id !== failedRowId &&
+						(!enabledIds || enabledIds.has(candidate.entry.id)) &&
+						!this.#isCredentialBlocked(this.#getProviderTypeKey(provider, credentialKind), candidate.index),
+				)
+				.map(candidate => candidate.entry.id);
+		};
+		if (!target || target.credential.type !== credentialKind || (enabledIds && !enabledIds.has(failedRowId))) {
+			return {
+				state: "not-marked",
+				failedRowId,
+				credentialKind,
+				remainingCredentialIds: remainingCredentialIds(),
+			};
+		}
+		const providerKey = this.#getProviderTypeKey(provider, credentialKind);
 		this.#markCredentialBlocked(providerKey, targetIndex, blockedUntil);
-
-		const remainingCredentials = this.#getCredentialsForProvider(provider)
-			.map((credential, index) => ({ credential, index }))
-			.filter(
-				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === target.credential.type && entry.index !== targetIndex,
-			);
-
-		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
+		return {
+			state: "marked",
+			failedRowId,
+			credentialKind,
+			remainingCredentialIds: remainingCredentialIds(),
+		};
 	}
 
 	/**

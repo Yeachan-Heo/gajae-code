@@ -168,7 +168,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 async function printStatsSummary(): Promise<void> {
 	const { getDashboardStats } = await import("@gajae-code/stats");
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder, byAgent } = stats;
+	const { overall, byModel, byFolder, byAgent, cacheMissAttribution } = stats;
 
 	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
 
@@ -212,6 +212,23 @@ async function printStatsSummary(): Promise<void> {
 		}
 	}
 
+	if (cacheMissAttribution.trackedRequests > 0) {
+		const misses = cacheMissAttribution;
+		console.log(chalk.bold("\nCache Prefix Misses:"));
+		console.log(
+			`  Misses: ${formatNumber(misses.prefixMisses)} of ${formatNumber(misses.trackedRequests)} tracked follow-up requests`,
+		);
+		console.log(
+			`  Client-caused: ${formatNumber(misses.clientCausedMisses)} (${formatPercent(misses.clientCausedShare)})`,
+		);
+		console.log(`  Provider-side (prefix intact): ${formatNumber(misses.providerSideMisses)}`);
+		console.log(`  Model switch: ${formatNumber(misses.modelSwitchMisses)}`);
+		for (const cause of misses.byCause) {
+			const label = cause.divergedRole ? `${cause.change} (${cause.divergedRole})` : cause.change;
+			console.log(`    ${label}: ${formatNumber(cause.misses)}`);
+		}
+	}
+
 	console.log("");
 }
 
@@ -244,5 +261,6 @@ ${chalk.bold("Metrics:")}
   - Cost breakdown
   - Average duration and time to first token (TTFT)
   - Tokens per second throughput
+  - Cache prefix misses split into client-caused vs provider-side
 `);
 }

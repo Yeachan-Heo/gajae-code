@@ -5,12 +5,14 @@
  * fallback strategies for finding text in files.
  */
 import type { AgentToolResult } from "@gajae-code/agent-core";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as z from "zod/v4";
 import type { WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { ToolError } from "../../tools/tool-errors";
 import { generateDiffString, replaceText } from "../diff";
 import {
 	detectLineEnding,
@@ -132,6 +134,8 @@ export class EditMatchError extends Error {
 	) {
 		super(EditMatchError.formatMessage(path, searchText, closest, options));
 		this.name = "EditMatchError";
+		// The edit tool answering the model's non-matching input, not a fault.
+		markDesignedError(this);
 	}
 
 	static formatMessage(
@@ -628,7 +632,7 @@ export async function executeReplaceSingle(
 	enforcePlanModeWrite(session, path);
 
 	if (old_text.length === 0) {
-		throw new Error("old_text must not be empty.");
+		throw new ToolError("old_text must not be empty.");
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
@@ -693,7 +697,7 @@ async function executeReplaceSingleUnderLock(
 		});
 
 		if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-			throw new Error(formatOccurrenceError(path, matchOutcome));
+			throw new ToolError(formatOccurrenceError(path, matchOutcome));
 		}
 
 		throw new EditMatchError(path, normalizedOldText, matchOutcome.closest, {
@@ -704,7 +708,7 @@ async function executeReplaceSingleUnderLock(
 	}
 
 	if (normalizedContent === result.content) {
-		throw new Error(`Edits to ${path} resulted in no changes being made.`);
+		throw new ToolError(`Edits to ${path} resulted in no changes being made.`);
 	}
 
 	const finalContent = await serializeEditFileText(

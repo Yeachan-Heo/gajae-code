@@ -1,5 +1,5 @@
 import type { AssistantMessage, ServiceTier, StopReason, Usage } from "@gajae-code/ai";
-import type { AgentRole } from "./shared-types";
+import type { AgentRole, PromptPrefixChange } from "./shared-types";
 
 export * from "./shared-types";
 
@@ -35,6 +35,8 @@ export interface MessageStats {
 	errorMessage: string | null;
 	/** Token usage */
 	usage: Usage;
+	/** Prompt-prefix change recorded for the request, when the session captured it. */
+	promptPrefix?: { change: PromptPrefixChange; divergedRole: string | null };
 }
 
 /**

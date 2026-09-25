@@ -371,6 +371,8 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
 	generatedCacheBudget: GeneratedCacheBudget;
+	/** `provider\0model` keys already warned about a long cache-retention downgrade. */
+	warnedUnknownLongCacheRetention: Set<string>;
 	thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope;
 	thinkingReplayRepairAttempts: number;
 	thinkingReplayRejectedPayload?: AnthropicPayloadFingerprint;
@@ -399,12 +401,14 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
 		generatedCacheBudget: 2,
+		warnedUnknownLongCacheRetention: new Set(),
 		thinkingReplayRepairScope: "none",
 		thinkingReplayRepairAttempts: 0,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
 			state.generatedCacheBudget = 2;
+			state.warnedUnknownLongCacheRetention.clear();
 			state.thinkingReplayRepairScope = "none";
 			state.thinkingReplayRepairAttempts = 0;
 			state.thinkingReplayRejectedPayload = undefined;
@@ -800,10 +804,14 @@ function getCacheControl(
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
 	generatedCacheBudget: GeneratedCacheBudget = 2,
-): { mode: AnthropicCacheMode; cacheControl?: AnthropicCacheControl } {
-	if (generatedCacheBudget === 0) return { mode: "none" };
+): {
+	mode: AnthropicCacheMode;
+	cacheControl?: AnthropicCacheControl;
+	warnUnknownLongCacheRetention: boolean;
+} {
+	if (generatedCacheBudget === 0) return { mode: "none", warnUnknownLongCacheRetention: false };
 	const retention = resolveCacheRetention(cacheRetention ?? model.cacheRetention, "long");
-	if (retention === "none") return { mode: "none" };
+	if (retention === "none") return { mode: "none", warnUnknownLongCacheRetention: false };
 
 	const isCanonicalApi = isAnthropicApiBaseUrl(baseUrl);
 	const promptCacheMode = model.compat?.promptCacheMode;
@@ -819,13 +827,16 @@ function getCacheControl(
 						: isClaudeFamilyModel(model)
 							? "explicit"
 							: "none";
-	if (mode === "none") return { mode };
+	if (mode === "none") return { mode, warnUnknownLongCacheRetention: false };
+	const warnUnknownLongCacheRetention =
+		!isCanonicalApi && retention === "long" && model.compat?.supportsLongCacheRetention === undefined;
 
 	const supportsLongCacheRetention = isCanonicalApi
 		? getAnthropicCompat(model).supportsLongCacheRetention
 		: model.compat?.supportsLongCacheRetention === true;
 	return {
 		mode,
+		warnUnknownLongCacheRetention,
 		cacheControl: {
 			type: "ephemeral",
 			...(retention === "long" && supportsLongCacheRetention ? { ttl: "1h" } : {}),
@@ -1972,13 +1983,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			// never persisted — so a completed stream must not release it.
 			let thinkingReplayRepairPersistent = thinkingReplayRepairScope !== "none";
 			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
+			let warnedUnknownLongCacheRetention = false;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
 				// repairs activated so far. Rebuilding from only the immediate call lets
 				// a later strict/forced-tool/fast-mode fallback reintroduce the rejected
 				// shape (e.g. invalid thinking signatures or forced tool_choice), and
 				// the one-shot thinking-repair guard then blocks recovery.
-				let nextParams = buildParams(
+				const builtParams = buildParams(
 					model,
 					baseUrl,
 					context,
@@ -1991,6 +2003,20 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					},
 					generatedCacheBudget,
 				);
+				let nextParams = builtParams.params;
+				const longCacheWarningKey = `${model.provider}\0${model.id}`;
+				if (
+					builtParams.warnUnknownLongCacheRetention &&
+					!warnedUnknownLongCacheRetention &&
+					!providerSessionState?.warnedUnknownLongCacheRetention.has(longCacheWarningKey)
+				) {
+					warnedUnknownLongCacheRetention = true;
+					providerSessionState?.warnedUnknownLongCacheRetention.add(longCacheWarningKey);
+					logger.warn(
+						'Anthropic-compatible endpoint has unknown long cache-retention support; omitting ttl (default ~5m). Set compat.supportsLongCacheRetention: true to opt into ttl: "1h".',
+						{ provider: model.provider, model: model.id },
+					);
+				}
 				if (droppedForcedToolChoice) {
 					delete nextParams.tool_choice;
 				}
@@ -3554,13 +3580,12 @@ function buildParams(
 	disableStrictTools = false,
 	thinkingRepair?: { repairLatestAssistantThinking?: boolean; repairAllAssistantThinking?: boolean },
 	generatedCacheBudget: GeneratedCacheBudget = 2,
-): MessageCreateParamsStreaming {
-	const { mode: cacheMode, cacheControl } = getCacheControl(
-		model,
-		baseUrl,
-		options?.cacheRetention,
-		generatedCacheBudget,
-	);
+): { params: MessageCreateParamsStreaming; warnUnknownLongCacheRetention: boolean } {
+	const {
+		mode: cacheMode,
+		cacheControl,
+		warnUnknownLongCacheRetention,
+	} = getCacheControl(model, baseUrl, options?.cacheRetention, generatedCacheBudget);
 
 	const params: AnthropicSamplingParams = {
 		model: model.id,
@@ -3731,11 +3756,17 @@ function buildParams(
 		params.system = systemBlocks;
 	}
 	ensureMaxTokensForThinking(params, model);
-	applyPromptCaching(params as AnthropicCacheParams, cacheMode, cacheControl, generatedCacheBudget);
+	const cacheParams = params as AnthropicCacheParams;
+	const cacheBreakpointCountBefore = countCacheControlBreakpoints(cacheParams);
+	applyPromptCaching(cacheParams, cacheMode, cacheControl, generatedCacheBudget);
 	enforceCacheControlLimit(params, 4);
 	normalizeCacheControlTtlOrdering(params);
 
-	return params;
+	return {
+		params,
+		warnUnknownLongCacheRetention:
+			warnUnknownLongCacheRetention && countCacheControlBreakpoints(cacheParams) > cacheBreakpointCountBefore,
+	};
 }
 
 /**

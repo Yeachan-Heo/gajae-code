@@ -157,8 +157,7 @@ const initialNodeAuthorities = initialProcessEnvironment.then(async environment 
 		try {
 			const real = await fs.realpath(lexical);
 			if (temporaryRoots.some(root => isWithin(root, real))) continue;
-			const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
-			authorities.set(real, sha256(bytes));
+			authorities.set(real, await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES));
 		} catch {
 			// Missing or unstable startup candidates do not become authority.
 		}
@@ -408,6 +407,49 @@ async function readStableFile(
 	}
 }
 
+const STABLE_HASH_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * SHA-256 of a regular file with the same stability contract as `readStableFile`
+ * (follows symlinks, bounded size, rejects a file that changes while it is read),
+ * streamed through one reusable chunk. Startup Node authority hashes every `node`
+ * on PATH; buffering each interpreter (~120 MiB) held its full bytes in the
+ * session process until exit.
+ */
+export async function hashStableFile(filePath: string, label: string, maxBytes: number): Promise<string> {
+	const handle = await fs.open(filePath, fs.constants.O_RDONLY);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile()) throw new Error(`${label} is not a regular file`);
+		if (before.size > maxBytes) throw new Error(`${label} exceeds its byte limit`);
+		const hash = createHash("sha256");
+		const chunk = Buffer.allocUnsafe(STABLE_HASH_CHUNK_BYTES);
+		let offset = 0;
+		for (;;) {
+			const remaining = maxBytes + 1 - offset;
+			if (remaining <= 0) throw new Error(`${label} exceeds its byte limit`);
+			const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.byteLength, remaining), offset);
+			if (bytesRead === 0) break;
+			hash.update(chunk.subarray(0, bytesRead));
+			offset += bytesRead;
+		}
+		const after = await handle.stat();
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeMs !== after.mtimeMs ||
+			before.ctimeMs !== after.ctimeMs ||
+			offset !== after.size
+		) {
+			throw new Error(`${label} changed while reading`);
+		}
+		return hash.digest("hex");
+	} finally {
+		await handle.close();
+	}
+}
+
 /**
  * Resolve host launchers through absolute PATH entries outside the workspace
  * and installed plugin. Relative entries such as `.` and absolute workspace
@@ -475,8 +517,7 @@ async function isInitialManagedNodeLauncherPath(
 	if ((await initialTemporaryRoots).some(root => isWithin(root, real))) return false;
 	const expected = (await initialNodeAuthorities).get(real);
 	if (!expected) return false;
-	const bytes = await readStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES, true);
-	return sha256(bytes) === expected;
+	return (await hashStableFile(real, "Initial Node executable", MCP_LAUNCHER_MAX_BYTES)) === expected;
 }
 
 async function resolveTrustedSnapshotBase(
