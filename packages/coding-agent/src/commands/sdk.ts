@@ -493,6 +493,7 @@ export async function runSessionHost(
 		cwd?: string;
 		processIncarnation?: (pid: number) => string | undefined;
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
+		initTheme?: typeof initTheme;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
@@ -502,6 +503,7 @@ export async function runSessionHost(
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
+	const initializeTheme = timing.initTheme ?? initTheme;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
@@ -588,18 +590,31 @@ export async function runSessionHost(
 	const startupOwner: SdkLifecycleStartupOwner = { capability, rollback };
 	let startupComplete = false;
 	let readinessPublicationCleanupComplete = true;
-	let revokePendingReadinessMarker: (() => boolean) | undefined;
+	let revokePendingReadinessMarker: (() => Promise<boolean>) | undefined;
+	let readinessRevocation: Promise<boolean> | undefined;
 	let startupInterruption: SdkStartupFailure | undefined;
 	const interrupted = Promise.withResolvers<SdkStartupFailure>();
+	const startReadinessRevocation = (revoke: () => Promise<boolean>): void => {
+		readinessPublicationCleanupComplete = false;
+		readinessRevocation ??= Promise.resolve()
+			.then(revoke)
+			.then(
+				revoked => {
+					readinessPublicationCleanupComplete = revoked;
+					if (revoked) revokePendingReadinessMarker = undefined;
+					return revoked;
+				},
+				() => {
+					readinessPublicationCleanupComplete = false;
+					return false;
+				},
+			);
+	};
 	const interruptStartup = (failure: SdkStartupFailure): void => {
 		if (startupInterruption !== undefined) return;
 		startupInterruption = failure;
 		capability.cancel(failure);
-		if (revokePendingReadinessMarker) {
-			const revoked = revokePendingReadinessMarker();
-			readinessPublicationCleanupComplete = revoked;
-			if (revoked) revokePendingReadinessMarker = undefined;
-		}
+		if (revokePendingReadinessMarker) startReadinessRevocation(revokePendingReadinessMarker);
 		interrupted.resolve(failure);
 	};
 	const cutoffFailure = (): SdkStartupFailure => capability.normalizeFailure("startup", "pending");
@@ -631,6 +646,7 @@ export async function runSessionHost(
 	const beforeCutoff = async <T>(
 		stage: () => Promise<T>,
 		cleanupLateResult?: (value: T) => Promise<void>,
+		options: { processLocalOnly?: boolean } = {},
 	): Promise<T> => {
 		throwIfStartupInterrupted();
 		const pending = Promise.resolve()
@@ -644,6 +660,7 @@ export async function runSessionHost(
 			interrupted.promise.then(failure => ({ failure }) as const),
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
+			if (options.processLocalOnly) return;
 			if (!cleanupLateResult) {
 				constructionCleanupComplete = false;
 				return;
@@ -777,7 +794,7 @@ export async function runSessionHost(
 			throwIfStartupInterrupted();
 		}
 
-		await beforeCutoff(() => initTheme(false));
+		await beforeCutoff(() => initializeTheme(false), undefined, { processLocalOnly: true });
 
 		// The longer MCP startup ceiling is scoped to ACP lifecycle launches only:
 		// it applies when this request actually carried `mcpServers`. Ordinary
@@ -924,6 +941,13 @@ export async function runSessionHost(
 	let failureRollback: Promise<void> | undefined;
 	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
 		failureRollback ??= (async () => {
+			if (readinessRevocation) {
+				const revoked = await Promise.race([
+					readinessRevocation,
+					Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+				]);
+				if (!revoked) readinessPublicationCleanupComplete = false;
+			}
 			const transcript = await disposeAndCapture();
 			if (rollback.generation === undefined && readinessPublicationCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
@@ -1021,11 +1045,8 @@ export async function runSessionHost(
 						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
 						revoke => {
 							revokePendingReadinessMarker = revoke;
-							if (startupInterruption !== undefined) {
-								const revoked = revoke();
-								readinessPublicationCleanupComplete = revoked;
-								if (revoked) revokePendingReadinessMarker = undefined;
-							} else if (now() >= request.semanticReadyDeadlineAt) {
+							if (startupInterruption !== undefined) startReadinessRevocation(revoke);
+							else if (now() >= request.semanticReadyDeadlineAt) {
 								interruptStartup(cutoffFailure());
 							}
 						},
@@ -1054,6 +1075,7 @@ export async function runSessionHost(
 		readinessPublicationCleanupComplete = true;
 		startupComplete = true;
 		revokePendingReadinessMarker = undefined;
+		readinessRevocation = undefined;
 		removeStartupSignalHandlers();
 		process.once("SIGTERM", onReadySignal);
 		process.once("SIGINT", onReadySignal);
