@@ -715,16 +715,18 @@ describe("pi-natives", () => {
 		});
 	});
 
-describe("rasterizeSvg", () => {
-	it("rasterizes the shared SVG fixture to bounded PNG bytes", async () => {
-		const svg = await fs.readFile(path.join(import.meta.dir, "fixtures/svg/geometry.svg"));
-		const png = Buffer.from(await rasterizeSvg(svg, 2048, 2048));
+	describe("rasterizeSvg", () => {
+		it("rasterizes the shared SVG fixture to bounded PNG bytes", async () => {
+			const svg = await fs.readFile(path.join(import.meta.dir, "fixtures/svg/geometry.svg"));
+			const png = Buffer.from(await rasterizeSvg(svg, 2048, 2048));
 
-		expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-		expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([17, 11]);
-		expect(createHash("sha256").update(png).digest("hex")).toBe("de47f937636d8b90e8a27cef076d772cf3e622a9bacd12f321630e78e6d3b528");
+			expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+			expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([17, 11]);
+			expect(createHash("sha256").update(png).digest("hex")).toBe(
+				"de47f937636d8b90e8a27cef076d772cf3e622a9bacd12f321630e78e6d3b528",
+			);
+		});
 	});
-});
 
 	describe("MacOSPowerAssertion", () => {
 		it("should create a stoppable power assertion handle", () => {

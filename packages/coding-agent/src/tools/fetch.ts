@@ -13,9 +13,9 @@ import type { AgentStorage } from "../session/agent-storage";
 import { DEFAULT_MAX_BYTES, type TruncationDirection, truncateContent } from "../session/streaming-output";
 import { CachedOutputBlock } from "../tui/output-block";
 import { renderStatusLine } from "../tui/status-line";
+import { rasterizeSvgInputBytes } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import { parseHtmlLazy } from "../utils/linkedom";
-import { rasterizeSvgInputBytes } from "../utils/image-loading";
 import { INSANE_NOTES } from "../web/insane/bridge";
 import { validatePublicHttpUrl } from "../web/insane/url-guard";
 import {
@@ -110,7 +110,13 @@ const IMAGE_MIME_BY_EXTENSION = new Map<string, string>([
 	[".webp", "image/webp"],
 	[".svg", "image/svg+xml"],
 ]);
-const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]);
+const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set([
+	"image/png",
+	"image/jpeg",
+	"image/gif",
+	"image/webp",
+	"image/svg+xml",
+]);
 const MAX_INLINE_IMAGE_SOURCE_BYTES = 20 * 1024 * 1024;
 const MAX_INLINE_IMAGE_OUTPUT_BYTES = 300 * 1024;
 
