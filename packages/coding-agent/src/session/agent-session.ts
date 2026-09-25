@@ -6265,7 +6265,7 @@ export class AgentSession {
 	async replaceNamedCustomTools(
 		previousNames: readonly string[],
 		nextTools: CustomTool[],
-		options?: { mandatoryMCPToolNames?: readonly string[] },
+		options?: { mandatoryMCPToolNames?: readonly string[]; activateNewTools?: boolean },
 	): Promise<void> {
 		const previous = new Set(previousNames);
 		const previousActive = this.getActiveToolNames();
@@ -6286,9 +6286,10 @@ export class AgentSession {
 			);
 		}
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
+		const shouldActivateNewTools = options?.activateNewTools !== false;
 		await this.#applyActiveToolsByName([
 			...previousActive.filter(name => !previous.has(name)),
-			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+			...(shouldActivateNewTools ? added.filter(name => !previous.has(name) || previousActive.includes(name)) : []),
 		]);
 	}
 
@@ -13008,6 +13009,7 @@ export class AgentSession {
 			selectedMCPToolNames?: string[];
 			activeMCPToolNames?: string[];
 			persistMCPSelection?: boolean;
+			mandatoryMCPToolNames?: readonly string[];
 		} = {},
 	): Promise<void> {
 		const previousSelectedMCPToolNames = this.getSelectedMCPToolNames();
@@ -13040,6 +13042,11 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 		}
 
+		if (options.mandatoryMCPToolNames) {
+			this.#mandatoryMCPToolNames = new Set(
+				options.mandatoryMCPToolNames.map(name => name.toLowerCase()).filter(name => this.#toolRegistry.has(name)),
+			);
+		}
 		this.#setDiscoverableMCPTools(this.#collectDiscoverableMCPToolsFromRegistry());
 		this.#pruneSelectedMCPToolNames();
 		const hasPersistedMCPToolSelection = this.buildDisplaySessionContext().hasPersistedMCPToolSelection;
@@ -19093,6 +19100,7 @@ export class AgentSession {
 		await this.#withSelectionAdmission(identity, async () => {
 			const previousEditMode = this.#resolveActiveEditMode();
 			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+			options?.onMutationStarted?.();
 			this.#assertSelectionMutationReady(identity);
 			if (!apiKey) {
 				throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -19641,6 +19649,7 @@ export class AgentSession {
 			providerSessionScope?: TemporaryProviderSessionScope;
 			signal?: AbortSignal;
 			allowPromptContinuationReentry?: boolean;
+			onMutationStarted?: () => void;
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {

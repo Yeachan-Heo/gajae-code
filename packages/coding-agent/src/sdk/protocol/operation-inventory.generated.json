@@ -2911,28 +2911,6 @@
 		}
 	},
 	{
-		"sourceId": "agent_session:setCoordinatorRuntimeStateFileForTests",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "test-only coordinator runtime state file setup seam, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:getCoordinatorRuntimeStateFileForTests",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "read-only test-only coordinator runtime state file accessor, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
 		"sourceId": "agent_session:trackPostPromptTaskForTests",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -3004,17 +2982,6 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "test-only prompt admission seam, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
-		"sourceId": "agent_session:trackCoordinatorRuntimeStatePersistenceFailuresForTests",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "test-only coordinator persistence failure observation seam, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
