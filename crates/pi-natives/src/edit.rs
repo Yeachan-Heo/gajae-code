@@ -130,6 +130,61 @@ pub fn edit_seek_sequence(
 	to_js_sequence_result(result)
 }
 
+#[napi(object)]
+pub struct EditApplyPatchEntry {
+	pub path:   String,
+	pub op:     String,
+	pub rename: Option<String>,
+	pub diff:   Option<String>,
+}
+
+#[napi(object)]
+pub struct EditPatchApplyTextResult {
+	pub content:  String,
+	pub warnings: Vec<String>,
+}
+
+#[napi]
+pub fn edit_parse_apply_patch(
+	input: String,
+	streaming: bool,
+) -> napi::Result<Vec<EditApplyPatchEntry>> {
+	let entries = if streaming {
+		pi_edit::modes::apply_patch::parse_apply_patch_streaming(&input)
+	} else {
+		pi_edit::modes::apply_patch::parse_apply_patch(&input)
+	}
+	.map_err(|error| napi::Error::from_reason(error.to_string()))?;
+	Ok(entries
+		.into_iter()
+		.map(|entry| EditApplyPatchEntry {
+			path:   entry.path,
+			op:     match entry.op {
+				pi_edit::modes::patch::Operation::Create => "create",
+				pi_edit::modes::patch::Operation::Delete => "delete",
+				pi_edit::modes::patch::Operation::Update => "update",
+			}
+			.to_owned(),
+			rename: entry.rename,
+			diff:   entry.diff,
+		})
+		.collect())
+}
+
+#[napi]
+pub fn edit_patch_apply_text(
+	content: String,
+	path: String,
+	diff: String,
+	threshold: f64,
+	allow_fuzzy: bool,
+) -> napi::Result<EditPatchApplyTextResult> {
+	let (content, warnings) =
+		pi_edit::modes::patch::apply_patch_text(&content, &path, &diff, threshold, allow_fuzzy)
+			.map_err(|error| napi::Error::from_reason(error.to_string()))?;
+	Ok(EditPatchApplyTextResult { content, warnings })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

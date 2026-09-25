@@ -13,7 +13,6 @@ import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { generateDiffString, replaceText } from "../diff";
 import {
-	countLeadingWhitespace,
 	detectLineEnding,
 	normalizeForFuzzy,
 	normalizeToLF,
@@ -22,52 +21,55 @@ import {
 	stripBom,
 } from "../normalize";
 
-type NativeBestFuzzyMatchResult = {
-	best?: FuzzyMatch;
-	aboveThresholdCount: number;
-	secondBestScore: number;
-};
-
-type NativeSequenceFuzzyResult = {
-	index?: number;
+type NativeFuzzyMatch = {
+	actualText: string;
+	startIndex: number;
+	startLine: number;
 	confidence: number;
-	matchCount: number;
-	matchIndices: number[];
-	secondBestScore: number;
 };
 
-let scoreSequenceFuzzyNative:
-	| ((lines: string[], pattern: string[], start: number, eof: boolean) => NativeSequenceFuzzyResult)
-	| undefined;
-let findBestFuzzyMatchNative:
-	| ((content: string, target: string, threshold: number) => NativeBestFuzzyMatchResult)
-	| undefined;
-let nativeFuzzyWarmupStarted = false;
-/**
- * First-use warm-up for the native fuzzy matchers. Deliberately NOT started at
- * module evaluation: the W5b idle/S1 module-trace gate requires that merely
- * importing the edit tool never materializes @gajae-code/natives. Callers stay
- * on the TS fallback until the fire-and-forget load resolves.
- */
-function warmNativeFuzzy(): void {
-	if (nativeFuzzyWarmupStarted) return;
-	nativeFuzzyWarmupStarted = true;
-	void Promise.resolve()
-		.then(() => {
-			const mod = require("@gajae-code/natives") as {
-				h02ScoreSequenceFuzzy?: typeof scoreSequenceFuzzyNative;
-				h01FindBestFuzzyMatch?: typeof findBestFuzzyMatchNative;
-			};
-			if (typeof mod.h02ScoreSequenceFuzzy === "function") {
-				scoreSequenceFuzzyNative = mod.h02ScoreSequenceFuzzy;
+type NativeFindMatchResult = {
+	matched?: NativeFuzzyMatch | null;
+	closest?: NativeFuzzyMatch | null;
+	occurrences?: number | null;
+	occurrenceLines?: number[] | null;
+	occurrencePreviews?: string[] | null;
+	fuzzyMatches?: number | null;
+	dominantFuzzy?: boolean | null;
+};
+
+type NativeSeekSequenceResult = {
+	index?: number | null;
+	confidence: number;
+	matchCount?: number | null;
+	matchIndices?: number[] | null;
+	strategy?: string | null;
+};
+
+type NativeEditFuzzyBindings = {
+	editFindMatch: (content: string, target: string, allowFuzzy: boolean, threshold?: number) => NativeFindMatchResult;
+	editSeekSequence: (
+		lines: string[],
+		pattern: string[],
+		start: number,
+		eof: boolean,
+		allowFuzzy: boolean,
+	) => NativeSeekSequenceResult;
+};
+
+let nativeEditFuzzyBindingsPromise: Promise<NativeEditFuzzyBindings> | undefined;
+
+function loadNativeEditFuzzyBindings(): Promise<NativeEditFuzzyBindings> {
+	if (!nativeEditFuzzyBindingsPromise) {
+		nativeEditFuzzyBindingsPromise = Promise.resolve().then(() => {
+			const mod = require("@gajae-code/natives") as Partial<NativeEditFuzzyBindings>;
+			if (typeof mod.editFindMatch !== "function" || typeof mod.editSeekSequence !== "function") {
+				throw new Error("Native pi-edit matcher exports are missing from @gajae-code/natives");
 			}
-			if (typeof mod.h01FindBestFuzzyMatch === "function") {
-				findBestFuzzyMatchNative = mod.h01FindBestFuzzyMatch;
-			}
-		})
-		.catch(() => {
-			// Native unavailable; fuzzy matching uses the TS fallback.
+			return mod as NativeEditFuzzyBindings;
 		});
+	}
+	return nativeEditFuzzyBindingsPromise;
 }
 
 import { withEditPathMutation } from "../path-mutation-lock";
@@ -197,12 +199,6 @@ function formatOccurrenceError(path: string, matchOutcome: MatchOutcome): string
 /** Default similarity threshold for fuzzy matching */
 export const DEFAULT_FUZZY_THRESHOLD = 0.95;
 
-/** Threshold for sequence-based fuzzy matching */
-const SEQUENCE_FUZZY_THRESHOLD = 0.92;
-
-/** Fallback threshold for line-based matching */
-const FALLBACK_THRESHOLD = 0.8;
-
 /** Threshold for context line matching */
 const CONTEXT_FUZZY_THRESHOLD = 0.8;
 
@@ -212,30 +208,13 @@ const PARTIAL_MATCH_MIN_LENGTH = 6;
 /** Minimum ratio of pattern to line length for substring match */
 const PARTIAL_MATCH_MIN_RATIO = 0.3;
 
-/** Context lines to show before/after an ambiguous match preview */
-const OCCURRENCE_PREVIEW_CONTEXT = 5;
-
-/** Maximum line length for ambiguous match previews */
-const OCCURRENCE_PREVIEW_MAX_LEN = 80;
-
 /** Maximum number of match indices or previews to retain for diagnostics */
 const MAX_RECORDED_MATCHES = 5;
-
-/** Minimum confidence for a dominant fuzzy match to be auto-selected */
-const DOMINANT_FUZZY_MIN_CONFIDENCE = 0.97;
-
-/** Minimum score gap between the best and second-best fuzzy matches */
-const DOMINANT_FUZZY_DELTA = 0.08;
 
 interface IndexedMatches {
 	firstMatch: number | undefined;
 	matchCount: number;
 	matchIndices: number[];
-}
-
-interface PreviewWindowOptions {
-	context: number;
-	maxLen: number;
 }
 
 function collectIndexedMatches(
@@ -261,21 +240,6 @@ function collectIndexedMatches(
 	return { firstMatch, matchCount, matchIndices };
 }
 
-function toSingleMatchResult<TStrategy extends SequenceMatchStrategy | ContextMatchStrategy>(
-	matches: IndexedMatches,
-	confidence: number,
-	strategy: TStrategy,
-): { index: number; confidence: number; strategy: TStrategy } | undefined {
-	if (matches.firstMatch === undefined) {
-		return undefined;
-	}
-	return {
-		index: matches.firstMatch,
-		confidence,
-		strategy,
-	};
-}
-
 function toAmbiguousMatchResult<TStrategy extends SequenceMatchStrategy | ContextMatchStrategy>(
 	matches: IndexedMatches,
 	confidence: number,
@@ -290,60 +254,6 @@ function toAmbiguousMatchResult<TStrategy extends SequenceMatchStrategy | Contex
 		matchCount: matches.matchCount,
 		matchIndices: matches.matchIndices,
 		strategy,
-	};
-}
-
-function formatPreviewWindow(lines: string[], centerIndex: number, options: PreviewWindowOptions): string {
-	const start = Math.max(0, centerIndex - options.context);
-	const end = Math.min(lines.length, centerIndex + options.context + 1);
-	return lines
-		.slice(start, end)
-		.map((line, index) => {
-			const num = start + index + 1;
-			const truncated = line.length > options.maxLen ? `${line.slice(0, options.maxLen - 1)}…` : line;
-			return `  ${num} | ${truncated}`;
-		})
-		.join("\n");
-}
-
-function findExactMatchOutcome(content: string, target: string): MatchOutcome | undefined {
-	const exactIndex = content.indexOf(target);
-	if (exactIndex === -1) {
-		return undefined;
-	}
-
-	const occurrences = content.split(target).length - 1;
-	if (occurrences > 1) {
-		const contentLines = content.split("\n");
-		const occurrenceLines: number[] = [];
-		const occurrencePreviews: string[] = [];
-		let searchStart = 0;
-
-		for (let i = 0; i < MAX_RECORDED_MATCHES; i++) {
-			const idx = content.indexOf(target, searchStart);
-			if (idx === -1) break;
-			const lineNumber = content.slice(0, idx).split("\n").length;
-			occurrenceLines.push(lineNumber);
-			occurrencePreviews.push(
-				formatPreviewWindow(contentLines, lineNumber - 1, {
-					context: OCCURRENCE_PREVIEW_CONTEXT,
-					maxLen: OCCURRENCE_PREVIEW_MAX_LEN,
-				}),
-			);
-			searchStart = idx + 1;
-		}
-
-		return { occurrences, occurrenceLines, occurrencePreviews };
-	}
-
-	const startLine = content.slice(0, exactIndex).split("\n").length;
-	return {
-		match: {
-			actualText: target,
-			startIndex: exactIndex,
-			startLine,
-			confidence: 1,
-		},
 	};
 }
 
@@ -393,189 +303,47 @@ export function similarity(a: string, b: string): number {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Line-Based Utilities
-// ═══════════════════════════════════════════════════════════════════════════
-
-/** Compute relative indent depths for lines */
-function computeRelativeIndentDepths(lines: string[]): number[] {
-	const indents = lines.map(countLeadingWhitespace);
-	const nonEmptyIndents: number[] = [];
-	for (let i = 0; i < lines.length; i++) {
-		if (lines[i].trim().length > 0) {
-			nonEmptyIndents.push(indents[i]);
-		}
-	}
-	const minIndent = nonEmptyIndents.length > 0 ? Math.min(...nonEmptyIndents) : 0;
-	const indentSteps = nonEmptyIndents.map(indent => indent - minIndent).filter(step => step > 0);
-	const indentUnit = indentSteps.length > 0 ? Math.min(...indentSteps) : 1;
-
-	return lines.map((line, index) => {
-		if (line.trim().length === 0) return 0;
-		if (indentUnit <= 0) return 0;
-		const relativeIndent = indents[index] - minIndent;
-		return Math.round(relativeIndent / indentUnit);
-	});
-}
-
-/** Normalize lines for matching, optionally including indent depth */
-function normalizeLines(lines: string[], includeDepth = true): string[] {
-	const indentDepths = includeDepth ? computeRelativeIndentDepths(lines) : null;
-	return lines.map((line, index) => {
-		const trimmed = line.trim();
-		const prefix = indentDepths ? `${indentDepths[index]}|` : "|";
-		if (trimmed.length === 0) return prefix;
-		return `${prefix}${normalizeForFuzzy(trimmed)}`;
-	});
-}
-
-/** Compute character offsets for each line in content */
-function computeLineOffsets(lines: string[]): number[] {
-	const offsets: number[] = [];
-	let offset = 0;
-	for (let i = 0; i < lines.length; i++) {
-		offsets.push(offset);
-		offset += lines[i].length;
-		if (i < lines.length - 1) offset += 1; // newline
-	}
-	return offsets;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Character-Level Fuzzy Match (for replace mode)
 // ═══════════════════════════════════════════════════════════════════════════
-
-interface BestFuzzyMatchResult {
-	best?: FuzzyMatch;
-	aboveThresholdCount: number;
-	secondBestScore: number;
-}
-
-function findBestFuzzyMatchCore(
-	contentLines: string[],
-	targetLines: string[],
-	offsets: number[],
-	threshold: number,
-	includeDepth: boolean,
-): BestFuzzyMatchResult {
-	const targetNormalized = normalizeLines(targetLines, includeDepth);
-
-	let best: FuzzyMatch | undefined;
-	let bestScore = -1;
-	let secondBestScore = -1;
-	let aboveThresholdCount = 0;
-
-	for (let start = 0; start <= contentLines.length - targetLines.length; start++) {
-		const windowLines = contentLines.slice(start, start + targetLines.length);
-		const windowNormalized = normalizeLines(windowLines, includeDepth);
-		let score = 0;
-		for (let i = 0; i < targetLines.length; i++) {
-			score += similarity(targetNormalized[i], windowNormalized[i]);
-		}
-		score = score / targetLines.length;
-
-		if (score >= threshold) {
-			aboveThresholdCount++;
-		}
-
-		if (score > bestScore) {
-			secondBestScore = bestScore;
-			bestScore = score;
-			best = {
-				actualText: windowLines.join("\n"),
-				startIndex: offsets[start],
-				startLine: start + 1,
-				confidence: score,
-			};
-		} else if (score > secondBestScore) {
-			secondBestScore = score;
-		}
-	}
-
-	return { best, aboveThresholdCount, secondBestScore };
-}
-
-export function findBestFuzzyMatch(content: string, target: string, threshold: number): BestFuzzyMatchResult {
-	const contentLines = content.split("\n");
-	const targetLines = target.split("\n");
-
-	if (targetLines.length === 0 || target.length === 0) {
-		return { aboveThresholdCount: 0, secondBestScore: 0 };
-	}
-	if (targetLines.length > contentLines.length) {
-		return { aboveThresholdCount: 0, secondBestScore: 0 };
-	}
-
-	const offsets = computeLineOffsets(contentLines);
-	let result = findBestFuzzyMatchCore(contentLines, targetLines, offsets, threshold, true);
-
-	// Retry without indent depth if match is close but below threshold
-	if (result.best && result.best.confidence < threshold && result.best.confidence >= FALLBACK_THRESHOLD) {
-		const noDepthResult = findBestFuzzyMatchCore(contentLines, targetLines, offsets, threshold, false);
-		if (noDepthResult.best && noDepthResult.best.confidence > result.best.confidence) {
-			result = noDepthResult;
-		}
-	}
-
-	return result;
-}
 
 /**
  * Find a match for target text within content.
  * Used primarily for replace-mode edits.
  */
-export function findMatch(
+function toFuzzyMatch(match: NativeFuzzyMatch | null | undefined): FuzzyMatch | undefined {
+	if (!match) return undefined;
+	return {
+		actualText: match.actualText,
+		startIndex: match.startIndex,
+		startLine: match.startLine,
+		confidence: match.confidence,
+	};
+}
+
+/** Find an exact or fuzzy match through the native pi-edit matcher. */
+export async function findMatch(
 	content: string,
 	target: string,
 	options: { allowFuzzy: boolean; threshold?: number },
-): MatchOutcome {
-	if (target.length === 0) {
-		return {};
-	}
-
-	const exactMatch = findExactMatchOutcome(content, target);
-	if (exactMatch) {
-		return exactMatch;
-	}
-
-	// Try fuzzy match
-	const threshold = options.threshold ?? DEFAULT_FUZZY_THRESHOLD;
-	warmNativeFuzzy();
-	const { best, aboveThresholdCount, secondBestScore } =
-		findBestFuzzyMatchNative?.(content, target, threshold) ?? findBestFuzzyMatch(content, target, threshold);
-
-	if (!best) {
-		return {};
-	}
-
-	if (options.allowFuzzy && best.confidence >= threshold) {
-		if (aboveThresholdCount === 1) {
-			return { match: best, closest: best };
-		}
-		if (
-			aboveThresholdCount > 1 &&
-			best.confidence >= DOMINANT_FUZZY_MIN_CONFIDENCE &&
-			best.confidence - secondBestScore >= DOMINANT_FUZZY_DELTA
-		) {
-			return { match: best, closest: best, fuzzyMatches: aboveThresholdCount, dominantFuzzy: true };
-		}
-	}
-
-	return { closest: best, fuzzyMatches: aboveThresholdCount };
+): Promise<MatchOutcome> {
+	const native = await loadNativeEditFuzzyBindings();
+	const result = native.editFindMatch(content, target, options.allowFuzzy, options.threshold);
+	const match = toFuzzyMatch(result.matched);
+	const closest = toFuzzyMatch(result.closest);
+	return {
+		...(match ? { match } : {}),
+		...(closest ? { closest } : {}),
+		...(result.occurrences != null ? { occurrences: result.occurrences } : {}),
+		...(result.occurrenceLines != null ? { occurrenceLines: result.occurrenceLines } : {}),
+		...(result.occurrencePreviews != null ? { occurrencePreviews: result.occurrencePreviews } : {}),
+		...(result.fuzzyMatches != null ? { fuzzyMatches: result.fuzzyMatches } : {}),
+		...(result.dominantFuzzy != null ? { dominantFuzzy: result.dominantFuzzy } : {}),
+	};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Line-Based Sequence Match (for patch mode)
 // ═══════════════════════════════════════════════════════════════════════════
-
-/** Check if pattern matches lines starting at index using comparison function */
-function matchesAt(lines: string[], pattern: string[], i: number, compare: (a: string, b: string) => boolean): boolean {
-	for (let j = 0; j < pattern.length; j++) {
-		if (!compare(lines[i + j], pattern[j])) {
-			return false;
-		}
-	}
-	return true;
-}
 
 /** Compute average similarity score for pattern at position */
 function fuzzyScoreAt(lines: string[], pattern: string[], i: number): number {
@@ -588,265 +356,24 @@ function fuzzyScoreAt(lines: string[], pattern: string[], i: number): number {
 	return totalScore / pattern.length;
 }
 
-/** Check if line starts with pattern (normalized) */
-function lineStartsWithPattern(line: string, pattern: string): boolean {
-	const lineNorm = normalizeForFuzzy(line);
-	const patternNorm = normalizeForFuzzy(pattern);
-	if (patternNorm.length === 0) return lineNorm.length === 0;
-	return lineNorm.startsWith(patternNorm);
-}
-
-/** Check if line contains pattern as significant substring */
-function lineIncludesPattern(line: string, pattern: string): boolean {
-	const lineNorm = normalizeForFuzzy(line);
-	const patternNorm = normalizeForFuzzy(pattern);
-	if (patternNorm.length === 0) return lineNorm.length === 0;
-	if (patternNorm.length < PARTIAL_MATCH_MIN_LENGTH) return false;
-	if (!lineNorm.includes(patternNorm)) return false;
-	return patternNorm.length / Math.max(1, lineNorm.length) >= PARTIAL_MATCH_MIN_RATIO;
-}
-
-function stripCommentPrefix(line: string): string {
-	let trimmed = line.trimStart();
-	if (trimmed.startsWith("/*")) {
-		trimmed = trimmed.slice(2);
-	} else if (trimmed.startsWith("*/")) {
-		trimmed = trimmed.slice(2);
-	} else if (trimmed.startsWith("//")) {
-		trimmed = trimmed.slice(2);
-	} else if (trimmed.startsWith("*")) {
-		trimmed = trimmed.slice(1);
-	} else if (trimmed.startsWith("#")) {
-		trimmed = trimmed.slice(1);
-	} else if (trimmed.startsWith(";")) {
-		trimmed = trimmed.slice(1);
-	} else if (trimmed.startsWith("/") && trimmed[1] === " ") {
-		trimmed = trimmed.slice(1);
-	}
-	return trimmed.trimStart();
-}
-
-/**
- * Find a sequence of pattern lines within content lines.
- *
- * Attempts matches with decreasing strictness:
- * 1. Exact match
- * 2. Trailing whitespace ignored
- * 3. All whitespace trimmed
- * 4. Unicode punctuation normalized
- * 5. Prefix match (pattern is prefix of line)
- * 6. Substring match (pattern is substring of line)
- * 7. Fuzzy similarity match
- *
- * @param lines - The lines of the file content
- * @param pattern - The lines to search for
- * @param start - Starting index for the search
- * @param eof - If true, prefer matching at end of file first
- */
-export function seekSequence(
+/** Search line sequences with the native pi-edit matcher. */
+export async function seekSequence(
 	lines: string[],
 	pattern: string[],
 	start: number,
 	eof: boolean,
 	options?: { allowFuzzy?: boolean },
-): SequenceSearchResult {
-	const allowFuzzy = options?.allowFuzzy ?? true;
-	// Empty pattern matches immediately
-	if (pattern.length === 0) {
-		return { index: start, confidence: 1.0, strategy: "exact" };
-	}
-
-	// Pattern longer than available content cannot match
-	if (pattern.length > lines.length) {
-		return { index: undefined, confidence: 0 };
-	}
-
-	// Determine search start position
-	const searchStart = eof && lines.length >= pattern.length ? lines.length - pattern.length : start;
-	const maxStart = lines.length - pattern.length;
-
-	const runExactPasses = (from: number, to: number): SequenceSearchResult | undefined => {
-		const comparisonPasses: Array<{
-			compare: (a: string, b: string) => boolean;
-			confidence: number;
-			strategy: SequenceMatchStrategy;
-		}> = [
-			{ compare: (a, b) => a === b, confidence: 1.0, strategy: "exact" },
-			{ compare: (a, b) => a.trimEnd() === b.trimEnd(), confidence: 0.99, strategy: "trim-trailing" },
-			{ compare: (a, b) => a.trim() === b.trim(), confidence: 0.98, strategy: "trim" },
-			{
-				compare: (a, b) => stripCommentPrefix(a) === stripCommentPrefix(b),
-				confidence: 0.975,
-				strategy: "comment-prefix",
-			},
-			{
-				compare: (a, b) => normalizeUnicode(a) === normalizeUnicode(b),
-				confidence: 0.97,
-				strategy: "unicode",
-			},
-		];
-
-		for (const pass of comparisonPasses) {
-			const matches = collectIndexedMatches(from, to, i => matchesAt(lines, pattern, i, pass.compare));
-			const result = toSingleMatchResult(matches, pass.confidence, pass.strategy);
-			if (result) {
-				return result;
-			}
-		}
-
-		if (!allowFuzzy) {
-			return undefined;
-		}
-
-		const partialPasses: Array<{
-			compare: (line: string, patternLine: string) => boolean;
-			confidence: number;
-			strategy: SequenceMatchStrategy;
-		}> = [
-			{ compare: lineStartsWithPattern, confidence: 0.965, strategy: "prefix" },
-			{ compare: lineIncludesPattern, confidence: 0.94, strategy: "substring" },
-		];
-
-		for (const pass of partialPasses) {
-			const matches = collectIndexedMatches(from, to, i => matchesAt(lines, pattern, i, pass.compare));
-			const result = toAmbiguousMatchResult(matches, pass.confidence, pass.strategy);
-			if (result) {
-				return result;
-			}
-		}
-
-		return undefined;
+): Promise<SequenceSearchResult> {
+	const native = await loadNativeEditFuzzyBindings();
+	const result = native.editSeekSequence(lines, pattern, start, eof, options?.allowFuzzy ?? true);
+	return {
+		index: result.index ?? undefined,
+		confidence: result.confidence,
+		...(result.matchCount != null ? { matchCount: result.matchCount } : {}),
+		...(result.matchIndices != null ? { matchIndices: result.matchIndices } : {}),
+		...(result.strategy != null ? { strategy: result.strategy as SequenceMatchStrategy } : {}),
 	};
-
-	const primaryPassResult = runExactPasses(searchStart, maxStart);
-	if (primaryPassResult) {
-		return primaryPassResult;
-	}
-
-	if (eof && searchStart > start) {
-		const fromStartResult = runExactPasses(start, maxStart);
-		if (fromStartResult) {
-			return fromStartResult;
-		}
-	}
-
-	if (!allowFuzzy) {
-		return { index: undefined, confidence: 0 };
-	}
-
-	warmNativeFuzzy();
-	const nativeFuzzyResult = scoreSequenceFuzzyNative?.(lines, pattern, start, eof);
-	if (nativeFuzzyResult?.index !== undefined && nativeFuzzyResult.confidence >= SEQUENCE_FUZZY_THRESHOLD) {
-		if (
-			nativeFuzzyResult.matchCount > 1 &&
-			nativeFuzzyResult.confidence >= DOMINANT_FUZZY_MIN_CONFIDENCE &&
-			nativeFuzzyResult.confidence - nativeFuzzyResult.secondBestScore >= DOMINANT_FUZZY_DELTA
-		) {
-			return {
-				index: nativeFuzzyResult.index,
-				confidence: nativeFuzzyResult.confidence,
-				matchCount: 1,
-				matchIndices: nativeFuzzyResult.matchIndices,
-				strategy: "fuzzy-dominant",
-			};
-		}
-		return {
-			index: nativeFuzzyResult.index,
-			confidence: nativeFuzzyResult.confidence,
-			matchCount: nativeFuzzyResult.matchCount,
-			matchIndices: nativeFuzzyResult.matchIndices,
-			strategy: "fuzzy",
-		};
-	}
-	// Pass 7: Fuzzy matching - find best match above threshold
-	let bestScore = 0;
-	let secondBestScore = 0;
-	let bestIndex: number | undefined;
-	const fuzzyMatches: IndexedMatches = {
-		firstMatch: undefined,
-		matchCount: 0,
-		matchIndices: [],
-	};
-
-	const scoreFuzzyRange = (from: number, to: number): void => {
-		for (let i = from; i <= to; i++) {
-			const score = fuzzyScoreAt(lines, pattern, i);
-			if (score >= SEQUENCE_FUZZY_THRESHOLD) {
-				if (fuzzyMatches.firstMatch === undefined) {
-					fuzzyMatches.firstMatch = i;
-				}
-				fuzzyMatches.matchCount++;
-				if (fuzzyMatches.matchIndices.length < MAX_RECORDED_MATCHES) {
-					fuzzyMatches.matchIndices.push(i);
-				}
-			}
-			if (score > bestScore) {
-				secondBestScore = bestScore;
-				bestScore = score;
-				bestIndex = i;
-			} else if (score > secondBestScore) {
-				secondBestScore = score;
-			}
-		}
-	};
-
-	scoreFuzzyRange(searchStart, maxStart);
-
-	// Also search from start if eof mode started from end
-	if (eof && searchStart > start) {
-		scoreFuzzyRange(start, searchStart - 1);
-	}
-
-	if (bestIndex !== undefined && bestScore >= SEQUENCE_FUZZY_THRESHOLD) {
-		if (
-			fuzzyMatches.matchCount > 1 &&
-			bestScore >= DOMINANT_FUZZY_MIN_CONFIDENCE &&
-			bestScore - secondBestScore >= DOMINANT_FUZZY_DELTA
-		) {
-			return {
-				index: bestIndex,
-				confidence: bestScore,
-				matchCount: 1,
-				matchIndices: fuzzyMatches.matchIndices,
-				strategy: "fuzzy-dominant",
-			};
-		}
-		return {
-			index: bestIndex,
-			confidence: bestScore,
-			matchCount: fuzzyMatches.matchCount,
-			matchIndices: fuzzyMatches.matchIndices,
-			strategy: "fuzzy",
-		};
-	}
-
-	// Pass 8: Character-based fuzzy matching via findMatch
-	// This is the final fallback for when line-based matching fails
-	const CHARACTER_MATCH_THRESHOLD = 0.92;
-	const patternText = pattern.join("\n");
-	const contentText = lines.slice(start).join("\n");
-	const matchOutcome = findMatch(contentText, patternText, {
-		allowFuzzy: true,
-		threshold: CHARACTER_MATCH_THRESHOLD,
-	});
-
-	if (matchOutcome.match) {
-		// Convert character index back to line index
-		const matchedContent = contentText.substring(0, matchOutcome.match.startIndex);
-		const lineIndex = start + matchedContent.split("\n").length - 1;
-		const fallbackMatchCount = matchOutcome.occurrences ?? matchOutcome.fuzzyMatches ?? 1;
-		return {
-			index: lineIndex,
-			confidence: matchOutcome.match.confidence,
-			matchCount: fallbackMatchCount,
-			strategy: "character",
-		};
-	}
-
-	const fallbackMatchCount = matchOutcome.occurrences ?? matchOutcome.fuzzyMatches;
-	return { index: undefined, confidence: bestScore, matchCount: fallbackMatchCount };
 }
-
 export function findClosestSequenceMatch(
 	lines: string[],
 	pattern: string[],
@@ -1153,14 +680,14 @@ async function executeReplaceSingleUnderLock(
 	const normalizedOldText = normalizeToLF(old_text);
 	const normalizedNewText = normalizeToLF(new_text);
 
-	const result = replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
+	const result = await replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
 		fuzzy: allowFuzzy,
 		all: all ?? false,
 		threshold: fuzzyThreshold,
 	});
 
 	if (result.count === 0) {
-		const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+		const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 			allowFuzzy,
 			threshold: fuzzyThreshold,
 		});

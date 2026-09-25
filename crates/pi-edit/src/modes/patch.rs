@@ -1327,6 +1327,25 @@ fn apply_hunks(
 	Ok((next, warnings))
 }
 
+/// Apply unified-diff hunks to normalized editable text.
+///
+/// This is the text-only boundary used by hosts that own filesystem reads and
+/// writes. Matching, indentation repair, and model-facing errors stay in the
+/// native patch engine.
+pub fn apply_patch_text(
+	content: &str,
+	path: &str,
+	diff: &str,
+	threshold: f64,
+	allow_fuzzy: bool,
+) -> Result<(String, Vec<String>), EditError> {
+	let hunks = parse_diff_hunks(diff)?;
+	if hunks.is_empty() {
+		return Err(EditError::apply("Diff contains no hunks"));
+	}
+	apply_hunks(content, path, &hunks, threshold, allow_fuzzy)
+}
+
 fn validate_rename(
 	input: &PatchInput<'_>,
 	source: &Resolved,

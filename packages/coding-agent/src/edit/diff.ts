@@ -664,7 +664,12 @@ export function parseDiffHunks(diff: string): DiffHunk[] {
 /**
  * Find and replace text in content using fuzzy matching.
  */
-export function replaceText(content: string, oldText: string, newText: string, options: ReplaceOptions): ReplaceResult {
+export async function replaceText(
+	content: string,
+	oldText: string,
+	newText: string,
+	options: ReplaceOptions,
+): Promise<ReplaceResult> {
 	if (oldText.length === 0) {
 		throw new Error("oldText must not be empty.");
 	}
@@ -686,7 +691,7 @@ export function replaceText(content: string, oldText: string, newText: string, o
 
 		// No exact matches - try fuzzy matching iteratively
 		while (true) {
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+			const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 				allowFuzzy: options.fuzzy,
 				threshold,
 			});
@@ -716,7 +721,7 @@ export function replaceText(content: string, oldText: string, newText: string, o
 	}
 
 	// Single replacement mode
-	const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+	const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 		allowFuzzy: options.fuzzy,
 		threshold,
 	});
@@ -775,7 +780,7 @@ export async function computeEditDiff(
 		const normalizedOldText = normalizeToLF(oldText);
 		const normalizedNewText = normalizeToLF(newText);
 
-		const result = replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
+		const result = await replaceText(normalizedContent, normalizedOldText, normalizedNewText, {
 			fuzzy,
 			all,
 			threshold,
@@ -783,7 +788,7 @@ export async function computeEditDiff(
 
 		if (result.count === 0) {
 			// Get closest match for error message
-			const matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+			const matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 				allowFuzzy: fuzzy,
 				threshold: threshold ?? DEFAULT_FUZZY_THRESHOLD,
 			});

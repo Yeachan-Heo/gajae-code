@@ -6,7 +6,7 @@ import { readGoldens, verifyDifferential } from "./harness";
 const goldenPath = path.join(import.meta.dir, "golden", "edit-fuzzy.jsonl");
 const report = await verifyDifferential(editFuzzyDifferential, goldenPath);
 
-test("pi-edit matchers preserve edit-benchmark outputs and error strings", () => {
+test("pi-edit matchers preserve edit-benchmark TS outputs, confidences, and error strings", () => {
 	expect(report).toEqual({
 		total: 80,
 		identical: 80,
@@ -16,7 +16,21 @@ test("pi-edit matchers preserve edit-benchmark outputs and error strings", () =>
 	});
 });
 
-test("edit-benchmark match, ambiguity, and dominant-match decisions match TS for every fixture", async () => {
+function confidences(output: EditFuzzyOutput): Array<number | undefined> {
+	return [
+		output.strict.match?.confidence,
+		output.strict.closest?.confidence,
+		output.fuzzy.match?.confidence,
+		output.fuzzy.closest?.confidence,
+		output.sequence.confidence,
+		output.missing.strict.match?.confidence,
+		output.missing.strict.closest?.confidence,
+		output.missing.fuzzy.match?.confidence,
+		output.missing.fuzzy.closest?.confidence,
+	];
+}
+
+test("edit-benchmark match decisions and every confidence match the TS golden", async () => {
 	const records = await readGoldens(goldenPath);
 	const byId = new Map(records.map(record => [record.caseId, record.output as EditFuzzyOutput]));
 	for (const testCase of editFuzzyDifferential.cases) {
@@ -35,5 +49,6 @@ test("edit-benchmark match, ambiguity, and dominant-match decisions match TS for
 			sequenceDominant: output.sequence.strategy === "fuzzy-dominant",
 		});
 		expect(decisions(actual), testCase.id).toEqual(decisions(expected));
+		expect(confidences(actual), testCase.id).toEqual(confidences(expected));
 	}
 });

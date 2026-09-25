@@ -45,52 +45,52 @@ async function applyLegacyPatch(patch: string, options: { cwd: string }) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("seekSequence", () => {
-	test("exact match finds sequence", () => {
+	test("exact match finds sequence", async () => {
 		const lines = ["foo", "bar", "baz"];
 		const pattern = ["bar", "baz"];
-		expect(seekSequence(lines, pattern, 0, false).index).toBe(1);
+		expect((await seekSequence(lines, pattern, 0, false)).index).toBe(1);
 	});
 
-	test("rstrip match ignores trailing whitespace", () => {
+	test("rstrip match ignores trailing whitespace", async () => {
 		const lines = ["foo   ", "bar\t\t"];
 		const pattern = ["foo", "bar"];
-		expect(seekSequence(lines, pattern, 0, false).index).toBe(0);
+		expect((await seekSequence(lines, pattern, 0, false)).index).toBe(0);
 	});
 
-	test("trim match ignores leading and trailing whitespace", () => {
+	test("trim match ignores leading and trailing whitespace", async () => {
 		const lines = ["    foo   ", "   bar\t"];
 		const pattern = ["foo", "bar"];
-		expect(seekSequence(lines, pattern, 0, false).index).toBe(0);
+		expect((await seekSequence(lines, pattern, 0, false)).index).toBe(0);
 	});
 
-	test("pattern longer than input returns undefined", () => {
+	test("pattern longer than input returns undefined", async () => {
 		const lines = ["just one line"];
 		const pattern = ["too", "many", "lines"];
-		expect(seekSequence(lines, pattern, 0, false).index).toBeUndefined();
+		expect((await seekSequence(lines, pattern, 0, false)).index).toBeUndefined();
 	});
 
-	test("empty pattern returns start", () => {
+	test("empty pattern returns start", async () => {
 		const lines = ["foo", "bar"];
-		expect(seekSequence(lines, [], 0, false).index).toBe(0);
-		expect(seekSequence(lines, [], 5, false).index).toBe(5);
+		expect((await seekSequence(lines, [], 0, false)).index).toBe(0);
+		expect((await seekSequence(lines, [], 5, false)).index).toBe(5);
 	});
 
-	test("eof mode prefers end of file", () => {
+	test("eof mode prefers end of file", async () => {
 		const lines = ["a", "b", "c", "d", "e"];
 		const pattern = ["d", "e"];
-		expect(seekSequence(lines, pattern, 0, true).index).toBe(3);
+		expect((await seekSequence(lines, pattern, 0, true)).index).toBe(3);
 	});
 
-	test("unicode normalization matches dashes", () => {
+	test("unicode normalization matches dashes", async () => {
 		const lines = ["import asyncio  # local import \u2013 avoids top\u2011level dep"];
 		const pattern = ["import asyncio  # local import - avoids top-level dep"];
-		expect(seekSequence(lines, pattern, 0, false).index).toBe(0);
+		expect((await seekSequence(lines, pattern, 0, false)).index).toBe(0);
 	});
 
-	test("fuzzy match finds sequence with minor differences", () => {
+	test("fuzzy match finds sequence with minor differences", async () => {
 		const lines = ["function greet() {", '  console.log("Hello!");', "}"];
 		const pattern = ["function greet() {", '  console.log("Hello!")  ', "}"];
-		const result = seekSequence(lines, pattern, 0, false);
+		const result = await seekSequence(lines, pattern, 0, false);
 		expect(result.index).toBe(0);
 		expect(result.confidence).toBeGreaterThanOrEqual(0.92);
 	});

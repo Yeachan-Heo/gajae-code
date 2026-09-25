@@ -1092,6 +1092,13 @@ export interface DoctorLinkSwapResult {
   code?: string
 }
 
+export interface EditApplyPatchEntry {
+  path: string
+  op: string
+  rename?: string
+  diff?: string
+}
+
 export declare function editFindMatch(content: string, target: string, allowFuzzy: boolean, threshold?: number | undefined | null): EditFindMatchResult
 
 export interface EditFindMatchResult {
@@ -1109,6 +1116,15 @@ export interface EditFuzzyMatch {
   startIndex: number
   startLine: number
   confidence: number
+}
+
+export declare function editParseApplyPatch(input: string, streaming: boolean): Array<EditApplyPatchEntry>
+
+export declare function editPatchApplyText(content: string, path: string, diff: string, threshold: number, allowFuzzy: boolean): EditPatchApplyTextResult
+
+export interface EditPatchApplyTextResult {
+  content: string
+  warnings: Array<string>
 }
 
 export declare function editSeekSequence(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean, allowFuzzy: boolean): EditSeekSequenceResult
@@ -1520,31 +1536,6 @@ export interface GrepResult {
   filesSearched: number
   /** Whether the limit/offset stopped the search early. */
   limitReached?: boolean
-}
-
-export interface H01BestFuzzyMatch {
-  actualText: string
-  startIndex: number
-  startLine: number
-  confidence: number
-}
-
-export interface H01BestFuzzyMatchResult {
-  best?: H01BestFuzzyMatch
-  aboveThresholdCount: number
-  secondBestScore: number
-}
-
-export declare function h01FindBestFuzzyMatch(content: string, target: string, threshold: number): H01BestFuzzyMatchResult
-
-export declare function h02ScoreSequenceFuzzy(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean): H02SequenceFuzzyResult
-
-export interface H02SequenceFuzzyResult {
-  index?: number
-  confidence: number
-  matchCount: number
-  matchIndices: Array<number>
-  secondBestScore: number
 }
 
 export declare function h06FormatHashLines(text: string, startLine?: number | undefined | null): string
