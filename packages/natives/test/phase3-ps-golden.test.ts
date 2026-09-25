@@ -7,13 +7,13 @@ type PsGolden = {
 	source: string;
 	normalization: string;
 	result: {
-		status: string;
+		status: ProcessStatus;
 		pidMatches: boolean;
 		ppidPositive: boolean;
 		incarnationPresent: boolean;
-		observationStatus: string;
+		observationStatus: "absent" | "present" | "unknown";
 		observationIncarnationPresent: boolean;
-		runningEnum: string;
+		runningEnum: ProcessStatus;
 	};
 };
 

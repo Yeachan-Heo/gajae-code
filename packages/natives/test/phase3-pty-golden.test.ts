@@ -34,7 +34,7 @@ test("Phase 3 PTY output and completion state match the pre-sync golden", async 
 
 	expect({
 		output: output.replace(/\r\n/g, "\n"),
-		exitCode: result.exitCode,
+		exitCode: result.exitCode ?? null,
 		cancelled: result.cancelled,
 		timedOut: result.timedOut,
 	}).toEqual(ptyGolden.result);
