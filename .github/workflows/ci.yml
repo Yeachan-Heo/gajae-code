@@ -577,9 +577,12 @@ jobs:
            run: |
               set -euo pipefail
               # Newest published, non-draft, non-prerelease release other than this one.
+              # Paginated: daily nightly prereleases can push every stable release off
+              # the first page. The API lists newest first, so the first match wins.
               # A missing predecessor is not an error: the checkpoint is still written.
-              previous="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=30" \
-                 --jq "[.[] | select(.draft == false and .prerelease == false and .tag_name != \"$CURRENT_TAG\")][0].tag_name // empty")"
+              previous="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                 --jq ".[] | select(.draft == false and .prerelease == false and .tag_name != \"$CURRENT_TAG\") | .tag_name" \
+                 | sed -n 1p)"
               echo "tag=$previous" >> "$GITHUB_OUTPUT"
               if [ -n "$previous" ]; then
                  git fetch --quiet --force origin "refs/tags/$previous:refs/tags/$previous"
