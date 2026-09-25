@@ -23,6 +23,7 @@ import {
 } from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
+	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
@@ -493,6 +494,7 @@ export async function runSessionHost(
 		processIncarnation?: (pid: number) => string | undefined;
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
+		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 	} = {},
 ): Promise<void> {
 	const now = timing.now ?? Date.now;
@@ -500,6 +502,7 @@ export async function runSessionHost(
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
+	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
@@ -860,10 +863,11 @@ export async function runSessionHost(
 		return disposal ?? Promise.resolve(undefined);
 	};
 	let failureRollback: Promise<void> | undefined;
+	let readinessPublicationCleanupComplete = true;
 	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
 		failureRollback ??= (async () => {
 			const transcript = await disposeAndCapture();
-			if (rollback.generation === undefined) rollback.recordAbsent();
+			if (rollback.generation === undefined && readinessPublicationCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
 		})();
 		return failureRollback;
@@ -946,8 +950,40 @@ export async function runSessionHost(
 			throw new Error("Lifecycle test failure after SDK host registration.");
 
 		await beforeCutoff(() => session.sessionManager.ensureOnDisk());
-
-		await writeSessionLifecycleReady(request.stateRoot, request.sessionId, effectMarker);
+		throwIfStartupInterrupted();
+		let readinessPublished = false;
+		readinessPublicationCleanupComplete = false;
+		const readinessOutcome = await beforeCutoff(
+			async () => {
+				try {
+					await writeLifecycleReady(
+						request.stateRoot,
+						request.sessionId,
+						effectMarker,
+						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
+						() => {
+							readinessPublished = true;
+						},
+					);
+					return { published: true } as const;
+				} catch (error) {
+					return { published: false, error } as const;
+				}
+			},
+			async outcome => {
+				readinessPublicationCleanupComplete =
+					!outcome.published && !(outcome.error instanceof LifecycleReadinessCleanupError);
+			},
+		);
+		if (!readinessOutcome.published) {
+			readinessPublicationCleanupComplete = !(readinessOutcome.error instanceof LifecycleReadinessCleanupError);
+			throw readinessOutcome.error;
+		}
+		if (!readinessPublished) {
+			readinessPublicationCleanupComplete = false;
+			throw new Error("Lifecycle readiness publication completed without its commit callback.");
+		}
+		readinessPublicationCleanupComplete = true;
 		startupComplete = true;
 		removeStartupSignalHandlers();
 		process.once("SIGTERM", onReadySignal);
