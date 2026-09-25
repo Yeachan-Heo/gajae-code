@@ -438,6 +438,36 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
+	it("wraps cleanup diagnostics when a proxy silently rejects property definition", async () => {
+		const dirs = makeDirs("reload-silent-proxy");
+		const cleanupError = new Error("owned auth storage close failed");
+		const reloadError = new Proxy(new Error("initial reload failed"), {
+			defineProperty() {
+				return true;
+			},
+		});
+		const storage = {
+			reload: vi.fn(async () => {
+				throw reloadError;
+			}),
+			close: vi.fn(() => {
+				throw cleanupError;
+			}),
+		} as unknown as AuthStorage;
+		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
+
+		const thrown = await discoverAuthStorage(dirs.agentDir).then(
+			() => undefined,
+			error => error,
+		);
+		expect(thrown).toBeInstanceOf(AggregateError);
+		if (!(thrown instanceof AggregateError)) return;
+		expect(thrown.errors).toEqual([reloadError, cleanupError]);
+		expect(thrown.message).toContain("initial reload failed");
+		expect("startupCleanupDiagnostic" in thrown).toBe(true);
+		expect(storage.close).toHaveBeenCalledTimes(1);
+	});
+
 	it("preserves cleanup diagnostics when the startup error is a hostile proxy", async () => {
 		const dirs = makeDirs("reload-hostile-error");
 		const cleanupError = new Error("owned auth storage close failed");
@@ -495,6 +525,35 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(unsubscriptions).toBe(1);
 		expect(close).not.toHaveBeenCalled();
 	});
+
+	it(
+		"replays buffered credential-disabled events after scoped settings failure",
+		async () => {
+			const dirs = makeDirs("settings-failure-buffered-event");
+			const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			failOAuthRefresh();
+			await authStorage.getApiKey("anthropic", "buffered-settings-failure");
+			vi.spyOn(Settings, "loadForScope").mockRejectedValueOnce(new Error("settings initialization failed"));
+			const { settings: _settings, ...startupOptions } = baseOptions(dirs, authStorage);
+
+			await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
+
+			const ext = makeRecordingExtension();
+			const { session } = await createAgentSession(baseOptions(dirs, authStorage, [ext.factory]));
+			try {
+				const observed = ext.next();
+				initializeRunnerForTest(session.extensionRunner);
+				const event = await observed;
+				expect(event.provider).toBe("anthropic");
+				expect(event.disabledCause).toContain("invalid_grant");
+				expect(ext.events).toHaveLength(1);
+			} finally {
+				await session.dispose();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 
 	it("closes internally owned storage when startup fails before AgentSession construction", async () => {
 		const dirs = makeDirs("owned-settings-failure");

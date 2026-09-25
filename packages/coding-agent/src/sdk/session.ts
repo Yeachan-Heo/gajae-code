@@ -236,6 +236,9 @@ import {
 
 export type { AutomationToolName, AutomationTools } from "../tools";
 
+const MAX_STARTUP_CREDENTIAL_DISABLED_EVENT_BUFFER = 32;
+const startupCredentialDisabledEventsByAuthStorage = new WeakMap<AuthStorage, CredentialDisabledEvent[]>();
+
 type AsyncResultEntry = {
 	jobId: string;
 	generation: string;
@@ -1399,9 +1402,11 @@ function attachStartupCleanupDiagnostic(primary: unknown, cleanup: unknown): unk
 				enumerable: false,
 				configurable: true,
 			});
-			return primary;
+			if ((primary as { startupCleanupDiagnostic?: unknown }).startupCleanupDiagnostic === diagnostic)
+				if ((primary as { startupCleanupDiagnostic?: unknown }).startupCleanupDiagnostic === diagnostic)
+					return primary;
 		} catch {
-			// Frozen errors retain their original message in this typed wrapper.
+			// Frozen or hostile proxy errors retain their original message in this typed wrapper.
 		}
 	}
 	const wrapped = new AggregateError([primary, cleanup], safeErrorDescription(primary), { cause: primary });
@@ -1616,7 +1621,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		throw discoveredAuthStorage.error;
 	}
 	const authStorage = discoveredAuthStorage.value;
-	const startupCredentialDisabledEvents: CredentialDisabledEvent[] = [];
+	const startupCredentialDisabledEvents = startupCredentialDisabledEventsByAuthStorage.get(authStorage) ?? [];
+	startupCredentialDisabledEventsByAuthStorage.delete(authStorage);
+	const preserveCredentialDisabledEventsForRetry = (): void => {
+		if (ownsAuthStorage || startupCredentialDisabledEvents.length === 0) return;
+		const pending = startupCredentialDisabledEventsByAuthStorage.get(authStorage) ?? [];
+		pending.push(...startupCredentialDisabledEvents.splice(0));
+		if (pending.length > MAX_STARTUP_CREDENTIAL_DISABLED_EVENT_BUFFER)
+			pending.splice(0, pending.length - MAX_STARTUP_CREDENTIAL_DISABLED_EVENT_BUFFER);
+		startupCredentialDisabledEventsByAuthStorage.set(authStorage, pending);
+	};
 	let credentialDisabledTarget: ExtensionRunner | undefined;
 	let unsubscribeCredentialDisabled: (() => void) | undefined;
 	const releaseCredentialDisabledSubscription = (): void => {
@@ -1626,6 +1640,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	const failInitialSetup = async (primary: unknown, scopedSettings?: Settings): Promise<never> => {
 		const cleanupErrors: unknown[] = [];
+		preserveCredentialDisabledEventsForRetry();
 		try {
 			releaseCredentialDisabledSubscription();
 		} catch (cleanupError) {
@@ -5974,6 +5989,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Release the subscription if the throw happened after install but before the
 		// dispose-wrap took ownership. Each independent cleanup still runs if another
 		// teardown reports an error, and every failure is retained for lifecycle proof.
+		if (!hasSession) preserveCredentialDisabledEventsForRetry();
 		await attemptCleanup(stopInheritedMcpToolsSubscription);
 		await attemptCleanup(releaseCredentialDisabledSubscription);
 		if (hasSession) {
