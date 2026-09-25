@@ -608,6 +608,7 @@ export async function runSessionHost(
 			if (!startupComplete) interruptStartup(capability.normalizeFailure("startup", "failed", error));
 		},
 	);
+	const interruptedStageCleanupGraceMs = 100;
 	const throwIfStartupInterrupted = (): void => {
 		if (startupInterruption !== undefined) throw startupInterruption;
 		if (now() >= request.semanticReadyDeadlineAt) {
@@ -618,7 +619,6 @@ export async function runSessionHost(
 	const beforeCutoff = async <T>(
 		stage: () => Promise<T>,
 		cleanupLateResult?: (value: T) => Promise<void>,
-		waitForStageOnInterruption = true,
 	): Promise<T> => {
 		throwIfStartupInterrupted();
 		const pending = Promise.resolve()
@@ -631,30 +631,44 @@ export async function runSessionHost(
 			pending.then(settlement => ({ settlement }) as const),
 			interrupted.promise.then(failure => ({ failure }) as const),
 		]);
-		if ("failure" in result) {
-			if (waitForStageOnInterruption) {
-				const late = await pending;
-				if ("value" in late) {
-					try {
-						await cleanupLateResult?.(late.value);
-					} catch (error) {
-						throw capability.normalizeFailure(result.failure.phase, result.failure.reason, error);
-					}
-				}
+		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
+			if (!cleanupLateResult) {
+				constructionCleanupComplete = false;
+				return;
 			}
+			const cleanup = lateStage
+				.then(async late => {
+					if ("error" in late) {
+						constructionCleanupComplete = false;
+						return;
+					}
+					try {
+						await cleanupLateResult(late.value);
+					} catch {
+						constructionCleanupComplete = false;
+						logger.warn(
+							"Late lifecycle stage cleanup failed after startup interruption; rollback remains incomplete.",
+						);
+					}
+				})
+				.catch(() => {
+					constructionCleanupComplete = false;
+				});
+			const cleanupCompleted = await Promise.race([
+				cleanup.then(() => true),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+			]);
+			if (!cleanupCompleted) constructionCleanupComplete = false;
+		};
+		if ("failure" in result) {
+			await cleanupLateStage(pending);
 			throw result.failure;
 		}
 		const settlement = result.settlement;
 		if (startupInterruption !== undefined || now() >= request.semanticReadyDeadlineAt) {
 			const failure = startupInterruption ?? cutoffFailure();
 			interruptStartup(failure);
-			if (waitForStageOnInterruption && "value" in settlement) {
-				try {
-					await cleanupLateResult?.(settlement.value);
-				} catch (error) {
-					throw capability.normalizeFailure(failure.phase, failure.reason, error);
-				}
-			}
+			await cleanupLateStage(Promise.resolve(settlement));
 			throw failure;
 		}
 		if ("error" in settlement) throw settlement.error;
@@ -900,38 +914,32 @@ export async function runSessionHost(
 
 	try {
 		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
-		await beforeCutoff(
-			() =>
-				process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
-					? new Promise<void>(() => {})
-					: applyModelProfiles({
-							session,
-							settings: session.settings,
-							modelRegistry: session.modelRegistry,
-							parsedArgs: parsed,
-							startupThinkingLevel,
-							preferCachedModels: true,
-							preferCachedDefaultProfile: true,
-						}),
-			undefined,
-			false,
+		await beforeCutoff(() =>
+			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
+				? new Promise<void>(() => {})
+				: applyModelProfiles({
+						session,
+						settings: session.settings,
+						modelRegistry: session.modelRegistry,
+						parsedArgs: parsed,
+						startupThinkingLevel,
+						preferCachedModels: true,
+						preferCachedDefaultProfile: true,
+					}),
 		);
-		await beforeCutoff(
-			() =>
-				initializeExtensions(session, {
-					reportSendError: () => {},
-					reportRuntimeError: () => {},
-					onShutdown: stop,
-				}),
-			undefined,
-			false,
+		await beforeCutoff(() =>
+			initializeExtensions(session, {
+				reportSendError: () => {},
+				reportRuntimeError: () => {},
+				onShutdown: stop,
+			}),
 		);
 		throwIfStartupInterrupted();
 		if (session.sessionManager.getSessionId() !== request.sessionId)
 			throw new Error(
 				`Lifecycle session id mismatch: expected ${request.sessionId}, got ${session.sessionManager.getSessionId()}.`,
 			);
-		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise, undefined, false);
+		const startup = await beforeCutoff<SdkStartupResult>(() => capability.promise);
 		if (startup.status !== "started") throw startup.failure;
 		throwIfStartupInterrupted();
 		if (process.env.GJC_SDK_TEST_FAIL_AFTER_REGISTRATION === cwd)
