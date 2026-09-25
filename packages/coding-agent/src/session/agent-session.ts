@@ -118,6 +118,7 @@ import {
 	modelSupportsMaintenanceCalls,
 	modelSupportsServiceTier,
 	modelsAreEqual,
+	resolveOAuthStorageProvider,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
@@ -22777,13 +22778,14 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const storageProvider = resolveOAuthStorageProvider(model.provider);
 		const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
-		for (const credential of authStorage.listCredentialInventory(storageProvider)) {
+		const inventory = authStorage.listCredentialInventory(storageProvider);
+		for (const credential of inventory) {
 			if (
 				(rowId !== undefined && credential.id !== rowId) ||
 				credential.provider !== storageProvider ||
 				credential.credentialKind !== credentialKind ||
 				(rowId === undefined && triedRows.has(credential.id)) ||
-				!authStorage.isCredentialAvailable(model.provider, credential.id)
+				credential.disabled
 			)
 				continue;
 			let apiKey: string | undefined;
@@ -22792,14 +22794,16 @@ export class AgentSession {
 					credentialSelector: { kind: "id", value: String(credential.id) },
 				});
 			} catch (error) {
-				if (authStorage.isCredentialAvailable(model.provider, credential.id)) throw error;
+				const currentCredential = inventory.find(row => row.id === credential.id);
+				if (!currentCredential?.disabled) throw error;
 				continue;
 			}
+			const currentCredential = inventory.find(row => row.id === credential.id);
 			if (
 				isAuthenticated(apiKey) &&
 				authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId) === credential.id &&
 				authStorage.getSessionCredentialType(model.provider, this.credentialSessionId) === credentialKind &&
-				authStorage.isCredentialAvailable(model.provider, credential.id)
+				currentCredential && !currentCredential.disabled
 			)
 				return apiKey;
 		}
