@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } from "../../../natives/native/index.js";
+import {
+	h01FindBestFuzzyMatch,
+	h02ScoreSequenceFuzzy,
+	h06FormatHashLines,
+	pdfToMarkdown,
+} from "../../../natives/native/index.js";
 
 // Single-binary verification (G005): every new native export resolves through
 // the embedded-addon loader and is callable on a minimal fixture.
@@ -7,6 +12,7 @@ test("new native exports are callable via the loader", () => {
 	expect(typeof h06FormatHashLines).toBe("function");
 	expect(typeof h02ScoreSequenceFuzzy).toBe("function");
 	expect(typeof h01FindBestFuzzyMatch).toBe("function");
+	expect(typeof pdfToMarkdown).toBe("function");
 });
 
 test("h06FormatHashLines produces LINE+HASH|TEXT output", () => {

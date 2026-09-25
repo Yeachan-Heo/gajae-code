@@ -26,7 +26,7 @@
     "dependencyInstall": ["bun", "install", "--offline", "--frozen-lockfile"],
     "nativeBuild": ["bun", "--cwd=packages/natives", "run", "build"],
     "nativeEmbed": ["bun", "--cwd=packages/natives", "run", "embed:native"],
-    "compile": ["bun", "build", "--compile", "--minify", "--no-compile-autoload-bunfig", "--no-compile-autoload-dotenv", "--no-compile-autoload-tsconfig", "--no-compile-autoload-package-json", "--keep-names", "--define", "process.env.PI_COMPILED=\"true\"", "--define", "process.env.GJC_BUILD_CHANNEL=\"dev\"", "--root", "../..", "--external", "mupdf", "./src/cli.ts", "./src/notifications/telegram-daemon-cli.ts", "--outfile", "dist/gjc-rollback"],
+    "compile": ["bun", "build", "--compile", "--minify", "--no-compile-autoload-bunfig", "--no-compile-autoload-dotenv", "--no-compile-autoload-tsconfig", "--no-compile-autoload-package-json", "--keep-names", "--define", "process.env.PI_COMPILED=\"true\"", "--define", "process.env.GJC_BUILD_CHANNEL=\"dev\"", "--root", "../..", "./src/cli.ts", "./src/notifications/telegram-daemon-cli.ts", "--outfile", "dist/gjc-rollback"],
     "sign": {
       "darwin": ["codesign", "--force", "--sign", "-", "dist/gjc-rollback"],
       "linux": [],

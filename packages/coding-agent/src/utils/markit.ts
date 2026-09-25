@@ -1,7 +1,8 @@
+import * as fs from "node:fs/promises";
 import { untilAborted } from "@gajae-code/utils";
 import type { Markit, StreamInfo } from "../../vendor/markit-ai/dist/index.js";
 import { ToolAbortError } from "../tools/tool-errors";
-import { prepareMuPdf, sanitizeMuPdfDiagnostic, withMuPdfDiagnostic } from "./mupdf";
+import { type PdfMarkdownResult, pdfToMarkdown } from "./pdf";
 
 export interface MarkitConversionResult {
 	content: string;
@@ -33,17 +34,16 @@ function normalizeExtension(extension: string): string {
 	return trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
 }
 
-function normalizeError(error: unknown, pdf = false): string {
+function normalizeError(error: unknown): string {
 	const messages: string[] = [];
 	const seen = new Set<unknown>();
 	while (error !== undefined && !seen.has(error)) {
 		seen.add(error);
 		if (error instanceof Error) {
-			const message = `${error.name}: ${error.message}`;
-			messages.push(pdf ? sanitizeMuPdfDiagnostic(message) : message);
+			messages.push(`${error.name}: ${error.message}`);
 			error = error.cause;
 		} else {
-			messages.push(pdf ? sanitizeMuPdfDiagnostic(String(error)) : String(error));
+			messages.push(String(error));
 			break;
 		}
 	}
@@ -55,42 +55,58 @@ async function runMarkitConversion<T>(task: (markit: Markit) => Promise<T>, sign
 		const markit = instance ?? (await loadMarkit());
 		return signal ? await untilAborted(signal, () => task(markit)) : await task(markit);
 	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
-		if (error instanceof Error && error.name === "AbortError") {
-			throw new ToolAbortError();
-		}
+		if (error instanceof ToolAbortError) throw error;
+		if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
 		throw error;
 	}
 }
 
 function finalizeConversion(markdown?: string): MarkitConversionResult {
-	if (typeof markdown === "string" && markdown.length > 0) {
-		return { content: markdown, ok: true };
-	}
-
+	if (typeof markdown === "string" && markdown.length > 0) return { content: markdown, ok: true };
 	return { content: "", ok: false, error: "Conversion produced no output" };
 }
 
-export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
-	try {
-		if (filePath.toLowerCase().endsWith(".pdf")) await prepareMuPdf();
-		const result = await runMarkitConversion(async markit => {
-			return markit.convertFile(filePath);
-		}, signal);
-		return finalizeConversion(result.markdown);
-	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
+function finalizePdfConversion(result: PdfMarkdownResult): MarkitConversionResult {
+	if (result.markdown.trim().length > 0) return { content: result.markdown, ok: true };
+	if (result.pagesNeedingOcr.length > 0) {
 		return {
 			content: "",
 			ok: false,
-			error: filePath.toLowerCase().endsWith(".pdf")
-				? normalizeError(withMuPdfDiagnostic(error), true)
-				: normalizeError(error),
+			error: `PDF inspection produced no text; OCR is required for page${result.pagesNeedingOcr.length === 1 ? "" : "s"} ${result.pagesNeedingOcr.join(", ")}`,
 		};
+	}
+	return { content: "", ok: false, error: "PDF inspection produced no Markdown output" };
+}
+
+function pdfFailure(error: unknown): MarkitConversionResult {
+	if (error instanceof ToolAbortError) throw error;
+	if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
+	return { content: "", ok: false, error: normalizeError(error) };
+}
+
+export async function convertFileWithMarkit(filePath: string, signal?: AbortSignal): Promise<MarkitConversionResult> {
+	if (filePath.toLowerCase().endsWith(".pdf")) {
+		let buffer: Buffer;
+		try {
+			buffer = await fs.readFile(filePath, { signal });
+		} catch (error) {
+			if (error instanceof ToolAbortError) throw error;
+			if (error instanceof Error && error.name === "AbortError") throw new ToolAbortError();
+			return { content: "", ok: false, error: "PDF file could not be read" };
+		}
+		try {
+			return finalizePdfConversion(await pdfToMarkdown(buffer, signal));
+		} catch (error) {
+			return pdfFailure(error);
+		}
+	}
+
+	try {
+		const result = await runMarkitConversion(markit => markit.convertFile(filePath), signal);
+		return finalizeConversion(result.markdown);
+	} catch (error) {
+		if (error instanceof ToolAbortError) throw error;
+		return { content: "", ok: false, error: normalizeError(error) };
 	}
 }
 
@@ -100,26 +116,23 @@ export async function convertBufferWithMarkit(
 	signal?: AbortSignal,
 ): Promise<MarkitConversionResult> {
 	const normalizedExtension = normalizeExtension(extension);
+	if (normalizedExtension === ".pdf") {
+		try {
+			return finalizePdfConversion(await pdfToMarkdown(buffer, signal));
+		} catch (error) {
+			return pdfFailure(error);
+		}
+	}
+
 	const streamInfo: StreamInfo = {
 		extension: normalizedExtension,
 		filename: `input${normalizedExtension}`,
 	};
-
 	try {
-		if (normalizedExtension === ".pdf") await prepareMuPdf();
-		const result = await runMarkitConversion(async markit => {
-			return markit.convert(Buffer.from(buffer), streamInfo);
-		}, signal);
+		const result = await runMarkitConversion(markit => markit.convert(Buffer.from(buffer), streamInfo), signal);
 		return finalizeConversion(result.markdown);
 	} catch (error) {
-		if (error instanceof ToolAbortError) {
-			throw error;
-		}
-		return {
-			content: "",
-			ok: false,
-			error:
-				normalizedExtension === ".pdf" ? normalizeError(withMuPdfDiagnostic(error), true) : normalizeError(error),
-		};
+		if (error instanceof ToolAbortError) throw error;
+		return { content: "", ok: false, error: normalizeError(error) };
 	}
 }

@@ -164,14 +164,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
 	// Basename matching would never reach that test from this file, which is how
 	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
-	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
-	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
+	"crates/pi-natives/src/pdf.rs": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
+	"packages/coding-agent/src/utils/markit.ts": ["packages/coding-agent/test/pdf-native.test.ts"],
+	"packages/coding-agent/src/utils/pdf.ts": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",

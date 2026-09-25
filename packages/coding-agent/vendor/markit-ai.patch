@@ -1,44 +1,2521 @@
+diff --git a/dist/converters/pdf/columns.d.ts b/dist/converters/pdf/columns.d.ts
+deleted file mode 100644
+index 24f7010d9625a38398c01dc8fa395c3bde4518a4..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/columns.d.ts
++++ /dev/null
+@@ -1,35 +0,0 @@
+-/**
+- * Multi-column layout detection and text box reordering.
+- *
+- * Many PDFs (legal documents, datasheets, academic papers) use two-column
+- * layouts. Without column detection, text boxes are ordered by Y position
+- * only, interleaving left and right column content.
+- *
+- * Algorithm:
+- *   1. Collect left edges of all text boxes on the page
+- *   2. Find the largest horizontal gap between consecutive left edges
+- *   3. If gap > MIN_GAP_RATIO of the text width and both sides have
+- *      enough boxes → multi-column detected
+- *   4. Assign each text box to a column based on its center X
+- *   5. Return columns in reading order (left-to-right, top-to-bottom)
+- *
+- * This only detects the column structure. The caller is responsible for
+- * processing each column's text boxes independently (table detection,
+- * rendering, etc.).
+- */
+-import type { TextBox } from "./types.js";
+-export interface ColumnLayout {
+-    /** Number of columns detected (1 = single column, 2+ = multi-column). */
+-    columnCount: number;
+-    /** Text boxes grouped by column, in reading order (left to right). */
+-    columns: TextBox[][];
+-    /** X positions of column boundaries (between columns). */
+-    boundaries: number[];
+-}
+-/**
+- * Detect column layout and return text boxes grouped by column.
+- *
+- * For single-column pages, returns all boxes in one group.
+- * For multi-column pages, returns boxes split by column in reading order.
+- */
+-export declare function detectColumns(textBoxes: TextBox[]): ColumnLayout;
+diff --git a/dist/converters/pdf/columns.js b/dist/converters/pdf/columns.js
+deleted file mode 100644
+index 89973a6ae1ca63b70e35d1b71b003b674b700f28..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/columns.js
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/**
+- * Multi-column layout detection and text box reordering.
+- *
+- * Many PDFs (legal documents, datasheets, academic papers) use two-column
+- * layouts. Without column detection, text boxes are ordered by Y position
+- * only, interleaving left and right column content.
+- *
+- * Algorithm:
+- *   1. Collect left edges of all text boxes on the page
+- *   2. Find the largest horizontal gap between consecutive left edges
+- *   3. If gap > MIN_GAP_RATIO of the text width and both sides have
+- *      enough boxes → multi-column detected
+- *   4. Assign each text box to a column based on its center X
+- *   5. Return columns in reading order (left-to-right, top-to-bottom)
+- *
+- * This only detects the column structure. The caller is responsible for
+- * processing each column's text boxes independently (table detection,
+- * rendering, etc.).
+- */
+-/**
+- * Minimum gap as a fraction of the total text width to consider a column
+- * boundary. A two-column layout typically has ~50% gap; we use a lower
+- * threshold to catch asymmetric columns.
+- */
+-const MIN_GAP_RATIO = 0.15;
+-/** Minimum number of text boxes on each side of the gap. */
+-const MIN_BOXES_PER_COLUMN = 4;
+-/** Minimum gap in absolute points to avoid splitting on small whitespace. */
+-const MIN_GAP_PTS = 40;
+-/**
+- * Detect column layout and return text boxes grouped by column.
+- *
+- * For single-column pages, returns all boxes in one group.
+- * For multi-column pages, returns boxes split by column in reading order.
+- */
+-export function detectColumns(textBoxes) {
+-    if (textBoxes.length < MIN_BOXES_PER_COLUMN * 2) {
+-        return { columnCount: 1, columns: [textBoxes], boundaries: [] };
+-    }
+-    // Collect unique left edges (rounded to avoid float noise)
+-    const lefts = [
+-        ...new Set(textBoxes.map((tb) => Math.round(tb.bounds.left))),
+-    ].sort((a, b) => a - b);
+-    if (lefts.length < 2) {
+-        return { columnCount: 1, columns: [textBoxes], boundaries: [] };
+-    }
+-    const textXMin = lefts[0];
+-    const textXMax = Math.max(...textBoxes.map((tb) => Math.round(tb.bounds.right)));
+-    const textWidth = textXMax - textXMin;
+-    if (textWidth <= 0) {
+-        return { columnCount: 1, columns: [textBoxes], boundaries: [] };
+-    }
+-    // Find the largest gap between consecutive left-edge positions
+-    let maxGap = 0;
+-    let gapLeft = 0;
+-    let gapRight = 0;
+-    for (let i = 1; i < lefts.length; i++) {
+-        const gap = lefts[i] - lefts[i - 1];
+-        if (gap > maxGap) {
+-            maxGap = gap;
+-            gapLeft = lefts[i - 1];
+-            gapRight = lefts[i];
+-        }
+-    }
+-    const gapRatio = maxGap / textWidth;
+-    if (gapRatio < MIN_GAP_RATIO || maxGap < MIN_GAP_PTS) {
+-        return { columnCount: 1, columns: [textBoxes], boundaries: [] };
+-    }
+-    // Split point is the midpoint of the gap
+-    const splitX = (gapLeft + gapRight) / 2;
+-    // Assign boxes to columns based on center X
+-    const leftCol = [];
+-    const rightCol = [];
+-    for (const tb of textBoxes) {
+-        const cx = (tb.bounds.left + tb.bounds.right) / 2;
+-        if (cx < splitX) {
+-            leftCol.push(tb);
+-        }
+-        else {
+-            rightCol.push(tb);
+-        }
+-    }
+-    // Validate both columns have enough content
+-    if (leftCol.length < MIN_BOXES_PER_COLUMN ||
+-        rightCol.length < MIN_BOXES_PER_COLUMN) {
+-        return { columnCount: 1, columns: [textBoxes], boundaries: [] };
+-    }
+-    return {
+-        columnCount: 2,
+-        columns: [leftCol, rightCol],
+-        boundaries: [splitX],
+-    };
+-}
+diff --git a/dist/converters/pdf/extract.d.ts b/dist/converters/pdf/extract.d.ts
+deleted file mode 100644
+index e07f88336385db6334d145c1f5e66cd6973e3bd4..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/extract.d.ts
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/**
+- * PDF content extraction using mupdf.
+- *
+- * Extracts text boxes (with position, font size, bold) and vector line
+- * segments (table borders) from each page. Uses mupdf's native WASM
+- * engine for fast parsing, and reads raw content streams for vector graphics.
+- *
+- * Coordinate system: PDF native (origin = bottom-left, Y increases upward).
+- */
+-import type { ImageRegion, PageContent } from "./types.js";
+-/**
+- * Render an image region from a PDF page as a PNG buffer.
+- * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
+- */
+-export declare function renderImageRegion(input: Uint8Array, region: ImageRegion): Uint8Array;
+-/**
+- * Extract text boxes and vector segments from all pages of a PDF buffer.
+- */
+-export declare function extractPages(input: Uint8Array): Promise<PageContent[]>;
 diff --git a/dist/converters/pdf/extract.js b/dist/converters/pdf/extract.js
-index 7e3f02ea889f166c30975cce53f7cbe4de620e54..e1dcd4517128adf1021299cb5aa937bf2f98fab7 100644
+deleted file mode 100644
+index 7e3f02ea889f166c30975cce53f7cbe4de620e54..0000000000000000000000000000000000000000 100644
 --- a/dist/converters/pdf/extract.js
-+++ b/dist/converters/pdf/extract.js
-@@ -14,6 +14,8 @@
- const SAME_LINE_Y_TOLERANCE = 2;
- /** Max horizontal gap (pts) to merge adjacent fragments into one text box. */
- const MAX_MERGE_GAP = 14;
-+// Reuse the asynchronously initialized module when rendering extracted images.
-+let mupdf;
- /**
-  * Merge horizontally adjacent raw text items on the same visual line into
-  * word/phrase-level text boxes.
-@@ -429,7 +431,6 @@ function extractImageRegions(stext, pageNumber, pageHeight) {
-  * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
-  */
- export function renderImageRegion(input, region) {
++++ /dev/null
+@@ -1,513 +0,0 @@
+-/**
+- * PDF content extraction using mupdf.
+- *
+- * Extracts text boxes (with position, font size, bold) and vector line
+- * segments (table borders) from each page. Uses mupdf's native WASM
+- * engine for fast parsing, and reads raw content streams for vector graphics.
+- *
+- * Coordinate system: PDF native (origin = bottom-left, Y increases upward).
+- */
+-// ---------------------------------------------------------------------------
+-// Text extraction
+-// ---------------------------------------------------------------------------
+-/** Y tolerance for merging text fragments on the same visual line. */
+-const SAME_LINE_Y_TOLERANCE = 2;
+-/** Max horizontal gap (pts) to merge adjacent fragments into one text box. */
+-const MAX_MERGE_GAP = 14;
+-/**
+- * Merge horizontally adjacent raw text items on the same visual line into
+- * word/phrase-level text boxes.
+- */
+-function mergeIntoWords(raws) {
+-    if (raws.length === 0)
+-        return [];
+-    // Sort by Y descending (top-first in bottom-left coords), then X ascending
+-    const sorted = [...raws].sort((a, b) => {
+-        const dy = b.y - a.y;
+-        return Math.abs(dy) > SAME_LINE_Y_TOLERANCE ? dy : a.x - b.x;
+-    });
+-    const merged = [];
+-    let cur = { ...sorted[0] };
+-    for (let i = 1; i < sorted.length; i++) {
+-        const next = sorted[i];
+-        const sameY = Math.abs(next.y - cur.y) <= SAME_LINE_Y_TOLERANCE;
+-        const close = next.x <= cur.x + cur.width + MAX_MERGE_GAP;
+-        if (sameY && close) {
+-            const gap = next.x - (cur.x + cur.width);
+-            const sep = gap > 1 ? " " : "";
+-            cur.text += sep + next.text;
+-            cur.width = next.x + next.width - cur.x;
+-            cur.height = Math.max(cur.height, next.height);
+-            cur.fontSize = Math.max(cur.fontSize, next.fontSize);
+-            cur.isBold = cur.isBold || next.isBold;
+-        }
+-        else {
+-            merged.push(cur);
+-            cur = { ...next };
+-        }
+-    }
+-    merged.push(cur);
+-    return merged;
+-}
+-/**
+- * Extract text boxes from a mupdf page using structured text output.
+- *
+- * mupdf's structured text JSON uses top-left origin; we convert to
+- * bottom-left (standard PDF coordinates) using the page height.
+- */
+-function extractTextBoxes(page, pageNumber, pageHeight, stext) {
+-    if (!stext) {
+-        stext = JSON.parse(page.toStructuredText("preserve-whitespace").asJSON());
+-    }
+-    const raws = [];
+-    for (const block of stext.blocks) {
+-        if (block.type !== "text")
+-            continue;
+-        for (const line of block.lines) {
+-            const text = line.text?.trim();
+-            if (!text)
+-                continue;
+-            const fontSize = line.font?.size ?? 0;
+-            const weight = line.font?.weight ?? "normal";
+-            const fontName = line.font?.name ?? "";
+-            const isBold = weight === "bold" ||
+-                /bold/i.test(fontName) ||
+-                /Black|Heavy/i.test(fontName);
+-            // mupdf bbox: {x, y, w, h} in top-left coords
+-            // Convert to bottom-left: pdfY = pageHeight - (bbox.y + bbox.h)
+-            const bboxY = line.bbox.y;
+-            const bboxH = line.bbox.h;
+-            const pdfY = pageHeight - (bboxY + bboxH);
+-            raws.push({
+-                text,
+-                x: line.bbox.x,
+-                y: pdfY,
+-                width: line.bbox.w,
+-                height: bboxH,
+-                fontSize,
+-                isBold,
+-            });
+-        }
+-    }
+-    const words = mergeIntoWords(raws);
+-    return words
+-        .map((w, i) => ({
+-        id: `p${pageNumber}-t${i}`,
+-        text: w.text.trim(),
+-        pageNumber,
+-        fontSize: w.fontSize,
+-        isBold: w.isBold,
+-        bounds: {
+-            left: w.x,
+-            right: w.x + w.width,
+-            bottom: w.y,
+-            top: w.y + w.height,
+-        },
+-    }))
+-        .filter((b) => b.text.length > 0);
+-}
+-// ---------------------------------------------------------------------------
+-// Vector segment extraction from raw content stream
+-// ---------------------------------------------------------------------------
+-/** Minimum aspect ratio for a filled rect to be considered a line. */
+-const LINE_ASPECT_THRESHOLD = 6;
+-/** Minimum length (pts) for a segment to count. */
+-const MIN_LENGTH = 2;
+-/** Maximum thickness (pts) for a border line (filters out filled areas). */
+-const MAX_THICKNESS = 3;
+-/**
+- * Convert a thin filled rectangle to a horizontal or vertical segment.
+- * Returns null if the rect doesn't look like a border line.
+- */
+-function thinRectToSegment(id, x, y, w, h) {
+-    const aw = Math.abs(w);
+-    const ah = Math.abs(h);
+-    if (aw > ah * LINE_ASPECT_THRESHOLD &&
+-        aw >= MIN_LENGTH &&
+-        ah <= MAX_THICKNESS) {
+-        // Horizontal line
+-        const cy = y + ah / 2;
+-        return { id, x1: x, y1: cy, x2: x + aw, y2: cy };
+-    }
+-    if (ah > aw * LINE_ASPECT_THRESHOLD &&
+-        ah >= MIN_LENGTH &&
+-        aw <= MAX_THICKNESS) {
+-        // Vertical line
+-        const cx = x + aw / 2;
+-        return { id, x1: cx, y1: y, x2: cx, y2: y + ah };
+-    }
+-    return null;
+-}
+-/**
+- * Emit 4 edge segments from a stroked rectangle.
+- */
+-function pushStrokedRectEdges(segments, id, x, y, w, h) {
+-    const aw = Math.abs(w);
+-    const ah = Math.abs(h);
+-    const base = id;
+-    if (aw >= MIN_LENGTH) {
+-        segments.push({ id: `${base}-b`, x1: x, y1: y, x2: x + aw, y2: y });
+-        segments.push({
+-            id: `${base}-t`,
+-            x1: x,
+-            y1: y + ah,
+-            x2: x + aw,
+-            y2: y + ah,
+-        });
+-    }
+-    if (ah >= MIN_LENGTH) {
+-        segments.push({ id: `${base}-l`, x1: x, y1: y, x2: x, y2: y + ah });
+-        segments.push({
+-            id: `${base}-r`,
+-            x1: x + aw,
+-            y1: y,
+-            x2: x + aw,
+-            y2: y + ah,
+-        });
+-    }
+-}
+-const CTM_IDENTITY = [1, 0, 0, 1, 0, 0];
+-/** Concatenate two affine matrices: result = parent × child. */
+-function ctmConcat(p, c) {
+-    return [
+-        p[0] * c[0] + p[2] * c[1],
+-        p[1] * c[0] + p[3] * c[1],
+-        p[0] * c[2] + p[2] * c[3],
+-        p[1] * c[2] + p[3] * c[3],
+-        p[0] * c[4] + p[2] * c[5] + p[4],
+-        p[1] * c[4] + p[3] * c[5] + p[5],
+-    ];
+-}
+-function ctmApply(m, x, y) {
+-    return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+-}
+-// ---------------------------------------------------------------------------
+-// Content stream parsing
+-// ---------------------------------------------------------------------------
+-/**
+- * Parse a PDF content stream and extract line segments from thin filled
+- * rectangles (re+f), stroked rectangles (re+S), and explicit lines (m/l+S).
+- * Tracks the CTM via q/Q/cm operators so coordinates are in page space.
+- */
+-function extractSegmentsFromContentStream(raw, pageNumber) {
+-    const segments = [];
+-    const tokens = tokenizeContentStream(raw);
+-    let idx = 0;
+-    let strokeWidth = 1.0;
+-    // Graphics state stack (q/Q): saves CTM + strokeWidth
+-    let ctm = [...CTM_IDENTITY];
+-    const stateStack = [];
+-    // State for path building (in user coordinates, pre-CTM)
+-    let curX = 0;
+-    let curY = 0;
+-    let pathStartX = 0;
+-    let pathStartY = 0;
+-    const pendingRects = [];
+-    const pendingLines = [];
+-    function flushPath(mode) {
+-        const sid = () => `p${pageNumber}-s${segments.length}`;
+-        if (mode === "fill") {
+-            for (const r of pendingRects) {
+-                // Transform the rect corners through CTM, then check if it's a thin line
+-                const [x0, y0] = ctmApply(ctm, r.x, r.y);
+-                const [x1, y1] = ctmApply(ctm, r.x + r.w, r.y + r.h);
+-                const seg = thinRectToSegment(sid(), Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+-                if (seg)
+-                    segments.push(seg);
+-            }
+-        }
+-        else if (mode === "stroke" && strokeWidth <= MAX_THICKNESS) {
+-            for (const r of pendingRects) {
+-                const [x0, y0] = ctmApply(ctm, r.x, r.y);
+-                const [x1, y1] = ctmApply(ctm, r.x + r.w, r.y + r.h);
+-                pushStrokedRectEdges(segments, sid(), Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
+-            }
+-            for (const l of pendingLines) {
+-                const [lx1, ly1] = ctmApply(ctm, l.x1, l.y1);
+-                const [lx2, ly2] = ctmApply(ctm, l.x2, l.y2);
+-                const dx = Math.abs(lx2 - lx1);
+-                const dy = Math.abs(ly2 - ly1);
+-                // Only keep H/V lines
+-                if ((dx >= MIN_LENGTH && dy < 1) || (dy >= MIN_LENGTH && dx < 1)) {
+-                    segments.push({ id: sid(), x1: lx1, y1: ly1, x2: lx2, y2: ly2 });
+-                }
+-            }
+-        }
+-        pendingRects.length = 0;
+-        pendingLines.length = 0;
+-    }
+-    while (idx < tokens.length) {
+-        const t = tokens[idx];
+-        if (t === "q") {
+-            stateStack.push({ ctm: [...ctm], strokeWidth });
+-        }
+-        else if (t === "Q") {
+-            const saved = stateStack.pop();
+-            if (saved) {
+-                ctm = saved.ctm;
+-                strokeWidth = saved.strokeWidth;
+-            }
+-        }
+-        else if (t === "cm" && idx >= 6) {
+-            const a = Number(tokens[idx - 6]);
+-            const b = Number(tokens[idx - 5]);
+-            const c = Number(tokens[idx - 4]);
+-            const d = Number(tokens[idx - 3]);
+-            const e = Number(tokens[idx - 2]);
+-            const f = Number(tokens[idx - 1]);
+-            ctm = ctmConcat(ctm, [a, b, c, d, e, f]);
+-        }
+-        else if (t === "w" && idx >= 1) {
+-            strokeWidth = Number(tokens[idx - 1]) || strokeWidth;
+-        }
+-        else if (t === "re" && idx >= 4) {
+-            const x = Number(tokens[idx - 4]);
+-            const y = Number(tokens[idx - 3]);
+-            const w = Number(tokens[idx - 2]);
+-            const h = Number(tokens[idx - 1]);
+-            if (Number.isFinite(x + y + w + h)) {
+-                pendingRects.push({ x, y, w, h });
+-            }
+-        }
+-        else if (t === "m" && idx >= 2) {
+-            curX = Number(tokens[idx - 2]);
+-            curY = Number(tokens[idx - 1]);
+-            pathStartX = curX;
+-            pathStartY = curY;
+-        }
+-        else if (t === "l" && idx >= 2) {
+-            const x2 = Number(tokens[idx - 2]);
+-            const y2 = Number(tokens[idx - 1]);
+-            pendingLines.push({ x1: curX, y1: curY, x2, y2 });
+-            curX = x2;
+-            curY = y2;
+-        }
+-        else if (t === "h") {
+-            // closePath: line back to start
+-            if (curX !== pathStartX || curY !== pathStartY) {
+-                pendingLines.push({
+-                    x1: curX,
+-                    y1: curY,
+-                    x2: pathStartX,
+-                    y2: pathStartY,
+-                });
+-            }
+-            curX = pathStartX;
+-            curY = pathStartY;
+-        }
+-        else if (t === "f" || t === "F" || t === "f*") {
+-            flushPath("fill");
+-        }
+-        else if (t === "S" || t === "s") {
+-            if (t === "s") {
+-                // closeStroke: implicit closePath
+-                if (curX !== pathStartX || curY !== pathStartY) {
+-                    pendingLines.push({
+-                        x1: curX,
+-                        y1: curY,
+-                        x2: pathStartX,
+-                        y2: pathStartY,
+-                    });
+-                }
+-            }
+-            flushPath("stroke");
+-        }
+-        else if (t === "B" || t === "B*" || t === "b" || t === "b*") {
+-            // fill + stroke combined
+-            flushPath("fill");
+-            flushPath("stroke");
+-        }
+-        else if (t === "n") {
+-            // end path without painting — discard
+-            pendingRects.length = 0;
+-            pendingLines.length = 0;
+-        }
+-        idx++;
+-    }
+-    return segments;
+-}
+-/**
+- * Fast tokenizer for PDF content streams.
+- * Splits on whitespace, skipping comments and string literals.
+- */
+-function tokenizeContentStream(raw) {
+-    const tokens = [];
+-    const len = raw.length;
+-    let i = 0;
+-    while (i < len) {
+-        const ch = raw.charCodeAt(i);
+-        // Skip whitespace
+-        if (ch <= 32) {
+-            i++;
+-            continue;
+-        }
+-        // Skip comments
+-        if (ch === 37 /* % */) {
+-            while (i < len && raw.charCodeAt(i) !== 10)
+-                i++;
+-            continue;
+-        }
+-        // Skip string literals (...)
+-        if (ch === 40 /* ( */) {
+-            let depth = 1;
+-            i++;
+-            while (i < len && depth > 0) {
+-                const c = raw.charCodeAt(i);
+-                if (c === 92 /* \ */) {
+-                    i++;
+-                }
+-                else if (c === 40) {
+-                    depth++;
+-                }
+-                else if (c === 41) {
+-                    depth--;
+-                }
+-                i++;
+-            }
+-            continue;
+-        }
+-        // Skip hex strings <...>
+-        if (ch === 60 /* < */ && i + 1 < len && raw.charCodeAt(i + 1) !== 60) {
+-            i++;
+-            while (i < len && raw.charCodeAt(i) !== 62)
+-                i++;
+-            i++; // skip >
+-            continue;
+-        }
+-        // Skip dict delimiters << >>
+-        if (ch === 60 && i + 1 < len && raw.charCodeAt(i + 1) === 60) {
+-            i += 2;
+-            continue;
+-        }
+-        if (ch === 62 && i + 1 < len && raw.charCodeAt(i + 1) === 62) {
+-            i += 2;
+-            continue;
+-        }
+-        // Regular token: read until whitespace or delimiter
+-        const start = i;
+-        while (i < len) {
+-            const c = raw.charCodeAt(i);
+-            if (c <= 32 || c === 40 || c === 41 || c === 60 || c === 62 || c === 37)
+-                break;
+-            i++;
+-        }
+-        if (i > start) {
+-            tokens.push(raw.substring(start, i));
+-        }
+-    }
+-    return tokens;
+-}
+-// ---------------------------------------------------------------------------
+-// Image region detection
+-// ---------------------------------------------------------------------------
+-/** Minimum area (pts²) for an image to be considered a diagram, not an icon. */
+-const MIN_IMAGE_AREA = 5000;
+-function extractImageRegions(stext, pageNumber, pageHeight) {
+-    const regions = [];
+-    for (const block of stext.blocks) {
+-        if (block.type !== "image")
+-            continue;
+-        const { x, y, w, h } = block.bbox;
+-        if (w * h < MIN_IMAGE_AREA)
+-            continue; // skip tiny icons
+-        // Convert Y from mupdf (top-left) to PDF (bottom-left) for ordering
+-        const pdfTopY = pageHeight - y;
+-        regions.push({
+-            id: `p${pageNumber}-img${regions.length}`,
+-            pageNumber,
+-            bbox: { x, y, w, h },
+-            topY: pdfTopY,
+-        });
+-    }
+-    return regions;
+-}
+-// ---------------------------------------------------------------------------
+-// Public API
+-// ---------------------------------------------------------------------------
+-/**
+- * Render an image region from a PDF page as a PNG buffer.
+- * Uses mupdf's DrawDevice to render just the cropped area at 2x resolution.
+- */
+-export function renderImageRegion(input, region) {
 -    const mupdf = require("mupdf");
-     const doc = mupdf.Document.openDocument(input, "application/pdf");
-     const page = doc.loadPage(region.pageNumber - 1);
-     const pad = 10;
-@@ -453,12 +454,11 @@ export function renderImageRegion(input, region) {
-  * Extract text boxes and vector segments from all pages of a PDF buffer.
-  */
- export async function extractPages(input) {
+-    const doc = mupdf.Document.openDocument(input, "application/pdf");
+-    const page = doc.loadPage(region.pageNumber - 1);
+-    const pad = 10;
+-    const bx = region.bbox.x - pad;
+-    const by = region.bbox.y - pad;
+-    const bw = region.bbox.w + 2 * pad;
+-    const bh = region.bbox.h + 2 * pad;
+-    const scale = 2;
+-    const pw = Math.round(bw * scale);
+-    const ph = Math.round(bh * scale);
+-    const pix = new mupdf.Pixmap(mupdf.ColorSpace.DeviceRGB, [0, 0, pw, ph], false);
+-    pix.clear(255);
+-    const matrix = [scale, 0, 0, scale, -bx * scale, -by * scale];
+-    const dl = page.toDisplayList();
+-    const dev = new mupdf.DrawDevice(matrix, pix);
+-    dl.run(dev, mupdf.Matrix.identity);
+-    dev.close();
+-    return pix.asPNG();
+-}
+-/**
+- * Extract text boxes and vector segments from all pages of a PDF buffer.
+- */
+-export async function extractPages(input) {
 -    let mupdf;
-     try {
-         mupdf = await import("mupdf");
-     }
+-    try {
+-        mupdf = await import("mupdf");
+-    }
 -    catch {
 -        throw new Error("PDF support requires 'mupdf'. Install it: npm install mupdf");
-+    catch (cause) {
-+        throw new Error("MuPDF module initialization failed", { cause });
-     }
-     const doc = mupdf.Document.openDocument(input, "application/pdf");
-     const pages = [];
+-    }
+-    const doc = mupdf.Document.openDocument(input, "application/pdf");
+-    const pages = [];
+-    for (let i = 0; i < doc.countPages(); i++) {
+-        const pageNumber = i + 1;
+-        const page = doc.loadPage(i);
+-        const bounds = page.getBounds();
+-        const pageHeight = bounds[3] - bounds[1];
+-        // Single structured text pass with both flags
+-        const stext = JSON.parse(page.toStructuredText("preserve-whitespace,preserve-images").asJSON());
+-        // Extract text boxes and image regions from the same parse
+-        const textBoxes = extractTextBoxes(page, pageNumber, pageHeight, stext);
+-        const images = extractImageRegions(stext, pageNumber, pageHeight);
+-        // Extract vector segments from raw content stream
+-        let segments = [];
+-        try {
+-            const pageObj = page.getObject();
+-            const contents = pageObj.get("Contents");
+-            if (contents) {
+-                let rawBytes;
+-                if (contents.isArray()) {
+-                    // Multiple content streams — concatenate
+-                    const parts = [];
+-                    const len = contents.length ?? 0;
+-                    for (let j = 0; j < len; j++) {
+-                        const stream = contents.get(j);
+-                        if (stream?.readStream) {
+-                            parts.push(stream.readStream().asUint8Array());
+-                        }
+-                    }
+-                    const totalLen = parts.reduce((s, p) => s + p.length, 0);
+-                    rawBytes = new Uint8Array(totalLen);
+-                    let offset = 0;
+-                    for (const part of parts) {
+-                        rawBytes.set(part, offset);
+-                        offset += part.length;
+-                    }
+-                }
+-                else {
+-                    rawBytes = contents.readStream().asUint8Array();
+-                }
+-                const raw = new TextDecoder().decode(rawBytes);
+-                segments = extractSegmentsFromContentStream(raw, pageNumber);
+-            }
+-        }
+-        catch {
+-            // Content stream extraction failed — proceed with text only
+-        }
+-        pages.push({ pageNumber, textBoxes, segments, images });
+-    }
+-    return pages;
+-}
+diff --git a/dist/converters/pdf/grid.d.ts b/dist/converters/pdf/grid.d.ts
+deleted file mode 100644
+index bad8135df7f0593d79fce9736cab5b1e310515b0..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/grid.d.ts
++++ /dev/null
+@@ -1,25 +0,0 @@
+-/**
+- * Table grid detection from vector segments and text boxes.
+- *
+- * Ported from @oharato/pdf2md-ts with TypeScript types and without
+- * CJK-specific borderless table heuristics. The core algorithm:
+- *
+- * 1. Classify segments as horizontal or vertical lines
+- * 2. Group horizontal Y-lines into table groups (split by vertical gaps)
+- * 3. For each group:
+- *    a. Full grid (H+V lines): build cells from grid intersections,
+- *       place text via raycasting
+- *    b. H-line only (no V lines): infer columns from text X positions
+- * 4. Prune empty rows/cols
+- *
+- * Coordinate system: PDF native (bottom-left origin, Y increases upward).
+- */
+-import type { Segment, TableGrid, TextBox } from "./types.js";
+-export interface GridResult {
+-    grids: TableGrid[];
+-    consumedIds: string[];
+-}
+-/**
+- * Detect all table grids on a single page from its text boxes and segments.
+- */
+-export declare function resolveTableGrids(pageNumber: number, textBoxes: TextBox[], segments: Segment[]): GridResult;
+diff --git a/dist/converters/pdf/grid.js b/dist/converters/pdf/grid.js
+deleted file mode 100644
+index 39cb561ddf291d954ef4e3bb68928ca3a4707028..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/grid.js
++++ /dev/null
+@@ -1,795 +0,0 @@
+-/**
+- * Table grid detection from vector segments and text boxes.
+- *
+- * Ported from @oharato/pdf2md-ts with TypeScript types and without
+- * CJK-specific borderless table heuristics. The core algorithm:
+- *
+- * 1. Classify segments as horizontal or vertical lines
+- * 2. Group horizontal Y-lines into table groups (split by vertical gaps)
+- * 3. For each group:
+- *    a. Full grid (H+V lines): build cells from grid intersections,
+- *       place text via raycasting
+- *    b. H-line only (no V lines): infer columns from text X positions
+- * 4. Prune empty rows/cols
+- *
+- * Coordinate system: PDF native (bottom-left origin, Y increases upward).
+- */
+-function castRaysForTextBox(textBox, segments) {
+-    const cx = (textBox.bounds.left + textBox.bounds.right) / 2;
+-    const cy = (textBox.bounds.top + textBox.bounds.bottom) / 2;
+-    let up = { direction: "up", segmentId: null, distance: Infinity };
+-    let down = { direction: "down", segmentId: null, distance: Infinity };
+-    let left = { direction: "left", segmentId: null, distance: Infinity };
+-    let right = {
+-        direction: "right",
+-        segmentId: null,
+-        distance: Infinity,
+-    };
+-    for (const seg of segments) {
+-        const isH = Math.abs(seg.y1 - seg.y2) < 0.5;
+-        const isV = Math.abs(seg.x1 - seg.x2) < 0.5;
+-        if (isH) {
+-            const minX = Math.min(seg.x1, seg.x2);
+-            const maxX = Math.max(seg.x1, seg.x2);
+-            if (cx >= minX && cx <= maxX) {
+-                const d = seg.y1 - cy;
+-                if (d >= 0 && d < up.distance)
+-                    up = { direction: "up", segmentId: seg.id, distance: d };
+-                const dd = cy - seg.y1;
+-                if (dd >= 0 && dd < down.distance)
+-                    down = { direction: "down", segmentId: seg.id, distance: dd };
+-            }
+-        }
+-        if (isV) {
+-            const minY = Math.min(seg.y1, seg.y2);
+-            const maxY = Math.max(seg.y1, seg.y2);
+-            if (cy >= minY && cy <= maxY) {
+-                const d = cx - seg.x1;
+-                if (d >= 0 && d < left.distance)
+-                    left = { direction: "left", segmentId: seg.id, distance: d };
+-                const rd = seg.x1 - cx;
+-                if (rd >= 0 && rd < right.distance)
+-                    right = { direction: "right", segmentId: seg.id, distance: rd };
+-            }
+-        }
+-    }
+-    return [up, down, left, right];
+-}
+-// ---------------------------------------------------------------------------
+-// Utility
+-// ---------------------------------------------------------------------------
+-const AXIS_EPSILON = 0.8;
+-const PAGE_MARGIN = 20;
+-function uniqueSorted(values) {
+-    const sorted = [...values].sort((a, b) => a - b);
+-    const result = [];
+-    for (const v of sorted) {
+-        if (result.length === 0 || Math.abs(result[result.length - 1] - v) > 1)
+-            result.push(v);
+-    }
+-    return result;
+-}
+-// ---------------------------------------------------------------------------
+-// Y-line group splitting
+-// ---------------------------------------------------------------------------
+-function chainCoversRange(intervals, lowerY, upperY, eps) {
+-    const sorted = [...intervals].sort((a, b) => a.min - b.min);
+-    let covered = lowerY;
+-    for (const iv of sorted) {
+-        if (iv.min > covered + eps)
+-            break;
+-        if (iv.max > covered)
+-            covered = iv.max;
+-        if (covered >= upperY - eps)
+-            return true;
+-    }
+-    return false;
+-}
+-function countBridgingVLineCols(upperY, lowerY, verticals) {
+-    const eps = 1.5;
+-    const byX = new Map();
+-    for (const seg of verticals) {
+-        const rx = Math.round(seg.x1);
+-        if (!byX.has(rx))
+-            byX.set(rx, []);
+-        byX
+-            .get(rx)
+-            ?.push({ min: Math.min(seg.y1, seg.y2), max: Math.max(seg.y1, seg.y2) });
+-    }
+-    let count = 0;
+-    for (const intervals of byX.values()) {
+-        if (chainCoversRange(intervals, lowerY, upperY, eps))
+-            count++;
+-    }
+-    return count;
+-}
+-function bridgingXSet(upperY, lowerY, verticals) {
+-    const eps = 1.5;
+-    const xs = new Set();
+-    const byX = new Map();
+-    for (const seg of verticals) {
+-        const rx = Math.round(seg.x1);
+-        if (!byX.has(rx))
+-            byX.set(rx, []);
+-        byX
+-            .get(rx)
+-            ?.push({ min: Math.min(seg.y1, seg.y2), max: Math.max(seg.y1, seg.y2) });
+-    }
+-    for (const [rx, intervals] of byX) {
+-        if (chainCoversRange(intervals, lowerY, upperY, eps))
+-            xs.add(rx);
+-    }
+-    return xs;
+-}
+-const MIN_RICH_BRIDGING_COLS = 3;
+-function splitYLinesIntoGroups(yLines, verticals) {
+-    if (yLines.length === 0)
+-        return [];
+-    const eps = 1.5;
+-    const allX = verticals.map((s) => Math.round(s.x1));
+-    const globalXMin = allX.length > 0 ? Math.min(...allX) : 0;
+-    const globalXMax = allX.length > 0 ? Math.max(...allX) : 0;
+-    const groups = [];
+-    let currentGroup = [yLines[0]];
+-    let prevBridgingCols = -1;
+-    for (let i = 1; i < yLines.length; i++) {
+-        const upperY = yLines[i - 1];
+-        const lowerY = yLines[i];
+-        const cols = countBridgingVLineCols(upperY, lowerY, verticals);
+-        if (cols === 0) {
+-            groups.push(currentGroup);
+-            currentGroup = [yLines[i]];
+-            prevBridgingCols = -1;
+-            continue;
+-        }
+-        if (prevBridgingCols >= MIN_RICH_BRIDGING_COLS &&
+-            cols < MIN_RICH_BRIDGING_COLS) {
+-            const bxs = bridgingXSet(upperY, lowerY, verticals);
+-            const isOuterFrameOnly = [...bxs].every((x) => Math.abs(x - globalXMin) <= eps || Math.abs(x - globalXMax) <= eps);
+-            if (!isOuterFrameOnly) {
+-                groups.push(currentGroup);
+-                currentGroup = [yLines[i - 1], yLines[i]];
+-                prevBridgingCols = cols;
+-                continue;
+-            }
+-        }
+-        currentGroup.push(yLines[i]);
+-        prevBridgingCols = cols;
+-    }
+-    groups.push(currentGroup);
+-    return groups;
+-}
+-// ---------------------------------------------------------------------------
+-// Sub-row Y-cluster expansion
+-// ---------------------------------------------------------------------------
+-const Y_CLUSTER_GAP = 10;
+-const MIN_COLS_IN_TOP_CLUSTER = 2;
+-function assignToYCluster(y, clusters) {
+-    let closest = 0;
+-    let closestDist = Math.abs(y - clusters[0]);
+-    for (let k = 1; k < clusters.length; k++) {
+-        const d = Math.abs(y - clusters[k]);
+-        if (d < closestDist) {
+-            closestDist = d;
+-            closest = k;
+-        }
+-    }
+-    return closest;
+-}
+-function expandSubRowsByYClusters(originalRows, cols, cells, cellBoxes) {
+-    let addedRows = 0;
+-    for (let origRow = 0; origRow < originalRows; origRow++) {
+-        const currentRow = origRow + addedRows;
+-        const rowCellInfos = [];
+-        for (let col = 0; col < cols; col++) {
+-            const cell = cells.find((c) => c.row === currentRow && c.col === col);
+-            if (!cell)
+-                continue;
+-            const boxes = cellBoxes.get(cell);
+-            if (boxes && boxes.length > 0)
+-                rowCellInfos.push({ cell, col, boxes });
+-        }
+-        if (rowCellInfos.length === 0)
+-            continue;
+-        const allMidYs = rowCellInfos.flatMap(({ boxes }) => boxes.map((b) => (b.bounds.top + b.bounds.bottom) / 2));
+-        const sortedY = [
+-            ...new Set(allMidYs.map((y) => Math.round(y * 10) / 10)),
+-        ].sort((a, b) => b - a);
+-        const clusters = [sortedY[0]];
+-        for (let i = 1; i < sortedY.length; i++) {
+-            if (clusters[clusters.length - 1] - sortedY[i] > Y_CLUSTER_GAP) {
+-                clusters.push(sortedY[i]);
+-            }
+-        }
+-        if (clusters.length < 2)
+-            continue;
+-        const colsInTopCluster = new Set();
+-        const totalNonEmptyCols = new Set();
+-        for (const { col, boxes } of rowCellInfos) {
+-            totalNonEmptyCols.add(col);
+-            if (boxes.some((b) => assignToYCluster((b.bounds.top + b.bounds.bottom) / 2, clusters) ===
+-                0)) {
+-                colsInTopCluster.add(col);
+-            }
+-        }
+-        if (colsInTopCluster.size < MIN_COLS_IN_TOP_CLUSTER)
+-            continue;
+-        if (colsInTopCluster.size >= totalNonEmptyCols.size)
+-            continue;
+-        const sparseColsHaveMultipleBoxes = rowCellInfos.some(({ col, boxes }) => !colsInTopCluster.has(col) && boxes.length > 1);
+-        if (!sparseColsHaveMultipleBoxes)
+-            continue;
+-        const numSubRows = clusters.length;
+-        const numNewRows = numSubRows - 1;
+-        for (const cell of cells) {
+-            if (cell.row > currentRow)
+-                cell.row += numNewRows;
+-        }
+-        for (let subRow = 1; subRow < numSubRows; subRow++) {
+-            for (let col = 0; col < cols; col++) {
+-                cells.push({
+-                    row: currentRow + subRow,
+-                    col,
+-                    text: "",
+-                    rowSpan: 1,
+-                    colSpan: 1,
+-                });
+-            }
+-        }
+-        for (const { cell: origCell, col, boxes } of rowCellInfos) {
+-            const subRowBoxGroups = Array.from({ length: numSubRows }, () => []);
+-            for (const box of boxes) {
+-                const cy = (box.bounds.top + box.bounds.bottom) / 2;
+-                subRowBoxGroups[assignToYCluster(cy, clusters)].push(box);
+-            }
+-            cellBoxes.set(origCell, subRowBoxGroups[0]);
+-            if (subRowBoxGroups[0].length === 0)
+-                cellBoxes.delete(origCell);
+-            for (let subRow = 1; subRow < numSubRows; subRow++) {
+-                if (subRowBoxGroups[subRow].length > 0) {
+-                    const newCell = cells.find((c) => c.row === currentRow + subRow && c.col === col);
+-                    if (newCell)
+-                        cellBoxes.set(newCell, subRowBoxGroups[subRow]);
+-                }
+-            }
+-        }
+-        addedRows += numNewRows;
+-    }
+-    return originalRows + addedRows;
+-}
+-// ---------------------------------------------------------------------------
+-// Cross-column text box splitting
+-// ---------------------------------------------------------------------------
+-/**
+- * Find which column a horizontal position falls into.
+- * Returns -1 if outside the grid.
+- */
+-function findCol(x, xLines) {
+-    for (let i = 0; i < xLines.length - 1; i++) {
+-        if (x >= xLines[i] && x <= xLines[i + 1])
+-            return i;
+-    }
+-    return -1;
+-}
+-/**
+- * When a text box spans across one or more vertical column boundaries,
+- * split it into multiple virtual text boxes — one per column — with the
+- * text divided proportionally by width.
+- *
+- * We split at word boundaries closest to the proportional split point
+- * so we don't chop words in half.
+- */
+-function splitCrossColumnBoxes(textBoxes, xLines) {
+-    const result = [];
+-    const MARGIN = 5; // allow small overlap before considering it cross-column
+-    for (const tb of textBoxes) {
+-        const leftCol = findCol(tb.bounds.left + MARGIN, xLines);
+-        const rightCol = findCol(tb.bounds.right - MARGIN, xLines);
+-        // Not spanning columns, or outside grid — keep as-is
+-        if (leftCol < 0 || rightCol < 0 || leftCol === rightCol) {
+-            result.push(tb);
+-            continue;
+-        }
+-        // Text box spans from leftCol to rightCol — split it
+-        const totalWidth = tb.bounds.right - tb.bounds.left;
+-        if (totalWidth <= 0) {
+-            result.push(tb);
+-            continue;
+-        }
+-        const words = tb.text.split(/\s+/);
+-        if (words.length <= 1) {
+-            // Single word spanning columns — just assign to whichever col has more overlap
+-            result.push(tb);
+-            continue;
+-        }
+-        // For each column boundary crossing, find the best word-boundary split
+-        let remainingWords = [...words];
+-        let currentLeft = tb.bounds.left;
+-        for (let col = leftCol; col <= rightCol && remainingWords.length > 0; col++) {
+-            const colRight = col < xLines.length - 1 ? xLines[col + 1] : tb.bounds.right;
+-            const segmentRight = Math.min(colRight, tb.bounds.right);
+-            if (col === rightCol) {
+-                // Last column — take all remaining words
+-                result.push({
+-                    ...tb,
+-                    id: `${tb.id}-split${col}`,
+-                    text: remainingWords.join(" "),
+-                    bounds: {
+-                        ...tb.bounds,
+-                        left: currentLeft,
+-                        right: tb.bounds.right,
+-                    },
+-                });
+-                remainingWords = [];
+-            }
+-            else {
+-                // Find how many words fit in this column segment proportionally
+-                const segmentWidth = segmentRight - currentLeft;
+-                const fractionOfTotal = segmentWidth / totalWidth;
+-                const approxChars = Math.round(fractionOfTotal * tb.text.length);
+-                // Walk words to find the split closest to the proportional point
+-                let charCount = 0;
+-                let splitIdx = 0;
+-                for (let w = 0; w < remainingWords.length; w++) {
+-                    const nextCount = charCount + remainingWords[w].length + (w > 0 ? 1 : 0);
+-                    if (nextCount > approxChars && splitIdx > 0)
+-                        break;
+-                    charCount = nextCount;
+-                    splitIdx = w + 1;
+-                }
+-                if (splitIdx === 0)
+-                    splitIdx = 1; // take at least one word
+-                if (splitIdx >= remainingWords.length) {
+-                    // All remaining words fit here
+-                    result.push({
+-                        ...tb,
+-                        id: `${tb.id}-split${col}`,
+-                        text: remainingWords.join(" "),
+-                        bounds: {
+-                            ...tb.bounds,
+-                            left: currentLeft,
+-                            right: segmentRight,
+-                        },
+-                    });
+-                    remainingWords = [];
+-                }
+-                else {
+-                    const partWords = remainingWords.slice(0, splitIdx);
+-                    result.push({
+-                        ...tb,
+-                        id: `${tb.id}-split${col}`,
+-                        text: partWords.join(" "),
+-                        bounds: {
+-                            ...tb.bounds,
+-                            left: currentLeft,
+-                            right: segmentRight,
+-                        },
+-                    });
+-                    remainingWords = remainingWords.slice(splitIdx);
+-                    currentLeft = segmentRight;
+-                }
+-            }
+-        }
+-    }
+-    return result;
+-}
+-// ---------------------------------------------------------------------------
+-// Full grid table (H + V lines)
+-// ---------------------------------------------------------------------------
+-function buildCells(rows, cols) {
+-    const cells = [];
+-    for (let row = 0; row < rows; row++) {
+-        for (let col = 0; col < cols; col++) {
+-            cells.push({ row, col, text: "", rowSpan: 1, colSpan: 1 });
+-        }
+-    }
+-    return cells;
+-}
+-function buildTableGrid(pageNumber, yLines, xLines, filteredSegments, textBoxes) {
+-    let rows = yLines.length - 1;
+-    const cols = xLines.length - 1;
+-    const cells = buildCells(rows, cols);
+-    const consumedIds = [];
+-    const yMin = yLines[yLines.length - 1];
+-    const yMax = yLines[0];
+-    const xMin = xLines[0];
+-    const xMax = xLines[xLines.length - 1];
+-    // Split text boxes that span multiple columns before placement
+-    const splitBoxes = splitCrossColumnBoxes(textBoxes, xLines);
+-    // Track which split piece IDs get placed in cells, so we can consume
+-    // the original (unsplit) text box IDs too.
+-    const placedSplitIds = new Set();
+-    // Look for header text boxes just above the grid.
+-    // Use the ORIGINAL (unsplit) text boxes for header detection so that
+-    // wide paragraph text isn't falsely split into column-sized header chunks.
+-    // Reject boxes wider than 1.5 columns — those are paragraph text, not headers.
+-    const avgColWidth = (xMax - xMin) / cols;
+-    const maxHeaderBoxWidth = avgColWidth * 1.5;
+-    const headerBoxes = textBoxes.filter((tb) => {
+-        const cy = (tb.bounds.top + tb.bounds.bottom) / 2;
+-        const cx = (tb.bounds.left + tb.bounds.right) / 2;
+-        const boxWidth = tb.bounds.right - tb.bounds.left;
+-        return (cy > yMax &&
+-            cy <= yMax + 20 &&
+-            cx >= xMin &&
+-            cx <= xMax &&
+-            boxWidth <= maxHeaderBoxWidth);
+-    });
+-    if (headerBoxes.length > 0) {
+-        rows += 1;
+-        for (const cell of cells)
+-            cell.row += 1;
+-        for (let col = 0; col < cols; col++) {
+-            cells.push({ row: 0, col, text: "", rowSpan: 1, colSpan: 1 });
+-        }
+-        for (const tb of headerBoxes) {
+-            const cx = (tb.bounds.left + tb.bounds.right) / 2;
+-            const col = xLines.findIndex((lineX, idx) => {
+-                const next = xLines[idx + 1];
+-                return next !== undefined && cx >= lineX && cx <= next;
+-            });
+-            if (col >= 0 && col < cols) {
+-                const cell = cells.find((c) => c.row === 0 && c.col === col);
+-                if (cell) {
+-                    cell.text =
+-                        cell.text.length === 0 ? tb.text : `${cell.text} ${tb.text}`;
+-                    consumedIds.push(tb.id);
+-                }
+-            }
+-        }
+-    }
+-    const cellBoxes = new Map();
+-    for (const tb of splitBoxes) {
+-        const cx = (tb.bounds.left + tb.bounds.right) / 2;
+-        const cy = (tb.bounds.top + tb.bounds.bottom) / 2;
+-        if (cy < yMin || cy > yMax || cx < xMin || cx > xMax)
+-            continue;
+-        const rays = castRaysForTextBox(tb, filteredSegments);
+-        const rayConfidence = rays.filter((r) => r.segmentId !== null).length;
+-        let row = yLines.findIndex((lineY, idx) => {
+-            const next = yLines[idx + 1];
+-            return next !== undefined && cy <= lineY && cy >= next;
+-        });
+-        if (row < 0 || row >= (headerBoxes.length > 0 ? rows - 1 : rows))
+-            continue;
+-        if (headerBoxes.length > 0)
+-            row += 1;
+-        const col = xLines.findIndex((lineX, idx) => {
+-            const next = xLines[idx + 1];
+-            return next !== undefined && cx >= lineX && cx <= next;
+-        });
+-        if (col < 0 || col >= cols)
+-            continue;
+-        if (rayConfidence === 0)
+-            continue;
+-        const cell = cells.find((c) => c.row === row && c.col === col);
+-        if (!cell)
+-            continue;
+-        if (!cellBoxes.has(cell))
+-            cellBoxes.set(cell, []);
+-        cellBoxes.get(cell)?.push(tb);
+-        consumedIds.push(tb.id);
+-        if (tb.id.includes("-split"))
+-            placedSplitIds.add(tb.id);
+-    }
+-    rows = expandSubRowsByYClusters(rows, cols, cells, cellBoxes);
+-    // Merge text boxes within each cell into cell text
+-    for (const [cell, boxes] of cellBoxes.entries()) {
+-        boxes.sort((a, b) => b.bounds.top - a.bounds.top);
+-        const lines = [];
+-        let currentLine = [];
+-        let currentY = boxes[0].bounds.top;
+-        for (const box of boxes) {
+-            if (Math.abs(box.bounds.top - currentY) > 5) {
+-                lines.push(currentLine.join(" "));
+-                currentLine = [box.text];
+-                currentY = box.bounds.top;
+-            }
+-            else {
+-                currentLine.push(box.text);
+-            }
+-        }
+-        if (currentLine.length > 0)
+-            lines.push(currentLine.join(" "));
+-        cell.text = lines.join("<br>");
+-    }
+-    const grid = pruneEmptyRowsAndCols({
+-        pageNumber,
+-        rows,
+-        cols,
+-        cells,
+-        warnings: [],
+-        topY: yLines[0],
+-        isBorderless: false,
+-    });
+-    // Also consume the original (unsplit) text box IDs when any of their
+-    // split pieces were placed in a cell.
+-    for (const splitId of placedSplitIds) {
+-        const origId = splitId.replace(/-split\d+$/, "");
+-        if (!consumedIds.includes(origId)) {
+-            consumedIds.push(origId);
+-        }
+-    }
+-    return { grid, consumedIds };
+-}
+-// ---------------------------------------------------------------------------
+-// H-line-only table (inferred columns)
+-// ---------------------------------------------------------------------------
+-const COL_GAP_THRESHOLD = 20;
+-const HONLY_ROW_GAP = 30;
+-const HONLY_ROW_TOLERANCE = 8;
+-const MIN_TABLE_HEIGHT = 24;
+-const MIN_LEFT_SPREAD = 50;
+-function inferXLinesFromBoxes(textBoxes, xMin, xMax) {
+-    const centers = textBoxes
+-        .map((tb) => (tb.bounds.left + tb.bounds.right) / 2)
+-        .sort((a, b) => a - b);
+-    if (centers.length === 0)
+-        return [xMin, xMax];
+-    const boundaries = [xMin];
+-    for (let i = 1; i < centers.length; i++) {
+-        if (centers[i] - centers[i - 1] >= COL_GAP_THRESHOLD) {
+-            boundaries.push((centers[i - 1] + centers[i]) / 2);
+-        }
+-    }
+-    boundaries.push(xMax);
+-    return boundaries;
+-}
+-function buildHLineOnlyTable(pageNumber, yLines, xMin, xMax, textBoxes, alreadyConsumed) {
+-    const yMax = yLines[0];
+-    const yMin = yLines[yLines.length - 1];
+-    const candidates = textBoxes.filter((tb) => !alreadyConsumed.has(tb.id));
+-    const BOX_LEFT_TOLERANCE = 30;
+-    const inRange = candidates.filter((tb) => {
+-        const cy = (tb.bounds.top + tb.bounds.bottom) / 2;
+-        return (tb.bounds.left >= xMin - BOX_LEFT_TOLERANCE &&
+-            tb.bounds.right <= xMax + BOX_LEFT_TOLERANCE &&
+-            cy >= yMin &&
+-            cy <= yMax);
+-    });
+-    // Extend downward below yMin
+-    const belowYMin = candidates
+-        .filter((tb) => {
+-        const cx = (tb.bounds.left + tb.bounds.right) / 2;
+-        const cy = (tb.bounds.top + tb.bounds.bottom) / 2;
+-        return cx >= xMin && cx <= xMax && cy < yMin;
+-    })
+-        .sort((a, b) => (b.bounds.top + b.bounds.bottom) / 2 -
+-        (a.bounds.top + a.bounds.bottom) / 2);
+-    const extensionBoxes = [];
+-    let lastY = yMin;
+-    for (const tb of belowYMin) {
+-        const cy = (tb.bounds.top + tb.bounds.bottom) / 2;
+-        if (lastY - cy > HONLY_ROW_GAP)
+-            break;
+-        extensionBoxes.push(tb);
+-        lastY = cy;
+-    }
+-    const allBoxes = [...inRange, ...extensionBoxes];
+-    if (allBoxes.length === 0)
+-        return null;
+-    const leftEdges = allBoxes.map((tb) => tb.bounds.left);
+-    if (Math.max(...leftEdges) - Math.min(...leftEdges) < MIN_LEFT_SPREAD)
+-        return null;
+-    const xLines = inferXLinesFromBoxes(allBoxes, xMin, xMax);
+-    if (xLines.length < 2)
+-        return null;
+-    const cols = xLines.length - 1;
+-    // Build visual rows
+-    const visualRows = [];
+-    const sortedBoxes = [...allBoxes].sort((a, b) => {
+-        const ya = (a.bounds.top + a.bounds.bottom) / 2;
+-        const yb = (b.bounds.top + b.bounds.bottom) / 2;
+-        if (Math.abs(ya - yb) > 0.5)
+-            return yb - ya;
+-        return a.bounds.left - b.bounds.left;
+-    });
+-    for (const box of sortedBoxes) {
+-        const cy = (box.bounds.top + box.bounds.bottom) / 2;
+-        const last = visualRows[visualRows.length - 1];
+-        if (last && Math.abs(last.midY - cy) <= HONLY_ROW_TOLERANCE) {
+-            last.boxes.push(box);
+-        }
+-        else {
+-            visualRows.push({ midY: cy, boxes: [box] });
+-        }
+-    }
+-    if (visualRows.length === 0)
+-        return null;
+-    const cells = [];
+-    const consumedIds = [];
+-    for (let rowIdx = 0; rowIdx < visualRows.length; rowIdx++) {
+-        const vrow = visualRows[rowIdx];
+-        const colBoxes = new Map();
+-        for (const box of vrow.boxes) {
+-            const cx = (box.bounds.left + box.bounds.right) / 2;
+-            const col = xLines.findIndex((lineX, idx) => {
+-                const next = xLines[idx + 1];
+-                return next !== undefined && cx >= lineX && cx <= next;
+-            });
+-            if (col >= 0 && col < cols) {
+-                if (!colBoxes.has(col))
+-                    colBoxes.set(col, []);
+-                colBoxes.get(col)?.push(box);
+-            }
+-        }
+-        for (let c = 0; c < cols; c++) {
+-            const cbs = (colBoxes.get(c) ?? []).sort((a, b) => a.bounds.left - b.bounds.left);
+-            cells.push({
+-                row: rowIdx,
+-                col: c,
+-                text: cbs.map((b) => b.text).join(" "),
+-                rowSpan: 1,
+-                colSpan: 1,
+-            });
+-            consumedIds.push(...cbs.map((b) => b.id));
+-        }
+-    }
+-    const contentTopY = visualRows.length > 0 ? visualRows[0].midY : yMax;
+-    const grid = pruneEmptyRowsAndCols({
+-        pageNumber,
+-        rows: visualRows.length,
+-        cols,
+-        cells,
+-        warnings: [],
+-        topY: contentTopY,
+-        isBorderless: false,
+-    });
+-    return { grid, consumedIds };
+-}
+-// ---------------------------------------------------------------------------
+-// Pruning
+-// ---------------------------------------------------------------------------
+-function pruneEmptyRowsAndCols(table) {
+-    const occupiedRows = new Set(table.cells.filter((c) => c.text.trim().length > 0).map((c) => c.row));
+-    const occupiedCols = new Set(table.cells.filter((c) => c.text.trim().length > 0).map((c) => c.col));
+-    if (occupiedRows.size === 0)
+-        return table;
+-    const rowMap = new Map();
+-    let newRow = 0;
+-    for (let r = 0; r < table.rows; r++) {
+-        if (occupiedRows.has(r))
+-            rowMap.set(r, newRow++);
+-    }
+-    const colMap = new Map();
+-    let newCol = 0;
+-    for (let c = 0; c < table.cols; c++) {
+-        if (occupiedCols.has(c))
+-            colMap.set(c, newCol++);
+-    }
+-    const prunedCells = table.cells
+-        .filter((c) => occupiedRows.has(c.row) && occupiedCols.has(c.col))
+-        .map((c) => ({
+-        ...c,
+-        row: rowMap.get(c.row) ?? c.row,
+-        col: colMap.get(c.col) ?? c.col,
+-    }));
+-    return { ...table, rows: newRow, cols: newCol, cells: prunedCells };
+-}
+-// ---------------------------------------------------------------------------
+-// Diagram vs table discrimination
+-// ---------------------------------------------------------------------------
+-/** Maximum column count for a plausible data table. */
+-const MAX_TABLE_COLS = 25;
+-/**
+- * Returns true if a grid looks like a vector diagram rather than a data table.
+- *
+- * Heuristics (any match → diagram):
+- *   1. Column count > 25 (diagrams create many X-lines from box edges)
+- *   2. Fill ratio < 25% (most cells empty — scattered boxes)
+- *   3. Fill < 50% AND duplicate text ratio > 30% (repeating labels in a
+- *      diagram layout, e.g. "Hash", "Transaction" appearing in each column)
+- *   4. Fill < 50% AND cols >= 6 (moderate sparseness with wide grid)
+- */
+-function isDiagram(grid) {
+-    const totalCells = grid.rows * grid.cols;
+-    if (totalCells === 0)
+-        return true;
+-    const filled = grid.cells.filter((c) => c.text.trim().length > 0);
+-    const fillRatio = filled.length / totalCells;
+-    // Very high column count
+-    if (grid.cols > MAX_TABLE_COLS)
+-        return true;
+-    // Very sparse
+-    if (fillRatio < 0.25)
+-        return true;
+-    // Compute duplicate text ratio among non-trivial cells.
+-    // Exclude short values (≤3 chars) like "—", "V", "YES", "NO" which
+-    // naturally repeat in real data tables.
+-    const substantive = filled.filter((c) => c.text.trim().length > 3);
+-    const uniqueTexts = new Set(substantive.map((c) => c.text.trim())).size;
+-    const dupRatio = substantive.length > 2 ? 1 - uniqueTexts / substantive.length : 0;
+-    // Sparse + highly duplicated substantive text → repeating diagram
+-    if (fillRatio < 0.5 && dupRatio > 0.3)
+-        return true;
+-    // High duplication + wide grid → repeating diagram even at moderate fill
+-    if (dupRatio > 0.4 && grid.cols >= 6)
+-        return true;
+-    // Sparse + wide grid with no substantive text to judge
+-    if (fillRatio < 0.4 && grid.cols >= 6)
+-        return true;
+-    return false;
+-}
+-/**
+- * Detect all table grids on a single page from its text boxes and segments.
+- */
+-export function resolveTableGrids(pageNumber, textBoxes, segments) {
+-    const vertical = segments.filter((s) => Math.abs(s.x1 - s.x2) <= AXIS_EPSILON);
+-    const horizontal = segments.filter((s) => Math.abs(s.y1 - s.y2) <= AXIS_EPSILON);
+-    // Filter segments to the text's visible area
+-    const textYValues = textBoxes.flatMap((t) => [t.bounds.bottom, t.bounds.top]);
+-    const textYMin = textYValues.length > 0 ? Math.min(...textYValues) - PAGE_MARGIN : -Infinity;
+-    const textYMax = textYValues.length > 0 ? Math.max(...textYValues) + PAGE_MARGIN : Infinity;
+-    const textXValues = textBoxes.flatMap((t) => [t.bounds.left, t.bounds.right]);
+-    const textXMin = textXValues.length > 0 ? Math.min(...textXValues) - 100 : -Infinity;
+-    const textXMax = textXValues.length > 0 ? Math.max(...textXValues) + 100 : Infinity;
+-    const filteredH = horizontal.filter((s) => s.y1 >= textYMin &&
+-        s.y1 <= textYMax &&
+-        s.x1 <= textXMax &&
+-        s.x2 >= textXMin);
+-    const hMaxX2 = filteredH.length > 0 ? Math.max(...filteredH.map((s) => s.x2)) : textXMax;
+-    const vSegXMax = Math.max(textXMax, hMaxX2 + PAGE_MARGIN);
+-    const filteredV = vertical.filter((s) => {
+-        const segMin = Math.min(s.y1, s.y2);
+-        const segMax = Math.max(s.y1, s.y2);
+-        return (segMax >= textYMin &&
+-            segMin <= textYMax &&
+-            s.x1 >= textXMin &&
+-            s.x1 <= vSegXMax);
+-    });
+-    const allYLines = uniqueSorted(filteredH.flatMap((s) => [s.y1, s.y2])).sort((a, b) => b - a);
+-    if (allYLines.length < 2) {
+-        return { grids: [], consumedIds: [] };
+-    }
+-    const filteredSegments = [...filteredH, ...filteredV];
+-    const yGroups = splitYLinesIntoGroups(allYLines, filteredV);
+-    const grids = [];
+-    const gridConsumedIds = [];
+-    // Flat set for the alreadyConsumed check in H-line-only tables
+-    const allConsumedIds = [];
+-    for (const yLines of yGroups) {
+-        if (yLines.length < 2)
+-            continue;
+-        const yMin = yLines[yLines.length - 1];
+-        const yMax = yLines[0];
+-        const groupVerticals = filteredV.filter((s) => {
+-            const segMin = Math.min(s.y1, s.y2);
+-            const segMax = Math.max(s.y1, s.y2);
+-            return segMin < yMax - 1.5 && segMax > yMin + 1.5;
+-        });
+-        const groupXLines = uniqueSorted(groupVerticals.flatMap((s) => [s.x1, s.x2]));
+-        if (groupXLines.length < 2) {
+-            if (yMax - yMin < MIN_TABLE_HEIGHT)
+-                continue;
+-            const groupHoriz = filteredH.filter((s) => s.y1 >= yMin - 1.5 && s.y1 <= yMax + 1.5);
+-            if (groupHoriz.length === 0)
+-                continue;
+-            const hxMin = Math.min(...groupHoriz.map((s) => s.x1));
+-            const hxMax = Math.max(...groupHoriz.map((s) => s.x2));
+-            const result = buildHLineOnlyTable(pageNumber, yLines, hxMin, hxMax, textBoxes, new Set(allConsumedIds));
+-            if (result) {
+-                grids.push(result.grid);
+-                gridConsumedIds.push(result.consumedIds);
+-                allConsumedIds.push(...result.consumedIds);
+-            }
+-            continue;
+-        }
+-        if (yMax - yMin < MIN_TABLE_HEIGHT)
+-            continue;
+-        const result = buildTableGrid(pageNumber, yLines, groupXLines, filteredSegments, textBoxes);
+-        grids.push(result.grid);
+-        gridConsumedIds.push(result.consumedIds);
+-        allConsumedIds.push(...result.consumedIds);
+-    }
+-    // Filter out grids that look like vector diagrams, not data tables.
+-    // Their consumed text box IDs are released so the text becomes free text.
+-    const filteredGrids = [];
+-    const filteredConsumedIds = [];
+-    for (let i = 0; i < grids.length; i++) {
+-        if (isDiagram(grids[i]))
+-            continue;
+-        filteredGrids.push(grids[i]);
+-        filteredConsumedIds.push(...gridConsumedIds[i]);
+-    }
+-    return { grids: filteredGrids, consumedIds: filteredConsumedIds };
+-}
+diff --git a/dist/converters/pdf/headers.d.ts b/dist/converters/pdf/headers.d.ts
+deleted file mode 100644
+index 6baa5560d72991d46cfa8675f9c1fc956c39b6a3..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/headers.d.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-/**
+- * Running header/footer detection and removal.
+- *
+- * Many PDFs have repeated text at the top or bottom of every page:
+- * document titles, chapter names, page numbers, copyright notices.
+- * These pollute the markdown output as false headings or noise.
+- *
+- * Algorithm:
+- *   1. For each page, bucket text boxes by Y position (top/bottom zones)
+- *   2. Collect the text content at each zone across all pages
+- *   3. Text appearing on >20% of pages OR 8+ consecutive pages is a
+- *      running header/footer
+- *   4. Remove matching text boxes before further processing
+- */
+-import type { PageContent } from "./types.js";
+-/**
+- * Detect and remove running headers and footers from all pages.
+- * Mutates the pages array in place, removing header/footer text boxes.
+- *
+- * Uses two strategies:
+- *   1. Global frequency: text appearing on > 20% of all pages
+- *   2. Consecutive runs: text appearing on 8+ consecutive pages
+- */
+-export declare function stripHeadersFooters(pages: PageContent[]): void;
+diff --git a/dist/converters/pdf/headers.js b/dist/converters/pdf/headers.js
+deleted file mode 100644
+index ff0c8a65e20bf9fb8016bbd46d2d152e418539f2..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/headers.js
++++ /dev/null
+@@ -1,108 +0,0 @@
+-/**
+- * Running header/footer detection and removal.
+- *
+- * Many PDFs have repeated text at the top or bottom of every page:
+- * document titles, chapter names, page numbers, copyright notices.
+- * These pollute the markdown output as false headings or noise.
+- *
+- * Algorithm:
+- *   1. For each page, bucket text boxes by Y position (top/bottom zones)
+- *   2. Collect the text content at each zone across all pages
+- *   3. Text appearing on >20% of pages OR 8+ consecutive pages is a
+- *      running header/footer
+- *   4. Remove matching text boxes before further processing
+- */
+-/** Minimum number of pages to enable header/footer detection. */
+-const MIN_PAGES = 5;
+-/** Minimum Y position for top zone (from bottom of page in PDF coords). */
+-const TOP_ZONE_MIN_Y = 700;
+-/** Maximum Y position for bottom zone. */
+-const BOTTOM_ZONE_MAX_Y = 80;
+-/**
+- * Minimum consecutive pages a text must appear on to be considered a
+- * running header/footer. Catches both document-wide headers (appearing
+- * on every page) and chapter-specific headers (appearing on 4+ consecutive
+- * pages within a chapter).
+- */
+-const MIN_CONSECUTIVE_PAGES = 8;
+-/**
+- * Detect and remove running headers and footers from all pages.
+- * Mutates the pages array in place, removing header/footer text boxes.
+- *
+- * Uses two strategies:
+- *   1. Global frequency: text appearing on > 20% of all pages
+- *   2. Consecutive runs: text appearing on 8+ consecutive pages
+- */
+-export function stripHeadersFooters(pages) {
+-    if (pages.length < MIN_PAGES)
+-        return;
+-    // Step 1: Build per-page zone text sets
+-    const pageZoneTexts = [];
+-    for (const page of pages) {
+-        const zoneTexts = new Set();
+-        for (const tb of page.textBoxes) {
+-            const midY = (tb.bounds.top + tb.bounds.bottom) / 2;
+-            if (midY >= TOP_ZONE_MIN_Y || midY <= BOTTOM_ZONE_MAX_Y) {
+-                const key = tb.text.trim().replace(/\s+/g, " ");
+-                if (key.length > 0)
+-                    zoneTexts.add(key);
+-            }
+-        }
+-        pageZoneTexts.push(zoneTexts);
+-    }
+-    // Step 2: Count global frequency AND longest consecutive run for each text
+-    const globalCount = new Map();
+-    const maxConsecutive = new Map();
+-    // Collect all unique zone texts
+-    const allTexts = new Set();
+-    for (const zts of pageZoneTexts) {
+-        for (const t of zts)
+-            allTexts.add(t);
+-    }
+-    for (const text of allTexts) {
+-        let total = 0;
+-        let consecutive = 0;
+-        let maxRun = 0;
+-        for (const zts of pageZoneTexts) {
+-            if (zts.has(text)) {
+-                total++;
+-                consecutive++;
+-                if (consecutive > maxRun)
+-                    maxRun = consecutive;
+-            }
+-            else {
+-                consecutive = 0;
+-            }
+-        }
+-        globalCount.set(text, total);
+-        maxConsecutive.set(text, maxRun);
+-    }
+-    // Step 3: Identify running headers/footers
+-    const globalThreshold = Math.max(3, Math.floor(pages.length * 0.2));
+-    const repeatedTexts = new Set();
+-    for (const text of allTexts) {
+-        const gc = globalCount.get(text) ?? 0;
+-        const mc = maxConsecutive.get(text) ?? 0;
+-        // Global: appears on 20%+ of pages
+-        if (gc >= globalThreshold) {
+-            repeatedTexts.add(text);
+-            continue;
+-        }
+-        // Consecutive: appears on 8+ consecutive pages (chapter-level headers)
+-        if (mc >= MIN_CONSECUTIVE_PAGES) {
+-            repeatedTexts.add(text);
+-        }
+-    }
+-    if (repeatedTexts.size === 0)
+-        return;
+-    // Step 4: Remove matching text boxes from each page
+-    for (const page of pages) {
+-        page.textBoxes = page.textBoxes.filter((tb) => {
+-            const midY = (tb.bounds.top + tb.bounds.bottom) / 2;
+-            if (midY < TOP_ZONE_MIN_Y && midY > BOTTOM_ZONE_MAX_Y)
+-                return true;
+-            const normalized = tb.text.trim().replace(/\s+/g, " ");
+-            return !repeatedTexts.has(normalized);
+-        });
+-    }
+-}
+diff --git a/dist/converters/pdf/index.d.ts b/dist/converters/pdf/index.d.ts
+deleted file mode 100644
+index 04c6f622e43ce39aab5a8326e70d124d86dbb235..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/index.d.ts
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/**
+- * PDF to Markdown converter.
+- *
+- * Uses mupdf (native WASM) for fast PDF parsing and a custom pipeline for
+- * table detection via vector line extraction + raycasting.
+- *
+- * Pipeline:
+- *   1. Extract text boxes + vector segments + image regions per page (mupdf)
+- *   2. Detect column layout (single vs multi-column)
+- *   3. Per column: detect table grids from segments (grid detection + raycasting)
+- *   4. Render diagrams as PNG files (if output directory provided)
+- *   5. Render tables as markdown tables, free text as paragraphs/headings
+- */
+-import type { ConversionResult, Converter, StreamInfo } from "../../types.js";
+-export declare class PdfConverter implements Converter {
+-    name: string;
+-    accepts(streamInfo: StreamInfo): boolean;
+-    convert(input: Buffer, streamInfo: StreamInfo): Promise<ConversionResult>;
+-}
+diff --git a/dist/converters/pdf/index.js b/dist/converters/pdf/index.js
+deleted file mode 100644
+index 53b2703d354efefc44f5b364a3aab760efdc1138..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/index.js
++++ /dev/null
+@@ -1,136 +0,0 @@
+-/**
+- * PDF to Markdown converter.
+- *
+- * Uses mupdf (native WASM) for fast PDF parsing and a custom pipeline for
+- * table detection via vector line extraction + raycasting.
+- *
+- * Pipeline:
+- *   1. Extract text boxes + vector segments + image regions per page (mupdf)
+- *   2. Detect column layout (single vs multi-column)
+- *   3. Per column: detect table grids from segments (grid detection + raycasting)
+- *   4. Render diagrams as PNG files (if output directory provided)
+- *   5. Render tables as markdown tables, free text as paragraphs/headings
+- */
+-import { mkdirSync, writeFileSync } from "node:fs";
+-import { join } from "node:path";
+-import { detectColumns } from "./columns.js";
+-import { extractPages, renderImageRegion } from "./extract.js";
+-import { resolveTableGrids } from "./grid.js";
+-import { stripHeadersFooters } from "./headers.js";
+-import { renderPageContent } from "./render.js";
+-const EXTENSIONS = [".pdf"];
+-const MIMETYPES = ["application/pdf", "application/x-pdf"];
+-/**
+- * Process a set of text boxes (one column or full page): run table detection,
+- * separate free text, and render to markdown.
+- */
+-function processColumn(pageNumber, textBoxes, segments, imageBlocks) {
+-    const { grids, consumedIds } = resolveTableGrids(pageNumber, textBoxes, segments);
+-    const consumedSet = new Set(consumedIds);
+-    const freeTextBoxes = textBoxes.filter((tb) => !consumedSet.has(tb.id));
+-    return renderPageContent(freeTextBoxes, grids, imageBlocks, textBoxes);
+-}
+-export class PdfConverter {
+-    name = "pdf";
+-    accepts(streamInfo) {
+-        if (streamInfo.extension && EXTENSIONS.includes(streamInfo.extension)) {
+-            return true;
+-        }
+-        if (streamInfo.mimetype &&
+-            MIMETYPES.some((m) => streamInfo.mimetype?.startsWith(m))) {
+-            return true;
+-        }
+-        return false;
+-    }
+-    async convert(input, streamInfo) {
+-        const pdfBytes = new Uint8Array(input);
+-        const pages = await extractPages(pdfBytes);
+-        // Remove running headers/footers before processing
+-        stripHeadersFooters(pages);
+-        const imageDir = streamInfo.imageDir;
+-        if (imageDir) {
+-            mkdirSync(imageDir, { recursive: true });
+-        }
+-        const pageMarkdowns = [];
+-        for (const page of pages) {
+-            // Build image blocks for this page
+-            const imageBlocks = [];
+-            if (imageDir && page.images.length > 0) {
+-                for (const img of page.images) {
+-                    const filename = `${img.id}.png`;
+-                    const filepath = join(imageDir, filename);
+-                    try {
+-                        const png = renderImageRegion(pdfBytes, img);
+-                        writeFileSync(filepath, png);
+-                        imageBlocks.push({
+-                            topY: img.topY,
+-                            markdown: `![${img.id}](${filepath})`,
+-                        });
+-                    }
+-                    catch {
+-                        // Image rendering failed — skip
+-                    }
+-                }
+-            }
+-            else if (page.images.length > 0) {
+-                for (const img of page.images) {
+-                    imageBlocks.push({
+-                        topY: img.topY,
+-                        markdown: `<!-- image: ${img.id} (page ${img.pageNumber}, ${img.bbox.w}x${img.bbox.h}pt) -->`,
+-                    });
+-                }
+-            }
+-            // Detect column layout.
+-            // If the page has vertical segments (tables), suppress column detection
+-            // when one detected column is very narrow — that's a table's first column,
+-            // not a page layout column.
+-            const layout = detectColumns(page.textBoxes);
+-            if (layout.columnCount > 1 &&
+-                page.segments.some((s) => Math.abs(s.x1 - s.x2) <= 0.8)) {
+-                const pageXMin = Math.min(...page.textBoxes.map((tb) => tb.bounds.left));
+-                const pageXMax = Math.max(...page.textBoxes.map((tb) => tb.bounds.right));
+-                const pageWidth = pageXMax - pageXMin;
+-                const minColFraction = 0.3;
+-                const tooNarrow = layout.columns.some((col) => {
+-                    const colXMin = Math.min(...col.map((tb) => tb.bounds.left));
+-                    const colXMax = Math.max(...col.map((tb) => tb.bounds.right));
+-                    return (colXMax - colXMin) / pageWidth < minColFraction;
+-                });
+-                if (tooNarrow) {
+-                    layout.columnCount = 1;
+-                    layout.columns = [page.textBoxes];
+-                    layout.boundaries = [];
+-                }
+-            }
+-            if (layout.columnCount === 1) {
+-                // Single column — process normally
+-                const md = processColumn(page.pageNumber, page.textBoxes, page.segments, imageBlocks);
+-                if (md.length > 0)
+-                    pageMarkdowns.push(md);
+-            }
+-            else {
+-                // Multi-column — process each column independently, then join
+-                const columnMarkdowns = [];
+-                for (const colBoxes of layout.columns) {
+-                    // Filter segments to those within this column's X range
+-                    const colXMin = Math.min(...colBoxes.map((tb) => tb.bounds.left));
+-                    const colXMax = Math.max(...colBoxes.map((tb) => tb.bounds.right));
+-                    const margin = 10;
+-                    const colSegments = page.segments.filter((seg) => {
+-                        const segXMin = Math.min(seg.x1, seg.x2);
+-                        const segXMax = Math.max(seg.x1, seg.x2);
+-                        return segXMax >= colXMin - margin && segXMin <= colXMax + margin;
+-                    });
+-                    // Images go with the first column only (no X info to split by)
+-                    const md = processColumn(page.pageNumber, colBoxes, colSegments, columnMarkdowns.length === 0 ? imageBlocks : []);
+-                    if (md.length > 0)
+-                        columnMarkdowns.push(md);
+-                }
+-                const joined = columnMarkdowns.join("\n\n");
+-                if (joined.length > 0)
+-                    pageMarkdowns.push(joined);
+-            }
+-        }
+-        return { markdown: pageMarkdowns.join("\n\n") };
+-    }
+-}
+diff --git a/dist/converters/pdf/render.d.ts b/dist/converters/pdf/render.d.ts
+deleted file mode 100644
+index 466b4ea82da09f875d9e7a77b7be63c7b3ec9f9a..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/render.d.ts
++++ /dev/null
+@@ -1,24 +0,0 @@
+-/**
+- * Markdown rendering for PDF pages.
+- *
+- * Converts table grids and free text boxes into markdown, handling:
+- * - Table grid → markdown table (`| col | col |`)
+- * - Free text → paragraphs with heading detection (by font size)
+- * - Content ordering (top-to-bottom via Y coordinate)
+- * - Paragraph wrap merging (lines broken across PDF line boundaries)
+- * - Page number removal
+- *
+- * Ported from @oharato/pdf2md-ts, stripped of CJK/TDnet-specific logic.
+- */
+-import type { TableGrid, TextBox } from "./types.js";
+-/**
+- * Render a TableGrid as a markdown table.
+- */
+-export declare function renderTableToMarkdown(table: TableGrid): string;
+-/**
+- * Render one page's content: free text and tables interleaved top-to-bottom.
+- */
+-export declare function renderPageContent(freeTextBoxes: TextBox[], tables: TableGrid[], imageBlocks?: Array<{
+-    topY: number;
+-    markdown: string;
+-}>, allTextBoxes?: TextBox[]): string;
+diff --git a/dist/converters/pdf/render.js b/dist/converters/pdf/render.js
+deleted file mode 100644
+index 0f33b5b9a588d35a18f381a5ba95dccc3852b337..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/render.js
++++ /dev/null
+@@ -1,513 +0,0 @@
+-/**
+- * Markdown rendering for PDF pages.
+- *
+- * Converts table grids and free text boxes into markdown, handling:
+- * - Table grid → markdown table (`| col | col |`)
+- * - Free text → paragraphs with heading detection (by font size)
+- * - Content ordering (top-to-bottom via Y coordinate)
+- * - Paragraph wrap merging (lines broken across PDF line boundaries)
+- * - Page number removal
+- *
+- * Ported from @oharato/pdf2md-ts, stripped of CJK/TDnet-specific logic.
+- */
+-// ---------------------------------------------------------------------------
+-// Utility
+-// ---------------------------------------------------------------------------
+-/** Convert full-width ASCII characters (Ａ→A, ！→! etc.) to normal ASCII. */
+-function normalizeFullWidthAscii(text) {
+-    return text.replace(/[！-～]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0));
+-}
+-function escapePipes(text) {
+-    return normalizeFullWidthAscii(text)
+-        .replaceAll("|", "\\|")
+-        .replaceAll("\n", "<br>");
+-}
+-/** Parse a markdown pipe-delimited row into cell strings. */
+-function parsePipeRow(line) {
+-    const trimmed = line.trim();
+-    if (!trimmed.startsWith("|") || !trimmed.endsWith("|"))
+-        return [];
+-    return trimmed
+-        .slice(1, -1)
+-        .split("|")
+-        .map((cell) => cell.trim());
+-}
+-// ---------------------------------------------------------------------------
+-// Table rendering
+-// ---------------------------------------------------------------------------
+-/**
+- * Render a TableGrid as a markdown table.
+- */
+-export function renderTableToMarkdown(table) {
+-    if (table.rows === 0 || table.cols === 0)
+-        return "";
+-    const matrix = Array.from({ length: table.rows }, () => Array.from({ length: table.cols }, () => ""));
+-    for (const cell of table.cells) {
+-        if (cell.row < table.rows && cell.col < table.cols) {
+-            matrix[cell.row][cell.col] = escapePipes(cell.text.trim());
+-        }
+-    }
+-    const normalized = normalizeShiftedSparseColumns(matrix);
+-    const promoted = promoteSubHeaderPrefixes(normalized);
+-    const header = `| ${promoted[0].join(" | ")} |`;
+-    const divider = `| ${Array.from({ length: promoted[0].length }, () => "---").join(" | ")} |`;
+-    const body = promoted
+-        .slice(1)
+-        .map((row) => `| ${row.join(" | ")} |`)
+-        .join("\n");
+-    return [header, divider, body].filter((l) => l.length > 0).join("\n");
+-}
+-/**
+- * Fix tables with ≥5 columns where sparse single-value columns are
+- * misaligned. Shifts those values to the adjacent dense column and
+- * removes the now-empty sparse columns.
+- */
+-function normalizeShiftedSparseColumns(matrix) {
+-    if (matrix.length === 0 || matrix[0].length < 5)
+-        return matrix;
+-    const _rows = matrix.length;
+-    const cols = matrix[0].length;
+-    const counts = Array.from({ length: cols }, (_, c) => matrix.reduce((n, row) => n + (row[c].trim().length > 0 ? 1 : 0), 0));
+-    const denseCols = new Set(counts
+-        .map((count, col) => ({ count, col }))
+-        .filter(({ col, count }) => col === 0 || count >= 2)
+-        .map(({ col }) => col));
+-    const sparseCols = counts
+-        .map((count, col) => ({ count, col }))
+-        .filter(({ col, count }) => col > 0 && col < cols - 1 && count === 1)
+-        .map(({ col }) => col);
+-    if (sparseCols.length < 2 || denseCols.size < 4)
+-        return matrix;
+-    const moves = [];
+-    for (const from of sparseCols) {
+-        const row = matrix.findIndex((r) => r[from].trim().length > 0);
+-        const to = from + 1;
+-        if (row < 0)
+-            return matrix;
+-        if (!denseCols.has(to))
+-            return matrix;
+-        if (matrix[row][to].trim().length > 0)
+-            return matrix;
+-        moves.push({ from, to, row });
+-    }
+-    const copy = matrix.map((row) => [...row]);
+-    for (const { from, to, row } of moves) {
+-        copy[row][to] =
+-            copy[row][to].trim().length > 0
+-                ? `${copy[row][to]} ${copy[row][from]}`
+-                : copy[row][from];
+-        copy[row][from] = "";
+-    }
+-    const keepCols = Array.from({ length: cols }, (_, c) => c).filter((c) => copy.some((row) => row[c].trim().length > 0));
+-    if (keepCols.length === cols)
+-        return copy;
+-    return copy.map((row) => keepCols.map((c) => row[c]));
+-}
+-/**
+- * When a data row has ≥2 parenthesized qualifiers in non-first columns
+- * (and the first column is empty), promote them into the header row.
+- */
+-function promoteSubHeaderPrefixes(matrix) {
+-    if (matrix.length < 2)
+-        return matrix;
+-    const PAREN_RE = /^\([^)]{1,40}\)$/;
+-    const result = matrix.map((row) => [...row]);
+-    const cols = matrix[0].length;
+-    const rowsToRemove = new Set();
+-    for (let r = 1; r < result.length; r++) {
+-        if (rowsToRemove.has(r))
+-            continue;
+-        const promotable = [];
+-        for (let col = 1; col < cols; col++) {
+-            const cell = (result[r][col] ?? "").trim();
+-            if (!cell)
+-                continue;
+-            const parts = cell.split("<br>");
+-            if (parts.length === 1 && PAREN_RE.test(cell)) {
+-                promotable.push({ col, prefix: cell, isFullCell: true });
+-            }
+-            else if (parts.length >= 2 && PAREN_RE.test(parts[0].trim())) {
+-                promotable.push({
+-                    col,
+-                    prefix: parts[0].trim(),
+-                    isFullCell: false,
+-                });
+-            }
+-        }
+-        if (promotable.length < 2)
+-            continue;
+-        if (promotable.some((p) => p.isFullCell) && result[r][0].trim().length > 0)
+-            continue;
+-        for (const { col, prefix, isFullCell } of promotable) {
+-            result[0][col] = result[0][col].trim()
+-                ? `${result[0][col]} ${prefix}`
+-                : prefix;
+-            if (isFullCell) {
+-                result[r][col] = "";
+-            }
+-            else {
+-                const parts = result[r][col].split("<br>");
+-                result[r][col] = parts.slice(1).join("<br>");
+-            }
+-        }
+-        if (result[r].every((cell) => cell.trim().length === 0)) {
+-            rowsToRemove.add(r);
+-        }
+-    }
+-    return result.filter((_, r) => !rowsToRemove.has(r));
+-}
+-// ---------------------------------------------------------------------------
+-// Free text rendering
+-// ---------------------------------------------------------------------------
+-/** Y tolerance for grouping text boxes onto the same visual line. */
+-const TEXT_LINE_Y_TOLERANCE = 3;
+-/** Minimum X gap between adjacent boxes to mark line as tabular. */
+-const TABULAR_X_GAP = 30;
+-/**
+- * Minimum font size (pts) to consider when computing the modal body font.
+- * Tiny labels from diagrams, footnote markers, and superscripts are excluded
+- * so they don't skew the modal toward small sizes.
+- */
+-const MIN_BODY_FONT_SIZE = 7;
+-/**
+- * Compute the most frequent font size among text boxes, ignoring very small
+- * text that likely comes from diagrams, footnotes, or superscripts.
+- */
+-function modalFontSize(textBoxes) {
+-    const counts = new Map();
+-    for (const tb of textBoxes) {
+-        const size = Math.round((tb.fontSize ?? 0) * 10) / 10;
+-        if (size < MIN_BODY_FONT_SIZE)
+-            continue;
+-        counts.set(size, (counts.get(size) ?? 0) + 1);
+-    }
+-    let modal = 0;
+-    let maxCount = 0;
+-    for (const [size, count] of counts) {
+-        if (count > maxCount) {
+-            maxCount = count;
+-            modal = size;
+-        }
+-    }
+-    return modal;
+-}
+-/** Group free text boxes into horizontal lines, sorted top-to-bottom. */
+-function groupFreeTextIntoLines(textBoxes) {
+-    if (textBoxes.length === 0)
+-        return [];
+-    const sorted = [...textBoxes].sort((a, b) => {
+-        const ya = (a.bounds.top + a.bounds.bottom) / 2;
+-        const yb = (b.bounds.top + b.bounds.bottom) / 2;
+-        const dy = yb - ya;
+-        if (Math.abs(dy) > TEXT_LINE_Y_TOLERANCE)
+-            return dy;
+-        return a.bounds.left - b.bounds.left;
+-    });
+-    const lines = [];
+-    let curParts = [sorted[0].text];
+-    let curBoxes = [sorted[0]];
+-    let curY = (sorted[0].bounds.top + sorted[0].bounds.bottom) / 2;
+-    let curTopY = curY;
+-    let curFontSize = sorted[0].fontSize;
+-    let curIsBold = sorted[0].isBold;
+-    const finishLine = () => {
+-        let isTabular = false;
+-        for (let j = 1; j < curBoxes.length; j++) {
+-            if (curBoxes[j].bounds.left - curBoxes[j - 1].bounds.right >
+-                TABULAR_X_GAP) {
+-                isTabular = true;
+-                break;
+-            }
+-        }
+-        lines.push({
+-            text: curParts.join(" "),
+-            topY: curTopY,
+-            fontSize: curFontSize,
+-            isBold: curIsBold,
+-            isTabular,
+-        });
+-    };
+-    for (let i = 1; i < sorted.length; i++) {
+-        const box = sorted[i];
+-        const cy = (box.bounds.top + box.bounds.bottom) / 2;
+-        if (Math.abs(cy - curY) <= TEXT_LINE_Y_TOLERANCE) {
+-            curParts.push(box.text);
+-            curBoxes.push(box);
+-            curFontSize = Math.max(curFontSize, box.fontSize);
+-            curIsBold = curIsBold || box.isBold;
+-        }
+-        else {
+-            finishLine();
+-            curParts = [box.text];
+-            curBoxes = [box];
+-            curY = cy;
+-            curTopY = cy;
+-            curFontSize = box.fontSize;
+-            curIsBold = box.isBold;
+-        }
+-    }
+-    finishLine();
+-    return lines;
+-}
+-/** Determine markdown heading prefix based on font size relative to body. */
+-function headingPrefix(fontSize, bodyFontSize, isBold) {
+-    if (bodyFontSize <= 0)
+-        return "";
+-    const ratio = fontSize / bodyFontSize;
+-    // Large headings (>2x body size)
+-    if (ratio >= 2.0)
+-        return "# ";
+-    // Medium headings (~1.5x body size)
+-    if (ratio >= 1.4)
+-        return "## ";
+-    // Small headings (bold and slightly larger)
+-    if (ratio >= 1.1 && isBold)
+-        return "### ";
+-    return "";
+-}
+-// ---------------------------------------------------------------------------
+-// Block merging
+-// ---------------------------------------------------------------------------
+-/** Merge consecutive blocks with the same heading prefix (wrapped headings). */
+-function mergeConsecutiveHeadings(blocks, bodyFS) {
+-    if (blocks.length === 0)
+-        return [];
+-    const HEADING_RE = /^(#{1,6} )/;
+-    const maxGap = Math.max(bodyFS * 3, 30);
+-    const merged = [];
+-    let cur = { ...blocks[0] };
+-    for (let i = 1; i < blocks.length; i++) {
+-        const next = blocks[i];
+-        const curMatch = cur.content.match(HEADING_RE);
+-        const nextMatch = next.content.match(HEADING_RE);
+-        const gap = cur.topY - next.topY;
+-        if (curMatch &&
+-            nextMatch &&
+-            curMatch[1] === nextMatch[1] &&
+-            gap <= maxGap) {
+-            cur = {
+-                topY: cur.topY,
+-                content: `${cur.content} ${next.content.slice(nextMatch[1].length)}`,
+-                isTabular: cur.isTabular || next.isTabular,
+-            };
+-        }
+-        else {
+-            merged.push(cur);
+-            cur = { ...next };
+-        }
+-    }
+-    merged.push(cur);
+-    return merged;
+-}
+-/**
+- * Merge consecutive plain-text blocks that are wrapped lines of the same paragraph.
+- */
+-function mergeParagraphWraps(blocks, bodyFS) {
+-    if (blocks.length === 0 || bodyFS <= 0)
+-        return blocks;
+-    const HEADING_RE = /^#{1,6} /;
+-    const SENTENCE_END_RE = /[.!?…)\]]\s*$/;
+-    const maxGap = bodyFS * 2.0;
+-    const MIN_WRAP_LENGTH = 25;
+-    const merged = [];
+-    let cur = { ...blocks[0], lastTopY: blocks[0].topY };
+-    for (let i = 1; i < blocks.length; i++) {
+-        const next = blocks[i];
+-        const curIsBody = !HEADING_RE.test(cur.content) && !cur.content.startsWith("|");
+-        const nextIsBody = !HEADING_RE.test(next.content) && !next.content.startsWith("|");
+-        const gap = cur.lastTopY - next.topY;
+-        const isWrap = curIsBody &&
+-            nextIsBody &&
+-            !cur.isTabular &&
+-            !next.isTabular &&
+-            gap > 0 &&
+-            gap <= maxGap &&
+-            cur.content.length > MIN_WRAP_LENGTH &&
+-            !SENTENCE_END_RE.test(cur.content);
+-        if (isWrap) {
+-            cur = {
+-                topY: cur.topY,
+-                lastTopY: next.topY,
+-                content: `${cur.content.trimEnd()} ${next.content.trimStart()}`,
+-                isTabular: false,
+-            };
+-        }
+-        else {
+-            merged.push({ topY: cur.topY, content: cur.content });
+-            cur = { ...next, lastTopY: next.topY };
+-        }
+-    }
+-    merged.push({ topY: cur.topY, content: cur.content });
+-    return merged;
+-}
+-/** Remove page number blocks near the bottom of the page. */
+-function removePageNumbers(blocks) {
+-    const PAGE_NUM_RE = /^(?:#{1,6}\s*)?\d+\s*$/;
+-    const BOTTOM_Y = 120;
+-    return blocks.filter((block, idx) => {
+-        const isBottom = idx >= blocks.length - 3;
+-        const isLowY = block.topY <= BOTTOM_Y;
+-        const isPageNum = PAGE_NUM_RE.test(block.content.trim());
+-        return !(isBottom && isLowY && isPageNum);
+-    });
+-}
+-// ---------------------------------------------------------------------------
+-// Detached first-column table reconstruction
+-// ---------------------------------------------------------------------------
+-/**
+- * Fix tables where the first column was emitted as free text blocks
+- * around a markdown table containing only the right-side columns.
+- *
+- * Detects: a plain-text header line with (N+1) tokens above an N-column
+- * markdown table, plus short label lines whose count matches the table's
+- * logical row count. Reconstructs into a proper (N+1)-column table.
+- */
+-function normalizeDetachedFirstColumnTables(blocks) {
+-    const HEADING_RE = /^#{1,6}\s/;
+-    const isTableBlock = (text) => text.trimStart().startsWith("|");
+-    const isPlainBlock = (text) => !HEADING_RE.test(text) && !isTableBlock(text);
+-    const isShortLabel = (text) => {
+-        const t = text.trim();
+-        return t.length > 0 && t.length <= 40;
+-    };
+-    const splitTokens = (text) => text
+-        .trim()
+-        .split(/[ \t]+/)
+-        .filter(Boolean);
+-    const replacements = new Map();
+-    const remove = new Set();
+-    for (let tableIdx = 0; tableIdx < blocks.length; tableIdx++) {
+-        if (remove.has(tableIdx))
+-            continue;
+-        const tableBlock = blocks[tableIdx];
+-        if (!isTableBlock(tableBlock.content))
+-            continue;
+-        const tableLines = tableBlock.content
+-            .split("\n")
+-            .map((line) => line.trim())
+-            .filter((line) => line.startsWith("|"));
+-        const dataRows = tableLines
+-            .filter((line) => !/^\|\s*[-: ]+\|/.test(line))
+-            .map(parsePipeRow)
+-            .filter((row) => row.length > 0);
+-        if (dataRows.length === 0)
+-            continue;
+-        const cols = dataRows[0].length;
+-        if (cols < 2 || dataRows.some((row) => row.length !== cols))
+-            continue;
+-        // Expand by <br> count to get logical row count
+-        const logicalRows = [];
+-        for (const row of dataRows) {
+-            const splitCells = row.map((cell) => cell.split("<br>").map((p) => p.trim()));
+-            const rowSpan = Math.max(...splitCells.map((parts) => parts.length));
+-            for (let k = 0; k < rowSpan; k++) {
+-                logicalRows.push(splitCells.map((parts) => parts[k] ?? ""));
+-            }
+-        }
+-        if (logicalRows.length < 2)
+-            continue;
+-        // Find header with (cols + 1) non-numeric tokens
+-        let headerIdx = -1;
+-        let headerTokens = [];
+-        for (let i = Math.max(0, tableIdx - 4); i <= tableIdx - 1; i++) {
+-            const text = normalizeFullWidthAscii(blocks[i].content).trim();
+-            if (!isPlainBlock(text))
+-                continue;
+-            const tokens = splitTokens(text);
+-            if (tokens.length === cols + 1 &&
+-                tokens.every((tok) => !/[0-9]/.test(tok))) {
+-                headerIdx = i;
+-                headerTokens = tokens;
+-            }
+-        }
+-        if (headerIdx < 0)
+-            continue;
+-        // Collect short label lines above/below table
+-        const aboveLabels = [];
+-        for (let i = tableIdx - 1; i > headerIdx; i--) {
+-            const text = normalizeFullWidthAscii(blocks[i].content).trim();
+-            if (!isPlainBlock(text) || !isShortLabel(text))
+-                break;
+-            aboveLabels.push({ idx: i, text });
+-        }
+-        aboveLabels.reverse();
+-        const belowLabels = [];
+-        for (let i = tableIdx + 1; i < blocks.length; i++) {
+-            const text = normalizeFullWidthAscii(blocks[i].content).trim();
+-            if (!isPlainBlock(text) || !isShortLabel(text))
+-                break;
+-            belowLabels.push({ idx: i, text });
+-        }
+-        const labels = [...aboveLabels, ...belowLabels];
+-        if (labels.length !== logicalRows.length)
+-            continue;
+-        // Reconstruct the full table
+-        const normalizedLines = [];
+-        normalizedLines.push(`| ${headerTokens.join(" | ")} |`);
+-        normalizedLines.push(`| ${Array.from({ length: cols + 1 }, () => "---").join(" | ")} |`);
+-        for (let r = 0; r < logicalRows.length; r++) {
+-            normalizedLines.push(`| ${labels[r].text} | ${logicalRows[r].join(" | ")} |`);
+-        }
+-        replacements.set(tableIdx, normalizedLines.join("\n"));
+-        remove.add(headerIdx);
+-        for (const label of labels)
+-            remove.add(label.idx);
+-    }
+-    if (replacements.size === 0 && remove.size === 0)
+-        return blocks;
+-    const out = [];
+-    for (let i = 0; i < blocks.length; i++) {
+-        if (remove.has(i))
+-            continue;
+-        const replaced = replacements.get(i);
+-        if (replaced) {
+-            out.push({ topY: blocks[i].topY, content: replaced });
+-        }
+-        else {
+-            out.push(blocks[i]);
+-        }
+-    }
+-    return out;
+-}
+-// ---------------------------------------------------------------------------
+-// Public API
+-// ---------------------------------------------------------------------------
+-/**
+- * Render one page's content: free text and tables interleaved top-to-bottom.
+- */
+-export function renderPageContent(freeTextBoxes, tables, imageBlocks = [], allTextBoxes) {
+-    const blocks = [];
+-    // Use ALL text boxes (before table/diagram filtering) for modal font size,
+-    // so that diagram labels released as free text don't skew the body size.
+-    const bodyFS = modalFontSize(allTextBoxes ?? freeTextBoxes);
+-    // Free text lines
+-    for (const line of groupFreeTextIntoLines(freeTextBoxes)) {
+-        const prefix = headingPrefix(line.fontSize, bodyFS, line.isBold);
+-        blocks.push({
+-            topY: line.topY,
+-            content: prefix + line.text,
+-            isTabular: prefix === "" && line.isTabular,
+-        });
+-    }
+-    // Tables
+-    for (const table of tables) {
+-        const md = renderTableToMarkdown(table);
+-        if (md.length > 0) {
+-            blocks.push({ topY: table.topY, content: md });
+-        }
+-    }
+-    // Images
+-    for (const img of imageBlocks) {
+-        blocks.push({ topY: img.topY, content: img.markdown });
+-    }
+-    // Sort top-to-bottom (higher Y = higher on page = comes first)
+-    blocks.sort((a, b) => b.topY - a.topY);
+-    const cleaned = removePageNumbers(blocks);
+-    const headingsMerged = mergeConsecutiveHeadings(cleaned, bodyFS);
+-    const merged = mergeParagraphWraps(headingsMerged, bodyFS);
+-    const normalized = normalizeDetachedFirstColumnTables(merged);
+-    return normalized
+-        .map((b) => b.content)
+-        .join("\n\n")
+-        .trim();
+-}
+diff --git a/dist/converters/pdf/types.d.ts b/dist/converters/pdf/types.d.ts
+deleted file mode 100644
+index dfd808e61d166a6288e91e02c072974d119091d8..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/types.d.ts
++++ /dev/null
+@@ -1,75 +0,0 @@
+-/** Bounding box in PDF coordinate space (origin = bottom-left). */
+-export type Bounds = {
+-    left: number;
+-    right: number;
+-    /** Higher value = higher on the page. */
+-    top: number;
+-    bottom: number;
+-};
+-/** A text fragment with position and font metadata. */
+-export type TextBox = {
+-    id: string;
+-    text: string;
+-    bounds: Bounds;
+-    pageNumber: number;
+-    /** Dominant font size in points. */
+-    fontSize: number;
+-    /** True if rendered bold (font name or rendering mode). */
+-    isBold: boolean;
+-};
+-/** A horizontal or vertical line segment extracted from vector graphics. */
+-export type Segment = {
+-    id: string;
+-    x1: number;
+-    y1: number;
+-    x2: number;
+-    y2: number;
+-};
+-/** A single cell in a resolved table grid. */
+-export type TableCell = {
+-    row: number;
+-    col: number;
+-    text: string;
+-    rowSpan: number;
+-    colSpan: number;
+-};
+-/** A resolved table grid ready for markdown rendering. */
+-export type TableGrid = {
+-    pageNumber: number;
+-    rows: number;
+-    cols: number;
+-    cells: TableCell[];
+-    warnings: string[];
+-    /** Top Y coordinate (PDF space: larger = higher on page). */
+-    topY: number;
+-    /** True for tables detected without vector borders. */
+-    isBorderless: boolean;
+-};
+-/** An image/diagram region detected on a page. */
+-export type ImageRegion = {
+-    id: string;
+-    pageNumber: number;
+-    /** Bounding box in mupdf coordinates (top-left origin). */
+-    bbox: {
+-        x: number;
+-        y: number;
+-        w: number;
+-        h: number;
+-    };
+-    /** Y position in PDF coordinates (bottom-left) for ordering. */
+-    topY: number;
+-};
+-/** Result of extracting content from a single PDF page. */
+-export type PageContent = {
+-    pageNumber: number;
+-    textBoxes: TextBox[];
+-    segments: Segment[];
+-    images: ImageRegion[];
+-};
+-/** A block of rendered content (text paragraph or table). */
+-export type ContentBlock = {
+-    topY: number;
+-    content: string;
+-    /** True if this line has wide gaps between text boxes (column headers). */
+-    isTabular?: boolean;
+-};
+diff --git a/dist/converters/pdf/types.js b/dist/converters/pdf/types.js
+deleted file mode 100644
+index cb0ff5c3b541f646105198ee23ac0fc3d805023e..0000000000000000000000000000000000000000 100644
+--- a/dist/converters/pdf/types.js
++++ /dev/null
+@@ -1,1 +0,0 @@
+-export {};
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 925b86bf561ffd9108cdc4bb916f7f7ff205b2ca..a7424e981273a7be5019ae0353b4d4dd2ee79b6e 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -8,9 +8,8 @@
+ export { ImageConverter } from "./converters/image.js";
+ export { IpynbConverter } from "./converters/ipynb.js";
+ export { IWorkConverter } from "./converters/iwork.js";
+ export { JsonConverter } from "./converters/json.js";
+-export { PdfConverter } from "./converters/pdf/index.js";
+ export { PlainTextConverter } from "./converters/plain-text.js";
+ export { PptxConverter } from "./converters/pptx.js";
+ export { RssConverter } from "./converters/rss.js";
+ export { WikipediaConverter } from "./converters/wikipedia.js";
+diff --git a/dist/index.js b/dist/index.js
+index ab605d7df6360b7b3ddff51f1ec48f1ec0cc8cbc..5cff304ecfd512404fb460988c38dde0e0662bba 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -7,9 +7,8 @@
+ export { ImageConverter } from "./converters/image.js";
+ export { IpynbConverter } from "./converters/ipynb.js";
+ export { IWorkConverter } from "./converters/iwork.js";
+ export { JsonConverter } from "./converters/json.js";
+-export { PdfConverter } from "./converters/pdf/index.js";
+ export { PlainTextConverter } from "./converters/plain-text.js";
+ export { PptxConverter } from "./converters/pptx.js";
+ export { RssConverter } from "./converters/rss.js";
+ export { WikipediaConverter } from "./converters/wikipedia.js";
 diff --git a/dist/markit.js b/dist/markit.js
-index d9ba0a06e0d42a855f353a4df3aa7d3bfab11100..281ffc15b67b0d15a638f01ebcbcc1d842e5cc61 100644
+index d9ba0a06e0d42a855f353a4df3aa7d3bfab11100..b4e4617d535793237be1bff3f35b7b08c2e7014f 100644
 --- a/dist/markit.js
 +++ b/dist/markit.js
-@@ -225,7 +225,7 @@ export class Markit {
+@@ -9,9 +9,8 @@
+ import { ImageConverter } from "./converters/image.js";
+ import { IpynbConverter } from "./converters/ipynb.js";
+ import { IWorkConverter } from "./converters/iwork.js";
+ import { JsonConverter } from "./converters/json.js";
+-import { PdfConverter } from "./converters/pdf/index.js";
+ import { PlainTextConverter } from "./converters/plain-text.js";
+ import { PptxConverter } from "./converters/pptx.js";
+ import { RssConverter } from "./converters/rss.js";
+ import { WikipediaConverter } from "./converters/wikipedia.js";
+@@ -28,9 +27,8 @@
+         // Plugin converters go first — they override builtins for the same format
+         const pluginConverters = plugins.flatMap((p) => p.converters);
+         // Built-in converters: specific formats first, generic last.
+         const specific = [
+-            new PdfConverter(),
+             new DocxConverter(),
+             new PptxConverter(),
+             new XlsxConverter(),
+             new EpubConverter(),
+@@ -224,9 +222,9 @@
+         if (errors.length > 0) {
              const details = errors
                  .map((e) => `  ${e.converter}: ${e.error.message}`)
                  .join("\n");
@@ -47,3 +2524,18 @@ index d9ba0a06e0d42a855f353a4df3aa7d3bfab11100..281ffc15b67b0d15a638f01ebcbcc1d8
          }
          throw new Error(`Unsupported format: ${streamInfo.extension || streamInfo.mimetype || "unknown"}`);
      }
+ }
+diff --git a/package.json b/package.json
+index 6a799b201293762a706cd818deb32166d8f2ceeb..3023715d3cc2a00d8e4b5ffef3ef73b309c8154f 100644
+--- a/package.json
++++ b/package.json
+@@ -64,9 +64,8 @@
+     "exifr": "^7.1.3",
+     "fast-xml-parser": "^5.5.9",
+     "jszip": "^3.10.1",
+     "mammoth": "^1.9.0",
+-    "mupdf": "^1.27.0",
+     "music-metadata": "^11.12.3",
+     "rss-parser": "^3.13.0",
+     "turndown": "^7.2.0",
+     "turndown-plugin-gfm": "^1.0.2"

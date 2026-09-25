@@ -303,6 +303,9 @@ grep-searcher = "0.1"
 ignore = "0.4"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PDF inspection
+pdf-inspector = "1"
+
 # Image Processing & Syntax Highlighting
 # ──────────────────────────────────────────────────────────────────────────────
 image = { version = "0.25", default-features = false, features = [
