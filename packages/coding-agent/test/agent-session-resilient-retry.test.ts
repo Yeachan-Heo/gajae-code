@@ -9,10 +9,6 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
-import {
-	__sessionStateSidecarTestHooks,
-	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
-} from "../src/gjc-runtime/session-state-sidecar";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -24,6 +20,10 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
+import {
+	__sessionStateSidecarTestHooks,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "../src/gjc-runtime/session-state-sidecar";
 
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
