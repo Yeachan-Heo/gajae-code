@@ -1646,6 +1646,14 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 	} as Model<Api>);
 }
 
+interface SelectorCircuit {
+	openUntil: number;
+	consecutiveOpens: number;
+	cooldownMs: number;
+	/** Half-open probe lease: only `owner` may route to the selector until `leaseUntil`. */
+	probe: { owner: string; leaseUntil: number } | undefined;
+}
+
 function normalizeSuppressedSelector(selector: string): string {
 	const trimmed = selector.trim();
 	if (!trimmed) return trimmed;
@@ -1775,7 +1783,7 @@ export class ModelRegistry {
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
-	#selectorCircuits: Map<string, { openUntil: number; consecutiveOpens: number }> = new Map();
+	#selectorCircuits: Map<string, SelectorCircuit> = new Map();
 	#backgroundRefresh?: Promise<void>;
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
@@ -6573,30 +6581,47 @@ export class ModelRegistry {
 	/**
 	 * Open the fallback-chain circuit for a selector after it failed out of a
 	 * managed chain. Consecutive opens without an intervening success double the
-	 * cooldown up to `maxCooldownMs`. Returns the instant the circuit half-opens.
+	 * cooldown up to `maxCooldownMs`. A provider Retry-After instant (`retryAt`)
+	 * is authoritative and replaces the local cooldown window. Returns the instant
+	 * the circuit half-opens.
 	 */
-	openSelectorCircuit(selector: string, baseCooldownMs: number, maxCooldownMs: number): number {
+	openSelectorCircuit(selector: string, baseCooldownMs: number, maxCooldownMs: number, retryAt?: number): number {
 		const key = normalizeSuppressedSelector(selector);
 		const consecutiveOpens = (this.#selectorCircuits.get(key)?.consecutiveOpens ?? 0) + 1;
 		const cooldownMs = Math.min(
 			baseCooldownMs * 2 ** (consecutiveOpens - 1),
 			Math.max(baseCooldownMs, maxCooldownMs),
 		);
-		const openUntil = Date.now() + cooldownMs;
-		this.#selectorCircuits.set(key, { openUntil, consecutiveOpens });
+		const openUntil = retryAt ?? Date.now() + cooldownMs;
+		this.#selectorCircuits.set(key, { openUntil, consecutiveOpens, cooldownMs, probe: undefined });
 		return openUntil;
 	}
 
-	/** Whether a selector's fallback-chain circuit is open (still cooling down). */
-	isSelectorCircuitOpen(selector: string): boolean {
+	/**
+	 * Whether chain resolution must skip a selector. It is skipped while its
+	 * circuit cools down, and while half-open once another owner holds the probe
+	 * lease. Passing `probeOwner` atomically claims the half-open probe for that
+	 * owner (re-admitting the same owner), so exactly one session probes a
+	 * recovered entry at a time; omit it for read-only availability checks.
+	 */
+	isSelectorCircuitOpen(selector: string, probeOwner?: string): boolean {
 		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
-		return circuit !== undefined && circuit.openUntil > Date.now();
+		if (!circuit) return false;
+		const now = Date.now();
+		if (circuit.openUntil > now) return true;
+		const probe = circuit.probe;
+		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
+		if (probeOwner !== undefined) {
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+		}
+		return false;
 	}
 
-	/** Whether a selector has a failure record whose cooldown elapsed (half-open: one probe allowed). */
+	/** Whether a selector's cooldown elapsed with no live probe lease (half-open, probe available). */
 	isSelectorCircuitHalfOpen(selector: string): boolean {
 		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
-		return circuit !== undefined && circuit.openUntil <= Date.now();
+		const now = Date.now();
+		return circuit !== undefined && circuit.openUntil <= now && !(circuit.probe && circuit.probe.leaseUntil > now);
 	}
 
 	/** Close a selector's circuit after an accepted response, resetting its escalation. */

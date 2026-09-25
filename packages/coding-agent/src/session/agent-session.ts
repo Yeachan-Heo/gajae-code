@@ -23242,6 +23242,7 @@ export class AgentSession {
 			{
 				managedFallback: true,
 				canonicalSessionId: this.sessionId,
+				circuitProbeOwner: this.sessionId,
 				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 			},
 		);
@@ -23689,7 +23690,7 @@ export class AgentSession {
 			// an all-open chain degrades to probing rather than refusing the turn.
 			if (
 				controller.activeIndex < controller.chain.entries.length - 1 &&
-				this.#modelRegistry.isSelectorCircuitOpen(selector)
+				this.#modelRegistry.isSelectorCircuitOpen(selector, this.sessionId)
 			) {
 				controller.onResolutionSkip("circuit_open");
 				continue;
@@ -24492,16 +24493,15 @@ export class AgentSession {
 		// An entry that failed out of the chain opens its circuit so later turns,
 		// chain restarts, and sibling sessions sharing this registry skip it
 		// instead of re-spending its whole attempt budget on a known-bad route.
-		// A rate limit with a typed Retry-After already scheduled the entry's
-		// return via selector suppression above; the provider's own hint outranks
-		// the local cooldown.
-		const suppressedByRetryAfter = trigger.class === "rate_limit" && trigger.retryAfterMs !== undefined;
+		// A typed Retry-After is authoritative: the circuit stays open exactly
+		// until the provider-specified instant, so sibling sessions honour it too.
 		const circuitCooldownMs = this.settings.get("fallback.circuitCooldownMs");
-		if (managedFallback && outcome !== "retry" && failedSelector && !suppressedByRetryAfter && circuitCooldownMs > 0) {
+		if (managedFallback && outcome !== "retry" && failedSelector && circuitCooldownMs > 0) {
 			this.#modelRegistry.openSelectorCircuit(
 				failedSelector,
 				circuitCooldownMs,
 				this.settings.get("fallback.circuitMaxCooldownMs"),
+				trigger.retryAfterMs === undefined ? undefined : Date.now() + trigger.retryAfterMs,
 			);
 		}
 		if (outcome === "advance") {

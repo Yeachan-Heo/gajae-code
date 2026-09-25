@@ -1187,6 +1187,60 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(false);
 	});
 
+	it("keeps a Retry-After exhausted head closed to sibling sessions until the provider's retry time", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary) ? typedRateLimitStream(model, 600_000) : successfulStream(model);
+		};
+		// Local cooldown is tiny; the provider's 10-minute Retry-After must win.
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.circuitCooldownMs": 1 });
+
+		await session!.prompt("Head is rate limited for ten minutes");
+		await session!.waitForIdle();
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		await Bun.sleep(5);
+
+		await session!.dispose();
+		calls.length = 0;
+		createSession(1, streamFn, { "fallback.circuitCooldownMs": 1 });
+		await session!.prompt("Sibling must not retry the rate-limited head");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(fallback)]);
+	});
+
+	it("lets exactly one session claim a half-open probe", () => {
+		const head = "anthropic/claude-sonnet-4-5";
+		modelRegistry.openSelectorCircuit(head, 1, 1, Date.now() - 1);
+
+		expect(modelRegistry.isSelectorCircuitHalfOpen(head)).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-a")).toBe(false);
+		// The lease now belongs to session-a: siblings skip, the owner is re-admitted.
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-b")).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head)).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-a")).toBe(false);
+		expect(modelRegistry.isSelectorCircuitHalfOpen(head)).toBe(false);
+
+		modelRegistry.closeSelectorCircuit(head);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-b")).toBe(false);
+	});
+
+	it("skips a half-open head in a sibling session while another session holds its probe", async () => {
+		const calls: string[] = [];
+		const { primary, fallback } = createSession(1, model => {
+			calls.push(selector(model));
+			return successfulStream(model);
+		});
+		modelRegistry.openSelectorCircuit(selector(primary), 60_000, 60_000, Date.now() - 1);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary), "another-session")).toBe(false);
+
+		await session!.prompt("Another session is probing the head");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(fallback)]);
+	});
+
 	it("doubles the cooldown on consecutive opens up to the configured ceiling", () => {
 		const before = Date.now();
 		const first = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini:high", 1_000, 3_000) - before;
