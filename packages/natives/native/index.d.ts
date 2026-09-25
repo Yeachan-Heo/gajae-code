@@ -1901,6 +1901,36 @@ export declare function matchesKittySequence(data: string, expectedCodepoint: nu
  */
 export declare function matchesLegacySequence(data: string, keyName: string): boolean
 
+/**
+ * Options for [`render_mermaid_ascii`]; every field defaults like the
+ * TypeScript renderer (`useAscii: false`, paddings 5, border padding 1,
+ * `colorMode: "auto"`).
+ */
+export interface MermaidRenderOptions {
+  /** `+-|>` instead of Unicode box-drawing characters. */
+  useAscii?: boolean
+  paddingX?: number
+  paddingY?: number
+  boxBorderPadding?: number
+  /** Force the flowchart/state layout direction. */
+  direction?: 'TD' | 'TB' | 'LR' | 'BT' | 'RL'
+  /** `auto` (or omitted) detects from the terminal environment. */
+  colorMode?: 'none' | 'auto' | 'ansi16' | 'ansi256' | 'truecolor' | 'html'
+  theme?: MermaidTheme
+}
+
+/** Theme colors for [`render_mermaid_ascii`]; hex strings, all optional. */
+export interface MermaidTheme {
+  fg?: string
+  border?: string
+  line?: string
+  arrow?: string
+  accent?: string
+  bg?: string
+  corner?: string
+  junction?: string
+}
+
 /** N-API opt-in handle for the minimizer. */
 export interface MinimizerOptions {
   /** Master switch. Absent / false = disabled. */
@@ -2548,6 +2578,16 @@ export declare function renameNoReplacePath(sourcePath: string, destinationPath:
  * one unresolved receipt rather than a frozen process.
  */
 export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
+
+/**
+ * Render Mermaid diagram text (flowchart, state, sequence, class, ER, or
+ * xychart) to ASCII/Unicode art. Synchronous: callers render inside the
+ * TUI compositor.
+ *
+ * # Errors
+ * Unparseable flowchart source or an unknown `direction`/`colorMode` value.
+ */
+export declare function renderMermaidAscii(text: string, options?: MermaidRenderOptions | undefined | null): string
 
 /**
  * Remove only group/other permission bits from an exact, user-owned regular

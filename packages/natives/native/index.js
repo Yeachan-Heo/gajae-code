@@ -98,6 +98,7 @@ export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoRepl
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;
 export const renameNoReplacePath = nativeBindings.renameNoReplacePath;
 export const renameNoReplacePathAsync = nativeBindings.renameNoReplacePathAsync;
+export const renderMermaidAscii = nativeBindings.renderMermaidAscii;
 export const repairConfigFilePermissions = nativeBindings.repairConfigFilePermissions;
 export const repairOwnerOnlyPathSecurityExpected = nativeBindings.repairOwnerOnlyPathSecurityExpected;
 export const retainBrokerPublication = nativeBindings.retainBrokerPublication;

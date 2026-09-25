@@ -43,6 +43,7 @@ pub mod highlight;
 pub mod html;
 pub mod keys;
 pub mod memory;
+pub mod mermaid;
 pub mod sdk;
 pub mod sixel;
 pub mod svg;
