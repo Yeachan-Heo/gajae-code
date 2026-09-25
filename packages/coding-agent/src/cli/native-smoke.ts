@@ -28,6 +28,7 @@ interface NativeSmokeBindings {
 	structuredPatchHunks(oldText: string, newText: string, context?: number): NativeSmokePatchHunk[];
 	diffWords(oldText: string, newText: string): NativeSmokeDiffChange[];
 	DiffStream?: unknown;
+	PowerAssertion?: { start?: unknown };
 }
 
 export type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
@@ -107,5 +108,8 @@ export async function runNativeSmokeTest(): Promise<void> {
 	}
 	if (typeof native.DiffStream !== "function") {
 		throw new Error("smoke-test: native DiffStream export missing from embedded addon");
+	}
+	if (typeof native.PowerAssertion?.start !== "function") {
+		throw new Error("smoke-test: PowerAssertion export missing from embedded addon");
 	}
 }

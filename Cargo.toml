@@ -250,6 +250,7 @@ memmap2 = "0.9"
 # System & Platform
 # ──────────────────────────────────────────────────────────────────────────────
 libc = "0.2"
+log = "0.4"
 os_pipe = "1"
 windows-sys = { version = "0.61", features = [
    "Win32_Foundation",
@@ -272,6 +273,7 @@ windows-sys = { version = "0.61", features = [
 # breaking Windows builds. Mirrors the upstream pin recorded in docs/rust-porting-inventory.md.
 find-msvc-tools = "=0.1.12"
 winreg = "0.56"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Node.js Bindings (NAPI)
@@ -284,6 +286,7 @@ napi-derive = "3"
 # Terminal & PTY
 # ──────────────────────────────────────────────────────────────────────────────
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+clipboard-win = "5.4"
 icy_sixel = "0.7"
 portable-pty = "0.9"
 

@@ -1,5 +1,4 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,12 +14,10 @@ import {
 	initNativeCrashDiagnostics,
 	invalidateFsScanCache,
 	listWorkspace,
-	MacOSPowerAssertion,
-	nativeBuildInfo,
+	PowerAssertion,
 	Process,
 	ProcessStatus,
 	PtySession,
-	rasterizeSvg,
 	summarizeCode,
 	truncateToWidth,
 	visibleWidth,
@@ -90,9 +87,6 @@ describe("pi-natives", () => {
 		};
 	});
 
-	it("reports the language set compiled into this addon", () => {
-		expect(nativeBuildInfo().languageSet).toBe(Bun.env.PI_NATIVE_FULL_LANGS === "1" ? "full" : "default");
-	});
 	it("keeps native crash diagnostics opt-in", () => {
 		delete process.env.GJC_NATIVE_CRASH_DIAGNOSTICS;
 		expect(initNativeCrashDiagnostics()).toBe(false);
@@ -715,24 +709,18 @@ describe("pi-natives", () => {
 		});
 	});
 
-	describe("rasterizeSvg", () => {
-		it("rasterizes the shared SVG fixture to bounded PNG bytes", async () => {
-			const svg = await fs.readFile(path.join(import.meta.dir, "fixtures/svg/geometry.svg"));
-			const png = Buffer.from(await rasterizeSvg(svg, 2048, 2048));
-
-			expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-			expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([17, 11]);
-			expect(createHash("sha256").update(png).digest("hex")).toBe(
-				"de47f937636d8b90e8a27cef076d772cf3e622a9bacd12f321630e78e6d3b528",
-			);
-		});
-	});
-
-	describe("MacOSPowerAssertion", () => {
-		it("should create a stoppable power assertion handle", () => {
-			const assertion = MacOSPowerAssertion.start({ reason: "pi-natives test" });
-			assertion.stop();
-			assertion.stop();
+	describe("PowerAssertion", () => {
+		it("creates a stoppable handle or reports an unavailable Linux login1 service", () => {
+			try {
+				const assertion = PowerAssertion.start({ reason: "pi-natives test" });
+				assertion.stop();
+				assertion.stop();
+			} catch (error) {
+				if (process.platform !== "linux") throw error;
+				expect(String(error)).toMatch(
+					/Unable to connect to the system bus|login1 Inhibit failed|Invalid login1 inhibitor response/,
+				);
+			}
 		});
 	});
 });

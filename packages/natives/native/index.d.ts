@@ -113,27 +113,6 @@ export declare class MacAppearanceObserver {
   stop(): void
 }
 
-/**
- * Long-lived macOS power assertion.
- *
- * On macOS this acquires one or more `IOKit` assertions that prevent the
- * requested sleep modes until the handle is stopped or dropped. On other
- * platforms it is a no-op handle so the caller can keep one cross-platform
- * code path.
- */
-export declare class MacOSPowerAssertion {
-  /**
-   * Acquire a macOS power assertion. On non-macOS platforms returns a
-   * no-op handle so callers can stay cross-platform.
-   */
-  static start(options?: MacOSPowerAssertionOptions | undefined | null): MacOSPowerAssertion
-  /**
-   * Release every assertion held by this handle. Safe to call multiple
-   * times; subsequent calls are a no-op.
-   */
-  stop(): void
-}
-
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
   /**
@@ -387,6 +366,26 @@ export declare class NotificationServer {
   stopAndWait(): Promise<void>
 }
 
+/**
+ * Long-lived cross-platform power assertion.
+ *
+ * macOS uses `IOKit`, Linux holds login1 and desktop `ScreenSaver` inhibitors,
+ * and Windows holds thread-affine execution state until the handle is stopped
+ * or dropped. Other platforms return a no-op handle.
+ */
+export declare class PowerAssertion {
+  /**
+   * Acquire a power assertion. Unsupported platforms return a no-op handle
+   * so callers can stay cross-platform.
+   */
+  static start(options?: PowerAssertionOptions | undefined | null): PowerAssertion
+  /**
+   * Release every assertion held by this handle. Safe to call multiple
+   * times; subsequent calls are a no-op.
+   */
+  stop(): void
+}
+
 /** Stable process reference. */
 export declare class Process {
   /** Open a stable process reference from a PID. */
@@ -600,12 +599,6 @@ export declare class Shell {
 }
 
 /**
- * Install the bounded Tokio runtime and probed Rayon pool after the addon is
- * loaded, before any native consumer can start async or parallel work.
- */
-export declare function __gjcInstallTokioRuntime(): void
-
-/**
  * Dedicated writer thread for one terminal fd.
  *
  * Constructed by the TUI's `ProcessTerminal` around stdout. The fd is
@@ -645,6 +638,12 @@ export declare class TtyWriter {
    */
   stop(flushTimeoutMs: number): void
 }
+
+/**
+ * Install the bounded Tokio runtime and probed Rayon pool after the addon is
+ * loaded, before any native consumer can start async or parallel work.
+ */
+export declare function __gjcInstallTokioRuntime(): void
 
 /**
  * Publish-result wire-contract sentinel.
@@ -1655,7 +1654,8 @@ export interface InboundImageEvent {
 }
 
 /**
- * Installs a Rust panic hook only when `GJC_NATIVE_CRASH_DIAGNOSTICS` is set.
+ * Installs Rust panic and allocation-error hooks only when
+ * `GJC_NATIVE_CRASH_DIAGNOSTICS` is set.
  *
  * This is an opt-in structured panic report, not a minidump/signal handler.
  * It intentionally avoids always-on work and does not attempt to recover from
@@ -1880,30 +1880,6 @@ export declare enum MacOSAppearance {
   Dark = 'dark',
   /** Light color scheme. */
   Light = 'light'
-}
-
-/**
- * Options for starting a macOS power assertion.
- *
- * Each boolean maps to a `caffeinate(8)` flag and a corresponding `IOKit`
- * `IOPMAssertion` type. Multiple flags can be combined; when set, one
- * assertion is taken per flag and all are released together when the
- * handle is stopped or dropped.
- *
- * If every flag is unset (or omitted), the handle behaves as if `idle`
- * were `true` — preserving the historical default of `caffeinate -i`.
- */
-export interface MacOSPowerAssertionOptions {
-  /** Human-readable reason shown in macOS power diagnostics. */
-  reason?: string
-  /** `caffeinate -i`: prevent the system from idle-sleeping. */
-  idle?: boolean
-  /** `caffeinate -s`: prevent the system from sleeping (AC power only). */
-  system?: boolean
-  /** `caffeinate -u`: declare the user is active (wakes the display). */
-  user?: boolean
-  /** `caffeinate -d`: prevent the display from idle-sleeping. */
-  display?: boolean
 }
 
 /** A single match in the content. */
@@ -2402,6 +2378,30 @@ export interface PatchHunk {
    * `\ No newline at end of file` markers where applicable.
    */
   lines: Array<string>
+}
+
+/**
+ * Options for starting a power assertion.
+ *
+ * Each boolean maps to a `caffeinate(8)` flag and the closest corresponding
+ * platform capability. Multiple flags can be combined; when set, one
+ * assertion is taken per flag and all are released together when the
+ * handle is stopped or dropped.
+ *
+ * If every flag is unset (or omitted), the handle behaves as if `idle`
+ * were `true` — preserving the historical default of `caffeinate -i`.
+ */
+export interface PowerAssertionOptions {
+  /** Human-readable reason shown in platform power diagnostics. */
+  reason?: string
+  /** `caffeinate -i`: prevent the system from idle-sleeping. */
+  idle?: boolean
+  /** `caffeinate -s`: prevent the system from sleeping (AC power only). */
+  system?: boolean
+  /** `caffeinate -u`: declare the user is active (wakes the display). */
+  user?: boolean
+  /** `caffeinate -d`: prevent the display from idle-sleeping. */
+  display?: boolean
 }
 
 /**

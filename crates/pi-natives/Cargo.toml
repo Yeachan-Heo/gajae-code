@@ -26,7 +26,7 @@ grep-searcher.workspace = true
 html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["bmp"] }
 png.workspace = true
 resvg.workspace = true
 # Feature activation only (see workspace manifest): zune-jpeg needs `log` to compile.
@@ -62,13 +62,18 @@ unicode-width.workspace = true
 xutf.workspace = true
 xxhash-rust.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+log.workspace = true
+zbus.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
+clipboard-win.workspace = true
 winreg.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Power"] }
 
 [build-dependencies]
 # Transitive-only pin: see find-msvc-tools in the root workspace manifest.

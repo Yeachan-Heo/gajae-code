@@ -207,6 +207,7 @@ const requiredGeneratedBindingSymbols = [
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
 	"__gjcInstallTokioRuntime",
+	"PowerAssertion",
 	"currentExecutablePath",
 ] as const;
 

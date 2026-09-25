@@ -24,6 +24,17 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - The process binding is derived from `crates/pi-natives/src/ps.rs` at the pinned commit and delegates process operations to the local `pi_shell::process`, retaining identity-aware observations and pinned-root signaling.
 
 Copyright (c) 2025 Mario Zechner, 2025–2026 Can Bölük, and 2026 Stencil Labs, Inc. Per-file headers retain the upstream source path and local modifications.
+
+## Vendored Rust modules
+
+The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` source pinned to `a85bd5228d9f0f619deade1db78fa49420a721e1`; each source file carries its own attribution and local-modification header.
+- `crates/pi-natives/src/html.rs`
+- `crates/pi-natives/src/sixel.rs`
+- `crates/pi-natives/src/clipboard.rs`
+- `crates/pi-natives/src/power.rs`
+- `crates/pi-natives/src/prof.rs`
+- `crates/pi-natives/src/appearance.rs`
+- `crates/pi-natives/src/crash.rs` (alloc-error handling merged from `crash_handler.rs`)
 ## MuPDF WebAssembly
 
 PDF extraction uses MuPDF.js, copyright (C) 2004–2026 Artifex Software, Inc., distributed under [GNU Affero General Public License version 3 or later](https://www.gnu.org/licenses/agpl-3.0.html). MuPDF is provided without warranty; the repository's MIT license does not replace MuPDF's license. Alternative commercial licensing is available from [Artifex](https://artifex.com/).
