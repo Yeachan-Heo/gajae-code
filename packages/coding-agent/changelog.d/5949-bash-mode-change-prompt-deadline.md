@@ -1,0 +1,5 @@
+### Fixed
+
+- Goal sessions no longer write a `mode_change` session entry after every tool call. Usage counters now update in memory at tool boundaries and are saved once at agent end or when the goal's status changes, so session files grow much less ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+- bash now uses a leading `cd <dir> &&` as the tool cwd only when `<dir>` is a single shell word. Commands like `cd /repo 2>/dev/null && …` no longer fail with "Working directory does not exist"; the shell runs them unchanged. The missing-cwd error and the restricted-bash control-operator rejection now say how to fix the command ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
+- The system prompt preparation deadline now counts only time when the event loop is responsive. Concurrent in-process sessions (for example `bench:edit`) no longer report `loadSystemPromptFiles` as timed out and fall back to the minimal prompt ([#5949](https://github.com/Yeachan-Heo/gajae-code/issues/5949)).
