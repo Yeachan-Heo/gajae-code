@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	CheckpointError,
@@ -7,7 +8,9 @@ import {
 	chooseToolCall,
 	deferredScenario,
 	loadRescopeReference,
+	maxRssCommand,
 	parseArgs,
+	parseMaxRssBytes,
 	resolveDefaultBaseline,
 	successfulScenarioResult,
 	validateScenarioWorkload,
@@ -197,4 +200,27 @@ describe("VB001 gen-3 harness gates", () => {
 			await fs.rm(tempRoot, { recursive: true, force: true });
 		}
 	});
+
+	// Issue #5940: a measured Bun child shares GNU time's stderr pipe and marks it
+	// O_NONBLOCK; a full pipe then made time's own report write fail with EAGAIN,
+	// so time exited 1 and the harness rejected successful S1/S2 samples.
+	test.skipIf(process.platform !== "linux")(
+		"Linux max-RSS sampler exits 0 and reports RSS while the measured Bun child floods a shared stderr pipe",
+		async () => {
+			const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-rss-sampler-"));
+			try {
+				const reportPath = path.join(tempRoot, "time-report.txt");
+				const child = [process.execPath, "-e", "process.stderr.write('x'.repeat(256 * 1024)); await Bun.sleep(50);"];
+				const proc = Bun.spawn(maxRssCommand(child, reportPath), { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+				// Leave the pipe undrained while the child exits so time writes into a full pipe.
+				await Bun.sleep(1_000);
+				const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+				expect(exitCode).toBe(0);
+				expect(stderr).toBe("x".repeat(256 * 1024));
+				expect(parseMaxRssBytes(await fs.readFile(reportPath, "utf8"))).toBeGreaterThan(0);
+			} finally {
+				await fs.rm(tempRoot, { recursive: true, force: true });
+			}
+		},
+	);
 });
