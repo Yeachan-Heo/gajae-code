@@ -12,7 +12,7 @@ import type { Extension } from "@gajae-code/coding-agent/extensibility/extension
 import {
 	__sessionStateSidecarTestHooks,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
-} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+} from "../src/gjc-runtime/session-state-sidecar";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
