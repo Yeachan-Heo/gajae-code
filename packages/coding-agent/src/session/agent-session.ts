@@ -3479,6 +3479,7 @@ export class AgentSession {
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
 		this.#managedFallbackActiveCredentialRows.clear();
+		this.#managedFallbackCapturedCredential.clear();
 		this.#managedFallbackNextCredentialOverride = undefined;
 		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 		this.#codexCredentialModelUnavailableRetried = false;
@@ -3525,13 +3526,6 @@ export class AgentSession {
 	/** Same-kind credential rows already visited by managed quota/rate-limit retries per canonical model in this prompt generation. */
 	#managedFallbackTriedCredentialRowsGeneration = -1;
 	#managedFallbackTriedCredentialRows = new Map<string, Set<number>>();
-	/** Stored credential captured after a managed request resolves its API key, before failure handling mutates assignment. */
-	#managedFallbackActiveCredentialRows = new Map<string, { credentialKind: string; rowId: number }>();
-	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
-	#managedFallbackNextCredentialOverride:
-		| { modelKey: string; storageProvider: string; rowId: number }
-		| undefined;
-	#restoreManagedFallbackGetApiKey: (() => void) | undefined;
 	/** Credential kinds with a quota/rate-limit failure for each canonical model identity this prompt. */
 	#managedFallbackQuotaFailedModelCredentialKinds = new Map<string, Set<string>>();
 	/** Models whose quota/rate-limit attempt reached its provider ceiling without an AuthStorage mark. */
@@ -3553,6 +3547,8 @@ export class AgentSession {
 	#fallbackInvocationId = 0;
 	/** Credential rows tried by managed fallback for each canonical model and credential kind. */
 	#managedFallbackActiveCredentialRows = new Map<string, Map<string, Set<number>>>();
+	/** Currently captured credential after a managed request resolves its API key for tracking same-turn rows. */
+	#managedFallbackCapturedCredential = new Map<string, { credentialKind: string; rowId: number }>();
 	/** One exact same-turn credential choice for the next managed request's API-key resolution. */
 	#managedFallbackNextCredentialOverride:
 		| { modelKey: string; storageProvider: string; rowId: number; credentialKind: string }
@@ -22883,25 +22879,6 @@ export class AgentSession {
 		return undefined;
 	}
 
-	#managedFallbackCanonicalModelKey(model: Model): string {
-		return `${model.provider}/${model.id}`;
-	}
-
-	#managedFallbackTriedRows(model: Model, credentialKind: string): Set<number> {
-		const modelKey = this.#managedFallbackCanonicalModelKey(model);
-		let credentialKindMap = this.#managedFallbackActiveCredentialRows.get(modelKey);
-		if (!credentialKindMap) {
-			credentialKindMap = new Map();
-			this.#managedFallbackActiveCredentialRows.set(modelKey, credentialKindMap);
-		}
-		let rowSet = credentialKindMap.get(credentialKind);
-		if (!rowSet) {
-			rowSet = new Set();
-			credentialKindMap.set(credentialKind, rowSet);
-		}
-		return rowSet;
-	}
-
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
@@ -23690,6 +23667,7 @@ export class AgentSession {
 			return await rollbackCancelled();
 		this.#managedFallbackNextCredentialOverride = undefined;
 		this.#managedFallbackActiveCredentialRows.clear();
+		this.#managedFallbackCapturedCredential.clear();
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
@@ -23774,6 +23752,7 @@ export class AgentSession {
 			const failedCredentialKinds = this.#managedFallbackQuotaFailedModelCredentialKinds.get(canonicalModelKey);
 			let selectedUntriedCredential = false;
 			let selectedCredentialRowId: number | undefined;
+			let selectedCredentialKind: string | undefined;
 			if (failedCredentialKinds !== undefined) {
 				const authStorage = this.#modelRegistry.authStorage;
 				const storageProvider = resolveOAuthStorageProvider(resolvedModel.provider);
@@ -23827,6 +23806,7 @@ export class AgentSession {
 						)
 							continue;
 						selectedCredentialRowId = selectedRowId;
+						selectedCredentialKind = credentialKind;
 						selectedUntriedCredential = true;
 						break candidateRows;
 					}
@@ -23887,11 +23867,12 @@ export class AgentSession {
 				!transitionStillOwned()
 			)
 				return await rollbackCancelled();
-			if (selectedCredentialRowId !== undefined && this.#restoreManagedFallbackGetApiKey) {
+			if (selectedCredentialRowId !== undefined && selectedCredentialKind !== undefined && this.#restoreManagedFallbackGetApiKey) {
 				this.#managedFallbackNextCredentialOverride = {
 					modelKey: canonicalModelKey,
 					storageProvider: resolveOAuthStorageProvider(resolvedModel.provider),
 					rowId: selectedCredentialRowId,
+					credentialKind: selectedCredentialKind,
 				};
 			}
 			return true;
@@ -23972,6 +23953,7 @@ export class AgentSession {
 		this.#managedFallbackQuotaFailedModelCredentialKinds.clear();
 		this.#managedFallbackQuotaCeilingModels.clear();
 		this.#managedFallbackActiveCredentialRows.clear();
+		this.#managedFallbackCapturedCredential.clear();
 		this.#managedFallbackNextCredentialOverride = undefined;
 		this.#managedFallbackTriedCredentialRowsGeneration = this.#promptGeneration;
 	}
@@ -24004,8 +23986,11 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const rowId = authStorage.getSessionCredentialRowId(model.provider, this.credentialSessionId);
 		const credentialKind = authStorage.getSessionCredentialType(model.provider, this.credentialSessionId);
-		if (rowId !== undefined && credentialKind !== undefined)
-			this.#managedFallbackActiveCredentialRows.set(modelKey, { credentialKind, rowId });
+		if (rowId !== undefined && credentialKind !== undefined) {
+			this.#managedFallbackCapturedCredential.set(modelKey, { credentialKind, rowId });
+			const triedRows = this.#managedFallbackTriedRows(model, credentialKind);
+			triedRows.add(rowId);
+		}
 	}
 
 	#hasManagedFallbackCredentialPin(provider: string): boolean {
@@ -24073,7 +24058,7 @@ export class AgentSession {
 				return "unchanged";
 			const modelKey = this.#managedFallbackCanonicalModelKey(model);
 			const dispatchedCredential = trigger.trackSameTurnRows
-				? this.#managedFallbackActiveCredentialRows.get(modelKey)
+				? this.#managedFallbackCapturedCredential.get(modelKey)
 				: undefined;
 			// Retain this snapshot through mark/result policy; the mark can mutate
 			// assignments before fallback decides whether the typed pool is exhausted.
@@ -24423,7 +24408,7 @@ export class AgentSession {
 				const authStorage = this.#modelRegistry.authStorage;
 				// A same-turn row insertion resets AuthStorage's session assignment;
 				// use the dispatched request's kind rather than that now-missing pointer.
-				const dispatchedCredential = this.#managedFallbackActiveCredentialRows.get(
+				const dispatchedCredential = this.#managedFallbackCapturedCredential.get(
 					this.#managedFallbackCanonicalModelKey(this.model),
 				);
 				const credentialKind =
