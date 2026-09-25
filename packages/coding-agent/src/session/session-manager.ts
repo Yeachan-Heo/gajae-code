@@ -18449,6 +18449,7 @@ export class SessionManager {
 	 * available for diagnostics/export.
 	 */
 	appendContextClearEntry(data?: Record<string, unknown>): string {
+		const ownershipMarker = this.getModelProfileOwnershipMarker();
 		const entry: CustomEntry = {
 			type: "custom",
 			customType: "context_clear",
@@ -18458,6 +18459,9 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 		};
 		this.#appendEntry(entry);
+		if (ownershipMarker && ownershipMarker.kind !== "inherit") {
+			this.appendModelProfileOwnershipMarker(ownershipMarker);
+		}
 		return entry.id;
 	}
 

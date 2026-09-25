@@ -226,9 +226,10 @@ describe("model-profile ownership contract", () => {
 			manager.setSessionMemoryMode("enabled");
 			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
 			const contextSnapshot = manager.buildSessionContext();
-			expect(contextSnapshot.modelProfileOwnershipMarker).toEqual(profileA);
 			contextSnapshot.modelProfileOwnershipMarker = cleared;
 			expect(manager.buildSessionContext().modelProfileOwnershipMarker).toEqual(profileA);
+			manager.appendContextClearEntry();
+			expect(manager.getModelProfileOwnershipMarker()).toEqual(profileA);
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected persisted session file");
 			await manager.close();
