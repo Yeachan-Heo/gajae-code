@@ -444,8 +444,8 @@ async function globIf(
 	fileType: FileTypeEnum,
 	recursive: boolean = true,
 ): Promise<Array<{ path: string }>> {
+	const { glob } = await discoveryNatives();
 	try {
-		const { glob } = await discoveryNatives();
 		const result = await glob({ pattern, path: dir, gitignore: true, hidden: false, fileType, recursive });
 		return result.matches;
 	} catch {

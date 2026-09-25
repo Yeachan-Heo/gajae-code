@@ -2776,6 +2776,8 @@ dependencies = [
  "pi-diff",
  "pi-iso",
  "pi-shell",
+ "pi-vfs",
+ "pi-walker",
  "png",
  "portable-pty",
  "rayon",
@@ -2833,6 +2835,32 @@ name = "pico-args"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5be167a7af36ee22fe3115051bc51f6e6c7054c9348e28deb4f49bd6f705a315"
+
+[[package]]
+name = "pi-vfs"
+version = "0.17.6"
+dependencies = [
+ "async-trait",
+ "libc",
+ "parking_lot",
+ "tokio",
+ "tokio-util",
+ "windows-sys 0.61.2",
+ "xattr",
+]
+
+[[package]]
+name = "pi-walker"
+version = "0.17.6"
+dependencies = [
+ "globset",
+ "ignore",
+ "libc",
+ "parking_lot",
+ "pi-vfs",
+ "rayon",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "pin-project-lite"
@@ -5470,6 +5498,16 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "xmlwriter"
