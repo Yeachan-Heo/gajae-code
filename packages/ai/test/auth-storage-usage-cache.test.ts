@@ -814,6 +814,60 @@ describe("AuthStorage usage cache: credential selection across processes (#5939)
 		}
 	});
 
+	it("cache-only probe mode ranks from a broker store's fresh presentation cache", async () => {
+		let hookCalls = 0;
+		let freshUntil = Date.now() + 60_000;
+		const exhausted = makeReport("a@example.com");
+		exhausted.limits[0]!.amount.used = 100;
+		const store: AuthCredentialStore = {
+			...makeStore([oauthRow(1, "a@example.com"), oauthRow(2, "b@example.com")]),
+			getUsageReport: async () => {
+				hookCalls += 1;
+				return null;
+			},
+			// Zero-network presentation cache, as RemoteAuthCredentialStore exposes it.
+			peekCachedUsagePresentation: (provider, credentialId) =>
+				provider === "anthropic" && credentialId === 1
+					? {
+							credentialId: 1,
+							provider: "anthropic",
+							inventoryGeneration: 1,
+							identityDigest: "digest-a",
+							usage: exhausted,
+							fetchedAt: Date.now(),
+							freshUntil,
+							retainUntil: Date.now() + 86_400_000,
+						}
+					: undefined,
+		};
+		const storage = new AuthStorage(store, { usageProviderResolver: anthropicOnly });
+		await storage.reload();
+		try {
+			storage.setUsageProbeMode("cache-only");
+			// The broker already reported row 1 exhausted: ranking must skip it.
+			expect(await storage.getApiKey("anthropic", "broker-print-1")).toBe("oat-2");
+			expect(hookCalls).toBe(0);
+		} finally {
+			storage.close();
+		}
+
+		// A stale presentation is not ranking evidence: across fresh sessions the
+		// exhausted-looking row 1 must be selectable again.
+		freshUntil = Date.now() - 1;
+		const staleStorage = new AuthStorage(store, { usageProviderResolver: anthropicOnly });
+		await staleStorage.reload();
+		try {
+			staleStorage.setUsageProbeMode("cache-only");
+			const selected = new Set<string | undefined>();
+			for (let i = 0; i < 6; i += 1)
+				selected.add(await staleStorage.getApiKey("anthropic", `broker-print-stale-${i}`));
+			expect(selected.has("oat-1")).toBe(true);
+			expect(hookCalls).toBe(0);
+		} finally {
+			staleStorage.close();
+		}
+	});
+
 	it("re-probes after a credential change instead of reusing the old report", async () => {
 		const { root, dbPath } = await openSharedDb("pi-ai-usage-5939-invalidate-");
 		let calls = 0;

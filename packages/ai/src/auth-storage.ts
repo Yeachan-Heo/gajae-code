@@ -4463,11 +4463,8 @@ export class AuthStorage {
 		// whole point of routing through it.
 		// Cache-only mode must precede the store hook: a remote store's hook
 		// fetches the broker's /v1/usage, which can probe upstream providers.
-		if (this.#usageProbeMode === "cache-only") {
-			const request = this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl);
-			const cached = this.#usageCache.get<UsageReport | null>(this.#buildUsageReportCacheKey(request));
-			return cached && cached.expiresAt > Date.now() ? cached.value : null;
-		}
+		if (this.#usageProbeMode === "cache-only")
+			return this.#peekFreshUsageReport(provider, credential, options?.baseUrl);
 		const storeHook = this.#store.getUsageReport?.bind(this.#store);
 		if (storeHook) {
 			return storeHook(provider, credential, options?.signal);
@@ -4479,6 +4476,24 @@ export class AuthStorage {
 			),
 			options?.signal,
 		);
+	}
+
+	/**
+	 * Zero-network usage lookup for `cache-only` ranking. Remote (broker) stores
+	 * keep reports in their presentation cache rather than the local usage map,
+	 * so consult that first; accept only fresh entries either way.
+	 */
+	#peekFreshUsageReport(provider: Provider, credential: OAuthCredential, baseUrl?: string): UsageReport | null {
+		const now = Date.now();
+		const request = this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+		const credentialId = this.#findStoredCredentialIdForUsageCredential(provider, request.credential);
+		if (credentialId !== undefined) {
+			const storageProvider = resolveOAuthStorageProvider(provider);
+			const presentation = this.#store.peekCachedUsagePresentation?.(storageProvider, credentialId);
+			if (presentation && presentation.freshUntil > now) return presentation.usage;
+		}
+		const cached = this.#usageCache.get<UsageReport | null>(this.#buildUsageReportCacheKey(request));
+		return cached && cached.expiresAt > now ? cached.value : null;
 	}
 
 	async fetchUsageReports(options?: {
