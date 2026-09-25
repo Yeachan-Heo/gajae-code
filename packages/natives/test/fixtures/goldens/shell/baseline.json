@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "source": "executeShell from integration-wave1 at b61218470f before the Phase 3.6 shell re-sync",
+  "normalization": "Exact callback text and ShellRunResult status; UTF-8 literals are platform-independent.",
+  "cases": [
+    {
+      "id": "plain",
+      "command": "printf 'shell-golden:plain\\n'",
+      "result": {
+        "output": "shell-golden:plain\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "unicode",
+      "command": "printf 'shell-golden:中文 雪🙂\\n'",
+      "result": {
+        "output": "shell-golden:中文 雪🙂\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "split-utf8",
+      "command": "printf 'shell-golden: \\344'; printf '\\270\\255\\n'",
+      "result": {
+        "output": "shell-golden: 中\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    }
+  ]
+}
