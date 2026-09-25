@@ -2,6 +2,8 @@ import * as util from "node:util";
 import { resolveModelProfileName } from "./model-profile-contract";
 import type { SettingsAtomicPatch } from "./settings";
 
+const OWNERSHIP_PROJECTION_PATHS = new Set(["modelProfile.ownership", "modelProfile.default"]);
+
 export type ModelProfileOwnershipMarker =
 	| { kind: "inherit" }
 	| { kind: "cleared" }
@@ -250,6 +252,9 @@ export async function commitDurableModelProfileOwnershipWithResult(
 	validateCurrent?: () => Promise<void> | void,
 	observedOwnership?: DurableModelProfileOwnership,
 ): Promise<DurableModelProfileOwnershipCommit> {
+	if (extraPatches.some(patch => OWNERSHIP_PROJECTION_PATHS.has(patch.path))) {
+		throw new Error("Durable ownership extra patches cannot target modelProfile.ownership or modelProfile.default.");
+	}
 	const expected = observedOwnership ?? readDurableModelProfileOwnership(settings);
 	let result = expected;
 	let wrote = false;
