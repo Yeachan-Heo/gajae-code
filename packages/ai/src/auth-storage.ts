@@ -669,6 +669,18 @@ export interface CredentialDisabledEvent {
  */
 export type CredentialRankingMode = "balanced" | "earliest-reset";
 
+/**
+ * Whether credential selection may probe provider usage endpoints.
+ *
+ * - `network` (default): ranking and quota checks fetch usage when the shared
+ *   cache has no fresh report.
+ * - `cache-only`: ranking and quota checks read only fresh reports another
+ *   process already cached in agent.db and never call the provider. Used by
+ *   short-lived non-interactive runs (`gjc -p`) that never display usage.
+ *   Explicit `fetchUsageReports()` calls are unaffected.
+ */
+export type UsageProbeMode = "network" | "cache-only";
+
 export type AuthStorageOptions = {
 	usageProviderResolver?: (provider: Provider) => UsageProvider | undefined;
 	rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
@@ -961,6 +973,13 @@ const USAGE_LAST_GOOD_RETENTION_MS = 24 * 60 * 60_000;
  * on the next poll.
  */
 const USAGE_FAILURE_BACKOFF_MS = 10_000;
+/**
+ * Cool-down after a usage fetch fails for a credential with no last-good
+ * value. The failure is persisted in the shared agent.db cache so sibling
+ * processes (short-lived `gjc -p` runs, SDK hosts) and repeated credential
+ * selection in one process do not re-probe a rate-limited endpoint (#5939).
+ */
+const USAGE_FAILURE_NEGATIVE_TTL_MS = 60_000;
 // Bumped from 3s — Anthropic model usage retries up to 3 times with exponential backoff
 // (~3.5s total worst case); a tight per-request budget aborts retries mid-cycle.
 const DEFAULT_USAGE_REQUEST_TIMEOUT_MS = 10_000;
@@ -1431,6 +1450,7 @@ export class AuthStorage {
 	#usageRequestTimeoutMs: number;
 	#usageFetchLeaseMs: number;
 	#credentialRankingMode: CredentialRankingMode = "balanced";
+	#usageProbeMode: UsageProbeMode = "network";
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
 	#ownedFallbackResolvers: Map<object, (provider: string) => string | undefined> = new Map();
@@ -1505,6 +1525,11 @@ export class AuthStorage {
 				debug: (message, meta) => logger.debug(message, meta),
 				warn: (message, meta) => logger.warn(message, meta),
 			} satisfies UsageLogger);
+	}
+
+	/** Select whether credential selection may probe provider usage endpoints. */
+	setUsageProbeMode(mode: UsageProbeMode): void {
+		this.#usageProbeMode = mode;
 	}
 
 	/**
@@ -2432,6 +2457,7 @@ export class AuthStorage {
 	 * @param credentials - Array of stored credentials to cache
 	 */
 	#setStoredCredentials(provider: string, credentials: StoredCredential[]): void {
+		const loaded = this.#data.has(provider);
 		const current = this.#data.get(provider) ?? [];
 		if (storedCredentialArraysEqual(current, credentials)) return;
 		const identityOrderChanged =
@@ -2458,7 +2484,11 @@ export class AuthStorage {
 			this.#data.set(provider, credentials);
 		}
 		if (identityOrderChanged) this.#resetProviderAssignments(storageProvider);
-		if (!tokenRotationOnly) this.#invalidateUsageCacheForProvider(storageProvider);
+		// The persisted usage cache is keyed by credential identity and shared with
+		// sibling processes through agent.db. A first load of a provider's rows is
+		// not a configuration change; purging there made every new process discard
+		// its peers' reports and re-fetch provider usage at startup (#5939).
+		if (!tokenRotationOnly && loaded) this.#invalidateUsageCacheForProvider(storageProvider);
 		if (tokenRotationOnly) this.#bumpGeneration("oauth-token-rotation");
 		else this.#bumpGeneration("credentials", provider);
 	}
@@ -4088,29 +4118,27 @@ export class AuthStorage {
 		if (inFlight) return inFlight;
 
 		const promise = (async () => {
-			const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
-			if (this.#getProviderGeneration(provider) !== credentialGeneration) return null;
-			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
-			if (report !== null) {
-				// Success: stagger per-credential cache expiry so all accounts don't
-				// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
-				// per source IP regardless of account, and synchronized 5-credential
-				// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
-				// times decorrelate within a few cycles.
-				this.#usageCache.set(cacheKey, { value: report, expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter });
-				return report;
+			// Cross-process single flight: the lease owner fetches; peers wait for
+			// the owner's cached outcome instead of issuing their own request.
+			// `undefined` means the store has no lease support: fetch locally.
+			const leaseClaim = this.#tryAcquireUsageFetchLease(cacheKey);
+			if (leaseClaim === false) {
+				const shared = await this.#waitForUsageReportFromPeer(cacheKey);
+				if (!shared.leaseAcquired) return shared.value;
 			}
-			// Failure: cache the LAST GOOD value (if any) with a short jittered TTL
-			// so the credential cools down briefly without dropping out of the
-			// report. If we never had a good value, return null this cycle and
-			// don't write — let the next poll retry.
-			const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
-			if (lastGood !== null) {
-				const backoffJitter = USAGE_FAILURE_BACKOFF_MS * (Math.random() * 0.5 - 0.25);
-				const coolDown = Date.now() + USAGE_FAILURE_BACKOFF_MS + backoffJitter;
-				this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: coolDown });
+			const leaseOwned = leaseClaim !== undefined;
+			try {
+				return await this.#fetchAndCacheUsageReport(
+					request,
+					cacheKey,
+					provider,
+					credentialGeneration,
+					timeoutMs,
+					logDetails,
+				);
+			} finally {
+				if (leaseOwned) this.#releaseUsageFetchLease(cacheKey);
 			}
-			return lastGood;
 		})().finally(() => {
 			if (this.#usageRequestInFlight.get(cacheKey) === promise) {
 				this.#usageRequestInFlight.delete(cacheKey);
@@ -4119,6 +4147,57 @@ export class AuthStorage {
 
 		this.#usageRequestInFlight.set(cacheKey, promise);
 		return promise;
+	}
+
+	/**
+	 * Wait while a peer process holds the per-credential usage lease. Returns the
+	 * peer's cached outcome, or reports that this process now owns the lease.
+	 * If the peer neither publishes nor releases in time, serve the last-good
+	 * value (or null) rather than piling another request onto the endpoint.
+	 */
+	async #waitForUsageReportFromPeer(
+		cacheKey: string,
+	): Promise<{ value: UsageReport | null; leaseAcquired: false } | { leaseAcquired: true }> {
+		const deadline = Date.now() + this.#usageFetchLeaseMs;
+		while (Date.now() < deadline) {
+			await Bun.sleep(USAGE_FETCH_WAIT_POLL_MS);
+			const cached = this.#usageCache.get<UsageReport | null>(cacheKey);
+			if (cached && cached.expiresAt > Date.now()) return { value: cached.value, leaseAcquired: false };
+			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return { leaseAcquired: true };
+		}
+		return { value: this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null, leaseAcquired: false };
+	}
+
+	async #fetchAndCacheUsageReport(
+		request: UsageRequestDescriptor,
+		cacheKey: string,
+		provider: string,
+		credentialGeneration: number,
+		timeoutMs: number | undefined,
+		logDetails: boolean,
+	): Promise<UsageReport | null> {
+		const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
+		if (this.#getProviderGeneration(provider) !== credentialGeneration) return null;
+		if (report !== null) {
+			// Success: stagger per-credential cache expiry so all accounts don't
+			// refresh in the same window — Anthropic / OpenAI rate-limit `/usage`
+			// per source IP regardless of account, and synchronized 5-credential
+			// fan-out trips 429s every cycle. With ±25% jitter on TTL the refresh
+			// times decorrelate within a few cycles.
+			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
+			this.#usageCache.set(cacheKey, { value: report, expiresAt: Date.now() + USAGE_REPORT_TTL_MS + ttlJitter });
+			return report;
+		}
+		// Failure: cache the LAST GOOD value (if any) with a short jittered TTL
+		// so the credential cools down briefly without dropping out of the
+		// report. Without a previous value, persist the failure itself for a
+		// longer cool-down so neither this process nor its siblings re-probe a
+		// rate-limited endpoint on every credential selection.
+		const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+		const backoffMs = lastGood !== null ? USAGE_FAILURE_BACKOFF_MS : USAGE_FAILURE_NEGATIVE_TTL_MS;
+		const backoffJitter = backoffMs * (Math.random() * 0.5 - 0.25);
+		this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: Date.now() + backoffMs + backoffJitter });
+		return lastGood;
 	}
 
 	#captureUsageProviderGenerations(requests: ReadonlyArray<UsageRequestDescriptor>): Map<string, number> {
@@ -4370,6 +4449,11 @@ export class AuthStorage {
 		const storeHook = this.#store.getUsageReport?.bind(this.#store);
 		if (storeHook) {
 			return storeHook(provider, credential, options?.signal);
+		}
+		if (this.#usageProbeMode === "cache-only") {
+			const request = this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl);
+			const cached = this.#usageCache.get<UsageReport | null>(this.#buildUsageReportCacheKey(request));
+			return cached && cached.expiresAt > Date.now() ? cached.value : null;
 		}
 		return raceUsageWithSignal(
 			this.#fetchUsageCached(
