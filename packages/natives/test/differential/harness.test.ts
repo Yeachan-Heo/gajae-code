@@ -99,8 +99,8 @@ describe("differential golden harness", () => {
 			defineDifferential({
 				...identityDefinition(),
 				cases: [
-					{ id: "same", input: 1 },
-					{ id: "same", input: 2 },
+					{ id: "same", input: { text: "first" } },
+					{ id: "same", input: { text: "second" } },
 				],
 			}),
 		).toThrow("duplicate differential case id");

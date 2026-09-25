@@ -22,7 +22,7 @@ export const diffLinesCases: DifferentialCase<DiffLinesInput>[] = inputs.map((in
 	input,
 }));
 
-type DiffLinesOutput = Array<{ added: boolean; removed: boolean; value: string }>;
+type DiffLinesOutput = Array<{ added: boolean; count: number; removed: boolean; value: string }>;
 
 export const diffLinesDifferential = defineDifferential<DiffLinesInput, DiffLinesOutput>({
 	module: "diff-lines",
@@ -30,6 +30,7 @@ export const diffLinesDifferential = defineDifferential<DiffLinesInput, DiffLine
 	reference: input =>
 		Diff.diffLines(input.oldStr, input.newStr).map(part => ({
 			added: part.added ?? false,
+			count: part.count ?? 0,
 			removed: part.removed ?? false,
 			value: part.value,
 		})),

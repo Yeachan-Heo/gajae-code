@@ -17,6 +17,7 @@ describe("native diffLines differential self-test", () => {
 		expect(diffLines("left\n", "right\n")).toEqual(
 			Diff.diffLines("left\n", "right\n").map(part => ({
 				added: part.added ?? false,
+				count: part.count ?? 0,
 				removed: part.removed ?? false,
 				value: part.value,
 			})),
