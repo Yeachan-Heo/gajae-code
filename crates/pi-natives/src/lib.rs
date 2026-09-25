@@ -57,6 +57,7 @@ pub mod shell;
 pub mod summary;
 pub mod task;
 pub mod text;
+pub mod tty_writer;
 pub(crate) mod utils;
 pub mod workspace;
 

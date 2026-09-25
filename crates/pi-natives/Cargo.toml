@@ -55,6 +55,7 @@ toml.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+xutf.workspace = true
 xxhash-rust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
