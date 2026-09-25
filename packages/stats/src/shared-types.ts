@@ -167,10 +167,34 @@ export interface CacheMissAttribution {
 }
 
 /**
+ * Provider-failure cost over a window: how often requests fail or abort, and
+ * how many prompt tokens the request right after a failure re-paid because it
+ * missed the prompt cache entirely.
+ */
+export interface FailureReport {
+	totalRequests: number;
+	/** Requests with stop_reason `error` */
+	erroredRequests: number;
+	/** Requests with stop_reason `aborted` */
+	abortedRequests: number;
+	/** (errored + aborted) / total (0-1) */
+	failureShare: number;
+	/** Summed duration of errored and aborted requests, in ms */
+	failedDurationMs: number;
+	/** Non-failed requests that directly follow a failed one in the same session */
+	postFailureRequests: number;
+	/** Of those, requests that read nothing from cache on a cacheable prompt */
+	postFailureFullMissRequests: number;
+	/** Input tokens re-paid by those full-miss requests */
+	postFailureFullMissTokens: number;
+}
+
+/**
  * Overall dashboard stats.
  */
 export interface DashboardStats {
 	overall: AggregatedStats;
+	failures: FailureReport;
 	byModel: ModelStats[];
 	byFolder: FolderStats[];
 	byAgent: AgentStats[];
