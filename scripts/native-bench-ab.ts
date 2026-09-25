@@ -174,31 +174,6 @@ export function pairedBootstrapRatio(
 	return { lower: quantile(ratios, 0.025), upper: quantile(ratios, 0.975) };
 }
 
-/** Bootstrap the mean block statistic, keeping each base/head block paired. */
-export function pairedBootstrapMeanRatio(
-	base: readonly number[],
-	head: readonly number[],
-	seed = 0x6a09e667,
-	resamples = BOOTSTRAP_RESAMPLES,
-): ConfidenceInterval {
-	if (base.length === 0 || base.length !== head.length) throw new BenchError("SamplePairMismatch", "base and head require the same non-zero number of paired blocks");
-	if (base.some(value => !Number.isFinite(value) || value <= 0) || head.some(value => !Number.isFinite(value) || value <= 0)) {
-		throw new BenchError("InvalidSamples", "latency samples must be finite and positive");
-	}
-	const state = { value: seed >>> 0 || 1 };
-	const ratios: number[] = [];
-	for (let run = 0; run < resamples; run += 1) {
-		let baseSum = 0;
-		let headSum = 0;
-		for (let block = 0; block < base.length; block += 1) {
-			const index = randomIndex(state, base.length);
-			baseSum += base[index] ?? 0;
-			headSum += head[index] ?? 0;
-		}
-		ratios.push(headSum / baseSum);
-	}
-	return { lower: quantile(ratios, 0.025), upper: quantile(ratios, 0.975) };
-}
 
 export function assertBaselineIdentity(baseSha: string, headSha: string, allowBaselineDrift: boolean, calibrate: boolean): void {
 	if (baseSha !== headSha && !allowBaselineDrift) {
@@ -211,8 +186,8 @@ export function assessLatencyCase(
 	baseBlocks: readonly number[],
 	headBlocks: readonly number[],
 ): LatencyCaseResult {
-	const p50 = pairedBootstrapMeanRatio(baseBlocks, headBlocks, 0x6a09e667);
-	const p95 = pairedBootstrapMeanRatio(baseBlocks, headBlocks, 0xbb67ae85);
+	const p50 = pairedBootstrapRatio(baseBlocks, headBlocks, 0.5, 0x6a09e667);
+	const p95 = pairedBootstrapRatio(baseBlocks, headBlocks, 0.5, 0xbb67ae85);
 	let verdict: Verdict = "INCONCLUSIVE";
 	if (p50.upper <= 1.03 && p95.upper <= 1.10) verdict = "PASS";
 	else if (p50.lower > 1.03 || p95.lower > 1.10) verdict = "FAIL";
@@ -359,8 +334,8 @@ function makeLatencyResult(baseReports: BenchAdapterReport[], headReports: Bench
 			headP50.push(block.p50);
 			headP95.push(block.p95);
 		}
-		const p50 = pairedBootstrapMeanRatio(baseP50, headP50, 0x6a09e667);
-		const p95 = pairedBootstrapMeanRatio(baseP95, headP95, 0xbb67ae85);
+		const p50 = pairedBootstrapRatio(baseP50, headP50, 0.5, 0x6a09e667);
+		const p95 = pairedBootstrapRatio(baseP95, headP95, 0.5, 0xbb67ae85);
 		let verdict: Verdict = "INCONCLUSIVE";
 		if (p50.upper <= 1.03 && p95.upper <= 1.10) verdict = "PASS";
 		else if (p50.lower > 1.03 || p95.lower > 1.10) verdict = "FAIL";

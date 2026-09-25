@@ -76,7 +76,7 @@ describe("native bench A/B contract", () => {
 		expect(pass.verdict).toBe("PASS");
 		const fail = assessLatencyCase("slow", Array(15).fill(1), Array(15).fill(1.2));
 		expect(fail.verdict).toBe("FAIL");
-		const uncertainHead = Array(14).fill(1).concat(2);
+		const uncertainHead = Array(8).fill(1).concat(Array(7).fill(1.2));
 		const inconclusive = assessLatencyCase("noisy", Array(15).fill(1), uncertainHead);
 		expect(inconclusive.verdict).toBe("INCONCLUSIVE");
 		expect(assessLatencyRound([pass, inconclusive])).toBe("INCONCLUSIVE");
