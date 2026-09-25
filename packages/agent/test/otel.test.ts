@@ -376,6 +376,7 @@ describe("agent-loop OTEL instrumentation", () => {
 			expect(await Bun.file(getHandledErrorLogPath()).exists()).toBe(false);
 		} finally {
 			resetAgentDirFromEnvironment();
+			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 

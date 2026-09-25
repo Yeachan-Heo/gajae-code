@@ -72,13 +72,17 @@ function extensionWithToolCallHandler(handler: () => Promise<unknown>): Extensio
 }
 
 describe("handled-error crash store excludes designed tool outcomes (#5938)", () => {
+	let agentDir: string;
+
 	beforeEach(() => {
 		resetHandledErrorDedupeForTest();
-		setAgentDir(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-5938-")));
+		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-5938-"));
+		setAgentDir(agentDir);
 	});
 
 	afterEach(() => {
 		resetAgentDirFromEnvironment();
+		fs.rmSync(agentDir, { recursive: true, force: true });
 	});
 
 	test("an extension tool_call block is a designed refusal", async () => {
