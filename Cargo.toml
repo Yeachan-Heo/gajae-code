@@ -220,6 +220,7 @@ similar = "3.2.0"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+xutf = "1.5"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Structures - Collections

@@ -33,6 +33,19 @@ This document covers the media/system/conversion exports in `@gajae-code/natives
 
 ## Data format boundaries and conversions
 
+### Mermaid rendering (`mermaid`)
+
+- **JS input boundary**: Mermaid source text and optional `MermaidRenderOptions`.
+- **Native boundary**: synchronous rendering for flowcharts, state, sequence, class, ER, and XY chart diagrams.
+- **Output boundary**: a plain string containing the rendered terminal art; the utils wrapper defaults `colorMode` to `none` and forwards explicit options.
+- **Differential evidence**: pre-port TypeScript outputs for the pinned fixture corpus live under `packages/natives/test/fixtures/goldens/mermaid/`; every accepted output difference has a case-specific entry in `accepted-divergences.json`.
+
+### SVG rasterization (`svg`)
+
+- **JS input boundary**: SVG/SVGZ bytes and positive maximum width/height in pixels.
+- **Native boundary**: `rasterizeSvg(...)` parses and renders on the blocking pool, does not resolve file-backed images, and returns PNG bytes.
+- **Bounds**: renders are not enlarged; requested canvas limits with a product above 16 megapixels are rejected.
+
 ### Image (`image`)
 
 - **JS input boundary**: `Uint8Array` encoded image bytes for `encodeSixel`.

@@ -41,6 +41,7 @@ pub mod html;
 pub mod keys;
 pub mod linediff;
 pub mod memory;
+pub mod mermaid;
 pub mod sdk;
 pub mod sixel;
 pub use pi_ast::language;

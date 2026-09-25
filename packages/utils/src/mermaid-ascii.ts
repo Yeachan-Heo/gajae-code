@@ -1,14 +1,28 @@
-import { type AsciiRenderOptions, renderMermaidASCII } from "beautiful-mermaid";
+import type { MermaidRenderOptions } from "@gajae-code/natives";
 
-export type { AsciiRenderOptions as MermaidAsciiRenderOptions };
+export type { MermaidRenderOptions as MermaidAsciiRenderOptions };
 
-export function renderMermaidAscii(source: string, options?: AsciiRenderOptions): string {
-	return renderMermaidASCII(source, options);
+type NativeMermaidBindings = Pick<typeof import("@gajae-code/natives"), "renderMermaidAscii">;
+
+let nativeMermaidBindings: NativeMermaidBindings | undefined;
+
+function getNativeMermaidBindings(): NativeMermaidBindings {
+	if (!nativeMermaidBindings) {
+		nativeMermaidBindings = require("@gajae-code/natives") as NativeMermaidBindings;
+	}
+	return nativeMermaidBindings;
 }
 
-export function renderMermaidAsciiSafe(source: string, options?: AsciiRenderOptions): string | null {
+export function renderMermaidAscii(source: string, options?: MermaidRenderOptions): string {
+	return getNativeMermaidBindings().renderMermaidAscii(source, {
+		...options,
+		colorMode: options?.colorMode ?? "none",
+	});
+}
+
+export function renderMermaidAsciiSafe(source: string, options?: MermaidRenderOptions): string | null {
 	try {
-		return renderMermaidASCII(source, options);
+		return renderMermaidAscii(source, options);
 	} catch {
 		return null;
 	}
