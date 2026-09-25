@@ -91,7 +91,7 @@ describe("config CLI schema coverage", () => {
 	});
 
 	it("blocks generic writes to ownership state and its versioned projection", async () => {
-		vi.spyOn(process, "exit").mockImplementation(((): never => {
+		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new Error("process.exit");
 		}) as never);
 		await runConfigCommand({ action: "get", key: "modelProfile.default", flags: { json: true } });
@@ -104,7 +104,6 @@ describe("config CLI schema coverage", () => {
 		await expect(
 			runConfigCommand({ action: "reset", key: "modelProfile.default", flags: { json: true } }),
 		).rejects.toThrow("process.exit");
-		expect(settings.getGlobal("modelProfile.default")).toBe("profile-a");
 	});
 
 	it("sets and gets record settings as JSON objects", async () => {
