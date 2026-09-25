@@ -1516,31 +1516,6 @@ export interface GrepResult {
   limitReached?: boolean
 }
 
-export interface H01BestFuzzyMatch {
-  actualText: string
-  startIndex: number
-  startLine: number
-  confidence: number
-}
-
-export interface H01BestFuzzyMatchResult {
-  best?: H01BestFuzzyMatch
-  aboveThresholdCount: number
-  secondBestScore: number
-}
-
-export declare function h01FindBestFuzzyMatch(content: string, target: string, threshold: number): H01BestFuzzyMatchResult
-
-export declare function h02ScoreSequenceFuzzy(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean): H02SequenceFuzzyResult
-
-export interface H02SequenceFuzzyResult {
-  index?: number
-  confidence: number
-  matchCount: number
-  matchIndices: Array<number>
-  secondBestScore: number
-}
-
 export declare function h06FormatHashLines(text: string, startLine?: number | undefined | null): string
 
 /**

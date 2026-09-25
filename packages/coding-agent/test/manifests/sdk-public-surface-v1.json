@@ -291,7 +291,6 @@
     "extractReadableFromHtml",
     "fetch",
     "finalizeSubprocessOutput",
-    "findBestFuzzyMatch",
     "findClosestSequenceMatch",
     "findContextLine",
     "findMatch",

@@ -34,7 +34,6 @@ pub mod doctor_journal;
 pub mod doctor_link;
 
 pub mod edit;
-pub mod edit_fuzzy;
 pub mod fd;
 pub mod fs_cache;
 pub mod glob;

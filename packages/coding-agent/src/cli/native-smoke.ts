@@ -20,8 +20,6 @@ interface NativeSmokePatchHunk {
 }
 
 interface NativeSmokeBindings {
-	h01FindBestFuzzyMatch?: unknown;
-	h02ScoreSequenceFuzzy?: unknown;
 	editFindMatch?: (
 		content: string,
 		target: string,
@@ -88,9 +86,6 @@ export async function runNativeSmokeTest(): Promise<void> {
 	const hashed = native.h06FormatHashLines("a\nb", 1);
 	if (hashed.split("\n").length !== 2) {
 		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
-	}
-	if (typeof native.h02ScoreSequenceFuzzy !== "function" || typeof native.h01FindBestFuzzyMatch !== "function") {
-		throw new Error("smoke-test: native fuzzy exports missing from embedded addon");
 	}
 	if (typeof native.editFindMatch !== "function" || typeof native.editSeekSequence !== "function") {
 		throw new Error("smoke-test: native pi-edit matcher exports missing from embedded addon");

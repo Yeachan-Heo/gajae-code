@@ -826,23 +826,23 @@ function findHierarchicalContext(
 }
 
 /** Find sequence with optional hint position, returning full search result */
-function findSequenceWithHint(
+async function findSequenceWithHint(
 	lines: string[],
 	pattern: string[],
 	currentIndex: number,
 	hintIndex: number | undefined,
 	eof: boolean,
 	allowFuzzy: boolean,
-): SequenceSearchResult {
+): Promise<SequenceSearchResult> {
 	// Prefer content-based search starting from currentIndex
-	const primaryResult = seekSequence(lines, pattern, currentIndex, eof, { allowFuzzy });
+	const primaryResult = await seekSequence(lines, pattern, currentIndex, eof, { allowFuzzy });
 	if (
 		primaryResult.matchCount &&
 		primaryResult.matchCount > 1 &&
 		hintIndex !== undefined &&
 		hintIndex !== currentIndex
 	) {
-		const hintedResult = seekSequence(lines, pattern, hintIndex, eof, { allowFuzzy });
+		const hintedResult = await seekSequence(lines, pattern, hintIndex, eof, { allowFuzzy });
 		if (hintedResult.index !== undefined && (hintedResult.matchCount ?? 1) <= 1) {
 			return hintedResult;
 		}
@@ -856,7 +856,7 @@ function findSequenceWithHint(
 
 	// Use line hint as a secondary bias only if needed
 	if (hintIndex !== undefined && hintIndex !== currentIndex) {
-		const hintedResult = seekSequence(lines, pattern, hintIndex, eof, { allowFuzzy });
+		const hintedResult = await seekSequence(lines, pattern, hintIndex, eof, { allowFuzzy });
 		if (hintedResult.index !== undefined || (hintedResult.matchCount && hintedResult.matchCount > 1)) {
 			return hintedResult;
 		}
@@ -864,7 +864,7 @@ function findSequenceWithHint(
 
 	// Last resort: search from beginning (handles out-of-order hunks)
 	if (currentIndex !== 0) {
-		const fromStartResult = seekSequence(lines, pattern, 0, eof, { allowFuzzy });
+		const fromStartResult = await seekSequence(lines, pattern, 0, eof, { allowFuzzy });
 		if (fromStartResult.index !== undefined || (fromStartResult.matchCount && fromStartResult.matchCount > 1)) {
 			return fromStartResult;
 		}
@@ -873,17 +873,17 @@ function findSequenceWithHint(
 	return primaryResult;
 }
 
-function attemptSequenceFallback(
+async function attemptSequenceFallback(
 	lines: string[],
 	hunk: DiffHunk,
 	currentIndex: number,
 	lineHint: number | undefined,
 	allowFuzzy: boolean,
 	allowAggressiveFallbacks: boolean,
-): number | undefined {
+): Promise<number | undefined> {
 	if (hunk.oldLines.length === 0) return undefined;
 	const matchHint = getHunkHintIndex(hunk, currentIndex);
-	const fallbackResult = findSequenceWithHint(
+	const fallbackResult = await findSequenceWithHint(
 		lines,
 		hunk.oldLines,
 		currentIndex,
@@ -894,7 +894,7 @@ function attemptSequenceFallback(
 	if (fallbackResult.index !== undefined && (fallbackResult.matchCount ?? 1) <= 1) {
 		const nextIndex = fallbackResult.index + 1;
 		if (nextIndex <= lines.length - hunk.oldLines.length) {
-			const secondMatch = seekSequence(lines, hunk.oldLines, nextIndex, false, { allowFuzzy });
+			const secondMatch = await seekSequence(lines, hunk.oldLines, nextIndex, false, { allowFuzzy });
 			if (secondMatch.index !== undefined) {
 				return undefined;
 			}
@@ -904,7 +904,7 @@ function attemptSequenceFallback(
 
 	for (const variant of filterFallbackVariants(buildFallbackVariants(hunk), allowAggressiveFallbacks)) {
 		if (variant.oldLines.length === 0) continue;
-		const variantResult = findSequenceWithHint(
+		const variantResult = await findSequenceWithHint(
 			lines,
 			variant.oldLines,
 			currentIndex,
@@ -923,27 +923,27 @@ function attemptSequenceFallback(
  * Apply a hunk using character-based fuzzy matching.
  * Used when the hunk contains only -/+ lines without context.
  */
-function applyCharacterMatch(
+async function applyCharacterMatch(
 	originalContent: string,
 	path: string,
 	hunk: DiffHunk,
 	fuzzyThreshold: number,
 	allowFuzzy: boolean,
-): { content: string; warnings: string[] } {
+): Promise<{ content: string; warnings: string[] }> {
 	const oldText = hunk.oldLines.join("\n");
 	const newText = hunk.newLines.join("\n");
 
 	const normalizedContent = normalizeToLF(originalContent);
 	const normalizedOldText = normalizeToLF(oldText);
 
-	let matchOutcome = findMatch(normalizedContent, normalizedOldText, {
+	let matchOutcome = await findMatch(normalizedContent, normalizedOldText, {
 		allowFuzzy,
 		threshold: fuzzyThreshold,
 	});
 	if (!matchOutcome.match && allowFuzzy) {
 		const relaxedThreshold = Math.min(fuzzyThreshold, 0.92);
 		if (relaxedThreshold < fuzzyThreshold) {
-			const relaxedOutcome = findMatch(normalizedContent, normalizedOldText, {
+			const relaxedOutcome = await findMatch(normalizedContent, normalizedOldText, {
 				allowFuzzy,
 				threshold: relaxedThreshold,
 			});
@@ -1020,12 +1020,12 @@ async function readExistingPatchFile(fileSystem: FileSystem, absolutePath: strin
 /**
  * Compute replacements needed to transform originalLines using the diff hunks.
  */
-function computeReplacements(
+async function computeReplacements(
 	originalLines: string[],
 	path: string,
 	hunks: DiffHunk[],
 	allowFuzzy: boolean,
-): { replacements: Replacement[]; warnings: string[] } {
+): Promise<{ replacements: Replacement[]; warnings: string[] }> {
 	const replacements: Replacement[] = [];
 	const warnings: string[] = [];
 	let lineIndex = 0;
@@ -1057,7 +1057,7 @@ function computeReplacements(
 			contextIndex = idx;
 
 			if (idx === undefined || (result.matchCount !== undefined && result.matchCount > 1)) {
-				const fallback = attemptSequenceFallback(
+				const fallback = await attemptSequenceFallback(
 					originalLines,
 					hunk,
 					lineIndex,
@@ -1140,7 +1140,7 @@ function computeReplacements(
 		// Try to find the old lines in the file
 		let pattern = [...hunk.oldLines];
 		const matchHint = getHunkHintIndex(hunk, lineIndex);
-		let searchResult = findSequenceWithHint(
+		let searchResult = await findSequenceWithHint(
 			originalLines,
 			pattern,
 			lineIndex,
@@ -1156,7 +1156,7 @@ function computeReplacements(
 			if (newSlice.length > 0 && newSlice[newSlice.length - 1] === "") {
 				newSlice = newSlice.slice(0, -1);
 			}
-			searchResult = findSequenceWithHint(
+			searchResult = await findSequenceWithHint(
 				originalLines,
 				pattern,
 				lineIndex,
@@ -1169,7 +1169,7 @@ function computeReplacements(
 		if (searchResult.index === undefined || (searchResult.matchCount ?? 0) > 1) {
 			for (const variant of fallbackVariants) {
 				if (variant.oldLines.length === 0) continue;
-				const variantResult = findSequenceWithHint(
+				const variantResult = await findSequenceWithHint(
 					originalLines,
 					variant.oldLines,
 					lineIndex,
@@ -1284,7 +1284,7 @@ function computeReplacements(
 		// This ensures ambiguous replacements are rejected
 		// Skip this check if isEndOfFile is set (EOF marker provides disambiguation)
 		if (hunk.changeContext === undefined && !hunk.hasContextLines && !hunk.isEndOfFile && lineHint === undefined) {
-			const secondMatch = seekSequence(originalLines, pattern, found + 1, false, { allowFuzzy });
+			const secondMatch = await seekSequence(originalLines, pattern, found + 1, false, { allowFuzzy });
 			if (secondMatch.index !== undefined) {
 				const preview1 = formatSequenceMatchPreview(originalLines, found);
 				const preview2 = formatSequenceMatchPreview(originalLines, secondMatch.index);
@@ -1365,13 +1365,13 @@ function applyReplacements(lines: string[], replacements: Replacement[]): string
 /**
  * Apply diff hunks to file content.
  */
-function applyHunksToContent(
+async function applyHunksToContent(
 	originalContent: string,
 	path: string,
 	hunks: DiffHunk[],
 	fuzzyThreshold: number,
 	allowFuzzy: boolean,
-): { content: string; warnings: string[] } {
+): Promise<{ content: string; warnings: string[] }> {
 	const hadFinalNewline = originalContent.endsWith("\n");
 
 	// Detect simple replace pattern: single hunk, no @@ context, no context lines, has old lines to match
@@ -1385,7 +1385,13 @@ function applyHunksToContent(
 			hunk.oldStartLine === undefined && // No line hint to use for positioning
 			!hunk.isEndOfFile // No EOF targeting (prefer end of file)
 		) {
-			const { content, warnings } = applyCharacterMatch(originalContent, path, hunk, fuzzyThreshold, allowFuzzy);
+			const { content, warnings } = await applyCharacterMatch(
+				originalContent,
+				path,
+				hunk,
+				fuzzyThreshold,
+				allowFuzzy,
+			);
 			return { content: applyTrailingNewlinePolicy(content, hadFinalNewline), warnings };
 		}
 	}
@@ -1401,7 +1407,7 @@ function applyHunksToContent(
 		strippedTrailingEmpty = true;
 	}
 
-	const { replacements, warnings } = computeReplacements(originalLines, path, hunks, allowFuzzy);
+	const { replacements, warnings } = await computeReplacements(originalLines, path, hunks, allowFuzzy);
 	const newLines = applyReplacements(originalLines, replacements);
 
 	// Restore the trailing empty element if we stripped it
@@ -1528,7 +1534,7 @@ async function applyNormalizedPatch(input: PatchInput, options: ApplyPatchOption
 		throw new ApplyPatchError("Diff contains no hunks");
 	}
 
-	const { content: newContent, warnings } = applyHunksToContent(
+	const { content: newContent, warnings } = await applyHunksToContent(
 		normalizedContent,
 		input.path,
 		hunks,
