@@ -4,7 +4,7 @@ import type { AgentMessage } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { type CreateAgentSessionResult, createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -188,7 +188,7 @@ describe("async result yield queue delivery", () => {
 	test("acknowledgement during formatting settles only the stale owned registration", async () => {
 		const tempDir = TempDir.createSync("@gjc-async-yield-race-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		let created: Awaited<ReturnType<typeof createAgentSession>> | undefined;
+		let created: CreateAgentSessionResult | undefined;
 		let staleRegistration: TurnRegistrationKey | undefined;
 		let liveRegistration: TurnRegistrationKey | undefined;
 		const formattingStarted = Promise.withResolvers<void>();

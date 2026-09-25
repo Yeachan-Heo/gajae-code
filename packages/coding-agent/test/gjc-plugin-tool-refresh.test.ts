@@ -135,7 +135,7 @@ describe("AgentSession GJC plugin sub-skill tool refresh", () => {
 		const release = Promise.withResolvers<void>();
 		const gateKey = "__gjcSubskillRefreshGate";
 		Object.assign(globalThis, { [gateKey]: { started: started.resolve, promise: release.promise } });
-		await fs.writeFile(
+		await Bun.write(
 			toolPath,
 			`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 const gate = (globalThis as unknown as { __gjcSubskillRefreshGate: { started(): void; promise: Promise<void> } }).__gjcSubskillRefreshGate;

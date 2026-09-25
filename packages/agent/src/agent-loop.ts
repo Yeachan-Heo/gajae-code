@@ -5442,7 +5442,7 @@ async function executeToolCalls(
 		let result: AgentToolResult<any> = { content: [], details: {} };
 		let isError = false;
 		let caughtError: unknown;
-		let preDispatchCancellationResult: AgentToolResult<any> | undefined;
+		let preDispatchCancellationResult: AgentToolResult<{ cancellation: "before_dispatch" }> | undefined;
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
