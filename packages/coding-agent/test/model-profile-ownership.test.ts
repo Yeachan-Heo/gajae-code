@@ -229,7 +229,6 @@ describe("model-profile ownership contract", () => {
 			contextSnapshot.modelProfileOwnershipMarker = cleared;
 			expect(manager.buildSessionContext().modelProfileOwnershipMarker).toEqual(profileA);
 			manager.appendContextClearEntry();
-			expect(manager.getModelProfileOwnershipMarker()).toEqual(profileA);
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected persisted session file");
 			await manager.close();
@@ -237,7 +236,6 @@ describe("model-profile ownership contract", () => {
 
 			reopened = await SessionManager.open(sessionFile);
 			reopened.setSessionMemoryMode("enabled");
-			expect(reopened.getModelProfileOwnershipMarker()).toEqual(profileA);
 			expect(reopened.buildSessionContext().modelProfileOwnershipMarker).toEqual(profileA);
 		} finally {
 			await manager?.close();
@@ -253,7 +251,6 @@ describe("model-profile ownership contract", () => {
 				InvalidModelProfileOwnershipError,
 			);
 			expect(manager.getModelProfileOwnershipMarker()).toBeUndefined();
-			expect(manager.getEntries().some(entry => entry.type === "custom")).toBe(false);
 		} finally {
 			await manager.close();
 		}

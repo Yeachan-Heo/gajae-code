@@ -18459,9 +18459,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 		};
 		this.#appendEntry(entry);
-		if (ownershipMarker && ownershipMarker.kind !== "inherit") {
-			this.appendModelProfileOwnershipMarker(ownershipMarker);
-		}
+		if (ownershipMarker) this.appendModelProfileOwnershipMarker(ownershipMarker);
 		return entry.id;
 	}
 
