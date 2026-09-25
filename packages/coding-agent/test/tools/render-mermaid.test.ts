@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { RenderMermaidTool } from "../../src/tools/render-mermaid";
 import type { ToolSession } from "../../src/tools";
+import { RenderMermaidTool } from "../../src/tools/render-mermaid";
 
 describe("RenderMermaidTool", () => {
 	it("returns a native-rendered Mermaid diagram", async () => {
