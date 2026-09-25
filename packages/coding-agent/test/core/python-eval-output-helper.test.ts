@@ -160,4 +160,62 @@ for item in result:
 			await kernel.shutdown();
 		}
 	});
+
+	it("preserves lines longer than 768 cols (uses :raw selector)", async () => {
+		using tempDir = TempDir.createSync("@python-eval-output-long-lines-");
+		// Create an artifact with a line longer than 768 columns (the default read maxColumns)
+		const longLine = "x".repeat(1000);
+		const mockOutput = `short line\n${longLine}\nshort line again`;
+		const readTool = {
+			name: "read",
+			label: "read",
+			description: "read",
+			parameters: { type: "object" },
+			async execute(_id: string, args: unknown): Promise<AgentToolResult> {
+				const { path } = args as { path: string };
+				if (path === "agent://test_long_0:raw") {
+					// With :raw selector, return unmodified content
+					return { content: [{ type: "text", text: mockOutput }] };
+				}
+				if (path === "agent://test_long_0") {
+					// Without :raw, would truncate the long line - but we always use :raw now
+					// This case shouldn't happen with the fix
+					throw new Error(`Expected :raw selector for output() call, got: ${path}`);
+				}
+				throw new Error(`Unexpected path: ${path}`);
+			},
+		} as unknown as AgentTool;
+		const toolSession = {
+			getToolByName: (name: string) => (name === "read" ? readTool : undefined),
+		} as unknown as ToolSession;
+		const bridge = await ensurePyToolBridge();
+		const capability = crypto.randomUUID();
+		const sessionId = "python-eval-output-long-lines-test";
+		const unregister = registerPyToolBridge(sessionId, capability, { toolSession });
+		const kernel = await PythonKernel.start({
+			cwd: tempDir.path(),
+			env: {
+				PI_TOOL_BRIDGE_URL: bridge.url,
+				PI_TOOL_BRIDGE_CAPABILITY: capability,
+				PI_TOOL_BRIDGE_SESSION: sessionId,
+			},
+		});
+		try {
+			const result = await executePythonWithKernel(
+				kernel,
+				`result = output("test_long_0")
+lines = result.split('\\n')
+print(f"line_count: {len(lines)}")
+print(f"long_line_len: {len(lines[1])}")
+print(f"long_line_intact: {lines[1] == 'x' * 1000}")`,
+			);
+			expect(result.exitCode).toBe(0);
+			// Verify the long line was not truncated at 768 cols
+			expect(result.output).toContain("long_line_len: 1000");
+			expect(result.output).toContain("long_line_intact: True");
+		} finally {
+			unregister();
+			await kernel.shutdown();
+		}
+	});
 });

@@ -215,8 +215,9 @@ if "__gjc_prelude_loaded__" not in globals():
         results: list[dict] = []
         
         for output_id in ids:
-            # Read the whole resource via tool bridge (no selector to avoid context expansion)
-            path = f"agent://{output_id}"
+            # Read the whole resource via tool bridge with :raw to avoid truncation at 768 cols
+            # and line-number decoration. This ensures output() returns exact artifact bytes.
+            path = f"agent://{output_id}:raw"
             try:
                 # Call tool.read() to get the content
                 # The read tool returns either a string or {text, details, ...}
