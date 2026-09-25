@@ -2430,6 +2430,8 @@ dependencies = [
  "pi-ast",
  "pi-iso",
  "pi-shell",
+ "pi-vfs",
+ "pi-walker",
  "portable-pty",
  "rayon",
  "regex",
@@ -2476,6 +2478,32 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg 0.56.0",
  "xxhash-rust",
+]
+
+[[package]]
+name = "pi-vfs"
+version = "0.17.6"
+dependencies = [
+ "async-trait",
+ "libc",
+ "parking_lot",
+ "tokio",
+ "tokio-util",
+ "windows-sys 0.61.2",
+ "xattr",
+]
+
+[[package]]
+name = "pi-walker"
+version = "0.17.6"
+dependencies = [
+ "globset",
+ "ignore",
+ "libc",
+ "parking_lot",
+ "pi-vfs",
+ "rayon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4839,6 +4867,16 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "xxhash-rust"

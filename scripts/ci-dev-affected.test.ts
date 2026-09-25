@@ -259,6 +259,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		expect(windowsJob).toContain("bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts");
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
 		expect(requiredLines.length).toBe(2);
 		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
@@ -1347,6 +1348,15 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"Cargo.lock",
 			"crates/brush-core-vendored/Cargo.toml",
 			"crates/pi-shell/Cargo.toml",
+			// 2.3: native walker pool failure requires the Windows Job Object live test.
+			"crates/pi-vfs/Cargo.toml",
+			"crates/pi-vfs/src/native/windows.rs",
+			"crates/pi-walker/Cargo.toml",
+			"crates/pi-walker/src/cache.rs",
+			"crates/pi-natives/src/iofs.rs",
+			"crates/pi-natives/src/glob.rs",
+			"packages/natives/test/walker-pool-unavailable.test.ts",
+			"packages/natives/test/walker-pool-unavailable.windows.test.ts",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);

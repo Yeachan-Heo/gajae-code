@@ -636,6 +636,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/dirs.ts" ||
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
+		// 2.3 walker Rayon pool failures are constrained-host-sensitive: only the
+		// Windows Job Object test can prove that no implicit worker threads spawn.
+		changedPath.startsWith("crates/pi-vfs/") ||
+		changedPath.startsWith("crates/pi-walker/") ||
+		changedPath === "crates/pi-natives/src/iofs.rs" ||
+		changedPath === "crates/pi-natives/src/glob.rs" ||
+		changedPath.startsWith("packages/natives/test/walker-pool-unavailable") ||
 		changedPath === "packages/natives/native/loader-state.js" ||
 		changedPath === "scripts/host-detect.ts" ||
 		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the

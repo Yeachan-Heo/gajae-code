@@ -1160,8 +1160,8 @@ export declare function getWorkProfile(lastSeconds: number): WorkProfile
  * Resolves the search root, scans entries, applies glob and optional file-type
  * filters, and optionally streams each accepted match through `on_match`.
  *
- * If `sortByMtime` is enabled, all matching entries are collected, sorted by
- * descending mtime, then truncated to `maxResults`.
+ * When `sortByMtime` is enabled, entries are ordered by mtime after the
+ * budget-checked filesystem scan and final symlink-aware type filtering.
  *
  * # Errors
  * Returns an error when the search path cannot be resolved, the path is not a
@@ -1176,10 +1176,7 @@ export interface GlobMatch {
   path: string
   /** Resolved filesystem type for the match. */
   fileType: FileType
-  /**
-   * Modification time in milliseconds since Unix epoch (from
-   * `symlink_metadata`).
-   */
+  /** Modification time in milliseconds since Unix epoch. */
   mtime?: number
   /** File size in bytes for regular files. */
   size?: number
@@ -1189,7 +1186,7 @@ export interface GlobMatch {
 export interface GlobOptions {
   /** Glob pattern to match (e.g., "*.ts"). */
   pattern: string
-  /** Directory to search. */
+  /** Directory to search: a host path or an absolute `scheme://` URL. */
   path: string
   /**
    * Filter by file type: "file", "dir", or "symlink". Symlinks are
@@ -1204,7 +1201,7 @@ export interface GlobOptions {
   maxResults?: number
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
+  /** Enable walker scan caching (default: false). */
   cache?: boolean
   /** Sort results by mtime (most recent first) before applying limit. */
   sortByMtime?: boolean
@@ -1503,13 +1500,13 @@ export declare function initNativeCrashDiagnostics(): boolean
 export declare function inspectConfigFilePermissionRepair(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**
- * Invalidate the filesystem scan cache.
+ * Invalidate the walker scan cache.
  *
  * When called with a path, removes entries for roots containing that path.
  * When called without a path, clears the entire cache.
  *
- * Intended to be called after agent file mutations (write, edit, rename,
- * delete).
+ * Intended to be called after agent file mutations: write, edit, rename, or
+ * delete.
  */
 export declare function invalidateFsScanCache(path?: string | undefined | null): void
 
@@ -2674,6 +2671,12 @@ export declare function visibleWidth(text: string, tabWidth: number): number
 
 /** Calculate visible widths of many strings, excluding ANSI escape sequences. */
 export declare function visibleWidths(lines: Array<string>, tabWidth: number): Array<number>
+
+/**
+ * Reports walker Rayon pool initialization without triggering pool
+ * construction.
+ */
+export declare function walkerPoolStatus(): string
 
 export interface WindowsJobMemoryProbeResult {
   kind: string

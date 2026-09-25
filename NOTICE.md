@@ -7,6 +7,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - [`oh-my-claudecode`](https://github.com/Yeachan-Heo/oh-my-claudecode) — Claude Code workflow exploration.
 - [`insane-search`](https://github.com/fivetaku/insane-search) — MIT-licensed public-route fetch engine by @fivetaku, vendored as the safe `insane` fallback/search provider lineage.
 - [`Markit`](https://github.com/Michaelliv/markit) — MIT-licensed document converter, pinned to `markit-ai` 0.5.3 under `packages/coding-agent/vendor/markit-ai`. Its license, upstream package metadata, integrity/hash inventory and reproducible patch are retained alongside the vendored code; MuPDF remains separately licensed as described below.
+- `pi-vfs` and `pi-walker` are MIT-licensed crates vendored at `a85bd5228d9f0f619deade1db78fa49420a721e1`; their retained license texts are in `crates/pi-vfs/LICENSE` and `crates/pi-walker/LICENSE`.
 
 ## MuPDF WebAssembly
 

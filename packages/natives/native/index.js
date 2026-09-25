@@ -108,6 +108,7 @@ export const verifyOwnerOnlyPathSecurity = nativeBindings.verifyOwnerOnlyPathSec
 export const verifyOwnerOnlyPathSecurityExpected = nativeBindings.verifyOwnerOnlyPathSecurityExpected;
 export const visibleWidth = nativeBindings.visibleWidth;
 export const visibleWidths = nativeBindings.visibleWidths;
+export const walkerPoolStatus = nativeBindings.walkerPoolStatus;
 export const wrapTextWithAnsi = nativeBindings.wrapTextWithAnsi;
 
 // string/numeric enums (napi-rs string_enum produces TS-only const enum)

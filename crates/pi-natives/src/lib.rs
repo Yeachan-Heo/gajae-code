@@ -38,6 +38,7 @@ pub mod grep;
 pub mod hashline;
 pub mod highlight;
 pub mod html;
+pub mod iofs;
 pub mod keys;
 pub mod linediff;
 pub mod memory;
