@@ -15,6 +15,7 @@ import {
 	type TSchema,
 	validateToolArguments,
 } from "@gajae-code/ai/core";
+import { isDesignedError, markDesignedError } from "@gajae-code/utils/error-classification";
 import type { Theme } from "../../modes/theme/theme";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { applyToolProxy } from "../tool-proxy";
@@ -216,7 +217,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					// Extension marks a successful result as error
 					const textBlocks = (modifiedContent ?? []).filter((c): c is TextContent => c.type === "text");
 					const errorText = textBlocks.map(t => t.text).join("\n") || "Tool result marked as error by extension";
-					throw new Error(errorText);
+					// A deliberate extension verdict on a successful result, like a block, is not a fault.
+					throw markDesignedError(new Error(errorText));
 				}
 				if (resultResult.isError === false && executionError) {
 					// Extension clears the error - return success
@@ -226,7 +228,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// Error status unchanged, but content/details may be modified
 				if (executionError) {
 					const textBlocks = modifiedContent.filter((content): content is TextContent => content.type === "text");
-					throw new Error(textBlocks.map(content => content.text).join("\n") || "Tool execution failed");
+					const mediatedError = new Error(
+						textBlocks.map(content => content.text).join("\n") || "Tool execution failed",
+					);
+					// Rewording the text does not change what failed: keep the original classification.
+					throw isDesignedError(executionError) ? markDesignedError(mediatedError) : mediatedError;
 				}
 				return { content: modifiedContent, details: modifiedDetails };
 			}

@@ -12,6 +12,7 @@ import type { ToolSession } from "../../tools";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
+import { ToolError } from "../../tools/tool-errors";
 import { generateDiffString, replaceText } from "../diff";
 import {
 	countLeadingWhitespace,
@@ -1104,7 +1105,7 @@ export async function executeReplaceSingle(
 	enforcePlanModeWrite(session, path);
 
 	if (old_text.length === 0) {
-		throw new Error("old_text must not be empty.");
+		throw new ToolError("old_text must not be empty.");
 	}
 
 	const absolutePath = resolvePlanPath(session, path);
@@ -1169,7 +1170,7 @@ async function executeReplaceSingleUnderLock(
 		});
 
 		if (matchOutcome.occurrences && matchOutcome.occurrences > 1) {
-			throw new Error(formatOccurrenceError(path, matchOutcome));
+			throw new ToolError(formatOccurrenceError(path, matchOutcome));
 		}
 
 		throw new EditMatchError(path, normalizedOldText, matchOutcome.closest, {
@@ -1180,7 +1181,7 @@ async function executeReplaceSingleUnderLock(
 	}
 
 	if (normalizedContent === result.content) {
-		throw new Error(`Edits to ${path} resulted in no changes being made.`);
+		throw new ToolError(`Edits to ${path} resulted in no changes being made.`);
 	}
 
 	const finalContent = await serializeEditFileText(
