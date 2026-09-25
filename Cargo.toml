@@ -179,6 +179,8 @@ too_many_lines = "allow"     # Arbitrary limits don't account for necessary comp
 pi-ast = { path = "crates/pi-ast" }
 pi-iso = { path = "crates/pi-iso" }
 pi-shell = { path = "crates/pi-shell" }
+pi-vfs = { path = "crates/pi-vfs" }
+pi-walker = { path = "crates/pi-walker" }
 brush-core = { path = "crates/brush-core-vendored" }
 brush-builtins = { path = "crates/brush-builtins-vendored" }
 
