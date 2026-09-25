@@ -1,3 +1,5 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/pty.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain bounded loss reporting, ConPTY single-flight, and child cleanup.
 //! PTY-backed interactive command execution exported via N-API.
 //!
 //! # Overview

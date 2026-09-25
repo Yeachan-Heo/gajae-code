@@ -11,6 +11,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 ## Vendored Rust from oh-my-pi @ a85bd522
 
 - The syntax-highlighting re-sync and six bundled `.sublime-syntax` files are derived from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1` and distributed under MIT.
+- The PTY binding is derived from `crates/pi-natives/src/pty.rs` at the pinned commit and retains GJC's bounded output-loss reporting, ConPTY single-flight guard, and child cleanup.
 Copyright (c) 2025 Mario Zechner, 2025–2026 Can Bölük, and 2026 Stencil Labs, Inc. Per-file headers retain the upstream source path and local modifications.
 
 ## MuPDF WebAssembly
