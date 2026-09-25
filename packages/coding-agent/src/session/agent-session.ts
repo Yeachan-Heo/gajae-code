@@ -14494,6 +14494,7 @@ export class AgentSession {
 			);
 		}
 		try {
+			await this.sessionManager.recoverPersistenceFailure();
 			this.sessionManager.appendTtsrInjection([], this.#ttsrManager.getInjectedRecords(), failure.nextMessageCount);
 			this.#ttsrManager.restoreMessageCount(failure.nextMessageCount);
 			if (failure.slot.error === failure.error) failure.slot.error = undefined;

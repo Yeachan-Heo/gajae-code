@@ -2230,18 +2230,27 @@ describe("AgentSession TTSR resume gate", () => {
 				return stream;
 			},
 		});
-		const sessionManager = SessionManager.inMemory(tempDir);
-		const appendTtsrInjection = sessionManager.appendTtsrInjection.bind(sessionManager);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
+		const originalWriteSync = fs.writeSync.bind(fs);
 		let rejectNextTurnCheckpoint = true;
-		vi.spyOn(sessionManager, "appendTtsrInjection").mockImplementation((ruleNames, records, messageCount) => {
-			if (ruleNames.length === 0 && rejectNextTurnCheckpoint) {
-				rejectNextTurnCheckpoint = false;
-				order.push("persist-failed");
-				throw new Error("injected turn-end persistence failure");
+		vi.spyOn(fs, "writeSync").mockImplementation(function (this: unknown, ...args: Parameters<typeof fs.writeSync>) {
+			const payload: unknown = args[1];
+			const line =
+				typeof payload === "string"
+					? payload
+					: payload instanceof Uint8Array
+						? new TextDecoder().decode(payload)
+						: "";
+			if (line.includes('"type":"ttsr_injection"')) {
+				if (rejectNextTurnCheckpoint) {
+					rejectNextTurnCheckpoint = false;
+					order.push("persist-failed");
+					throw new Error("injected turn-end persistence failure");
+				}
+				order.push("persisted");
 			}
-			order.push("persisted");
-			return appendTtsrInjection(ruleNames, records, messageCount);
-		});
+			return originalWriteSync(...args);
+		} as typeof fs.writeSync);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-turn-end-failure.db"));
 		authStorages.push(authStorage);
