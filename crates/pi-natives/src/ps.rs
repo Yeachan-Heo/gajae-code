@@ -1,3 +1,5 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/ps.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain identity observation and pinned-root signaling via local process.rs.
 //! N-API bindings for cross-platform process tree management.
 //!
 //! The platform-specific implementation lives in [`pi_shell::process`]; this
