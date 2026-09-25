@@ -6,6 +6,7 @@ import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { inspectConfigFile, runConfigCommand } from "../src/cli/config-cli";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { readDurableModelProfileOwnership } from "../src/config/model-profile-ownership";
 import { resetSettingsForTest, settings } from "../src/config/settings";
 
 let testAgentDir = "";
@@ -103,6 +104,49 @@ describe("config CLI schema coverage", () => {
 		expect(parsed.key).toBe("modelRoles");
 		expect(parsed.type).toBe("record");
 		expect(parsed.value).toEqual({ default: "claude-opus-4-6" });
+	});
+
+	it("sets and resets durable model-profile ownership through versioned commits", async () => {
+		await runConfigCommand({
+			action: "set",
+			key: "modelProfile.default",
+			value: "codex-medium",
+			flags: { json: true },
+		});
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 1,
+			marker: { kind: "profile", profile: "codex-medium" },
+		});
+
+		await runConfigCommand({ action: "reset", key: "modelProfile.default", flags: { json: true } });
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 2,
+			marker: { kind: "cleared" },
+		});
+		expect(settings.getGlobal("modelProfile.default")).toBeUndefined();
+	});
+
+	it("rejects a missing profile before committing durable ownership", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.spyOn(process, "exit").mockImplementation(((): never => {
+			throw new Error("process.exit");
+		}) as never);
+
+		await expect(
+			runConfigCommand({
+				action: "set",
+				key: "modelProfile.default",
+				value: "deleted-profile",
+				flags: { json: true },
+			}),
+		).rejects.toThrow("process.exit");
+		expect(readDurableModelProfileOwnership(settings)).toEqual({
+			schemaVersion: 1,
+			version: 0,
+			marker: { kind: "inherit" },
+		});
 	});
 
 	it("sets and gets array settings as JSON arrays", async () => {
