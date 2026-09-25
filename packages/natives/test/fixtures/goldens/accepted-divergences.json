@@ -179,6 +179,64 @@
       },
       "reason": "Pinned upstream resolves job specifications and reports missing jobs with the shell-compatible diagnostic and non-zero status."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "enable-shared-object-unsupported",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -f\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "enable: cannot open shared object missing.so: dynamic loading is not supported\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports dynamic loading as an ordinary builtin error with an explicit unsupported-platform explanation."
+    },
+    {
+      "module": "shell",
+      "caseId": "enable-remove-built-in",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -d\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "echo: not dynamically loaded\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream distinguishes static builtins from builtins that could be removed from a dynamically loaded object."
+    },
+    {
+      "module": "shell",
+      "caseId": "enable-remove-missing-built-in",
+      "fields": {
+        "before": {
+          "output": "error: enable: not yet implemented: enable -d\n",
+          "exitCode": 99,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "missing: not a shell builtin\n",
+          "exitCode": 1,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports the named object as not a builtin when no dynamically loaded command exists to remove."
+    }
   ],
   "nonAdoptions": [
     {

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "source": "executeShell from integration-wave1 at b61218470f before the Phase 3.6 shell re-sync",
-  "normalization": "Exact callback text and ShellRunResult status; UTF-8 literals are platform-independent.",
+  "normalization": "Exact callback text and ShellRunResult status; command outputs are platform-independent.",
   "cases": [
     {
       "id": "plain",
@@ -32,8 +32,7 @@
         "cancelled": false,
         "timedOut": false
       }
-    }
-,
+    },
     {
       "id": "read-e-redirected-input",
       "command": "printf '' | read -e value",
@@ -53,8 +52,7 @@
         "cancelled": false,
         "timedOut": false
       }
-    }
-,
+    },
     {
       "id": "jobs-list-changed",
       "command": "jobs -n",
@@ -80,6 +78,36 @@
       "command": "jobs %99999",
       "result": {
         "output": "error: jobs: not yet implemented: jobs with job specs\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-shared-object-unsupported",
+      "command": "enable -f missing.so",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -f\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-remove-built-in",
+      "command": "enable -d echo",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -d\n",
+        "exitCode": 99,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "enable-remove-missing-built-in",
+      "command": "enable -d missing",
+      "result": {
+        "output": "error: enable: not yet implemented: enable -d\n",
         "exitCode": 99,
         "cancelled": false,
         "timedOut": false
