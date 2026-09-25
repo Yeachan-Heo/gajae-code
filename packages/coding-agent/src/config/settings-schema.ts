@@ -1554,6 +1554,19 @@ export const SETTINGS_SCHEMA = {
 		default: 3,
 		validate: (value: number) => Number.isInteger(value) && value > 0,
 	},
+	// Circuit breaker: an entry that fails out of a managed fallback chain is
+	// skipped by later turns and sibling sessions until its cooldown elapses.
+	// Consecutive opens double the cooldown up to the max. 0 disables the breaker.
+	"fallback.circuitCooldownMs": {
+		type: "number",
+		default: 60_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"fallback.circuitMaxCooldownMs": {
+		type: "number",
+		default: 30 * 60 * 1000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
 
 	// Retries
 	"retry.enabled": { type: "boolean", default: true },
