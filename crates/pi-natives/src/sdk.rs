@@ -33,7 +33,7 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 
 fn saturating_increment(counter: &AtomicU64) {
-	let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
+	let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1));
 }
 /// Bound endpoint info returned from [`NotificationServer::start`].
 #[napi(object)]

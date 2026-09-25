@@ -734,7 +734,7 @@ fn collect_files(
 /// Check if `bytes[start]` (which must be `b'{'`) begins a valid repetition
 /// quantifier: `{N}`, `{N,}`, or `{N,M}` where N and M are decimal digits.
 /// Returns the byte index of the closing `}` if valid.
-fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
+const fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
 	let len = bytes.len();
 	let mut i = start + 1;
 	// Must start with at least one digit.
@@ -767,7 +767,7 @@ fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
 	None
 }
 
-fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
+const fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
 	let mut i = start + 1;
 	while i < bytes.len() {
 		if bytes[i] == b'}' {

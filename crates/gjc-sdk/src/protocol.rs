@@ -1905,7 +1905,7 @@ mod tests {
 			EphemeralTurnResult { message_id: 0, ..valid.clone() },
 			EphemeralTurnResult { message_id: MAX_SAFE_INTEGER + 1, ..valid.clone() },
 			EphemeralTurnResult { thread_id: "0".into(), ..valid.clone() },
-			EphemeralTurnResult { status: EphemeralTurnStatus::Busy, ..valid.clone() },
+			EphemeralTurnResult { status: EphemeralTurnStatus::Busy, ..valid },
 		] {
 			assert!(serde_json::to_string(&invalid).is_err(), "serialized {invalid:?}");
 		}

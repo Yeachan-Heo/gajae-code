@@ -366,7 +366,7 @@ fn ansi_seq_len_u16(data: &[u16], pos: usize) -> Option<usize> {
 }
 
 #[inline]
-fn is_sgr_u16(seq: &[u16]) -> bool {
+const fn is_sgr_u16(seq: &[u16]) -> bool {
 	seq.len() >= 3 && seq[1] == b'[' as u16 && *seq.last().unwrap() == b'm' as u16
 }
 
@@ -429,7 +429,7 @@ impl Osc8State {
 }
 
 #[inline]
-fn is_osc8_u16(seq: &[u16]) -> bool {
+const fn is_osc8_u16(seq: &[u16]) -> bool {
 	seq.len() >= 6
 		&& seq[0] == ESC
 		&& seq[1] == b']' as u16
@@ -677,7 +677,7 @@ fn trim_end_spaces_in_place(line: &mut Vec<u16>) {
 	}
 }
 
-fn is_escaped_u16(data: &[u16], index: usize) -> bool {
+const fn is_escaped_u16(data: &[u16], index: usize) -> bool {
 	let mut backslashes = 0usize;
 	let mut i = index;
 	while i > 0 {

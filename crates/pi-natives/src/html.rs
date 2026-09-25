@@ -1,6 +1,8 @@
 //! HTML to Markdown conversion.
 
-use html_to_markdown_rs::{ConversionOptions, PreprocessingOptions, PreprocessingPreset, convert};
+use html_to_markdown_rs::{
+	ConversionOptions, PreprocessingOptions, PreprocessingPreset, WarningKind, convert,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -38,10 +40,19 @@ pub fn html_to_markdown(
 				remove_navigation: true,
 				remove_forms:      true,
 			},
+			tier_strategy: html_to_markdown_rs::TierStrategy::Tier2,
 			..Default::default()
 		};
 
-		convert(html.as_str(), Some(conversion_opts))
-			.map_err(|err| Error::from_reason(format!("Conversion error: {err}")))
+		let result = convert(html.as_str(), Some(conversion_opts))
+			.map_err(|err| Error::from_reason(format!("Conversion error: {err}")))?;
+		if let Some(warning) = result
+			.warnings
+			.iter()
+			.find(|warning| warning.kind == WarningKind::DepthLimitExceeded)
+		{
+			return Err(Error::from_reason(format!("Conversion error: {}", warning.message)));
+		}
+		Ok(result.content.unwrap_or_default())
 	})
 }

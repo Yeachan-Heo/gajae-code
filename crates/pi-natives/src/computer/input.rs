@@ -343,7 +343,7 @@ impl<S: EventSink> InputController<S> {
 	/// Returns a keyboard release error after releasing the held mouse buttons.
 	pub fn release_all(&mut self) -> Result<(), InputError> {
 		let at = self.cursor;
-		let held: Vec<MouseButton> = self.held_buttons.drain(..).collect();
+		let held: Vec<MouseButton> = std::mem::take(&mut self.held_buttons);
 		for button in held {
 			self.sink.mouse_button(at, button, false);
 		}
@@ -873,7 +873,7 @@ mod live_tests {
 	use crate::computer::capture::capture_primary_display;
 
 	/// Fires a real cursor move (no clicks/keys) and reads the position back to
-	/// prove the CGEvent input pipeline works end to end. Ignored by default;
+	/// prove the `CGEvent` input pipeline works end to end. Ignored by default;
 	/// run with `--ignored` on a macOS host with Accessibility granted.
 	#[test]
 	#[ignore = "moves the real cursor; needs macOS + Accessibility granted"]
@@ -922,7 +922,7 @@ mod live_tests {
 	}
 
 	/// G005 acceptance drill: drives all nine primitives through the gated
-	/// execute_input path against the focused frontmost app, then waits for a
+	/// `execute_input` path against the focused frontmost app, then waits for a
 	/// human kill-switch press and proves input is blocked afterward.
 	#[test]
 	#[ignore = "live G005: drives the focused app + needs a human hotkey press"]

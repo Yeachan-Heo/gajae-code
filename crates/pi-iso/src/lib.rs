@@ -222,6 +222,9 @@ pub type IsoResult<T> = Result<T, IsoError>;
 /// [`diff`](Self::diff) is async because it does heavy I/O — walking
 /// trees, reading files, spawning git — and benefits from the runtime
 /// interleaving requests with other work.
+// `async_trait` expands default async methods to `#[must_use]` pinned futures,
+// which newer clippy flags as `double_must_use` on macro-generated code.
+#[allow(clippy::double_must_use, reason = "async_trait-generated attribute")]
 #[async_trait]
 pub trait IsolationBackend: Send + Sync {
 	fn kind(&self) -> BackendKind;
