@@ -200,6 +200,7 @@ const requiredGeneratedBindingSymbols = [
 	"diffLines",
 	"diffWords",
 	"openRecoveryFsRoot",
+	"rasterizeSvg",
 	"repairOwnerOnlyPathSecurityExpected",
 	"structuredPatchHunks",
 	"verifyOwnerOnlyPathSecurityExpected",

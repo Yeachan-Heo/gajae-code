@@ -92,6 +92,7 @@ export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
 export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
+export const rasterizeSvg = nativeBindings.rasterizeSvg;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;
 export const renameDirectoryNoReplacePath = nativeBindings.renameDirectoryNoReplacePath;
 export const renameDirectoryNoReplacePathAsync = nativeBindings.renameDirectoryNoReplacePathAsync;

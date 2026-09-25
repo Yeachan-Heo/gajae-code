@@ -45,6 +45,7 @@ pub mod keys;
 pub mod memory;
 pub mod sdk;
 pub mod sixel;
+pub mod svg;
 pub use pi_ast::language;
 
 pub mod power;

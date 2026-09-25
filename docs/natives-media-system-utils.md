@@ -1,10 +1,11 @@
 # Natives media + system utilities
 
-This document covers the media/system/conversion exports in `@gajae-code/natives`: sixel encoding, HTML conversion, clipboard access, macOS appearance/power helpers, and work profiling.
+This document covers the media/system/conversion exports in `@gajae-code/natives`: bounded SVG-to-PNG rasterization, SIXEL encoding, HTML conversion, clipboard access, macOS appearance/power helpers, and work profiling.
 
 ## Implementation files
 
 - `crates/pi-natives/src/sixel.rs`
+- `crates/pi-natives/src/svg.rs`
 
 > Note: `PhotonImage` was removed from the addon; image decode/transform/encode now runs through `Bun.Image` in TypeScript (`packages/coding-agent/src/utils/image-resize.ts`). `encodeSixel` remains a native export.
 - `crates/pi-natives/src/html.rs`
@@ -22,6 +23,7 @@ This document covers the media/system/conversion exports in `@gajae-code/natives
 | JS export                                           | Rust N-API export              | Rust module         |
 | --------------------------------------------------- | ------------------------------ | ------------------- |
 | `encodeSixel(bytes, targetWidthPx, targetHeightPx)` | `encode_sixel`                 | `sixel.rs`          |
+| `rasterizeSvg(input, maxWidthPx, maxHeightPx)`       | `rasterize_svg`                | `svg.rs`            |
 | `htmlToMarkdown(html, options?)`                    | `html_to_markdown`             | `html.rs`           |
 | `copyToClipboard(text)`                             | `copy_to_clipboard`            | `clipboard.rs`      |
 | `readImageFromClipboard()`                          | `read_image_from_clipboard`    | `clipboard.rs`      |
@@ -32,6 +34,12 @@ This document covers the media/system/conversion exports in `@gajae-code/natives
 | `getWorkProfile(lastSeconds)`                       | `get_work_profile`             | `prof.rs`           |
 
 ## Data format boundaries and conversions
+
+### SVG rasterization (`svg`)
+
+- **JS input boundary**: SVG/SVGZ bytes and positive maximum width/height in pixels.
+- **Native boundary**: `rasterizeSvg(...)` parses and renders on the blocking pool, does not resolve file-backed images, and returns PNG bytes.
+- **Bounds**: renders are not enlarged; requested canvas limits with a product above 16 megapixels are rejected.
 
 ### Image (`image`)
 

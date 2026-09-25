@@ -4,6 +4,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 
 - [`oh-my-pi`](https://github.com/can1357/oh-my-pi) — the upstream red-claw lineage and implementation DNA.
 - MIT-licensed Rust diff primitives and N-API bridge vendored from `can1357/oh-my-pi` at `a85bd5228d9f0f619deade1db78fa49420a721e1` under `crates/pi-diff` and `crates/pi-natives/src/diff.rs`; see `crates/pi-diff/LICENSE`.
+- SVG rasterization uses `resvg` and `png` under their MIT licenses; `crates/pi-natives/src/svg.rs` is vendored from `can1357/oh-my-pi` commit `a85bd5228d9f0f619deade1db78fa49420a721e1` (MIT).
 - [`oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) — Codex-focused orchestration experiments.
 - [`oh-my-claudecode`](https://github.com/Yeachan-Heo/oh-my-claudecode) — Claude Code workflow exploration.
 - [`insane-search`](https://github.com/fivetaku/insane-search) — MIT-licensed public-route fetch engine by @fivetaku, vendored as the safe `insane` fallback/search provider lineage.

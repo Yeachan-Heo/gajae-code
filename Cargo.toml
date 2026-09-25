@@ -304,6 +304,8 @@ image = { version = "0.25", default-features = false, features = [
    "gif",
    "webp",
 ] }
+png = "0.18"
+resvg = "0.48"
 # Not used directly: activates zune-jpeg's 'log' feature so image's JPEG decoder
 # compiles (0.5.15 no-log stub macros are not expression-safe).
 zune-jpeg = { version = "0.5", default-features = false, features = ["log"] }

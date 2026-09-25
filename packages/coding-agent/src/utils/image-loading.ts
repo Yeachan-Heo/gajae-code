@@ -7,6 +7,20 @@ import { formatDimensionNote, resizeImageBuffer } from "./image-resize";
 export const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
 export const SUPPORTED_INPUT_IMAGE_MIME_TYPES = SUPPORTED_IMAGE_MIME_TYPES;
 
+const SVG_MIME_TYPE = "image/svg+xml";
+const SVG_PREVIEW_MAX_DIMENSION_PX = 2048;
+type NativeSvgBindings = Pick<typeof import("@gajae-code/natives"), "rasterizeSvg">;
+let nativeSvgBindings: NativeSvgBindings | undefined;
+
+function nativeSvg(): NativeSvgBindings {
+	nativeSvgBindings ??= require("@gajae-code/natives") as NativeSvgBindings;
+	return nativeSvgBindings;
+}
+
+export async function rasterizeSvgInputBytes(inputBuffer: Uint8Array): Promise<Uint8Array> {
+	return await nativeSvg().rasterizeSvg(inputBuffer, SVG_PREVIEW_MAX_DIMENSION_PX, SVG_PREVIEW_MAX_DIMENSION_PX);
+}
+
 export interface LoadImageInputOptions {
 	path: string;
 	cwd: string;
@@ -76,16 +90,23 @@ export async function transformImageInputBytes(options: LoadImageInputBytesOptio
 		throw new ImageInputTooLargeError(options.inputBuffer.byteLength, maxBytes);
 	}
 
-	let outputBuffer: Uint8Array = options.inputBuffer;
-	let outputMimeType = options.mimeType;
+	let sourceBuffer = options.inputBuffer;
+	let sourceMimeType = options.mimeType;
+	if (sourceMimeType === SVG_MIME_TYPE) {
+		sourceBuffer = Buffer.from(await rasterizeSvgInputBytes(sourceBuffer));
+		sourceMimeType = "image/png";
+	}
+
+	let outputBuffer: Uint8Array = sourceBuffer;
+	let outputMimeType = sourceMimeType;
 	let dimensionNote: string | undefined;
 
 	if (options.autoResize) {
 		options.signal?.throwIfAborted();
 		try {
 			const resized = await resizeImageBuffer(
-				options.inputBuffer,
-				options.mimeType,
+				sourceBuffer,
+				sourceMimeType,
 				options.maxOutputBytes === undefined ? undefined : { maxBytes: options.maxOutputBytes },
 			);
 			options.signal?.throwIfAborted();
