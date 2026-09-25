@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-25
+
+### Changed
+
+- Bump the spoofed Claude Code version from 2.1.280 to 2.1.281 and Gemini CLI version from 0.60.0 to 0.61.0. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli` fingerprint can return HTTP 400 for an otherwise reachable model; the Gemini CLI fingerprint drifts the same way.
+
+### Fixed
+
+- Anthropic-compatible endpoints that leave `compat.supportsLongCacheRetention` unset no longer downgrade the default `long` prompt-cache retention to the ~5m TTL silently: GJC now logs one warning per provider session naming the provider and model and pointing at the flag. Set it to `true` for gateways that forward `ttl: "1h"`, or to `false` to accept the ~5m lifetime and silence the warning. (#5944)
+
+- Vertex AI Application Default Credentials now accept `type: "external_account"` (Workload Identity Federation): the subject token is read from `credential_source` (file, url, or opt-in executable), exchanged at STS, and optionally impersonated via `service_account_impersonation_url`, so gjc authenticates from GitHub Actions / GitLab CI without a long-lived service-account key. Unrecognised credential types now fail with a clear "Unsupported Google credential type" error instead of a misleading OAuth client error. (#5929)
+
 ## [0.17.6] - 2026-09-24
 
 ## [0.17.5] - 2026-09-24

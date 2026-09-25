@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "gjc-sdk"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "futures-util",
  "hmac",
@@ -2322,7 +2322,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "async-trait",
  "libc",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "0.17.6"
+version = "0.17.7"
 dependencies = [
  "anyhow",
  "brush-builtins",
