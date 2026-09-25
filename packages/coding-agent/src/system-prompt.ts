@@ -105,19 +105,25 @@ const SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS = 100;
  * reported as timed out (issue #5949). Each tick contributes at most two tick
  * lengths, so blocked stretches do not consume the budget while a genuinely
  * hung step still times out after roughly `budgetMs` of responsive time.
+ *
+ * Aborting `signal` stops the ticker and resolves `false`; exhausting the
+ * budget resolves `true`.
  */
 export async function waitForResponsiveBudget(
 	budgetMs: number,
 	tickMs = SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS,
-): Promise<void> {
+	signal?: AbortSignal,
+): Promise<boolean> {
 	let consumed = 0;
 	let last = performance.now();
 	while (consumed < budgetMs) {
+		if (signal?.aborted) return false;
 		await Bun.sleep(Math.min(tickMs, budgetMs - consumed));
 		const now = performance.now();
 		consumed += Math.min(now - last, tickMs * 2);
 		last = now;
 	}
+	return !signal?.aborted;
 }
 
 async function getGpuModel(): Promise<string | null> {
@@ -622,7 +628,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		} satisfies WorkspaceTree,
 	};
 
-	const deadline = waitForResponsiveBudget(SYSTEM_PROMPT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
+	const deadlineController = new AbortController();
+	const deadline = waitForResponsiveBudget(
+		SYSTEM_PROMPT_PREP_TIMEOUT_MS,
+		SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS,
+		deadlineController.signal,
+	).then(() => "__timeout__" as const);
 	const timedOut: string[] = [];
 	const failed: Array<{ name: string; error: unknown }> = [];
 
@@ -669,26 +680,25 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 					buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
 				);
 
+	// Stop the deadline ticker as soon as every step settles so completed builds
+	// leave no background timers behind; each race has already been decided by then.
+	const preparedSteps = Promise.all([
+		withDeadline(
+			"customPrompt",
+			resolvePromptInput(customPrompt, "system prompt"),
+			prepDefaults.resolvedCustomPrompt,
+		),
+		withDeadline(
+			"appendSystemPrompt",
+			resolvePromptInput(appendSystemPrompt, "append system prompt"),
+			prepDefaults.resolvedAppendPrompt,
+		),
+		withDeadline("loadSystemPromptFiles", systemPromptCustomizationPromise, prepDefaults.systemPromptCustomization),
+		withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
+		withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
+	]).finally(() => deadlineController.abort());
 	const [resolvedCustomPrompt, resolvedAppendPrompt, systemPromptCustomization, contextFileResult, workspaceTree] =
-		await Promise.all([
-			withDeadline(
-				"customPrompt",
-				resolvePromptInput(customPrompt, "system prompt"),
-				prepDefaults.resolvedCustomPrompt,
-			),
-			withDeadline(
-				"appendSystemPrompt",
-				resolvePromptInput(appendSystemPrompt, "append system prompt"),
-				prepDefaults.resolvedAppendPrompt,
-			),
-			withDeadline(
-				"loadSystemPromptFiles",
-				systemPromptCustomizationPromise,
-				prepDefaults.systemPromptCustomization,
-			),
-			withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles),
-			withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
-		]);
+		await preparedSteps;
 	const contextFiles = dedupeExactContextFiles(contextFileResult.contextFiles);
 	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
 

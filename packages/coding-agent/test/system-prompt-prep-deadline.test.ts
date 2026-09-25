@@ -19,9 +19,19 @@ describe("waitForResponsiveBudget", () => {
 		expect(performance.now() - started).toBeGreaterThanOrEqual(500);
 	});
 
+	it("stops ticking as soon as it is aborted", async () => {
+		const controller = new AbortController();
+		const started = performance.now();
+		const deadline = waitForResponsiveBudget(5_000, 20, controller.signal);
+		await Bun.sleep(30);
+		controller.abort();
+		expect(await deadline).toBe(false);
+		expect(performance.now() - started).toBeLessThan(500);
+	});
+
 	it("expires after the budget when the loop stays responsive", async () => {
 		const started = performance.now();
-		await waitForResponsiveBudget(100, 20);
+		expect(await waitForResponsiveBudget(100, 20)).toBe(true);
 		const elapsed = performance.now() - started;
 		expect(elapsed).toBeGreaterThanOrEqual(95);
 		expect(elapsed).toBeLessThan(1_000);
