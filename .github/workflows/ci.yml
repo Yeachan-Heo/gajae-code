@@ -460,15 +460,10 @@ jobs:
               (cd packages/coding-agent && bun pm pack --destination "$package_dir")
               # `bun pm pack` on Windows records non-POSIX member modes, which the
               # strict release tar reader rejects. The published tarball is packed on
-              # Linux, so repack the same members with POSIX modes before scanning;
-              # member contents are unchanged and the binary/addon scan still runs.
+              # Linux; for this scan-only copy, repack the identical member bytes with
+              # uniform POSIX modes via Bun.Archive (no shell tar, no drive-letter paths).
               if [ "$RUNNER_OS" = "Windows" ]; then
-                 repack_dir="$RUNNER_TEMP/coding-agent-package-posix"
-                 mkdir -p "$repack_dir"
-                 tar --force-local -xzf "$package_dir"/*.tgz -C "$repack_dir"
-                 original=$(ls "$package_dir"/*.tgz)
-                 rm "$original"
-                 tar --force-local --format=ustar --mode='u=rwX,go=rX' --owner=0 --group=0 -czf "$original" -C "$repack_dir" package
+                 bun -e 'const [p] = await Array.fromAsync(new Bun.Glob("*.tgz").scan({ cwd: process.argv[1], absolute: true })); const files = await new Bun.Archive(await Bun.file(p).bytes()).files(); await Bun.write(p, await new Bun.Archive(Object.fromEntries(files), { compress: "gzip" }).bytes());' "$package_dir"
               fi
               bun scripts/verify-agpl-removal.ts --payload --tarball "$package_dir"/*.tgz --binary "${{ matrix.binary_path }}" --addon packages/natives/native/*.node --prose-root .
          - name: Smoke memory-guard native route (Windows)
