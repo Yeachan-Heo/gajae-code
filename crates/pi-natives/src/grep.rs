@@ -1197,6 +1197,36 @@ fn per_file_params(params: SearchParams) -> SearchParams {
 	SearchParams { max_count: file_limit, offset: 0, ..params }
 }
 
+fn search_entry(
+	searcher: &mut Searcher,
+	entry: &FileEntry,
+	matcher: &grep_regex::RegexMatcher,
+	params: SearchParams,
+	ct: &task::CancelToken,
+) -> Option<FileSearchResult> {
+	ct.heartbeat().ok()?;
+	let bytes = read_file_bytes(&entry.path).ok()??;
+	ct.heartbeat().ok()?;
+	let search = if params.mode == OutputMode::FilesWithMatches {
+		let matched = matcher.is_match(bytes.as_slice()).ok()?;
+		SearchResultInternal {
+			matches:       Vec::new(),
+			match_count:   u64::from(matched),
+			collected:     u64::from(matched),
+			limit_reached: false,
+		}
+	} else {
+		run_search_slice(searcher, matcher, bytes.as_slice(), params).ok()?
+	};
+	ct.heartbeat().ok()?;
+	Some(FileSearchResult {
+		relative_path: entry.relative_path.clone(),
+		matches:       search.matches,
+		match_count:   search.match_count,
+		limit_reached: search.limit_reached,
+	})
+}
+
 fn run_parallel_search(
 	entries: &[FileEntry],
 	matcher: &grep_regex::RegexMatcher,
@@ -1204,35 +1234,21 @@ fn run_parallel_search(
 	ct: &task::CancelToken,
 ) -> Vec<FileSearchResult> {
 	let file_params = per_file_params(params);
-	let raw: Vec<Option<FileSearchResult>> = entries
-		.par_iter()
-		.map_init(
-			|| build_searcher_for_params(file_params),
-			|searcher, entry| {
-				ct.heartbeat().ok()?;
-				let bytes = read_file_bytes(&entry.path).ok()??;
-				ct.heartbeat().ok()?;
-				let search = if file_params.mode == OutputMode::FilesWithMatches {
-					let matched = matcher.is_match(bytes.as_slice()).ok()?;
-					SearchResultInternal {
-						matches:       Vec::new(),
-						match_count:   u64::from(matched),
-						collected:     u64::from(matched),
-						limit_reached: false,
-					}
-				} else {
-					run_search_slice(searcher, matcher, bytes.as_slice(), file_params).ok()?
-				};
-				ct.heartbeat().ok()?;
-				Some(FileSearchResult {
-					relative_path: entry.relative_path.clone(),
-					matches:       search.matches,
-					match_count:   search.match_count,
-					limit_reached: search.limit_reached,
-				})
-			},
-		)
-		.collect();
+	let raw: Vec<Option<FileSearchResult>> = if crate::rayon_pool_unavailable() {
+		let mut searcher = build_searcher_for_params(file_params);
+		entries
+			.iter()
+			.map(|entry| search_entry(&mut searcher, entry, matcher, file_params, ct))
+			.collect()
+	} else {
+		entries
+			.par_iter()
+			.map_init(
+				|| build_searcher_for_params(file_params),
+				|searcher, entry| search_entry(searcher, entry, matcher, file_params, ct),
+			)
+			.collect()
+	};
 
 	raw.into_iter().flatten().collect()
 }

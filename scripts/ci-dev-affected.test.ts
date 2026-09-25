@@ -1348,6 +1348,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"crates/brush-core-vendored/Cargo.toml",
 			"crates/pi-shell/Cargo.toml",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
+			"packages/natives/test/windows-runtime-install.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);

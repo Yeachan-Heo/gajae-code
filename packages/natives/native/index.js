@@ -30,6 +30,7 @@ export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
 
 // functions
+export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
 export const __piNativesV0_17_6 = nativeBindings.__piNativesV0_17_6;
 export const applyBashFixups = nativeBindings.applyBashFixups;

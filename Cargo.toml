@@ -224,6 +224,7 @@ unicode-width = "0.2"
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Structures - Collections
 # ──────────────────────────────────────────────────────────────────────────────
+heapless = "0.9"
 phf = { version = "0.14", features = ["macros"] }
 smallvec = { version = "1.16.1", features = [
    "serde",
