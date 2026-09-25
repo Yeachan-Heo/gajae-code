@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/lex.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/lex.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 //! Minimal cursor over one line of Mermaid source, shared by every parser.
 //!
 //! Mermaid is line-oriented with a handful of sigils per line, so a

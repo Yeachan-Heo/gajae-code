@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/ansi.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/ansi.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 //! Color output for themed diagrams: ANSI terminal modes (16/256/truecolor)
 //! and HTML `<span>` tags for browser rendering.
 

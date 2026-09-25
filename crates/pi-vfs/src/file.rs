@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/file.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: yes — narrowly scoped async_trait clippy allowance
+// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/file.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: yes —
+// narrowly scoped async_trait clippy allowance
 //! Open file handles: host files and provider-owned handles.
 
 use std::{

@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/parsers.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: preserve full-langs Perl gating and add the pinned Emacs Lisp/Fortran grammars.
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/parsers.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: preserve
+// full-langs Perl gating and add the pinned Emacs Lisp/Fortran grammars.
 //! Tree-sitter parser functions for all supported languages.
 
 use ast_grep_core::tree_sitter::TSLanguage;

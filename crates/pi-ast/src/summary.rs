@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-ast/src/summary.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: gated extended grammars behind full-langs and retained Perl summary elision.
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/summary.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: gated extended
+// grammars behind full-langs and retained Perl summary elision.
 //! Structural source summaries powered by tree-sitter.
 
 use std::{collections::BTreeSet, path::Path};

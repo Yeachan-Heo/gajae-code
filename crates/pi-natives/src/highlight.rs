@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/highlight.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: retain checkpoint cache, input bounds, and the local N-API contract.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/highlight.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain
+// checkpoint cache, input bounds, and the local N-API contract.
 
 //! Syntax highlighting using syntect.
 //!

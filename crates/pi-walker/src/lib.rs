@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-walker/src/lib.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: yes — bounded collection limits and pool-failure serial traversal
+// Vendored from oh-my-pi (MIT) crates/pi-walker/src/lib.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: yes —
+// bounded collection limits and pool-failure serial traversal
 //! Reusable platform directory traversal primitives.
 //!
 //! # Overview

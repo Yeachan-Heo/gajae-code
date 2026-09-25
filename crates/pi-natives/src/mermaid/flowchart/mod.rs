@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/flowchart/mod.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/flowchart/mod.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 //! Flowchart and state-diagram pipeline: parse → layering → grid placement
 //! → A* edge routing → canvas drawing.
 //!

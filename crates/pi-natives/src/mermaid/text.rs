@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/text.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/text.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 //! Terminal display-width math and label normalization shared by every
 //! Mermaid renderer.
 //!

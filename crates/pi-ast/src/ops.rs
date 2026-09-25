@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-ast/src/ops.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: preserve the full-langs-specific language diagnostic and its guard test.
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/ops.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: preserve the
+// full-langs-specific language diagnostic and its guard test.
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};

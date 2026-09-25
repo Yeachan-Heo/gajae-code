@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/text.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: retain GJC OSC 8, inline-math, CRLF, 2-cell Hangul width, and private UTF-16 helper.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/text.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain GJC OSC
+// 8, inline-math, CRLF, 2-cell Hangul width, and private UTF-16 helper.
 //! ANSI-aware text measurement and slicing utilities.
 //!
 //! Optimized for JS string interop (UTF-16).

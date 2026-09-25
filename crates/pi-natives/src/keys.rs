@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/keys.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: retain GJC key-id validation, raw 0x08 handling, PSMux and modifier hardening.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/keys.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain GJC
+// key-id validation, raw 0x08 handling, PSMux and modifier hardening.
 
 //! Kitty keyboard sequence matching utilities.
 //!

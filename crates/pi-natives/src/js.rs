@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/js.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no source changes.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/js.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no source
+// changes.
 //! Borrowing JavaScript strings at the N-API boundary.
 //!
 //! Node-API never hands out a pointer into a JS string's backing store: every

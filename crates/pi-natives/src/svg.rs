@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/svg.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header and fixture-based dimensions/SHA-256 tests only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/svg.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header and fixture-based dimensions/SHA-256 tests only.
 //! Safe SVG rasterization for terminal image previews.
 //!
 //! SVGs are parsed without loading file-backed image resources, capped to a

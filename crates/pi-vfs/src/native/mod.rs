@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/native/mod.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no
+// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/native/mod.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no
 //! Host filesystem operations. Everything here is synchronous: the facades
 //! call it directly, without futures or boxing.
 

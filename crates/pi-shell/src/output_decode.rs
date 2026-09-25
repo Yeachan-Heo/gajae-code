@@ -273,6 +273,11 @@ mod tests {
 
 	#[test]
 	fn incomplete_utf8_at_eof_becomes_replacement() {
+		// Pin UTF-8-only decoding: on Windows `new()` falls back to the host ACP,
+		// where a trailing 0xE4 legitimately decodes (e.g. `ä` under cp1252).
+		#[cfg(windows)]
+		let mut decoder = OutputDecoder::with_fallback_codepage(CP_UTF8);
+		#[cfg(not(windows))]
 		let mut decoder = OutputDecoder::new();
 		assert_eq!(decoder.push(&[0xe4]), "");
 		assert_eq!(decoder.finish(), "\u{FFFD}");

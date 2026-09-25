@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-diff/src/lib.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: none.
+// Vendored from oh-my-pi (MIT) crates/pi-diff/src/lib.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
 
 //! jsdiff-compatible diff primitives without an FFI dependency.
 //!

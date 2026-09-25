@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/canvas.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/canvas.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 //! Column-major 2D text canvas plus the parallel role canvas used for
 //! colored output.
 //!

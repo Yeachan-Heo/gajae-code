@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/canonicalize.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no
+// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/canonicalize.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no
 //! uucore-compatible canonicalization over any backend, URL-aware.
 //!
 //! Mirrors `uucore::fs::canonicalize`: the same missing-component and

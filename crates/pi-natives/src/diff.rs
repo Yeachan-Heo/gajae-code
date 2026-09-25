@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/diff.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: owned path conversion uses `crate::js::into_string`.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/diff.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: owned path
+// conversion uses `crate::js::into_string`.
 
 //! N-API wrappers and streaming support for jsdiff-compatible diff primitives.
 //!

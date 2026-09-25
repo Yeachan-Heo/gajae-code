@@ -1,5 +1,6 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/tests/common/mod.rs @
-// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: test cwd keyed
+// via canonical_key (Windows verbatim prefix).
 //! Fixture harness shared by every engine's integration tests.
 //!
 //! A fixture file (`tests/fixtures/<mode>/<group>.json`) holds
@@ -106,7 +107,9 @@ pub struct Workspace {
 impl Workspace {
 	pub fn new(mode: EditMode) -> Self {
 		let dir = tempfile::tempdir().expect("tempdir");
-		let cwd = dir.path().canonicalize().expect("canonical tempdir");
+		// `canonical_key` strips the Windows `\\?\` verbatim prefix that
+		// `canonicalize()` adds, matching how the snapshot store keys paths.
+		let cwd = pi_edit::path_policy::canonical_key(dir.path());
 		let config = SessionConfig {
 			mode,
 			policy: PathPolicy {

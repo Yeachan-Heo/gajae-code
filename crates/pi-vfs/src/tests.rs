@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/tests.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no
+// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/tests.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no
 //! Regression tests for URL path handling, provider handle semantics, close
 //! tracking, cancellation, and uucore canonicalization parity.
 

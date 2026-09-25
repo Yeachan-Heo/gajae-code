@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-walker/examples/scan-cache-bench.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no
+// Vendored from oh-my-pi (MIT) crates/pi-walker/examples/scan-cache-bench.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no
 use std::{
 	hint::black_box,
 	path::PathBuf,

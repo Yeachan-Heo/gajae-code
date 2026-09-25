@@ -1,5 +1,5 @@
-// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/path.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: no
+// Vendored from oh-my-pi (MIT) crates/pi-vfs/src/path.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: no
 //! URL-aware lexical path helpers.
 //!
 //! A virtual path is spelled `scheme://rest` where `scheme` is an RFC 3986

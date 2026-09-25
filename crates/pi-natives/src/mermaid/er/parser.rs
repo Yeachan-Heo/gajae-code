@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/er/parser.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: attribution header only.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/mermaid/er/parser.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: attribution
+// header only.
 use super::{Cardinality, ErAttribute, ErDiagram, ErEntity, ErKey, ErRelationship};
 use crate::mermaid::{lex::Cursor, text::normalize_label};
 

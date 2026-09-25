@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-walker/src/cache.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: yes — serial pool-failure branch/test hook; bounded scan/cache policy
+// Vendored from oh-my-pi (MIT) crates/pi-walker/src/cache.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: yes —
+// serial pool-failure branch/test hook; bounded scan/cache policy
 //! Shared walker scan cache used by owned-entry collection.
 
 use std::{

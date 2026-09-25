@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/tty_writer.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: lone-surrogate normalization; use the shared UTF-16 N-API helper.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/tty_writer.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code:
+// lone-surrogate normalization; use the shared UTF-16 N-API helper.
 //! Off-thread terminal output pump.
 //!
 //! `write(2)` to a TTY/PTY from the JS thread blocks the whole event loop
@@ -33,8 +34,8 @@ use std::{
 use napi::{Error, JsString, Result};
 use napi_derive::napi;
 use parking_lot::{Condvar, Mutex};
-use crate::js;
 
+use crate::js;
 
 fn append_valid_utf16_segment(units: &[u16], output: &mut Vec<u8>) {
 	if units.is_empty() {

@@ -1,5 +1,7 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/task.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: retained catch_unwind→napi::Error and cancellation checks; adapted panic reporting; feature-gated Promise rejection probe.
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/task.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: retained
+// catch_unwind→napi::Error and cancellation checks; adapted panic reporting;
+// feature-gated Promise rejection probe.
 
 //! Blocking work scheduling for N-API exports.
 //!
