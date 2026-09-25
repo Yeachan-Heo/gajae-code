@@ -145,6 +145,17 @@ Wall-clock and RSS thresholds are noisy. Promotion is gradual:
 
 Held thresholds (`HELD_PERF_THRESHOLDS`) name candidates that need variance characterization before enforcement.
 
+### Per-release RSS checkpoints
+
+The `rss_checkpoint` job in `.github/workflows/ci.yml` runs for every stable tag and nightly. It measures the exact released `gjc-linux-x64` binary and the previous published stable release on the same runner with `scripts/verify-rss-checkpoints.ts --all`, then writes one checkpoint per commit (`<commit>.json` plus `.md`), so a regression can be bisected release to release. The `rss-checkpoint-<version>` run artifact holds both checkpoints. The current binary's compare uses `--compare --advisory --allow-baseline-drift`: this is stage 1 of the process above. Regressions go to the job summary and never fail the release.
+
+To reproduce or bisect locally, point the harness at any compiled binary and give the commit it was built from:
+
+```sh
+bun scripts/verify-rss-checkpoints.ts --scenario S1,S5 --write-baseline \
+  --binary ./gjc-linux-x64 --commit <full-sha> --output-dir /tmp/rss
+```
+
 ## Memory baseline protocol
 
 Detailed memory fixtures cover seven explicit surfaces: CLI startup/configuration, AgentSession-style message/context lifecycle, blob/external buffers, worker generations, Telegram reconnect/queue settlement, TUI render/dispose churn, and shared/native transfer boundaries. The fixtures are synthetic lifecycle proxies: they establish a reproducible allocation and teardown envelope but do not by themselves prove a production leak. A production optimization claim still requires a workload adapter that exercises the implicated owner and a same-host before/after artifact.
