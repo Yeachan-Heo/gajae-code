@@ -2342,8 +2342,10 @@ dependencies = [
  "tree-sitter-dart",
  "tree-sitter-diff",
  "tree-sitter-dockerfile-updated",
+ "tree-sitter-elisp",
  "tree-sitter-elixir",
  "tree-sitter-erlang",
+ "tree-sitter-fortran",
  "tree-sitter-go",
  "tree-sitter-graphql",
  "tree-sitter-haskell",
@@ -2386,6 +2388,7 @@ dependencies = [
  "tree-sitter-xml",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3568,6 +3571,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-elisp"
+version = "1.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b8b82ab7474028f20d2119285566f219209ebdbeec767fa28025b70f94f8cf3"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-elixir"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3582,6 +3595,16 @@ name = "tree-sitter-erlang"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ceb442e728225d601db0661f60d64e166bd9b9a55c587f71d4e4f27378717cce"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-fortran"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea5fea41363a9b59666001dc26c4b356d4e164da27c6ce31145e00aba6bf9b16"
 dependencies = [
  "cc",
  "tree-sitter-language",

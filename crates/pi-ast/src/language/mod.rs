@@ -1,3 +1,5 @@
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/mod.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain full-langs and Perl gating; add pinned Emacs Lisp and Fortran grammars behind full-langs.
 //! Vendored and extended language definitions for ast-grep integration.
 //!
 //! Originally derived from `ast-grep-language` v0.39.9, stripped of
@@ -116,6 +118,8 @@ impl_lang_expando!(Dockerfile, language_dockerfile, 'µ');
 impl_lang_expando!(Elixir, language_elixir, 'µ');
 #[cfg(feature = "full-langs")]
 impl_lang_expando!(Erlang, language_erlang, 'µ');
+#[cfg(feature = "full-langs")]
+impl_lang_expando!(Fortran, language_fortran, '𐀀');
 impl_lang_expando!(Go, language_go, 'µ');
 #[cfg(feature = "full-langs")]
 impl_lang!(Graphql, language_graphql);
@@ -203,6 +207,8 @@ impl_lang!(Xml, language_xml);
 impl_lang!(Regex, language_regex);
 #[cfg(feature = "full-langs")]
 impl_lang!(Dart, language_dart);
+#[cfg(feature = "full-langs")]
+impl_lang!(EmacsLisp, language_elisp);
 
 // ── Html (custom implementation with injection support) ──────────────────
 
@@ -322,9 +328,13 @@ pub enum SupportLang {
 	#[cfg(feature = "full-langs")]
 	Dockerfile,
 	#[cfg(feature = "full-langs")]
+	EmacsLisp,
+	#[cfg(feature = "full-langs")]
 	Elixir,
 	#[cfg(feature = "full-langs")]
 	Erlang,
+	#[cfg(feature = "full-langs")]
+	Fortran,
 	Go,
 	#[cfg(feature = "full-langs")]
 	Graphql,
@@ -423,7 +433,7 @@ const ALL_LANGS_DEFAULT: [SupportLang; 19] = [
 ];
 
 #[cfg(feature = "full-langs")]
-const ALL_LANGS_FULL: [SupportLang; 56] = [
+const ALL_LANGS_FULL: [SupportLang; 58] = [
 	SupportLang::Astro,
 	SupportLang::Bash,
 	SupportLang::C,
@@ -435,8 +445,10 @@ const ALL_LANGS_FULL: [SupportLang; 56] = [
 	SupportLang::Css,
 	SupportLang::Diff,
 	SupportLang::Dockerfile,
+	SupportLang::EmacsLisp,
 	SupportLang::Elixir,
 	SupportLang::Erlang,
+	SupportLang::Fortran,
 	SupportLang::Go,
 	SupportLang::Graphql,
 	SupportLang::Haskell,
@@ -527,9 +539,13 @@ impl SupportLang {
 			#[cfg(feature = "full-langs")]
 			Self::Dockerfile => "dockerfile",
 			#[cfg(feature = "full-langs")]
+			Self::EmacsLisp => "emacs-lisp",
+			#[cfg(feature = "full-langs")]
 			Self::Elixir => "elixir",
 			#[cfg(feature = "full-langs")]
 			Self::Erlang => "erlang",
+			#[cfg(feature = "full-langs")]
+			Self::Fortran => "fortran",
 			Self::Go => "go",
 			#[cfg(feature = "full-langs")]
 			Self::Graphql => "graphql",
@@ -660,6 +676,10 @@ macro_rules! execute_lang_method {
 			S::Elixir => Elixir.$method($($pname,)*),
 			#[cfg(feature = "full-langs")]
 			S::Erlang => Erlang.$method($($pname,)*),
+			#[cfg(feature = "full-langs")]
+			S::EmacsLisp => EmacsLisp.$method($($pname,)*),
+			#[cfg(feature = "full-langs")]
+			S::Fortran => Fortran.$method($($pname,)*),
 			S::Go => Go.$method($($pname,)*),
 			#[cfg(feature = "full-langs")]
 			S::Graphql => Graphql.$method($($pname,)*),
@@ -796,7 +816,7 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 		C => &["c", "h"],
 		#[cfg(feature = "full-langs")]
 		Cmake => &["cmake"],
-		Cpp => &["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"],
+		Cpp => &["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "cuh", "ino"],
 		CSharp => &["cs"],
 		#[cfg(feature = "full-langs")]
 		Dart => &["dart"],
@@ -808,9 +828,13 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 		#[cfg(feature = "full-langs")]
 		Dockerfile => &["dockerfile"],
 		#[cfg(feature = "full-langs")]
+		EmacsLisp => &["el"],
+		#[cfg(feature = "full-langs")]
 		Elixir => &["ex", "exs"],
 		#[cfg(feature = "full-langs")]
 		Erlang => &["erl", "hrl"],
+		#[cfg(feature = "full-langs")]
+		Fortran => &["f90", "F90", "f95", "F95", "f03", "F03", "f08", "F08"],
 		Go => &["go"],
 		#[cfg(feature = "full-langs")]
 		Graphql => &["graphql", "gql"],
@@ -912,6 +936,10 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 	{
 		return Some(SupportLang::Dockerfile);
 	}
+	#[cfg(feature = "full-langs")]
+	if name == ".emacs" {
+		return Some(SupportLang::EmacsLisp);
+	}
 
 	let ext = path.extension()?.to_str()?;
 	SupportLang::all_langs()
@@ -935,6 +963,7 @@ static CORE_LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "hh"             => SupportLang::Cpp,
 "hpp"            => SupportLang::Cpp,
 "cu"             => SupportLang::Cpp,
+"cuh"            => SupportLang::Cpp,
 "ino"            => SupportLang::Cpp,
 "csharp"         => SupportLang::CSharp,
 "c#"             => SupportLang::CSharp,
@@ -992,12 +1021,21 @@ static LONG_TAIL_LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {
 "docker"         => SupportLang::Dockerfile,
 "dockerfile"     => SupportLang::Dockerfile,
 "containerfile"  => SupportLang::Dockerfile,
+"emacs-lisp"     => SupportLang::EmacsLisp,
+"emacslisp"      => SupportLang::EmacsLisp,
+"elisp"          => SupportLang::EmacsLisp,
+"el"             => SupportLang::EmacsLisp,
 "elixir"         => SupportLang::Elixir,
 "ex"             => SupportLang::Elixir,
 "exs"            => SupportLang::Elixir,
 "erlang"         => SupportLang::Erlang,
 "erl"            => SupportLang::Erlang,
 "hrl"            => SupportLang::Erlang,
+"fortran"        => SupportLang::Fortran,
+"f90"             => SupportLang::Fortran,
+"f95"             => SupportLang::Fortran,
+"f03"             => SupportLang::Fortran,
+"f08"             => SupportLang::Fortran,
 "graphql"        => SupportLang::Graphql,
 "gql"            => SupportLang::Graphql,
 "haskell"        => SupportLang::Haskell,
@@ -1093,12 +1131,21 @@ pub const KNOWN_LONG_TAIL_ALIASES: &[&str] = &[
 	"docker",
 	"dockerfile",
 	"containerfile",
+	"emacs-lisp",
+	"emacslisp",
+	"elisp",
+	"el",
 	"elixir",
 	"ex",
 	"exs",
 	"erlang",
 	"erl",
 	"hrl",
+	"fortran",
+	"f90",
+	"f95",
+	"f03",
+	"f08",
 	"graphql",
 	"gql",
 	"haskell",
@@ -1215,7 +1262,36 @@ mod tests {
 
 		#[cfg(feature = "full-langs")]
 		{
-			assert_eq!(langs.len(), 56);
+			assert_eq!(langs.len(), 58);
+			let default_languages = [
+				SupportLang::TypeScript,
+				SupportLang::Tsx,
+				SupportLang::JavaScript,
+				SupportLang::Python,
+				SupportLang::Rust,
+				SupportLang::Go,
+				SupportLang::Java,
+				SupportLang::C,
+				SupportLang::Cpp,
+				SupportLang::CSharp,
+				SupportLang::Ruby,
+				SupportLang::Php,
+				SupportLang::Bash,
+				SupportLang::Json,
+				SupportLang::Yaml,
+				SupportLang::Toml,
+				SupportLang::Markdown,
+				SupportLang::Html,
+				SupportLang::Css,
+			];
+			assert!(
+				default_languages
+					.iter()
+					.all(|language| langs.contains(language))
+			);
+			assert!(langs.contains(&SupportLang::EmacsLisp));
+			assert!(langs.contains(&SupportLang::Fortran));
+			assert!(langs.contains(&SupportLang::Perl));
 			assert!(langs.contains(&SupportLang::Starlark));
 			assert!(langs.contains(&SupportLang::Swift));
 		}
@@ -1228,6 +1304,24 @@ mod tests {
 		assert_eq!(inferred, None);
 		#[cfg(feature = "full-langs")]
 		assert_eq!(inferred, Some(SupportLang::Starlark));
+	}
+
+	#[test]
+	fn new_grammar_paths_are_available_only_with_full_languages() {
+		#[cfg(feature = "full-langs")]
+		{
+			assert_eq!(SupportLang::from_path(Path::new(".emacs")), Some(SupportLang::EmacsLisp));
+			assert_eq!(SupportLang::from_path(Path::new("source.F90")), Some(SupportLang::Fortran));
+			assert_eq!(SupportLang::from_alias("elisp"), Some(SupportLang::EmacsLisp));
+			assert_eq!(SupportLang::from_alias("fortran"), Some(SupportLang::Fortran));
+			let _ = SupportLang::EmacsLisp.get_ts_language();
+			let _ = SupportLang::Fortran.get_ts_language();
+		}
+		#[cfg(not(feature = "full-langs"))]
+		{
+			assert_eq!(SupportLang::from_path(Path::new(".emacs")), None);
+			assert_eq!(SupportLang::from_path(Path::new("source.f90")), None);
+		}
 	}
 
 	#[test]
