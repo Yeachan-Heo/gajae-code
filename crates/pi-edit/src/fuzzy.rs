@@ -1,5 +1,6 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/src/fuzzy.rs @
-// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: UTF-16
+// code-unit scoring for TypeScript string parity.
 //! Text/sequence matching primitives shared by `replace`, `patch`, and
 //! `sloppy`: Levenshtein similarity, whole-block fuzzy search,
 //! line-sequence placement, and context-line placement.
@@ -201,7 +202,7 @@ const fn no_context_match(confidence: f64) -> ContextLineResult {
 }
 
 #[allow(clippy::suspicious_operation_groupings, reason = "paired index bounds are intentional")]
-fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
+fn levenshtein_units(a: &[u16], b: &[u16]) -> usize {
 	if a == b {
 		return 0;
 	}
@@ -229,13 +230,13 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
 	}
 
 	let mut row: Vec<usize> = (0..=shorter.len()).collect();
-	for (line, &a_char) in longer.iter().enumerate() {
+	for (line, &a_unit) in longer.iter().enumerate() {
 		let mut diagonal = row[0];
 		row[0] = line + 1;
-		for (column, &b_char) in shorter.iter().enumerate() {
+		for (column, &b_unit) in shorter.iter().enumerate() {
 			let cell = column + 1;
 			let above = row[cell];
-			row[cell] = if a_char == b_char {
+			row[cell] = if a_unit == b_unit {
 				diagonal
 			} else {
 				(above + 1).min(row[cell - 1] + 1).min(diagonal + 1)
@@ -246,25 +247,23 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
 	row[shorter.len()]
 }
 
-/// Levenshtein edit distance over Unicode scalar values.
-///
-/// The TypeScript source used UTF-16 code units. Rust deliberately uses
-/// Unicode scalar values, so astral characters count as one element.
+/// Levenshtein edit distance over UTF-16 code units, matching JavaScript
+/// strings.
 pub fn levenshtein_distance(a: &str, b: &str) -> usize {
-	let a_chars: Vec<char> = a.chars().collect();
-	let b_chars: Vec<char> = b.chars().collect();
-	levenshtein_chars(&a_chars, &b_chars)
+	let a_units: Vec<u16> = a.encode_utf16().collect();
+	let b_units: Vec<u16> = b.encode_utf16().collect();
+	levenshtein_units(&a_units, &b_units)
 }
 
-/// Similarity in `[0, 1]`: `1 - distance / max_len`.
+/// Similarity in `[0, 1]`: `1 - distance / max_len` in UTF-16 code units.
 pub fn similarity(a: &str, b: &str) -> f64 {
-	let a_chars: Vec<char> = a.chars().collect();
-	let b_chars: Vec<char> = b.chars().collect();
-	let max_len = a_chars.len().max(b_chars.len());
+	let a_units: Vec<u16> = a.encode_utf16().collect();
+	let b_units: Vec<u16> = b.encode_utf16().collect();
+	let max_len = a_units.len().max(b_units.len());
 	if max_len == 0 {
 		return 1.0;
 	}
-	1.0 - levenshtein_chars(&a_chars, &b_chars) as f64 / max_len as f64
+	1.0 - levenshtein_units(&a_units, &b_units) as f64 / max_len as f64
 }
 
 fn format_preview_window(lines: &[&str], center_index: usize) -> String {
@@ -590,8 +589,8 @@ fn fuzzy_score_at(lines: &[String], pattern: &[String], index: usize, min_score:
 			continue;
 		}
 		let remaining = count - offset - 1;
-		let line_len = line.chars().count();
-		let pat_len = pat.chars().count();
+		let line_len = utf16_len(line);
+		let pat_len = utf16_len(pat);
 		let max_len = line_len.max(pat_len);
 		let upper_bound = if max_len == 0 {
 			1.0
@@ -620,8 +619,8 @@ fn norm_starts_with(line: &str, pattern: &str) -> bool {
 }
 
 fn norm_includes(line: &str, pattern: &str) -> bool {
-	let pattern_len = pattern.chars().count();
-	let line_len = line.chars().count();
+	let pattern_len = utf16_len(pattern);
+	let line_len = utf16_len(line);
 	if pattern.is_empty() {
 		return line.is_empty();
 	}
@@ -925,14 +924,14 @@ pub fn find_context_line(
 			return result;
 		}
 	}
-	if context_normalized.chars().count() >= PARTIAL_MATCH_MIN_LENGTH {
-		let context_len = context_normalized.chars().count();
+	if utf16_len(&context_normalized) >= PARTIAL_MATCH_MIN_LENGTH {
+		let context_len = utf16_len(&context_normalized);
 		let all_substrings: Vec<(usize, f64)> = (start_from..lines.len())
 			.filter_map(|index| {
 				let normalized = normalize_for_fuzzy(lines[index]);
 				normalized
 					.contains(&context_normalized)
-					.then(|| (index, context_len as f64 / normalized.chars().count().max(1) as f64))
+					.then(|| (index, context_len as f64 / utf16_len(&normalized).max(1) as f64))
 			})
 			.collect();
 		let match_indices: Vec<usize> = all_substrings
@@ -1330,6 +1329,25 @@ mod tests {
 		});
 		assert_eq!(dominant.dominant_fuzzy, Some(true));
 		assert_eq!(dominant.fuzzy_matches, Some(2));
+	}
+
+	#[test]
+	fn fuzzy_scoring_matches_javascript_utf16_code_units() {
+		assert_eq!(levenshtein_distance("😀", "😃"), 1);
+		assert_eq!(similarity("😀", "😃"), 0.5);
+
+		let content = "alpha 👩‍💻\nbeta 😀\ngamma";
+		let target = "beta 😃";
+		let outcome = find_match(content, target, &FindMatchOptions {
+			allow_fuzzy:     true,
+			threshold:       Some(0.88),
+			excluded_ranges: &[],
+		});
+		assert_eq!(outcome.matched.as_ref().map(|matched| matched.confidence), Some(8.0 / 9.0));
+
+		let sequence = seek_sequence(&["alpha 👩‍💻", "beta 😀", "gamma"], &[target], 0, false, true);
+		assert_eq!(sequence.index, None);
+		assert_eq!(sequence.confidence, 1.0 - 1.0 / 7.0);
 	}
 
 	#[test]
