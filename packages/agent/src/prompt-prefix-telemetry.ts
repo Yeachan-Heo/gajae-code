@@ -10,8 +10,20 @@
 
 import type { Context, Message, Model, PromptPrefixChange, PromptPrefixTelemetry } from "@gajae-code/ai";
 
+/**
+ * Per-call request options that provider adapters use when serializing the
+ * context (e.g. Anthropic drops replayed thinking under a forced tool choice).
+ * They are part of the provider-visible request, so a change is client-caused.
+ */
+export interface PromptPrefixRequestOptions {
+	toolChoice?: unknown;
+	reasoning?: unknown;
+	serviceTier?: unknown;
+}
+
 interface PromptPrefixObservation {
 	modelKey: string;
+	optionsHash: bigint;
 	systemHash: bigint;
 	toolsHash: bigint;
 	messageHashes: bigint[];
@@ -31,9 +43,14 @@ export class PromptPrefixTracker {
 	#previous: PromptPrefixObservation | undefined;
 
 	/** Record the exact provider-visible request and classify it against the previous one. */
-	observe(model: Pick<Model, "provider" | "id">, context: Context): PromptPrefixTelemetry {
+	observe(
+		model: Pick<Model, "provider" | "id">,
+		context: Context,
+		options: PromptPrefixRequestOptions = {},
+	): PromptPrefixTelemetry {
 		const current: PromptPrefixObservation = {
 			modelKey: `${model.provider}/${model.id}`,
+			optionsHash: hashJson([options.toolChoice ?? null, options.reasoning ?? null, options.serviceTier ?? null]),
 			systemHash: hashJson(context.systemPrompt ?? []),
 			toolsHash: hashJson(context.tools ?? []),
 			messageHashes: context.messages.map(hashJson),
@@ -58,10 +75,13 @@ export class PromptPrefixTracker {
 		else if (previous.toolsHash !== current.toolsHash) change = "tools";
 		else if (previous.systemHash !== current.systemHash) change = "system";
 		else if (reusedMessages < previous.messageHashes.length) change = "messages";
+		else if (previous.optionsHash !== current.optionsHash) change = "options";
 		else change = "append";
 
 		const hash = Bun.hash
-			.xxHash64(`${current.modelKey}|${current.toolsHash}|${current.systemHash}|${current.messageHashes.join(",")}`)
+			.xxHash64(
+				`${current.modelKey}|${current.optionsHash}|${current.toolsHash}|${current.systemHash}|${current.messageHashes.join(",")}`,
+			)
 			.toString(16)
 			.padStart(16, "0");
 		return {

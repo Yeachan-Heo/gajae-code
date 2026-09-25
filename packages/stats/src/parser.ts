@@ -48,6 +48,7 @@ const PROMPT_PREFIX_CHANGES = new Set<PromptPrefixChange>([
 	"tools",
 	"system",
 	"messages",
+	"options",
 ]);
 const MESSAGE_ROLES = new Set(["user", "developer", "assistant", "toolResult"]);
 

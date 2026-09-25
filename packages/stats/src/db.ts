@@ -732,12 +732,13 @@ export function getModelPerformanceSeries(
 const PREFIX_MISS_MIN_PROMPT_TOKENS = 4096;
 /** A request whose cache read covers less than this share of its prompt lost its prefix. */
 const PREFIX_MISS_MAX_CACHED_SHARE = 0.1;
-const CLIENT_PREFIX_CHANGES: readonly PromptPrefixChange[] = ["tools", "system", "messages"];
+const CLIENT_PREFIX_CHANGES: readonly PromptPrefixChange[] = ["tools", "system", "messages", "options"];
 
 /**
  * Attribute prompt-cache prefix misses to their client-side cause using the
- * per-request prompt-prefix telemetry. Requests without telemetry and the
- * first request of each agent are excluded.
+ * per-request prompt-prefix telemetry. Requests without telemetry, the first
+ * request of each agent, and provider/model pairs that never reported a cache
+ * read (no usable prompt-cache telemetry, e.g. local backends) are excluded.
  */
 export function getCacheMissAttribution(cutoff?: number): CacheMissAttribution {
 	const empty: CacheMissAttribution = {
@@ -762,6 +763,9 @@ export function getCacheMissAttribution(cutoff?: number): CacheMissAttribution {
 				THEN 1 ELSE 0 END) as misses
 		FROM messages
 		WHERE prefix_change IS NOT NULL AND prefix_change <> 'initial'
+			AND (provider, model) IN (
+				SELECT provider, model FROM messages GROUP BY provider, model HAVING SUM(cache_read_tokens) > 0
+			)
 		${hasCutoff ? "AND timestamp >= ?" : ""}
 		GROUP BY prefix_change, prefix_diverged_role
 	`);

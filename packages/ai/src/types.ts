@@ -820,12 +820,15 @@ export interface DeveloperMessage {
  * - `tools`: tool specs changed.
  * - `system`: the system prompt changed.
  * - `messages`: a previously sent message was rewritten or removed.
+ * - `options`: prompt bytes were unchanged but a serialization-affecting request
+ *   option (tool choice, reasoning, service tier) changed, which adapters may
+ *   use to rewrite the provider payload.
  */
-export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages";
+export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages" | "options";
 
 /** Per-request prompt-prefix fingerprint that separates client prefix mutation from provider cache eviction. */
 export interface PromptPrefixTelemetry {
-	/** xxHash64 (hex) over the system prompt, tool specs, and every message sent in this request. */
+	/** xxHash64 (hex) over the model, serialization-affecting options, system prompt, tool specs, and every message. */
 	hash: string;
 	/** Messages sent in this request. */
 	messages: number;

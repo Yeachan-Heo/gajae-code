@@ -28,7 +28,11 @@ afterEach(() => {
 });
 
 let nextId = 0;
-function assistant(usage: { input: number; cacheRead: number }, promptPrefix?: unknown): Record<string, unknown> {
+function assistant(
+	usage: { input: number; cacheRead: number },
+	promptPrefix?: unknown,
+	provider = "anthropic",
+): Record<string, unknown> {
 	const id = `a${nextId++}`;
 	return {
 		type: "message",
@@ -39,7 +43,7 @@ function assistant(usage: { input: number; cacheRead: number }, promptPrefix?: u
 			role: "assistant",
 			content: [{ type: "text", text: "ok" }],
 			api: "anthropic-messages",
-			provider: "anthropic",
+			provider,
 			model: "claude-test",
 			stopReason: "toolUse",
 			timestamp: Date.now(),
@@ -89,6 +93,8 @@ describe("cache prefix-miss attribution", () => {
 			assistant(MISS, prefix("messages", "developer")),
 			assistant(MISS, prefix("messages", "developer")),
 			assistant(MISS, prefix("system")),
+			// Identical prompt bytes but a changed tool choice the adapter serializes differently.
+			assistant(MISS, prefix("options")),
 			// A system change that still hit the cache (e.g. after the last breakpoint) is not a miss.
 			assistant(HIT, prefix("system")),
 			assistant(MISS, prefix("model")),
@@ -101,16 +107,33 @@ describe("cache prefix-miss attribution", () => {
 
 		const attribution = getCacheMissAttribution();
 		expect(attribution).toEqual({
-			trackedRequests: 9,
-			prefixMisses: 5,
-			clientCausedMisses: 3,
+			trackedRequests: 10,
+			prefixMisses: 6,
+			clientCausedMisses: 4,
 			providerSideMisses: 1,
 			modelSwitchMisses: 1,
-			clientCausedShare: 3 / 5,
+			clientCausedShare: 4 / 6,
 			byCause: [
 				{ change: "messages", divergedRole: "developer", misses: 2 },
+				{ change: "options", divergedRole: null, misses: 1 },
 				{ change: "system", divergedRole: null, misses: 1 },
 			],
+		});
+	});
+
+	it("excludes provider/model pairs that never reported a cache read", async () => {
+		await ingest([
+			// A local backend that never reports cache reads: every large request looks cold.
+			assistant(MISS, prefix("append"), "ollama"),
+			assistant(MISS, prefix("messages", "user"), "ollama"),
+			assistant(HIT, prefix("append")),
+			assistant(MISS, prefix("append")),
+		]);
+		expect(getCacheMissAttribution()).toMatchObject({
+			trackedRequests: 2,
+			prefixMisses: 1,
+			clientCausedMisses: 0,
+			providerSideMisses: 1,
 		});
 	});
 

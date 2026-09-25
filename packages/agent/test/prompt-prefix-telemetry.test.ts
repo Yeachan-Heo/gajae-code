@@ -47,6 +47,20 @@ describe("PromptPrefixTracker", () => {
 		expect(switched).toMatchObject({ change: "model", reusedMessages: 0 });
 	});
 
+	it("attributes a serialization-option change with byte-identical prompts to the client", () => {
+		const tracker = new PromptPrefixTracker();
+		tracker.observe(model, request([first]), { toolChoice: "auto" });
+		const forced = tracker.observe(model, request([first, reply, second]), {
+			toolChoice: { type: "tool", name: "read" },
+		});
+		expect(forced).toMatchObject({ change: "options", reusedMessages: 1 });
+		// A prompt-layer rewrite still takes precedence over an option change.
+		const rewritten = tracker.observe(model, request([second]), { toolChoice: "auto" });
+		expect(rewritten.change).toBe("messages");
+		// Same options again with an appended suffix is a pure append.
+		expect(tracker.observe(model, request([second, reply]), { toolChoice: "auto" }).change).toBe("append");
+	});
+
 	it("records how far the message prefix survived and which role was rewritten", () => {
 		const tracker = new PromptPrefixTracker();
 		tracker.observe(model, request([first, reply, second]));
