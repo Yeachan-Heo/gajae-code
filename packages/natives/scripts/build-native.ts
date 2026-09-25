@@ -193,6 +193,7 @@ const requiredGeneratedBindingSymbols = [
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
+	"__gjcInstallTokioRuntime",
 	"currentExecutablePath",
 ] as const;
 

@@ -563,6 +563,12 @@ export declare class Shell {
 }
 
 /**
+ * Install the bounded Tokio runtime and probed Rayon pool after the addon is
+ * loaded, before any native consumer can start async or parallel work.
+ */
+export declare function __gjcInstallTokioRuntime(): void
+
+/**
  * Publish-result wire-contract sentinel.
  *
  * The loader requires this in addition to the release sentinel, so a

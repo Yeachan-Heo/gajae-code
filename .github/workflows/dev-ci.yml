@@ -624,6 +624,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/windows-hidden-shell.windows.test.ts --timeout 90000
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows constrained-memory native runtime install
+        shell: pwsh
+        run: |
+          bun test ./packages/natives/test/windows-runtime-install.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Windows hidden-console creation-flag unit tests
         shell: pwsh
         run: |

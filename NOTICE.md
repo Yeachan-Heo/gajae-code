@@ -8,6 +8,9 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - [`insane-search`](https://github.com/fivetaku/insane-search) — MIT-licensed public-route fetch engine by @fivetaku, vendored as the safe `insane` fallback/search provider lineage.
 - [`Markit`](https://github.com/Michaelliv/markit) — MIT-licensed document converter, pinned to `markit-ai` 0.5.3 under `packages/coding-agent/vendor/markit-ai`. Its license, upstream package metadata, integrity/hash inventory and reproducible patch are retained alongside the vendored code; MuPDF remains separately licensed as described below.
 
+## Vendored Rust from oh-my-pi
+
+`crates/pi-natives/src/{js.rs,task.rs,testing.rs,utils.rs}` include MIT-licensed material from `can1357/oh-my-pi` at commit `a85bd5228d9f0f619deade1db78fa49420a721e1`. Per-file attribution and local modifications are recorded in each source file.
 ## MuPDF WebAssembly
 
 PDF extraction uses MuPDF.js, copyright (C) 2004–2026 Artifex Software, Inc., distributed under [GNU Affero General Public License version 3 or later](https://www.gnu.org/licenses/agpl-3.0.html). MuPDF is provided without warranty; the repository's MIT license does not replace MuPDF's license. Alternative commercial licensing is available from [Artifex](https://artifex.com/).

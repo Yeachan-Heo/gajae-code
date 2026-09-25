@@ -48,6 +48,8 @@ pub use pi_ast::language;
 pub mod power;
 
 pub mod iso;
+pub mod js;
+
 pub mod path_identity;
 pub mod prof;
 pub mod ps;
@@ -56,11 +58,203 @@ pub mod recovery_fs;
 pub mod shell;
 pub mod summary;
 pub mod task;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod text;
 pub(crate) mod utils;
 pub mod workspace;
 
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_os = "windows")]
+use napi::bindgen_prelude::create_custom_tokio_runtime;
 use napi_derive::napi;
+
+/// Whether pi-natives must avoid Rayon parallel iterators because no safe
+/// global pool could be installed. The walker manages its own pool separately.
+pub(crate) static RAYON_POOL_UNAVAILABLE: AtomicBool = AtomicBool::new(cfg!(target_os = "windows"));
+
+pub(crate) fn rayon_pool_unavailable() -> bool {
+	RAYON_POOL_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
+#[cfg(any(target_os = "windows", test))]
+const RAYON_MAX_THREADS: usize = 8;
+#[cfg(any(target_os = "windows", test))]
+const RAYON_RESERVED_NON_RAYON_THREADS: usize = 1;
+
+#[cfg(target_os = "windows")]
+const NAPI_TOKIO_MAX_WORKER_THREADS: usize = 4;
+#[cfg(target_os = "windows")]
+const NAPI_TOKIO_MAX_BLOCKING_THREADS: usize = 8;
+
+#[cfg(target_os = "windows")]
+fn desired_worker_threads() -> usize {
+	std::thread::available_parallelism()
+		.map_or(1, |threads| threads.get())
+		.clamp(1, NAPI_TOKIO_MAX_WORKER_THREADS)
+}
+
+#[cfg(target_os = "windows")]
+fn desired_rayon_threads() -> usize {
+	clamped_rayon_threads(std::thread::available_parallelism().map_or(1, |threads| threads.get()))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn clamped_rayon_threads(threads: usize) -> usize {
+	threads.clamp(1, RAYON_MAX_THREADS)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
+enum RayonPoolPlan {
+	WorkerThreads(usize),
+	SkipGlobalPool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn rayon_pool_plan(desired: usize, spawnable: usize) -> RayonPoolPlan {
+	let desired = clamped_rayon_threads(desired);
+	let workers = spawnable
+		.saturating_sub(RAYON_RESERVED_NON_RAYON_THREADS)
+		.min(desired);
+	if workers > 0 {
+		RayonPoolPlan::WorkerThreads(workers)
+	} else {
+		RayonPoolPlan::SkipGlobalPool
+	}
+}
+
+#[cfg(target_os = "windows")]
+fn probe_spawnable_workers(target: usize) -> usize {
+	let keep_running = Arc::new(AtomicBool::new(true));
+	let mut handles = Vec::with_capacity(target);
+	for _ in 0..target {
+		let keep = Arc::clone(&keep_running);
+		match std::thread::Builder::new().spawn(move || {
+			while keep.load(Ordering::Relaxed) {
+				std::thread::park_timeout(std::time::Duration::from_millis(1));
+			}
+		}) {
+			Ok(handle) => handles.push(handle),
+			Err(_) => break,
+		}
+	}
+	let spawned = handles.len();
+	keep_running.store(false, Ordering::Relaxed);
+	for handle in handles {
+		handle.thread().unpark();
+		let _ = handle.join();
+	}
+	spawned
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn rayon_probe_target(desired: usize) -> usize {
+	clamped_rayon_threads(desired).saturating_add(RAYON_RESERVED_NON_RAYON_THREADS)
+}
+
+#[cfg(target_os = "windows")]
+fn configure_rayon_pool() {
+	let desired = desired_rayon_threads();
+	let plan = rayon_pool_plan(desired, probe_spawnable_workers(rayon_probe_target(desired)));
+	let result = match plan {
+		RayonPoolPlan::WorkerThreads(threads) => rayon::ThreadPoolBuilder::new()
+			.num_threads(threads)
+			.build_global(),
+		RayonPoolPlan::SkipGlobalPool => {
+			RAYON_POOL_UNAVAILABLE.store(true, Ordering::SeqCst);
+			return;
+		},
+	};
+	RAYON_POOL_UNAVAILABLE.store(result.is_err(), Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn create_windows_napi_tokio_runtime() -> Option<tokio::runtime::Runtime> {
+	let workers = probe_spawnable_workers(desired_worker_threads());
+	let multi_thread = (workers > 0)
+		.then(|| {
+			tokio::runtime::Builder::new_multi_thread()
+				.worker_threads(workers)
+				.max_blocking_threads(NAPI_TOKIO_MAX_BLOCKING_THREADS)
+				.enable_all()
+				.build()
+				.ok()
+		})
+		.flatten();
+	multi_thread.or_else(|| {
+		tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.ok()
+	})
+}
+
+#[cfg(target_os = "windows")]
+static TOKIO_RUNTIME_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Install the bounded Tokio runtime and probed Rayon pool after the addon is
+/// loaded, before any native consumer can start async or parallel work.
+#[napi(js_name = "__gjcInstallTokioRuntime")]
+#[allow(clippy::missing_const_for_fn, reason = "napi macro is incompatible with const fn")]
+pub fn gjc_install_tokio_runtime() {
+	#[cfg(target_os = "windows")]
+	if TOKIO_RUNTIME_INSTALLED.swap(true, Ordering::SeqCst) {
+		return;
+	}
+	#[cfg(target_os = "windows")]
+	if let Some(runtime) = create_windows_napi_tokio_runtime() {
+		create_custom_tokio_runtime(runtime);
+	}
+	#[cfg(target_os = "windows")]
+	configure_rayon_pool();
+}
+
+#[cfg(test)]
+mod runtime_tests {
+	use super::{
+		RAYON_MAX_THREADS, RayonPoolPlan, clamped_rayon_threads, rayon_pool_plan, rayon_probe_target,
+	};
+
+	#[test]
+	fn rayon_worker_count_is_clamped() {
+		assert_eq!(clamped_rayon_threads(1), 1);
+		assert_eq!(clamped_rayon_threads(RAYON_MAX_THREADS + 1), RAYON_MAX_THREADS);
+	}
+
+	#[test]
+	fn rayon_probe_reserves_one_non_rayon_worker() {
+		assert_eq!(rayon_probe_target(4), 5);
+		assert_eq!(
+			rayon_probe_target(RAYON_MAX_THREADS + 4),
+			RAYON_MAX_THREADS + super::RAYON_RESERVED_NON_RAYON_THREADS
+		);
+	}
+
+	#[test]
+	fn rayon_uses_requested_pool_when_probe_covers_request_and_reserve() {
+		assert_eq!(rayon_pool_plan(4, 5), RayonPoolPlan::WorkerThreads(4));
+		assert_eq!(
+			rayon_pool_plan(RAYON_MAX_THREADS + 4, usize::MAX),
+			RayonPoolPlan::WorkerThreads(RAYON_MAX_THREADS)
+		);
+	}
+
+	#[test]
+	fn rayon_uses_worker_pool_after_reserving_non_rayon_capacity() {
+		assert_eq!(rayon_pool_plan(4, 3), RayonPoolPlan::WorkerThreads(2));
+		assert_eq!(rayon_pool_plan(1, 2), RayonPoolPlan::WorkerThreads(1));
+	}
+
+	#[test]
+	fn rayon_skips_global_pool_when_only_reserved_capacity_can_spawn() {
+		assert_eq!(rayon_pool_plan(4, 1), RayonPoolPlan::SkipGlobalPool);
+		assert_eq!(rayon_pool_plan(1, 0), RayonPoolPlan::SkipGlobalPool);
+	}
+}
 
 /// Version sentinel — exists solely so the JS loader can prove at load time
 /// that the `.node` file on disk is from the same package release as the

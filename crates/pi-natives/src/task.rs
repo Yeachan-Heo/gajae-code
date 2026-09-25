@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/task.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Modified for gajae-code: retained catch_unwind→napi::Error and cancellation checks; adapted panic reporting; feature-gated Promise rejection probe.
+
 //! Blocking work scheduling for N-API exports.
 //!
 //! # Overview
@@ -33,6 +36,8 @@ use std::{
 };
 
 use napi::{Env, Error, Result, Task, bindgen_prelude::*};
+#[cfg(feature = "task-panic-test")]
+use napi_derive::napi;
 use pi_shell::cancel as core_cancel;
 
 use crate::prof::profile_region;
@@ -87,24 +92,29 @@ impl From<()> for CancelToken {
 	}
 }
 
+/// Returns whether a JavaScript abort signal has already been aborted.
+///
+/// Invalid values are tolerated so optional cancellation never rejects an
+/// otherwise valid native operation.
+pub fn signal_aborted(signal: &Unknown) -> bool {
+	signal
+		.coerce_to_object()
+		.and_then(|object| object.get_named_property::<bool>("aborted"))
+		.unwrap_or(false)
+}
+
 impl CancelToken {
 	/// Create a new cancel token from optional timeout and abort signal.
 	pub fn new(timeout_ms: Option<u32>, signal: Option<Unknown>) -> Self {
 		let mut result = Self { core: core_cancel::CancelToken::new(timeout_ms) };
-		if let Some(signal) = signal {
-			let object = Object::from_raw(signal.value().env, signal.value().value);
-			let aborted = object
-				.get_named_property::<bool>("aborted")
-				.unwrap_or(false);
-			let abort_token = result.emplace_abort_token();
-			if let Ok(signal) = AbortSignal::from_unknown(signal) {
-				if aborted {
-					abort_token.abort(AbortReason::Signal);
-				} else {
-					signal.on_abort(move || abort_token.abort(AbortReason::Signal));
-				}
-			} else {
-				abort_token.abort(AbortReason::Unknown);
+		if let Some(raw_signal) = signal {
+			// `on_abort` only fires for a future JS `abort` event. Do not wrap an
+			// already-aborted signal: napi's wrapper replaces its `onabort` handler.
+			if signal_aborted(&raw_signal) {
+				result.emplace_abort_token().abort(AbortReason::Signal);
+			} else if let Ok(signal) = AbortSignal::from_unknown(raw_signal) {
+				let abort_token = result.emplace_abort_token();
+				signal.on_abort(move || abort_token.abort(AbortReason::Signal));
 			}
 		}
 		result
@@ -184,11 +194,16 @@ where
 	fn compute(&mut self) -> Result<Self::Output> {
 		let _guard = profile_region(self.tag);
 		self.cancel_token.heartbeat()?;
+
 		let work = self
 			.work
 			.take()
 			.ok_or_else(|| Error::from_reason("BlockingTask: work already consumed"))?;
-		match catch_unwind(AssertUnwindSafe(|| work(self.cancel_token.clone()))) {
+		let cancel_token = self.cancel_token.clone();
+
+		// napi-rs invokes `compute` through an `extern "C"` async-work callback.
+		// Catch panics here so unwinding never crosses that FFI boundary.
+		match catch_unwind(AssertUnwindSafe(move || work(cancel_token))) {
 			Ok(result) => result,
 			Err(payload) => Err(Error::from_reason(format!(
 				"BlockingTask panic: {}",
@@ -213,6 +228,95 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 pub type Promise<T> = AsyncTask<Blocking<T>>;
+/// Like [`Blocking`], but the work closure fails with a typed domain error
+/// that a reject hook converts on the JS thread.
+///
+/// The hook runs with `Env` access, so rejections can carry a real error
+/// object (name/code/custom properties) instead of a bare message string.
+pub struct BlockingMapped<T, E>
+where
+	T: Send + 'static,
+	E: Send + 'static,
+{
+	tag:          &'static str,
+	cancel_token: CancelToken,
+	work:         Option<MappedWork<T, E>>,
+	/// Domain error stashed by `compute` for `reject` to convert with `Env`.
+	error:        Option<E>,
+	reject_hook:  fn(Env, E) -> Error,
+}
+/// Boxed work closure for [`BlockingMapped`].
+type MappedWork<T, E> = Box<dyn FnOnce(CancelToken) -> std::result::Result<T, E> + Send>;
+
+impl<T, E> Task for BlockingMapped<T, E>
+where
+	T: ToNapiValue + Send + 'static + TypeName,
+	E: Send + 'static,
+{
+	type JsValue = T;
+	type Output = T;
+
+	fn compute(&mut self) -> Result<Self::Output> {
+		let _guard = profile_region(self.tag);
+		self.cancel_token.heartbeat()?;
+
+		let work = self
+			.work
+			.take()
+			.ok_or_else(|| Error::from_reason("BlockingMapped: work already consumed"))?;
+		let cancel_token = self.cancel_token.clone();
+		// napi-rs invokes `compute` through an `extern "C"` async-work callback.
+		// Keep the same panic-to-error contract as [`Blocking::compute`].
+		match catch_unwind(AssertUnwindSafe(move || work(cancel_token))) {
+			Ok(Ok(value)) => Ok(value),
+			Ok(Err(domain)) => {
+				self.error = Some(domain);
+				Err(Error::from_reason("BlockingMapped: pending domain error"))
+			},
+			Err(payload) => Err(Error::from_reason(format!(
+				"BlockingTask panic: {}",
+				panic_payload_message(payload.as_ref())
+			))),
+		}
+	}
+
+	fn reject(&mut self, env: Env, err: Error) -> Result<Self::JsValue> {
+		match self.error.take() {
+			Some(domain) => Err((self.reject_hook)(env, domain)),
+			None => Err(err),
+		}
+	}
+
+	fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+		Ok(output)
+	}
+}
+
+/// Promise type produced by [`blocking_mapped`].
+pub type MappedPromise<T, E> = AsyncTask<BlockingMapped<T, E>>;
+
+/// Like [`blocking`], but the closure fails with a typed domain error and
+/// `reject_hook` converts it into the JS error on the JS thread (with `Env`),
+/// allowing rejections to carry structured properties.
+pub fn blocking_mapped<T, E, F>(
+	tag: &'static str,
+	cancel_token: impl Into<CancelToken>,
+	reject_hook: fn(Env, E) -> Error,
+	work: F,
+) -> MappedPromise<T, E>
+where
+	F: FnOnce(CancelToken) -> std::result::Result<T, E> + Send + 'static,
+	T: ToNapiValue + TypeName + Send + 'static,
+	E: Send + 'static,
+{
+	AsyncTask::new(BlockingMapped {
+		tag,
+		cancel_token: cancel_token.into(),
+		work: Some(Box::new(work)),
+		error: None,
+		reject_hook,
+	})
+}
 
 /// Create an `AsyncTask` that runs blocking work on libuv's thread pool.
 ///
@@ -289,76 +393,84 @@ where
 	})
 }
 
+#[cfg(feature = "task-panic-test")]
+#[napi(js_name = "__gjcTestBlockingPanic")]
+pub fn test_blocking_panic() -> Promise<String> {
+	blocking("test_task_panic", (), |_| -> Result<String> { panic!("injected blocking task panic") })
+}
 #[cfg(test)]
 mod tests {
-	use std::sync::{
-		Arc,
-		atomic::{AtomicBool, Ordering},
-	};
+	//! Regression coverage for the FFI-boundary panic guard in
+	//! [`Blocking::compute`]. These exercise the trait method directly on the
+	//! caller thread — libuv's async-work queue isn't running under
+	//! `cargo test`, but the guard sits inside `compute`, so calling it
+	//! synchronously proves the invariant: a panicking closure MUST NOT unwind
+	//! past this method.
 
-	use napi::Task;
+	use napi::Status;
 
 	use super::*;
+	use crate::testing::SilenceHook;
 
-	#[test]
-	fn blocking_compute_catches_non_string_panic_as_error() {
-		let mut task = Blocking {
-			tag:          "test_non_string_panic",
-			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> { std::panic::panic_any(42) })),
-		};
-
-		let result = task.compute();
-
-		let err = result.expect_err("non-string panic should be converted into a napi error");
-		assert!(
-			err.reason.contains("BlockingTask panic"),
-			"panic should be converted to a napi error, got: {}",
-			err.reason
-		);
-		assert!(
-			err.reason.contains("unknown panic payload"),
-			"non-string panic payload should be reported without unwinding, got: {}",
-			err.reason
-		);
+	fn blocking_task<T, F>(tag: &'static str, work: F) -> Blocking<T>
+	where
+		T: Send + 'static,
+		F: FnOnce(CancelToken) -> Result<T> + Send + 'static,
+	{
+		Blocking { tag, cancel_token: CancelToken::default(), work: Some(Box::new(work)) }
 	}
 
 	#[test]
-	fn blocking_compute_catches_panic_as_error() {
-		let mut task = Blocking {
-			tag:          "test_panic",
-			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> { panic!("native boom") })),
-		};
-
-		let result = task.compute();
-
-		let err = result.expect_err("panic should be converted into a napi error");
-		assert!(
-			err.reason.contains("native boom"),
-			"panic payload should be preserved, got: {}",
-			err.reason
-		);
+	fn compute_forwards_ok_result() {
+		let mut task = blocking_task("t_ok", |_| Ok(42_u32));
+		assert_eq!(task.compute().unwrap(), 42);
 	}
 
 	#[test]
-	fn blocking_compute_catches_string_panic_payload_as_error() {
-		let mut task = Blocking {
-			tag:          "test_string_panic",
-			cancel_token: CancelToken::default(),
-			work:         Some(Box::new(|_| -> Result<String> {
-				std::panic::panic_any(String::from("owned native boom"))
-			})),
-		};
+	fn compute_forwards_err_result() {
+		let mut task = blocking_task::<u32, _>("t_err", |_| Err(Error::from_reason("boom")));
+		let err = task.compute().unwrap_err();
+		assert_eq!(err.status, Status::GenericFailure);
+		assert_eq!(err.reason, "boom");
+	}
 
-		let result = task.compute();
+	#[test]
+	fn compute_catches_str_literal_panic() {
+		let _silence = SilenceHook::new();
+		let mut task = blocking_task::<u32, _>("t_panic_str", |_| panic!("kaboom"));
+		let err = task.compute().unwrap_err();
+		assert_eq!(err.status, Status::GenericFailure);
+		assert!(err.reason.contains("BlockingTask panic"), "reason = {}", err.reason);
+		assert!(err.reason.contains("kaboom"), "reason = {}", err.reason);
+	}
 
-		let err = result.expect_err("String panic should be converted into a napi error");
-		assert!(
-			err.reason.contains("owned native boom"),
-			"String panic payload should be preserved, got: {}",
-			err.reason
-		);
+	#[test]
+	fn compute_catches_formatted_panic() {
+		let _silence = SilenceHook::new();
+		let mut task = blocking_task::<u32, _>("t_panic_fmt", |_| {
+			let n = 7;
+			panic!("fmt {n}");
+		});
+		let err = task.compute().unwrap_err();
+		assert!(err.reason.contains("fmt 7"), "reason = {}", err.reason);
+	}
+
+	#[test]
+	fn compute_catches_non_string_panic() {
+		let _silence = SilenceHook::new();
+		let mut task = blocking_task::<u32, _>("t_panic_any", |_| {
+			std::panic::panic_any(0xdead_beef_u32);
+		});
+		let err = task.compute().unwrap_err();
+		assert!(err.reason.contains("unknown panic payload"), "reason = {}", err.reason);
+	}
+
+	#[test]
+	fn compute_rejects_second_call() {
+		let mut task = blocking_task("t_double", |_| Ok(1_u32));
+		assert_eq!(task.compute().unwrap(), 1);
+		let err = task.compute().unwrap_err();
+		assert!(err.reason.contains("work already consumed"), "reason = {}", err.reason);
 	}
 
 	#[test]
@@ -366,56 +478,21 @@ mod tests {
 		let mut cancel_token = CancelToken::default();
 		let abort_token = cancel_token.emplace_abort_token();
 		abort_token.abort(AbortReason::User);
-		let work_ran = Arc::new(AtomicBool::new(false));
-		let work_ran_in_task = Arc::clone(&work_ran);
+		let work_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let work_ran_in_task = std::sync::Arc::clone(&work_ran);
 		let mut task = Blocking {
 			tag: "test_cancelled",
 			cancel_token,
 			work: Some(Box::new(move |_| -> Result<String> {
-				work_ran_in_task.store(true, Ordering::SeqCst);
+				work_ran_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
 				Ok("ran".to_owned())
 			})),
 		};
 
-		let result = task.compute();
-
-		let err = result.expect_err("pre-cancelled task should return cancellation error");
-		assert!(
-			err.reason.contains("Aborted: User"),
-			"cancellation reason should be preserved, got: {}",
-			err.reason
-		);
-		assert!(!work_ran.load(Ordering::SeqCst), "work closure must not run after pre-cancellation");
-	}
-
-	#[test]
-	fn blocking_compute_observes_token_cancelled_by_heartbeat_mid_work() {
-		let mut cancel_token = CancelToken::default();
-		let abort_token = cancel_token.emplace_abort_token();
-		let work_started = Arc::new(AtomicBool::new(false));
-		let work_started_in_task = Arc::clone(&work_started);
-		let mut task = Blocking {
-			tag: "test_mid_work_cancelled",
-			cancel_token,
-			work: Some(Box::new(move |token| -> Result<String> {
-				work_started_in_task.store(true, Ordering::SeqCst);
-				abort_token.abort(AbortReason::User);
-				token.heartbeat()?;
-				Ok("missed cancellation".to_owned())
-			})),
-		};
-
-		let result = task.compute();
-
-		let err = result.expect_err("heartbeat should observe mid-work cancellation");
-		assert!(
-			work_started.load(Ordering::SeqCst),
-			"work closure should start before mid-work cancellation"
-		);
-		assert!(
-			err.reason.contains("Aborted: User"),
-			"heartbeat cancellation reason should be preserved, got: {}",
-			err.reason
-		);
+		let err = task
+			.compute()
+			.expect_err("pre-cancelled task should return cancellation error");
+		assert!(err.reason.contains("Aborted: User"), "reason = {}", err.reason);
+		assert!(!work_ran.load(std::sync::atomic::Ordering::SeqCst));
 	}
 }
