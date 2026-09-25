@@ -199,20 +199,6 @@ if "__gjc_prelude_loaded__" not in globals():
             output('explore_0', offset=10, limit=20)  # Lines 10-29
             output('explore_0', 'reviewer_1')  # Read multiple outputs
         """
-        # Prefer PI_ARTIFACTS_DIR so subagents resolve through the parent's
-        # shared artifacts dir; fall back to deriving from PI_SESSION_FILE
-        # for legacy callers / top-level sessions where the two coincide.
-        artifacts_dir = os.environ.get("PI_ARTIFACTS_DIR")
-        if not artifacts_dir:
-            session_file = os.environ.get("PI_SESSION_FILE")
-            if not session_file:
-                _emit_status("output", error="No session file available")
-                raise RuntimeError("No session - output artifacts unavailable")
-            artifacts_dir = session_file.rsplit(".", 1)[0]  # Strip .jsonl extension
-        if not Path(artifacts_dir).exists():
-            _emit_status("output", error="Artifacts directory not found", path=artifacts_dir)
-            raise RuntimeError(f"No artifacts directory found: {artifacts_dir}")
-        
         if not ids:
             _emit_status("output", error="No IDs provided")
             raise ValueError("At least one output ID is required")
@@ -221,26 +207,39 @@ if "__gjc_prelude_loaded__" not in globals():
             _emit_status("output", error="query cannot be combined with offset/limit")
             raise ValueError("query cannot be combined with offset/limit")
         
+        # Check if tool bridge is available
+        if 'tool' not in globals():
+            _emit_status("output", error="Tool bridge not available")
+            raise RuntimeError("output() requires tool bridge (PI_TOOL_BRIDGE_* env vars) to be available")
+        
         results: list[dict] = []
-        not_found: list[str] = []
         
         for output_id in ids:
-            output_path = Path(artifacts_dir) / f"{output_id}.md"
-            if not output_path.exists():
-                not_found.append(output_id)
-                continue
+            # Build the read tool path and selector
+            path = f"agent://{output_id}"
+            read_kwargs = {}
             
-            raw_content = output_path.read_text(encoding="utf-8")
-            raw_lines = raw_content.splitlines()
-            total_lines = len(raw_lines)
+            # Handle offset/limit by converting to read tool selector syntax
+            if offset is not None or limit is not None:
+                start_line = max(1, offset or 1)
+                if limit is not None:
+                    # :start+count format
+                    path += f":{start_line}+{limit}"
+                else:
+                    # :start format (read from start to end)
+                    path += f":{start_line}-"
             
-            selected_content = raw_content
-            range_info: dict | None = None
+            try:
+                # Call tool.read() to get the content
+                content = tool.read({"path": path, **read_kwargs})
+            except Exception as e:
+                _emit_status("output", id=output_id, error=str(e))
+                raise
             
             # Handle query
             if query:
                 try:
-                    json_value = json.loads(raw_content)
+                    json_value = json.loads(content)
                 except json.JSONDecodeError as e:
                     _emit_status("output", id=output_id, error=f"Not valid JSON: {e}")
                     raise ValueError(f"Output {output_id} is not valid JSON: {e}")
@@ -251,19 +250,8 @@ if "__gjc_prelude_loaded__" not in globals():
                     selected_content = json.dumps(result_value, indent=2) if result_value is not None else "null"
                 except (TypeError, ValueError):
                     selected_content = str(result_value)
-            
-            # Handle offset/limit
-            elif offset is not None or limit is not None:
-                start_line = max(1, offset or 1)
-                if start_line > total_lines:
-                    _emit_status("output", id=output_id, error=f"Offset {start_line} beyond end ({total_lines} lines)")
-                    raise ValueError(f"Offset {start_line} is beyond end of output ({total_lines} lines) for {output_id}")
-                
-                effective_limit = limit if limit is not None else total_lines - start_line + 1
-                end_line = min(total_lines, start_line + effective_limit - 1)
-                selected_lines = raw_lines[start_line - 1 : end_line]
-                selected_content = "\n".join(selected_lines)
-                range_info = {"start_line": start_line, "end_line": end_line, "total_lines": total_lines}
+            else:
+                selected_content = content
             
             # Strip ANSI codes if requested
             if format == "stripped":
@@ -274,31 +262,16 @@ if "__gjc_prelude_loaded__" not in globals():
             if format == "json":
                 result_data = {
                     "id": output_id,
-                    "path": str(output_path),
-                    "line_count": total_lines if not query else len(selected_content.splitlines()),
-                    "char_count": len(raw_content) if not query else len(selected_content),
+                    "path": f"agent://{output_id}",
+                    "line_count": len(content.splitlines()),
+                    "char_count": len(content) if not query else len(selected_content),
                     "content": selected_content,
                 }
-                if range_info:
-                    result_data["range"] = range_info
                 if query:
                     result_data["query"] = query
                 results.append(result_data)
             else:
                 results.append({"id": output_id, "content": selected_content})
-        
-        # Handle not found
-        if not_found:
-            available = sorted(
-                [f.stem for f in Path(artifacts_dir).glob("*.md")]
-            )
-            error_msg = f"Output not found: {', '.join(not_found)}"
-            if available:
-                error_msg += f"\n\nAvailable outputs: {', '.join(available[:20])}"
-                if len(available) > 20:
-                    error_msg += f" (and {len(available) - 20} more)"
-            _emit_status("output", not_found=not_found, available_count=len(available))
-            raise FileNotFoundError(error_msg)
         
         # Return format
         if len(ids) == 1:
