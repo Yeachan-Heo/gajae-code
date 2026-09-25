@@ -93,6 +93,32 @@ function parseWmicTable(output: string, header: string): string | null {
 }
 
 const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
+const SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS = 100;
+
+/**
+ * Resolve after `budgetMs` of event-loop-responsive time has elapsed.
+ *
+ * A plain wall-clock timer misfires when the loop is starved: concurrent
+ * sessions in one process (e.g. `bench:edit`) run seconds of synchronous
+ * startup work, the timer and the finished file I/O become ready together,
+ * and the timers phase runs first, so a step that needed milliseconds is
+ * reported as timed out (issue #5949). Each tick contributes at most two tick
+ * lengths, so blocked stretches do not consume the budget while a genuinely
+ * hung step still times out after roughly `budgetMs` of responsive time.
+ */
+export async function waitForResponsiveBudget(
+	budgetMs: number,
+	tickMs = SYSTEM_PROMPT_PREP_DEADLINE_TICK_MS,
+): Promise<void> {
+	let consumed = 0;
+	let last = performance.now();
+	while (consumed < budgetMs) {
+		await Bun.sleep(Math.min(tickMs, budgetMs - consumed));
+		const now = performance.now();
+		consumed += Math.min(now - last, tickMs * 2);
+		last = now;
+	}
+}
 
 async function getGpuModel(): Promise<string | null> {
 	switch (process.platform) {
@@ -596,7 +622,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		} satisfies WorkspaceTree,
 	};
 
-	const deadline = Bun.sleep(SYSTEM_PROMPT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
+	const deadline = waitForResponsiveBudget(SYSTEM_PROMPT_PREP_TIMEOUT_MS).then(() => "__timeout__" as const);
 	const timedOut: string[] = [];
 	const failed: Array<{ name: string; error: unknown }> = [];
 
