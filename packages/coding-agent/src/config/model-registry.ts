@@ -1752,7 +1752,7 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
-	#ownershipSettings: Pick<Settings, "commitAtomicBatchWithCurrent">;
+	#ownershipSettings: Pick<Settings, "commitAtomicBatchWithCurrent"> | undefined;
 	readonly #authStorageConfigOwner: object = {};
 	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
@@ -1801,15 +1801,15 @@ export class ModelRegistry {
 	constructor(
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
-		registrySettings?: Pick<Settings, "get" | "getGlobal">,
+		registrySettings?: Pick<Settings, "get" | "getGlobal"> & Partial<Pick<Settings, "commitAtomicBatchWithCurrent">>,
 		modelPresetRegistryDependencies: ModelPresetRegistryDependencies = {},
 	) {
 		this.#settings = registrySettings ?? settings;
-		const ownershipSettings = registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent"> | undefined;
-		this.#ownershipSettings =
-			ownershipSettings && typeof ownershipSettings.commitAtomicBatchWithCurrent === "function"
-				? ownershipSettings
-				: settings;
+		this.#ownershipSettings = registrySettings
+			? typeof registrySettings.commitAtomicBatchWithCurrent === "function"
+				? (registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent">)
+				: undefined
+			: settings;
 		const configuredAgentDir = path.resolve(modelPresetRegistryDependencies.agentDir ?? getAgentDir());
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
 		this.#modelPresetRegistryAgentDir = modelPresetRegistryDependencies.agentDir
@@ -3113,8 +3113,12 @@ export class ModelRegistry {
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
+		const ownershipSettings = this.#ownershipSettings;
+		if (!ownershipSettings) {
+			throw new Error("Profile deletion requires a settings store with ownership transaction support.");
+		}
 		let deletedProfile: ModelProfileConfig | undefined;
-		await this.#ownershipSettings.commitAtomicBatchWithCurrent(async currentSettings => {
+		await ownershipSettings.commitAtomicBatchWithCurrent(async currentSettings => {
 			const durableOwnership = readDurableModelProfileOwnershipFromRaw(currentSettings);
 			if (durableOwnership.marker.kind === "profile" && durableOwnership.marker.profile === normalizedName) {
 				throw new ModelProfileReplacementRequiredError(normalizedName);

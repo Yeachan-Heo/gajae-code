@@ -203,6 +203,22 @@ describe("custom model preset creation", () => {
 		expect(parsed.profiles.second?.display_name).toBe("second");
 	});
 
+	it("fails closed instead of using global settings when injected settings lack ownership CAS", async () => {
+		const scopedSettings = Settings.isolated();
+		const registrySettings: Pick<Settings, "get" | "getGlobal"> = {
+			get: key => scopedSettings.get(key),
+			getGlobal: key => scopedSettings.getGlobal(key),
+		};
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), registrySettings);
+		try {
+			await expect(registry.deleteCustomModelProfile("first")).rejects.toThrow(
+				"Profile deletion requires a settings store with ownership transaction support",
+			);
+		} finally {
+			await registry.dispose();
+		}
+	});
+
 	it("requires durable ownership replacement before deleting its profile", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
 		const settings = Settings.isolated({ "modelProfile.default": "first" });
