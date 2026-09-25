@@ -58,6 +58,25 @@ function expireCachePayloads(store: ObservableStore): void {
 	}
 }
 
+/**
+ * Simulate `ageMs` passing for every per-credential report: shift the report's
+ * `fetchedAt` back and expire its freshness, and drop aggregate snapshots so
+ * the next poll re-evaluates each credential.
+ */
+function ageStoredReports(store: ObservableStore, ageMs: number): void {
+	for (const [key, entry] of store.cache) {
+		if (key.includes("reports:")) {
+			store.cache.delete(key);
+			continue;
+		}
+		if (!key.includes("usage_cache:report:")) continue;
+		const parsed = JSON.parse(entry.value);
+		parsed.expiresAt = Date.now() - 1;
+		if (parsed.value && typeof parsed.value.fetchedAt === "number") parsed.value.fetchedAt -= ageMs;
+		store.cache.set(key, { value: JSON.stringify(parsed), expiresAtSec: entry.expiresAtSec });
+	}
+}
+
 interface CacheEntry {
 	value: string;
 	expiresAtSec: number;
@@ -379,17 +398,32 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 
 		// Age the stored report past the 24h last-good retention while leaving the
 		// row readable (expired rows are not swept and now survive startup).
-		for (const [key, entry] of store.cache) {
-			if (!key.includes("usage_cache:report:")) continue;
-			const parsed = JSON.parse(entry.value);
-			parsed.expiresAt = Date.now() - 25 * 60 * 60_000;
-			store.cache.set(key, { value: JSON.stringify(parsed), expiresAtSec: entry.expiresAtSec });
-		}
-		for (const key of [...store.cache.keys()]) if (key.includes("reports:")) store.cache.delete(key);
+		ageStoredReports(store, 25 * 60 * 60_000);
 
 		// The probe fails; the ancient report must not come back as a fallback.
 		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(0);
 		expect(calls).toBe(2);
+	});
+
+	it("repeated failures do not extend a last-good report past its retention", async () => {
+		let calls = 0;
+		const goldReport = makeReport("a@example.com");
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
+			calls += 1;
+			return calls === 1 ? goldReport : null;
+		});
+
+		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(1);
+
+		// 23h old: a failure still serves last-good, and rewrites the cool-down.
+		ageStoredReports(store, 23 * 60 * 60_000);
+		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(1);
+		expect(calls).toBe(2);
+
+		// Another 2h of failures: the rewrite must not have renewed its age.
+		ageStoredReports(store, 2 * 60 * 60_000);
+		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(0);
+		expect(calls).toBe(3);
 	});
 
 	it("re-attempts the failing credential after the cool-down expires", async () => {

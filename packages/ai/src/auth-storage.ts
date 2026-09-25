@@ -1363,12 +1363,7 @@ class AuthStorageUsageCache implements UsageCache {
 	getStale<T>(key: string): UsageCacheEntry<T> | undefined {
 		const raw = this.store.getCache(`${USAGE_CACHE_PREFIX}${key}`, { includeExpired: true });
 		if (!raw) return undefined;
-		const entry = parseUsageCacheEntry<T>(raw);
-		// Enforce last-good retention on read: rows now survive process startup
-		// (#5939) and expired rows are not swept, so a report older than the
-		// retention window must not be resurrected as a failure fallback.
-		if (!entry || entry.expiresAt + USAGE_LAST_GOOD_RETENTION_MS <= Date.now()) return undefined;
-		return entry;
+		return parseUsageCacheEntry<T>(raw);
 	}
 
 	set<T>(key: string, entry: UsageCacheEntry<T>): void {
@@ -4170,7 +4165,22 @@ export class AuthStorage {
 			if (cached && cached.expiresAt > Date.now()) return { value: cached.value, leaseAcquired: false };
 			if (this.#tryAcquireUsageFetchLease(cacheKey) === true) return { leaseAcquired: true };
 		}
-		return { value: this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null, leaseAcquired: false };
+		return { value: this.#readRetainedLastGoodUsage(cacheKey), leaseAcquired: false };
+	}
+
+	/**
+	 * Last successful report for a credential, if it is still inside the last-good
+	 * retention window. Age is measured from the report's own `fetchedAt`, which
+	 * failure cool-down rewrites never change, so repeated failures cannot keep an
+	 * old (possibly exhausted) report alive past retention. Rows survive process
+	 * startup (#5939) and expired rows are not swept, so this bound is enforced
+	 * on read.
+	 */
+	#readRetainedLastGoodUsage(cacheKey: string): UsageReport | null {
+		const report = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+		if (!report) return null;
+		const fetchedAt = Number.isFinite(report.fetchedAt) ? report.fetchedAt : 0;
+		return fetchedAt + USAGE_LAST_GOOD_RETENTION_MS > Date.now() ? report : null;
 	}
 
 	async #fetchAndCacheUsageReport(
@@ -4198,7 +4208,7 @@ export class AuthStorage {
 		// report. Without a previous value, persist the failure itself for a
 		// longer cool-down so neither this process nor its siblings re-probe a
 		// rate-limited endpoint on every credential selection.
-		const lastGood = this.#usageCache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+		const lastGood = this.#readRetainedLastGoodUsage(cacheKey);
 		const backoffMs = lastGood !== null ? USAGE_FAILURE_BACKOFF_MS : USAGE_FAILURE_NEGATIVE_TTL_MS;
 		const backoffJitter = backoffMs * (Math.random() * 0.5 - 0.25);
 		this.#usageCache.set(cacheKey, { value: lastGood, expiresAt: Date.now() + backoffMs + backoffJitter });
