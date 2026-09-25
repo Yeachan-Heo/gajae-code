@@ -134,6 +134,37 @@ export interface CostTimeSeriesPoint {
 	requests: number;
 }
 
+/** First prompt-prefix layer the client changed relative to the previous request (mirrors `PromptPrefixChange`). */
+export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages";
+
+/** Prefix-miss count for one client-side cause. */
+export interface CacheMissCause {
+	change: PromptPrefixChange;
+	/** Role of the rewritten or removed message when `change` is `messages`. */
+	divergedRole: string | null;
+	misses: number;
+}
+
+/**
+ * Attribution of prompt-cache prefix misses for requests that carry prompt-prefix
+ * telemetry. A prefix miss is a follow-up request whose cache read covers under
+ * 10% of a prompt of at least 4096 tokens.
+ */
+export interface CacheMissAttribution {
+	/** Follow-up requests (not the first of an agent) with prompt-prefix telemetry. */
+	trackedRequests: number;
+	prefixMisses: number;
+	/** Misses where tools, the system prompt, or already-sent messages changed. */
+	clientCausedMisses: number;
+	/** Misses on a pure append: the prefix was intact, so the provider evicted or rerouted. */
+	providerSideMisses: number;
+	/** Misses caused by switching provider/model, which never share a cache. */
+	modelSwitchMisses: number;
+	/** `clientCausedMisses / prefixMisses` (0 when there are no misses). */
+	clientCausedShare: number;
+	byCause: CacheMissCause[];
+}
+
 /**
  * Overall dashboard stats.
  */
@@ -146,6 +177,7 @@ export interface DashboardStats {
 	modelSeries: ModelTimeSeriesPoint[];
 	modelPerformanceSeries: ModelPerformancePoint[];
 	costSeries: CostTimeSeriesPoint[];
+	cacheMissAttribution: CacheMissAttribution;
 }
 
 /**

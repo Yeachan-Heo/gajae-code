@@ -810,6 +810,34 @@ export interface DeveloperMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * First cached-prefix layer the client changed relative to the previous request
+ * from the same agent, in provider cache order (tools → system → messages).
+ *
+ * - `initial`: first request observed by this agent; nothing to compare.
+ * - `append`: the previous request is an exact prefix; any cache miss is provider-side.
+ * - `model`: a different provider/model, which never shares a prompt cache.
+ * - `tools`: tool specs changed.
+ * - `system`: the system prompt changed.
+ * - `messages`: a previously sent message was rewritten or removed.
+ */
+export type PromptPrefixChange = "initial" | "append" | "model" | "tools" | "system" | "messages";
+
+/** Per-request prompt-prefix fingerprint that separates client prefix mutation from provider cache eviction. */
+export interface PromptPrefixTelemetry {
+	/** xxHash64 (hex) over the system prompt, tool specs, and every message sent in this request. */
+	hash: string;
+	/** Messages sent in this request. */
+	messages: number;
+	/** Leading messages byte-identical to the previous request's messages. */
+	reusedMessages: number;
+	/** Messages in the previous request (0 on the initial request). */
+	previousMessages: number;
+	change: PromptPrefixChange;
+	/** Role of the previously sent message that was rewritten or removed (only for `messages`). */
+	divergedRole?: Message["role"];
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | RedactedThinkingContent | ToolCall)[];
@@ -855,6 +883,8 @@ export interface AssistantMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 	duration?: number; // Request duration in milliseconds
 	ttft?: number; // Time to first token in milliseconds
+	/** Prompt-prefix fingerprint of the request that produced this message. */
+	promptPrefix?: PromptPrefixTelemetry;
 }
 
 export interface ToolResultMessage<TDetails = any> {

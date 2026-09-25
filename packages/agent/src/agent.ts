@@ -32,6 +32,7 @@ import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import { createAttemptScopeAuthority } from "./attempt-scope";
 import type { HarmonyAuditEvent } from "./harmony-leak";
 import { assertImagePlaceholdersHavePayload } from "./image-placeholder-guard";
+import { PromptPrefixTracker } from "./prompt-prefix-telemetry";
 import { createRunResourceLedger } from "./run-resource-ledger";
 import type {
 	AgentContext,
@@ -555,6 +556,7 @@ export class Agent {
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	readonly #promptPrefixTracker = new PromptPrefixTracker();
 	#mainAttemptScopeObserver?: (scope: AttemptScope) => void;
 
 	get intentTracing(): boolean {
@@ -2030,6 +2032,7 @@ export class Agent {
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
 			appendOnlyContext: this.#appendOnlyContext,
+			promptPrefixTracker: this.#promptPrefixTracker,
 			beforeToolCall: this.beforeToolCall
 				? async (ctx, signal) => {
 						if (this.#activeRunId !== runId) return undefined;

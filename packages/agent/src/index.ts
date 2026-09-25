@@ -8,6 +8,8 @@ export * from "./append-only-context";
 export * from "./compaction";
 export * from "./harmony-leak";
 export * from "./image-placeholder-guard";
+// Per-request prompt-prefix telemetry
+export * from "./prompt-prefix-telemetry";
 // Proxy utilities
 export * from "./proxy";
 // Run-level telemetry collector + aggregators

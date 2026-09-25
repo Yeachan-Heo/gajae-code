@@ -4,7 +4,9 @@ import { getPriorityPremiumRequests, type ServiceTier } from "@gajae-code/ai";
 import { getSessionsDir, isEnoent } from "@gajae-code/utils";
 import type {
 	AgentRole,
+	MessageStats,
 	ParsedMessageStats,
+	PromptPrefixChange,
 	SessionAssistantMessage,
 	SessionEntry,
 	SessionMessageEntry,
@@ -37,6 +39,27 @@ function isNonemptyString(value: unknown): value is string {
 
 function isNonnegativeNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+const PROMPT_PREFIX_CHANGES = new Set<PromptPrefixChange>([
+	"initial",
+	"append",
+	"model",
+	"tools",
+	"system",
+	"messages",
+]);
+const MESSAGE_ROLES = new Set(["user", "developer", "assistant", "toolResult"]);
+
+/** Read the persisted prompt-prefix telemetry; unknown or malformed payloads are ignored. */
+function extractPromptPrefix(value: unknown): MessageStats["promptPrefix"] {
+	if (!isObject(value) || !PROMPT_PREFIX_CHANGES.has(value.change as PromptPrefixChange)) return undefined;
+	const change = value.change as PromptPrefixChange;
+	const divergedRole =
+		change === "messages" && typeof value.divergedRole === "string" && MESSAGE_ROLES.has(value.divergedRole)
+			? value.divergedRole
+			: null;
+	return { change, divergedRole };
 }
 
 /**
@@ -188,6 +211,7 @@ function extractStats(
 		stopReason: isNonemptyString(msg.stopReason) ? msg.stopReason : "unknown",
 		errorMessage: typeof msg.errorMessage === "string" ? msg.errorMessage : null,
 		usage,
+		promptPrefix: extractPromptPrefix(msg.promptPrefix),
 	};
 }
 

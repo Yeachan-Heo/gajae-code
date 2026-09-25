@@ -1,0 +1,3 @@
+### Added
+
+- Every assistant turn now records a prompt-prefix fingerprint (`promptPrefix`) that compares its request with the agent's previous one: a stable xxHash64 of the provider-visible prefix, how many already-sent messages were reused, and the first layer the client changed (`append`, `model`, `tools`, `system`, or `messages` plus the role of the rewritten message). `gjc stats --summary` and `gjc stats --json` (`cacheMissAttribution`) use it to split prompt-cache prefix misses into client-caused, provider-side (prefix intact), and model-switch misses, and to break the client-caused misses down by cause (#5946).
