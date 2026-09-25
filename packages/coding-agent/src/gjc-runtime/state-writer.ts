@@ -2,7 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { repairOwnerOnlyPathSecurityExpected } from "@gajae-code/natives";
 import { type FileLockOptions, withFileLock } from "../config/file-lock";
+import {
+	ManagedPublishError,
+	ManagedSessionDescendantStore,
+	prepareManagedDirectoryRoot,
+} from "../session/internal/managed-session-storage";
 import type { ActiveSubskillEntry, SkillActiveEntry, SkillActiveState } from "../skill-state/active-state";
 import {
 	type AuditEntry,
@@ -257,68 +263,166 @@ function tempPathFor(filePath: string): string {
 	return `${filePath}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
 }
 
-const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
-async function ensurePrivateDirectory(directory: string): Promise<void> {
-	await fs.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-	await fs.chmod(directory, PRIVATE_DIRECTORY_MODE);
+interface ManagedWriterTarget {
+	store: ManagedSessionDescendantStore;
+	canonicalPath: string;
+	relativePath: string;
 }
 
-async function appendPrivate(filePath: string, content: string): Promise<void> {
-	let initialStat: nodeFs.BigIntStats | undefined;
-	let handle: fs.FileHandle | undefined;
-	for (let attempt = 0; attempt < 8 && !handle; attempt++) {
-		initialStat = undefined;
+function managedWriterRootPath(cwd: string): string {
+	return path.join(path.resolve(cwd), ".gjc");
+}
+
+function openManagedWriterTarget(filePath: string, cwd: string): ManagedWriterTarget {
+	const lexicalRoot = managedWriterRootPath(cwd);
+	const resolved = path.resolve(filePath);
+	const relative = path.relative(lexicalRoot, resolved);
+	if (!relative || relative.startsWith("..") || path.isAbsolute(relative))
+		throw new Error("target path must be within project .gjc/**");
+	const root = prepareManagedDirectoryRoot(lexicalRoot);
+	const canonicalPath = path.join(root.canonicalPath, relative);
+	return {
+		store: new ManagedSessionDescendantStore(root, path.dirname(canonicalPath)),
+		canonicalPath,
+		relativePath: path.basename(canonicalPath),
+	};
+}
+
+function openManagedWriterDirectory(directory: string, cwd: string): ManagedSessionDescendantStore {
+	const lexicalRoot = managedWriterRootPath(cwd);
+	const resolved = path.resolve(directory);
+	const relative = path.relative(lexicalRoot, resolved);
+	if (relative.startsWith("..") || path.isAbsolute(relative))
+		throw new Error("directory must be within project .gjc/**");
+	const root = prepareManagedDirectoryRoot(lexicalRoot);
+	return new ManagedSessionDescendantStore(root, path.join(root.canonicalPath, relative));
+}
+
+async function appendPrivate(
+	filePath: string,
+	content: string,
+	options: { cwd?: string; beforeAppend?: (offset: number) => Promise<unknown> } = {},
+): Promise<void> {
+	if (process.platform === "linux") {
+		const cwd = path.resolve(options.cwd ?? process.cwd());
+		const parentStore = openManagedWriterDirectory(path.dirname(filePath), cwd);
+		parentStore.close();
+		const privateOptions: StateWriterOptions = {
+			cwd,
+			privateDurable: { directory: path.dirname(filePath) },
+		};
+		const context = await preparePrivateDirectory(filePath, privateOptions);
 		try {
-			initialStat = await fs.lstat(filePath, { bigint: true });
-		} catch (error) {
-			if (!isErrno(error, "ENOENT")) throw error;
-		}
-		if (initialStat && (!initialStat.isFile() || initialStat.isSymbolicLink() || initialStat.nlink !== 1n))
-			throw new Error("append target must be a regular single-linked file");
-		const flags = initialStat
-			? nodeFs.constants.O_WRONLY |
-				nodeFs.constants.O_APPEND |
-				(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
-			: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
-		try {
-			handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
-		} catch (error) {
-			if (!initialStat && attempt < 7 && isErrno(error, "EEXIST")) continue;
-			throw error;
+			for (let attempt = 0; attempt < 8; attempt += 1) {
+				const initial = await fs.lstat(context.anchoredTarget, { bigint: true }).catch(error => {
+					if (isErrno(error, "ENOENT")) return undefined;
+					throw error;
+				});
+				if (initial && (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1n))
+					throw new Error("append target must be a regular single-linked file");
+				const flags =
+					nodeFs.constants.O_WRONLY |
+					nodeFs.constants.O_APPEND |
+					nodeFs.constants.O_NOFOLLOW |
+					(initial ? 0 : nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL);
+				let handle: fs.FileHandle;
+				try {
+					handle = await fs.open(context.anchoredTarget, flags, PRIVATE_FILE_MODE);
+				} catch (error) {
+					if (!initial && attempt < 7 && isErrno(error, "EEXIST")) continue;
+					throw error;
+				}
+				try {
+					const opened = await handle.stat({ bigint: true });
+					const named = await fs.lstat(context.anchoredTarget, { bigint: true });
+					const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+						left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+					if (
+						!opened.isFile() ||
+						opened.isSymbolicLink() ||
+						opened.nlink !== 1n ||
+						named.isSymbolicLink() ||
+						!named.isFile() ||
+						named.nlink !== 1n ||
+						(initial !== undefined && !sameObject(initial, opened)) ||
+						!sameObject(opened, named)
+					)
+						throw new Error("append target must be a regular single-linked file");
+					await handle.chmod(PRIVATE_FILE_MODE);
+					await options.beforeAppend?.(Number(opened.size));
+					await handle.writeFile(content, "utf-8");
+					await handle.sync();
+					const appended = await handle.stat({ bigint: true });
+					const finalNamed = await fs.lstat(context.anchoredTarget, { bigint: true });
+					if (
+						appended.isSymbolicLink() ||
+						!sameObject(opened, appended) ||
+						finalNamed.isSymbolicLink() ||
+						!sameObject(appended, finalNamed)
+					)
+						throw new Error("append target identity changed during append");
+					return;
+				} finally {
+					await handle.close();
+				}
+			}
+			throw new Error("append target changed repeatedly while opening");
+		} finally {
+			await closePrivatePublicationContext(context);
 		}
 	}
-	if (!handle) throw new Error("append target changed repeatedly while opening");
+	const target = openManagedWriterTarget(filePath, path.resolve(options.cwd ?? process.cwd()));
 	try {
-		const openedStat = await handle.stat({ bigint: true });
-		const pathStat = await fs.lstat(filePath, { bigint: true });
-		const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
-			left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
-		if (
-			!openedStat.isFile() ||
-			openedStat.isSymbolicLink() ||
-			openedStat.nlink !== 1n ||
-			pathStat.isSymbolicLink() ||
-			!pathStat.isFile() ||
-			pathStat.nlink !== 1n ||
-			(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
-			!sameObject(openedStat, pathStat)
-		)
-			throw new Error("append target must be a regular single-linked file");
-		await handle.chmod(PRIVATE_FILE_MODE);
-		await handle.writeFile(content, "utf-8");
-		const appendedStat = await handle.stat({ bigint: true });
-		const finalPathStat = await fs.lstat(filePath, { bigint: true });
-		if (
-			appendedStat.isSymbolicLink() ||
-			!sameObject(openedStat, appendedStat) ||
-			finalPathStat.isSymbolicLink() ||
-			!sameObject(appendedStat, finalPathStat)
-		)
-			throw new Error("append target identity changed during append");
+		for (let attempt = 0; attempt < 8; attempt += 1) {
+			const initialStat = await fs.lstat(target.canonicalPath, { bigint: true }).catch(error => {
+				if (isErrno(error, "ENOENT")) return undefined;
+				throw error;
+			});
+			if (initialStat && (!initialStat.isFile() || initialStat.isSymbolicLink() || initialStat.nlink !== 1n))
+				throw new Error("append target must be a regular single-linked file");
+			let expected = target.store.captureBoundedAppendExpectation(target.relativePath);
+			if (!expected) {
+				await options.beforeAppend?.(0);
+				try {
+					target.store.publishNoReplaceSync(target.relativePath, Buffer.from(content, "utf8"));
+					return;
+				} catch (error) {
+					if (error instanceof ManagedPublishError && error.classification === "destination_conflict") continue;
+					throw error;
+				}
+			}
+			const offset = Number(expected.size);
+			if (!Number.isSafeInteger(offset) || offset < 0)
+				throw new Error("append target is too large to append safely");
+			await options.beforeAppend?.(offset);
+			const named = await fs.lstat(target.canonicalPath, { bigint: true });
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n)
+				throw new Error("append target must be a regular single-linked file");
+			if ((named.mode & 0o777n) !== 0o600n) {
+				const repaired = repairOwnerOnlyPathSecurityExpected(target.canonicalPath, "file", named.dev, named.ino);
+				if (!repaired.ok) throw new Error(repaired.code ?? "append target permission repair failed");
+				const repairedStat = await fs.lstat(target.canonicalPath, { bigint: true });
+				if (
+					!repairedStat.isFile() ||
+					repairedStat.isSymbolicLink() ||
+					repairedStat.dev !== named.dev ||
+					repairedStat.ino !== named.ino ||
+					repairedStat.nlink !== 1n
+				)
+					throw new Error("append target identity changed during permission repair");
+				expected = target.store.captureBoundedAppendExpectation(target.relativePath);
+				if (!expected || Number(expected.size) !== offset)
+					throw new Error("append target identity changed during permission repair");
+			}
+			if (!expected) throw new Error("append target identity changed during append");
+			target.store.appendExpectedSync(target.relativePath, Buffer.from(content, "utf8"), expected);
+			return;
+		}
+		throw new Error("append target changed repeatedly while opening");
 	} finally {
-		await handle?.close();
+		target.store.close();
 	}
 }
 
@@ -475,16 +579,43 @@ function buildActiveSnapshot(entries: SkillActiveEntry[]): SkillActiveState {
 	};
 }
 
-async function atomicRemove(filePath: string): Promise<boolean> {
-	const tmpPath = tempPathFor(filePath);
-	try {
-		await fs.rename(filePath, tmpPath);
-	} catch (error) {
-		if (isErrno(error, "ENOENT")) return false;
-		throw error;
+async function atomicRemove(filePath: string, cwd = process.cwd()): Promise<boolean> {
+	if (process.platform === "linux") {
+		const stateOptions: StateWriterOptions = {
+			cwd: path.resolve(cwd),
+			privateDurable: { directory: path.dirname(filePath) },
+		};
+		const context = await preparePrivateDirectory(filePath, stateOptions);
+		try {
+			const before = await fs.lstat(context.anchoredTarget, { bigint: true }).catch(error => {
+				if (isErrno(error, "ENOENT")) return undefined;
+				throw error;
+			});
+			if (!before) return false;
+			if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n)
+				throw new Error("unsafe private publication file");
+			const retired = path.join(
+				directoryPath(context.targetParent),
+				`.${path.basename(filePath)}.remove.${process.pid}.${randomUUID()}`,
+			);
+			await fs.rename(context.anchoredTarget, retired);
+			await fs.rm(retired, { force: true });
+			await context.targetParent.handle.sync();
+			await assertPrivatePublicationDirectories(context);
+			return true;
+		} finally {
+			await closePrivatePublicationContext(context);
+		}
 	}
-	await fs.rm(tmpPath, { force: true });
-	return true;
+	const target = openManagedWriterTarget(filePath, cwd);
+	try {
+		const existing = target.store.readExpected(target.relativePath);
+		if (!existing) return false;
+		target.store.removeExpected(target.relativePath, existing);
+		return true;
+	} finally {
+		target.store.close();
+	}
 }
 
 async function readJsonIfPresent(filePath: string): Promise<unknown | undefined> {
@@ -597,16 +728,28 @@ async function maybeAudit(mutatedPath: string, options?: StateWriterOptions): Pr
 	});
 }
 
-async function atomicWrite(filePath: string, content: string): Promise<string> {
-	await ensurePrivateDirectory(path.dirname(filePath));
-	const tmpPath = tempPathFor(filePath);
+async function atomicWrite(filePath: string, content: string, options?: StateWriterOptions): Promise<string> {
+	if (process.platform === "linux") {
+		const cwd = cwdForOptions(options);
+		const parentStore = openManagedWriterDirectory(path.dirname(filePath), cwd);
+		parentStore.close();
+		const privateOptions: StateWriterOptions = {
+			cwd,
+			privateDurable: { directory: path.dirname(filePath) },
+		};
+		const context = await preparePrivateDirectory(filePath, privateOptions);
+		try {
+			await privateAtomicWrite(filePath, content, { cwd }, context, false);
+			return filePath;
+		} finally {
+			await closePrivatePublicationContext(context);
+		}
+	}
+	const target = openManagedWriterTarget(filePath, cwdForOptions(options));
 	try {
-		await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: PRIVATE_FILE_MODE, flag: "wx" });
-		await fs.chmod(tmpPath, PRIVATE_FILE_MODE);
-		await fs.rename(tmpPath, filePath);
-	} catch (error) {
-		await fs.rm(tmpPath, { force: true }).catch(() => undefined);
-		throw error;
+		target.store.replaceSync(target.relativePath, Buffer.from(content, "utf8"));
+	} finally {
+		target.store.close();
 	}
 	return filePath;
 }
@@ -643,6 +786,13 @@ function assertSafePublicationDirectory(stat: nodeFs.Stats, directory: string, p
 	}
 	if (privateSubtree && (stat.mode & 0o777) !== 0o700)
 		throw new Error("private publication directory is not owned mode 0700");
+}
+
+function assertPrivateDurableProjectRoot(cwd: string): void {
+	if (process.platform !== "linux") throw new Error("private durable publication requires Linux");
+	const root = path.resolve(cwd);
+	if (nodeFs.realpathSync(root) !== root) throw new Error("private durable publication requires canonical cwd");
+	assertSafePublicationDirectory(nodeFs.lstatSync(root), root, false);
 }
 
 function procPath(handle: fs.FileHandle): string {
@@ -705,6 +855,56 @@ async function assertPrivatePublicationDirectories(context: PrivatePublicationCo
 		namedRoot.ino !== root.ino
 	)
 		throw new Error("private publication root changed during publication");
+}
+
+async function secureExistingPrivatePublicationTarget(context: PrivatePublicationContext): Promise<void> {
+	const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
+		left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+	for (let attempt = 0; attempt < 8; attempt += 1) {
+		let initial: nodeFs.BigIntStats;
+		try {
+			initial = await fs.lstat(context.anchoredTarget, { bigint: true });
+		} catch (error) {
+			if (isErrno(error, "ENOENT")) return;
+			throw error;
+		}
+		if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1n)
+			throw new Error("append target must be a regular single-linked file");
+		if (initial.uid !== BigInt(currentUid())) throw new Error("unsafe private publication file");
+		let handle: fs.FileHandle | undefined;
+		try {
+			try {
+				handle = await fs.open(
+					context.anchoredTarget,
+					nodeFs.constants.O_WRONLY | nodeFs.constants.O_NOFOLLOW | nodeFs.constants.O_NONBLOCK,
+				);
+			} catch (error) {
+				if (isErrno(error, "ENOENT") && attempt < 7) continue;
+				throw error;
+			}
+			const opened = await handle.stat({ bigint: true });
+			const beforeChmod = await fs.lstat(context.anchoredTarget, { bigint: true });
+			if (!sameObject(initial, opened) || !sameObject(opened, beforeChmod)) continue;
+			if (!opened.isFile() || opened.isSymbolicLink() || opened.nlink !== 1n || opened.uid !== BigInt(currentUid()))
+				throw new Error("unsafe private publication file");
+			await handle.chmod(PRIVATE_FILE_MODE);
+			const secured = await handle.stat({ bigint: true });
+			const named = await fs.lstat(context.anchoredTarget, { bigint: true });
+			if (!sameObject(secured, named)) continue;
+			if (
+				!secured.isFile() ||
+				secured.isSymbolicLink() ||
+				secured.uid !== BigInt(currentUid()) ||
+				(secured.mode & 0o777n) !== BigInt(PRIVATE_FILE_MODE) ||
+				!sameObject(opened, secured)
+			)
+				throw new Error("private publication file identity changed during permission repair");
+			return;
+		} finally {
+			await handle?.close();
+		}
+	}
+	throw new Error("private publication file changed repeatedly during permission repair");
 }
 
 async function closePrivatePublicationContext(context: PrivatePublicationContext): Promise<void> {
@@ -820,6 +1020,8 @@ async function preparePrivateDirectory(
 			anchoredTarget: path.join(directoryPath(targetParent), path.basename(filePath)),
 		};
 		await assertPrivatePublicationDirectories(context);
+		await secureExistingPrivatePublicationTarget(context);
+		await assertPrivatePublicationDirectories(context);
 		try {
 			const stat = await fs.lstat(context.anchoredTarget);
 			if (
@@ -845,6 +1047,7 @@ async function privateAtomicWrite(
 	content: string,
 	options: StateWriterOptions,
 	context: PrivatePublicationContext,
+	auditAfterWrite = true,
 ): Promise<void> {
 	await assertPrivatePublicationDirectories(context);
 	const temporary = tempPathFor(filePath);
@@ -867,7 +1070,7 @@ async function privateAtomicWrite(
 		await fs.rename(anchoredTemporary, context.anchoredTarget);
 		await context.targetParent.handle.sync();
 		await assertPrivatePublicationDirectories(context);
-		await maybeAudit(filePath, options);
+		if (auditAfterWrite) await maybeAudit(filePath, options);
 	} catch (error) {
 		// A rename call or anything after it can have committed the replacement
 		// before returning an error. The caller must reload instead of retrying
@@ -883,13 +1086,14 @@ async function writeGuardedResolvedJsonAtomic(
 	value: unknown,
 	options: GuardedStateWriterOptions,
 ): Promise<GuardedWriteResult> {
+	if (options.privateDurable) assertPrivateDurableProjectRoot(cwdForOptions(options));
 	let privateContext: PrivatePublicationContext | undefined;
-	if (options.privateDurable) {
-		if (options.policy !== "source" || options.expectedRevision === undefined)
-			throw new Error("private durable publication requires source CAS");
-		privateContext = await preparePrivateDirectory(filePath, options);
-	}
 	const write = async (): Promise<GuardedWriteResult> => {
+		if (options.privateDurable) {
+			if (options.policy !== "source" || options.expectedRevision === undefined)
+				throw new Error("private durable publication requires source CAS");
+			privateContext = await preparePrivateDirectory(filePath, options);
+		}
 		if (privateContext) await assertPrivatePublicationDirectories(privateContext);
 		const strict = privateContext
 			? await readPrivateExistingStateForMutation(privateContext.anchoredTarget)
@@ -912,7 +1116,7 @@ async function writeGuardedResolvedJsonAtomic(
 				if (!privateContext) throw new Error("private publication directories were not prepared");
 				await privateAtomicWrite(filePath, jsonText(next), options, privateContext);
 			} else {
-				await atomicWrite(filePath, jsonText(next));
+				await atomicWrite(filePath, jsonText(next), options);
 				await maybeAudit(filePath, options);
 			}
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
@@ -930,7 +1134,7 @@ async function writeGuardedResolvedJsonAtomic(
 			currentRevision + 1,
 			incomingSourceRevision,
 		);
-		await atomicWrite(filePath, jsonText(next));
+		await atomicWrite(filePath, jsonText(next), options);
 		await maybeAudit(filePath, options);
 		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 	};
@@ -939,7 +1143,9 @@ async function writeGuardedResolvedJsonAtomic(
 	// so rather than deadlocking against itself — the same `lockHeld` contract the
 	// envelope writers already use.
 	try {
-		return options.lockHeld ? await write() : await lockResolvedWorkflowTarget(filePath, write, options.lock);
+		return options.lockHeld
+			? await write()
+			: await lockResolvedWorkflowTarget(filePath, write, options.lock, cwdForOptions(options));
 	} finally {
 		if (privateContext) await closePrivatePublicationContext(privateContext);
 	}
@@ -982,7 +1188,7 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 						.join("; ")}`,
 				);
 			}
-			await atomicWrite(filePath, jsonText(next));
+			await atomicWrite(filePath, jsonText(next), options);
 			await maybeAudit(filePath, options);
 			return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 		}
@@ -1006,11 +1212,13 @@ export async function writeGuardedWorkflowEnvelopeAtomic(
 					.join("; ")}`,
 			);
 		}
-		await atomicWrite(filePath, jsonText(next));
+		await atomicWrite(filePath, jsonText(next), options);
 		await maybeAudit(filePath, options);
 		return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 	};
-	return options.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options.lock);
+	return options.lockHeld
+		? write()
+		: lockResolvedWorkflowTarget(filePath, write, options.lock, cwdForOptions(options));
 }
 
 export async function writeJsonAtomic(
@@ -1019,7 +1227,7 @@ export async function writeJsonAtomic(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))));
+	await atomicWrite(filePath, jsonText(withWorkflowReceipt(value, buildReceipt(options))), options);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -1136,7 +1344,7 @@ export async function writeWorkflowEnvelopeAtomic(
 				}
 			}
 		}
-		await atomicWrite(filePath, jsonText(stamped));
+		await atomicWrite(filePath, jsonText(stamped), options);
 		await maybeAudit(filePath, options);
 		return filePath;
 	};
@@ -1145,12 +1353,14 @@ export async function writeWorkflowEnvelopeAtomic(
 	// inside a staged apply's check-then-write window and be silently overwritten
 	// (#3387 architect finding 1). Callers already inside `withWorkflowStateLock`
 	// for this path pass `lockHeld: true`.
-	return options?.lockHeld ? write() : lockResolvedWorkflowTarget(filePath, write, options?.lock);
+	return options?.lockHeld
+		? write()
+		: lockResolvedWorkflowTarget(filePath, write, options?.lock, cwdForOptions(options));
 }
 
 export async function writeTextAtomic(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await atomicWrite(filePath, text);
+	await atomicWrite(filePath, text, options);
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -1172,24 +1382,38 @@ export async function withWorkflowStateLock<T>(
 	fn: () => Promise<T>,
 	options?: StateWriterOptions,
 ): Promise<T> {
-	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const privateContext = options?.privateDurable ? await preparePrivateDirectory(filePath, options) : undefined;
-	try {
-		return await lockResolvedWorkflowTarget(filePath, fn, options?.lock);
-	} finally {
-		if (privateContext) await closePrivatePublicationContext(privateContext);
-	}
+	const cwd = cwdForOptions(options);
+	if (options?.privateDurable) assertPrivateDurableProjectRoot(cwd);
+	const filePath = resolveGjcTarget(targetPath, cwd);
+	const lockedOperation = async (): Promise<T> => {
+		if (!options?.privateDurable) return fn();
+		const context = await preparePrivateDirectory(filePath, options);
+		try {
+			await assertPrivatePublicationDirectories(context);
+			return await fn();
+		} finally {
+			await closePrivatePublicationContext(context);
+		}
+	};
+	return lockResolvedWorkflowTarget(filePath, lockedOperation, options?.lock, cwd);
 }
 
 async function lockResolvedWorkflowTarget<T>(
 	filePath: string,
 	fn: () => Promise<T>,
 	lockOptions?: FileLockOptions,
+	cwd = process.cwd(),
 ): Promise<T> {
-	// `withFileLock` creates the lock dir next to the target with a non-recursive
-	// mkdir, so the parent directory must exist before the lock is acquired.
-	await ensurePrivateDirectory(path.dirname(filePath));
-	return withFileLock(filePath, fn, lockOptions);
+	const parentStore = openManagedWriterDirectory(path.dirname(filePath), cwd);
+	const canonicalLockTarget = path.join(parentStore.dir, path.basename(filePath));
+	try {
+		parentStore.assertBound();
+		const result = await withFileLock(canonicalLockTarget, fn, lockOptions);
+		parentStore.assertBound();
+		return result;
+	} finally {
+		parentStore.close();
+	}
 }
 
 export async function updateJsonAtomic<T = unknown>(
@@ -1203,18 +1427,18 @@ export async function updateJsonAtomic<T = unknown>(
 		async () => {
 			const current = (await readJsonIfPresent(filePath)) as T | undefined;
 			const next = await mutator(current);
-			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))));
+			await atomicWrite(filePath, jsonText(withWorkflowReceipt(next, buildReceipt(options))), options);
 			await maybeAudit(filePath, options);
 			return filePath;
 		},
 		options?.lock,
+		cwdForOptions(options),
 	);
 }
 
 export async function appendJsonl(targetPath: string, entry: unknown, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await ensurePrivateDirectory(path.dirname(filePath));
-	await appendPrivate(filePath, `${JSON.stringify(entry)}\n`);
+	await appendPrivate(filePath, `${JSON.stringify(entry)}\n`, { cwd: cwdForOptions(options) });
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -1317,18 +1541,18 @@ export async function appendJsonlIdempotent(
 			if (duplicate !== undefined) {
 				return { path: filePath, appended: false, duplicate };
 			}
-			await appendPrivate(filePath, `${JSON.stringify(entry)}\n`);
+			await appendPrivate(filePath, `${JSON.stringify(entry)}\n`, { cwd: cwdForOptions(options) });
 			await maybeAudit(filePath, options);
 			return { path: filePath, appended: true };
 		},
 		options.lock,
+		cwdForOptions(options),
 	);
 }
 
 export async function appendText(targetPath: string, text: string, options?: StateWriterOptions): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await ensurePrivateDirectory(path.dirname(filePath));
-	await appendPrivate(filePath, text);
+	await appendPrivate(filePath, text, { cwd: cwdForOptions(options) });
 	await maybeAudit(filePath, options);
 	return filePath;
 }
@@ -1339,17 +1563,18 @@ export async function createJsonNoClobber(
 	options?: StateWriterOptions,
 ): Promise<string> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	await ensurePrivateDirectory(path.dirname(filePath));
-	let handle: fs.FileHandle | undefined;
+	const writer = openManagedWriterTarget(filePath, cwdForOptions(options));
 	try {
-		handle = await fs.open(filePath, "wx", PRIVATE_FILE_MODE);
-		await handle.chmod(PRIVATE_FILE_MODE);
-		await handle.writeFile(jsonText(withWorkflowReceipt(value, buildReceipt(options))), "utf-8");
+		writer.store.publishNoReplaceSync(
+			writer.relativePath,
+			Buffer.from(jsonText(withWorkflowReceipt(value, buildReceipt(options))), "utf8"),
+		);
 	} catch (error) {
-		if (isErrno(error, "EEXIST")) throw new AlreadyExistsError(filePath);
+		if (error instanceof ManagedPublishError && error.classification === "destination_conflict")
+			throw new AlreadyExistsError(filePath);
 		throw error;
 	} finally {
-		await handle?.close();
+		writer.store.close();
 	}
 	await maybeAudit(filePath, options);
 	return filePath;
@@ -1368,17 +1593,18 @@ export async function deleteIfOwned(
 			const current = await readJsonIfPresent(filePath);
 			if (current === undefined) return { path: filePath, deleted: false };
 			if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
-			const deleted = await atomicRemove(filePath);
+			const deleted = await atomicRemove(filePath, cwdForOptions(options));
 			if (deleted) await maybeAudit(filePath, options);
 			return { path: filePath, deleted };
 		},
 		options?.lock,
+		cwdForOptions(options),
 	);
 }
 
 export async function removeFileAudited(targetPath: string, options?: StateWriterOptions): Promise<DeleteResult> {
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const deleted = await atomicRemove(filePath);
+	const deleted = await atomicRemove(filePath, cwdForOptions(options));
 	if (deleted) await maybeAudit(filePath, options);
 	return { path: filePath, deleted };
 }
@@ -1402,6 +1628,7 @@ export async function writeActiveEntry(
 		{ ...entry, skill },
 		{
 			...options,
+			cwd: path.resolve(cwd),
 			policy: "cache",
 			advanceSourceRevision: true,
 		},
@@ -1417,11 +1644,12 @@ export async function removeActiveEntry(
 	options?: StateWriterOptions,
 ): Promise<DeleteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
+	const writerOptions = { ...options, cwd: path.resolve(cwd) };
 	return lockResolvedWorkflowTarget(
 		filePath,
 		async () => {
 			const current = await readJsonIfPresent(filePath);
-			const incomingSourceRevision = options?.sourceRevision;
+			const incomingSourceRevision = writerOptions.sourceRevision;
 			if (
 				current !== undefined &&
 				incomingSourceRevision !== undefined &&
@@ -1429,12 +1657,13 @@ export async function removeActiveEntry(
 			) {
 				return { path: filePath, deleted: false };
 			}
-			const deleted = await atomicRemove(filePath);
-			if (deleted) await maybeAudit(filePath, options);
+			const deleted = await atomicRemove(filePath, cwd);
+			if (deleted) await maybeAudit(filePath, writerOptions);
 			if (deleted) invalidateActiveStateCacheForScope(cwd, sessionScope);
 			return { path: filePath, deleted };
 		},
-		options?.lock,
+		writerOptions.lock,
+		cwd,
 	);
 }
 
@@ -1469,9 +1698,10 @@ export async function rebuildActiveSnapshot(
 ): Promise<string> {
 	const resolvedCwd = path.resolve(cwd);
 	const snapshotPath = activeSnapshotPath(resolvedCwd, sessionScope);
+	const writerOptions = { ...options, cwd: resolvedCwd };
 	const entries = await readActiveEntries(resolvedCwd, sessionScope);
 	await writeGuardedResolvedJsonAtomic(snapshotPath, buildActiveSnapshot(entries), {
-		...options,
+		...writerOptions,
 		policy: "cache",
 		sourceRevision: Math.max(
 			persistedSourceRevision(await readJsonIfPresent(snapshotPath)) + 1,
@@ -1578,7 +1808,7 @@ export async function hardPrune(
 			readJson: async () => JSON.parse(await fs.readFile(filePath, "utf-8")),
 		});
 		if (!shouldRemove) continue;
-		const deleted = await atomicRemove(filePath);
+		const deleted = await atomicRemove(filePath, cwd);
 		if (deleted) removed.push(filePath);
 	}
 	if (options?.audit && removed.length > 0) {
@@ -1610,7 +1840,7 @@ export async function forceOverwrite(
 	};
 	if (options?.raw === true) {
 		const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-		await atomicWrite(filePath, jsonText(rawValue));
+		await atomicWrite(filePath, jsonText(rawValue), auditOptions);
 		await maybeAudit(filePath, auditOptions);
 		return filePath;
 	}
@@ -1639,52 +1869,11 @@ export async function appendAuditEntry(
 	const entry = typeof sessionIdOrEntry === "string" ? maybeEntry : sessionIdOrEntry;
 	if (!entry) throw new Error("audit entry is required");
 	const filePath = resolveGjcTarget(layoutAuditPath(cwd, sessionId), cwd);
-	const append = async () => {
-		await ensurePrivateDirectory(path.dirname(filePath));
-		let initialStat: nodeFs.BigIntStats | undefined;
-		try {
-			initialStat = await fs.lstat(filePath, { bigint: true });
-			if (initialStat.isSymbolicLink() || !initialStat.isFile() || initialStat.nlink !== 1n)
-				throw new Error("audit path must be a regular single-linked file");
-		} catch (error) {
-			if (!isErrno(error, "ENOENT")) throw error;
-		}
-		const flags = initialStat
-			? nodeFs.constants.O_WRONLY |
-				nodeFs.constants.O_APPEND |
-				(process.platform === "win32" ? 0 : (nodeFs.constants.O_NOFOLLOW ?? 0))
-			: nodeFs.constants.O_WRONLY | nodeFs.constants.O_APPEND | nodeFs.constants.O_CREAT | nodeFs.constants.O_EXCL;
-		let handle: fs.FileHandle | undefined;
-		try {
-			handle = await fs.open(filePath, flags, PRIVATE_FILE_MODE);
-			const openedStat = await handle.stat({ bigint: true });
-			const pathStat = await fs.lstat(filePath, { bigint: true });
-			const sameObject = (left: nodeFs.BigIntStats, right: nodeFs.BigIntStats) =>
-				left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
-			if (
-				openedStat.isSymbolicLink() ||
-				!openedStat.isFile() ||
-				openedStat.nlink !== 1n ||
-				pathStat.isSymbolicLink() ||
-				!pathStat.isFile() ||
-				pathStat.nlink !== 1n ||
-				(initialStat !== undefined && !sameObject(initialStat, openedStat)) ||
-				!sameObject(openedStat, pathStat)
-			)
-				throw new Error("audit path identity changed before append");
-			if (openedStat.size > BigInt(Number.MAX_SAFE_INTEGER))
-				throw new Error("audit path is too large to append safely");
-			await handle.chmod(PRIVATE_FILE_MODE);
-			await options.beforeAppend?.(Number(openedStat.size));
-			await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf-8");
-			await handle.sync();
-			const afterPathStat = await fs.lstat(filePath, { bigint: true });
-			if (afterPathStat.isSymbolicLink() || afterPathStat.nlink !== 1n || !sameObject(openedStat, afterPathStat))
-				throw new Error("audit path identity changed during append");
-		} finally {
-			await handle?.close();
-		}
-	};
+	const append = () =>
+		appendPrivate(filePath, `${JSON.stringify(entry)}\n`, {
+			cwd,
+			beforeAppend: options.beforeAppend,
+		});
 	if (options.lockHeld) await append();
 	else await withWorkflowStateLock(filePath, append, { cwd });
 	return filePath;
@@ -1743,7 +1932,7 @@ export async function updateWorkflowTransactionJournal(
 	const filePath = transactionJournalPath(cwd, sessionId, mutationId);
 	const current = ((await readJsonIfPresent(filePath)) ?? {}) as WorkflowTransactionJournal;
 	const next = { ...current, ...patch, updated_at: new Date().toISOString() } as WorkflowTransactionJournal;
-	await atomicWrite(filePath, jsonText(next));
+	await atomicWrite(filePath, jsonText(next), { cwd });
 	return filePath;
 }
 
@@ -1753,5 +1942,5 @@ export async function completeWorkflowTransactionJournal(
 	mutationId: string,
 ): Promise<void> {
 	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { status: "committed" });
-	await atomicRemove(transactionJournalPath(cwd, sessionId, mutationId)).catch(() => false);
+	await atomicRemove(transactionJournalPath(cwd, sessionId, mutationId), cwd).catch(() => false);
 }
