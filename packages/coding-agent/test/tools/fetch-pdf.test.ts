@@ -32,7 +32,6 @@ function pdfFixture(text: string): string {
 	return `${pdf}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
 }
 
-
 describe("PDF URL source-text inspection", () => {
 	let server: Bun.Server<undefined>;
 	let session: ToolSession;

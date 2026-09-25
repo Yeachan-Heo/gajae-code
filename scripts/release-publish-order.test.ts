@@ -537,6 +537,9 @@ describe("native release binary coverage", () => {
 
 		expect(native).toContain("needs: [release_metadata]");
 		expect(binaries).toContain("needs: [native, release_metadata]");
+		expect(binaries).toContain("bun scripts/verify-agpl-removal.ts --active-refs");
+		expect(binaries).toContain("--payload --tarball");
+		expect(binaries).toContain("--prose-root .");
 		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
 		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
 		expect(finalize).toContain("needs: [publish, release_metadata]");

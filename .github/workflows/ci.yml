@@ -449,6 +449,16 @@ jobs:
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
            run: bun run ci:release:build-binaries
+         - name: Verify removed PDF references
+           run: bun scripts/verify-agpl-removal.ts --active-refs
+         - name: Verify packaged PDF payloads
+           shell: bash
+           run: |
+              set -euo pipefail
+              package_dir="$RUNNER_TEMP/coding-agent-package"
+              mkdir -p "$package_dir"
+              (cd packages/coding-agent && bun pm pack --destination "$package_dir")
+              bun scripts/verify-agpl-removal.ts --payload --tarball "$package_dir"/*.tgz --binary "${{ matrix.binary_path }}" --addon packages/natives/native/*.node --prose-root .
          - name: Smoke memory-guard native route (Windows)
            if: runner.os == 'Windows'
            shell: pwsh

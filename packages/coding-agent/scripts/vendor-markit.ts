@@ -53,7 +53,13 @@ async function inventory(directory: string): Promise<FileHash[]> {
 		} else if (metadata.isFile()) {
 			if (relative === provenanceName) return;
 			if (!selectedFile(relative)) throw new Error(`Unexpected vendor file: ${relative}`);
-			files.push({ path: relative, sha256: crypto.createHash("sha256").update(await Bun.file(absolute).bytes()).digest("hex") });
+			files.push({
+				path: relative,
+				sha256: crypto
+					.createHash("sha256")
+					.update(await Bun.file(absolute).bytes())
+					.digest("hex"),
+			});
 		} else {
 			throw new Error(`Vendor entries must be regular files or directories: ${relative}`);
 		}
@@ -70,7 +76,13 @@ async function provenance(directory: string): Promise<string> {
 		{
 			schemaVersion: 1,
 			upstream: { name: "markit-ai", version: "0.5.3", license: "MIT", url: sourceUrl, integrity: sourceIntegrity },
-			patch: { path: "../markit-ai.patch", sha256: crypto.createHash("sha256").update(await Bun.file(patchPath).bytes()).digest("hex") },
+			patch: {
+				path: "../markit-ai.patch",
+				sha256: crypto
+					.createHash("sha256")
+					.update(await Bun.file(patchPath).bytes())
+					.digest("hex"),
+			},
 			files: await inventory(directory),
 		},
 		null,
@@ -89,20 +101,31 @@ function replaceExactlyOnce(source: string, before: string, after: string, label
 async function applyLocalChanges(directory: string, tokens: readonly string[]): Promise<void> {
 	const markitPath = path.join(directory, "dist/markit.js");
 	let markit = await Bun.file(markitPath).text();
-	markit = replaceExactlyOnce(markit, 'import { PdfConverter } from "./converters/pdf/index.js";\n', "", "PDF converter import");
-	markit = replaceExactlyOnce(markit, "            new PdfConverter(),\n", "", "PDF converter registration");
 	markit = replaceExactlyOnce(
 		markit,
-		"throw new Error(`Conversion failed:\\n${details}`);",
-		"throw new AggregateError(errors.map((entry) => entry.error), `Conversion failed:\\n${details}`, { cause: errors[0].error });",
-		"conversion error cause chain",
+		'import { PdfConverter } from "./converters/pdf/index.js";\n',
+		"",
+		"PDF converter import",
 	);
+	markit = replaceExactlyOnce(markit, "            new PdfConverter(),\n", "", "PDF converter registration");
+	const errorPlaceholder = "$" + "{details}";
+	const originalError = `throw new Error(\`Conversion failed:\\n${errorPlaceholder}\`);`;
+	const replacementError = `throw new AggregateError(errors.map((entry) => entry.error), \`Conversion failed:\\n${errorPlaceholder}\`, { cause: errors[0].error });`;
+	markit = replaceExactlyOnce(markit, originalError, replacementError, "conversion error cause chain");
 	await Bun.write(markitPath, markit);
 
 	for (const file of ["dist/index.js", "dist/index.d.ts"]) {
 		const filePath = path.join(directory, file);
 		const source = await Bun.file(filePath).text();
-		await Bun.write(filePath, replaceExactlyOnce(source, 'export { PdfConverter } from "./converters/pdf/index.js";\n', "", "PDF converter public export"));
+		await Bun.write(
+			filePath,
+			replaceExactlyOnce(
+				source,
+				'export { PdfConverter } from "./converters/pdf/index.js";\n',
+				"",
+				"PDF converter public export",
+			),
+		);
 	}
 
 	const manifestPath = path.join(directory, "package.json");
@@ -122,13 +145,17 @@ async function applyLocalChanges(directory: string, tokens: readonly string[]): 
 
 async function fileContents(directory: string): Promise<Map<string, Buffer>> {
 	const contents = new Map<string, Buffer>();
-	for (const file of await inventory(directory)) contents.set(file.path, Buffer.from(await Bun.file(path.join(directory, file.path)).bytes()));
+	for (const file of await inventory(directory))
+		contents.set(file.path, Buffer.from(await Bun.file(path.join(directory, file.path)).bytes()));
 	return contents;
 }
 
 function gitBlobHash(bytes: Buffer | undefined): string {
 	if (!bytes) return "0".repeat(40);
-	return crypto.createHash("sha1").update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])).digest("hex");
+	return crypto
+		.createHash("sha1")
+		.update(Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes]))
+		.digest("hex");
 }
 
 async function makePatch(original: string, updated: string): Promise<string> {
@@ -164,7 +191,9 @@ async function verifyContents(directory: string): Promise<void> {
 		throw new Error("Vendored manifest must identify MIT markit-ai@0.5.3");
 	}
 	const tokens = await removalTokens();
-	const rootManifest = (await Bun.file(path.join(packageRoot, "package.json")).json()) as { dependencies?: Record<string, string> };
+	const rootManifest = (await Bun.file(path.join(packageRoot, "package.json")).json()) as {
+		dependencies?: Record<string, string>;
+	};
 	for (const dependency of Object.keys(upstream.dependencies ?? {})) {
 		if (typeof rootManifest.dependencies?.[dependency] !== "string") {
 			throw new Error(`Missing direct converter runtime dependency: ${dependency}`);
@@ -175,19 +204,25 @@ async function verifyContents(directory: string): Promise<void> {
 	}
 	const files = await inventory(directory);
 	for (const file of files) {
-		if (includesRetiredIdentifier(file.path, tokens)) throw new Error("Vendored converter contains a retired PDF file path");
+		if (includesRetiredIdentifier(file.path, tokens))
+			throw new Error("Vendored converter contains a retired PDF file path");
 		const contents = Buffer.from(await Bun.file(path.join(directory, file.path)).bytes()).toString("latin1");
-		if (includesRetiredIdentifier(contents, tokens)) throw new Error("Vendored converter contains a retired PDF runtime reference");
+		if (includesRetiredIdentifier(contents, tokens))
+			throw new Error("Vendored converter contains a retired PDF runtime reference");
 	}
-	if (files.some(file => file.path.startsWith("dist/converters/pdf/"))) throw new Error("Vendored converter still contains PDF modules");
+	if (files.some(file => file.path.startsWith("dist/converters/pdf/")))
+		throw new Error("Vendored converter still contains PDF modules");
 	const [markit, index, declarations] = await Promise.all([
 		Bun.file(path.join(directory, "dist/markit.js")).text(),
 		Bun.file(path.join(directory, "dist/index.js")).text(),
 		Bun.file(path.join(directory, "dist/index.d.ts")).text(),
 	]);
 	if (
-		markit.includes("PdfConverter") || index.includes("PdfConverter") || declarations.includes("PdfConverter") ||
-		!markit.includes("new AggregateError(errors.map((entry) => entry.error)") || !markit.includes("{ cause: errors[0].error }")
+		markit.includes("PdfConverter") ||
+		index.includes("PdfConverter") ||
+		declarations.includes("PdfConverter") ||
+		!markit.includes("new AggregateError(errors.map((entry) => entry.error)") ||
+		!markit.includes("{ cause: errors[0].error }")
 	) {
 		throw new Error("Vendored Markit must remove the PDF converter and preserve conversion causes");
 	}
@@ -231,7 +266,12 @@ async function generate(): Promise<void> {
 		const archiveEntries = await new Bun.Archive(bytes).files();
 		let unpackedSize = 0;
 		for (const [name, file] of archiveEntries) {
-			if (!name.startsWith("package/") || name.includes("\\") || name.includes("\0") || name.split("/").some(part => !part || part === "." || part === "..")) {
+			if (
+				!name.startsWith("package/") ||
+				name.includes("\\") ||
+				name.includes("\0") ||
+				name.split("/").some(part => !part || part === "." || part === "..")
+			) {
 				throw new Error(`Unsafe pinned archive entry: ${name}`);
 			}
 			unpackedSize += file.size;

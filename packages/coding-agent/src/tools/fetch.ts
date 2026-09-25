@@ -990,7 +990,9 @@ async function renderUrl(
 						notes,
 					};
 				}
-				notes.push(isPdf ? "PDF conversion produced no usable output" : "markit conversion produced no usable output");
+				notes.push(
+					isPdf ? "PDF conversion produced no usable output" : "markit conversion produced no usable output",
+				);
 			} else if (converted.error) {
 				notes.push(`${isPdf ? "PDF conversion" : "markit conversion"} failed: ${converted.error}`);
 			} else {
@@ -1194,7 +1196,11 @@ async function renderUrl(
 					if (!converted.ok && converted.error) {
 						notes.push(`${ext === ".pdf" ? "PDF conversion" : "markit conversion"} failed: ${converted.error}`);
 					} else if (converted.ok && !converted.content.trim()) {
-						notes.push(ext === ".pdf" ? "PDF conversion produced no usable output" : "markit conversion produced no usable output");
+						notes.push(
+							ext === ".pdf"
+								? "PDF conversion produced no usable output"
+								: "markit conversion produced no usable output",
+						);
 					}
 				} else if (binary.error) {
 					notes.push(`Binary fetch failed: ${binary.error}`);

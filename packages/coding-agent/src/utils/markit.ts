@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import { untilAborted } from "@gajae-code/utils";
 import type { Markit, StreamInfo } from "../../vendor/markit-ai/dist/index.js";
 import { ToolAbortError } from "../tools/tool-errors";
-import { pdfToMarkdown, type PdfMarkdownResult } from "./pdf";
+import { type PdfMarkdownResult, pdfToMarkdown } from "./pdf";
 
 export interface MarkitConversionResult {
 	content: string;

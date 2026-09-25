@@ -104,6 +104,7 @@
 		"README.md",
 		"CHANGELOG.md",
 		"vendor",
+		"!vendor/markit-ai.patch",
 		"!vendor/insane-search/engine/tests/**",
 		"!src/export/html/template.html",
 		"!src/export/html/template.css",

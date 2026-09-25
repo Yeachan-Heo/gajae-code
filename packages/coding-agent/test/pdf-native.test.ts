@@ -2,8 +2,8 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { convertBufferWithMarkit, convertFileWithMarkit } from "../src/utils/markit";
 import { pdfFixture, pdfGoldenCorpus } from "../../natives/test/pdf-fixtures";
+import { convertBufferWithMarkit, convertFileWithMarkit } from "../src/utils/markit";
 
 describe("native PDF conversion", () => {
 	it("routes PDF buffers and files through the native inspector", async () => {
