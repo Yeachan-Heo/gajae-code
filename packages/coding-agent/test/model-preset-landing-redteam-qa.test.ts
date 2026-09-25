@@ -141,6 +141,7 @@ function createRegistry(
 		getAvailableModelProfileNames: () => [...profileMap.keys()],
 		getApiKeyForProvider: async (provider: string) => (authenticatedProviders.includes(provider) ? "key" : undefined),
 		getApiKey: async () => "key",
+		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 }
 
