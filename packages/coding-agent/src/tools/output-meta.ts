@@ -632,6 +632,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		} else {
 			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; ${formatBytes(elidedBytes)} middle bytes elided`;
 		}
+		if (truncation.nextOffset != null) {
+			notice += `. Use :${truncation.nextOffset} to continue`;
+		}
 		if (hasArtifactNotice(truncation)) {
 			notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 		}
