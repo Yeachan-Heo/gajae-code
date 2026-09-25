@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { $env, $flag, $pickenv } from "@gajae-code/utils";
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
+import { flushTerminalOutput, terminalWriterIsDead, writeTerminalOutput } from "./terminal-writer";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -79,7 +80,7 @@ export function emergencyTerminalRestore(): void {
 		} else if (terminalEverStarted) {
 			// Blind restore only if we know a terminal was started but lost track of it
 			// This avoids writing escape sequences for non-TUI commands (grep, commit, etc.)
-			process.stdout.write(
+			writeTerminalOutput(
 				"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?1000l" + // Disable normal mouse reporting
 					"\x1b[?1002l" + // Disable button-event mouse reporting
@@ -1011,6 +1012,7 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.#wasRaw);
 		}
+		flushTerminalOutput();
 	}
 
 	#scheduleStdoutErrorHandlerCleanup(): void {
@@ -1072,7 +1074,8 @@ export class ProcessTerminal implements Terminal {
 			return;
 		}
 		try {
-			process.stdout.write(data);
+			writeTerminalOutput(data);
+			if (terminalWriterIsDead()) this.#markUnavailable(undefined, "writer-dead");
 		} catch (err) {
 			this.#markUnavailable(err, "write");
 		}
@@ -1114,6 +1117,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	get available(): boolean {
+		if (terminalWriterIsDead()) this.#markUnavailable(undefined, "writer-dead");
 		return !this.#dead;
 	}
 

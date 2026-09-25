@@ -29,6 +29,7 @@ export const PtySession = nativeBindings.PtySession;
 export const RecoveryFsFile = nativeBindings.RecoveryFsFile;
 export const RecoveryFsRoot = nativeBindings.RecoveryFsRoot;
 export const Shell = nativeBindings.Shell;
+export const TtyWriter = nativeBindings.TtyWriter;
 
 // functions
 export const __gjcInstallTokioRuntime = nativeBindings.__gjcInstallTokioRuntime;

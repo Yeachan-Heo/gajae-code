@@ -8,6 +8,7 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - `pi-iso` — MIT-licensed crate source vendored from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1`; see [crates/pi-iso/LICENSE](crates/pi-iso/LICENSE).
 - `crates/pi-natives/src/{text.rs,keys.rs}` include MIT-licensed code re-synced from oh-my-pi commit `a85bd5228d9f0f619deade1db78fa49420a721e1`.
 - Mermaid rendering in `crates/pi-natives/src/mermaid/` is vendored from `can1357/oh-my-pi` commit `a85bd5228d9f0f619deade1db78fa49420a721e1` (MIT); the pinned Mermaid test corpus is retained in `crates/pi-natives/fixtures/mermaid.json`.
+- `tty_writer.rs` is vendored from `can1357/oh-my-pi` commit `a85bd5228d9f0f619deade1db78fa49420a721e1` (MIT); native terminal writes run on a dedicated Unix thread.
 - [`oh-my-codex`](https://github.com/Yeachan-Heo/oh-my-codex) — Codex-focused orchestration experiments.
 - [`oh-my-claudecode`](https://github.com/Yeachan-Heo/oh-my-claudecode) — Claude Code workflow exploration.
 - [`insane-search`](https://github.com/fivetaku/insane-search) — MIT-licensed public-route fetch engine by @fivetaku, vendored as the safe `insane` fallback/search provider lineage.
