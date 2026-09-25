@@ -7,6 +7,12 @@ import { buildCompileArgs, buildDevCompileArgs, buildReleaseCompileArgs } from "
 // Issue #5940: a monolithic compiled bundle eagerly parses every lazily imported
 // module, so even `gjc --version` pays for the whole app. The shared compile
 // args must split code, and the split chunks must load from the compiled bunfs.
+/** Path inside the compiled bunfs root: `/$bunfs/root/...` on POSIX, `B:\~BUN\root\...` on Windows. */
+function bunfsRelativePath(modulePath: string | undefined): string | undefined {
+	const normalized = modulePath?.replaceAll("\\", "/");
+	return normalized ? /^(?:[A-Za-z]:\/(?:~|%7E)BUN|\/\$bunfs)\/root\/(.+)$/i.exec(normalized)?.[1] : undefined;
+}
+
 describe("compiled binary code splitting", () => {
 	const tempRoots: string[] = [];
 
@@ -60,10 +66,11 @@ describe("compiled binary code splitting", () => {
 		};
 
 		const lazy = run([]);
-		expect(lazy.main).toMatch(/\$bunfs\/root\//);
-		expect(lazy.lazy).toMatch(/\$bunfs\/root\/lazy-[a-z0-9]+\.js$/);
-		expect(lazy.lazy).not.toBe(lazy.main);
+		const mainPath = bunfsRelativePath(lazy.main);
+		expect(mainPath).toBeString();
+		expect(bunfsRelativePath(lazy.lazy)).toMatch(/^lazy-[a-z0-9]+\.js$/);
+		expect(bunfsRelativePath(lazy.lazy)).not.toBe(mainPath);
 
-		expect(run(["worker"]).worker).toMatch(/\$bunfs\/root\/src\/worker\.js$/);
+		expect(bunfsRelativePath(run(["worker"]).worker)).toBe("src/worker.js");
 	}, 60_000);
 });
