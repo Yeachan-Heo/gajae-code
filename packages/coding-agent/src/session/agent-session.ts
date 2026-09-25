@@ -7621,6 +7621,10 @@ export class AgentSession {
 		if (streamingMessage?.role === "assistant") this.agent.discardRejectedAssistantEvent(streamingMessage);
 		this.#retireCurrentSessionIdentityAttemptScopes();
 		this.#advanceSessionIdentityEpoch();
+		// A refresh can stage new sub-skill registrations before its admitted tool
+		// apply finishes. Never let a successor refresh short-circuit on that
+		// predecessor signature after this identity transition.
+		this.#gjcSubskillToolSignature = undefined;
 		this.#activeSkillState = undefined;
 		this.#restoredWorkflowSkillState = undefined;
 		this.#checkpointState = undefined;
@@ -13221,7 +13225,10 @@ export class AgentSession {
 			identityIsCurrent() && refreshGeneration === this.#gjcSubskillToolRefreshGeneration;
 		const stopIfStale = (): boolean => {
 			if (refreshIsCurrent()) return false;
-			if (!this.#isDisposed) this.#requestSubskillToolReconciliation();
+			// A newer refresh for the same admitted identity already owns
+			// reconciliation. Scheduling another one here would repeatedly stale
+			// that successor while it is awaiting active-state/plugin reads.
+			if (!this.#isDisposed && !identityIsCurrent()) this.#requestSubskillToolReconciliation();
 			return true;
 		};
 		if (stopIfStale()) return;
@@ -13282,6 +13289,7 @@ export class AgentSession {
 			return;
 		}
 
+		const previousToolRegistry = new Map(this.#toolRegistry);
 		const previousActiveToolNames = this.getActiveToolNames();
 		for (const name of previousGjcSubskillToolNames) {
 			this.#toolRegistry.delete(name);
@@ -13298,7 +13306,6 @@ export class AgentSession {
 			this.#toolRegistry.set(finalTool.name, finalTool);
 			this.#gjcSubskillToolNames.add(finalTool.name);
 		}
-		this.#gjcSubskillToolSignature = nextSignature;
 
 		this.#invalidateDiscoveryCaches();
 		const activeNonGjcSubskillToolNames = previousActiveToolNames.filter(
@@ -13320,7 +13327,23 @@ export class AgentSession {
 			),
 			{ admission: refreshIsCurrent },
 		);
-		stopIfStale();
+		if (!refreshIsCurrent()) {
+			// Do not publish registry metadata for an apply that lost its session
+			// admission. If no successor refresh has superseded this one, roll back
+			// the staged registry and leave the signature invalid so reconciliation
+			// must recompute against the admitted session state.
+			if (refreshGeneration === this.#gjcSubskillToolRefreshGeneration) {
+				this.#toolRegistry.clear();
+				for (const [name, tool] of previousToolRegistry) this.#toolRegistry.set(name, tool);
+				this.#gjcSubskillToolNames.clear();
+				for (const name of previousGjcSubskillToolNames) this.#gjcSubskillToolNames.add(name);
+				this.#gjcSubskillToolSignature = undefined;
+				this.#invalidateDiscoveryCaches();
+			}
+			stopIfStale();
+			return;
+		}
+		this.#gjcSubskillToolSignature = nextSignature;
 	}
 
 	/** Whether auto-compaction is currently running */

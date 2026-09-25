@@ -19,6 +19,30 @@ let tempDir: TempDir;
 let authStorage: AuthStorage | undefined;
 let session: AgentSession;
 let sessionManager: SessionManager;
+let subskillRefreshRebuildGate:
+	| {
+			toolName: string;
+			started: () => void;
+			promise: Promise<void>;
+	  }
+	| undefined;
+
+function deferredVoid(): { promise: Promise<void>; resolve: () => void } {
+	let resolvePromise!: () => void;
+	const promise = new Promise<void>(resolve => {
+		resolvePromise = resolve;
+	});
+	return { promise, resolve: resolvePromise };
+}
+
+async function waitFor(predicate: () => Promise<boolean>, label: string, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await predicate()) return;
+		await Bun.sleep(1);
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+}
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -47,6 +71,33 @@ const factory: CustomToolFactory = pi => ({
 		return { content: [{ type: "text", text: ${JSON.stringify(toolName)} }] };
 	},
 });
+
+export default factory;
+`,
+	);
+	return toolPath;
+}
+
+async function writeSwitchableBehaviorTool(fileName: string, implementationKey: string): Promise<string> {
+	const toolsDir = path.join(tempDir.path(), ".gjc", "gjc-plugins", "refresh-plugin", "tools");
+	await fs.mkdir(toolsDir, { recursive: true });
+	const toolPath = path.join(toolsDir, fileName);
+	await fs.writeFile(
+		toolPath,
+		`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
+
+const factory: CustomToolFactory = pi => {
+	const implementation = (globalThis as unknown as Record<string, { description: string; output: string }>)[${JSON.stringify(implementationKey)}]!;
+	return {
+		name: "domain_note",
+		label: "domain_note",
+		description: implementation.description,
+		parameters: pi.zod.object({}),
+		async execute() {
+			return { content: [{ type: "text", text: implementation.output }] };
+		},
+	};
+};
 
 export default factory;
 `,
@@ -118,10 +169,19 @@ beforeEach(async () => {
 			[readTool.name, readTool],
 			[bashTool.name, bashTool],
 		]),
+		rebuildSystemPrompt: async toolNames => {
+			const gate = subskillRefreshRebuildGate;
+			if (gate && toolNames.includes(gate.toolName)) {
+				gate.started();
+				await gate.promise;
+			}
+			return { systemPrompt: ["Test", ...toolNames] };
+		},
 	});
 });
 
 afterEach(async () => {
+	subskillRefreshRebuildGate = undefined;
 	await session.dispose();
 	authStorage?.close();
 	authStorage = undefined;
@@ -131,11 +191,11 @@ afterEach(async () => {
 describe("AgentSession GJC plugin sub-skill tool refresh", () => {
 	test("does not publish tools from a refresh superseded by same-session deactivation", async () => {
 		const toolPath = await writeCustomTool("stale-domain-note.ts", "stale_domain_note");
-		const started = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
+		const started = deferredVoid();
+		const release = deferredVoid();
 		const gateKey = "__gjcSubskillRefreshGate";
 		Object.assign(globalThis, { [gateKey]: { started: started.resolve, promise: release.promise } });
-		await Bun.write(
+		await fs.writeFile(
 			toolPath,
 			`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 const gate = (globalThis as unknown as { __gjcSubskillRefreshGate: { started(): void; promise: Promise<void> } }).__gjcSubskillRefreshGate;
@@ -172,6 +232,56 @@ export default factory;
 		} finally {
 			delete (globalThis as { __gjcSubskillRefreshGate?: unknown }).__gjcSubskillRefreshGate;
 			release.resolve();
+		}
+	});
+
+	test("refreshes successor sub-skill implementation after an admitted rebuild loses session identity", async () => {
+		const implementationKey = "__gjcPluginToolRefreshImplementation";
+		const globalImplementations = globalThis as unknown as Record<string, { description: string; output: string }>;
+		globalImplementations[implementationKey] = { description: "initial schema", output: "initial" };
+		const toolPath = await writeSwitchableBehaviorTool("domain-note.ts", implementationKey);
+		await activateSubskill([toolPath]);
+		await session.refreshGjcSubskillTools();
+
+		globalImplementations[implementationKey] = { description: "successor schema", output: "stale" };
+		const rebuildStarted = deferredVoid();
+		const releaseRebuild = deferredVoid();
+		subskillRefreshRebuildGate = {
+			toolName: "domain_note",
+			started: rebuildStarted.resolve,
+			promise: releaseRebuild.promise,
+		};
+		const staleRefresh = session.refreshGjcSubskillTools();
+		try {
+			await rebuildStarted.promise;
+			globalImplementations[implementationKey] = { description: "successor schema", output: "successor" };
+			// Only hold the refresh that was admitted against the predecessor identity.
+			subskillRefreshRebuildGate = undefined;
+			await session.clearContext();
+			await session.refreshGjcSubskillTools();
+			releaseRebuild.resolve();
+			await staleRefresh;
+
+			let output: string | undefined;
+			await waitFor(async () => {
+				const tool = session.agent.state.tools.find(candidate => candidate.name === "domain_note");
+				if (!tool) return false;
+				const result = await tool.execute(
+					"successor-refresh",
+					{},
+					undefined,
+					undefined as never,
+					undefined as never,
+				);
+				output = result.content.find(block => block.type === "text")?.text;
+				return output === "successor";
+			}, "successor sub-skill implementation");
+			expect(output).toBe("successor");
+		} finally {
+			delete globalImplementations[implementationKey];
+			subskillRefreshRebuildGate = undefined;
+			releaseRebuild.resolve();
+			await staleRefresh.catch(() => {});
 		}
 	});
 
