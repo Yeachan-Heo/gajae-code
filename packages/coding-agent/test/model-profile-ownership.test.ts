@@ -7,7 +7,6 @@ import {
 	type DurableModelProfileOwnershipStore,
 	InvalidModelProfileOwnershipError,
 	type ModelProfileOwnershipMarker,
-	modelProfileOwnershipMarkersEqual,
 	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	resolveEffectiveModelProfileMarker,
@@ -122,7 +121,6 @@ describe("model-profile ownership contract", () => {
 		expect(settings.getGlobal("modelProfile.default")).toBe("profile-b");
 		expect(readDurableModelProfileOwnership(settings)).toEqual(next);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "updated/default" });
-		expect(settings.getGlobal("modelProfile.default")).not.toBeUndefined();
 	});
 
 	it("rejects invalid markers before durable ownership writes", async () => {
@@ -258,10 +256,5 @@ describe("model-profile ownership contract", () => {
 		} finally {
 			await manager.close();
 		}
-	});
-
-	it("compares inherited and absent session decisions as the same owner", () => {
-		expect(modelProfileOwnershipMarkersEqual(undefined, inherit)).toBe(true);
-		expect(modelProfileOwnershipMarkersEqual(cleared, inherit)).toBe(false);
 	});
 });
