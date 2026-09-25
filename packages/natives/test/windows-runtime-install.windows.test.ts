@@ -56,7 +56,7 @@ describe("Windows constrained-memory native runtime install", () => {
 		const firstFile = path.join(fixtureRoot, "entry-0000.txt");
 		let jobHandle: ReturnType<typeof kernel32.symbols.CreateJobObjectW> | undefined;
 		let processHandle: ReturnType<typeof kernel32.symbols.OpenProcess> | undefined;
-		let child: ReturnType<typeof Bun.spawn> | undefined;
+		let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
 		let childExited: Promise<number> | undefined;
 		let processFinished = false;
 
