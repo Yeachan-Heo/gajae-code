@@ -44,6 +44,8 @@ pi-ast.workspace = true
 pi-diff = { path = "../pi-diff" }
 pi-iso.workspace = true
 pi-shell.workspace = true
+pi-vfs.workspace = true
+pi-walker.workspace = true
 portable-pty.workspace = true
 rayon.workspace = true
 regex.workspace = true

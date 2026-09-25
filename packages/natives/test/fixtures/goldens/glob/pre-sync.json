@@ -1,0 +1,26 @@
+{
+  "source": "pre-sync pi-natives addon recorded before the walker re-sync",
+  "normalization": "sort [relativePath, numericFileType] pairs by path; omit symlink rows from common-platform scenarios",
+  "scenarios": {
+    "visible": {
+      "matchCount": 517,
+      "sha256": "9ab071b71fef0956d2c2ac430e4dbc1a21e8d5f66d1922e935066dec80aff261"
+    },
+    "hidden": {
+      "matchCount": 519,
+      "sha256": "30971818ae6940ddce1ea8fe7fda7f078fad9e7207a03259179021f91e27deb1"
+    },
+    "all": {
+      "matchCount": 525,
+      "sha256": "faffe691d8bbc378f0b8538cbc735bad81837114b3e33d28d0334489a659eebb"
+    },
+    "symlinks": {
+      "matchCount": 2,
+      "sha256": "694adca0d79e0afe0107808b4fc039007bf925e88a1d93526eeb5d63f8efafe6"
+    },
+    "large": {
+      "matchCount": 512,
+      "sha256": "9924687427c4a21158b1639c0cabab838598bbd4c4220ac112b25ebd8474479e"
+    }
+  }
+}
