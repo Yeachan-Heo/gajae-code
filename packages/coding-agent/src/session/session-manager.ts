@@ -61,6 +61,12 @@ import {
 	Snowflake,
 	toError,
 } from "@gajae-code/utils";
+import {
+	InvalidModelProfileOwnershipError,
+	MODEL_PROFILE_OWNERSHIP_ENTRY,
+	type ModelProfileOwnershipMarker,
+	validateModelProfileOwnershipMarker,
+} from "../config/model-profile-ownership";
 import { EDIT_SNAPSHOT_EXTERNALIZED_NOTICE, editSnapshotReceipt } from "../edit/renderer";
 import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
@@ -2091,6 +2097,8 @@ export interface SessionContext {
 	models: Record<string, string>;
 	/** Configured fallback chains for model roles on the active branch. */
 	configuredModelChains: Record<string, ConfiguredModelChain>;
+	/** Effective-branch profile owner decision; absent means the legacy inherit marker. */
+	modelProfileOwnershipMarker?: ModelProfileOwnershipMarker;
 
 	/** Names of TTSR rules that have been injected this session */
 	injectedTtsrRules: string[];
@@ -2986,6 +2994,7 @@ export function buildSessionContext(
 	let serviceTier: ServiceTier | undefined;
 	const models: Record<string, string> = {};
 	const configuredModelChains: Record<string, ConfiguredModelChain> = {};
+	let modelProfileOwnershipMarker: ModelProfileOwnershipMarker | undefined;
 
 	let compaction: CompactionEntry | null = null;
 	const injectedTtsrRulesSet = new Set<string>();
@@ -3030,6 +3039,10 @@ export function buildSessionContext(
 			} else if (configuredChain) {
 				configuredModelChains[configuredChain.role] = configuredChain;
 			}
+		} else if (entry.type === "custom" && entry.customType === MODEL_PROFILE_OWNERSHIP_ENTRY) {
+			const validated = validateModelProfileOwnershipMarker(entry.data);
+			if (!validated) throw new InvalidModelProfileOwnershipError();
+			modelProfileOwnershipMarker = validated;
 		} else if (entry.type === "service_tier_change") {
 			serviceTier = entry.serviceTier ?? undefined;
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
@@ -3185,6 +3198,7 @@ export function buildSessionContext(
 		serviceTier,
 		models,
 		configuredModelChains,
+		...(modelProfileOwnershipMarker ? { modelProfileOwnershipMarker } : {}),
 
 		injectedTtsrRules,
 		injectedTtsrRuleRecords: injectedTtsrRuleRecordsArray,
@@ -18383,6 +18397,40 @@ export class SessionManager {
 		};
 		this.#appendEntry(entry);
 		return entry.id;
+	}
+
+	appendPreparedModelProfileOwnershipMarker(
+		prepared: PreparedNewSession,
+		marker: ModelProfileOwnershipMarker,
+	): string {
+		const validated = validateModelProfileOwnershipMarker(marker);
+		if (!validated) throw new InvalidModelProfileOwnershipError();
+		const stage = this.#getPreparedNewSessionStage(prepared);
+		const entry: CustomEntry<ModelProfileOwnershipMarker> = {
+			type: "custom",
+			customType: MODEL_PROFILE_OWNERSHIP_ENTRY,
+			data: validated,
+			id: this.#nextPreparedNewSessionEntryId(stage),
+			parentId: this.#preparedNewSessionLeafId(stage),
+			timestamp: new Date().toISOString(),
+		};
+		stage.fileEntries.push(entry);
+		return entry.id;
+	}
+
+	appendModelProfileOwnershipMarker(marker: ModelProfileOwnershipMarker): string {
+		return this.appendCustomEntry(MODEL_PROFILE_OWNERSHIP_ENTRY, marker);
+	}
+
+	getModelProfileOwnershipMarker(): ModelProfileOwnershipMarker | undefined {
+		let marker: ModelProfileOwnershipMarker | undefined;
+		for (const entry of this.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== MODEL_PROFILE_OWNERSHIP_ENTRY) continue;
+			const validated = validateModelProfileOwnershipMarker(entry.data);
+			if (!validated) throw new InvalidModelProfileOwnershipError();
+			marker = validated;
+		}
+		return marker;
 	}
 
 	/**
