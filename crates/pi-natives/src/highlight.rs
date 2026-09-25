@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/highlight.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
+// Local modifications: retain checkpoint cache, input bounds, and the local N-API contract.
+
 //! Syntax highlighting using syntect.
 //!
 //! Provides ANSI-colored output for code blocks. Takes theme colors as input
@@ -8,7 +11,9 @@
 use std::{cell::RefCell, collections::HashMap, sync::OnceLock};
 
 use napi_derive::napi;
-use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxReference, SyntaxSet};
+use syntect::parsing::{
+	ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxDefinition, SyntaxReference, SyntaxSet,
+};
 
 use crate::env_uint;
 
@@ -53,8 +58,27 @@ thread_local! {
 	static HIGHLIGHT_CHECKPOINT: RefCell<Vec<HighlightCheckpoint>> = const { RefCell::new(Vec::new()) };
 }
 
+const EXTRA_SYNTAXES: &[&str] = &[
+	include_str!("syntaxes/Astro.sublime-syntax"),
+	include_str!("syntaxes/Julia.sublime-syntax"),
+	include_str!("syntaxes/Mermaid.sublime-syntax"),
+	include_str!("syntaxes/Nix.sublime-syntax"),
+	include_str!("syntaxes/TypeScript.sublime-syntax"),
+	include_str!("syntaxes/TypeScriptReact.sublime-syntax"),
+];
+
 fn get_syntax_set() -> &'static SyntaxSet {
-	SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+	SYNTAX_SET.get_or_init(build_syntax_set)
+}
+
+fn build_syntax_set() -> SyntaxSet {
+	let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+	for source in EXTRA_SYNTAXES {
+		if let Ok(syntax) = SyntaxDefinition::load_from_str(source, true, None) {
+			builder.add(syntax);
+		}
+	}
+	builder.build()
 }
 
 /// Pre-compiled scope patterns for fast matching.
@@ -187,9 +211,14 @@ pub struct HighlightColors {
 /// Language alias mappings: (aliases, target syntax name).
 /// Used for languages not in syntect's default set or with non-standard names.
 const LANG_ALIASES: &[(&[&str], &str)] = &[
-	(&["ts", "tsx", "typescript", "js", "jsx", "javascript", "mjs", "cjs"], "JavaScript"),
+	(&["ts", "mts", "cts", "typescript"], "TypeScript"),
+	(&["tsx"], "TypeScriptReact"),
+	(&["js", "jsx", "javascript", "mjs", "cjs"], "JavaScript"),
 	(&["py", "python"], "Python"),
 	(&["rb", "ruby"], "Ruby"),
+	(&["jl", "julia"], "Julia"),
+	(&["nix"], "Nix"),
+	(&["mermaid", "mmd"], "Mermaid"),
 	(&["rs", "rust"], "Rust"),
 	(&["go", "golang"], "Go"),
 	(&["java"], "Java"),
@@ -201,7 +230,8 @@ const LANG_ALIASES: &[(&[&str], &str)] = &[
 	(&["php"], "PHP"),
 	(&["sh", "bash", "zsh", "shell"], "Bash"),
 	(&["ps1", "powershell"], "PowerShell"),
-	(&["html", "htm", "astro", "vue", "svelte"], "HTML"),
+	(&["html", "htm", "vue", "svelte"], "HTML"),
+	(&["astro"], "Astro"),
 	(&["css"], "CSS"),
 	(&["scss"], "SCSS"),
 	(&["sass"], "Sass"),
@@ -737,5 +767,41 @@ mod cap_tests {
 		let code = "x".repeat(17 * 1024 * 1024);
 		let out = highlight_code(code.clone(), Some("rust".to_string()), HighlightColors::default());
 		assert_eq!(out, code, "above the cap highlight_code must return the original code unchanged");
+	}
+}
+
+#[cfg(test)]
+mod bundled_syntax_tests {
+	use super::*;
+
+	#[test]
+	fn pinned_upstream_syntaxes_are_loaded() {
+		let languages = get_supported_languages();
+		for language in ["Astro", "Julia", "Mermaid", "Nix", "TypeScript", "TypeScriptReact"] {
+			assert!(
+				languages.iter().any(|candidate| candidate == language),
+				"missing syntax {language}"
+			);
+		}
+	}
+
+	#[test]
+	fn pinned_upstream_language_aliases_resolve_to_their_grammars() {
+		let syntax_set = get_syntax_set();
+		for (alias, expected) in [
+			("astro", "Astro"),
+			("julia", "Julia"),
+			("mermaid", "Mermaid"),
+			("mmd", "Mermaid"),
+			("nix", "Nix"),
+			("ts", "TypeScript"),
+			("tsx", "TypeScriptReact"),
+		] {
+			assert!(supports_language(alias.to_string()), "alias {alias} was not recognized");
+			assert_eq!(
+				find_syntax(syntax_set, alias).map(|syntax| syntax.name.as_str()),
+				Some(expected)
+			);
+		}
 	}
 }

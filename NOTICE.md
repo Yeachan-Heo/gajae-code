@@ -13,9 +13,15 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - [`Markit`](https://github.com/Michaelliv/markit) — MIT-licensed document converter, pinned to `markit-ai` 0.5.3 under `packages/coding-agent/vendor/markit-ai`. Its license, upstream package metadata, integrity/hash inventory and reproducible patch are retained alongside the vendored code; MuPDF remains separately licensed as described below.
 - `pi-ast` — MIT-licensed AST language, pattern, and structural-summary support from oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1, vendored under `crates/pi-ast` with its upstream license retained.
 
-## Vendored Rust from oh-my-pi
+## Vendored Rust from oh-my-pi @ a85bd522
 
 `crates/pi-natives/src/{js.rs,task.rs,testing.rs,utils.rs}` include MIT-licensed material from `can1357/oh-my-pi` at commit `a85bd5228d9f0f619deade1db78fa49420a721e1`. Per-file attribution and local modifications are recorded in each source file.
+
+- The syntax-highlighting re-sync and six bundled `.sublime-syntax` files are derived from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1` and distributed under MIT.
+- The PTY binding is derived from `crates/pi-natives/src/pty.rs` at the pinned commit and retains GJC's bounded output-loss reporting, ConPTY single-flight guard, and child cleanup.
+- The process binding is derived from `crates/pi-natives/src/ps.rs` at the pinned commit and delegates process operations to the local `pi_shell::process`, retaining identity-aware observations and pinned-root signaling.
+
+Copyright (c) 2025 Mario Zechner, 2025–2026 Can Bölük, and 2026 Stencil Labs, Inc. Per-file headers retain the upstream source path and local modifications.
 ## MuPDF WebAssembly
 
 PDF extraction uses MuPDF.js, copyright (C) 2004–2026 Artifex Software, Inc., distributed under [GNU Affero General Public License version 3 or later](https://www.gnu.org/licenses/agpl-3.0.html). MuPDF is provided without warranty; the repository's MIT license does not replace MuPDF's license. Alternative commercial licensing is available from [Artifex](https://artifex.com/).
