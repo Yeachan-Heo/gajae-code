@@ -26,11 +26,19 @@ type ScenarioStatus = "measured" | "deferred";
 
 interface CliOptions {
 	scenarios: ScenarioId[];
+	/** Compiled gjc binary under measurement; defaults to the source build output. */
+	binary: string;
+	/** Source commit the measured binary was built from; defaults to the checkout HEAD. */
+	commit?: string;
+	/** Checkpoint directory; defaults to .gjc/rss-checkpoints. */
+	outputDir: string;
 	milestone?: string;
 	rescopeRef?: string;
 	all: boolean;
 	compare: boolean;
 	allowBaselineDrift: boolean;
+	/** Report compare regressions without failing the process (threshold-promotion stage 1). */
+	advisory: boolean;
 	baseline?: string;
 	writeBaseline: boolean;
 	matrix: string[];
@@ -171,7 +179,7 @@ const REFERENCE_CHUNK_MARKER = "gjc-rss-reference-0123456789abcdef";
 const REFERENCE_LARGE_LINE_COUNT = 29_960;
 const BASH_OUTPUT_BYTES = 8_388_608;
 const BASH_OUTPUT_MARKER = `GJC_RSS_BASH_BYTES=${BASH_OUTPUT_BYTES}`;
-const binaryPath = path.join(repoRoot, "packages", "coding-agent", "dist", "gjc");
+const defaultBinaryPath = path.join(repoRoot, "packages", "coding-agent", "dist", "gjc");
 const buildCommand = "bun --cwd=packages/coding-agent run build";
 const deferredS6Reason = "requires W7/W8 authorization and daemon implementation";
 const allMeasuredScenarios: ScenarioId[] = ["S1", "S2", "S3", "S4", "S5", "S7"];
@@ -184,9 +192,13 @@ function usage(): string {
 		"  --scenario <S1..S7[,S...]>  Measure selected scenarios",
 		"  --all                       Measure S1-S5 and S7; report S6 as deferred",
 		"  --compare                   Compare against --baseline, or the current commit checkpoint when omitted",
+		"  --advisory                  With --compare, report regressions without failing (exit 0)",
 		"  --baseline <file>           Baseline JSON path (defaults to .gjc/rss-checkpoints/<commit>.json)",
+		"  --binary <file>             Compiled gjc binary to measure (defaults to packages/coding-agent/dist/gjc)",
+		"  --commit <sha>              Full source commit of --binary (defaults to git HEAD); names the checkpoint",
 		"  --allow-baseline-drift      Permit comparing across builds (required for milestone floor gates)",
-		"  --write-baseline            Write .gjc/rss-checkpoints/<commit>.json",
+		"  --write-baseline            Write <output-dir>/<commit>.json",
+		"  --output-dir <dir>          Checkpoint directory (defaults to .gjc/rss-checkpoints)",
 		"  --milestone <W1c|W3b|W5b>  enforce the declared RSS improvement floor",
 		"  --rescope-ref <file>       accepted re-scope record for a missed floor",
 		"  --matrix <name[,name...]>   Record a named measurement matrix",
@@ -201,6 +213,11 @@ function splitList(value: string): string[] {
 		.filter(Boolean);
 }
 
+function parseCommit(value: string): string {
+	if (!/^[0-9a-f]{40}$/.test(value)) throw new CheckpointError("UsageError", `--commit requires a full 40-character lowercase commit SHA, got: ${value}`);
+	return value;
+}
+
 function parseScenario(value: string): ScenarioId {
 	const normalized = value.toUpperCase() as ScenarioId;
 	if (!scenarioIds.has(normalized)) throw new CheckpointError("InvalidScenario", `Unknown RSS scenario: ${value}`);
@@ -210,9 +227,12 @@ function parseScenario(value: string): ScenarioId {
 export function parseArgs(argv: string[]): CliOptions {
 	const options: CliOptions = {
 		scenarios: [],
+		binary: defaultBinaryPath,
+		outputDir: checkpointRoot,
 		all: false,
 		compare: false,
 		allowBaselineDrift: false,
+		advisory: false,
 		writeBaseline: false,
 		matrix: [],
 		json: false,
@@ -227,6 +247,10 @@ export function parseArgs(argv: string[]): CliOptions {
 			options.compare = true;
 			continue;
 		}
+		if (arg === "--advisory") {
+			options.advisory = true;
+			continue;
+		}
 		if (arg === "--allow-baseline-drift") {
 			options.allowBaselineDrift = true;
 			continue;
@@ -239,10 +263,13 @@ export function parseArgs(argv: string[]): CliOptions {
 			options.json = true;
 			continue;
 		}
-		if (arg === "--scenario" || arg === "--baseline" || arg === "--matrix" || arg === "--milestone" || arg === "--rescope-ref") {
+		if (arg === "--scenario" || arg === "--baseline" || arg === "--binary" || arg === "--commit" || arg === "--output-dir" || arg === "--matrix" || arg === "--milestone" || arg === "--rescope-ref") {
 			const value = argv[++index];
 			if (!value) throw new CheckpointError("UsageError", `${arg} requires a value`);
 			if (arg === "--scenario") options.scenarios.push(...splitList(value).map(parseScenario));
+			else if (arg === "--binary") options.binary = path.resolve(value);
+			else if (arg === "--commit") options.commit = parseCommit(value);
+			else if (arg === "--output-dir") options.outputDir = path.resolve(value);
 			else if (arg === "--baseline") options.baseline = value;
 			else if (arg === "--matrix") options.matrix.push(...splitList(value));
 			else if (arg === "--milestone") {
@@ -257,6 +284,18 @@ export function parseArgs(argv: string[]): CliOptions {
 		}
 		if (arg.startsWith("--baseline=")) {
 			options.baseline = arg.slice("--baseline=".length);
+			continue;
+		}
+		if (arg.startsWith("--binary=")) {
+			options.binary = path.resolve(arg.slice("--binary=".length));
+			continue;
+		}
+		if (arg.startsWith("--output-dir=")) {
+			options.outputDir = path.resolve(arg.slice("--output-dir=".length));
+			continue;
+		}
+		if (arg.startsWith("--commit=")) {
+			options.commit = parseCommit(arg.slice("--commit=".length));
 			continue;
 		}
 		if (arg.startsWith("--matrix=")) {
@@ -281,6 +320,8 @@ export function parseArgs(argv: string[]): CliOptions {
 	}
 	if (!options.all && options.scenarios.length === 0) throw new CheckpointError("UsageError", "Use --all or --scenario");
 	if (options.milestone && !options.compare) throw new CheckpointError("MilestoneCompareRequired", "--milestone requires --compare; baseline capture is a separate non-milestone mode.");
+	if (options.advisory && !options.compare) throw new CheckpointError("UsageError", "--advisory only applies to --compare.");
+	if (options.advisory && options.milestone) throw new CheckpointError("UsageError", "--advisory cannot waive a --milestone floor gate.");
 	if (options.milestone && options.writeBaseline) throw new CheckpointError("MilestoneBaselineWriteRejected", "--milestone cannot be combined with --write-baseline; capture a baseline without a milestone.");
 	return options;
 }
@@ -709,7 +750,7 @@ for await (const line of rl) {
 	await fs.writeFile(serverPath, source, "utf8");
 	return serverPath;
 }
-async function writeInteractiveBarrierDriver(root: string): Promise<string> {
+async function writeInteractiveBarrierDriver(root: string, binaryPath: string): Promise<string> {
 	const driverPath = path.join(root, "rss-idle-driver.py");
 	const source = `
 import os, pty, select, subprocess, sys, time
@@ -778,19 +819,19 @@ sys.exit(0 if barrier else 1)
 	return driverPath;
 }
 
-function interactiveScenarioCommand(): string[] {
+function interactiveScenarioCommand(binaryPath: string): string[] {
 	return [binaryPath, "--no-session", "--no-tools"];
 }
 
 
-function scenarioCommand(id: ScenarioId, mcpConfig?: string, referenceWorkspace?: string): string[] {
+function scenarioCommand(id: ScenarioId, binaryPath: string, mcpConfig?: string, referenceWorkspace?: string): string[] {
 	switch (id) {
 		case "S1":
 			return [binaryPath, "--help"];
 		case "S2":
 			return [binaryPath, "--version"];
 		case "S3":
-			return interactiveScenarioCommand();
+			return interactiveScenarioCommand(binaryPath);
 		case "S4":
 			return [binaryPath, "--no-session", "--model", "rss-stub/stub-model", "--print", `Read one MiB from this exact file once: ${referenceFilePath(referenceWorkspace ?? ".", 0)}`];
 		case "S5":
@@ -885,19 +926,18 @@ function memoryDistribution(samples: ProcessSample[], phase: "barrierMemory" | "
 	return Object.fromEntries(keys.map(key => [key, sampleDistribution(samples.map(sample => sample[phase][key]))])) as Record<keyof MemorySnapshot, Distribution>;
 }
 /**
- * Wrap `command` in the platform max-RSS sampler. On Linux, GNU time writes its report to
- * `reportPath` rather than stderr: the measured Bun child shares time's stderr pipe and
- * flips it to O_NONBLOCK, so time's own report write fails with EAGAIN and time exits 1
- * even though the measured command succeeded.
+ * The report goes to a file, not stderr: the measured child inherits the stderr pipe and
+ * Bun marks the shared open file description O_NONBLOCK, so `time` writing its report to
+ * stderr fails with EAGAIN (exit 1) whenever the harness has not drained the pipe yet.
  */
-export function maxRssCommand(command: string[], reportPath: string): string[] {
-	if (process.platform === "darwin") return ["/usr/bin/time", "-l", ...command];
-	if (process.platform === "linux") return ["/usr/bin/time", "-v", "-o", reportPath, ...command];
-	throw new CheckpointError("RssSamplerUnavailable", `Stable RSS sampling is unsupported on ${process.platform}.`);
+export function maxRssCommand(command: string[], reportPath: string, platform: NodeJS.Platform = process.platform): string[] {
+	if (platform === "darwin") return ["/usr/bin/time", "-l", "-o", reportPath, ...command];
+	if (platform === "linux") return ["/usr/bin/time", "-v", "-o", reportPath, ...command];
+	throw new CheckpointError("RssSamplerUnavailable", `Stable RSS sampling is unsupported on ${platform}.`);
 }
 
-export function parseMaxRssBytes(stderr: string): number | undefined {
-	for (const line of stderr.split(/\r?\n/)) {
+export function parseMaxRssBytes(report: string): number | undefined {
+	for (const line of report.split(/\r?\n/)) {
 		const darwin = /^(?:\s*)(\d+)\s+maximum resident set size\s*$/.exec(line);
 		if (darwin) return Number(darwin[1]);
 		const linux = /Maximum resident set size \(kbytes\):\s*(\d+)\s*$/.exec(line);
@@ -908,17 +948,18 @@ export function parseMaxRssBytes(stderr: string): number | undefined {
 
 
 interface ProcessMeasureOptions {
+	timeReportFile: string;
 	barrierFile?: string;
 	memoryProbeFile?: string;
 	cleanupFile?: string;
 }
 
-async function measureProcess(command: string[], env: Record<string, string>, cwd: string, timeoutMs = 30_000, options: ProcessMeasureOptions = {}): Promise<ProcessSample> {
+async function measureProcess(command: string[], env: Record<string, string>, cwd: string, timeoutMs: number, options: ProcessMeasureOptions): Promise<ProcessSample> {
 	const processEnv = options.memoryProbeFile
 		? { ...env, GJC_RSS_MEMORY_PROBE: options.memoryProbeFile, ...(options.cleanupFile ? { GJC_RSS_CLEANUP_FILE: options.cleanupFile } : {}) }
 		: env;
-	const timeReportPath = path.join(os.tmpdir(), `gjc-rss-time-${process.pid}-${crypto.randomUUID()}.txt`);
-	const proc = Bun.spawn(maxRssCommand(command, timeReportPath), { cwd, env: processEnv, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	await fs.rm(options.timeReportFile, { force: true });
+	const proc = Bun.spawn(maxRssCommand(command, options.timeReportFile), { cwd, env: processEnv, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 	const stdoutPromise = new Response(proc.stdout).text();
 	const stderrPromise = new Response(proc.stderr).text();
 
@@ -988,10 +1029,6 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 		await Promise.race([exitPromise, sleep(1_000)]);
 	}
 	let exitCode = await exitPromise;
-	// Absent on darwin, where `time -l` still reports on stderr.
-	const timeReportFile = Bun.file(timeReportPath);
-	const timeReport = (await timeReportFile.exists()) ? await timeReportFile.text() : "";
-	await fs.rm(timeReportPath, { force: true });
 	const finalUsage = treeUsage(proc.pid);
 	for (const pid of finalUsage.childPids) observedChildPids.add(pid);
 	if (exitRssBytes === 0 && finalUsage.rssBytes > 0) exitRssBytes = finalUsage.rssBytes;
@@ -1012,9 +1049,9 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 	if (options.barrierFile && !barrierReached) {
 		throw new CheckpointError("ScenarioBarrierMissing", `Scenario ${command[0]} exited without explicit barrier ${options.barrierFile}.`);
 	}
-	const [, childStderr] = await Promise.all([stdoutPromise, stderrPromise]);
-	const stderr = childStderr + timeReport;
-	const stableRssBytes = parseMaxRssBytes(stderr) ?? 0;
+	const [, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+	const timeReport = await fs.readFile(options.timeReportFile, "utf8").catch(() => "");
+	const stableRssBytes = parseMaxRssBytes(timeReport) ?? 0;
 	const stableTreeRssBytes = Math.max(barrierRssBytes, exitRssBytes);
 	if (stableTreeRssBytes <= 0 || !Number.isFinite(stableTreeRssBytes)) {
 		throw new CheckpointError("RssSamplerUnavailable", `Whole-process-tree RSS sampling did not report a positive value for ${command[0]}.`, {
@@ -1055,8 +1092,8 @@ async function measureProcess(command: string[], env: Record<string, string>, cw
 	};
 }
 
-function baselineOutputPath(commit: string): string {
-	return path.join(checkpointRoot, `${commit}.json`);
+function baselineOutputPath(commit: string, root = checkpointRoot): string {
+	return path.join(root, `${commit}.json`);
 }
 
 function validateDefaultBaseline(filePath: string): void {
@@ -1085,6 +1122,7 @@ export function resolveDefaultBaseline(commit: string, root = checkpointRoot): s
 
 async function measureScenario(
 	id: ScenarioId,
+	binaryPath: string,
 	tempRoot: string,
 	baseEnv: Record<string, string>,
 	referenceWorkspace: string,
@@ -1116,12 +1154,12 @@ async function measureScenario(
 	let command: string[];
 	if (id === "S3") {
 		barrierFile = path.join(scenarioRoot, "interactive-first-render.complete");
-		command = ["python3", await writeInteractiveBarrierDriver(scenarioRoot)];
+		command = ["python3", await writeInteractiveBarrierDriver(scenarioRoot, binaryPath)];
 	} else {
-		command = scenarioCommand(id, mcpConfig, referenceWorkspace);
+		command = scenarioCommand(id, binaryPath, mcpConfig, referenceWorkspace);
 		if (id === "S4" || id === "S5" || id === "S7") barrierFile = path.join(scenarioRoot, "workload-complete");
 	}
-	const reportedCommand = id === "S3" ? [binaryPath, "--no-session", "--no-tools"] : command;
+	const reportedCommand = id === "S3" ? interactiveScenarioCommand(binaryPath) : command;
 	const probePath = await writeProcessProbe(scenarioRoot, command, referenceWorkspace);
 	const measuredCommand = [process.execPath, "--no-env-file", probePath];
 	const cleanupFile = path.join(scenarioRoot, "cleanup.signal");
@@ -1148,7 +1186,7 @@ async function measureScenario(
 		if (barrierFile) await fs.rm(barrierFile, { force: true });
 		await fs.rm(cleanupFile, { force: true });
 		if (id === "S4" || id === "S5" || id === "S7") provider.setBarrierFile(barrierFile);
-		const sample = await measureProcess(measuredCommand, env, referenceWorkspace, id === "S5" ? 120_000 : 30_000, { barrierFile, memoryProbeFile: path.join(scenarioRoot, "memory.ndjson"), cleanupFile });
+		const sample = await measureProcess(measuredCommand, env, referenceWorkspace, id === "S5" ? 120_000 : 30_000, { timeReportFile: path.join(scenarioRoot, "time-report.txt"), barrierFile, memoryProbeFile: path.join(scenarioRoot, "memory.ndjson"), cleanupFile });
 		if (index >= warmups) {
 			measuredToolCalls += provider.stats.toolCallCount - toolCallsBefore;
 			measuredToolNames.push(...provider.stats.toolNames.slice(toolNamesBefore));
@@ -1260,14 +1298,14 @@ export function deferredScenario(): ScenarioReport {
 	};
 }
 
-async function metadata(binarySha256: string, referenceWorkspace: Metadata["referenceWorkspace"], matrix: string[], milestone?: string, floorPolicy?: FloorPolicy, rescopeReference?: Metadata["rescopeReference"]): Promise<Metadata> {
+async function metadata(gitCommit: string, binarySha256: string, referenceWorkspace: Metadata["referenceWorkspace"], matrix: string[], milestone?: string, floorPolicy?: FloorPolicy, rescopeReference?: Metadata["rescopeReference"]): Promise<Metadata> {
 	return {
 		os: process.platform,
 		arch: process.arch,
 		kernel: runSync(["uname", "-r"]) || "unknown",
 		bun: Bun.version,
 		binarySha256,
-		gitCommit: runSync(["git", "rev-parse", "HEAD"]) || "unknown",
+		gitCommit,
 		timestamp: new Date().toISOString(),
 		matrix,
 		...(milestone ? { milestone, floorPolicy, ...(rescopeReference ? { rescopeReference } : {}) } : {}),
@@ -1490,6 +1528,10 @@ function formatMiB(value: number): string {
 	return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
+function formatRegression(regression: Regression): string {
+	return `${regression.id} ${regression.metric}: baseline ${formatMiB(regression.baseline)}, current ${formatMiB(regression.current)}, allowed delta ${formatMiB(regression.allowed)}`;
+}
+
 async function writeMarkdown(report: RssReport, outputPath: string, regressions: Regression[] = []): Promise<void> {
 	const lines = [
 		"# RSS Checkpoints",
@@ -1515,10 +1557,7 @@ async function writeMarkdown(report: RssReport, outputPath: string, regressions:
 	}
 	if (regressions.length > 0) {
 		lines.push("", "## Regressions", "");
-		for (const regression of regressions)
-			lines.push(
-				`- ${regression.id} ${regression.metric}: baseline ${formatMiB(regression.baseline)}, current ${formatMiB(regression.current)}, allowed delta ${formatMiB(regression.allowed)}`,
-			);
+		for (const regression of regressions) lines.push(`- ${formatRegression(regression)}`);
 	}
 	await fs.writeFile(outputPath, `${lines.join("\n")}\n`, "utf8");
 }
@@ -1542,10 +1581,10 @@ async function main(): Promise<void> {
 		printError(error, process.argv.includes("--json"));
 		return;
 	}
-	const currentCommit = runSync(["git", "rev-parse", "HEAD"]) || "unknown";
+	const currentCommit = options.commit ?? (runSync(["git", "rev-parse", "HEAD"]) || "unknown");
 	if (options.compare && !options.baseline) {
 		try {
-			options.baseline = resolveDefaultBaseline(currentCommit);
+			options.baseline = resolveDefaultBaseline(currentCommit, options.outputDir);
 		} catch (error) {
 			printError(error, options.json);
 			return;
@@ -1558,11 +1597,11 @@ async function main(): Promise<void> {
 		printError(new CheckpointError("ScenarioUnavailable", `S6 is unavailable — ${deferredS6Reason}`), options.json);
 		return;
 	}
-	if (!(await fs.stat(binaryPath).catch(() => null))) {
+	if (!(await fs.stat(options.binary).catch(() => null))) {
 		printError(
 			new CheckpointError(
 				"BuildArtifactMissing",
-				`Compiled RSS artifact is missing: ${binaryPath}. Build it with: ${buildCommand}`,
+				`Compiled RSS artifact is missing: ${options.binary}. Build it with: ${buildCommand}, or pass --binary <path>`,
 			),
 			options.json,
 		);
@@ -1577,7 +1616,7 @@ async function main(): Promise<void> {
 		const referenceRoot = path.join(tempRoot, "reference-workspace");
 		await fs.mkdir(referenceRoot, { recursive: true });
 		const referenceWorkspace = await generateReferenceWorkspace(referenceRoot);
-		const binarySha256 = await sha256File(binaryPath);
+		const binarySha256 = await sha256File(options.binary);
 		const home = path.join(tempRoot, "home");
 		const xdgConfig = path.join(tempRoot, "xdg-config");
 		const agentDir = path.join(tempRoot, "agent");
@@ -1607,12 +1646,12 @@ async function main(): Promise<void> {
 				reports.push(deferredScenario());
 				continue;
 			}
-			const scenarioReport = await measureScenario(id, tempRoot, baseEnv, referenceRoot, activeProvider);
+			const scenarioReport = await measureScenario(id, options.binary, tempRoot, baseEnv, referenceRoot, activeProvider);
 			reports.push(scenarioReport);
 		}
 		const report: RssReport = {
 			schemaVersion: 1,
-			metadata: await metadata(binarySha256, referenceWorkspace, options.matrix, options.milestone, floorPolicy),
+			metadata: await metadata(gitCommit, binarySha256, referenceWorkspace, options.matrix, options.milestone, floorPolicy),
 			scenarios: reports,
 		};
 		let rescopeReference: Metadata["rescopeReference"];
@@ -1626,7 +1665,7 @@ async function main(): Promise<void> {
 		}
 		let regressions: Regression[] = [];
 		if (options.compare && options.baseline) regressions = await compareReports(report, options.baseline, selected, floorPolicy, rescopeReference, options.allowBaselineDrift);
-		const outputPath = baselineOutputPath(gitCommit);
+		const outputPath = baselineOutputPath(gitCommit, options.outputDir);
 		await fs.mkdir(path.dirname(outputPath), { recursive: true });
 		// A non-baseline run must never leave the commit-stem baseline JSON and the
 		// regenerated Markdown describing different runs: every run writes its own
@@ -1645,9 +1684,10 @@ async function main(): Promise<void> {
 			}
 			console.log(`JSON: ${reportJsonPath}`);
 			console.log(`Markdown: ${markdownPath}`);
-			if (regressions.length > 0) console.error(`FAIL: ${regressions.length} RSS regression(s) exceeded tolerance`);
+			for (const regression of regressions) console.log(`- ${formatRegression(regression)}`);
+			if (regressions.length > 0) console.error(`${options.advisory ? "ADVISORY" : "FAIL"}: ${regressions.length} RSS regression(s) exceeded tolerance`);
 		}
-		if (regressions.length > 0) process.exitCode = 1;
+		if (regressions.length > 0 && !options.advisory) process.exitCode = 1;
 	} finally {
 		provider?.close();
 		await fs.rm(tempRoot, { recursive: true, force: true });

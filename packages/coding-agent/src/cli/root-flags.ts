@@ -1,4 +1,7 @@
-import { THINKING_EFFORTS } from "@gajae-code/ai/core";
+// Import the leaf module, not the `@gajae-code/ai/core` barrel: this file is on the
+// static startup path of every `gjc` invocation, and the barrel eagerly evaluates every
+// provider SDK (openai, @anthropic-ai/sdk, zod locales, mermaid) before argv is parsed.
+import { THINKING_EFFORTS } from "@gajae-code/ai/model-thinking";
 import { type FlagDescriptor, Flags } from "@gajae-code/utils/cli";
 
 export const ROOT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;

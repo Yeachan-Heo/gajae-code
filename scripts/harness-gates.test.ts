@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	CheckpointError,
@@ -9,8 +8,8 @@ import {
 	deferredScenario,
 	loadRescopeReference,
 	maxRssCommand,
-	parseArgs,
 	parseMaxRssBytes,
+	parseArgs,
 	resolveDefaultBaseline,
 	successfulScenarioResult,
 	validateScenarioWorkload,
@@ -200,27 +199,52 @@ describe("VB001 gen-3 harness gates", () => {
 			await fs.rm(tempRoot, { recursive: true, force: true });
 		}
 	});
+});
 
-	// Issue #5940: a measured Bun child shares GNU time's stderr pipe and marks it
-	// O_NONBLOCK; a full pipe then made time's own report write fail with EAGAIN,
-	// so time exited 1 and the harness rejected successful S1/S2 samples.
-	test.skipIf(process.platform !== "linux")(
-		"Linux max-RSS sampler exits 0 and reports RSS while the measured Bun child floods a shared stderr pipe",
-		async () => {
-			const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-rss-sampler-"));
-			try {
-				const reportPath = path.join(tempRoot, "time-report.txt");
-				const child = [process.execPath, "-e", "process.stderr.write('x'.repeat(256 * 1024)); await Bun.sleep(50);"];
-				const proc = Bun.spawn(maxRssCommand(child, reportPath), { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-				// Leave the pipe undrained while the child exits so time writes into a full pipe.
-				await Bun.sleep(1_000);
-				const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
-				expect(exitCode).toBe(0);
-				expect(stderr).toBe("x".repeat(256 * 1024));
-				expect(parseMaxRssBytes(await fs.readFile(reportPath, "utf8"))).toBeGreaterThan(0);
-			} finally {
-				await fs.rm(tempRoot, { recursive: true, force: true });
-			}
-		},
-	);
+describe("per-release RSS checkpoints (#5941)", () => {
+	const RELEASE_COMMIT = "c4a0299b8e2a4f0e6d7c1b9a8f3e2d1c0b9a8f7e";
+
+	test("release flags measure a foreign binary under its own commit identity and output directory", () => {
+		const options = parseArgs([
+			"--all",
+			"--write-baseline",
+			"--binary",
+			"release/gjc-linux-x64",
+			"--commit",
+			RELEASE_COMMIT,
+			"--output-dir=checkpoints",
+		]);
+		expect(options.binary).toBe(path.resolve("release/gjc-linux-x64"));
+		expect(options.commit).toBe(RELEASE_COMMIT);
+		expect(options.outputDir).toBe(path.resolve("checkpoints"));
+		expect(parseArgs(["--all"]).binary).toBe(path.resolve(import.meta.dir, "..", "packages", "coding-agent", "dist", "gjc"));
+		expect(parseArgs(["--all"]).commit).toBeUndefined();
+
+		// A checkpoint is keyed by its commit, so an abbreviated or tag-shaped identity is rejected.
+		expect(errorCode(() => parseArgs(["--all", "--commit", "c4a0299b8e"]))).toBe("UsageError");
+		expect(errorCode(() => parseArgs(["--all", "--commit", "v0.17.6"]))).toBe("UsageError");
+	});
+
+	test("advisory compare is a compare-only mode that can never waive a milestone floor", () => {
+		const options = parseArgs(["--all", "--compare", "--advisory", "--allow-baseline-drift", "--baseline", "prev.json"]);
+		expect(options.advisory).toBe(true);
+		expect(options.compare).toBe(true);
+		expect(parseArgs(["--all", "--compare"]).advisory).toBe(false);
+
+		expect(errorCode(() => parseArgs(["--all", "--advisory"]))).toBe("UsageError");
+		expect(
+			errorCode(() => parseArgs(["--scenario", "S4", "--compare", "--advisory", "--baseline", "b.json", "--milestone", "W1c"])),
+		).toBe("UsageError");
+	});
+
+	test("max-RSS sampler writes its report to a file instead of the inherited stderr pipe", () => {
+		const command = ["gjc", "--help"];
+		expect(maxRssCommand(command, "/tmp/report.txt", "linux")).toEqual(["/usr/bin/time", "-v", "-o", "/tmp/report.txt", ...command]);
+		expect(maxRssCommand(command, "/tmp/report.txt", "darwin")).toEqual(["/usr/bin/time", "-l", "-o", "/tmp/report.txt", ...command]);
+		expect(errorCode(() => maxRssCommand(command, "/tmp/report.txt", "win32"))).toBe("RssSamplerUnavailable");
+
+		expect(parseMaxRssBytes("\tMaximum resident set size (kbytes): 167292\n\tExit status: 0\n")).toBe(167_292 * 1024);
+		expect(parseMaxRssBytes("  184446976  maximum resident set size\n")).toBe(184_446_976);
+		expect(parseMaxRssBytes("")).toBeUndefined();
+	});
 });

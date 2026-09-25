@@ -534,6 +534,95 @@ jobs:
               name: gjc-binary-${{ matrix.target_id }}
               path: ${{ matrix.binary_path }}
 
+   # ---------------------------------------------------------------------------
+   # Per-release RSS checkpoint (#5941). Every stable tag and nightly records a
+   # whole-process-tree RSS checkpoint for the exact linux-x64 release binary, so
+   # regressions stay bisectable release-to-release. The compare against the
+   # previous published stable release is ADVISORY (docs/perf-profiling-corpus.md
+   # threshold promotion stage 1): both binaries are measured in this job on the
+   # same runner so host noise cancels, and regressions are reported, never
+   # gating. The job has no write scope; checkpoints ship as a run artifact.
+   # ---------------------------------------------------------------------------
+   rss_checkpoint:
+      if: ${{ always() && needs.release_metadata.result == 'success' && needs.binaries.result == 'success' }}
+      needs: [release_metadata, binaries]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 60
+      permissions:
+         contents: read
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              fetch-depth: 0
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Download release binary
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: gjc-binary-linux-x64
+              path: ${{ runner.temp }}/rss/current
+         - name: Resolve previous published stable release
+           id: previous
+           env:
+              GH_TOKEN: ${{ github.token }}
+              CURRENT_TAG: ${{ needs.release_metadata.outputs.tag_name }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              # Newest published, non-draft, non-prerelease release other than this one.
+              # Paginated: daily nightly prereleases can push every stable release off
+              # the first page. The API lists newest first, so the first match wins.
+              # A missing predecessor is not an error: the checkpoint is still written.
+              previous="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                 --jq ".[] | select(.draft == false and .prerelease == false and .tag_name != \"$CURRENT_TAG\") | .tag_name" \
+                 | sed -n 1p)"
+              echo "tag=$previous" >> "$GITHUB_OUTPUT"
+              if [ -n "$previous" ]; then
+                 git fetch --quiet --force origin "refs/tags/$previous:refs/tags/$previous"
+                 echo "commit=$(git rev-parse "$previous^{commit}")" >> "$GITHUB_OUTPUT"
+                 gh release download "$previous" --pattern gjc-linux-x64 --dir "$RUNNER_TEMP/rss/previous"
+                 chmod +x "$RUNNER_TEMP/rss/previous/gjc-linux-x64"
+              fi
+         - name: Install GNU time
+           run: test -x /usr/bin/time || { sudo apt-get update -qq && sudo apt-get install -y -qq time; }
+         - name: Write RSS checkpoints with advisory compare
+           env:
+              PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+              PREVIOUS_COMMIT: ${{ steps.previous.outputs.commit }}
+              CURRENT_COMMIT: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              out="$RUNNER_TEMP/rss/checkpoints"
+              current="$RUNNER_TEMP/rss/current/gjc-linux-x64"
+              chmod +x "$current"
+              if [ -z "$PREVIOUS_TAG" ]; then
+                 bun scripts/verify-rss-checkpoints.ts --all --write-baseline --matrix release \
+                    --binary "$current" --commit "$CURRENT_COMMIT" --output-dir "$out"
+                 exit 0
+              fi
+              bun scripts/verify-rss-checkpoints.ts --all --write-baseline --matrix "release-previous,$PREVIOUS_TAG" \
+                 --binary "$RUNNER_TEMP/rss/previous/gjc-linux-x64" --commit "$PREVIOUS_COMMIT" --output-dir "$out"
+              # One measurement of the current binary both writes its checkpoint and
+              # compares it; --advisory reports regressions without failing the job.
+              bun scripts/verify-rss-checkpoints.ts --all --write-baseline --compare --advisory --allow-baseline-drift \
+                 --matrix release --baseline "$out/$PREVIOUS_COMMIT.json" \
+                 --binary "$current" --commit "$CURRENT_COMMIT" --output-dir "$out" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+         - name: Upload RSS checkpoints
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: rss-checkpoint-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/rss/checkpoints
+              if-no-files-found: error
+              retention-days: 90
+
    release_prepare:
       if: ${{ always() && needs.native.result == 'success' && needs.binaries.result == 'success' && ((needs.release_metadata.outputs.channel == 'stable' && startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch') || (needs.release_metadata.outputs.channel == 'nightly' && needs.nightly_gate.result == 'success')) }}
       needs: [native, binaries, release_metadata, nightly_gate]
