@@ -87,6 +87,11 @@ import {
 	refreshModelPresetRegistry,
 	refreshModelPresetRegistryInBackground,
 } from "./model-preset-registry";
+import {
+	ModelProfileReplacementRequiredError,
+	readDurableModelProfileOwnershipFromRaw,
+	UnresolvedModelProfileOwnershipError,
+} from "./model-profile-ownership";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
 
@@ -1747,6 +1752,7 @@ export class ModelRegistry {
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
 	#settings: Pick<Settings, "get" | "getGlobal">;
+	#ownershipSettings: Pick<Settings, "commitAtomicBatchWithCurrent">;
 	readonly #authStorageConfigOwner: object = {};
 	#disposeAuthStorageFallbackResolver: (() => void) | undefined;
 	#lastStaticLoadMtime: number | null = null;
@@ -1799,6 +1805,11 @@ export class ModelRegistry {
 		modelPresetRegistryDependencies: ModelPresetRegistryDependencies = {},
 	) {
 		this.#settings = registrySettings ?? settings;
+		const ownershipSettings = registrySettings as Pick<Settings, "commitAtomicBatchWithCurrent"> | undefined;
+		this.#ownershipSettings =
+			ownershipSettings && typeof ownershipSettings.commitAtomicBatchWithCurrent === "function"
+				? ownershipSettings
+				: settings;
 		const configuredAgentDir = path.resolve(modelPresetRegistryDependencies.agentDir ?? getAgentDir());
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
 		this.#modelPresetRegistryAgentDir = modelPresetRegistryDependencies.agentDir
@@ -3005,6 +3016,18 @@ export class ModelRegistry {
 		return new Map(this.#modelProfiles);
 	}
 
+	assertCurrentModelProfileExists(name: string): void {
+		const loaded = this.#modelsConfigFile.tryLoad();
+		if (loaded.status === "error") {
+			throw new Error(
+				`Cannot validate durable model-profile ownership because ${this.#modelsConfigFile.path()} is invalid.`,
+			);
+		}
+		if (mergeModelProfiles(loaded.value?.profiles).has(name)) return;
+		if (this.#modelProfiles.get(name)?.source === "registry") return;
+		throw new UnresolvedModelProfileOwnershipError(name);
+	}
+
 	getModelProfile(name: string): ModelProfileDefinition | undefined {
 		return this.#modelProfiles.get(name);
 	}
@@ -3090,20 +3113,32 @@ export class ModelRegistry {
 	async deleteCustomModelProfile(name: string): Promise<ModelProfileConfig> {
 		const normalizedName = name.trim();
 		if (!normalizedName) throw new Error("Profile name is required.");
-		const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
-		const nextProfiles = { ...(current.profiles ?? {}) };
-		delete nextProfiles[normalizedName];
-		const checkedConfig = ModelsConfigSchema.safeParse({
-			...current,
-			profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+		let deletedProfile: ModelProfileConfig | undefined;
+		await this.#ownershipSettings.commitAtomicBatchWithCurrent(async currentSettings => {
+			const durableOwnership = readDurableModelProfileOwnershipFromRaw(currentSettings);
+			if (durableOwnership.marker.kind === "profile" && durableOwnership.marker.profile === normalizedName) {
+				throw new ModelProfileReplacementRequiredError(normalizedName);
+			}
+			const { current, profile } = this.#loadCustomProfileForMutation(normalizedName, "delete");
+			const nextProfiles = { ...(current.profiles ?? {}) };
+			delete nextProfiles[normalizedName];
+			const checkedConfig = ModelsConfigSchema.safeParse({
+				...current,
+				profiles: Object.keys(nextProfiles).length > 0 ? nextProfiles : undefined,
+			});
+			if (!checkedConfig.success) {
+				const first = checkedConfig.error.issues[0];
+				const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
+				throw new Error(
+					`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`,
+				);
+			}
+			await this.#writeCheckedModelsConfig(checkedConfig.data);
+			deletedProfile = profile;
+			return [];
 		});
-		if (!checkedConfig.success) {
-			const first = checkedConfig.error.issues[0];
-			const where = first?.path.length ? `/${first.path.map(String).join("/")}` : "root";
-			throw new Error(`Generated models config is invalid at ${where}: ${first?.message ?? "unknown schema error"}`);
-		}
-		await this.#writeCheckedModelsConfig(checkedConfig.data);
-		return profile;
+		if (!deletedProfile) throw new Error(`Model profile "${normalizedName}" was not deleted.`);
+		return deletedProfile;
 	}
 
 	#loadCustomProfileForMutation(
