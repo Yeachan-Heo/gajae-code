@@ -155,7 +155,7 @@ describe("AgentSession silent-abort marker stamping", () => {
 		await Promise.all([silentAbort, realAbort]);
 	});
 
-	it("canonically commits and classifies an orphan before publishing the same agent_end object", async () => {
+	it("retains orphan output without cloning every delta and snapshots at agent_end", async () => {
 		fixture = await createSessionWithObfuscator();
 		const { session } = fixture;
 		const { scope, dispose: disposeScope } = session.agent.mintSideAttemptScope();
@@ -163,20 +163,23 @@ describe("AgentSession silent-abort marker stamping", () => {
 		session.subscribe(event => seen.push(event));
 
 		const provisional = makeStoppedAssistantMessage("retained orphan partial");
+		const cloneSpy = vi.spyOn(globalThis, "structuredClone");
 		session.agent.emitExternalEvent({ type: "message_start", message: provisional, scope });
-		session.agent.emitExternalEvent({
-			type: "message_update",
-			message: provisional,
-			assistantMessageEvent: {
-				type: "text_delta",
-				contentIndex: 0,
-				delta: "retained orphan partial",
-				partial: provisional,
-			},
-			scope,
-		});
-		const provisionalText = provisional.content[0];
-		if (provisionalText?.type === "text") provisionalText.text = "mutated after captured update";
+		cloneSpy.mockClear();
+		for (let delta = 0; delta < 20; delta++) {
+			session.agent.emitExternalEvent({
+				type: "message_update",
+				message: provisional,
+				assistantMessageEvent: {
+					type: "text_delta",
+					contentIndex: 0,
+					delta: String(delta),
+					partial: provisional,
+				},
+				scope,
+			});
+		}
+		expect(cloneSpy).not.toHaveBeenCalled();
 		session.markPlanCompactAbortPending();
 		expect(session.isPlanCompactAbortPending).toBe(true);
 		const rawAgentEnd: Extract<AgentEvent, { type: "agent_end" }> = {
@@ -186,6 +189,8 @@ describe("AgentSession silent-abort marker stamping", () => {
 			scope,
 		};
 		session.agent.emitExternalEvent(rawAgentEnd);
+		const provisionalText = provisional.content[0];
+		if (provisionalText?.type === "text") provisionalText.text = "mutated after agent_end";
 		let agentEnd: Extract<AgentSessionEvent, { type: "agent_end" }> | undefined;
 		for (let attempt = 0; attempt < 50 && !agentEnd; attempt++) {
 			await Bun.sleep(1);

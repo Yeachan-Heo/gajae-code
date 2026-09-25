@@ -7821,7 +7821,10 @@ export class AgentSession {
 			this.#provisionalAssistantMessage.attemptScopeKey === attemptScopeKey &&
 			this.#provisionalAssistantMessage.sessionIdentityEpoch === this.#sessionIdentityEpoch
 		) {
-			this.#provisionalAssistantMessage.message = structuredClone(event.message);
+			// Agent emits a fresh shallow message record for each update, while
+			// provider-owned content blocks may be mutated in place. Retain only the
+			// latest reference here; orphan recovery snapshots it once at agent_end.
+			this.#provisionalAssistantMessage.message = event.message;
 			this.#provisionalAssistantMessage.presentationMessage = event.message;
 		}
 		const provisionalAssistant = this.#provisionalAssistantMessage;
@@ -7849,6 +7852,11 @@ export class AgentSession {
 			provisionalAssistant.sessionIdentityEpoch === this.#sessionIdentityEpoch
 				? provisionalAssistant
 				: undefined;
+		// This terminal boundary is the last point at which provider-owned partial
+		// content can be safely observed. Avoid a deep copy on every stream delta,
+		// but detach before any admission wait so a later provider mutation cannot
+		// alter the orphan that is published.
+		const orphanAssistantSnapshot = orphanAssistant ? structuredClone(orphanAssistant.message) : undefined;
 		const unadmittedTerminalAssistant =
 			event.type === "agent_end" &&
 			event.stopReason !== "maintenance" &&
@@ -8068,13 +8076,13 @@ export class AgentSession {
 				!correlatedCanonicalAssistant &&
 				(!unadmittedTerminalAssistant || getSessionMessageEntryId(unadmittedTerminalAssistant) === undefined)
 			) {
-				const recoveredAssistant: AssistantMessage = structuredClone(
-					unadmittedTerminalAssistant ?? {
-						...orphanAssistant!.message,
-						stopReason: event.stopReason === "cancelled" ? "aborted" : orphanAssistant!.message.stopReason,
-						...(silentTerminal || ttsrTerminal ? { errorMessage: SILENT_ABORT_MARKER } : {}),
-					},
-				);
+				const recoveredAssistant: AssistantMessage =
+					orphanAssistantSnapshot ?? structuredClone(unadmittedTerminalAssistant!);
+				if (orphanAssistantSnapshot) {
+					recoveredAssistant.stopReason =
+						event.stopReason === "cancelled" ? "aborted" : recoveredAssistant.stopReason;
+					if (silentTerminal || ttsrTerminal) recoveredAssistant.errorMessage = SILENT_ABORT_MARKER;
+				}
 				recoveredAssistant.content = recoveredAssistant.content.filter(block => block.type !== "toolCall");
 				if (
 					recoveredAssistant.stopReason === "aborted" &&
