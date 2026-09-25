@@ -1,6 +1,4 @@
 import type { WindowsJobMemoryProbeResult } from "@gajae-code/natives";
-import { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } from "@gajae-code/natives";
-import { loadNative as loadNativeBindings } from "../../../natives/native/loader-state.js";
 
 export type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
 
@@ -21,10 +19,13 @@ function parseWindowsJobMemoryProbeResult(value: unknown): WindowsJobMemoryProbe
 	return result as unknown as WindowsJobMemoryProbeResult;
 }
 
-export function runMemoryGuardNativeSmoke(
+export async function runMemoryGuardNativeSmoke(
 	options: { loadNative?: MemoryGuardNativeSmokeLoad; writeStdout?: (text: string) => void } = {},
-): void {
-	const probe = (options.loadNative ?? loadNativeBindings)().probeWindowsJobMemory;
+): Promise<void> {
+	const nativeBindings = options.loadNative
+		? options.loadNative()
+		: (await import("../../../natives/native/loader-state.js")).loadNative();
+	const probe = nativeBindings.probeWindowsJobMemory;
 	if (typeof probe !== "function") {
 		throw new Error("memory-guard-native-smoke: probeWindowsJobMemory export missing from native addon");
 	}
@@ -37,6 +38,7 @@ export function runMemoryGuardNativeSmoke(
 }
 
 export async function runNativeSmokeTest(): Promise<void> {
+	const { h01FindBestFuzzyMatch, h02ScoreSequenceFuzzy, h06FormatHashLines } = await import("@gajae-code/natives");
 	const hashed = h06FormatHashLines("a\nb", 1);
 	if (hashed.split("\n").length !== 2) {
 		throw new Error(`smoke-test: h06FormatHashLines returned unexpected output: ${JSON.stringify(hashed)}`);
