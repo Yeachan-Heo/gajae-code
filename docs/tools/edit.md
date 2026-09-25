@@ -189,7 +189,7 @@ export const done = true;
 - Bad anchor token:
   - `line N: expected a full anchor such as "119sr"; got "...".`
 - Line number without a hash (`≔16`, `≔23-25`, `≔23..25`):
-  - `line N: anchor "16" is missing its hash; ...` followed by `The edit was NOT applied. Current anchors for <path>:` and up to 20 current `LINEhh|TEXT` lines for the referenced span. The edit is never applied on a line number alone.
+  - `line N: anchor "16" is missing its hash; ...` followed by `The edit was NOT applied. Current anchors for <path>:` and the current `LINEhh|TEXT` lines for the referenced span (spans over 20 lines keep the first 19 and the last line; line text is column-bounded like `read` output). A reference past EOF reports `Line N does not exist`. The edit is never applied on a line number alone.
 - Bad range syntax:
   - `line N: explicit ranges are required for replacement...`
   - `line N: range must include exactly two full anchors separated by "..".`

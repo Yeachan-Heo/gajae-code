@@ -469,6 +469,37 @@ describe("hashline — hash-less line references", () => {
 			expect(await Bun.file(filePath).text()).toBe(original);
 		});
 	});
+
+	it("keeps both endpoints of a long hash-less range and bounds each echoed line", async () => {
+		await withTempDir(async tempDir => {
+			const lines = Array.from({ length: 100 }, (_, idx) => `line ${idx + 1}`);
+			const longLine = "x".repeat(5000);
+			lines[0] = longLine;
+			await Bun.write(path.join(tempDir, "a.ts"), `${lines.join("\n")}\n`);
+
+			let message = "";
+			try {
+				await executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔1..100\n${pl("X")}\n`));
+			} catch (err) {
+				message = (err as Error).message;
+			}
+			const echoed = message.split("Current anchors for a.ts:\n")[1]?.split("\n") ?? [];
+			expect(echoed).toHaveLength(21);
+			// Line 1 keeps the hash of its full content while its text is column-bounded.
+			expect(echoed[0]?.startsWith(`${tag(1, longLine)}${outputSep}`)).toBe(true);
+			expect(echoed[0]?.length).toBeLessThan(1100);
+			expect(echoed[19]).toBe("...");
+			expect(echoed[20]).toBe(`${tag(100, "line 100")}${outputSep}line 100`);
+		});
+	});
+
+	it("reports a hash-less reference past EOF instead of echoing an unrelated line", async () => {
+		await withTempDir(async tempDir => {
+			await Bun.write(path.join(tempDir, "a.ts"), "one\ntwo\n");
+			const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, `§a.ts\n≔40\n${pl("X")}\n`));
+			await expect(run).rejects.toThrow("The edit was NOT applied. Line 40 does not exist (a.ts has 3 lines).");
+		});
+	});
 });
 
 describe("hashline — stale anchors", () => {

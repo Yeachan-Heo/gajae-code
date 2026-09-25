@@ -5,6 +5,7 @@ import { getFileReadCache } from "../edit/file-read-cache";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "../edit/normalize";
 import { readEditFileText, serializeEditFileText } from "../edit/read-file";
 import type { EditToolDetails } from "../edit/renderer";
+import { truncateLine } from "../session/streaming-output";
 import type { ToolSession } from "../tools";
 import { assertEditableFileContent } from "../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../tools/fs-cache-invalidation";
@@ -13,7 +14,7 @@ import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard"
 import { HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { buildCompactHashlineDiffPreview } from "./diff-preview";
-import { formatHashLine } from "./hash";
+import { computeLineHash, HL_BODY_SEP } from "./hash";
 import { type HashlineInputSection, splitHashlineInputs } from "./input";
 import { HashlineMissingHashError, parseHashlineWithWarnings } from "./parser";
 import { tryRecoverHashlineWithCache } from "./recovery";
@@ -69,6 +70,25 @@ function getEditDetails(result: AgentToolResult<EditToolDetails>): EditToolDetai
 const MISSING_HASH_ANCHOR_LIMIT = 20;
 
 /**
+ * Format the anchors echoed for a hash-less reference. Both requested
+ * endpoints are always kept (a replacement range needs both hashes); a longer
+ * span is elided in the middle. Hashes are computed from the full line, but
+ * the displayed text is column-bounded like `read` output.
+ */
+function formatMissingHashAnchors(fileLines: string[], start: number, end: number): string[] {
+	const format = (line: number): string => {
+		const text = fileLines[line - 1] ?? "";
+		return `${line}${computeLineHash(line, text)}${HL_BODY_SEP}${truncateLine(text).text}`;
+	};
+	const count = end - start + 1;
+	if (count <= MISSING_HASH_ANCHOR_LIMIT) {
+		return Array.from({ length: count }, (_, offset) => format(start + offset));
+	}
+	const head = Array.from({ length: MISSING_HASH_ANCHOR_LIMIT - 1 }, (_, offset) => format(start + offset));
+	return [...head, "...", format(end)];
+}
+
+/**
  * Parse an edit section. When an op names lines by number only, answer with
  * the current full anchors for those lines so the model can retry without
  * another read. The edit itself is never applied on a line number alone.
@@ -85,11 +105,13 @@ async function parseHashlineSection(
 		const source = await readHashlineFile(absolutePath, pathText);
 		if (!source.exists) throw err;
 		const fileLines = normalizeToLF(stripBom(source.rawContent).text).split("\n");
-		const start = Math.min(err.lines.start, fileLines.length);
-		if (start < 1) throw err;
-		const end = Math.min(err.lines.end, fileLines.length, start + MISSING_HASH_ANCHOR_LIMIT - 1);
-		const anchors: string[] = [];
-		for (let line = start; line <= end; line++) anchors.push(formatHashLine(line, fileLines[line - 1] ?? ""));
+		const { start, end } = err.lines;
+		if (end > fileLines.length) {
+			throw new Error(
+				`${err.message}\nThe edit was NOT applied. Line ${end} does not exist (${pathText} has ${fileLines.length} lines).`,
+			);
+		}
+		const anchors = formatMissingHashAnchors(fileLines, start, end);
 		throw new Error(
 			`${err.message}\nThe edit was NOT applied. Current anchors for ${pathText}:\n${anchors.join("\n")}`,
 		);
