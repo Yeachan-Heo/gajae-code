@@ -621,7 +621,9 @@ export async function ensureWorkflowSkillActivationSeed(
 				throw new Error(`Workflow subskill activation write was not persisted: ${skill}`);
 			}
 			existingEntry = merged.predecessor;
-			if (!existingEntry) return { state: existing, seeded: false, rollback: noRollback };
+			if (!existingEntry) {
+				throw new Error(`Workflow activation entry disappeared during subskill merge: ${skill}`);
+			}
 		}
 		const rawPredecessor = merged.predecessor;
 		if (!rawPredecessor) return { state: existing, seeded: false, rollback: noRollback };
