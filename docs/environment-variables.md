@@ -261,14 +261,15 @@ providers:
 
 `models.yml` is strict: unsupported provider/model keys fail validation before the provider request is dispatched.
 
-### GJC workflow bridge commands
+### GJC workflow commands
 
-`gjc ralplan`, `gjc deep-interview`, and `gjc state` are private runtime bridge commands. They require `GJC_RUNTIME_BINARY` (or legacy `GJC_LEGACY_RUNTIME_BINARY`) to point at the private runtime executable; public bundled workflow use remains through `/skill:ralplan` and `/skill:deep-interview` inside a GJC session.
+`gjc ralplan`, `gjc deep-interview`, and `gjc state` are native CLI commands (`packages/coding-agent/src/commands/{ralplan,deep-interview,state}.ts`). They need no environment variable or external runtime binary; the retired `GJC_RUNTIME_BINARY` and `GJC_LEGACY_RUNTIME_BINARY` variables are not read. Inside a GJC session, the bundled workflows remain available as `/skill:ralplan` and `/skill:deep-interview`.
 
-| Variable | Behavior |
+| Command | Behavior |
 | --- | --- |
-| `GJC_RUNTIME_BINARY` | Private runtime bridge binary for `gjc ralplan`, `gjc deep-interview`, and `gjc state` |
-| `GJC_LEGACY_RUNTIME_BINARY` | Legacy fallback bridge binary name |
+| `gjc ralplan` | Runs the native RALPLAN consensus planning workflow |
+| `gjc deep-interview` | Runs the native deep-interview workflow |
+| `gjc state` | Reads or updates current-session workflow state receipts under `.gjc/_session-{sessionid}/state` |
 
 ### Interactive `--tmux` startup and scroll/mouse profile
 
