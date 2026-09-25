@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-25
+
+### Added
+
+- Add versioned durable ownership storage and transcript markers for transactional model-profile changes.
+
+- Add an opt-in, off-by-default transient Kev delegation notice from bounded local aggregates, including remaining context budget ratio and the pending/in-progress task count in the largest plan phase. A successful todo update with at least three active steps in one phase can trigger a hint. It does not alter prompts, task arguments, or saved sessions; enforcement and decision telemetry are not included.
+
+### Changed
+
+- Require explicit replacement before deleting a profile owned by a durable default or active session.
+
+### Fixed
+
+- Initialize owned SDK model catalogs with final scoped settings before the first catalog pass.
+
+- Initialize owned SDK model registries once with scoped settings, and keep source-host construction within owner-bound readiness cancellation and rollback.
+
+- SDK `session.list` retries one complete identity-bound scan after a concurrent transcript change and returns a path-free, target-correlated reason if selection still fails; exact saved-session lookups cannot be mixed with page cursors, and resolution remains fail-closed (#5887).
+
+- Preserve pre-session rollback proof when theme startup is interrupted and revoke published readiness markers through bounded off-thread cleanup.
+
+- Interactive sessions now expose their own async-job snapshot to extensions and the SDK, so `runtime.jobs.list` reports the session's running jobs, recent jobs, and pending delivery instead of failing with `resource_gone`.
+- `gjc sdk session` failures caused by a typed `resource_gone` now carry a fixed diagnostic that distinguishes absent resource state from an empty result, without changing the public error code, retryability, or exit code.
+
+- SDK lifecycle failures caused by a broker idempotency conflict now carry a single fixed public diagnostic (`lifecycle_idempotency_conflict`) in both JSON and text command-error output, so an operator can tell a conflict from an ordinary `operation_failed` without the broker's raw message, paths, or credentials reaching the envelope. The diagnostic text names no cause and does not suggest that another request key is safe. The public failure code, effect proof, retryability, and exit code are unchanged.
+- `gjc sdk session raw global --op session.lookup` no longer prints the broker's own idempotency-conflict message. That route returns its structured outcome directly, so it bypasses the public error envelope and its 8192-byte budget, and a hostile or oversized broker message could expose request keys, paths, or credentials in CLI output. The exact `idempotency_conflict` code now carries the same fixed, cause-neutral text as the public diagnostic; lookup status, error code, certainty, reconciliation guidance, and exit code are unchanged, and every other lookup code is left untouched.
+
+- `session.lookup` for a `session.create` now recovers the recorded outcome when the lookup target matches the create target. The broker fingerprinted the raw lookup target while the create path fingerprinted its normalized input (resolved `cwd` plus the derived `stateRoot`), so every lookup reported `idempotency_conflict` and callers could not reconcile a lost create acknowledgement. Lookup targets now pass through the same normalization before fingerprinting; a genuinely different target still conflicts, and an invalid lookup target is rejected as `invalid_input`. Create rows recorded before target-bound identities, which carry a raw-target fingerprint, stay recoverable: lookup falls back to the raw fingerprint only for that exact legacy identity (#5933).
+
+- Answer an SDK `turn.prompt`/`turn.abort_and_prompt` submitted to a session with no selected model with the typed `model_not_selected` control error and a fixed public message, instead of a generic `internal` failure. The local onboarding guidance (providers, commands, environment variables, setup paths) stays local-only and is not published on the control protocol, missing credentials and arbitrary exceptions keep their existing generic classification, and the rejection still happens before admission so no turn is accepted.
+
+- Remove per-process test agent and log isolation directories after each Bun test file completes, while keeping the isolated log sink available throughout the run. Set `GJC_TEST_KEEP_TMP=1` to preserve per-file test sandboxes and their isolated state for debugging, including failed preload initialization (#5852).
+
 ## [0.17.6] - 2026-09-24
 
 ### Fixed
