@@ -5,6 +5,7 @@
  * used when not in patch mode.
  */
 
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as Diff from "diff";
 import { resolveToCwd } from "../tools/path-utils";
 import { DEFAULT_FUZZY_THRESHOLD, EditMatchError, findMatch } from "./modes/replace";
@@ -44,6 +45,8 @@ export class ApplyPatchError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "ApplyPatchError";
+		// A patch that does not apply is the tool answering the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 

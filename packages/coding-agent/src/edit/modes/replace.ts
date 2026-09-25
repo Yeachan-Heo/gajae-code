@@ -5,6 +5,7 @@
  * fallback strategies for finding text in files.
  */
 import type { AgentToolResult } from "@gajae-code/agent-core";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as z from "zod/v4";
 import type { WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
@@ -130,6 +131,8 @@ export class EditMatchError extends Error {
 	) {
 		super(EditMatchError.formatMessage(path, searchText, closest, options));
 		this.name = "EditMatchError";
+		// The edit tool answering the model's non-matching input, not a fault.
+		markDesignedError(this);
 	}
 
 	static formatMessage(

@@ -43,6 +43,7 @@ import {
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
+import { markDesignedError } from "@gajae-code/utils/error-classification";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
@@ -5379,7 +5380,7 @@ async function executeToolCalls(
 								: reason === "ambiguous"
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
-					throw new Error(detail);
+					throw markDesignedError(new Error(detail));
 				}
 				const displaySafeEscapedArguments =
 					escapedArgumentsGuarded &&
@@ -5407,10 +5408,12 @@ async function executeToolCalls(
 						toolRegistered: tool !== undefined,
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
-					throw new Error(
-						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
-							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-							`so the call was not executed. Re-issue it writing every printable character literally.`,
+					throw markDesignedError(
+						new Error(
+							`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
+								`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+								`so the call was not executed. Re-issue it writing every printable character literally.`,
+						),
 					);
 				}
 				if (!tool) {
@@ -5429,10 +5432,12 @@ async function executeToolCalls(
 					// naming that guess hits a tool the model never asked for, which is
 					// worse than the dead end it would replace.
 					const base = `Tool ${toolCall.name} not found`;
-					throw new Error(
-						isToolDiscoveryCallable(tools)
-							? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
-							: base,
+					throw markDesignedError(
+						new Error(
+							isToolDiscoveryCallable(tools)
+								? `${base}. If you are unsure whether this tool exists or how to use it, call \`${TOOL_DISCOVERY_NAME}\` to discover and activate the matching tool, then retry.`
+								: base,
+						),
 					);
 				}
 
