@@ -2290,6 +2290,9 @@ test("session manager open preserves failed manager-close evidence", async () =>
 	const stateRoot = path.join(root, ".gjc", "state");
 	await fs.mkdir(cwd, { recursive: true });
 	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+	// Use in-memory session to avoid file system dependencies
+	const previous = process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+	process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
 	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
 	const request: SessionLifecycleLaunchRequest = {
 		operation: "session.create",
@@ -2318,6 +2321,8 @@ test("session manager open preserves failed manager-close evidence", async () =>
 		managerClose.mockRestore();
 		settingsLoad.mockRestore();
 		settingsClose.mockRestore();
+		if (previous === undefined) delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		else process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = previous;
 		await manager?.close().catch(() => {});
 		await fs.rm(root, { recursive: true, force: true });
 	}
@@ -2525,7 +2530,8 @@ test("session manager open preserves close failure when scoped settings also fai
 	try {
 		await fs.mkdir(cwd, { recursive: true });
 		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-		delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		// Use in-memory session to avoid file system dependencies
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
 		const request: SessionLifecycleLaunchRequest = {
 			operation: "session.create",
 			sessionId,
