@@ -52,13 +52,52 @@ function inlineText(result: AgentToolResult): string {
 }
 
 describe("inline-result backstop (Finding 12)", () => {
-	test("disabled by default: oversized output passes through untouched, no artifact saved", async () => {
+	test("default settings cap a 40KB read below the 50KB spill threshold at 12KB with artifact recovery (#5945)", async () => {
 		const full = bigText(40);
 		const saved: Array<{ content: string; toolType: string }> = [];
-		const tool = wrapToolWithMetaNotice(makeTool("mytool", { content: [{ type: "text", text: full }] }));
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
 		const ctx = makeContext(Settings.isolated(), saved);
 
 		const result = await tool.execute("c1", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		expect(result.details?.meta?.truncation?.maxBytes).toBe(12 * 1024);
+		expect(text).toContain(HEAD_MARKER);
+		expect(text).toContain(TAIL_MARKER);
+		expect(text).toContain("artifact://art-1");
+		expect(saved).toEqual([{ content: full, toolType: "read" }]);
+	});
+
+	test("default settings leave results at or below 12KB untouched", async () => {
+		const small = bigText(11);
+		const saved: Array<{ content: string; toolType: string }> = [];
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: small }] }));
+
+		const result = await tool.execute("c1b", {}, undefined, undefined, makeContext(Settings.isolated(), saved));
+
+		expect(inlineText(result)).toBe(small);
+		expect(saved).toHaveLength(0);
+	});
+
+	test("leaves output uncapped when no artifact can be stored (standalone gjc read)", async () => {
+		const full = bigText(40);
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
+
+		const result = await tool.execute("c1d", {}, undefined, undefined, {
+			settings: Settings.isolated(),
+		} as AgentToolContext);
+
+		expect(inlineText(result)).toBe(full);
+		expect(result.details?.meta?.truncation).toBeUndefined();
+	});
+
+	test("a 0 cap disables the backstop", async () => {
+		const full = bigText(40);
+		const saved: Array<{ content: string; toolType: string }> = [];
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
+		const ctx = makeContext(Settings.isolated({ "tools.maxInlineResultBytes": 0 }), saved);
+
+		const result = await tool.execute("c1c", {}, undefined, undefined, ctx);
 
 		expect(inlineText(result)).toBe(full);
 		expect(saved).toHaveLength(0);

@@ -1165,14 +1165,16 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.maxInlineResultBytes": {
 		type: "number",
-		default: 0,
+		default: 12,
 		ui: {
 			tab: "tools",
 			label: "Max inline tool-result size (KB)",
 			description:
-				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. Default 12 KB (live A/B, #5945); 0 disables.",
 			options: [
 				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "8", label: "8 KB", description: "~2K tokens" },
+				{ value: "12", label: "12 KB", description: "Default; ~3K tokens" },
 				{ value: "20", label: "20 KB", description: "~5K tokens" },
 				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },

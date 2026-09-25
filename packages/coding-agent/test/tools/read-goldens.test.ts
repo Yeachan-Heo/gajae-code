@@ -509,6 +509,10 @@ async function runPhase(currentPhase: GoldenPhase): Promise<number> {
 		for (const hashLines of entry.hashLines) {
 			const variant = variantFor(hashLines);
 			const settings = Settings.isolated({
+				// Goldens pin the read tool's own rendering. The universal inline-result
+				// backstop is a separate wrapper layer with its own tests
+				// (inline-result-backstop.test.ts); entries opt in via entry.settings.
+				"tools.maxInlineResultBytes": 0,
 				...(entry.settings ?? {}),
 				...(FORCE_TRUNCATION === undefined ? {} : { "read.truncation": FORCE_TRUNCATION }),
 				readHashLines: hashLines,

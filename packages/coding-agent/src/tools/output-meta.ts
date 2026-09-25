@@ -1003,8 +1003,9 @@ function stripBodyOwnedTruncationFooter(text: string, details: unknown): string 
  * closes those gaps: when `tools.maxInlineResultBytes` is configured (> 0), any
  * final result whose inline text exceeds the cap is force-saved to an artifact
  * (reusing an existing artifactId to avoid double-artifacting) and truncated to a
- * head+tail view that fits the cap. Disabled by default (opt-in pending
- * measurement); a 0 cap returns the result untouched.
+ * head+tail view that fits the cap. Defaults to 12 KB, chosen by the live
+ * tool-result A/B in #5945; a 0 cap, or a context that cannot store an
+ * artifact, returns the result untouched.
  */
 async function enforceInlineResultBackstop(
 	result: AgentToolResult,
@@ -1035,6 +1036,9 @@ async function enforceInlineResultBackstop(
 	if (!artifactId && artifactCapability) {
 		artifactId = (await artifactCapability.saveArtifact(fullText, toolName)) ?? undefined;
 	}
+	// Without an artifact the elided text would be unrecoverable (e.g. standalone
+	// `gjc read` has no session store), so an uncapped result beats silent loss.
+	if (!artifactId) return result;
 
 	// Budget head+tail below the cap, reserving room for the elision marker so the
 	// composed `<head>\n<marker>\n<tail>` view never exceeds the configured cap.
