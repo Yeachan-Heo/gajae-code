@@ -373,7 +373,6 @@ fn fuzzy_find_sync_with_fs(
 		&& cache_age_ms >= empty_recheck_ms
 	{
 		let fresh = request
-			.clone()
 			.cache(false)
 			.collect_with_heartbeat(|| ct.heartbeat())
 			.map_err(iofs::map_walker_error)?;
