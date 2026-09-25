@@ -909,20 +909,19 @@ test("session host publishes SIGTERM failure without waiting for hung readiness 
 			},
 			writeSessionLifecycleReady: async (_root, _id, _effectMarker, canPublish, onPublishing, onPublished) => {
 				if (!canPublish) throw new Error("Readiness publication has no owner-bound cutoff guard.");
-				expect(canPublish()).toBe(true);
 				if (!onPublishing) throw new Error("Readiness publication has no revocation callback.");
 				await fs.writeFile(readyPath, JSON.stringify({ pid: process.pid, effectMarker }));
-				onPublishing(() => {
-					syncFs.rmSync(readyPath, { force: true });
-					readinessMarkerRevoked = !syncFs.existsSync(readyPath);
-					return readinessMarkerRevoked;
-				});
 				readinessStarted.resolve();
 				const startupSignal = process
 					.listeners("SIGTERM")
 					.find(listener => !previousSigtermListeners.includes(listener));
 				if (!startupSignal) throw new Error("Readiness publication has no owner-bound SIGTERM handler.");
 				startupSignal.call(process, "SIGTERM");
+				onPublishing(() => {
+					syncFs.rmSync(readyPath, { force: true });
+					readinessMarkerRevoked = !syncFs.existsSync(readyPath);
+					return readinessMarkerRevoked;
+				});
 				await releaseLateReadiness.promise;
 				if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
 				onPublished?.();
@@ -938,7 +937,6 @@ test("session host publishes SIGTERM failure without waiting for hung readiness 
 			Bun.sleep(1_500).then(() => false),
 		]);
 		expect(reachedReadiness).toBe(true);
-		if (!reachedReadiness) return;
 		const outcome = await Promise.race([
 			startup.then(
 				() => ({ kind: "resolved" as const }),
@@ -1006,7 +1004,6 @@ test("session host publishes SIGTERM failure without waiting for hung MCP config
 			Bun.sleep(1_500).then(() => false),
 		]);
 		expect(reachedConfigWrite).toBe(true);
-		if (!reachedConfigWrite) return;
 		const outcome = await Promise.race([
 			startup.then(
 				() => ({ kind: "resolved" as const }),

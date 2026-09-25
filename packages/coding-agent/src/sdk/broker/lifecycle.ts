@@ -1825,7 +1825,7 @@ export async function writeSessionLifecycleReady(
 	let published = false;
 	try {
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
-		fsSync.renameSync(temporary, lifecycleReadyPath(root, id));
+		await fs.rename(temporary, lifecycleReadyPath(root, id));
 		published = true;
 		onPublishing?.(() => removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation));
 		await syncDirectory(directory);

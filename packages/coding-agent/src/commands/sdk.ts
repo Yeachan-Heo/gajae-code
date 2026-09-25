@@ -1021,6 +1021,13 @@ export async function runSessionHost(
 						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
 						revoke => {
 							revokePendingReadinessMarker = revoke;
+							if (startupInterruption !== undefined) {
+								const revoked = revoke();
+								readinessPublicationCleanupComplete = revoked;
+								if (revoked) revokePendingReadinessMarker = undefined;
+							} else if (now() >= request.semanticReadyDeadlineAt) {
+								interruptStartup(cutoffFailure());
+							}
 						},
 						() => {
 							readinessPublished = true;
