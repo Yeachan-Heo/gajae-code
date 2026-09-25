@@ -666,7 +666,8 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
 		changedPath === "crates/pi-shell/Cargo.toml" ||
 		changedPath === "packages/natives/test/windows-runtime-install.windows.test.ts" ||
-		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts" ||
+		changedPath === "packages/natives/test/windows-shell-path.windows.test.ts"
 	);
 }
 
