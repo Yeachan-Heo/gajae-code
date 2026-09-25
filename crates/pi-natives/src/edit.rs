@@ -38,23 +38,19 @@ pub struct EditSeekSequenceResult {
 	pub strategy:      Option<String>,
 }
 
-fn to_js_match(matched: Option<FuzzyMatch>, content: &str) -> Option<EditFuzzyMatch> {
-	matched.map(|matched| EditFuzzyMatch {
+fn to_js_match(matched: FuzzyMatch, content: &str) -> EditFuzzyMatch {
+	EditFuzzyMatch {
 		actual_text: matched.actual_text,
 		start_index: content[..matched.start_index].encode_utf16().count() as u32,
 		start_line:  matched.start_line,
 		confidence:  matched.confidence,
-	})
+	}
 }
 
 fn to_js_match_result(result: MatchOutcome, content: &str) -> EditFindMatchResult {
 	EditFindMatchResult {
-		matched:             result
-			.matched
-			.and_then(|matched| to_js_match(Some(matched), content)),
-		closest:             result
-			.closest
-			.and_then(|matched| to_js_match(Some(matched), content)),
+		matched:             result.matched.map(|matched| to_js_match(matched, content)),
+		closest:             result.closest.map(|matched| to_js_match(matched, content)),
 		occurrences:         result.occurrences.map(|count| count as u32),
 		occurrence_lines:    result.occurrence_lines,
 		occurrence_previews: result.occurrence_previews,

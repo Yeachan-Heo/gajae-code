@@ -1,5 +1,6 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/src/session.rs @
-// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: scoped clippy
+// allow for async_trait-generated double_must_use.
 //! One edit session per tool call: accumulates streamed arguments, computes
 //! previews, and finally stages + applies the edit through a host writer.
 //!
@@ -71,6 +72,9 @@ pub struct WriteResponse {
 }
 
 /// Host-side byte owner.
+// `async_trait` expands default async methods to `#[must_use]` pinned futures,
+// which newer clippy flags as `double_must_use` on macro-generated code.
+#[allow(clippy::double_must_use, reason = "async_trait-generated attribute")]
 #[async_trait]
 pub trait EditWriter: Send + Sync {
 	async fn write(&self, request: WriteRequest) -> EditResult<WriteResponse>;
