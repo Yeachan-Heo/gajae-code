@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/iso.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: use the 2.1
+// UTF-8 helper contract through a private integration shim.
 //! napi shim for the `pi-iso` PAL.
 //!
 //! Mirrors [`pi_iso::IsolationBackend`] across the FFI boundary:
@@ -22,7 +25,31 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use pi_iso::{BackendKind, ChangeKind, Diff, FileChange, IsoError, IsolationBackend};
 
+// TEMP: replace with crate::js once 2.1 lands.
+mod js {
+	use std::ops::Deref;
+
+	pub(crate) struct Utf8(String);
+
+	impl Deref for Utf8 {
+		type Target = str;
+
+		fn deref(&self) -> &Self::Target {
+			&self.0
+		}
+	}
+
+	pub(crate) fn utf8(value: napi::JsString<'_>) -> napi::Result<Utf8> {
+		into_string(value).map(Utf8)
+	}
+
+	pub(crate) fn into_string(value: napi::JsString<'_>) -> napi::Result<String> {
+		value.into_utf8()?.into_owned()
+	}
+}
+
 const ISO_UNAVAILABLE_PREFIX: &str = "ISO_UNAVAILABLE:";
+const ISO_UNAVAILABLE_WITH_LEADING_SPACE: &str = " ISO_UNAVAILABLE:";
 
 /// Isolation backend identifier. Numeric so the JS side can `switch` on
 /// the enum without string comparisons.
@@ -174,12 +201,13 @@ pub async fn iso_diff(lower: String, merged: String) -> Result<IsoDiff> {
 /// Use this to distinguish "this backend isn't installed" from a hard
 /// failure when handling caught errors on the JS side.
 #[napi]
-pub fn iso_is_unavailable_error(message: String) -> bool {
-	message.starts_with(ISO_UNAVAILABLE_PREFIX)
-		|| message.contains(&format!(" {ISO_UNAVAILABLE_PREFIX}"))
+pub fn iso_is_unavailable_error(message: napi::JsString<'_>) -> Result<bool> {
+	let message = js::utf8(message)?;
+	Ok(message.starts_with(ISO_UNAVAILABLE_PREFIX)
+		|| message.contains(ISO_UNAVAILABLE_WITH_LEADING_SPACE))
 }
 
-const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
+pub(crate) const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
 	match kind {
 		BackendKind::Apfs => IsoBackendKind::Apfs,
 		BackendKind::Btrfs => IsoBackendKind::Btrfs,
@@ -192,7 +220,7 @@ const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
 	}
 }
 
-const fn from_napi_kind(kind: IsoBackendKind) -> BackendKind {
+pub(crate) const fn from_napi_kind(kind: IsoBackendKind) -> BackendKind {
 	match kind {
 		IsoBackendKind::Apfs => BackendKind::Apfs,
 		IsoBackendKind::Btrfs => BackendKind::Btrfs,
