@@ -1363,7 +1363,12 @@ class AuthStorageUsageCache implements UsageCache {
 	getStale<T>(key: string): UsageCacheEntry<T> | undefined {
 		const raw = this.store.getCache(`${USAGE_CACHE_PREFIX}${key}`, { includeExpired: true });
 		if (!raw) return undefined;
-		return parseUsageCacheEntry<T>(raw);
+		const entry = parseUsageCacheEntry<T>(raw);
+		// Enforce last-good retention on read: rows now survive process startup
+		// (#5939) and expired rows are not swept, so a report older than the
+		// retention window must not be resurrected as a failure fallback.
+		if (!entry || entry.expiresAt + USAGE_LAST_GOOD_RETENTION_MS <= Date.now()) return undefined;
+		return entry;
 	}
 
 	set<T>(key: string, entry: UsageCacheEntry<T>): void {

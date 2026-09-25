@@ -49,7 +49,8 @@ function expireCachePayloads(store: ObservableStore): void {
 	for (const [key, entry] of store.cache) {
 		try {
 			const parsed = JSON.parse(entry.value);
-			parsed.expiresAt = 1; // positive but already in the past (epoch ms)
+			// Just past freshness, still inside the 24h last-good retention window.
+			parsed.expiresAt = Date.now() - 1;
 			store.cache.set(key, { value: JSON.stringify(parsed), expiresAtSec: entry.expiresAtSec });
 		} catch {
 			// Non-JSON entries — leave alone.
@@ -364,6 +365,31 @@ describe("AuthStorage usage cache: last-good failure fallback", () => {
 		expect(second).toHaveLength(1);
 		// The fallback value must be the SAME report (not a synthetic empty one).
 		expect(second?.[0]?.limits[0]?.amount.used).toBe(42);
+	});
+
+	it("does not resurrect a last-good report older than the retention window on failure", async () => {
+		let calls = 0;
+		const goldReport = makeReport("a@example.com");
+		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async () => {
+			calls += 1;
+			return calls === 1 ? goldReport : null;
+		});
+
+		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(1);
+
+		// Age the stored report past the 24h last-good retention while leaving the
+		// row readable (expired rows are not swept and now survive startup).
+		for (const [key, entry] of store.cache) {
+			if (!key.includes("usage_cache:report:")) continue;
+			const parsed = JSON.parse(entry.value);
+			parsed.expiresAt = Date.now() - 25 * 60 * 60_000;
+			store.cache.set(key, { value: JSON.stringify(parsed), expiresAtSec: entry.expiresAtSec });
+		}
+		for (const key of [...store.cache.keys()]) if (key.includes("reports:")) store.cache.delete(key);
+
+		// The probe fails; the ancient report must not come back as a fallback.
+		expect(anthropicReports(await storage.fetchUsageReports())).toHaveLength(0);
+		expect(calls).toBe(2);
 	});
 
 	it("re-attempts the failing credential after the cool-down expires", async () => {
