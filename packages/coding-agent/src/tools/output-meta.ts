@@ -1070,14 +1070,21 @@ async function enforceInlineResultBackstop(
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
 
-	// If a prior truncation exists (from spillLargeResultToArtifact), preserve its totals
-	// instead of using the intermediate truncated view's totals. The intermediate view was
-	// already truncated by the spill step, so its totalLines/totalBytes do not reflect the
-	// original full output. We only update outputLines/outputBytes to reflect the new
-	// backstop truncation level.
+	// If a prior truncation exists from spillLargeResultToArtifact (not from tool-owned window
+	// metadata like read's rangeBase: "window"), preserve its totals instead of using the
+	// intermediate truncated view's totals. The intermediate view was already truncated by the
+	// spill step, so its totalLines/totalBytes do not reflect the original full output.
+	// Tool-owned windows have different semantics: totalLines is file-relative but totalBytes
+	// are window-relative, so we must keep them as-is. We only update outputLines/outputBytes
+	// to reflect the new backstop truncation level.
 	const priorTruncation = existingMeta?.truncation;
-	const realTotalLines = priorTruncation?.totalLines ?? truncated.totalLines;
-	const realTotalBytes = priorTruncation?.totalBytes ?? truncated.totalBytes;
+	const isToolOwnedWindow = priorTruncation?.rangeBase === "window";
+	const realTotalLines = !isToolOwnedWindow
+		? (priorTruncation?.totalLines ?? truncated.totalLines)
+		: truncated.totalLines;
+	const realTotalBytes = !isToolOwnedWindow
+		? (priorTruncation?.totalBytes ?? truncated.totalBytes)
+		: truncated.totalBytes;
 	const elidedLines = Math.max(0, realTotalLines - outputLines);
 	const elidedBytes = Math.max(0, realTotalBytes - outputBytes);
 
