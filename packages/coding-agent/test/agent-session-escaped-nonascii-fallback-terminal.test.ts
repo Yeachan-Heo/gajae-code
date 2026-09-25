@@ -458,6 +458,9 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"fallback.maxAttempts": 1,
+			// Rollback of the cancelled transition is under test, so keep the failed
+			// head eligible on the next turn instead of circuit-skipping it.
+			"fallback.circuitCooldownMs": 0,
 			"retry.baseDelayMs": 10,
 		});
 		settings.setModelRole("default", selector(primary));

@@ -1769,6 +1769,7 @@ export class ModelRegistry {
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
+	#selectorCircuits: Map<string, { openUntil: number; consecutiveOpens: number }> = new Map();
 	#backgroundRefresh?: Promise<void>;
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
@@ -1908,6 +1909,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
@@ -1941,6 +1943,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
 					strategy,
 					undefined,
@@ -1991,6 +1994,11 @@ export class ModelRegistry {
 				for (const selector of this.#suppressedSelectors.keys()) {
 					if (selector.startsWith(`${providerId}/`)) {
 						this.#suppressedSelectors.delete(selector);
+					}
+				}
+				for (const selector of this.#selectorCircuits.keys()) {
+					if (selector.startsWith(`${providerId}/`)) {
+						this.#selectorCircuits.delete(selector);
 					}
 				}
 				await this.#refreshRuntimeDiscoveries(
@@ -6361,6 +6369,40 @@ export class ModelRegistry {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Open the fallback-chain circuit for a selector after it failed out of a
+	 * managed chain. Consecutive opens without an intervening success double the
+	 * cooldown up to `maxCooldownMs`. Returns the instant the circuit half-opens.
+	 */
+	openSelectorCircuit(selector: string, baseCooldownMs: number, maxCooldownMs: number): number {
+		const key = normalizeSuppressedSelector(selector);
+		const consecutiveOpens = (this.#selectorCircuits.get(key)?.consecutiveOpens ?? 0) + 1;
+		const cooldownMs = Math.min(
+			baseCooldownMs * 2 ** (consecutiveOpens - 1),
+			Math.max(baseCooldownMs, maxCooldownMs),
+		);
+		const openUntil = Date.now() + cooldownMs;
+		this.#selectorCircuits.set(key, { openUntil, consecutiveOpens });
+		return openUntil;
+	}
+
+	/** Whether a selector's fallback-chain circuit is open (still cooling down). */
+	isSelectorCircuitOpen(selector: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		return circuit !== undefined && circuit.openUntil > Date.now();
+	}
+
+	/** Whether a selector has a failure record whose cooldown elapsed (half-open: one probe allowed). */
+	isSelectorCircuitHalfOpen(selector: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		return circuit !== undefined && circuit.openUntil <= Date.now();
+	}
+
+	/** Close a selector's circuit after an accepted response, resetting its escalation. */
+	closeSelectorCircuit(selector: string): void {
+		this.#selectorCircuits.delete(normalizeSuppressedSelector(selector));
 	}
 
 	/** Return whether a selector has an active, expired, or no rate-limit suppression. */

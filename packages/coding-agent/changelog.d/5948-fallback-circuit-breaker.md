@@ -1,0 +1,3 @@
+### Added
+
+- Managed model fallback chains now circuit-break failing entries. When an entry fails out of a chain, its circuit opens in the shared model registry, so later turns, chain restarts, and sibling sessions such as subagents skip that entry instead of spending its whole `fallback.maxAttempts` budget again. The cooldown starts at `fallback.circuitCooldownMs` (default 60s) and doubles on each consecutive failure, up to `fallback.circuitMaxCooldownMs` (default 30m). An accepted response closes the circuit. After the cooldown, `retry.fallbackRevertPolicy: cooldown-expiry` probes the head again. The final chain entry is never skipped, and a chain whose entries are all open still probes. Set `fallback.circuitCooldownMs: 0` to disable the breaker (#5948).
