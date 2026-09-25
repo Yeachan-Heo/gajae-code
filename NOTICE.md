@@ -17,6 +17,7 @@ The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` sour
 - `crates/pi-natives/src/power.rs`
 - `crates/pi-natives/src/prof.rs`
 - `crates/pi-natives/src/appearance.rs`
+- `crates/pi-natives/src/crash.rs` (alloc-error handling merged from `crash_handler.rs`)
 
 ## MuPDF WebAssembly
 
