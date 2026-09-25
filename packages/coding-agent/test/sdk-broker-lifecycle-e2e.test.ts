@@ -30,6 +30,7 @@ import {
 	setLifecycleTimingForTest,
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
+	writeSessionLifecycleReady,
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -42,6 +43,7 @@ import { createSdkMcpServer } from "../src/sdk/mcp";
 import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
+import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -71,6 +73,23 @@ test("formats cause-bearing diagnostics for children that started and exited", (
 	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
 		"Session exited before readiness. (exit=23)",
 	);
+});
+
+test("lifecycle ready publication revokes its marker when cutoff wins during directory sync", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-ready-cutoff-"));
+	const sessionId = "ready-cutoff-race";
+	const effectMarker = "ready-cutoff-race-effect";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	let cutoffChecks = 0;
+	try {
+		await expect(
+			writeSessionLifecycleReady(root, sessionId, effectMarker, () => ++cutoffChecks === 1),
+		).rejects.toThrow("Lifecycle readiness cutoff passed during publication.");
+		expect(cutoffChecks).toBe(2);
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });
 
 async function incarnation(pid: number): Promise<string> {
@@ -943,6 +962,136 @@ test("session host publishes SIGTERM failure without waiting for hung constructi
 		});
 	} finally {
 		releaseLateResult?.();
+		await startup?.catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
+test("session host publishes SIGTERM failure without waiting for hung readiness publication", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-hung-readiness-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "hung-readiness";
+	const effectMarker = "hung-readiness-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const readinessStarted = Promise.withResolvers<void>();
+	const releaseLateReadiness = Promise.withResolvers<void>();
+	let startup: Promise<void> | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		});
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const readyPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`);
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			applyStartupModelProfiles: async () => {},
+			createLifecycleAgentSession: async (options, owner) => {
+				if (!owner) throw new Error("Expected lifecycle startup owner.");
+				const openedSessionManager = options?.sessionManager;
+				if (!openedSessionManager) throw new Error("Expected an opened lifecycle session manager.");
+				const sessionManager = {
+					getSessionId: () => sessionId,
+					ensureOnDisk: async () => await openedSessionManager.ensureOnDisk(),
+					getSessionFile: () => openedSessionManager.getSessionFile(),
+				} as unknown as SessionManager;
+				const session = {
+					sessionManager,
+					settings: {},
+					modelRegistry: {},
+					registerToolSessionTransitionCleanup: (_cleanup: () => Promise<void>) => {},
+					dispose: async () => await openedSessionManager.close(),
+					awaitDisposeCompletion: async () => {},
+				} as unknown as AgentSession;
+				owner.capability.settleStarted();
+				return {
+					session,
+					capability: owner.capability,
+					rollback: owner.rollback,
+					startDeferredMemoryBackend: async () => {},
+				};
+			},
+			writeSessionLifecycleReady: async (_root, _id, _effectMarker, canPublish, onPublished) => {
+				if (!canPublish) throw new Error("Readiness publication has no owner-bound cutoff guard.");
+				expect(canPublish()).toBe(true);
+				readinessStarted.resolve();
+				const startupSignal = process
+					.listeners("SIGTERM")
+					.find(listener => !previousSigtermListeners.includes(listener));
+				if (!startupSignal) throw new Error("Readiness publication has no owner-bound SIGTERM handler.");
+				startupSignal.call(process, "SIGTERM");
+				await releaseLateReadiness.promise;
+				if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
+				onPublished?.();
+			},
+		});
+
+		const reachedReadiness = await Promise.race([
+			readinessStarted.promise.then(() => true),
+			startup.then(
+				() => false,
+				() => false,
+			),
+			Bun.sleep(1_500).then(() => false),
+		]);
+		expect(reachedReadiness).toBe(true);
+		if (!reachedReadiness) return;
+		const outcome = await Promise.race([
+			startup.then(
+				() => ({ kind: "resolved" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_500).then(() => ({ kind: "timed_out" as const })),
+		]);
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind !== "rejected") return;
+		expect(outcome.error).toMatchObject({ phase: "startup", reason: "failed" });
+		expect(await Bun.file(failurePath).exists()).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+		};
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		releaseLateReadiness.resolve();
 		await startup?.catch(() => {});
 		names.forEach((name, index) => {
 			const value = previous[index];
