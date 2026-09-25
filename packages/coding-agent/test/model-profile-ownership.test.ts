@@ -89,6 +89,21 @@ describe("model-profile ownership contract", () => {
 		expect(() => resolveOwnedModelProfileName(profileA, new Map())).toThrow(UnresolvedModelProfileOwnershipError);
 	});
 
+	it("resolves the legacy codex-standard alias without overriding a custom shadow", () => {
+		const codexProfiles = new Map([["codex-medium", {}]]);
+		const shadowingProfiles = new Map([
+			["codex-standard", {}],
+			["codex-medium", {}],
+		]);
+
+		expect(resolveOwnedModelProfileName({ kind: "profile", profile: "codex-standard" }, codexProfiles)).toBe(
+			"codex-medium",
+		);
+		expect(resolveOwnedModelProfileName({ kind: "profile", profile: "codex-standard" }, shadowingProfiles)).toBe(
+			"codex-standard",
+		);
+	});
+
 	it("commits the durable marker and its legacy projection atomically", async () => {
 		const settings = Settings.isolated({
 			"modelProfile.default": "profile-a",
@@ -175,17 +190,27 @@ describe("model-profile ownership contract", () => {
 		let reopened: SessionManager | undefined;
 		try {
 			manager = SessionManager.create(tempDir.path(), tempDir.path());
-			manager.appendModelProfileOwnershipMarker(cleared);
+			manager.appendModelProfileOwnershipMarker(profileA);
+			manager.appendMessage({ role: "user", content: "old context", timestamp: 1 });
+			const firstKeptEntryId = manager.appendMessage({ role: "user", content: "kept context", timestamp: 2 });
+			manager.appendCompaction("summary", undefined, firstKeptEntryId, 100);
 			await manager.ensureOnDisk();
 			await manager.flush();
+			manager.setSessionMemoryMode("enabled");
+			expect(manager.getSessionMemoryStats().coldRetirementActive).toBe(true);
+			const contextSnapshot = manager.buildSessionContext();
+			expect(contextSnapshot.modelProfileOwnershipMarker).toEqual(profileA);
+			contextSnapshot.modelProfileOwnershipMarker = cleared;
+			expect(manager.buildSessionContext().modelProfileOwnershipMarker).toEqual(profileA);
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected persisted session file");
 			await manager.close();
 			manager = undefined;
 
 			reopened = await SessionManager.open(sessionFile);
-			expect(reopened.getModelProfileOwnershipMarker()).toEqual(cleared);
-			expect(reopened.buildSessionContext().modelProfileOwnershipMarker).toEqual(cleared);
+			reopened.setSessionMemoryMode("enabled");
+			expect(reopened.getModelProfileOwnershipMarker()).toEqual(profileA);
+			expect(reopened.buildSessionContext().modelProfileOwnershipMarker).toEqual(profileA);
 		} finally {
 			await manager?.close();
 			await reopened?.close();
