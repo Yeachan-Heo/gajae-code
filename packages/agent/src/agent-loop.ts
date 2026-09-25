@@ -4704,6 +4704,12 @@ async function streamAssistantResponse(
 				await finishChat(aborted);
 				return aborted;
 			}
+			// Fingerprint the exact provider-visible request only once it is really sent.
+			const promptPrefix = config.promptPrefixTracker?.observe(config.model, llmContext, {
+				toolChoice: effectiveToolChoice,
+				reasoning: effectiveReasoning,
+				serviceTier: config.serviceTier,
+			});
 			let responsePromise: Promise<Awaited<ReturnType<StreamFn>>>;
 			try {
 				responsePromise = Promise.resolve(
@@ -4970,6 +4976,7 @@ async function streamAssistantResponse(
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
 							promoteTypedEmptyResponseStop(finalMessage);
+							if (promptPrefix) finalMessage.promptPrefix = promptPrefix;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -4993,6 +5000,7 @@ async function streamAssistantResponse(
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
+			if (promptPrefix) trailing.promptPrefix = promptPrefix;
 			await finishChat(trailing);
 			return trailing;
 		});

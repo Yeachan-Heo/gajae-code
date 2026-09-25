@@ -20,6 +20,8 @@ export type {
 	AgentRole,
 	AgentStats,
 	AggregatedStats,
+	CacheMissAttribution,
+	CacheMissCause,
 	DashboardStats,
 	FolderStats,
 	MessageStats,
