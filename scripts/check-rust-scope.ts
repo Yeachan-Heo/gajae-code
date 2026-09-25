@@ -24,14 +24,19 @@ const repoRoot = path.join(import.meta.dir, "..");
 
 const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 	{
-		dir: "crates/pi-natives",
-		packageName: "pi-natives",
-		rationale: "N-API addon boundary for native, CPU-bound, blocking I/O, and OS integration primitives.",
+		dir: "crates/brush-builtins-vendored",
+		packageName: "brush-builtins",
+		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
 	},
 	{
-		dir: "crates/pi-shell",
-		packageName: "pi-shell",
-		rationale: "Embedded shell, PTY, and process-management runtime used behind native bindings.",
+		dir: "crates/brush-core-vendored",
+		packageName: "brush-core",
+		rationale: "Vendored Rust shell runtime dependency for the native shell boundary.",
+	},
+	{
+		dir: "crates/gjc-sdk",
+		packageName: "gjc-sdk",
+		rationale: "Gajae-Code SDK Rust core for loopback WebSocket transport, endpoint discovery, and planned N-API integration.",
 	},
 	{
 		dir: "crates/pi-ast",
@@ -41,7 +46,7 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 	{
 		dir: "crates/pi-diff",
 		packageName: "pi-diff",
-		rationale: "Vendored upstream Rust diff primitives behind the native addon boundary.",
+		rationale: "Diff algorithms and patch primitives shared by native editing and review tools.",
 	},
 	{
 		dir: "crates/pi-edit",
@@ -54,29 +59,24 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		rationale: "Native filesystem isolation backends such as clone, reflink, overlay, and ProjFS.",
 	},
 	{
+		dir: "crates/pi-natives",
+		packageName: "pi-natives",
+		rationale: "N-API addon boundary for native, CPU-bound, blocking I/O, and OS integration primitives.",
+	},
+	{
+		dir: "crates/pi-shell",
+		packageName: "pi-shell",
+		rationale: "Embedded shell, PTY, and process-management runtime used behind native bindings.",
+	},
+	{
 		dir: "crates/pi-vfs",
 		packageName: "pi-vfs",
-		rationale: "Vendored upstream filesystem abstraction behind the native addon boundary.",
+		rationale: "Virtual filesystem abstraction and platform adapters for native filesystem operations.",
 	},
 	{
 		dir: "crates/pi-walker",
 		packageName: "pi-walker",
 		rationale: "Vendored upstream filesystem traversal infrastructure behind the native addon boundary.",
-	},
-	{
-		dir: "crates/gjc-sdk",
-		packageName: "gjc-sdk",
-		rationale: "Gajae-Code SDK Rust core for loopback WebSocket transport, endpoint discovery, and planned N-API integration.",
-	},
-	{
-		dir: "crates/brush-core-vendored",
-		packageName: "brush-core",
-		rationale: "Vendored Rust shell runtime dependency for the native shell boundary.",
-	},
-	{
-		dir: "crates/brush-builtins-vendored",
-		packageName: "brush-builtins",
-		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
 	},
 ] as const;
 

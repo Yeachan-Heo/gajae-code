@@ -1541,6 +1541,17 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:packages/coding-agent/test/core/edit-hotspots-golden.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/tools.test.ts");
 	});
+	test("fd, iofs, and workspace walker changes select their behavioral suites", () => {
+		const fd = targeted(["crates/pi-natives/src/fd.rs"]).map(task => task.key);
+		expect(fd).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+
+		const iofs = targeted(["crates/pi-natives/src/iofs.rs"]).map(task => task.key);
+		expect(iofs).toContain("test:packages/natives/test/native.test.ts");
+
+		const workspace = targeted(["crates/pi-natives/src/workspace.rs"]).map(task => task.key);
+		expect(workspace).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+		expect(workspace).toContain("test:packages/coding-agent/test/workspace-tree.test.ts");
+	});
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");

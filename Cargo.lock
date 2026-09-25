@@ -3114,6 +3114,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "ast-grep-core",
+ "async-trait",
  "clap",
  "clipboard-win",
  "dashmap",

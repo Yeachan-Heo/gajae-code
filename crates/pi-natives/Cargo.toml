@@ -87,6 +87,9 @@ napi-build.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [features]
 default = []
 full-langs = ["pi-ast/full-langs"]

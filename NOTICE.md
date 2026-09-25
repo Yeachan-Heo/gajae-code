@@ -42,6 +42,8 @@ The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` sour
 - `crates/pi-natives/src/prof.rs`
 - `crates/pi-natives/src/appearance.rs`
 - `crates/pi-natives/src/crash.rs` (alloc-error handling merged from `crash_handler.rs`)
+- `crates/pi-natives/src/fd.rs`
+- `crates/pi-natives/src/workspace.rs`
 
 ## Notice history
 
