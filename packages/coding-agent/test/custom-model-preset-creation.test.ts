@@ -815,7 +815,7 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
-	it("restores a deleted custom preset when post-delete notification fails", async () => {
+	it("refuses to delete an active profile before an explicit replacement is selected", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
@@ -842,12 +842,14 @@ describe("custom model preset creation", () => {
 					model_mapping: Record<string, string>;
 			  }
 			| undefined;
+		let deletionCalls = 0;
 		const registry = {
 			...createRegistry(profiles),
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
 			getAvailableModelProfileNames: () => [...profiles.keys()],
 			deleteCustomModelProfile: async (name: string) => {
+				deletionCalls++;
 				const profile = profiles.get(name);
 				if (!profile) throw new Error("missing profile");
 				const config = {
@@ -905,7 +907,9 @@ describe("custom model preset creation", () => {
 			updateEditorBorderColor: () => {},
 			showStatus: () => {},
 			showError: (message: string) => {
-				expect(message).toBe("Preset delete failed: notify failed");
+				expect(message).toBe(
+					'Preset delete failed: Choose a replacement profile before deleting the active profile "custom-default".',
+				);
 			},
 			showHookConfirm: async (title: string) => {
 				confirmTitle = title;
@@ -921,7 +925,8 @@ describe("custom model preset creation", () => {
 		await selector?.__testSelectPresetAction("custom-default", "delete");
 
 		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
-		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
+		expect(deletionCalls).toBe(0);
+		expect(restoredProfile).toBeUndefined();
 		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
 		expect(settings.get("modelProfile.default")).toBe("custom-default");
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });
