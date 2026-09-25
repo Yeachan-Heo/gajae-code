@@ -19,7 +19,7 @@ import { isDesignedError, markDesignedError } from "@gajae-code/utils/error-clas
 import type { Theme } from "../../modes/theme/theme";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { applyToolProxy } from "../tool-proxy";
-import type { ExtensionRunner } from "./runner";
+import { type ExtensionRunner, isFailedToolResultMediation } from "./runner";
 import type { RegisteredTool, ToolCallEventResult } from "./types";
 
 function toolAbortReason(signal: AbortSignal | undefined, fallback: string): Error {
@@ -225,8 +225,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					// Extension marks a successful result as error
 					const textBlocks = (modifiedContent ?? []).filter((c): c is TextContent => c.type === "text");
 					const errorText = textBlocks.map(t => t.text).join("\n") || "Tool result marked as error by extension";
-					// A deliberate extension verdict on a successful result, like a block, is not a fault.
-					throw markDesignedError(new Error(errorText));
+					const verdictError = new Error(errorText);
+					// A deliberate extension verdict on a successful result, like a block, is not a fault;
+					// a verdict the runner synthesized from a failing or malformed hook is.
+					throw isFailedToolResultMediation(resultResult) ? verdictError : markDesignedError(verdictError);
 				}
 				if (resultResult.isError === false && executionError) {
 					// Extension clears the error - return success
@@ -239,8 +241,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					const mediatedError = new Error(
 						textBlocks.map(content => content.text).join("\n") || "Tool execution failed",
 					);
-					// Rewording the text does not change what failed: keep the original classification.
-					throw isDesignedError(executionError) ? markDesignedError(mediatedError) : mediatedError;
+					// Rewording the text does not change what failed: keep the original classification,
+					// unless the mediation itself failed, which is an extension fault.
+					throw isDesignedError(executionError) && !isFailedToolResultMediation(resultResult)
+						? markDesignedError(mediatedError)
+						: mediatedError;
 				}
 				return { content: modifiedContent, details: modifiedDetails };
 			}

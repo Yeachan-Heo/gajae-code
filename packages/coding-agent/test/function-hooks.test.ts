@@ -30,7 +30,7 @@ import { discoverAndLoadHookExtensions } from "../src/extensibility/hooks/loader
 import { Type } from "../src/extensibility/typebox";
 import { AttemptRecordStore } from "../src/session/attempt-record-store";
 import { SessionManager } from "../src/session/session-manager";
-import { ToolAbortError } from "../src/tools/tool-errors";
+import { ToolAbortError, ToolError } from "../src/tools/tool-errors";
 import { EventBus } from "../src/utils/event-bus";
 
 type HookRegistration = Omit<FunctionHookRegistration, "grant"> & {
@@ -869,6 +869,54 @@ describe("capability-scoped function hooks", () => {
 		const original = { type: "resources_discover", cwd: process.cwd(), reason: "startup" } as const;
 		const result = await runner.emitFunctionHooks(original);
 		expect(result).toEqual({ action: "continue", event: original });
+	});
+
+	test("a malformed tool_result transform stays a fault, not a designed verdict", async () => {
+		const malformedTransform = () =>
+			makeRunner([
+				registration(
+					"tool_result",
+					async invocation => ({
+						action: "continue",
+						event: { ...invocation.payload, content: [{ type: "text" }] } as never,
+					}),
+					{ capabilities: ["tool.transform"] },
+					0,
+					"read",
+				),
+			]);
+		const readTool = (execute: () => Promise<{ content: { type: "text"; text: string }[] }>) => ({
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: Type.Object({ path: Type.String() }),
+			execute,
+		});
+		const rejectionOf = (promise: Promise<unknown>) =>
+			promise.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+
+		const onSuccess = await rejectionOf(
+			new ExtensionToolWrapper(
+				readTool(async () => ({ content: [{ type: "text", text: "ok" }] })),
+				malformedTransform(),
+			).execute("call-1", { path: "a.txt" }),
+		);
+		expect(onSuccess).toBeInstanceOf(Error);
+		expect(isDesignedError(onSuccess)).toBe(false);
+
+		const onDesignedFailure = await rejectionOf(
+			new ExtensionToolWrapper(
+				readTool(async () => {
+					throw new ToolError("File not found: a.txt");
+				}),
+				malformedTransform(),
+			).execute("call-2", { path: "a.txt" }),
+		);
+		expect(onDesignedFailure).toBeInstanceOf(Error);
+		expect(isDesignedError(onDesignedFailure)).toBe(false);
 	});
 
 	test("rejects malformed transformed tool-result content", async () => {
