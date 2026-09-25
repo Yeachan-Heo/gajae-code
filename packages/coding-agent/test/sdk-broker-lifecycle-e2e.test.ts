@@ -1040,12 +1040,13 @@ test("session host preserves pre-session absence when theme initialization is in
 	const previousSigtermListeners = process.listeners("SIGTERM");
 	const themeStarted = Promise.withResolvers<void>();
 	const releaseLateTheme = Promise.withResolvers<void>();
+	const neverDeadline = Promise.withResolvers<void>();
 	let startup: Promise<void> | undefined;
 	try {
 		startup = runSessionHost({
 			cwd: root,
 			now: () => 1_000,
-			sleep: async () => await new Promise<void>(() => {}),
+			sleep: async () => await neverDeadline.promise,
 			processIncarnation: () => "test-incarnation",
 			initTheme: async () => {
 				themeStarted.resolve();
