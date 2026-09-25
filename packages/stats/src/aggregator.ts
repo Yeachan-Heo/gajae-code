@@ -6,6 +6,7 @@ import {
 	getBehaviorByModel,
 	getBehaviorOverall,
 	getBehaviorTimeSeries,
+	getCacheMissAttribution,
 	getCostTimeSeries,
 	getFileOffset,
 	getMessageById,
@@ -373,6 +374,7 @@ export async function getDashboardStats(range?: string | null): Promise<Dashboar
 		modelSeries: getModelTimeSeries(modelSeriesDays, cutoff, modelSeriesBucketMs),
 		modelPerformanceSeries: getModelPerformanceSeries(modelPerformanceDays, cutoff, modelPerformanceBucketMs),
 		costSeries: getCostTimeSeries(costSeriesDays, cutoff),
+		cacheMissAttribution: getCacheMissAttribution(cutoff ?? undefined),
 	};
 }
 

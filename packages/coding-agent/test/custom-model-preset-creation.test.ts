@@ -8,6 +8,7 @@ import {
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "@gajae-code/coding-agent/config/model-profile-activation";
+import { commitDurableModelProfileOwnership } from "@gajae-code/coding-agent/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import type { ModelProfileConfig } from "@gajae-code/coding-agent/config/models-config-schema";
@@ -173,7 +174,7 @@ describe("custom model preset creation", () => {
 
 	it("deletes only the selected custom preset", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
-		const registry = new ModelRegistry(authStorage, modelsPath);
+		const registry = new ModelRegistry(authStorage, modelsPath, Settings.isolated());
 		await registry.saveCustomModelProfile("first", {
 			display_name: "first",
 			required_providers: ["my-oai"],
@@ -202,9 +203,48 @@ describe("custom model preset creation", () => {
 		expect(parsed.profiles.second?.display_name).toBe("second");
 	});
 
+	it("fails closed instead of using global settings when injected settings lack ownership CAS", async () => {
+		const scopedSettings = Settings.isolated();
+		const registrySettings: Pick<Settings, "get" | "getGlobal"> = {
+			get: key => scopedSettings.get(key),
+			getGlobal: key => scopedSettings.getGlobal(key),
+		};
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), registrySettings);
+		try {
+			await expect(registry.deleteCustomModelProfile("first")).rejects.toThrow(
+				"Profile deletion requires a settings store with ownership transaction support",
+			);
+		} finally {
+			await registry.dispose();
+		}
+	});
+
+	it("requires durable ownership replacement before deleting its profile", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		const settings = Settings.isolated({ "modelProfile.default": "first" });
+		const registry = new ModelRegistry(authStorage, modelsPath, settings);
+		await registry.saveCustomModelProfile("first", {
+			display_name: "first",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		});
+		const originalConfig = await Bun.file(modelsPath).text();
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "first" });
+
+		await expect(registry.deleteCustomModelProfile("first")).rejects.toThrow(
+			"Choose a replacement profile before deleting the active profile",
+		);
+		expect(await Bun.file(modelsPath).text()).toBe(originalConfig);
+		expect(registry.getModelProfile("first")).toBeDefined();
+
+		await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		await registry.deleteCustomModelProfile("first");
+		expect(registry.getModelProfile("first")).toBeUndefined();
+	});
+
 	it("rejects empty rename input and built-in delete without mutating config", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");
-		const registry = new ModelRegistry(authStorage, modelsPath);
+		const registry = new ModelRegistry(authStorage, modelsPath, Settings.isolated());
 		await registry.saveCustomModelProfile("my-fast", {
 			display_name: "my-fast",
 			required_providers: ["my-oai"],
@@ -791,7 +831,7 @@ describe("custom model preset creation", () => {
 		expect(settings.get("task.agentModelOverrides")).toEqual({ critic: "old/critic" });
 		expect(activeProfiles.at(-1)).toBe("custom-default");
 	});
-	it("restores a deleted custom preset when post-delete notification fails", async () => {
+	it("refuses to delete an active profile before an explicit replacement is selected", async () => {
 		const unsafeDisplayName = "Custom\x1b[31m Default\x1b[0m\nRestored";
 		const profiles = new Map<string, ModelProfileDefinition>([
 			[
@@ -818,12 +858,14 @@ describe("custom model preset creation", () => {
 					model_mapping: Record<string, string>;
 			  }
 			| undefined;
+		let deletionCalls = 0;
 		const registry = {
 			...createRegistry(profiles),
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
 			getAvailableModelProfileNames: () => [...profiles.keys()],
 			deleteCustomModelProfile: async (name: string) => {
+				deletionCalls++;
 				const profile = profiles.get(name);
 				if (!profile) throw new Error("missing profile");
 				const config = {
@@ -881,7 +923,9 @@ describe("custom model preset creation", () => {
 			updateEditorBorderColor: () => {},
 			showStatus: () => {},
 			showError: (message: string) => {
-				expect(message).toBe("Preset delete failed: notify failed");
+				expect(message).toBe(
+					'Preset delete failed: Choose a replacement profile before deleting the active profile "custom-default".',
+				);
 			},
 			showHookConfirm: async (title: string) => {
 				confirmTitle = title;
@@ -897,7 +941,8 @@ describe("custom model preset creation", () => {
 		await selector?.__testSelectPresetAction("custom-default", "delete");
 
 		expect(confirmTitle).toBe("Delete custom model preset: Custom Default Restored");
-		expect(restoredProfile?.display_name).toBe(unsafeDisplayName);
+		expect(deletionCalls).toBe(0);
+		expect(restoredProfile).toBeUndefined();
 		expect(profiles.get("custom-default")?.displayName).toBe(unsafeDisplayName);
 		expect(settings.get("modelProfile.default")).toBe("custom-default");
 		expect(settings.get("modelRoles")).toEqual({ default: "old/default" });

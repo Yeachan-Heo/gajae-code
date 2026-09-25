@@ -46,7 +46,7 @@ struct Line<'a> {
 }
 
 impl Line<'_> {
-	fn is_empty_trim(&self) -> bool {
+	const fn is_empty_trim(&self) -> bool {
 		let mut start = 0;
 		let mut end = self.units.len();
 		while start < end && is_js_trim_whitespace(self.units[start]) {
@@ -70,7 +70,7 @@ impl Line<'_> {
 		count
 	}
 
-	fn trimmed_bounds(&self) -> (usize, usize) {
+	const fn trimmed_bounds(&self) -> (usize, usize) {
 		let mut start = 0;
 		let mut end = self.units.len();
 		while start < end && is_js_trim_whitespace(self.units[start]) {

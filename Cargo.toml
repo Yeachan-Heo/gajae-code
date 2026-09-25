@@ -4,7 +4,7 @@ exclude = ["crates/brush-core-vendored", "crates/brush-builtins-vendored", "crat
 resolver = "3"
 
 [workspace.package]
-version = "0.17.4"
+version = "0.17.7"
 edition = "2024"
 license = "MIT"
 authors = ["Yeachan-Heo"]
@@ -138,6 +138,7 @@ option_if_let_else = "allow"                 # match/if-let-else often clearer
 enum_glob_use = "allow"
 items_after_statements = "allow" # Sometimes more readable
 wildcard_imports = "allow"       # Cleaner for preludes and test modules
+redundant_pub_crate = "allow"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Variables & Type Inference
@@ -156,6 +157,7 @@ verbose_bit_mask = "allow"   # Explicit bit patterns can be clearer than hex
 # ──────────────────────────────────────────────────────────────────────────────
 default_trait_access = "allow"        # Default::default() sometimes clearer
 significant_drop_tightening = "allow" # We pay attention to this already
+assert_is_empty = "allow" # `is_empty()` states intent without brittle type annotations
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Documentation
@@ -184,7 +186,7 @@ brush-builtins = { path = "crates/brush-builtins-vendored" }
 # Async Runtime & Concurrency
 # ──────────────────────────────────────────────────────────────────────────────
 async-trait = "0.1"
-dashmap = "6.1"
+dashmap = "6.2"
 parking_lot = "0.12.5"
 rayon = "1.12"
 tokio = { version = "1", features = ["full"] }
@@ -214,7 +216,7 @@ clap = { version = "4", features = ["derive"] }
 # Text Processing & Parsing
 # ──────────────────────────────────────────────────────────────────────────────
 regex = "1"
-similar = "3.1.0"
+similar = "3.2.0"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
@@ -222,8 +224,8 @@ unicode-width = "0.2"
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Structures - Collections
 # ──────────────────────────────────────────────────────────────────────────────
-phf = { version = "0.13", features = ["macros"] }
-smallvec = { version = "1.15.1", features = [
+phf = { version = "0.14", features = ["macros"] }
+smallvec = { version = "1.16.1", features = [
    "serde",
    "write",
    "union",
@@ -249,6 +251,7 @@ libc = "0.2"
 os_pipe = "1"
 windows-sys = { version = "0.61", features = [
    "Win32_Foundation",
+   "Win32_Globalization",
    "Win32_Security",
    "Win32_Security_Authorization",
    "Win32_Storage_FileSystem",
@@ -262,6 +265,10 @@ windows-sys = { version = "0.61", features = [
    "Win32_System_ProcessStatus",
    "Win32_System_Threading",
 ] }
+# Transitive-only pin (wired through crates/pi-natives build-deps): cc 1.2.x passes
+# FILE_ATTRIBUTE_TEMPORARY as u32 but find-msvc-tools 0.1.13 retyped it to i32,
+# breaking Windows builds. Mirrors the upstream pin recorded in docs/rust-porting-inventory.md.
+find-msvc-tools = "=0.1.12"
 winreg = "0.56"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -275,7 +282,7 @@ napi-derive = "3"
 # Terminal & PTY
 # ──────────────────────────────────────────────────────────────────────────────
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
-icy_sixel = "0.5"
+icy_sixel = "0.7"
 portable-pty = "0.9"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -296,21 +303,28 @@ image = { version = "0.25", default-features = false, features = [
    "gif",
    "webp",
 ] }
+# Not used directly: activates zune-jpeg's 'log' feature so image's JPEG decoder
+# compiles (0.5.15 no-log stub macros are not expression-safe).
+zune-jpeg = { version = "0.5", default-features = false, features = ["log"] }
+# Not used directly: tinyvec 1.13.0 was published broken; pin the fixed release.
+tinyvec = "=1.13.3"
 inferno = { version = "0.12", default-features = false }
 syntect = { version = "5.3", default-features = false, features = [
    "default-syntaxes",
+   "default-themes",
    "regex-fancy",
+   "yaml-load",
 ] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Markup Conversion
 # ──────────────────────────────────────────────────────────────────────────────
-html-to-markdown-rs = { version = "2.24", default-features = false }
+html-to-markdown-rs = { version = "3.12.4", default-features = false }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shell Parsing
 # ──────────────────────────────────────────────────────────────────────────────
-brush-parser = "0.3"
+brush-parser = "0.4"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # AST & Tree-Sitter
@@ -324,7 +338,7 @@ tree-sitter-bash = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-clojure = "0.1"
-tree-sitter-cmake = "0.7.1"
+tree-sitter-cmake = "0.7.5"
 tree-sitter-cpp = "0.23"
 tree-sitter-css = "0.25"
 tree-sitter-dart = "0.2"
@@ -356,7 +370,7 @@ tree-sitter-php = "0.24"
 tree-sitter-powershell = "0.26.4"
 tree-sitter-proto = "0.4.0"
 tree-sitter-python = "0.25"
-tree-sitter-r = "1.2.0"
+tree-sitter-r = "1.3.0"
 tree-sitter-regex = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-rust = "0.24"

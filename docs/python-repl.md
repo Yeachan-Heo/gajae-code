@@ -22,9 +22,13 @@ Tool params:
 
 ```ts
 {
-  cells: Array<{ code: string; title?: string }>;
-  timeout?: number; // seconds, clamped to 1..600, default 30
-  reset?: boolean; // reset selected runtime before the first cell only
+  cells: Array<{
+    language: "py" | "js";
+    code: string;
+    title?: string;
+    timeout?: number; // per-cell seconds, 1..600, default 30
+    reset?: boolean; // wipe this cell's language kernel before running it
+  }>;
 }
 ```
 
@@ -105,10 +109,8 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
 - `session` (default)
   - Reuses kernel sessions keyed by session file plus cwd when a session file exists; otherwise by cwd.
   - Execution is serialized per session via a queue.
-  - Idle sessions are evicted after 5 minutes.
-  - At most 4 sessions; oldest is evicted on overflow.
-  - Heartbeat checks detect dead kernels.
-  - Auto-restart allowed once; repeated crash ⇒ hard failure.
+  - There is no idle eviction, session cap, or heartbeat; retained kernels live until reset, owner cleanup, or process shutdown.
+  - A kernel found dead (`isAlive()` false) before a cell runs is replaced. If a cell fails for a reason other than cancellation and leaves the kernel dead, the kernel is replaced and the cell is retried once.
 - `per-call`
   - Spawns a fresh subprocess for each request.
   - Shuts the subprocess down after the request.
@@ -143,7 +145,7 @@ If an intermediate cell fails:
 - Tool returns a targeted error indicating which cell failed.
 - Later cells are not executed.
 
-`reset=true` only applies to the first cell execution in that call.
+`reset` is per cell: a Python cell with `reset: true` disposes that session's kernel before it runs, and later Python cells in the same call reuse the fresh kernel.
 
 ## Environment filtering and runtime resolution
 
@@ -177,7 +179,7 @@ The runner additionally receives `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-
 - `1` / `py` → Python backend only
 - `mix` / `both` → both backends
 
-If Python preflight fails and `eval.js` is enabled, `eval` remains available and dispatches to JavaScript unless `language: "python"` is explicitly requested.
+If Python preflight fails and `eval.js` is enabled, `eval` remains available for JavaScript cells. A cell with `language: "py"` throws a `ToolError`; there is no automatic fallback to JavaScript.
 
 ## Execution flow and cancellation/timeout
 
@@ -189,12 +191,12 @@ If Python preflight fails and `eval.js` is enabled, `eval` remains available and
 
 On abort/timeout:
 
-- The host sends `kill("SIGINT")` to the runner subprocess.
+- The host sends `SIGINT` to the runner's process group (the runner is spawned detached as a group leader).
 - The runner's exec-time signal handler raises `KeyboardInterrupt` inside the user code.
-- Result includes `cancelled=true`; timeout path annotates output as `Command timed out after <n> seconds`.
+- Result includes `cancelled=true`. A timeout annotates the output with `eval cell timed out after <n>s; kernel interrupted but remains running. ...`, or with a kernel-killed notice when escalation was needed (`formatKernelTimeoutAnnotation()`). A deadline that expires before the kernel returns a result (for example while waiting for the session queue) yields a `Command timed out` notice instead.
 - Between requests the runner installs `SIG_IGN` for SIGINT so a stray cancel does not tear down the kernel.
 
-If a second cancel is required (runner stuck in C code), the host escalates to `SIGTERM` and the session restarts on the next call.
+If the runner has not finished 5s after `SIGINT` (for example, stuck in C code), the host shuts the kernel down (`exit` request, then `SIGTERM`, then `SIGKILL`) and marks the cell as kernel-killed; the next call starts a new kernel.
 
 ### stdin behavior
 
@@ -245,7 +247,7 @@ Output is streamed through `OutputSink` and may be persisted to artifact storage
 
 ## Operational troubleshooting
 
-- **Python backend not available** — Check `eval.py`, `GJC_PY`, and that `python`/`python3` is on PATH. If preflight fails and `eval.js` is enabled, omit `language` or pass `language: "js"` to use JavaScript.
+- **Python backend not available** — Check `eval.py`, `GJC_PY`, and that `python`/`python3` is on PATH. If preflight fails and `eval.js` is enabled, pass `language: "js"` to use JavaScript.
 - **No Python on PATH** — Install a system Python 3.8+ or place a venv at `~/.gjc/python-env`. `gjc setup python --check` reports the resolved interpreter.
 - **Execution hangs then times out** — Increase tool `timeout` (max 600s) if workload is legitimate. For stuck native code, cancellation triggers `SIGINT` first then escalates; the session restarts on the next request.
 - **stdin/input prompts in Python code** — `input()` is not supported; pass data programmatically.

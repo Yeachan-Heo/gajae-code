@@ -355,6 +355,31 @@ describe("agent-loop OTEL instrumentation", () => {
 		}
 	});
 
+	it("does not record a model call to an unknown tool as a handled-error crash", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telemetry-unknown-tool-"));
+		resetHandledErrorDedupeForTest();
+		setAgentDir(agentDir);
+		try {
+			const mock = createMockModel({
+				...MOCK_IDENT,
+				responses: [
+					{ content: [{ type: "toolCall", id: "tc-missing", name: "missing", arguments: {} }] },
+					{ content: ["done"] },
+				],
+			});
+			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter, telemetry: {} };
+			const ctx: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+			await runAndDrain(agentLoop([createUserMessage("hi")], ctx, config, undefined, mock.stream));
+
+			const tool = findSpan(exporter.getFinishedSpans(), "execute_tool missing");
+			expect(tool?.status.code).toBe(SpanStatusCode.ERROR);
+			expect(await Bun.file(getHandledErrorLogPath()).exists()).toBe(false);
+		} finally {
+			resetAgentDirFromEnvironment();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("emits ERROR status on chat spans when stopReason is error", async () => {
 		const mock = createMockModel({
 			...MOCK_IDENT,

@@ -1265,6 +1265,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// must stay associated with the requesting connection or a later
 		// terminal abort from that client is rejected as non-owner.
 		let promoted = 0;
+		const steerPromoted = Promise.withResolvers<void>();
 		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
 		await session.prompt("first turn");
 		await session.waitForIdle();
@@ -1274,36 +1275,82 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			deliverAs: "steer",
 			onQueuedPromoted: () => {
 				promoted += 1;
+				steerPromoted.resolve();
 			},
 		});
-		await waitFor(() => !session.agent.hasQueuedSteering(), "steer consumed by its own run");
-		await waitFor(() => promoted === 1, "steer ownership hook fired");
+		// Promotion is fired from the queued-message run-acceptance callback,
+		// after the Agent has consumed the steer; join that boundary directly
+		// instead of polling wall-clock time for the scheduler to run.
+		await steerPromoted.promise;
+		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(promoted).toBe(1);
 		await session.waitForIdle();
 		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
 	}, 60_000);
 
 	it("rejects a steering snapshot token captured for an earlier turn", async () => {
-		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
+		scriptedResponses = [stopReply("first turn done")];
 		await session.prompt("first turn");
 		await session.waitForIdle();
 		const staleToken = session.captureTerminalAbortSteeringSnapshot();
 		expect(staleToken).toBeDefined();
-		const secondPrompt = session.prompt("second turn").catch(() => {});
-		await waitFor(() => session.agent.activeResourceRunId !== undefined, "second run handle");
-		const handle = session.agent.activeResourceRunId ?? "run";
-		await expect(
-			session.abortPromptAndWait(handle, {
+		const bashStarted = Promise.withResolvers<bashExecutor.BashExecutorOptions>();
+		const bashStopped = Promise.withResolvers<void>();
+		const executeBashSpy = vi.spyOn(bashExecutor, "executeBash").mockImplementation(async (_command, options) => {
+			const signal = options?.signal;
+			if (!signal) throw new Error("expected the second turn's bash command to have an abort signal");
+			bashStarted.resolve(options);
+			await bashStopped.promise;
+			return {
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				totalLines: 0,
+				totalBytes: 0,
+				outputLines: 0,
+				outputBytes: 0,
+			};
+		});
+		try {
+			scriptedResponses = [bashCall("controlled second-turn command", "call_second_turn")];
+			const secondPrompt = session.prompt("second turn").catch(() => {});
+			// A prompt that ends before dispatching Bash must also settle this gate;
+			// otherwise a failed/short-circuited run leaves bashStarted unresolved
+			// until the test's 60-second timeout.
+			const bashExecution = await Promise.race([
+				bashStarted.promise,
+				secondPrompt.then(() => {
+					throw new Error("second turn settled before the controlled Bash executor started");
+				}),
+			]);
+			expect(bashExecution.signal?.aborted).toBe(false);
+			const handle = session.agent.activeResourceRunId ?? "run";
+			await expect(
+				session.abortPromptAndWait(handle, {
+					graceMs: TEST_ABORT_GRACE_MS,
+					terminal: { scope: "turn", steeringSnapshotToken: staleToken },
+				}),
+			).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
+			// The stale token is retired and cannot affect cleanup of the live turn.
+			session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
+			const abortPromise = session.abortPromptAndWait(handle, {
 				graceMs: TEST_ABORT_GRACE_MS,
-				terminal: { scope: "turn", steeringSnapshotToken: staleToken },
-			}),
-		).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
-		// The stale token is retired and cannot affect cleanup of the live turn.
-		session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
-		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		await secondPrompt;
-		await session.waitForIdle();
-		await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+				terminal: { scope: "turn" },
+			});
+			// `abortPromptAndWait` admits the terminal fence synchronously, but a
+			// foreground BashTool does not necessarily cancel its shell when the
+			// Agent turn is aborted. Release the controlled command after that
+			// admission so the test does not depend on process timing.
+			bashStopped.resolve();
+			await abortPromise;
+			await secondPrompt;
+			await session.waitForIdle();
+			await session.awaitCoordinatorRuntimeStatePersistenceForTests();
+		} finally {
+			bashStopped.resolve();
+			executeBashSpy.mockRestore();
+		}
 	}, 60_000);
 
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {

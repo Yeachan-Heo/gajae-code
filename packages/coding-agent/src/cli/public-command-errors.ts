@@ -98,8 +98,14 @@ export type PublicEvidenceStatus =
 export const PUBLIC_COMMAND_DIAGNOSTICS = {
 	macos_nofile_limit_low:
 		"The macOS open-file limit is below the recommended minimum; increase it before starting additional concurrent work.",
+	sdk_resource_gone:
+		"The requested resource is not available from this session endpoint; this reports absent resource state, not an empty result.",
 	router_cleanup_failed: "SDK session Router cleanup failed.",
 	broker_cleanup_failed: "SDK broker client cleanup failed.",
+	// The broker reports this code from several distinct causes, so the text names none
+	// of them and never implies that another key would be safe.
+	lifecycle_idempotency_conflict:
+		"The broker reported an idempotency conflict. Reconcile existing lifecycle state before deciding whether another request is safe.",
 	usage_transport_exclusive: "Specify exactly one of --stdio or --socket <path>.",
 	usage_duplicate_option: "Each option on this command may occur at most once.",
 	usage_unknown_argument: "An unrecognized argument was supplied; re-read the command help for its accepted grammar.",

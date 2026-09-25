@@ -52,7 +52,7 @@ The tool returns a single text content block plus structured `details`.
   - `response: SearchResponse`
   - `error?: string`
 
-`text` is produced by `formatForLLM()` in `packages/coding-agent/src/web/search/index.ts`:
+`text` is produced by `formatSearchResponseForLlm()` in `packages/coding-agent/src/web/search/index.ts`:
 
 - If `response.answer` exists, it is emitted first.
 - If sources exist, a `## Sources` section follows with a source count, then one entry per source:
@@ -84,7 +84,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
    - `query` after year-rewrite,
    - `limit`, `recency`, `temperature`, `maxOutputTokens`, `numSearchResults`,
    - `systemPrompt` from `packages/coding-agent/src/prompts/tools/web-search.md`.
-6. On the first successful `SearchResponse`, `formatForLLM()` renders answer/sources/citations/related/search-queries into one text block and returns it with `details.response`.
+6. On the first successful `SearchResponse`, `formatSearchResponseForLlm()` renders answer/sources/citations/related/search-queries into one text block and returns it with `details.response`.
 7. If a provider throws, `executeSearch()` records the error and tries the next provider. Fallback is sequential, with one exception: when DuckDuckGo is a non-primary chain member, `executeSearch()` fires it as a background hedge after `DDG_HEDGE_DELAY_MS` (3s). A successful primary aborts the hedge; a failing primary reuses the (typically already-settled) hedge result, collapsing fallback latency from `t(primary failure) + t(ddg)` to `max(t(primary failure), t(ddg))`.
 8. After all candidates fail, `formatProviderError()` normalizes the last error:
    - Anthropic `404` becomes `Anthropic web search returned 404 (model or endpoint not found).`
@@ -213,8 +213,8 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - Insane result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - Insane public-route response bodies are limited to 1 MiB after transfer/content decoding; oversized declared or streamed bodies are cancelled and that route fails closed (`packages/coding-agent/src/web/search/providers/insane.ts`).
-- `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
-- `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
+- `formatSearchResponseForLlm()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
+- `formatSearchResponseForLlm()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).
 - Tavily result count: default `5`, max `20` (`packages/coding-agent/src/web/search/providers/tavily.ts`).
 - Kimi result count: default `10`, max `20`; request timeout field fixed to `30` seconds (`packages/coding-agent/src/web/search/providers/kimi.ts`).
@@ -232,7 +232,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 - There is no "no provider configured" case: DuckDuckGo (keyless) is always appended as the terminal fallback, so the chain is never empty.
 - Tool-level all-failed case also returns a normal tool result with `Error: ...`; failures are summarized from the last attempted provider.
 - Provider adapters usually throw `SearchProviderError(provider, message, status)` for HTTP or protocol failures.
-- Availability probes intentionally swallow lookup errors and report `false` in many providers via `isApiKeyAvailable()`.
+- Availability probes are each provider's `isAvailable()` (abstract in `packages/coding-agent/src/web/search/providers/base.ts`): cheap credential/setting presence checks that never call the provider. `exa.ts` additionally tolerates uninitialized settings and falls back to the API-key check.
 - Per-provider notable failures:
   - Anthropic: missing credentials throw a plain `Error`; a `404` is remapped to a special final message by `formatProviderError()`.
   - Perplexity: missing auth throws a plain `Error`; OAuth stream `error_code` events become `SearchProviderError("perplexity", ...)`.

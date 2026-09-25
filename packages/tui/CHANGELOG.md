@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-25
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Fixed
+
+- `Text` rows, including custom-background rows, no longer exceed the viewport width.
+
+### Performance
+
+- Layout-only frames reuse a cached transcript prefix instead of copying and re-normalizing every row. Off-screen prefix identity is still checked by reference, and only the viewport window is normalized. Emitted bytes stay the same.
+
+- `Text` measures each row once and slices overflow instead of measuring again. `Loader` no longer re-clamps its rows.
+
 ## [0.17.4] - 2026-09-23
 
 ## [0.17.3] - 2026-09-22

@@ -30,14 +30,8 @@ import {
 	runHermesSetup,
 } from "../setup/hermes-setup";
 import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
-import {
-	type PaseoSetupFlags,
-	type PaseoSetupOutcome,
-	PaseoSetupUsageError,
-	runPaseoSetup,
-} from "../setup/paseo/paseo-setup";
+import type { PaseoSetupFlags, PaseoSetupOutcome } from "../setup/paseo/paseo-setup";
 import { checkExitCode } from "../setup/paseo/result-types";
-import { createDefaultPaseoSetupDependencies } from "../setup/paseo/setup-deps";
 import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
@@ -481,6 +475,14 @@ async function handleProviderSetup(flags: {
  * rather than worked around: a refusal here means the user's files were left
  * exactly as they were.
  */
+/**
+ * Paseo setup reaches config/settings -> model-registry/discovery (~0.9s of
+ * module evaluation). Load it only for `setup paseo` so every other setup
+ * component, notably `setup defaults`, starts without that cost (#5949). Same
+ * lazy-loader shape as the `commands` table in cli-main.ts.
+ */
+const loadPaseoSetup = () => Promise.all([import("../setup/paseo/paseo-setup"), import("../setup/paseo/setup-deps")]);
+
 async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void> {
 	const paseoFlags: PaseoSetupFlags = {
 		check: flags.check,
@@ -489,6 +491,7 @@ async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void>
 		remove: flags.remove,
 		mpreset: flags.mpreset,
 	};
+	const [{ PaseoSetupUsageError, runPaseoSetup }, { createDefaultPaseoSetupDependencies }] = await loadPaseoSetup();
 	try {
 		const outcome = await runPaseoSetup(paseoFlags, createDefaultPaseoSetupDependencies());
 		if (flags.json) {

@@ -623,10 +623,12 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 	);
 	// The fixed publish boundary iterates the sealed plan, so dependency order
 	// (e.g. @gajae-code/ai before @gajae-code/agent-core) must be computed here.
-	const publicationOrder = planExpectedEvidencePublication(expected.packages).map(record => record.name);
+	// Each wave holds packages that do not depend on one another; the boundary
+	// publishes a wave concurrently and only starts the next once it is visible.
+	const publicationWaves = planExpectedEvidencePublicationWaves(expected.packages);
 	await writeImmutableBytes(
 		path.join(evidenceDirectory, PUBLISH_ORDER_FILE),
-		canonicalJsonBytes({ schema_version: 1, order: publicationOrder }),
+		canonicalJsonBytes({ schema_version: 2, waves: publicationWaves }),
 	);
 	console.log(JSON.stringify({
 		ok: true,
@@ -638,12 +640,32 @@ async function prepareExpectedEvidence(evidenceDirectory: string, releaseChannel
 	return { path: expectedPath, sha256: digest };
 }
 
-function isMissingRegistryPackage(output: string): boolean {
-	return /\bE404\b|404 Not Found|is not in this registry/iu.test(output);
+/**
+ * Read one registry document through `/<package>/<version-or-tag>`. Unlike the full
+ * packument that `npm view` reads (CDN `max-age=300`), this endpoint is served
+ * uncached, so a just-published version or a just-moved dist-tag is observed at once
+ * instead of up to five minutes later. HTTP 404 is the registry's authoritative
+ * "absent" answer; every other failure is an observation error.
+ */
+async function readRegistryDocument(packageName: string, versionOrTag: string): Promise<unknown | undefined> {
+	const url = `${NPM_REGISTRY_URL}${packageName.replace("/", "%2f")}/${encodeURIComponent(versionOrTag)}`;
+	let response: Response;
+	try {
+		response = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(30_000) });
+	} catch (error) {
+		throw new Error(`Registry read failed for ${packageName}@${versionOrTag}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (response.status === 404) return undefined;
+	if (!response.ok) throw new Error(`Registry read failed for ${packageName}@${versionOrTag}: HTTP ${response.status}`);
+	try {
+		return await response.json() as unknown;
+	} catch {
+		throw new Error(`Registry returned invalid JSON for ${packageName}@${versionOrTag}`);
+	}
 }
 export const CHANNEL_BEFORE_EVIDENCE_FILE = "gajae-release-channel-before-v1.json";
 /** Dependency-ordered publication plan sealed by release_prepare; the fixed boundary publishes in exactly this order. */
-export const PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json";
+export const PUBLISH_ORDER_FILE = "gajae-release-publish-order-v2.json";
 /** Written by the fixed (no-repo-code) OIDC publish boundary; finalize requires it. */
 export const PUBLISH_RECEIPT_FILE = "gajae-release-oidc-publish-receipt-v1.json";
 
@@ -713,23 +735,16 @@ async function observeRegistryTagSnapshot(
 ): Promise<RegistryTagSnapshotRecord[]> {
 	const snapshot: RegistryTagSnapshotRecord[] = [];
 	for (const record of records) {
-		const view = await $`npm view ${`${record.name}@${npmTag}`} version --json --registry=${NPM_REGISTRY_URL} --tag=${npmTag}`.quiet().nothrow();
-		const output = outputOf(view);
-		if (view.exitCode !== 0) {
-			if (isMissingRegistryPackage(output)) {
-				snapshot.push({ name: record.name, version: null });
-				continue;
-			}
-			throw new Error(`npm view failed for protected ${npmTag} ${record.name}: ${output || `exit ${view.exitCode ?? "unknown"}`}`);
+		const document = await readRegistryDocument(record.name, npmTag);
+		if (document === undefined) {
+			snapshot.push({ name: record.name, version: null });
+			continue;
 		}
-		let version: unknown;
-		try {
-			version = JSON.parse(view.stdout.toString()) as unknown;
-		} catch {
-			throw new Error(`npm view returned invalid protected ${npmTag} JSON for ${record.name}`);
-		}
+		const version = document !== null && typeof document === "object" && !Array.isArray(document)
+			? (document as Record<string, unknown>).version
+			: undefined;
 		if (typeof version !== "string" || !stableVersionPattern.test(version)) {
-			throw new Error(`npm view returned non-stable protected ${npmTag} version for ${record.name}`);
+			throw new Error(`Registry returned non-stable protected ${npmTag} version for ${record.name}`);
 		}
 		snapshot.push({ name: record.name, version });
 	}
@@ -738,26 +753,26 @@ async function observeRegistryTagSnapshot(
 
 function parseRegistryDist(value: unknown, packageName: string): { integrity: string; tarball: string } {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error(`npm view returned an invalid dist object for ${packageName}`);
+		throw new Error(`Registry returned an invalid dist object for ${packageName}`);
 	}
 	const direct = value as Record<string, unknown>;
 	const dist = direct.dist !== undefined && direct.dist !== null && typeof direct.dist === "object" && !Array.isArray(direct.dist)
 		? direct.dist as Record<string, unknown>
 		: direct;
 	if (typeof dist.integrity !== "string" || typeof dist.tarball !== "string") {
-		throw new Error(`npm view returned incomplete dist metadata for ${packageName}`);
+		throw new Error(`Registry returned incomplete dist metadata for ${packageName}`);
 	}
-	validateNpmRegistryTarballUrl(dist.tarball, `npm view tarball for ${packageName}`);
+	validateNpmRegistryTarballUrl(dist.tarball, `Registry tarball for ${packageName}`);
 	return { integrity: dist.integrity, tarball: dist.tarball };
 }
 
 function parseTaggedRegistryDist(value: unknown, packageName: string, npmTag: string): { version: string; dist: { integrity: string; tarball: string } } {
 	if (value === null || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error(`npm view returned invalid ${npmTag} metadata for ${packageName}`);
+		throw new Error(`Registry returned invalid ${npmTag} metadata for ${packageName}`);
 	}
 	const tagged = value as Record<string, unknown>;
 	if (typeof tagged.version !== "string" || tagged.dist === undefined) {
-		throw new Error(`npm view returned incomplete ${npmTag} metadata for ${packageName}`);
+		throw new Error(`Registry returned incomplete ${npmTag} metadata for ${packageName}`);
 	}
 	return { version: tagged.version, dist: parseRegistryDist(tagged.dist, `${packageName}@${npmTag}`) };
 }
@@ -876,18 +891,8 @@ async function observeTaggedRegistryPackage(
 	record: PackageEvidenceRecord,
 	policy: ReleasePolicy,
 ): Promise<{ version: string; dist: { integrity: string; tarball: string } } | undefined> {
-	const taggedView = await $`npm view ${`${record.name}@${policy.npmTag}`} version dist --json --registry=${NPM_REGISTRY_URL} --tag=${policy.npmTag}`.quiet().nothrow();
-	const taggedOutput = outputOf(taggedView);
-	if (taggedView.exitCode !== 0) {
-		if (isMissingRegistryPackage(taggedOutput)) return undefined;
-		throw new Error(`npm view failed for ${policy.channel} ${policy.npmTag} ${record.name}: ${taggedOutput || `exit ${taggedView.exitCode ?? "unknown"}`}`);
-	}
-	let taggedValue: unknown;
-	try {
-		taggedValue = JSON.parse(taggedView.stdout.toString()) as unknown;
-	} catch {
-		throw new Error(`npm view returned invalid ${policy.npmTag} JSON for ${record.name}`);
-	}
+	const taggedValue = await readRegistryDocument(record.name, policy.npmTag);
+	if (taggedValue === undefined) return undefined;
 	const tagged = parseTaggedRegistryDist(taggedValue, record.name, policy.npmTag);
 	const targetIsOlder = policy.channel === "stable"
 		? compareStableVersions(record.version, tagged.version) < 0
@@ -906,22 +911,12 @@ async function observeRegistryPackage(
 	const specifier = `${record.name}@${record.version}`;
 	// Read the selected dist-tag before target-version absence can authorize mutation.
 	const tagged = await observeTaggedRegistryPackage(record, policy);
-	const view = await $`npm view ${specifier} dist --json --registry=${NPM_REGISTRY_URL} --tag=${policy.npmTag}`.quiet().nothrow();
-	const viewOutput = outputOf(view);
-	if (view.exitCode !== 0) {
-		if (isMissingRegistryPackage(viewOutput)) return undefined;
-		throw new Error(`npm view failed for ${specifier}: ${viewOutput || `exit ${view.exitCode ?? "unknown"}`}`);
-	}
+	const distValue = await readRegistryDocument(record.name, record.version);
+	if (distValue === undefined) return undefined;
 	if (tagged === undefined) throw new Error(`${policy.channel} ${policy.npmTag} tag is absent although ${specifier} exists`);
-	let distValue: unknown;
-	try {
-		distValue = JSON.parse(view.stdout.toString()) as unknown;
-	} catch {
-		throw new Error(`npm view returned invalid JSON for ${specifier}`);
-	}
 	const dist = parseRegistryDist(distValue, specifier);
 	if (dist.integrity !== record.expected_sri) {
-		throw new Error(`npm view integrity for ${specifier} conflicts with immutable expected evidence`);
+		throw new Error(`Registry integrity for ${specifier} conflicts with immutable expected evidence`);
 	}
 	if (tagged.version !== record.version || tagged.dist.integrity !== dist.integrity || tagged.dist.tarball !== dist.tarball) {
 		throw new Error(`${policy.channel} ${policy.npmTag} for ${record.name} does not identify immutable expected evidence`);
@@ -1145,6 +1140,27 @@ export function planExpectedEvidencePublication(records: readonly PackageEvidenc
 		throw new Error(`Expected evidence internal dependency graph contains a cycle: ${cycle}`);
 	}
 	return ordered;
+}
+
+/**
+ * Group the dependency-ordered plan into waves: every package lands in the first wave
+ * after all of its internal dependencies, so packages inside one wave never depend on
+ * each other and may be published concurrently while dependencies still publish first.
+ * npm takes minutes to accept each publish, so waves bound wall time by graph depth
+ * instead of package count. Within a wave, declaration order is preserved.
+ */
+export function planExpectedEvidencePublicationWaves(records: readonly PackageEvidenceRecord[]): string[][] {
+	const waveByName = new Map<string, number>();
+	const waves: string[][] = [];
+	for (const record of planExpectedEvidencePublication(records)) {
+		let wave = 0;
+		for (const dependencyName of Object.keys(record.internal_dependencies)) {
+			wave = Math.max(wave, waveByName.get(dependencyName)! + 1);
+		}
+		waveByName.set(record.name, wave);
+		(waves[wave] ??= []).push(record.name);
+	}
+	return waves;
 }
 
 export async function publishExpectedEvidencePackages<T>(

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-25
+
+### Changed
+
+- Build the native addon with Rust `nightly-2026-08-12` and align shared Cargo dependencies with the pinned upstream tracked in `docs/rust-porting-inventory.md` (html-to-markdown-rs 3.x, icy_sixel 0.7, brush-parser 0.4, phf 0.14, similar 3.2, smallvec 1.16, dashmap 6.2, tree-sitter-cmake 0.7.5, tree-sitter-r 1.3, syntect with bundled themes and YAML syntax loading).
+- `htmlToMarkdown` now uses html-to-markdown-rs 3.x and fails with `Conversion error` when the document exceeds the converter's nesting depth, instead of returning truncated markdown.
+- `encodeSixel` output now starts with a SIXEL raster-attributes header (`"1;1;<width>;<height>`), so terminals size the image before drawing it.
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Fixed
+
+- Bounded managed-recovery cleanup now reaps dead-process replacement evidence after a 2-hour grace and detached regular-file removal evidence after 7 days (plus 5 minutes of clock-skew margin); that seven-day TTL does not apply to quarantined directory trees. New replacement candidates record publisher PID-namespace and boot-scoped generation identities so a recycled or cross-namespace PID cannot reap a live publisher. The link fallback rolls back its new candidate link after a failed source unlink when identity checks prove that rollback safe. Legacy replacement names without namespace identity are conservatively retained, while legacy file evidence uses durable, inode-keyed first-seen markers. A descriptor-relative persistent cursor lets bounded sweeps continue across fresh reaper instances. `RecoveryFsRoot.recoveryReaperMetrics()` exposes per-sweep and cumulative file/byte counters.
+
 ## [0.17.4] - 2026-09-23
 
 ## [0.17.3] - 2026-09-22

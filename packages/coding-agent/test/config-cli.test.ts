@@ -90,6 +90,22 @@ describe("config CLI schema coverage", () => {
 		expect(plainModelRolesLine).not.toContain("[object Object]");
 	});
 
+	it("blocks generic writes to ownership state and its versioned projection", async () => {
+		vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("process.exit");
+		}) as never);
+		await runConfigCommand({ action: "get", key: "modelProfile.default", flags: { json: true } });
+		const ownerRecord = { schemaVersion: 1, version: 1, marker: { kind: "profile", profile: "profile-a" } } as const;
+		settings.set("modelProfile.ownership", ownerRecord as never);
+		settings.set("modelProfile.default", "profile-a");
+		await expect(
+			runConfigCommand({ action: "set", key: "modelProfile.ownership", value: "{}", flags: { json: true } }),
+		).rejects.toThrow("process.exit");
+		await expect(
+			runConfigCommand({ action: "reset", key: "modelProfile.default", flags: { json: true } }),
+		).rejects.toThrow("process.exit");
+	});
+
 	it("sets and gets record settings as JSON objects", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const recordValue = '{"default":"claude-opus-4-6"}';

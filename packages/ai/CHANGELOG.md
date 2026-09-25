@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-25
+
+### Changed
+
+- Bump the spoofed Claude Code version from 2.1.280 to 2.1.281 and Gemini CLI version from 0.60.0 to 0.61.0. Anthropic gates newer models behind a minimum client version, so a stale `claude-cli` fingerprint can return HTTP 400 for an otherwise reachable model; the Gemini CLI fingerprint drifts the same way.
+
+### Fixed
+
+- Anthropic-compatible endpoints that leave `compat.supportsLongCacheRetention` unset no longer downgrade the default `long` prompt-cache retention to the ~5m TTL silently: GJC now logs one warning per provider session naming the provider and model and pointing at the flag. Set it to `true` for gateways that forward `ttl: "1h"`, or to `false` to accept the ~5m lifetime and silence the warning. (#5944)
+
+- Vertex AI Application Default Credentials now accept `type: "external_account"` (Workload Identity Federation): the subject token is read from `credential_source` (file, url, or opt-in executable), exchanged at STS, and optionally impersonated via `service_account_impersonation_url`, so gjc authenticates from GitHub Actions / GitLab CI without a long-lived service-account key. Unrecognised credential types now fail with a clear "Unsupported Google credential type" error instead of a misleading OAuth client error. (#5929)
+
+## [0.17.6] - 2026-09-24
+
+## [0.17.5] - 2026-09-24
+
+### Added
+
+- `packages/ai/src/models.json` was regenerated against models.dev, bundling Claude Opus 5.5 across Anthropic (`claude-opus-5-5`), Bedrock (`anthropic.claude-opus-5-5` plus the `us.`/`eu.`/`au.`/`jp.`/`global.` inference profiles), OpenRouter, Vercel AI Gateway, Kilo, and Venice, alongside the rest of the upstream catalog drift (Grok 4.7, GLM 5.3 variants, Xiaomi MiMo V2.6 Flash/Pro/Pro-Ultraspeed, DeepSeek/Qwen token-plan rows). `VISION_CORRECTED_CLAUDE_OPUS_GENERATIONS` declares generation 5.5 so the new rows pass the Opus vision tripwire instead of silently bypassing the generator correction.
+- Kiro bundles `claude-opus-5.5` (1M input / 128K output, text input only). Kiro's API-key request serializer drops images, so this model does not advertise image support until that transport can serialize them. Kiro's Anthropic model list is hand-maintained in `kiro-api-key.ts` rather than sourced from models.dev, so a regeneration alone left Kiro stranded on Opus 5 while every models.dev-backed provider advanced; the entry follows the existing dual dotted/dashed id convention already used for `claude-opus-4.5` through `4.8`.
+
+### Fixed
+
+- openai-completions treats a `compat.extraBody` `tool_choice` as an endpoint default instead of an override: it fills the gap only on ordinary turns that offer tools and resolved no directive of their own, leaving forced-tool directives and deliberate no-tools turns untouched (strict backends reject `tool_choice` with an empty `tools` list). The default also passes through the provider's existing tool-choice reasoning suppression so endpoint defaults do not bypass compatibility flags.
+
+- Cross-model assistant-history replay now collapses pathological runs of exact consecutive thinking paragraphs into one copy with the exact repeat count, preventing repeated reasoning from inflating custom OpenAI-compatible prompts while preserving stored history, final answers, tool content, and native same-model reasoning (#5805).
+
+- Keep provider evidence stable when the same runtime, configured, or environment API key is resolved.
+
 ## [0.17.4] - 2026-09-23
 
 ### Added

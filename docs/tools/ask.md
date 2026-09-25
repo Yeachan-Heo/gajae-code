@@ -8,7 +8,7 @@
 - Key collaborators:
   - `packages/coding-agent/src/config/settings-schema.ts` — `ask.timeout` / `ask.notify` defaults
   - `packages/coding-agent/src/modes/theme/theme.ts` — checkbox and tree glyphs for TUI rendering
-  - `packages/coding-agent/src/tui.ts` — status-line rendering
+  - `packages/coding-agent/src/tui/status-line.ts` — status-line rendering (`renderStatusLine()`)
 
 ## Inputs
 

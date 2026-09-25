@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -89,7 +90,8 @@ test("test logger rejects an inherited operator sink", async () => {
 		expect(result.effectiveLogsDir).not.toBe(inheritedOperatorSink);
 		expect(path.basename(result.effectiveLogsDir ?? "")).toMatch(/^gjc-test-logs-/);
 		expect(result.markerDir).toBe(result.effectiveLogsDir);
-		expect(await countMarkersInDir(result.effectiveLogsDir ?? "")).toBeGreaterThan(0);
+		// The child reports this only after reading the marker while its isolated
+		// sink is live; its preload removes that sink during shutdown.
 		expect(await countMarkerRecords(operatorHome)).toBe(0);
 	} finally {
 		await Promise.all([
@@ -132,6 +134,45 @@ test("test logger honors an explicitly owned sink under its HOME", async () => {
 		expect(await countMarkersInDir(owned)).toBeGreaterThan(0);
 	} finally {
 		await fs.rm(home, { recursive: true, force: true });
+	}
+}, 30_000);
+
+test("test cleanup preserves an explicitly pinned temp-looking log sink", async () => {
+	const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-log-sink-prefix-home-"));
+	const owned = path.join(os.tmpdir(), `gjc-test-logs-${crypto.randomUUID()}`);
+	try {
+		await fs.mkdir(owned);
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			HOME: home,
+			GJC_LOG_DIR: owned,
+			GJC_TEST_PRELOAD_LOG_DIR_PROVENANCE: path.join(home, ".gjc", "parent-logs"),
+			GJC_PROBE_WRITE: "1",
+		};
+		const proc = Bun.spawn([process.execPath, "--preload", PRELOAD, PROBE], {
+			cwd: REPO_ROOT,
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode, `log probe failed:\n${stdout}\n${stderr}`).toBe(0);
+		const result = JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as {
+			effectiveLogsDir: string | null;
+			markerDir: string | null;
+		};
+		expect(result.effectiveLogsDir).toBe(owned);
+		expect(result.markerDir).toBe(owned);
+		expect(await countMarkersInDir(owned)).toBeGreaterThan(0);
+	} finally {
+		await Promise.all([
+			fs.rm(home, { recursive: true, force: true }),
+			fs.rm(owned, { recursive: true, force: true }),
+		]);
 	}
 }, 30_000);
 

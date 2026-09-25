@@ -9,6 +9,10 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
+import {
+	__sessionStateSidecarTestHooks,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -24,6 +28,7 @@ import { GJC_COORDINATOR_SESSION_STATE_FILE_ENV } from "../src/gjc-runtime/sessi
 
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+const ORIGINAL_BEFORE_PERSIST_FROM_EVENT = __sessionStateSidecarTestHooks.beforePersistFromEvent;
 
 setDefaultTimeout(120_000);
 
@@ -92,18 +97,46 @@ function assistantMessage(
  *  - first Esc (retryNow) skips the backoff; abortRetry cancels.
  */
 describe.serial("AgentSession resilient retry", () => {
+	const WATCHDOG_CASE_WALL_BUDGET_MS = 30_000;
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
+	let retryTestStateFiles = new Set<string>();
+	let retryTestNamespaceLocks = new Set<string>();
 
 	function configureRetryTestSession(value: AgentSession): AgentSession {
+		value.setCoordinatorRuntimeStateFileForTests(
+			path.join(tempDir.path(), `session-${value.sessionManager.getSessionId()}`, "state", "runtime-state.json"),
+		);
+		const stateFile = value.getCoordinatorRuntimeStateFileForTests() ?? "";
+		expect(stateFile).not.toBe("");
+		const namespaceLock = path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
+		expect(retryTestStateFiles.has(stateFile)).toBe(false);
+		expect(retryTestNamespaceLocks.has(namespaceLock)).toBe(false);
+		retryTestStateFiles.add(stateFile);
+		retryTestNamespaceLocks.add(namespaceLock);
 		value.setDisposeTimeoutForTests(120_000);
+		value.trackCoordinatorRuntimeStatePersistenceFailuresForTests();
 		return value;
+	}
+
+	function createRetryTestSessionManager(): SessionManager {
+		return SessionManager.inMemory(tempDir.path());
+	}
+
+	async function disposeAfterCoordinatorPersistence(value: AgentSession): Promise<void> {
+		// waitForIdle() does not include the sidecar write. Join it before dispose
+		// closes the session manager, or teardown can wait on the flush until its
+		// 120s disposal deadline.
+		await value.awaitCoordinatorRuntimeStatePersistenceForTests();
+		await value.dispose();
 	}
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-resilient-retry-");
+		retryTestStateFiles = new Set<string>();
+		retryTestNamespaceLocks = new Set<string>();
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(tempDir.path(), "runtime-state.json");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
@@ -115,17 +148,14 @@ describe.serial("AgentSession resilient retry", () => {
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
 		vi.restoreAllMocks();
 		Date.now = REAL_DATE_NOW;
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = ORIGINAL_BEFORE_PERSIST_FROM_EVENT;
 		const currentSession = session;
 		const currentAuthStorage = authStorage;
 		const currentTempDir = tempDir;
 		session = undefined;
 		if (currentSession) {
-			// `waitForIdle()` does not cover the secondary coordinator sidecar
-			// write, so disposing straight after a turn races that flush and the
-			// bounded disposal deadline reports
-			// `SessionDisposalIncompleteError: ... waiting for coordinator
-			// persistence` instead of the behavior under test. Join the flush
-			// first; a failure here must not mask the case's own result.
+			// Keep teardown failures from masking the case result. The explicit loop
+			// disposals below propagate persistence failures after their assertions.
 			await currentSession.awaitCoordinatorRuntimeStatePersistenceForTests().catch(() => {});
 			await currentSession.dispose();
 		}
@@ -161,7 +191,7 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: SessionManager.inMemory(tempDir.path()), settings, modelRegistry }),
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
 		);
 	}
 
@@ -270,7 +300,7 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: SessionManager.inMemory(tempDir.path()), settings, modelRegistry }),
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
 		);
 	}
 
@@ -310,7 +340,7 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		return configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: SessionManager.inMemory(tempDir.path()), settings, modelRegistry }),
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
 		);
 	}
 	// Builds a single-model session with a BARE default retry configuration:
@@ -329,7 +359,7 @@ describe.serial("AgentSession resilient retry", () => {
 		const mock = createMockModel({ responses: options.responses });
 		const extensionRunner = options.extensionRunner;
 		const requestedModels = options.requestedModels ?? [];
-		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const sessionManager = createRetryTestSessionManager();
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
@@ -386,7 +416,7 @@ describe.serial("AgentSession resilient retry", () => {
 		return configureRetryTestSession(
 			new AgentSession({
 				agent,
-				sessionManager: SessionManager.inMemory(tempDir.path()),
+				sessionManager: createRetryTestSessionManager(),
 				settings,
 				modelRegistry,
 				extensionRunner: options.extensionRunner,
@@ -507,7 +537,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(testCase.errorMessage);
 			expect(last.content).toEqual([{ type: "text", text: testCase.partialContent }]);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -632,7 +662,7 @@ describe.serial("AgentSession resilient retry", () => {
 			const last = lastAssistant(session);
 			expect(last.stopReason).toBe("error");
 			expect(last.errorMessage).toBe(refusal);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -674,7 +704,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 			expect(retryStartEvents.length).toBeGreaterThanOrEqual(1);
 			expect(lastAssistant(session).stopReason).toBe("stop");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	}, 30_000);
@@ -828,7 +858,7 @@ describe.serial("AgentSession resilient retry", () => {
 			"HTTP 400: request timed out during validation",
 		] as const) {
 			if (session) {
-				await session.dispose();
+				await disposeAfterCoordinatorPersistence(session);
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: errorMessage }] });
@@ -898,7 +928,7 @@ describe.serial("AgentSession resilient retry", () => {
 			[503, "HTTP 503 service unavailable"],
 		] as const) {
 			if (session) {
-				await session.dispose();
+				await disposeAfterCoordinatorPersistence(session);
 				session = undefined;
 			}
 			session = buildSession({ responses: [{ throw: message }, { content: [`recovered ${status}`] }] });
@@ -1032,7 +1062,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(session.isRetrying).toBe(false);
 			expect(session.isStreaming).toBe(false);
 
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -1060,7 +1090,7 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(retryRequestedModels).toHaveLength(2);
 		expect(retryEvents.retryStartEvents).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("stop");
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 		waitSpy.mockClear();
 
@@ -1087,6 +1117,8 @@ describe.serial("AgentSession resilient retry", () => {
 			model: alibabaModel.id,
 			errorMessage: timeoutMessage,
 		});
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
 	}, 60_000);
 
 	it("keeps Alibaba near misses, cross-API text, and unrelated transient failures retryable", async () => {
@@ -1132,7 +1164,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 			expect(lastAssistant(session).stopReason).toBe("stop");
 			expect(waitSpy).toHaveBeenCalled();
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -1197,7 +1229,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(lastAssistant(session)).toMatchObject({ stopReason: "error", errorMessage });
 			expect(session.isRetrying).toBe(false);
 			expect(session.isStreaming).toBe(false);
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -1313,7 +1345,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -1385,7 +1417,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -1406,7 +1438,8 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(progressEvents.retryStartEvents).toHaveLength(0);
 		expect(progressModels).toHaveLength(1);
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
 
 		const disabledModels: string[] = [];
 		session = buildStatusErrorSession({
@@ -1544,7 +1577,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	}, 120_000);
@@ -1582,7 +1615,7 @@ describe.serial("AgentSession resilient retry", () => {
 			// result, so read the failed turn itself rather than the trailing message.
 			const failed = session.agent.state.messages.findLast(entry => entry.role === "assistant");
 			expect((failed as AssistantMessage).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	}, 120_000);
@@ -1707,7 +1740,7 @@ describe.serial("AgentSession resilient retry", () => {
 				model,
 				modelRegistry,
 				settings,
-				sessionManager: SessionManager.inMemory(tempDir.path()),
+				sessionManager: createRetryTestSessionManager(),
 				disableExtensionDiscovery: true,
 				skills: [],
 				rules: [],
@@ -1737,7 +1770,7 @@ describe.serial("AgentSession resilient retry", () => {
 			await configuredSession.waitForIdle();
 			expect(capturedTimeouts, testCase.name).toEqual([testCase.expected]);
 
-			await configuredSession.dispose();
+			await disposeAfterCoordinatorPersistence(configuredSession);
 			session = undefined;
 		}
 	}, 120_000);
@@ -1797,7 +1830,7 @@ describe.serial("AgentSession resilient retry", () => {
 		await session.waitForIdle();
 
 		expect(progressModels).toHaveLength(1);
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 
 		const disabledModels: string[] = [];
@@ -2004,7 +2037,7 @@ describe.serial("AgentSession resilient retry", () => {
 			"retry.maxRetries": 5,
 		});
 		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: SessionManager.inMemory(tempDir.path()), settings, modelRegistry }),
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
 		);
 
 		await session.prompt("timeout once then fail the turn");
@@ -2085,7 +2118,7 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 		session = configureRetryTestSession(
-			new AgentSession({ agent, sessionManager: SessionManager.inMemory(tempDir.path()), settings, modelRegistry }),
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
 		);
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
@@ -2110,7 +2143,7 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(noProgressModels).toHaveLength(2);
 		expect(lastAssistant(session).stopReason).toBe("stop");
-		await session.dispose();
+		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 
 		const progressModels: string[] = [];
@@ -2126,6 +2159,8 @@ describe.serial("AgentSession resilient retry", () => {
 
 		expect(progressModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
 	});
 	it("retries a typed clean first-event timeout without manual attempt-scope seeding", async () => {
 		const requestedModels: string[] = [];
@@ -2313,7 +2348,92 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(1);
 		expect(lastAssistant(session).stopReason).toBe("error");
 	}, 300000);
+	it("reports coordinator sidecar failures through the retry-test persistence drain", async () => {
+		const failures = [
+			new Error("injected fire-and-forget sidecar failure"),
+			new Error("injected queued sidecar failure"),
+		];
+		let nextFailure = 0;
+		let agentStartEvent: AgentSessionEvent | undefined;
+		session = buildBareRetrySession({ responses: [{ content: ["completed"] }] });
+		session.subscribe(event => {
+			if (event.type === "agent_start") agentStartEvent = event;
+		});
+		__sessionStateSidecarTestHooks.beforePersistFromEvent = eventType => {
+			if (eventType !== "agent_start" || nextFailure >= failures.length) return;
+			throw failures[nextFailure++];
+		};
+
+		await session.prompt("surface sidecar persistence failure");
+		await session.waitForIdle();
+
+		expect(nextFailure).toBe(1);
+		await expect(session.awaitCoordinatorRuntimeStatePersistenceForTests()).rejects.toThrow(
+			"Coordinator runtime-state persistence failed during test",
+		);
+		const event = agentStartEvent;
+		if (!event) throw new Error("Expected agent_start event for queued persistence failure test");
+		await expect(session.queueCoordinatorRuntimeStatePersistForTests(event, Promise.resolve())).rejects.toBe(
+			failures[1],
+		);
+		expect(nextFailure).toBe(2);
+		await expect(session.awaitCoordinatorRuntimeStatePersistenceForTests()).rejects.toThrow(
+			"Coordinator runtime-state persistence failed during test",
+		);
+	});
+	it("keeps a delayed session writer on its own marker after another session is configured", async () => {
+		const startedAt = performance.now();
+		let agentStartEvent: AgentSessionEvent | undefined;
+		const firstSession = buildBareRetrySession({ responses: [{ content: ["first session"] }] });
+		session = firstSession;
+		firstSession.subscribe(event => {
+			if (event.type === "agent_start") agentStartEvent = event;
+		});
+
+		await firstSession.prompt("create first session marker");
+		await firstSession.waitForIdle();
+		await firstSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+
+		const firstStateFile = firstSession.getCoordinatorRuntimeStateFileForTests();
+		expect(firstStateFile).toBeDefined();
+		if (!firstStateFile) throw new Error("Expected first test marker path");
+		const secondSession = buildBareRetrySession({ responses: [{ content: ["second session"] }] });
+		try {
+			const secondStateFile = secondSession.getCoordinatorRuntimeStateFileForTests();
+			expect(secondStateFile).toBeDefined();
+			if (!secondStateFile) throw new Error("Expected second test marker path");
+			expect(secondStateFile).not.toBe(firstStateFile);
+			const secondNamespaceLock = path.resolve(path.dirname(secondStateFile), "..", "locks", "mutation.lock");
+			const firstNamespaceLock = path.resolve(path.dirname(firstStateFile), "..", "locks", "mutation.lock");
+			expect(secondNamespaceLock).not.toBe(firstNamespaceLock);
+
+			await secondSession.prompt("create second session marker");
+			await secondSession.waitForIdle();
+			await secondSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+			const secondMarkerBefore = await Bun.file(secondStateFile).text();
+
+			// Simulate a later session retargeting the old process-wide pin. Session A's
+			// already-captured sidecar work must still use its instance-bound marker.
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = secondStateFile;
+			const event = agentStartEvent;
+			if (!event) throw new Error("Expected agent_start event for the first session");
+			await firstSession.queueCoordinatorRuntimeStatePersistForTests(event, Promise.resolve());
+			await firstSession.awaitCoordinatorRuntimeStatePersistenceForTests();
+
+			expect(firstSession.getCoordinatorRuntimeStateFileForTests()).toBe(firstStateFile);
+			expect(await Bun.file(secondStateFile).text()).toBe(secondMarkerBefore);
+			expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
+		} finally {
+			await disposeAfterCoordinatorPersistence(secondSession);
+		}
+
+		await disposeAfterCoordinatorPersistence(firstSession);
+		session = undefined;
+	});
 	it("does not replay bare-default watchdogs after provider lifecycle handlers participate", async () => {
+		const startedAt = performance.now();
+		const coordinatorStateFiles = new Set<string>();
+		const coordinatorNamespaceLocks = new Set<string>();
 		for (const eventType of ["context", "before_provider_request", "after_provider_response"] as const) {
 			let hookCalls = 0;
 			const requestedModels: string[] = [];
@@ -2340,6 +2460,13 @@ describe.serial("AgentSession resilient retry", () => {
 					]),
 				),
 			});
+			const coordinatorStateFile = session.getCoordinatorRuntimeStateFileForTests() ?? "";
+			expect(coordinatorStateFile).not.toBe("");
+			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
+			coordinatorStateFiles.add(coordinatorStateFile);
+			const namespaceLock = path.resolve(path.dirname(coordinatorStateFile), "..", "locks", "mutation.lock");
+			expect(coordinatorNamespaceLocks.has(namespaceLock)).toBe(false);
+			coordinatorNamespaceLocks.add(namespaceLock);
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
@@ -2350,9 +2477,12 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
+		expect(coordinatorStateFiles).toHaveLength(3);
+		expect(coordinatorNamespaceLocks).toHaveLength(3);
+		expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
 	}, 120000);
 	it("rejects a typed watchdog when a handler executes in its current scope", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -2659,7 +2789,7 @@ describe.serial("AgentSession resilient retry", () => {
 				expect(observedDeltas).toEqual(streamedDeltas);
 				expect(lastAssistant(session).content).toEqual([{ type: "text", text: "already visible" }]);
 			}
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
 	});
@@ -2805,7 +2935,7 @@ describe.serial("AgentSession resilient retry", () => {
 				content: [{ type: "text", text: "recovered" }],
 			});
 
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 			waitSpy.mockClear();
 		}
@@ -2906,6 +3036,9 @@ describe.serial("AgentSession resilient retry", () => {
 		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "replacement recovered" }]);
 	}, 60_000);
 	it("fails closed on non-canonical watchdog prose under bare defaults", async () => {
+		const startedAt = performance.now();
+		const coordinatorStateFiles = new Set<string>();
+		const coordinatorNamespaceLocks = new Set<string>();
 		const nearMisses = [
 			"stream timed out while waiting for the first event",
 			"Provider stream timed out while waiting for first event",
@@ -2919,6 +3052,13 @@ describe.serial("AgentSession resilient retry", () => {
 				responses: [{ throw: errorMessage }, { content: ["should-not-reach"] }],
 				requestedModels,
 			});
+			const coordinatorStateFile = session.getCoordinatorRuntimeStateFileForTests() ?? "";
+			expect(coordinatorStateFile).not.toBe("");
+			expect(coordinatorStateFiles.has(coordinatorStateFile)).toBe(false);
+			coordinatorStateFiles.add(coordinatorStateFile);
+			const namespaceLock = path.resolve(path.dirname(coordinatorStateFile), "..", "locks", "mutation.lock");
+			expect(coordinatorNamespaceLocks.has(namespaceLock)).toBe(false);
+			coordinatorNamespaceLocks.add(namespaceLock);
 			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 
@@ -2928,12 +3068,14 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
-			await session.dispose();
+			await disposeAfterCoordinatorPersistence(session);
 			session = undefined;
 		}
-		// Five full session lifecycles, one per near-miss phrasing. The
-		// single-scenario sibling below costs ~15s on CI hardware, so this loop
-		// legitimately needs several times the 30s default it used to inherit.
+		expect(coordinatorStateFiles).toHaveLength(5);
+		expect(coordinatorNamespaceLocks).toHaveLength(5);
+		expect(performance.now() - startedAt).toBeLessThan(WATCHDOG_CASE_WALL_BUDGET_MS);
+		// Preserve the existing 150s runner timeout, but keep the measured loop
+		// within 30s so it remains well below the issue's 120s shard budget.
 	}, 150_000);
 
 	it("still fails closed on generic unknown errors under a bare default config", async () => {

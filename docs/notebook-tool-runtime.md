@@ -1,217 +1,93 @@
-# Notebook tool runtime internals
+# Notebook runtime internals
 
-This document describes the current `notebook` tool implementation and its relationship to the kernel-backed Python runtime.
+This document describes how coding-agent reads and edits Jupyter notebooks (`.ipynb`) and how that relates to Python execution.
 
-The critical distinction: **`notebook` is a JSON notebook editor, not a notebook executor**. It edits `.ipynb` cell sources directly; it does not start or talk to a Python kernel.
+The critical distinction: **there is no dedicated `notebook` tool, and nothing automatically executes notebook cells**. The notebook-aware `read` route and the `replace`, `patch`, `hashline`, and `apply_patch` edit modes convert a notebook to an editable plain-text cell representation and serialize those edits back to notebook JSON; `vim` and `write` use their ordinary text paths described below. Running Python goes through the `eval` tool (`language: "py"`) or the `python` tool. Neither automatically loads notebook cells, though supplied Python code can use ordinary filesystem APIs to read or write files.
 
 ## Implementation files
 
-- [`src/tools/notebook.ts`](../packages/coding-agent/src/tools/notebook.ts)
-- [`src/eval/py/executor.ts`](../packages/coding-agent/src/eval/py/executor.ts)
-- [`src/eval/py/kernel.ts`](../packages/coding-agent/src/eval/py/kernel.ts)
-- [`src/session/streaming-output.ts`](../packages/coding-agent/src/session/streaming-output.ts)
-- [`src/tools/eval.ts`](../packages/coding-agent/src/tools/eval.ts)
+- [`src/edit/notebook.ts`](../packages/coding-agent/src/edit/notebook.ts) — notebook JSON ↔ editable text conversion
+- [`src/edit/read-file.ts`](../packages/coding-agent/src/edit/read-file.ts) — edit-mode read/serialize hooks that route `.ipynb` through the converter
+- [`src/tools/read.ts`](../packages/coding-agent/src/tools/read.ts) — `read` tool notebook branch
+- [`src/tools/eval.ts`](../packages/coding-agent/src/tools/eval.ts), [`src/tools/python.ts`](../packages/coding-agent/src/tools/python.ts) — Python execution surfaces (see [`python-repl.md`](python-repl.md))
 
-## 1) Runtime boundary: editing vs executing
+## 1) Editable cell representation
 
-## `notebook` tool (`src/tools/notebook.ts`)
+`notebookToEditableText()` renders each cell as a marker line followed by the cell source, and joins cells with `\n`:
 
-- Supports `action: edit | insert | delete` on a `.ipynb` file.
-- Resolves path relative to session CWD (`resolveToCwd`).
-- Loads notebook JSON, validates `cells` array, validates `cell_index` bounds.
-- Applies source edits in-memory and writes full notebook JSON back with `JSON.stringify(notebook, null, 1)`.
-- Returns textual summary + structured `details` (`action`, `cellIndex`, `cellType`, `totalCells`, `cellSource`).
+```text
+# %% [markdown] cell:0
+# Title
+# %% [code] cell:1
+import pandas as pd
+df = pd.read_csv("data.csv")
+# %% [raw] cell:2
+```
 
-No kernel lifecycle exists in this tool:
+- Marker format: `# %% [<cell_type>] cell:<index>`, where `<cell_type>` is `code`, `markdown`, or `raw` and `<index>` is the cell's position in the original notebook.
+- A cell with empty source renders as the marker line alone.
+- Only cell sources are shown. On round-trip, top-level notebook fields and metadata on matched original cells are preserved. Existing outputs and execution counts are preserved only for matched cells that remain code cells; changing a matched cell to a non-code type removes those fields. New and removed cells follow the rules in [Round-trip semantics](#3-round-trip-semantics).
+- A cell source that ends with a newline shows as a blank line before the next marker and round-trips with that newline intact.
 
-- no gateway acquisition
-- no kernel session ID
-- no `execute_request`
-- no stream chunks from kernel channels
-- no rich display capture (`image/png`, JSON display, status MIME)
+## 2) Tool integration
 
-## Notebook-like execution path (`src/tools/eval.ts` + `src/eval/py/*`)
+### `read`
 
-When the agent needs to run cell-style Python code (sequential cells, persistent state, rich displays), that goes through the **`eval` tool** with `language: "python"`, not `notebook`.
+- A `.ipynb` path is converted with `readEditableNotebookText()` unless the `:raw` selector is used. `:raw` returns the notebook JSON verbatim.
+- Line selectors and multi-range selectors apply to the converted text, not the JSON. Results are labelled as `notebook` content.
+- See [`tools/read.md`](tools/read.md#jupyter-notebooks) for truncation defaults.
 
-That path is where kernel modes, restart/cancel behavior, chunk streaming, and output artifact truncation live.
+### `edit`
 
-## 2) Notebook cell handling semantics (`notebook` tool)
+For `.ipynb` updates, the `replace`, `patch`, and `hashline` edit modes and `apply_patch` updates route existing-file content through `readEditFileText()` and serialize edits through `serializeEditFileText()`. An `apply_patch` create operation skips the read step but still uses the serializer when writing the new `.ipynb` file.
 
-## Source normalization
+- On the existing-file read path, `readEditFileText()` enforces the `MAX_EDIT_FILE_BYTES` (8 MiB) guard **before** notebook conversion, so an oversized notebook fails fast instead of being parsed on the main thread.
+- For `.ipynb`, the edit mode then operates on the editable text, and `serializeEditFileText()` maps the edited text back to notebook JSON via `serializeEditedNotebookText()`.
+- If the notebook does not exist at serialization time (an edit mode creating a new file), edits apply to a new empty notebook (`nbformat` 4, `nbformat_minor` 5).
+- Notebook JSON is written with `JSON.stringify(notebook, null, 1)`.
 
-`content` is split into `source: string[]` with newline preservation:
+The `vim` edit mode reads the file as UTF-8 text and edits the notebook's raw JSON text directly; it does not use the notebook cell converter. Saving follows the ordinary write-through path.
 
-- each non-final line keeps trailing `\n`
-- final line has no forced trailing newline
+### `write`
 
-This mirrors notebook JSON conventions and avoids accidental line concatenation on later edits.
+`write` does not use the notebook converter. It follows the ordinary write path and does not translate editable cell markers into notebook JSON, so supply valid notebook JSON when the result should remain a notebook.
 
-## Action behavior
+## 3) Round-trip semantics
 
-- `edit`
-  - replaces `cells[cell_index].source`
-  - preserves existing `cell_type`
-- `insert`
-  - inserts at `[0..cellCount]`
-  - `cell_type` defaults to `code`
-  - code cells initialize `execution_count: null` and `outputs: []`
-  - markdown cells initialize only `metadata` + `source`
-- `delete`
-  - removes `cells[cell_index]`
-  - returns removed `source` in details for renderer preview
+`applyNotebookEditableText()` parses the edited text into cells and rebuilds the `cells` array from a deep clone of the original notebook, so notebook-level `metadata`, `nbformat`, and any other top-level keys are preserved.
 
-## Error surfaces
+For each parsed cell, in order:
 
-Hard failures are thrown for:
+- **Marker with `cell:N` that refers to an unused original cell**: that original cell is cloned, keeping its metadata, outputs, and any other keys. Its `cell_type` is set from the marker and its `source` is replaced.
+  - If the result is a `code` cell, missing `execution_count` / `outputs` are initialized to `null` / `[]`; existing values are kept.
+  - If the result is a non-code cell, `execution_count` and `outputs` are removed.
+- **Marker without `cell:N`, with an out-of-range index, or with an index already used earlier in the text**: a new cell is created with `metadata: {}`; new code cells also get `execution_count: null` and `outputs: []`.
+- Original cells whose markers are removed from the text are dropped.
 
-- missing notebook file
-- invalid JSON
-- missing/non-array `cells`
-- out-of-range index (insert and non-insert have different valid ranges)
-- missing `content` for `edit`/`insert`
+Consequences:
 
-These become `Error:` tool responses upstream; renderer uses notebook path + formatted error text.
+- Deleting a cell = deleting its marker and source.
+- Inserting a cell = adding a marker without an index (for example `# %% [code]`).
+- Moving a cell = moving its marker block; keeping the original `cell:N` preserves its outputs and metadata.
+- Duplicating a marker's index gives the first occurrence the original cell and makes later occurrences new cells.
 
-## 3) Kernel session semantics (where they actually exist)
+Cell source is stored as a line array with trailing newlines preserved (`splitNotebookSource()`): every line except the last keeps its `\n`, and the last line has no forced trailing newline.
 
-Kernel semantics are implemented in `executePython` / `PythonKernel` and apply to the Python backend of the `eval` tool.
+## 4) Error surfaces
 
-## Modes
+Conversion throws for:
 
-`PythonKernelMode`:
+- missing file on read: `File not found: <path>` (serialization of a newly created notebook starts from an empty notebook instead)
+- invalid JSON: `Invalid JSON in notebook: <path>`
+- non-object root or missing `cells` array: `Invalid notebook structure (...)`
+- a cell that is not an object or has a `cell_type` other than `code` / `markdown` / `raw`: `Invalid notebook cell <index> in <path>`
+- edited text whose first line is not a cell marker: `Invalid notebook editable representation for <path>: ...`
 
-- `session` (default)
-  - kernels cached in `kernelSessions` map
-  - max 4 sessions; oldest evicted on overflow
-  - idle/dead cleanup every 30s, timeout after 5 minutes
-  - per-session queue serializes execution (`session.queue`)
-- `per-call`
-  - creates kernel for request
-  - executes
-  - always shuts down kernel in `finally`
+## 5) Relationship to Python execution
 
-## Reset behavior
+Notebook conversion and Python execution share no code path:
 
-`eval` passes `reset` only for the first cell in a multi-cell Python call; later cells always run with `reset: false`.
+- Notebook-aware `read`/`edit` paths never start a kernel or execute cells. The edit converter preserves or clears output fields according to the round-trip rules above; it does not execute cells to produce new outputs.
+- `eval` (`language: "py"`) and `python` run code in a subprocess-backed Python runner (`src/eval/py/`). Kernel lifecycle, session reuse, cancellation, display capture, and output truncation are documented in [`python-repl.md`](python-repl.md).
 
-## Kernel death / restart / retry
-
-In session mode (`withKernelSession`):
-
-- dead kernel detected by heartbeat (`kernel.isAlive()` check every 5s) or execute failure.
-- pre-run dead state triggers `restartKernelSession`.
-- execute-time crash path retries once: restart kernel, rerun handler.
-- `restartCount > 1` in same session throws `Python kernel restarted too many times in this session`.
-
-Startup retry behavior:
-
-- shared gateway kernel creation retries once on `SharedGatewayCreateError` with HTTP 5xx.
-
-Resource exhaustion recovery:
-
-- detects `EMFILE`/`ENFILE`/"Too many open files" style failures
-- clears tracked sessions
-- calls `shutdownSharedGateway()`
-- retries kernel session creation once
-
-## 4) Environment/session variable injection
-
-Kernel startup receives the optional session file path from executor:
-
-- `GJC_SESSION_FILE` (session state file path)
-
-`PythonKernel.#initializeKernelEnvironment(...)` then runs init script inside kernel to:
-
-- `os.chdir(cwd)`
-- inject env entries into `os.environ`
-- prepend cwd to `sys.path` if missing
-
-Implication:
-
-- prelude helpers that read session context rely on this env var in Python process state.
-
-## 5) Streaming/chunk and display handling (kernel-backed path)
-
-The kernel client processes Jupyter protocol messages per execution:
-
-- `stream` -> text chunk to `onChunk`
-- `execute_result` / `display_data` ->
-  - display text chosen by MIME precedence: `text/markdown` > `text/plain` > converted `text/html`
-  - structured outputs captured separately:
-    - `application/json` -> `{ type: "json" }`
-    - `image/png` -> `{ type: "image" }`
-    - `application/x-gjc-status` -> `{ type: "status" }` (no text emission)
-- `error` -> traceback text pushed to chunk stream + structured error metadata
-- `input_request` -> emits stdin warning text, sends empty `input_reply`, marks stdin requested
-- completion waits for both `execute_reply` and kernel `status=idle`
-
-Cancellation/timeout:
-
-- abort signal triggers `interrupt()` (REST `/interrupt` + control-channel `interrupt_request`)
-- result marks `cancelled=true`
-- timeout path annotates output with `Command timed out after <n> seconds`
-
-## 6) Truncation and artifact behavior
-
-`OutputSink` in `src/session/streaming-output.ts` is used by kernel execution paths (`executeWithKernel`):
-
-- sanitizes every chunk (`sanitizeText`)
-- tracks total/output lines and bytes
-- optional artifact spill file (`artifactPath`, `artifactId`)
-- when in-memory buffer exceeds threshold (`DEFAULT_MAX_BYTES` unless overridden):
-  - marks truncated
-  - keeps tail bytes in memory (UTF-8 safe boundary)
-  - can spill full stream to artifact sink
-
-`dump()` returns:
-
-- visible output text (possibly tail-truncated)
-- truncation flag + counts
-- artifact ID (for `artifact://<id>` references)
-
-`eval` converts this metadata into result truncation notices and TUI warnings.
-
-`notebook` tool does **not** use `OutputSink`; it has no stream/artifact truncation pipeline because it does not execute code.
-
-## 7) Renderer assumptions and formatting
-
-## Notebook renderer (`notebookToolRenderer`)
-
-- call view: status line with action + notebook path + cell/type metadata
-- result view:
-  - success summary derived from `details`
-  - `cellSource` rendered via `renderCodeCell`
-  - markdown cells set language hint `markdown`; other cells have no explicit language override
-  - collapsed code preview limit is `PREVIEW_LIMITS.COLLAPSED_LINES * 2`
-  - supports expanded mode via shared render options
-  - uses render cache keyed by width + expanded state
-
-Error rendering assumption:
-
-- if first text content starts with `Error:`, renderer formats as notebook error block.
-
-## Python renderer (for actual execution output)
-
-Kernel-backed execution rendering expects:
-
-- per-cell status transitions (`pending/running/complete/error`)
-- optional structured status event section
-- optional JSON output trees
-- truncation warnings + optional `artifact://<id>` pointer
-
-This renderer behavior is unrelated to `notebook` JSON editing results except that both reuse shared TUI primitives.
-
-## 8) Divergence from eval Python backend behavior
-
-If "plain Python execution" means the `eval` tool with `language: "python"`:
-
-- `eval` executes code in a kernel, persists state by mode, streams chunks, captures rich displays, handles interrupts/timeouts, and supports output truncation/artifacts.
-- `notebook` performs deterministic notebook JSON mutations only; no execution, no kernel state, no chunk stream, no display outputs, no artifact pipeline.
-
-If a workflow needs both:
-
-1. edit notebook source with `notebook`
-2. execute code cells via `eval` with `language: "python"` (manually passing code), not through `notebook`
-
-Current implementation does not provide a single tool that both mutates `.ipynb` and executes notebook cells through kernel context.
+To run code from a notebook, read the relevant cells and pass their source to `eval` or `python` explicitly. No built-in notebook-aware path both edits an `.ipynb` document and automatically executes its cells in a kernel.

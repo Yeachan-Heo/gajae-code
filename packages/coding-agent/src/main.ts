@@ -1830,6 +1830,10 @@ export async function runRootCommand(
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
+	// One-shot print runs (`gjc -p`, auto-print) never display provider usage, so
+	// credential selection must not probe usage endpoints from every short-lived
+	// process; it reuses reports that long-lived hosts already cached (#5939).
+	if (!isInteractive && mode !== "acp") authStorage.setUsageProbeMode("cache-only");
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);

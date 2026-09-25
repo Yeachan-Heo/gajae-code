@@ -47,7 +47,7 @@ A v1–v3 win is **never** called "confirmed" from current-only coverage. `valid
 - `gitSha` is the full checked-out `HEAD` when Git is available, with `GITHUB_SHA` used only as a fallback; `gitDirty` explicitly marks tracked or untracked worktree changes so local evidence cannot silently masquerade as a clean commit. The runner captures SHA and the complete porcelain worktree fingerprint before and after the workloads and rejects any in-flight source-state change.
 - Every detailed sample separates `rssBytes`, `heapUsedBytes`, `heapTotalBytes`, `externalBytes`, `arrayBuffersBytes`, and `activeResourceCount`.
 
-`hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry is `CPU-self-time confirmed` because no profiler artifacts have been captured yet.
+`hotspotClassifications: HotspotClassification[]` carry `{ hotspotId, status, evidenceClass, artifactRefs, notes }`. The current v1–v3 reclassification lives in `V1_V3_RECLASSIFICATION`; no entry there is `CPU-self-time confirmed` because the base runner attaches no profiler. Profiler-backed reclassifications for the agent-session hotspots come from `bench/agent-session-profile.ts` (see [Agent-session profiler evidence](#agent-session-profiler-evidence-5942)).
 
 ## Privacy rules
 
@@ -85,6 +85,56 @@ The base runner attaches no profiler (`profilerSelfTime.profiler: "none"`), so i
 3. Set the hotspot classification to `CPU-self-time confirmed` with `evidenceClass: "profiler-self-time"` and the artifact in `artifactRefs`.
 4. `validatePerfCorpusReport()` will then accept the claim.
 
+`bench/agent-session-profile.ts` automates this for the `memory-agent-session-lifecycle` fixture. Its report's `profilerSelfTime` drops into that fixture and its `hotspotClassifications` validate against it.
+
+## Agent-session profiler evidence (#5942)
+
+The `short`/`soak` corpus reported an agent-session RSS slope of 28.8 MB/s and a heap slope of 14.8 MB/s (153 → 244 MB), but had no profiler evidence. `bench/agent-session-profile.ts` runs the same `createSessionWorkload()` in two equal phases:
+
+1. **Memory phase, unprofiled.** A forced full GC runs every `--sample-interval-ms` (default 1000). Each sample records pre-GC RSS and heap, then post-GC RSS, `heapUsed`, external bytes, and the live JSC object count. V8 heap snapshots are taken after warm-up (at 1/4 of the run) and at the end. The CPU profiler stays detached because its sample buffer lives on the JS heap.
+2. **CPU phase.** The inspector CPU profiler samples every 500 µs and writes a `.cpuprofile`.
+
+Retention is judged from the **snapshot-reachable self size** and the live object count across the steady-state window. It is never judged from RSS, which keeps allocator pages already released, or from `heapUsed` alone. JSC `heapUsed` can step up by a heap block without any new reachable objects.
+
+```bash
+bun --smol packages/coding-agent/bench/agent-session-profile.ts [--duration-ms 30000] [--sample-interval-ms 1000] [--out artifacts/perf/agent-session-profile]
+```
+
+The output directory holds `agent-session-lifecycle.cpuprofile`, `agent-session-lifecycle.{early,late}.heapsnapshot`, and `agent-session-profile.json`. That directory is `artifacts/` by default, which is gitignored; artifacts are regenerated, not committed.
+
+### Recorded result
+
+- Measurement: commit `f0b74b4dcd80`, clean worktree, Bun 1.4.0, linux-x64, `--duration-ms 30000 --sample-interval-ms 1000`, three independent runs. Each run did 2.04–2.26 M appends and profiled about 30 s of CPU.
+- **Verdict for this fixture: `bounded-high-water` in 3/3 runs.** Across the fixture's 128-entry sessions there is no retention, and the corpus RSS slope is allocator high-water:
+  - Snapshot-reachable heap moved from 24.27–24.36 to 23.83–24.87 MiB (−0.53 to +0.56 MiB) across the steady-state window.
+  - The live object count *fell* by 420–582 objects.
+  - Post-GC RSS plateaued at 193–219 MB after warm-up and ended at 193–210 MB.
+  - The peak RSS of 309–362 MB appears at the early-snapshot sample. It is the snapshot's own serialization, not workload growth.
+- **Scope limit.** `createSessionWorkload()` replaces its `SessionManager` every 128 entries. Its roughly 512-byte messages are also below the 1 KiB resident-blob externalization threshold. This result therefore explains the corpus soak slope, but it does **not** clear retention in a long-lived session or on the blob-externalization path (M01). That needs a fixture with one persistent session and payloads of at least 1 KiB.
+- **Slope explanation.** The 28.8 MB/s corpus slope comes from its 1 s soak window. RSS climbs about 70 MB in the first ~500 ms as the allocator reaches its high-water mark, then stops. A longer window drives the slope toward zero. Pre-GC heap churns between about 18 and 32 MB within each 128-entry session, and a GC returns it.
+- **CPU.** Inclusive / self shares of profiled time across the three runs. Self time is the time spent in the symbol's own frames.
+  - `getEntries`: 46.5–48.9% / 0.0–0.1%; `#getMaterializedEntriesInternal`: 35.9–39.1% / 0.0%
+  - `#appendEntry`: 29.2–34.4% / 0.1–1.0%; `#appendEntryWithinPersistenceFence`: 28.3–33.1% / 1.3–2.0%
+  - `Object.entries`: 31.5–34.9% / 31.5–34.9%, called from `jsonLikeValueExceedsCacheLimit`'s `visit`, `stripUndefinedPlainObjectFields`, `externalizeResidentValueSync`, `cloneJsonSemantic`, and `materializeResidentValueSync`
+  - `Buffer.byteLength`: 9.2–10.9% / 9.2–10.9%
+  - `stripUndefinedPlainObjectFields`: 13.0–14.4% / 6.4–8.4%; `externalizeResidentValueSync`: 10.7–15.0% / 4.8–8.3%
+
+Reclassification of the agent-session hotspots from that evidence:
+
+- `CPU-self-time confirmed` requires the hotspot's owning symbols to carry at least 5% of profiled time as **self** time.
+- Inclusive-only cost, which sits in callees, is `covered-current`.
+
+| Hotspot | Status | Evidence |
+|---|---|---|
+| M01 `#appendEntry` retention | `covered-current` | 1.3–2.8% self / 29.2–34.4% inclusive; retention not exercised (see scope limit) |
+| M02 `getEntries()` copy | `covered-current` | 0.0–0.1% self / 46.5–48.9% inclusive; the cost is the per-entry `Object.entries` walk in callees |
+| M03 `buildDisplaySessionContext` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| M04 `AppendOnlyLog` + `cloneJson` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| M05 `captureState`/`restoreState` | `needs-trace-coverage` | symbol absent from this fixture's profile |
+| H10 replay equality | `needs-trace-coverage` | symbol absent from this fixture's profile |
+
+No agent-session hotspot is `CPU-self-time confirmed`. The self time sits in shared JSON-shape walkers: `Object.entries`, `Buffer.byteLength`, `stripUndefinedPlainObjectFields`, and `externalizeResidentValueSync`. None of these is a hotspot in the static map. Any optimization there needs a same-host before/after run of this tool, and byte-parity gates still apply.
+
 ## Threshold-promotion process
 
 Wall-clock and RSS thresholds are noisy. Promotion is gradual:
@@ -94,6 +144,17 @@ Wall-clock and RSS thresholds are noisy. Promotion is gradual:
 3. **Enforced** — a hard CI gate, allowed only with `varianceCharacterized: true`, passed before/after `benchmarkEvidence`, and human approval. `validatePerfThresholdLedger()` rejects enforced thresholds lacking this evidence.
 
 Held thresholds (`HELD_PERF_THRESHOLDS`) name candidates that need variance characterization before enforcement.
+
+### Per-release RSS checkpoints
+
+The `rss_checkpoint` job in `.github/workflows/ci.yml` runs for every stable tag and nightly. It measures the exact released `gjc-linux-x64` binary and the previous published stable release on the same runner with `scripts/verify-rss-checkpoints.ts --all`, then writes one checkpoint per commit (`<commit>.json` plus `.md`), so a regression can be bisected release to release. The `rss-checkpoint-<version>` run artifact holds both checkpoints. The current binary's compare uses `--compare --advisory --allow-baseline-drift`: this is stage 1 of the process above. Regressions go to the job summary and never fail the release.
+
+To reproduce or bisect locally, point the harness at any compiled binary and give the commit it was built from:
+
+```sh
+bun scripts/verify-rss-checkpoints.ts --scenario S1,S5 --write-baseline \
+  --binary ./gjc-linux-x64 --commit <full-sha> --output-dir /tmp/rss
+```
 
 ## Memory baseline protocol
 

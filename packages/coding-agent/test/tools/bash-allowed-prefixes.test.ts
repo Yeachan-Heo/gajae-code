@@ -432,6 +432,15 @@ describe("checkBashAllowedPrefixes", () => {
 		expect(result.reason).toContain("shell control operator");
 	});
 
+	it("tells the agent how to fix a chained `cd \u2026 &&` command", () => {
+		const result = checkBashAllowedPrefixes("git status && git log", ROLE_AGENT_PREFIXES);
+
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toContain("shell control operator '&'");
+		expect(result.reason).toContain("one simple command per bash call");
+		expect(result.reason).toContain("pass the directory as `cwd`");
+	});
+
 	it("blocks ordinary shell commands for restricted role agents", () => {
 		const result = checkBashAllowedPrefixes("echo verdict", ROLE_AGENT_PREFIXES);
 

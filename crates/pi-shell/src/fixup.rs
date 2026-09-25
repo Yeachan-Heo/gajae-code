@@ -25,7 +25,7 @@
 
 use std::{io::BufReader, sync::LazyLock};
 
-use brush_parser::{Parser, ParserOptions, SourceInfo, ast::*};
+use brush_parser::{Parser, ParserOptions, ast::*};
 use regex::Regex;
 
 /// Result of [`apply_bash_fixups`].
@@ -47,9 +47,8 @@ pub fn apply_bash_fixups(cmd: &str) -> BashFixupResult {
 	}
 
 	let options = ParserOptions::default();
-	let source_info = SourceInfo::default();
 	let mut reader = BufReader::new(cmd.as_bytes());
-	let mut parser = Parser::new(&mut reader, &options, &source_info);
+	let mut parser = Parser::new(&mut reader, &options);
 	let Ok(program) = parser.parse_program() else {
 		return BashFixupResult { command: cmd.to_owned(), stripped: vec![] };
 	};

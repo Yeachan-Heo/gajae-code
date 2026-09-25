@@ -84,6 +84,11 @@ export function buildCompileArgs(options: CompileArgOptions): string[] {
 		// bunfs extra entrypoint (which --minify silently dropped, crashing
 		// v0.9.3–v0.9.6 releases at startup).
 		"--minify",
+		// Splitting keeps `await import()` boundaries as separate bunfs chunks, so
+		// `--version`/`--help` and the self-spawned helper processes stop parsing
+		// the whole app at startup (#5940). Do not add `--bytecode`: it needs
+		// `--format=esm` with splitting and crashed agent turns in Bun 1.4.0.
+		"--splitting",
 		...compileAutoloadDisableFlags,
 		"--keep-names",
 	];
