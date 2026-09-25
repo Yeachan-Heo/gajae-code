@@ -175,20 +175,22 @@ describe("default GJC definitions", () => {
 		).text();
 
 		for (const [heading, pointer] of [
-			[
-				"## Boundary completion cohort gate",
-				"embedded:gjc/skill-fragments/ultragoal/boundary-cohort-gate.md",
-			],
+			["## Boundary completion cohort gate", "embedded:gjc/skill-fragments/ultragoal/boundary-cohort-gate.md"],
 			["## Terminal critic gate", "embedded:gjc/skill-fragments/ultragoal/terminal-critic-gate.md"],
-			[
-				"## Cross-repository succession",
-				"embedded:gjc/skill-fragments/ultragoal/cross-repository-succession.md",
-			],
+			["## Cross-repository succession", "embedded:gjc/skill-fragments/ultragoal/cross-repository-succession.md"],
 		] as const) {
 			expect(ultragoal).toContain(heading);
 			expect(ultragoal).toContain(pointer);
 		}
 		expect(ultragoal.length).toBeLessThan(40_000);
+
+		// The cohort summary must keep the fragment's applicability: boundary-only,
+		// never per intermediate story.
+		const cohortStart = ultragoal.indexOf("## Boundary completion cohort gate");
+		const cohortEnd = ultragoal.indexOf("\n## ", cohortStart + 1);
+		const cohortSummary = ultragoal.slice(cohortStart, cohortEnd === -1 ? undefined : cohortEnd);
+		expect(cohortSummary).toContain("the run's final required goal, or an explicit validation batch's final member");
+		expect(cohortSummary).toContain("Intermediate stories use the lightweight `deferredToBatch` checkpoint");
 	});
 
 	it("authors the ai-slop-cleaner fragment with the mandated report labels and full taxonomy", () => {
