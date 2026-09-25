@@ -901,6 +901,26 @@ async function writeHandoffEntry(
 	});
 }
 
+async function migrateLegacySnapshotEntriesToActiveDirectory(
+	cwd: string,
+	sessionId: string,
+	updatedSkill: string,
+): Promise<void> {
+	// The caller holds the scope lock through migration and the current skill write.
+	const sessionScope = { sessionId };
+	if (await hasAuthoritativeActiveEntryDirectory(cwd, sessionId)) return;
+
+	const { sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
+	const legacyState = await readRawActiveStateForHandoff(sessionPath, false);
+	// Let the current sync write own this skill's source revision.
+	const entries = dedupeVisibleBySkill(rawActiveEntries(legacyState), sessionId).filter(
+		entry => entry.skill !== updatedSkill,
+	);
+	for (const entry of entries) {
+		await writeHandoffEntry(cwd, sessionScope, entry);
+	}
+}
+
 async function rebuildActiveState(cwd: string, sessionScope?: ActiveSessionScope): Promise<void> {
 	await rebuildActiveSnapshot(cwd, sessionScope, {
 		cwd,
@@ -942,7 +962,8 @@ async function activeSubskillsForExistingEntry(
 export async function syncSkillActiveState(
 	options: SyncSkillActiveStateOptions,
 ): Promise<GuardedWriteResult | undefined> {
-	if (!options.sessionId) return undefined;
+	const sessionId = options.sessionId;
+	if (!sessionId) return undefined;
 	const nowIso = options.nowIso ?? new Date().toISOString();
 	const hud = normalizeWorkflowHudSummary(options.hud);
 	const entryBase: SkillActiveEntry = {
@@ -961,12 +982,13 @@ export async function syncSkillActiveState(
 		...(options.receipt ? { receipt: options.receipt } : {}),
 		...(typeof options.sourceRevision === "number" ? { source_state_revision: options.sourceRevision } : {}),
 	};
-	const sessionScope = { sessionId: options.sessionId };
+	const sessionScope = { sessionId };
 	return withActiveStateScopeLock(options.cwd, sessionScope, async () => {
 		const preservedActiveSubskills =
 			options.active_subskills === undefined
-				? await activeSubskillsForExistingEntry(options.cwd, options.sessionId, options.skill, true)
+				? await activeSubskillsForExistingEntry(options.cwd, sessionId, options.skill, true)
 				: undefined;
+		await migrateLegacySnapshotEntriesToActiveDirectory(options.cwd, sessionId, options.skill);
 		const entry: SkillActiveEntry = {
 			...entryBase,
 			...(options.active_subskills !== undefined

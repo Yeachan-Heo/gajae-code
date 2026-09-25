@@ -481,6 +481,47 @@ describe("GJC native skill-state hooks", () => {
 		await expect(readVisibleSkillActiveState(root, "test-session")).resolves.toMatchObject(state);
 	});
 
+	it("migrates every legacy active snapshot entry before syncing one skill", async () => {
+		const root = await cwd();
+		const sessionId = "test-legacy-active-snapshot-migration";
+		const stateDir = sessionStateDir(root, sessionId);
+		await fs.mkdir(stateDir, { recursive: true });
+		await fs.writeFile(
+			activeSnapshotPath(root, sessionId),
+			JSON.stringify({
+				version: 1,
+				active: true,
+				skill: "autoresearch",
+				session_id: sessionId,
+				active_skills: [
+					{ skill: "autoresearch", active: true, phase: "running", session_id: sessionId },
+					{ skill: "ultragoal", active: true, phase: "executing", session_id: sessionId },
+				],
+			}),
+		);
+
+		await activeStateModule.syncSkillActiveState({
+			cwd: root,
+			skill: "autoresearch",
+			active: true,
+			phase: "verdict",
+			sessionId,
+		});
+
+		const entries = await readActiveEntries(root, { sessionId });
+		expect(entries.map(entry => entry.skill).sort()).toEqual(["autoresearch", "ultragoal"]);
+		expect(entries.find(entry => entry.skill === "autoresearch")?.phase).toBe("verdict");
+		expect(entries.find(entry => entry.skill === "ultragoal")?.phase).toBe("executing");
+		await expect(
+			activeStateModule.readVisibleSkillActiveState(root, sessionId, { bypassCache: true }),
+		).resolves.toMatchObject({
+			active_skills: expect.arrayContaining([
+				expect.objectContaining({ skill: "autoresearch", phase: "verdict" }),
+				expect.objectContaining({ skill: "ultragoal", phase: "executing" }),
+			]),
+		});
+	});
+
 	it("does not resurrect a stale snapshot after authoritative entries are cleared", async () => {
 		const root = await cwd();
 		const sessionId = "test-cleared-authoritative-entries";
