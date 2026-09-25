@@ -112,6 +112,26 @@
         "cancelled": false,
         "timedOut": false
       }
+    },
+    {
+      "id": "command-v-multiple",
+      "command": "command -v true echo",
+      "result": {
+        "output": "true\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
+    },
+    {
+      "id": "command-V-found-and-missing",
+      "command": "command -V true nonexistent",
+      "result": {
+        "output": "true is a shell builtin\n",
+        "exitCode": 0,
+        "cancelled": false,
+        "timedOut": false
+      }
     }
   ]
 }

@@ -237,6 +237,45 @@
       },
       "reason": "Pinned upstream reports the named object as not a builtin when no dynamically loaded command exists to remove."
     }
+,
+    {
+      "module": "shell",
+      "caseId": "command-v-multiple",
+      "fields": {
+        "before": {
+          "output": "true\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "true\necho\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream resolves every operand to `command -v` and emits each found builtin rather than stopping at the first name."
+    },
+    {
+      "module": "shell",
+      "caseId": "command-V-found-and-missing",
+      "fields": {
+        "before": {
+          "output": "true is a shell builtin\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        },
+        "after": {
+          "output": "true is a shell builtin\ncommand: nonexistent: not found\n",
+          "exitCode": 0,
+          "cancelled": false,
+          "timedOut": false
+        }
+      },
+      "reason": "Pinned upstream reports each `command -V` operand independently while retaining success when at least one command resolves."
+    }
   ],
   "nonAdoptions": [
     {
