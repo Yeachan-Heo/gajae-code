@@ -27,8 +27,11 @@ pub mod build_info;
 pub mod clipboard;
 pub mod computer;
 pub mod crash;
+pub mod diff;
+
 pub mod doctor_journal;
 pub mod doctor_link;
+
 pub mod edit_fuzzy;
 pub mod fd;
 pub mod fs_cache;
@@ -39,7 +42,6 @@ pub mod hashline;
 pub mod highlight;
 pub mod html;
 pub mod keys;
-pub mod linediff;
 pub mod memory;
 pub mod sdk;
 pub mod sixel;

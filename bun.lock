@@ -114,6 +114,7 @@
         "@napi-rs/cli": "catalog:",
         "@types/bun": "catalog:",
         "@types/ws": "catalog:",
+        "diff": "catalog:",
       },
       "optionalDependencies": {
         "@gajae-code/natives-darwin-arm64": "workspace:*",
