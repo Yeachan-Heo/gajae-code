@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import type { NativeExactFileIdentity, NativeExactUnlinkResult } from "@gajae-code/natives";
 
 let nativeLifecycleBindings: typeof import("@gajae-code/natives") | undefined;
 
@@ -1765,37 +1765,7 @@ export class LifecycleReadinessCleanupError extends Error {
 	}
 }
 
-function removeOwnedLifecycleReadyMarker(root: string, id: string, effectMarker: string, incarnation: string): boolean {
-	const directory = path.join(root, "sdk");
-	const readyPath = lifecycleReadyPath(root, id);
-	let ready: LifecycleFileCapture | undefined;
-	try {
-		ready = captureLifecycleFile(readyPath, true, true);
-	} catch {
-		return false;
-	}
-	if (!ready) return !fsSync.existsSync(readyPath);
-	try {
-		const marker = parseLifecycleJson(ready.bytes);
-		if (
-			!isExactEffectMarker(marker) ||
-			marker.pid !== process.pid ||
-			marker.effectMarker !== effectMarker ||
-			marker.incarnation !== incarnation
-		)
-			return false;
-		const parent = lifecycleParentIdentity(directory);
-		if (!parent) return false;
-		return nativeLifecycle().exactUnlinkDirect(readyPath, {
-			...ready.identity,
-			parentDev: BigInt(parent.dev),
-			parentIno: BigInt(parent.ino),
-			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
-		}).ok;
-	} catch {
-		return false;
-	}
-}
+const LIFECYCLE_READY_REVOCATION_GRACE_MS = 100;
 
 /** The child writes this only after its endpoint and semantic ready event are both live. */
 export async function writeSessionLifecycleReady(
@@ -1803,39 +1773,89 @@ export async function writeSessionLifecycleReady(
 	id: string,
 	effectMarker: string,
 	canPublish: () => boolean = () => true,
-	onPublishing?: (revoke: () => boolean) => void,
+	onPublishing?: (revoke: () => Promise<boolean>) => void,
 	onPublished?: () => void,
 ): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
+	const native = nativeLifecycle();
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
-	const handle = await fs.open(
-		temporary,
-		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
-		0o600,
-	);
-	try {
-		await handle.writeFile(canonicalJson({ pid: process.pid, effectMarker, incarnation }));
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
+	const readyPath = lifecycleReadyPath(root, id);
+	let handle: fs.FileHandle | undefined;
 	let published = false;
+	let publicationIdentity: NativeExactFileIdentity | undefined;
+	let revocation: Promise<boolean> | undefined;
+	const readyMarkerIsAbsent = async (): Promise<boolean> => {
+		try {
+			await fs.lstat(readyPath);
+			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT";
+		}
+	};
+	const revoke = (): Promise<boolean> => {
+		if (revocation) return revocation;
+		if (!publicationIdentity) return Promise.resolve(false);
+		let queued: boolean;
+		try {
+			queued = native.exactUnlinkDirectDetached(readyPath, publicationIdentity);
+		} catch {
+			queued = false;
+		}
+		if (!queued) {
+			revocation = readyMarkerIsAbsent();
+			return revocation;
+		}
+		revocation = (async () => {
+			const deadline = Date.now() + LIFECYCLE_READY_REVOCATION_GRACE_MS;
+			while (Date.now() < deadline) {
+				if (await readyMarkerIsAbsent()) return true;
+				await Bun.sleep(5);
+			}
+			return false;
+		})();
+		return revocation;
+	};
 	try {
+		handle = await fs.open(
+			temporary,
+			fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+			0o600,
+		);
+		const contents = Buffer.from(canonicalJson({ pid: process.pid, effectMarker, incarnation }), "utf8");
+		await handle.writeFile(contents);
+		await handle.sync();
+		const stat = await handle.stat({ bigint: true });
+		const parent = await fs.lstat(directory, { bigint: true });
+		if (!stat.isFile() || stat.nlink !== 1n || stat.size !== BigInt(contents.byteLength) || !parent.isDirectory())
+			throw new Error("Lifecycle readiness publication identity is invalid.");
+		publicationIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: createHash("sha256").update(contents).digest("hex"),
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+		};
+		await handle.close();
+		handle = undefined;
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
-		await fs.rename(temporary, lifecycleReadyPath(root, id));
+		await fs.rename(temporary, readyPath);
 		published = true;
-		onPublishing?.(() => removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation));
+		onPublishing?.(revoke);
 		await syncDirectory(directory);
 		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
 		onPublished?.();
 	} catch (error) {
-		if (published && !removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation))
-			throw new LifecycleReadinessCleanupError(error);
+		if (published && !(await revoke())) throw new LifecycleReadinessCleanupError(error);
 		throw error;
 	} finally {
+		if (handle) await handle.close().catch(() => {});
 		if (!published) await fs.rm(temporary, { force: true });
 	}
 }
