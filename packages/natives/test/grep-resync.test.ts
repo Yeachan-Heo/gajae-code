@@ -14,7 +14,6 @@ const cases: GrepCase[] = [
 		id: "regex",
 		options: {
 			pattern: String.raw`^\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*`,
-			multiline: true,
 			glob: "**/*.ts",
 			maxCount: 8,
 		},
@@ -102,10 +101,24 @@ describe("grep upstream re-sync", () => {
 		if (temporaryRoot) await fs.rm(temporaryRoot, { recursive: true, force: true });
 	});
 
-	it("records the pre-sync fixture corpus and regex outputs", async () => {
+	it("matches the pre-sync fixture corpus except for accepted PCRE2 syntax support", async () => {
 		const output = await captureGrepCases();
 		const goldenPath = path.join(import.meta.dir, "fixtures/goldens/grep/pre-sync.json");
 		const expected = JSON.parse(await fs.readFile(goldenPath, "utf8")) as typeof output;
-		expect(output).toEqual(expected);
+		const divergencePath = path.join(import.meta.dir, "fixtures/goldens/grep/accepted-divergences.json");
+		const divergences = JSON.parse(await fs.readFile(divergencePath, "utf8")) as {
+			divergences: Array<{ caseId: string; expected: GrepOutput }>;
+		};
+		const baselineById = new Map(expected.cases.map(testCase => [testCase.id, testCase.output]));
+		const acceptedById = new Map(divergences.divergences.map(divergence => [divergence.caseId, divergence.expected]));
+
+		expect(output.archiveSha256).toBe(expected.archiveSha256);
+		expect(output.cases.map(testCase => testCase.id)).toEqual(expected.cases.map(testCase => testCase.id));
+		expect([...acceptedById.keys()].sort()).toEqual(["pcre2-lookahead"]);
+		for (const testCase of output.cases) {
+			const baseline = baselineById.get(testCase.id);
+			expect(baseline).not.toBeUndefined();
+			expect(testCase.output).toEqual(acceptedById.get(testCase.id) ?? baseline);
+		}
 	});
 });

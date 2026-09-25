@@ -29,6 +29,7 @@ Copyright (c) 2025 Mario Zechner, 2025–2026 Can Bölük, and 2026 Stencil Labs
 ## Vendored Rust modules
 
 The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` source pinned to `a85bd5228d9f0f619deade1db78fa49420a721e1`; each source file carries its own attribution and local-modification header.
+- `crates/pi-natives/src/grep.rs` is re-synced from the pinned source. `grep-pcre2` uses `PCRE2_SYS_STATIC=1` so PCRE2 is bundled into the addon rather than loaded from a host library; GJC omits the upstream-only injectable `shell::vfs` filesystem option.
 - `crates/pi-natives/src/html.rs`
 - `crates/pi-natives/src/sixel.rs`
 - `crates/pi-natives/src/clipboard.rs`

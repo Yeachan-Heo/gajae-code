@@ -2162,13 +2162,15 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 				type_filter.as_ref(),
 			);
 		}
+		// Cached searches retain whole-tree totals; streaming searches may stop at the
+		// output cap.
 		process_candidates(
 			fs,
 			candidates,
 			matcher,
 			params,
 			!crate::rayon_pool_unavailable(),
-			streaming_stop_after(params),
+			None,
 			&ct,
 		)?
 	} else {

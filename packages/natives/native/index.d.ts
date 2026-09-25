@@ -1424,7 +1424,7 @@ export interface GrepMatch {
 export interface GrepOptions {
   /** Regex pattern to search for. */
   pattern: string
-  /** Directory or file to search. */
+  /** Directory or file to search: a host path or an absolute `scheme://` URL. */
   path: string
   /** Glob filter for filenames (e.g., "*.ts"). */
   glob?: string
@@ -1438,7 +1438,7 @@ export interface GrepOptions {
   hidden?: boolean
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
+  /** Enable the shared filesystem scan cache (default: false). */
   cache?: boolean
   /** Maximum number of matches to return. */
   maxCount?: number
@@ -1454,6 +1454,12 @@ export interface GrepOptions {
   maxColumns?: number
   /** Output mode (content, filesWithMatches, or count). */
   mode?: GrepOutputMode
+  /**
+   * Maximum matches collected per file (content mode). Keeps one hot file
+   * from exhausting the global `max_count` budget before other files are
+   * reached.
+   */
+  maxCountPerFile?: number
   /** Abort signal for cancelling the operation. */
   signal?: unknown
   /** Timeout in milliseconds for the operation. */
