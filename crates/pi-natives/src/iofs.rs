@@ -1,5 +1,6 @@
-// Vendored from oh-my-pi (MIT) crates/pi-natives/src/iofs.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Modified for gajae-code: yes — walker pool diagnostic; uses the shared crate::js UTF-8 conversion
+// Vendored from oh-my-pi (MIT) crates/pi-natives/src/iofs.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Modified for gajae-code: yes —
+// walker pool diagnostic; uses the shared crate::js UTF-8 conversion
 //! N-API filesystem DTOs and conversion helpers.
 //!
 //! `pi-walker` owns traversal and cache policy. This module keeps only the
