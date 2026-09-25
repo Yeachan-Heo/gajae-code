@@ -1,5 +1,5 @@
 // Vendored from oh-my-pi (MIT) crates/pi-natives/src/diff.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: private UTF-16/UTF-8 helpers and owned path conversion.
+// Local modifications: owned path conversion uses `crate::js::into_string`.
 
 //! N-API wrappers and streaming support for jsdiff-compatible diff primitives.
 //!
@@ -21,31 +21,7 @@ use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
 use parking_lot::Mutex;
 
-use crate::task;
-
-mod js {
-	use std::ops::Range;
-
-	use napi::{JsString, Result};
-
-	pub(super) fn utf16(value: JsString<'_>) -> Result<Vec<u16>> {
-		let length = value.utf16_len()?;
-		let buffer = value.into_utf16()?;
-		Ok(buffer.as_slice()[..length].to_vec())
-	}
-
-	pub(super) fn utf16_append(value: JsString<'_>, output: &mut Vec<u16>) -> Result<Range<usize>> {
-		let length = value.utf16_len()?;
-		let buffer = value.into_utf16()?;
-		let start = output.len();
-		output.extend_from_slice(&buffer.as_slice()[..length]);
-		Ok(start..output.len())
-	}
-
-	pub(super) fn utf8(value: JsString<'_>) -> Result<String> {
-		value.into_utf8()?.into_owned()
-	}
-}
+use crate::{js, task};
 
 /// UTF-16 code unit for `\n`.
 const LF: u16 = 0x000a;
@@ -451,7 +427,7 @@ impl DiffStream {
 		max_bytes: Option<u32>,
 		signal: Option<Unknown>,
 	) -> Result<task::Promise<DiffStreamProgress>> {
-		let path = PathBuf::from(js::utf8(path)?);
+		let path = PathBuf::from(js::into_string(path)?);
 		{
 			let mut state = self.state.lock();
 			let stream = state.side_mut(side);
