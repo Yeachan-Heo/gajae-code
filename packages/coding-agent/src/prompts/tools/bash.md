@@ -34,6 +34,7 @@ This session's bash tool is restricted. It only accepts commands beginning with:
 {{#each restrictedAllowedPrefixes}}
 - `{{this}}`
 {{/each}}
+Send exactly one simple command per call: `&&`, `||`, `;`, `|`, `&`, and redirects are rejected before execution, so issue separate calls and use `cwd` instead of `cd … &&`.
 Use it only for sanctioned GJC workflow CLI persistence or state read/write/contract operations; the only per-command env override allowed is `GJC_RALPLAN_ARTIFACT` when paired with `gjc ralplan --write … --artifact-env GJC_RALPLAN_ARTIFACT`, and all other shell command shapes are blocked before execution.
 {{/when}}
 </restricted-bash-mode>
