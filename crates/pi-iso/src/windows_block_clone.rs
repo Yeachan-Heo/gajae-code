@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/windows_block_clone.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain Windows
+// cleanup behavior and add selective tree cloning.
 //! Windows block-clone based isolation.
 //!
 //! `FSCTL_DUPLICATE_EXTENTS_TO_FILE` asks NTFS/ReFS to share file extents
@@ -45,6 +48,18 @@ impl IsolationBackend for WindowsBlockCloneBackend {
 		#[cfg(not(windows))]
 		{
 			let _ = (lower, merged);
+			Err(IsoError::unavailable("Windows block-clone isolation is only available on Windows"))
+		}
+	}
+
+	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+		#[cfg(windows)]
+		{
+			imp::clone_tree(lower, merged, skip)
+		}
+		#[cfg(not(windows))]
+		{
+			let _ = (lower, merged, skip);
 			Err(IsoError::unavailable("Windows block-clone isolation is only available on Windows"))
 		}
 	}
@@ -101,6 +116,22 @@ mod imp {
 		result
 	}
 
+	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+		let lower = canonical_existing_dir(lower)?;
+		prepare_destination(merged)?;
+		let result = (|| {
+			fs::create_dir_all(merged)
+				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
+			clone_dir_contents(&lower, merged, Some(skip))?;
+			copy_metadata_best_effort(&lower, merged);
+			Ok(())
+		})();
+		if result.is_err() {
+			let _ = remove_path(merged);
+		}
+		result
+	}
+
 	pub fn stop(merged: &Path) -> IsoResult<()> {
 		remove_path(merged).map_err(|err| {
 			IsoError::other(format!("unable to remove block-cloned tree {}: {err}", merged.display()))
@@ -111,9 +142,7 @@ mod imp {
 		let resolved = if path.is_absolute() {
 			path.to_path_buf()
 		} else {
-			std::env::current_dir()
-				.map(|cwd| cwd.join(path))
-				.unwrap_or_else(|_| path.to_path_buf())
+			std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 		};
 		let meta = fs::metadata(&resolved).map_err(|err| {
 			IsoError::other(format!("invalid block-clone source {}: {err}", resolved.display()))
@@ -164,6 +193,11 @@ mod imp {
 		}
 		let mut permissions = meta.permissions();
 		if permissions.readonly() {
+			#[allow(
+				clippy::permissions_set_readonly_false,
+				reason = "Windows block-clone cleanup must clear the readonly file attribute before \
+				          deletion"
+			)]
 			permissions.set_readonly(false);
 			let _ = fs::set_permissions(path, permissions);
 		}
@@ -172,17 +206,24 @@ mod imp {
 	fn recursive_block_clone(lower: &Path, merged: &Path) -> IsoResult<()> {
 		fs::create_dir_all(merged)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-		clone_dir_contents(lower, merged)?;
+		clone_dir_contents(lower, merged, None)?;
 		copy_metadata_best_effort(lower, merged);
 		Ok(())
 	}
 
-	fn clone_dir_contents(src: &Path, dst: &Path) -> IsoResult<()> {
+	fn clone_dir_contents(
+		src: &Path,
+		dst: &Path,
+		skip: Option<&[&std::ffi::OsStr]>,
+	) -> IsoResult<()> {
 		let entries = fs::read_dir(src)
 			.map_err(|err| IsoError::other(format!("read_dir {}: {err}", src.display())))?;
 		for entry in entries {
 			let entry = entry
 				.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", src.display())))?;
+			if skip.is_some_and(|names| names.contains(&entry.file_name().as_os_str())) {
+				continue;
+			}
 			let file_type = entry.file_type().map_err(|err| {
 				IsoError::other(format!("file_type {}: {err}", entry.path().display()))
 			})?;
@@ -195,7 +236,7 @@ mod imp {
 			} else if file_type.is_dir() {
 				fs::create_dir_all(&dst_path)
 					.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
-				clone_dir_contents(&src_path, &dst_path)?;
+				clone_dir_contents(&src_path, &dst_path, None)?;
 				copy_metadata_best_effort(&src_path, &dst_path);
 			} else if file_type.is_file() {
 				clone_regular_file(&src_path, &dst_path)?;
