@@ -453,6 +453,75 @@
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
 				},
+				"ownership": {
+					"type": "object",
+					"properties": {
+						"schemaVersion": {
+							"type": "integer",
+							"const": 1
+						},
+						"version": {
+							"type": "integer",
+							"minimum": 0,
+							"maximum": 9007199254740991
+						},
+						"marker": {
+							"type": "object",
+							"oneOf": [
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "inherit"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "cleared"
+										}
+									},
+									"required": [
+										"kind"
+									],
+									"additionalProperties": false
+								},
+								{
+									"type": "object",
+									"properties": {
+										"kind": {
+											"type": "string",
+											"const": "profile"
+										},
+										"profile": {
+											"type": "string",
+											"minLength": 1
+										}
+									},
+									"required": [
+										"kind",
+										"profile"
+									],
+									"additionalProperties": false
+								}
+							]
+						}
+					},
+					"required": [
+						"schemaVersion",
+						"version",
+						"marker"
+					],
+					"additionalProperties": false
+				},
 				"proxyProvider": {
 					"type": "string",
 					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."

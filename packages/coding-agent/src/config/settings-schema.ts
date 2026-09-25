@@ -16,6 +16,7 @@ import {
 	validateAutoroutingProvenance,
 	validateAutoroutingSetup,
 } from "./autorouting-contract";
+import { type DurableModelProfileOwnership, validateDurableModelProfileOwnership } from "./model-profile-ownership";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
 
@@ -369,6 +370,42 @@ const AUTOROUTING_PROVENANCE_JSON_SCHEMA: JsonSchemaObject = {
 	required: ["schema", "source", "declarationFingerprint", "tiersFingerprint"],
 };
 
+const MODEL_PROFILE_OWNERSHIP_JSON_SCHEMA: JsonSchemaObject = {
+	type: "object",
+	properties: {
+		schemaVersion: { type: "integer", const: 1 },
+		version: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+		marker: {
+			type: "object",
+			oneOf: [
+				{
+					type: "object",
+					properties: { kind: { type: "string", const: "inherit" } },
+					required: ["kind"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: { kind: { type: "string", const: "cleared" } },
+					required: ["kind"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: {
+						kind: { type: "string", const: "profile" },
+						profile: { type: "string", minLength: 1 },
+					},
+					required: ["kind", "profile"],
+					additionalProperties: false,
+				},
+			],
+		},
+	},
+	required: ["schemaVersion", "version", "marker"],
+	additionalProperties: false,
+};
+
 // SDK prompt deadline defaults. The `sdk.promptDeadlineMs` /
 // `sdk.promptMaxRuntimeMs` schema entries below and the SDK bus/host lease
 // fallbacks read these same constants, so a Settings lookup that misses — no
@@ -683,6 +720,23 @@ export const SETTINGS_SCHEMA = {
 			description: "Model profile applied automatically at startup",
 			options: "runtime",
 		},
+	},
+	"modelProfile.ownership": {
+		type: "optional-object",
+		default: undefined,
+		jsonSchema: MODEL_PROFILE_OWNERSHIP_JSON_SCHEMA,
+		validate: (value: unknown) =>
+			validateDurableModelProfileOwnership(value)
+				? []
+				: [
+						{
+							path: "modelProfile.ownership",
+							code: "config_invalid",
+							reason: "config_invalid",
+							detail: "Expected a versioned ownership record with a valid inherit, cleared, or profile marker.",
+						},
+					],
+		_value: undefined as unknown as DurableModelProfileOwnership,
 	},
 	"modelProfile.proxyProvider": {
 		type: "string",
@@ -4322,6 +4376,14 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
+		if (path === "modelProfile.default" || path === "modelProfile.ownership") {
+			issues.push({
+				path,
+				detail:
+					"Model-profile ownership is managed separately; use model.profile.set for a session selection or gjc config set/reset for durable ownership.",
+			});
+			continue;
+		}
 		const definition = SETTINGS_SCHEMA[path as SettingPath];
 		if (!definition) {
 			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
