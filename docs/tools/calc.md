@@ -6,7 +6,7 @@
 - Entry: `packages/coding-agent/src/tools/calculator.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/calculator.md`
 - Key collaborators:
-  - `packages/coding-agent/src/tui.ts` — status lines and tree-list rendering
+  - `packages/coding-agent/src/tui/status-line.ts`, `packages/coding-agent/src/tui/tree-list.ts` — status lines and tree-list rendering
   - `packages/coding-agent/src/tools/render-utils.ts` — preview limits and formatting helpers
 
 ## Inputs
