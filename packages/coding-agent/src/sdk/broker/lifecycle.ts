@@ -1863,7 +1863,7 @@ export async function writeSessionLifecycleReady(
 	let temporaryCreatedByUs = false;
 	let placeholderCreatedByUs = false;
 	let publicationAttempted = false;
-	let publicationIdentity: NativeExactFileIdentity | undefined;
+	let publicationIdentity: (NativeExactFileIdentity & LifecyclePublicationIdentity) | undefined;
 	let placeholderIdentity: (LifecyclePublicationIdentity & { nlink: bigint }) | undefined;
 	let directoryChanged = false;
 	let retainedPublicationPath: string | undefined;
@@ -1875,7 +1875,7 @@ export async function writeSessionLifecycleReady(
 	const capturePublicationIdentity = async (
 		fileHandle: fs.FileHandle,
 		file: string,
-	): Promise<NativeExactFileIdentity> => ({
+	): Promise<NativeExactFileIdentity & LifecyclePublicationIdentity> => ({
 		...(await captureOpenedLifecycleFileIdentity(fileHandle)),
 		parentDev: parentIdentity.dev,
 		parentIno: parentIdentity.ino,

@@ -682,7 +682,7 @@ export async function runSessionHost(
 	const beforeCutoff = async <T>(
 		stage: () => Promise<T>,
 		cleanupLateResult?: (value: T) => Promise<void>,
-		options: { processLocalOnly?: boolean } = {},
+		options: { processLocalOnly?: boolean; readinessPublication?: boolean } = {},
 	): Promise<T> => {
 		throwIfStartupInterrupted();
 		const pending = Promise.resolve()
@@ -696,7 +696,7 @@ export async function runSessionHost(
 			interrupted.promise.then(failure => ({ failure }) as const),
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
-			if (options.processLocalOnly) return;
+			if (options.processLocalOnly || options.readinessPublication) return;
 			if (!cleanupLateResult) {
 				constructionCleanupComplete = false;
 				return;
@@ -775,100 +775,105 @@ export async function runSessionHost(
 	const removeMcpConfigDirectory = async (): Promise<void> => {
 		const directory = mcpConfigDirectory;
 		if (!directory) return;
+		let cleanupFailure: { error: unknown } | undefined;
 		const cleanupComplete = await runBoundedStartupCleanup(async () => {
 			try {
-			const identity = directory.directoryIdentity;
-			const parentIdentity = directory.parentIdentity;
-			const snapshot = directory.snapshot;
-			if (!identity || !parentIdentity || !snapshot)
-				throw new Error("MCP temporary directory cleanup lacks exact creation authority.");
-			const parent = await fs.lstat(path.dirname(directory.path), { bigint: true });
-			if (
-				!parent.isDirectory() ||
-				parent.isSymbolicLink() ||
-				parent.dev !== parentIdentity.dev ||
-				parent.ino !== parentIdentity.ino
-			)
-				throw new Error("MCP temporary directory parent changed before cleanup.");
-			const current = await fs.lstat(directory.path, { bigint: true }).catch(error => {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-				throw error;
-			});
-			if (
-				current &&
-				(!current.isDirectory() ||
-					current.isSymbolicLink() ||
-					current.dev !== identity.dev ||
-					current.ino !== identity.ino)
-			)
-				throw new Error("MCP temporary directory identity changed before cleanup.");
-			const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
-			if (removed.ok) {
-				mcpConfigDirectory = undefined;
-				return;
-			}
-			if (
-				removed.code === "cleanup_pending" &&
-				removed.payloadDurable === true &&
-				removed.detachedPath === `${directory.path}.removing`
-			) {
-				const detached = await fs.lstat(removed.detachedPath, { bigint: true }).catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-					throw error;
-				});
-				const originalAfter = await fs.lstat(directory.path, { bigint: true }).catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-					throw error;
-				});
-				const parentAfter = await fs.lstat(path.dirname(directory.path), { bigint: true });
-				const retained = snapshotDirectoryTree(removed.detachedPath);
-				const originalEntries = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
-				const retainedTreeIsScrubbed =
-					retained.ok &&
-					retained.snapshot !== undefined &&
-					retained.snapshot.entries.length === snapshot.entries.length &&
-					retained.snapshot.entries.every(entry => {
-						const originalEntry = originalEntries.get(entry.relativePath);
-						if (
-							!originalEntry ||
-							entry.kind !== originalEntry.kind ||
-							entry.dev !== originalEntry.dev ||
-							entry.ino !== originalEntry.ino
-						)
-							return false;
-						if (entry.kind === "directory") return true;
-						return (
-							entry.kind === "file" &&
-							entry.size === "0" &&
-							entry.sha256 === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-						);
-					});
+				const identity = directory.directoryIdentity;
+				const parentIdentity = directory.parentIdentity;
+				const snapshot = directory.snapshot;
+				if (!identity || !parentIdentity || !snapshot)
+					throw new Error("MCP temporary directory cleanup lacks exact creation authority.");
+				const parent = await fs.lstat(path.dirname(directory.path), { bigint: true });
 				if (
-					!detached ||
-					originalAfter !== undefined ||
-					!detached.isDirectory() ||
-					detached.isSymbolicLink() ||
-					detached.dev !== identity.dev ||
-					detached.ino !== identity.ino ||
-					parentAfter.dev !== parentIdentity.dev ||
-					parentAfter.ino !== parentIdentity.ino ||
-					!retained.ok ||
-					!retained.snapshot ||
-					retained.snapshot.rootDev !== identity.dev.toString() ||
-					retained.snapshot.rootIno !== identity.ino.toString() ||
-					!retainedTreeIsScrubbed
+					!parent.isDirectory() ||
+					parent.isSymbolicLink() ||
+					parent.dev !== parentIdentity.dev ||
+					parent.ino !== parentIdentity.ino
 				)
-					throw new Error("MCP temporary directory retained unresolved cleanup authority.");
-				mcpConfigDirectory = undefined;
-				return;
-			}
-			throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
-		} catch (error) {
-			constructionCleanupComplete = false;
-			throw error;
+					throw new Error("MCP temporary directory parent changed before cleanup.");
+				const current = await fs.lstat(directory.path, { bigint: true }).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				});
+				if (
+					current &&
+					(!current.isDirectory() ||
+						current.isSymbolicLink() ||
+						current.dev !== identity.dev ||
+						current.ino !== identity.ino)
+				)
+					throw new Error("MCP temporary directory identity changed before cleanup.");
+				const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
+				if (removed.ok) {
+					mcpConfigDirectory = undefined;
+					return;
+				}
+				if (
+					removed.code === "cleanup_pending" &&
+					removed.payloadDurable === true &&
+					removed.detachedPath === `${directory.path}.removing`
+				) {
+					const detached = await fs.lstat(removed.detachedPath, { bigint: true }).catch(error => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+						throw error;
+					});
+					const originalAfter = await fs.lstat(directory.path, { bigint: true }).catch(error => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+						throw error;
+					});
+					const parentAfter = await fs.lstat(path.dirname(directory.path), { bigint: true });
+					const retained = snapshotDirectoryTree(removed.detachedPath);
+					const originalEntries = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
+					const retainedTreeIsScrubbed =
+						retained.ok &&
+						retained.snapshot !== undefined &&
+						retained.snapshot.entries.length === snapshot.entries.length &&
+						retained.snapshot.entries.every(entry => {
+							const originalEntry = originalEntries.get(entry.relativePath);
+							if (
+								!originalEntry ||
+								entry.kind !== originalEntry.kind ||
+								entry.dev !== originalEntry.dev ||
+								entry.ino !== originalEntry.ino
+							)
+								return false;
+							if (entry.kind === "directory") return true;
+							return (
+								entry.kind === "file" &&
+								entry.size === "0" &&
+								entry.sha256 === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+							);
+						});
+					if (
+						!detached ||
+						originalAfter !== undefined ||
+						!detached.isDirectory() ||
+						detached.isSymbolicLink() ||
+						detached.dev !== identity.dev ||
+						detached.ino !== identity.ino ||
+						parentAfter.dev !== parentIdentity.dev ||
+						parentAfter.ino !== parentIdentity.ino ||
+						!retained.ok ||
+						!retained.snapshot ||
+						retained.snapshot.rootDev !== identity.dev.toString() ||
+						retained.snapshot.rootIno !== identity.ino.toString() ||
+						!retainedTreeIsScrubbed
+					)
+						throw new Error("MCP temporary directory retained unresolved cleanup authority.");
+					mcpConfigDirectory = undefined;
+					return;
+				}
+				throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
+			} catch (error) {
+				constructionCleanupComplete = false;
+				cleanupFailure = { error };
+				throw error;
 			}
 		});
-		if (!cleanupComplete) throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+		if (!cleanupComplete) {
+			if (cleanupFailure) throw cleanupFailure.error;
+			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+		}
 	};
 	const captureMcpConfigDirectoryIdentity = async (
 		owned: OwnedMcpConfigDirectory,
@@ -938,8 +943,8 @@ export async function runSessionHost(
 		}
 		const managerCleanupRequired =
 			!sessionManagerTransferred ||
-			(Boolean(created && "failure" in created) && !created.cleanupComplete) ||
-			(Boolean(created && !("failure" in created)) && !sessionDisposalComplete);
+			(created !== undefined && "failure" in created && !created.cleanupComplete) ||
+			(created !== undefined && !("failure" in created) && !sessionDisposalComplete);
 		if (managerCleanupRequired) {
 			try {
 				await closeSessionManager(opened?.sessionManager);
@@ -976,11 +981,11 @@ export async function runSessionHost(
 					await captureMcpConfigDirectoryIdentity(owned);
 					await captureMcpConfigDirectory(owned);
 					return owned;
-									},
+				},
 				async late => {
 					mcpConfigDirectory = late;
 					await removeMcpConfigDirectory();
-									},
+				},
 			);
 			mcpConfigDirectory = ownedDirectory;
 			const resolvedMcpConfigDirectory = await beforeCutoff(
@@ -1006,55 +1011,56 @@ export async function runSessionHost(
 			);
 			ownedDirectory.path = resolvedMcpConfigDirectory;
 			await captureMcpConfigDirectory(ownedDirectory);
-			mcpConfigPath = path.join(ownedDirectory.path, "mcp.json");
+			const configPath = path.join(ownedDirectory.path, "mcp.json");
+			mcpConfigPath = configPath;
 			const configContents = JSON.stringify({
-					mcpServers: Object.fromEntries(
-						request.mcpServers.map(server => [
-							server.name,
-							"url" in server
-								? {
-										type: server.type,
-										url: server.url,
-										...(server.headers ? { headers: server.headers } : {}),
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									}
-								: {
-										type: server.type,
-										command: server.command,
-										args: server.args,
-										...(server.env ? { env: server.env } : {}),
-										noInheritEnv: true,
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									},
-						]),
-					),
+				mcpServers: Object.fromEntries(
+					request.mcpServers.map(server => [
+						server.name,
+						"url" in server
+							? {
+									type: server.type,
+									url: server.url,
+									...(server.headers ? { headers: server.headers } : {}),
+									timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+								}
+							: {
+									type: server.type,
+									command: server.command,
+									args: server.args,
+									...(server.env ? { env: server.env } : {}),
+									noInheritEnv: true,
+									timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+								},
+					]),
+				),
 			});
 			const configOutcome = await beforeCutoff(
 				async () => {
 					let writeFailure: { error: unknown } | undefined;
 					try {
-						await writeMcpConfig(mcpConfigPath, configContents);
+						await writeMcpConfig(configPath, configContents);
 					} catch (error) {
 						writeFailure = { error };
-		}
+					}
 					let snapshotFailure: { error: unknown } | undefined;
 					try {
-			await captureMcpConfigDirectory(ownedDirectory);
+						await captureMcpConfigDirectory(ownedDirectory);
 					} catch (error) {
 						snapshotFailure = { error };
 					}
 					return { writeFailure, snapshotFailure };
-									},
+				},
 				async () => {
-			mcpConfigDirectory = ownedDirectory;
+					mcpConfigDirectory = ownedDirectory;
 					await removeMcpConfigDirectory();
-									},
+				},
 			);
 			if (configOutcome.writeFailure && configOutcome.snapshotFailure)
 				throw new AggregateError(
 					[configOutcome.writeFailure.error, configOutcome.snapshotFailure.error],
 					"MCP configuration write and ownership snapshot both failed.",
-			);
+				);
 			if (configOutcome.snapshotFailure) throw configOutcome.snapshotFailure.error;
 			if (configOutcome.writeFailure) throw configOutcome.writeFailure.error;
 			throwIfStartupInterrupted();
@@ -1105,6 +1111,7 @@ export async function runSessionHost(
 					return;
 				}
 				await disposeConstructedSession(late.session);
+				await closeSessionManager(opened?.sessionManager);
 			},
 		);
 		await removeMcpConfigDirectory();
@@ -1221,6 +1228,7 @@ export async function runSessionHost(
 				]);
 				if (!revoked) readinessPublicationCleanupComplete = false;
 			}
+			if (!readinessPublicationCleanupComplete) constructionCleanupComplete = false;
 			const transcript = await disposeAndCapture();
 			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
@@ -1336,6 +1344,7 @@ export async function runSessionHost(
 				readinessPublicationCleanupComplete =
 					!outcome.published && !(outcome.error instanceof LifecycleReadinessCleanupError);
 			},
+			{ readinessPublication: true },
 		);
 		if (!readinessOutcome.published) {
 			readinessPublicationCleanupComplete = !(readinessOutcome.error instanceof LifecycleReadinessCleanupError);

@@ -157,10 +157,10 @@ test("lifecycle ready publication revokes its marker when cutoff wins during dir
 	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
 	let cutoffChecks = 0;
 	try {
-		await expect(
-			writeSessionLifecycleReady(root, sessionId, effectMarker, () => ++cutoffChecks === 1),
-		).rejects.toThrow("Lifecycle readiness cutoff passed during publication.");
-		expect(cutoffChecks).toBe(2);
+		await expect(writeSessionLifecycleReady(root, sessionId, effectMarker, () => ++cutoffChecks < 3)).rejects.toThrow(
+			"Lifecycle readiness cutoff passed during publication.",
+		);
+		expect(cutoffChecks).toBe(3);
 		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
@@ -965,6 +965,7 @@ test("session host publishes SIGTERM failure without waiting for hung constructi
 							result?.status === "failed"
 								? result.failure
 								: owner.capability.normalizeFailure("startup", "failed", "late construction fixture"),
+						cleanupComplete: false,
 					});
 				};
 				const startupSignal = process
