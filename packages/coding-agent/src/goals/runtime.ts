@@ -104,6 +104,9 @@ export function renderGoalPrompt(kind: GoalPromptKind, goal: Goal): string {
 	});
 }
 
+/** Flush usage into in-memory state only; the caller writes (or defers) the durable entry. */
+const IN_MEMORY_FLUSH = { persist: false } as const;
+
 function isAccountingStatus(goal: Goal): boolean {
 	return goal.status === "active";
 }
@@ -113,6 +116,8 @@ export class GoalRuntime {
 	#turnSnapshot: GoalTurnSnapshot | undefined;
 	#wallClock: GoalWallClockSnapshot;
 	#accountingTail: Promise<void> = Promise.resolve();
+	/** In-memory usage advanced at a tool boundary that no durable entry records yet. */
+	#usagePendingPersist = false;
 
 	constructor(host: GoalRuntimeHost) {
 		this.#host = host;
@@ -167,6 +172,7 @@ export class GoalRuntime {
 	): Promise<void> {
 		this.#host.setState(state ? cloneState(state) : undefined);
 		if (options?.persist) {
+			this.#usagePendingPersist = false;
 			this.#host.persist(options.persist, state);
 		}
 		if (options?.emit !== false) {
@@ -208,15 +214,21 @@ export class GoalRuntime {
 		}
 	}
 
+	/**
+	 * Tool boundaries refresh live accounting in memory only. Persisting a
+	 * `mode_change` per tool call made usage counters the dominant session-log
+	 * writer (issue #5949); the durable copy is written at agent end and on every
+	 * status transition, which already carry the latest in-memory counters.
+	 */
 	async onToolCompleted(toolName: string): Promise<void> {
 		if (toolName === "goal") return;
 		if (!this.#hasAccountingState()) return;
-		await this.flushUsage();
+		await this.#withAccounting(() => this.#flushUsageLocked(this.#host.getCurrentUsage(), IN_MEMORY_FLUSH));
 	}
 
 	async onGoalToolCompleted(): Promise<void> {
 		if (!this.#hasAccountingState()) return;
-		await this.flushUsage();
+		await this.#withAccounting(() => this.#flushUsageLocked(this.#host.getCurrentUsage(), IN_MEMORY_FLUSH));
 	}
 
 	async onAgentEnd(options?: { turnCompleted?: boolean; currentUsage?: GoalTokenUsage }): Promise<void> {
@@ -236,7 +248,7 @@ export class GoalRuntime {
 			return;
 		}
 		await this.#withAccounting(async () => {
-			await this.#flushUsageLocked();
+			await this.#flushUsageLocked(this.#host.getCurrentUsage(), IN_MEMORY_FLUSH);
 			this.#turnSnapshot = undefined;
 			const cloned = this.#getStateClone();
 			if (!cloned?.enabled || !isAccountingStatus(cloned.goal)) return;
@@ -261,7 +273,10 @@ export class GoalRuntime {
 		return state;
 	}
 
-	async #flushUsageLocked(currentUsage: GoalTokenUsage = this.#host.getCurrentUsage()): Promise<void> {
+	async #flushUsageLocked(
+		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
+		options: { persist: boolean } = { persist: true },
+	): Promise<void> {
 		const state = this.#getStateClone();
 		if (!state?.enabled || !isAccountingStatus(state.goal)) return;
 		if (this.#turnSnapshot?.activeGoalId !== state.goal.id && this.#wallClock.activeGoalId !== state.goal.id) return;
@@ -274,7 +289,13 @@ export class GoalRuntime {
 			this.#wallClock.activeGoalId === state.goal.id
 				? Math.max(0, Math.floor((this.#now() - this.#wallClock.lastAccountedAt) / 1000))
 				: 0;
-		if (tokenDelta <= 0 && wallSeconds <= 0) return;
+		if (tokenDelta <= 0 && wallSeconds <= 0) {
+			if (options.persist && this.#usagePendingPersist) {
+				this.#usagePendingPersist = false;
+				this.#host.persist("goal", state);
+			}
+			return;
+		}
 
 		state.goal.tokensUsed += tokenDelta;
 		state.goal.timeUsedSeconds += wallSeconds;
@@ -287,7 +308,8 @@ export class GoalRuntime {
 			this.#wallClock.lastAccountedAt += wallSeconds * 1000;
 		}
 
-		await this.#commitState(state, { persist: "goal" });
+		this.#usagePendingPersist = !options.persist;
+		await this.#commitState(state, options.persist ? { persist: "goal" } : undefined);
 	}
 
 	async flushUsage(currentUsage: GoalTokenUsage = this.#host.getCurrentUsage()): Promise<void> {
@@ -357,7 +379,7 @@ export class GoalRuntime {
 
 	async pauseGoal(): Promise<GoalModeState | undefined> {
 		return await this.#withAccounting(async () => {
-			await this.#flushUsageLocked();
+			await this.#flushUsageLocked(this.#host.getCurrentUsage(), IN_MEMORY_FLUSH);
 			const state = this.#getStateClone();
 			if (!state?.goal) return undefined;
 			if (state.goal.status !== "active") {
@@ -393,7 +415,7 @@ export class GoalRuntime {
 
 	async completeGoalFromTool(): Promise<Goal> {
 		return await this.#withAccounting(async () => {
-			await this.#flushUsageLocked();
+			await this.#flushUsageLocked(this.#host.getCurrentUsage(), IN_MEMORY_FLUSH);
 			const state = this.#getStateClone();
 			if (!state?.goal) {
 				throw new Error("cannot complete goal because no goal is active");

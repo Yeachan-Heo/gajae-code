@@ -96,7 +96,10 @@ function parseShellWords(command: string): { words: string[]; reason?: string } 
 			return { words, reason: "multiple shell commands are not allowed in restricted bash mode" };
 		}
 		if (SHELL_CONTROL_CHARS.has(char)) {
-			return { words, reason: `shell control operator '${char}' is not allowed in restricted bash commands` };
+			return {
+				words,
+				reason: `shell control operator '${char}' is not allowed in restricted bash commands; send one simple command per bash call (no chaining, pipes, or redirects) and pass the directory as \`cwd\` instead of \`cd … &&\``,
+			};
 		}
 		if (UNSAFE_UNQUOTED_EXPANSION_CHARS.has(char)) {
 			return { words, reason: `shell expansion character '${char}' is not allowed in restricted bash commands` };

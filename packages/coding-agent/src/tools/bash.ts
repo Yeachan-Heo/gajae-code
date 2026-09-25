@@ -186,6 +186,24 @@ function artifactReferenceIsReachable(text: string, result: BashResult | BashInt
 	);
 }
 
+const LEADING_CD_PATTERN =
+	/^cd[ \t]+(?:"([^"\n\r$`\\]*)"|'([^'\n\r]*)'|((?:[^\s;&|<>()$`"'\\*?[]|\\[^\n\r])+))[ \t]*&&[ \t]*/;
+
+/**
+ * Lift a leading `cd <dir> &&` into the tool cwd only when `<dir>` is exactly
+ * one shell word. Anything else (`cd dir 2>/dev/null && …`, `cd ~ ; cmd && …`)
+ * previously leaked redirects or later commands into the cwd and failed with
+ * "Working directory does not exist" (issue #5949); such commands now run
+ * verbatim so the shell applies its own `cd` semantics.
+ */
+export function extractLeadingCdCwd(command: string): { cwd: string; command: string } | undefined {
+	const match = LEADING_CD_PATTERN.exec(command);
+	if (!match) return undefined;
+	const cwd = match[1] ?? match[2] ?? match[3]?.replace(/\\(.)/g, "$1");
+	if (!cwd) return undefined;
+	return { cwd, command: command.slice(match[0].length) };
+}
+
 export function suffixPrefixOverlap(source: string, target: string): number {
 	if (source.length === 0 || target.length === 0) return 0;
 	if (target.startsWith(source)) return source.length;
@@ -1320,10 +1338,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (!cwd) {
-			const cdMatch = command.match(/^cd[ \t]+((?:[^&\\\n\r]|\\.)+?)[ \t]*&&[ \t]*/);
-			if (cdMatch) {
-				cwd = cdMatch[1].trim().replace(/^["']|["']$/g, "");
-				command = command.slice(cdMatch[0].length);
+			const extracted = extractLeadingCdCwd(command);
+			if (extracted) {
+				cwd = extracted.cwd;
+				command = extracted.command;
 			}
 		}
 
@@ -1486,7 +1504,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			cwdStat = await fs.promises.stat(commandCwd);
 		} catch (err) {
 			if (isEnoent(err)) {
-				throw new ToolError(`Working directory does not exist: ${commandCwd}`);
+				throw new ToolError(
+					`Working directory does not exist: ${commandCwd}. Pass an existing directory as \`cwd\` (relative paths resolve against ${this.session.cwd}); the command was not run.`,
+				);
 			}
 			throw err;
 		}
