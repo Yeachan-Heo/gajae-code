@@ -1285,6 +1285,16 @@ export async function resolveModelOverrideWithAuthFallback(
 		}
 	}
 	for (const pattern of modelPatterns) {
+		// Skip entries with open circuits in managed fallback chains
+		if (
+			options?.managedFallback &&
+			modelPatterns.length > 1 &&
+			modelRegistry.isSelectorCircuitOpen?.(pattern, options.circuitProbeOwner)
+		) {
+			skips.push({ selector: pattern, reason: "circuit_open" });
+			activeIndex += 1;
+			continue;
+		}
 		const candidate = resolveModelRoleValue(pattern, availableModels, {
 			settings,
 			matchPreferences,

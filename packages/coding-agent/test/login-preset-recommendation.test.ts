@@ -95,6 +95,7 @@ function createControllerContext(
 			resolveCanonicalModel: () => undefined,
 			getCanonicalVariants: () => [],
 			getCanonicalId: () => undefined,
+			isSelectorCircuitOpen: (_selector: string) => false,
 		},
 	};
 	const ctx = {
