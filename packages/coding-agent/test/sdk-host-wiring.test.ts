@@ -536,6 +536,10 @@ test("lifecycle SDK startup capability settles once and sanitizes public failure
 	expect(started.settleStarted()).toEqual({ status: "started" });
 	expect(started.settleFailure(failure)).toEqual({ status: "started" });
 	expect(await started.promise).toEqual({ status: "started" });
+	const cancelled = new SdkStartupCapability();
+	cancelled.cancel(failure);
+	expect(cancelled.cancelled).toBe(true);
+	expect(await cancelled.promise).toEqual({ status: "failed", failure });
 });
 
 test("lifecycle teardown swallows dual owner failures without surfacing an extension error and retains exact retry authority", async () => {
