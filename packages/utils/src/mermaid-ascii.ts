@@ -1,6 +1,6 @@
 import type { MermaidRenderOptions } from "@gajae-code/natives";
 
-export type { MermaidRenderOptions as MermaidAsciiRenderOptions };
+export type { MermaidRenderOptions };
 
 type NativeMermaidBindings = Pick<typeof import("@gajae-code/natives"), "renderMermaidAscii">;
 
