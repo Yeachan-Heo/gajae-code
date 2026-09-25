@@ -36,6 +36,9 @@ The files listed below are adapted from the MIT-licensed `can1357/oh-my-pi` sour
 - `crates/pi-natives/src/prof.rs`
 - `crates/pi-natives/src/appearance.rs`
 - `crates/pi-natives/src/crash.rs` (alloc-error handling merged from `crash_handler.rs`)
+- `crates/pi-natives/src/fd.rs`
+- `crates/pi-natives/src/workspace.rs`
+
 ## MuPDF WebAssembly
 
 PDF extraction uses MuPDF.js, copyright (C) 2004–2026 Artifex Software, Inc., distributed under [GNU Affero General Public License version 3 or later](https://www.gnu.org/licenses/agpl-3.0.html). MuPDF is provided without warranty; the repository's MIT license does not replace MuPDF's license. Alternative commercial licensing is available from [Artifex](https://artifex.com/).
