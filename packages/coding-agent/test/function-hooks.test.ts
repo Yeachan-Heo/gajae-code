@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createAttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
+import { isDesignedError } from "@gajae-code/utils/error-classification";
 import {
 	type FunctionHook,
 	type FunctionHookEventType,
@@ -922,8 +923,14 @@ describe("capability-scoped function hooks", () => {
 			},
 			runner,
 		);
-		await expect(wrapped.execute("call-1", { path: "safe.txt" })).rejects.toThrow();
+		const rejection = await wrapped.execute("call-1", { path: "safe.txt" }).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
 		expect(executed).toBe(false);
+		// An extension corrupting valid model input is an extension defect, not a designed model-input refusal.
+		expect((rejection as Error).message).toStartWith("Extension rewrote tool input into invalid arguments:");
+		expect(isDesignedError(rejection)).toBe(false);
 	});
 
 	test("does not expose raw updates or original errors before tool-result mediation", async () => {

@@ -11,6 +11,7 @@ import {
 	setAgentDir,
 } from "@gajae-code/utils/dirs";
 import { resetHandledErrorDedupeForTest } from "@gajae-code/utils/postmortem";
+import { parseApplyPatch } from "../src/edit/apply-patch/parser";
 import { ApplyPatchError, replaceText } from "../src/edit/diff";
 import { EditMatchError } from "../src/edit/modes/replace";
 import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
@@ -135,6 +136,21 @@ describe("handled-error crash store excludes designed tool outcomes (#5938)", ()
 			"edit",
 		);
 		finishWithError(new ApplyPatchError("Failed to find expected lines in src/a.ts:\nmissing"), "edit");
+		expect(await crashStoreExists()).toBe(false);
+	});
+
+	test("a malformed apply_patch envelope is a model input error, not a crash", async () => {
+		const error = (() => {
+			try {
+				parseApplyPatch("*** Update File: src/a.ts\n@@\n-a\n+b\n*** End Patch");
+			} catch (thrown) {
+				return thrown;
+			}
+			throw new Error("expected malformed patch refusal");
+		})();
+		expect((error as Error).message).toContain("*** Begin Patch");
+
+		finishWithError(error, "edit");
 		expect(await crashStoreExists()).toBe(false);
 	});
 

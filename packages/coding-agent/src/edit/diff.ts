@@ -39,6 +39,8 @@ export class ParseError extends Error {
 	) {
 		super(lineNumber !== undefined ? `Line ${lineNumber}: ${message}` : message);
 		this.name = "ParseError";
+		// A malformed patch or diff hunk is the model's input, not a fault.
+		markDesignedError(this);
 	}
 }
 
