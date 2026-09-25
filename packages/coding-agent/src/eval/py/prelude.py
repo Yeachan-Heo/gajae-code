@@ -215,26 +215,37 @@ if "__gjc_prelude_loaded__" not in globals():
         results: list[dict] = []
         
         for output_id in ids:
-            # Build the read tool path and selector
+            # Read the whole resource via tool bridge (no selector to avoid context expansion)
             path = f"agent://{output_id}"
-            read_kwargs = {}
-            
-            # Handle offset/limit by converting to read tool selector syntax
-            if offset is not None or limit is not None:
-                start_line = max(1, offset or 1)
-                if limit is not None:
-                    # :start+count format
-                    path += f":{start_line}+{limit}"
-                else:
-                    # :start format (read from start to end)
-                    path += f":{start_line}-"
-            
             try:
                 # Call tool.read() to get the content
-                content = tool.read({"path": path, **read_kwargs})
+                # The read tool returns either a string or {text, details, ...}
+                result = tool.read({"path": path})
+                if isinstance(result, dict):
+                    # ReadTool returns {text, details, ...} when details are set
+                    content = result.get("text", "")
+                else:
+                    # Fallback: treat as string directly
+                    content = result
             except Exception as e:
                 _emit_status("output", id=output_id, error=str(e))
                 raise
+            
+            # Convert to string if not already
+            if not isinstance(content, str):
+                content = str(content)
+            
+            # Handle offset/limit by slicing in Python (exact ranges, no context expansion)
+            raw_content = content
+            if offset is not None or limit is not None:
+                lines = content.splitlines()
+                start_line = max(0, (offset or 1) - 1)  # Convert to 0-indexed
+                if start_line >= len(lines):
+                    _emit_status("output", id=output_id, error=f"Offset {offset or 1} beyond end ({len(lines)} lines)")
+                    raise ValueError(f"Offset {offset or 1} is beyond end of output ({len(lines)} lines) for {output_id}")
+                effective_limit = limit if limit is not None else len(lines) - start_line
+                end_line = min(len(lines), start_line + effective_limit)
+                content = "\n".join(lines[start_line:end_line])
             
             # Handle query
             if query:
@@ -263,8 +274,8 @@ if "__gjc_prelude_loaded__" not in globals():
                 result_data = {
                     "id": output_id,
                     "path": f"agent://{output_id}",
-                    "line_count": len(content.splitlines()),
-                    "char_count": len(content) if not query else len(selected_content),
+                    "line_count": len(raw_content.splitlines()),
+                    "char_count": len(raw_content) if not query else len(selected_content),
                     "content": selected_content,
                 }
                 if query:
