@@ -1,5 +1,6 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/src/path_policy.rs @
-// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: tests use
+// platform-absolute paths for Windows.
 //! Path resolution and write authorization for edit targets.
 //!
 //! Plain paths resolve against the session `cwd`/`home_dir`. Internal URLs
@@ -709,9 +710,18 @@ mod tests {
 		assert_eq!(p.resolve("/", &urls).unwrap().absolute, tmp.path());
 		assert_eq!(p.resolve("@~/x", &urls).unwrap().absolute, tmp.path().join("home/x"));
 		assert_eq!(p.resolve(":./x", &urls).unwrap().absolute, tmp.path().join("./x"));
+		#[cfg(not(windows))]
 		assert_eq!(
 			p.resolve("file:///tmp/a%20b", &urls).unwrap().absolute,
 			PathBuf::from("/tmp/a b")
+		);
+		// `file:///tmp/...` has no drive on Windows; it resolves against the cwd drive.
+		#[cfg(windows)]
+		assert!(
+			p.resolve("file:///tmp/a%20b", &urls)
+				.unwrap()
+				.absolute
+				.ends_with("tmp\\a b")
 		);
 		// Scheme-colon names without a slash, Windows drives, and `./`-prefixed
 		// URI-shaped names are plain paths.
@@ -952,8 +962,7 @@ mod tests {
 		let missing = tmp.path().join("missing.txt");
 		assert_eq!(
 			canonical_key(&missing),
-			std::fs::canonicalize(tmp.path())
-				.unwrap()
+			strip_windows_verbatim_path(std::fs::canonicalize(tmp.path()).unwrap())
 				.join("missing.txt")
 		);
 	}

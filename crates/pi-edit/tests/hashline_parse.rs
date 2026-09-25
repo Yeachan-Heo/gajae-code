@@ -1,6 +1,6 @@
 // Vendored from oh-my-pi (MIT) crates/pi-edit/tests/hashline_parse.rs @
-// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: none.
-use std::path::Path;
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: tests use
+// platform-absolute paths for Windows.
 
 use pi_edit::modes::hashline::{
 	format::{
@@ -624,9 +624,12 @@ fn input_supports_fallback_path_and_absolute_paths_in_cwd() {
 	let fallback = SplitOptions { cwd: None, path: Some("a.ts") };
 	let patch = Patch::parse("PUT <1:\n+x", &fallback).unwrap();
 	assert_eq!(patch.sections[0].path, "a.ts");
-	let cwd = Path::new("/tmp/work");
+	// Platform-absolute cwd: `/tmp/work` is not absolute on Windows.
+	let cwd_buf = std::env::temp_dir().join("work");
+	let cwd = cwd_buf.as_path();
 	let options = SplitOptions { cwd: Some(cwd), path: None };
-	let patch = Patch::parse("[/tmp/work/src/a.ts]\nPUT <1:\n+x", &options).unwrap();
+	let header = format!("[{}]\nPUT <1:\n+x", cwd.join("src").join("a.ts").display());
+	let patch = Patch::parse(&header, &options).unwrap();
 	assert_eq!(patch.sections[0].path, "src/a.ts");
 	assert!(Patch::parse("plain text", &fallback).is_err());
 }
