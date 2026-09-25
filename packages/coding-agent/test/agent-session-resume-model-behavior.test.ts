@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
-import { UnresolvedModelProfileOwnershipError } from "@gajae-code/coding-agent/config/model-profile-ownership";
+import {
+	commitDurableModelProfileOwnership,
+	UnresolvedModelProfileOwnershipError,
+} from "@gajae-code/coding-agent/config/model-profile-ownership";
 import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -121,6 +124,54 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 			outcome: "committed",
 		});
 		expect(session.sessionId).not.toBe(clearedSessionId);
+	});
+
+	it("does not broadcast a durable owner change into a running session before transition", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(0);
+
+		await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(0);
+
+		expect(await session.newSession()).toBe(true);
+		expect(session.getEffectiveModelProfileName()).toBeUndefined();
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(1);
+	});
+
+	it("keeps the running session's durable owner snapshot until a new-session transition", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+		});
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(0);
+
+		await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(0);
+
+		expect(await session.newSession()).toBe(true);
+		expect(session.getEffectiveModelProfileName()).toBeUndefined();
+		expect(session.getDurableModelProfileOwnershipSnapshot().version).toBe(1);
 	});
 
 	it("fails closed on a deleted session profile without falling back to the durable profile", async () => {
@@ -329,6 +380,71 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(session.getConfiguredModelChainState("default")).toMatchObject({
 			origin: "model_selection",
 		});
+	});
+
+	it("re-resolves a profile-owned default chain from the current profile on resume", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		targetSession!.setConfiguredModelChain(
+			"default",
+			["removed-provider/old-profile-default"],
+			"profile-activation",
+			"codex-medium",
+		);
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.provider).toBe("openai-codex");
+		expect(session.model?.id).toBe("gpt-5.6-sol");
+		expect(session.getActiveModelProfile()).toBe("codex-medium");
+		expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: ["removed-provider/old-profile-default"],
+			origin: "profile-activation",
+			identity: "codex-medium",
+		});
+		expect(session.getDefaultFallbackRuntimeState().chain).toMatchObject({
+			entries: ["openai-codex/gpt-5.6-sol:low"],
+			origin: "profile-activation",
+			identity: "codex-medium",
+		});
+	});
+
+	it("preserves a concrete session model selected after a clear tombstone", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: "openai-codex/gpt-5.6-sol:low" },
+			"session.resumeModelBehavior": "keepSessionModel",
+		});
+		const sessionFile = await createPersistedTarget(sonnet, settings);
+		settings.setModelRole("default", "openai-codex/gpt-5.6-sol:low");
+		targetSession!.sessionManager.appendModelProfileOwnershipMarker({ kind: "cleared" });
+		await targetSession!.sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: sonnet, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.provider).toBe("anthropic");
+		expect(session.model?.id).toBe(sonnet.id);
+		expect(session.getEffectiveModelProfileName()).toBeUndefined();
+		expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
 	});
 
 	it("clears a saved profile marker when its runtime layer is removed during cross-file resume", async () => {
@@ -700,7 +816,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(recover).not.toHaveBeenCalled();
 	});
 
-	it("does not recover a bare saved alias that remains registered but unavailable", async () => {
+	it("uses current ownership without recovering a registered but unavailable saved alias", async () => {
 		const registeredAlias = {
 			...getBundledModel("anthropic", "claude-sonnet-4-5")!,
 			provider: "disabled-provider",
@@ -739,7 +855,19 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		vi.spyOn(modelRegistry, "resolveModelByLookupAlias").mockReturnValue(undefined);
 		const notice = vi.spyOn(session, "emitNotice");
 
-		expect(await session.switchSession(sessionFile)).toBe(false);
+		expect(await session.switchSession(sessionFile)).toBe(true);
+		expect(session.model?.provider).toBe("openai-codex");
+		expect(session.model?.id).toBe(codex.id);
+		expect(session.getConfiguredModelChainState("default")).toMatchObject({
+			entries: ["Registered-Alias"],
+			origin: "profile-activation",
+			identity: profile.name,
+		});
+		expect(session.getDefaultFallbackRuntimeState().chain).toMatchObject({
+			entries: [`${codex.provider}/${codex.id}`],
+			origin: "profile-activation",
+			identity: profile.name,
+		});
 		expect(notice).not.toHaveBeenCalledWith(
 			"warning",
 			"Saved session model is no longer registered; restored the durable default preset instead.",

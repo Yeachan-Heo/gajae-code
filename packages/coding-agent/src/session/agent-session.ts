@@ -219,6 +219,7 @@ import {
 	activateModelProfile,
 	applyModelProfileRuntimeBindings,
 	resolveMissingSessionModelRecovery,
+	resolveModelProfileDefaultChain,
 } from "../config/model-profile-activation";
 import {
 	ModelProfileRegistryError,
@@ -226,6 +227,7 @@ import {
 	validateModelProfileName,
 } from "../config/model-profile-contract";
 import {
+	type DurableModelProfileOwnership,
 	type ModelProfileOwnershipMarker,
 	modelProfileOwnershipMarkersEqual,
 	type ProfileOwnershipChangedEvent,
@@ -938,6 +940,8 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Durable owner snapshot captured at create/restore before asynchronous startup work. */
+	initialDurableModelProfileOwnership?: DurableModelProfileOwnership;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
 	agentDir?: string;
@@ -2722,6 +2726,12 @@ export class AgentSession {
 	#thinkingLevel: ThinkingLevel | undefined;
 	#activeModelProfile: string | undefined;
 	#modelProfileOwnershipFailure: Error | undefined;
+	#durableModelProfileOwnershipSnapshot: DurableModelProfileOwnership = {
+		schemaVersion: 1,
+		version: 0,
+		marker: { kind: "inherit" },
+	};
+	#effectiveModelProfileOwnershipMarker: ModelProfileOwnershipMarker = { kind: "inherit" };
 	#activeProfileInstalledRoles = new Map<string, ModelSelectorValue | undefined>();
 	#activeProfileInstalledAgentOverrides = new Map<string, ModelSelectorValue | undefined>();
 	#preProfileModel: Model | undefined;
@@ -5230,6 +5240,9 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#updateDurableModelProfileOwnershipSnapshot(
+			config.initialDurableModelProfileOwnership ?? readDurableModelProfileOwnership(this.settings),
+		);
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
@@ -17402,7 +17415,8 @@ export class AgentSession {
 		const previousSessionFile = this.sessionFile;
 		const previousSessionId = this.sessionId;
 		const previousModelProfileOwnershipMarker = this.getModelProfileOwnershipMarker();
-		const observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
+		const durableOwnershipSnapshot = readDurableModelProfileOwnership(this.settings);
+		const observedDurableVersion = durableOwnershipSnapshot.version;
 		const previousWorkflowGateSessionId = this.sessionId;
 		const selectionOnlyDiscoveredBuiltinToolNames = new Set(
 			this.#getSelectedDiscoveredBuiltinToolNames().filter(
@@ -17481,6 +17495,7 @@ export class AgentSession {
 				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
+			this.#updateDurableModelProfileOwnershipSnapshot(durableOwnershipSnapshot);
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
@@ -17570,6 +17585,7 @@ export class AgentSession {
 				await exactRetirement?.abort();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
+			this.#updateDurableModelProfileOwnershipSnapshot(durableOwnershipSnapshot);
 			this.#disconnectFromAgent();
 			this.#closeAllProviderSessions("new session");
 			this.#rebindProviderSessionState(new Map());
@@ -17622,7 +17638,6 @@ export class AgentSession {
 		let profileOwnershipReady = true;
 		try {
 			targetProfileName = this.getEffectiveModelProfileName();
-			observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
 		} catch (error) {
 			profileOwnershipReady = false;
 			this.markModelProfileOwnershipFailed(
@@ -17721,7 +17736,7 @@ export class AgentSession {
 				outcome: "failed",
 			});
 		}
-		if (this.#extensionRunner) {
+		if (profileOwnershipReady && this.#extensionRunner) {
 			await this.#runCommittedSuccessorHook(() =>
 				this.#extensionRunner!.emit({
 					type: "session_switch",
@@ -17729,7 +17744,6 @@ export class AgentSession {
 					previousSessionFile,
 				}),
 			);
-		} else {
 		}
 	}
 
@@ -17742,7 +17756,8 @@ export class AgentSession {
 		try {
 			const sessionId = this.sessionId;
 			const previousModelProfileOwnershipMarker = this.getModelProfileOwnershipMarker();
-			const observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
+			const previousDurableOwnershipSnapshot = this.#durableModelProfileOwnershipSnapshot;
+			const observedDurableVersion = previousDurableOwnershipSnapshot.version;
 			this.#disconnectFromAgent();
 			await this.abort();
 			await this.sessionManager.flush();
@@ -17783,6 +17798,7 @@ export class AgentSession {
 				this.agent.reset();
 				this.sessionManager.appendContextClearEntry({ sessionId });
 				this.sessionManager.appendModelProfileOwnershipMarker({ kind: "cleared" });
+				this.#updateDurableModelProfileOwnershipSnapshot(previousDurableOwnershipSnapshot);
 				this.#resetSessionScopedModelProfileState({ force: true });
 				this.#modelProfileOwnershipFailure = undefined;
 				const ordinaryDefaultChain = normalizeModelSelectorValue(this.settings.getModelRole("default"));
@@ -17828,6 +17844,7 @@ export class AgentSession {
 				} catch (rollbackError) {
 					rollbackErrors.push(rollbackError);
 				}
+				this.#updateDurableModelProfileOwnershipSnapshot(previousDurableOwnershipSnapshot);
 				this.#syncAgentSessionId(sessionId);
 				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
 				else this.settings.override("modelRoles", previousModelRolesOverride);
@@ -17899,7 +17916,7 @@ export class AgentSession {
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const previousModelProfileOwnershipMarker = this.getModelProfileOwnershipMarker();
-			const observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
+			const observedDurableVersion = this.#durableModelProfileOwnershipSnapshot.version;
 			const predecessorQueuedSdkWork = this.#queuedMessagesForSessionTransition();
 			const settleForkPredecessorWork = (): void => {
 				this.#terminalizeQueuedSdkWorkForSessionTransition(predecessorQueuedSdkWork);
@@ -18054,7 +18071,7 @@ export class AgentSession {
 			}
 
 			// Emit session_switch event with reason "fork" to hooks
-			if (this.#extensionRunner) {
+			if (!this.#modelProfileOwnershipFailure && this.#extensionRunner) {
 				await this.#runCommittedSuccessorHook(() =>
 					this.#extensionRunner!.emit({
 						type: "session_switch",
@@ -18145,15 +18162,33 @@ export class AgentSession {
 		this.#activeModelProfile = name;
 	}
 
+	#updateDurableModelProfileOwnershipSnapshot(
+		durable: DurableModelProfileOwnership,
+		sessionMarker: ModelProfileOwnershipMarker | undefined = this.getModelProfileOwnershipMarker(),
+	): void {
+		this.#durableModelProfileOwnershipSnapshot = durable;
+		this.#effectiveModelProfileOwnershipMarker = resolveEffectiveModelProfileMarker(sessionMarker, durable);
+	}
+
+	/** @internal Return the immutable durable owner snapshot installed for this session. */
+	getDurableModelProfileOwnershipSnapshot(): DurableModelProfileOwnership {
+		return {
+			...this.#durableModelProfileOwnershipSnapshot,
+			marker: { ...this.#durableModelProfileOwnershipSnapshot.marker },
+		};
+	}
+
+	/** @internal Update the committed durable snapshot only at an explicit lifecycle/activation boundary. */
+	updateDurableModelProfileOwnershipSnapshot(durable: DurableModelProfileOwnership): void {
+		this.#updateDurableModelProfileOwnershipSnapshot(durable);
+	}
+
 	getModelProfileOwnershipMarker(): ModelProfileOwnershipMarker | undefined {
 		return this.sessionManager.getModelProfileOwnershipMarker();
 	}
 
 	getEffectiveModelProfileOwnershipMarker(): ModelProfileOwnershipMarker {
-		return resolveEffectiveModelProfileMarker(
-			this.getModelProfileOwnershipMarker(),
-			readDurableModelProfileOwnership(this.settings),
-		);
+		return this.#effectiveModelProfileOwnershipMarker;
 	}
 
 	getEffectiveModelProfileName(): string | undefined {
@@ -18169,6 +18204,7 @@ export class AgentSession {
 			await this.sessionManager.ensureOnDisk();
 			await this.sessionManager.flush();
 		}
+		this.#updateDurableModelProfileOwnershipSnapshot(this.#durableModelProfileOwnershipSnapshot, marker);
 		this.#modelProfileOwnershipFailure = undefined;
 	}
 
@@ -18184,6 +18220,16 @@ export class AgentSession {
 				error: caught instanceof Error ? caught.message : String(caught),
 			});
 		});
+	}
+
+	/** @internal Clear a prior fail-closed marker after a complete successful reconciliation. */
+	markModelProfileOwnershipReady(): void {
+		this.#modelProfileOwnershipFailure = undefined;
+	}
+
+	/** @internal Report whether this session is currently fail-closed on ownership. */
+	hasModelProfileOwnershipFailure(): boolean {
+		return this.#modelProfileOwnershipFailure !== undefined;
 	}
 
 	emitProfileOwnershipChanged(event: ProfileOwnershipChangedEvent): void {
@@ -18534,6 +18580,27 @@ export class AgentSession {
 			skips,
 			options?.emitResolutionEvent ?? true,
 		);
+	}
+
+	/** Install a freshly resolved owner chain without rewriting the saved session intent. */
+	installResolvedProfileDefaultFallbackChain(
+		entries: readonly string[],
+		profileName: string,
+		activeIndex: number,
+		skips: Array<{ selector: string; reason: string }>,
+	): void {
+		this.#defaultFallbackController = new FallbackChainController(
+			{
+				role: "default",
+				entries: [...entries],
+				origin: "profile-activation",
+				identity: profileName,
+				explicitHead: true,
+			},
+			this.settings.get("fallback.maxAttempts"),
+		);
+		this.#defaultFallbackExhaustedLastTurn = false;
+		this.#seedDefaultFallbackResolutionForController(this.#defaultFallbackController, activeIndex, skips);
 	}
 
 	markStartupRecoveryBindingsRequired(): void {
@@ -20519,7 +20586,8 @@ export class AgentSession {
 			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			const previousModelProfileOwnershipMarker = this.getModelProfileOwnershipMarker();
-			const observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
+			const durableOwnershipSnapshot = readDurableModelProfileOwnership(this.settings);
+			const observedDurableVersion = durableOwnershipSnapshot.version;
 			await this.sessionManager.flush();
 			const rollbackSessionState = await this.sessionManager.captureRollbackState();
 			const rollbackAgentMessages = [...this.agent.state.messages];
@@ -20570,6 +20638,7 @@ export class AgentSession {
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				await exactRetirement?.commit();
+				this.#updateDurableModelProfileOwnershipSnapshot(durableOwnershipSnapshot, { kind: "inherit" });
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
@@ -20661,7 +20730,7 @@ export class AgentSession {
 					this.getModelProfileOwnershipMarker() ?? { kind: "inherit" },
 					rollbackSessionState.sessionId,
 					this.sessionId,
-					readDurableModelProfileOwnership(this.settings).version,
+					observedDurableVersion,
 				);
 				// session_switch is a post-commit identity signal. Extension handler
 				// errors are isolated by ExtensionRunner and must not roll back the
@@ -23515,22 +23584,52 @@ export class AgentSession {
 		const settingsEntries = normalizeModelSelectorValue(
 			this.settings.getModelRole("default") ?? (this.model ? formatModelString(this.model) : undefined),
 		);
+		const preservesConcreteSessionChain =
+			configuredChain?.origin === "model_selection" ||
+			configuredChain?.origin === "startup-override" ||
+			configuredChain?.origin === "legacy_session";
+		const activeProfile = this.#activeModelProfile
+			? this.#modelRegistry.getModelProfile(this.#activeModelProfile)
+			: undefined;
+		const activeProfileOwnsDefault = activeProfile
+			? resolveProfileBindings(activeProfile).defaultSelector !== undefined
+			: false;
+		const useSettingsDefaultChain =
+			this.settings.get("session.resumeModelBehavior") === "useCurrentDefault" ||
+			(!preservesConcreteSessionChain &&
+				(this.#effectiveModelProfileOwnershipMarker.kind === "cleared" ||
+					(configuredChain?.origin === "profile-activation" &&
+						activeProfile !== undefined &&
+						!activeProfileOwnsDefault)));
 		const materializeSettingsChain =
+			!useSettingsDefaultChain &&
+			this.#effectiveModelProfileOwnershipMarker.kind === "inherit" &&
 			configuredChain?.origin === "legacy_session" &&
 			configuredChain.entries.length === 1 &&
 			settingsEntries.length > 1;
 		if (materializeSettingsChain && materializeLegacyChain) {
 			this.setConfiguredModelChain("default", settingsEntries, "modelRoles");
 		}
-		const chain: ConfiguredFallbackChain = materializeSettingsChain
+		const chain: ConfiguredFallbackChain = useSettingsDefaultChain
 			? { role: "default", entries: settingsEntries, origin: "modelRoles", explicitHead: true }
-			: configuredChain
-				? { ...configuredChain, entries: [...configuredChain.entries] }
-				: { role: "default", entries: settingsEntries, origin: "session", explicitHead: true };
+			: materializeSettingsChain
+				? { role: "default", entries: settingsEntries, origin: "modelRoles", explicitHead: true }
+				: configuredChain
+					? { ...configuredChain, entries: [...configuredChain.entries] }
+					: { role: "default", entries: settingsEntries, origin: "session", explicitHead: true };
 		const existing = this.#defaultFallbackController;
 		if (
 			existing &&
-			(existing.chain.origin === "runtime" || existing.chain.entries.join("\u0000") === chain.entries.join("\u0000"))
+			(existing.chain.origin === "runtime" ||
+				(existing.chain.origin === "profile-activation" &&
+					existing.chain.identity !== undefined &&
+					existing.chain.identity === this.#activeModelProfile &&
+					this.#effectiveModelProfileOwnershipMarker.kind === "profile" &&
+					this.#effectiveModelProfileOwnershipMarker.profile === existing.chain.identity &&
+					this.#modelProfileOwnershipFailure === undefined) ||
+				(existing.chain.origin === chain.origin &&
+					existing.chain.identity === chain.identity &&
+					existing.chain.entries.join("\u0000") === chain.entries.join("\u0000")))
 		) {
 			return existing;
 		}
@@ -26369,7 +26468,8 @@ export class AgentSession {
 			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionContext = this.buildDisplaySessionContext();
 			const previousModelProfileOwnershipMarker = previousSessionContext.modelProfileOwnershipMarker;
-			let observedDurableVersion = readDurableModelProfileOwnership(this.settings).version;
+			const previousDurableOwnershipSnapshot = this.#durableModelProfileOwnershipSnapshot;
+			let observedDurableVersion = previousDurableOwnershipSnapshot.version;
 			// switchSession replaces these arrays wholesale during load/rollback, so retaining
 			// the existing message objects is sufficient and avoids structured-clone failures for
 			// extension/custom metadata that is valid to persist but not cloneable.
@@ -26475,6 +26575,7 @@ export class AgentSession {
 				const targetSessionMarker = sessionContext.modelProfileOwnershipMarker ?? { kind: "inherit" as const };
 				const durableOwnership = readDurableModelProfileOwnership(this.settings);
 				observedDurableVersion = durableOwnership.version;
+				this.#updateDurableModelProfileOwnershipSnapshot(durableOwnership, targetSessionMarker);
 				const targetEffectiveMarker = resolveEffectiveModelProfileMarker(targetSessionMarker, durableOwnership);
 				const targetActiveModelProfile =
 					targetEffectiveMarker.kind === "profile" && profileDefinitions.has(targetEffectiveMarker.profile)
@@ -26514,45 +26615,133 @@ export class AgentSession {
 					}
 				}
 				const settingsDefaultEntries = normalizeModelSelectorValue(this.settings.getModelRole("default"));
-				const savedChainMatchesOwnershipProfile =
-					targetEffectiveMarker.kind === "profile" &&
-					configuredDefaultChain?.origin === "profile-activation" &&
-					configuredDefaultChain.identity === targetEffectiveMarker.profile;
 				const hasSessionConcreteDefault =
 					configuredDefaultChain?.origin === "model_selection" ||
-					configuredDefaultChain?.origin === "startup-override";
-				const useEffectiveProfileDefault =
-					targetEffectiveMarker.kind === "profile" &&
-					!hasSessionConcreteDefault &&
-					!savedChainMatchesOwnershipProfile;
+					configuredDefaultChain?.origin === "startup-override" ||
+					configuredDefaultChain?.origin === "legacy_session" ||
+					(targetEffectiveMarker.kind === "inherit" &&
+						configuredDefaultChain?.origin === "profile-activation" &&
+						targetActiveModelProfile === undefined);
+				let currentProfileDefaultEntries: string[] | undefined;
+				if (targetActiveModelProfile && !hasSessionConcreteDefault && resumeModelBehavior !== "useCurrentDefault") {
+					try {
+						currentProfileDefaultEntries = (
+							await resolveModelProfileDefaultChain({
+								modelRegistry: this.#modelRegistry,
+								settings: this.settings,
+								profileName: targetActiveModelProfile,
+								credentialSessionId: this.credentialSessionId,
+							})
+						).entries;
+					} catch (profileError) {
+						unavailableDefaultChainMessage =
+							profileError instanceof Error
+								? profileError.message
+								: "Model-profile default chain could not be resolved.";
+						throw profileError;
+					}
+				}
 				const defaultEntries =
-					resumeModelBehavior === "useCurrentDefault" ||
-					targetEffectiveMarker.kind === "cleared" ||
-					useEffectiveProfileDefault
+					resumeModelBehavior === "useCurrentDefault"
 						? settingsDefaultEntries
-						: (configuredDefaultChain?.entries ??
-							(sessionContext.models.default ? [sessionContext.models.default] : []));
+						: hasSessionConcreteDefault
+							? (configuredDefaultChain?.entries ??
+								(sessionContext.models.default ? [sessionContext.models.default] : []))
+							: targetEffectiveMarker.kind === "cleared" ||
+									(targetEffectiveMarker.kind === "profile" && targetActiveModelProfile === undefined)
+								? settingsDefaultEntries
+								: targetActiveModelProfile
+									? currentProfileDefaultEntries?.length
+										? currentProfileDefaultEntries
+										: settingsDefaultEntries
+									: configuredDefaultChain?.origin === "profile-activation"
+										? settingsDefaultEntries
+										: (configuredDefaultChain?.entries ??
+											(sessionContext.models.default ? [sessionContext.models.default] : []));
 				this.#activeModelProfile = targetActiveModelProfile;
 				this.#modelProfileOwnershipFailure = unresolvedTargetProfile
 					? new UnresolvedModelProfileOwnershipError(targetEffectiveMarker.profile)
 					: undefined;
 				this.#defaultFallbackController = undefined;
-				if (defaultEntries.length > 0) {
-					const resolution = await resolveModelChainWithAuth(
-						defaultEntries,
-						this.#modelRegistry,
-						this.settings,
-						this.credentialSessionId,
-						{
-							managedFallback: true,
-							canonicalSessionId: this.sessionId,
+				let recoveredProfileModel: Model | undefined;
+				if (
+					resumeModelBehavior === "keepSessionModel" &&
+					targetActiveModelProfile !== undefined &&
+					!unresolvedTargetProfile &&
+					sessionContext.models.default
+				) {
+					const savedDefaultEntries = configuredDefaultChain?.entries.length
+						? configuredDefaultChain.entries
+						: [sessionContext.models.default];
+					try {
+						const savedResolution = await resolveModelChainWithAuth(
+							savedDefaultEntries,
+							this.#modelRegistry,
+							this.settings,
+							this.credentialSessionId,
+							{
+								managedFallback: true,
+								canonicalSessionId: this.sessionId,
+								...(this.#persistedModelProfileAliasIntent("default") ?? {}),
+							},
+						);
+						const recovery = await resolveMissingSessionModelRecovery({
+							modelRegistry: this.#modelRegistry,
+							settings: this.settings,
+							profileName: targetActiveModelProfile,
+							defaultEntries: savedDefaultEntries,
+							skips: savedResolution.skips,
+							savedDefault: sessionContext.models.default,
+							credentialSessionId: this.credentialSessionId,
 							...(this.#persistedModelProfileAliasIntent("default") ?? {}),
-						},
-					);
-					let controller = this.#defaultFallbackChain();
-					this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
-					let resolvedModel = resolution.model;
+						});
+						if (recovery?.model) {
+							this.installRecoveredDefaultFallbackChain(
+								recovery.entries,
+								recovery.profileName,
+								recovery.activeIndex,
+								recovery.skips,
+								{ emitResolutionEvent: false },
+							);
+							recoveredProfileModel = recovery.model;
+							recoveredThinkingLevel = recovery.explicitThinkingLevel ? recovery.thinkingLevel : undefined;
+							recoveredDefaultChainMessage =
+								"Saved session model is no longer registered; restored the active ownership profile at runtime.";
+						}
+					} catch (error) {
+						logger.warn("Failed to recover saved session model through durable default", {
+							error: safeErrorDescription(error),
+						});
+					}
+				}
+				if (defaultEntries.length > 0) {
+					let resolvedModel = recoveredProfileModel;
 					if (!resolvedModel) {
+						const resolution = await resolveModelChainWithAuth(
+							defaultEntries,
+							this.#modelRegistry,
+							this.settings,
+							this.credentialSessionId,
+							{
+								managedFallback: true,
+								canonicalSessionId: this.sessionId,
+								...(this.#persistedModelProfileAliasIntent("default") ?? {}),
+							},
+						);
+						let controller: FallbackChainController;
+						if (targetActiveModelProfile && !hasSessionConcreteDefault && currentProfileDefaultEntries?.length) {
+							this.installResolvedProfileDefaultFallbackChain(
+								currentProfileDefaultEntries,
+								targetActiveModelProfile,
+								resolution.activeIndex,
+								resolution.skips,
+							);
+							controller = this.#defaultFallbackChain(false);
+						} else {
+							controller = this.#defaultFallbackChain();
+							this.seedDefaultFallbackResolution(resolution.activeIndex, resolution.skips);
+						}
+						resolvedModel = resolution.model;
 						if (resumeModelBehavior === "keepSessionModel" && targetActiveModelProfile !== undefined) {
 							try {
 								const recovery = await resolveMissingSessionModelRecovery({
@@ -26756,7 +26945,7 @@ export class AgentSession {
 				// other identity-bound integrations must not observe the successor until
 				// messages, model state, MCP selections, the agent subscription, and
 				// session-scoped tool cleanup are complete.
-				if (this.#extensionRunner) {
+				if (!unresolvedTargetProfile && this.#extensionRunner) {
 					await this.#runCommittedSuccessorHook(() =>
 						this.#extensionRunner!.emit({
 							type: "session_switch",
@@ -26825,6 +27014,10 @@ export class AgentSession {
 				} catch (restoreError) {
 					sessionRestoreError = restoreError;
 				}
+				this.#updateDurableModelProfileOwnershipSnapshot(
+					previousDurableOwnershipSnapshot,
+					previousModelProfileOwnershipMarker ?? { kind: "inherit" },
+				);
 				this.restoreDefaultFallbackRuntimeState(previousDefaultFallbackRuntimeState);
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				if (previousModelRolesOverride === undefined) this.settings.clearOverride("modelRoles");
@@ -26942,6 +27135,7 @@ export class AgentSession {
 			const previousWorkflowGateSessionId = this.sessionId;
 			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const previousModelProfileOwnershipMarker = this.getModelProfileOwnershipMarker();
+			const durableOwnershipSnapshot = this.#durableModelProfileOwnershipSnapshot;
 
 			const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
@@ -27012,8 +27206,9 @@ export class AgentSession {
 			// Reload messages from entries (works for both file and in-memory mode)
 			const sessionContext = this.buildDisplaySessionContext();
 			const targetSessionMarker = sessionContext.modelProfileOwnershipMarker ?? { kind: "inherit" as const };
-			const targetDurableOwnership = readDurableModelProfileOwnership(this.settings);
+			const targetDurableOwnership = durableOwnershipSnapshot;
 			const targetEffectiveMarker = resolveEffectiveModelProfileMarker(targetSessionMarker, targetDurableOwnership);
+			this.#updateDurableModelProfileOwnershipSnapshot(targetDurableOwnership, targetSessionMarker);
 			const profileDefinitions = this.#modelRegistry.getModelProfiles();
 			const targetProfileName =
 				targetEffectiveMarker.kind === "profile" && profileDefinitions.has(targetEffectiveMarker.profile)
@@ -27080,7 +27275,7 @@ export class AgentSession {
 			}
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
-			if (this.#extensionRunner) {
+			if (profileOwnershipReady && this.#extensionRunner) {
 				await this.#runCommittedSuccessorHook(() =>
 					this.#extensionRunner!.emit({
 						type: "session_branch",

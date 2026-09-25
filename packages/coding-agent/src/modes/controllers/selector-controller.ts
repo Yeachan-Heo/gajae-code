@@ -1288,8 +1288,9 @@ export class SelectorController {
 		error: unknown,
 		restoreLiveModel: boolean = true,
 		restoreProfileState: boolean = true,
+		restorePersistedAssignments: boolean = true,
 	): Promise<never> {
-		if (!restoreLiveModel && !restoreProfileState) throw error;
+		if (!restoreLiveModel && !restoreProfileState && !restorePersistedAssignments) throw error;
 		const rollbackErrors: unknown[] = [];
 		const restore = (action: () => void): void => {
 			try {
@@ -1298,16 +1299,18 @@ export class SelectorController {
 				rollbackErrors.push(rollbackError);
 			}
 		};
-		restore(() =>
-			snapshot.persistedModelRoles === undefined
-				? this.ctx.settings.unset("modelRoles")
-				: this.ctx.settings.set("modelRoles", snapshot.persistedModelRoles),
-		);
-		restore(() =>
-			snapshot.persistedAgentOverrides === undefined
-				? this.ctx.settings.unset("task.agentModelOverrides")
-				: this.ctx.settings.set("task.agentModelOverrides", snapshot.persistedAgentOverrides),
-		);
+		if (restorePersistedAssignments) {
+			restore(() =>
+				snapshot.persistedModelRoles === undefined
+					? this.ctx.settings.unset("modelRoles")
+					: this.ctx.settings.set("modelRoles", snapshot.persistedModelRoles),
+			);
+			restore(() =>
+				snapshot.persistedAgentOverrides === undefined
+					? this.ctx.settings.unset("task.agentModelOverrides")
+					: this.ctx.settings.set("task.agentModelOverrides", snapshot.persistedAgentOverrides),
+			);
+		}
 		restore(() =>
 			snapshot.persistedProfile === undefined
 				? this.ctx.settings.unset("modelProfile.default")
@@ -1354,10 +1357,12 @@ export class SelectorController {
 			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
 		}
 		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
-		try {
-			await this.ctx.settings.flushOrThrow();
-		} catch (rollbackError) {
-			rollbackErrors.push(rollbackError);
+		if (restorePersistedAssignments) {
+			try {
+				await this.ctx.settings.flushOrThrow();
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
 		}
 		if (restoreLiveModel) {
 			try {
@@ -2816,6 +2821,7 @@ export class SelectorController {
 								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
 									? selectedSelector.slice(0, -thinkingLevel.length - 1)
 									: selectedSelector;
+							const sessionOwnsProfile = this.#effectiveModelProfileNameForCurrentSession() !== undefined;
 
 							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
 							let defaultMutationStarted = false;
@@ -2823,16 +2829,26 @@ export class SelectorController {
 							let materializedProfile = false;
 							try {
 								if (includesDefault) {
-									await this.ctx.session.setModel(model, "default", {
-										selector: defaultSelector,
-										thinkingLevel,
-										cause: "user-selection",
-										onMutationStarted: () => {
-											defaultMutationStarted = true;
-										},
-									});
-									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(thinkingLevel);
+									if (sessionOwnsProfile) {
+										await this.ctx.session.setModelTemporary(model, thinkingLevel, {
+											persistAsSessionDefault: true,
+											cause: "user-selection",
+											onMutationStarted: () => {
+												defaultMutationStarted = true;
+											},
+										});
+									} else {
+										await this.ctx.session.setModel(model, "default", {
+											selector: defaultSelector,
+											thinkingLevel,
+											cause: "user-selection",
+											onMutationStarted: () => {
+												defaultMutationStarted = true;
+											},
+										});
+										if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+											this.ctx.session.setThinkingLevel(thinkingLevel);
+										}
 									}
 								}
 								assignmentMutationStarted = true;
@@ -2842,6 +2858,9 @@ export class SelectorController {
 									assignments,
 								});
 								if (!materializedProfile) {
+									if (sessionOwnsProfile) {
+										throw new Error("The current model-profile owner could not be materialized safely.");
+									}
 									for (const targetRole of targetRoles) {
 										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
 										if (target.settingsPath === "modelRoles") {
@@ -2857,6 +2876,7 @@ export class SelectorController {
 									error,
 									defaultMutationStarted,
 									defaultMutationStarted || assignmentMutationStarted,
+									!sessionOwnsProfile,
 								);
 							}
 							modelSelector.refreshRoleAssignments({

@@ -432,7 +432,7 @@ describe("fork context policy surface", () => {
 			tasks: [{ id: "ManualExecutor", description: "manual", assignment: "Keep manual override exact." }],
 		});
 
-		expect(getOptions()?.activeModelProfile).toBeUndefined();
+		expect(getOptions()?.modelProfileOwnershipMarker).toBeUndefined();
 	});
 
 	test("passes a sanitized fork seed and cache identity without sharing provider state", async () => {

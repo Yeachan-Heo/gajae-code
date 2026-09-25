@@ -149,6 +149,123 @@ describe("legacy memory startup ordering", () => {
 		}
 	});
 
+	test("SDK resume persists an explicit inherit over a saved clear tombstone", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-inherit-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const settings = Settings.isolated({
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"compaction.enabled": false,
+		});
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!sonnet) throw new Error("Expected bundled Sonnet model");
+		let manager: SessionManager | undefined;
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const originalManager = SessionManager.create(agentDir, agentDir);
+			originalManager.appendModelChange(`${sonnet.provider}/${sonnet.id}`);
+			originalManager.appendModelProfileOwnershipMarker({ kind: "cleared" });
+			await originalManager.ensureOnDisk();
+			await originalManager.flush();
+			const sessionFile = originalManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted resume session");
+			await originalManager.close();
+			manager = await SessionManager.open(sessionFile);
+
+			const result = await createAgentSession({
+				cwd: process.cwd(),
+				agentDir,
+				settings,
+				authStorage,
+				modelRegistry,
+				sessionManager: manager,
+				modelProfileOwnershipMarker: { kind: "inherit" },
+				disableExtensionDiscovery: true,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				hasUI: false,
+			});
+			session = result.session;
+
+			expect(session.model?.provider).toBe("anthropic");
+			expect(session.model?.id).toBe(sonnet.id);
+			expect(session.getModelProfileOwnershipMarker()).toEqual({ kind: "inherit" });
+			expect(session.getEffectiveModelProfileName()).toBe("codex-medium");
+			expect(session.getActiveModelProfile()).toBe("codex-medium");
+			expect(manager.getModelProfileOwnershipMarker()).toEqual({ kind: "inherit" });
+			expect(settings.getGlobal("modelProfile.default")).toBe("codex-medium");
+			expect(readDurableModelProfileOwnership(settings).version).toBe(0);
+		} finally {
+			await session?.dispose();
+			if (!session) await manager?.close();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses explicit SDK inheritance when the durable profile is unresolved", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-inherit-unresolved-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const settings = Settings.isolated({
+			"modelProfile.default": "deleted-profile",
+			"compaction.enabled": false,
+		});
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		let manager: SessionManager | undefined;
+		try {
+			const originalManager = SessionManager.create(agentDir, agentDir);
+			originalManager.appendModelChange("anthropic/claude-sonnet-4-5");
+			originalManager.appendModelProfileOwnershipMarker({ kind: "cleared" });
+			await originalManager.ensureOnDisk();
+			await originalManager.flush();
+			expect(originalManager.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
+			const sessionFile = originalManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted resume session");
+			await originalManager.close();
+			manager = await SessionManager.open(sessionFile);
+
+			await expect(
+				createAgentSession({
+					cwd: process.cwd(),
+					agentDir,
+					settings,
+					authStorage,
+					modelRegistry,
+					sessionManager: manager,
+					modelProfileOwnershipMarker: { kind: "inherit" },
+					disableExtensionDiscovery: true,
+					enableLsp: false,
+					skipPythonPreflight: true,
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					hasUI: false,
+				}),
+			).rejects.toThrow('Model profile "deleted-profile"');
+
+			await manager.close();
+			manager = await SessionManager.open(sessionFile);
+			expect(manager.getModelProfileOwnershipMarker()).toEqual({ kind: "cleared" });
+			expect(settings.getGlobal("modelProfile.default")).toBe("deleted-profile");
+			expect(settings.getGlobal("modelProfile.ownership")).toBeUndefined();
+		} finally {
+			await manager?.close();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("SDK resume preserves an explicit concrete model while applying durable role bindings", async () => {
 		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-concrete-"));
 		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
@@ -207,6 +324,74 @@ describe("legacy memory startup ordering", () => {
 				entries: [`${sonnet.provider}/${sonnet.id}`],
 				origin: "model_selection",
 				explicitHead: true,
+			});
+		} finally {
+			await session?.dispose();
+			if (!session) await manager?.close();
+			authStorage.close();
+			await rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("SDK resume resolves a saved profile-owned chain from the current profile definition", async () => {
+		const agentDir = await mkdtemp(join(tmpdir(), "gjc-profile-sdk-current-chain-"));
+		const authStorage = await AuthStorage.create(join(agentDir, "auth.db"));
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const settings = Settings.isolated({
+			"modelProfile.default": "codex-medium",
+			modelRoles: { default: "anthropic/claude-sonnet-4-5" },
+			"compaction.enabled": false,
+		});
+		const modelRegistry = new ModelRegistry(authStorage, join(agentDir, "models.yml"), settings);
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!sonnet) throw new Error("Expected bundled Sonnet model");
+		let manager: SessionManager | undefined;
+		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+		try {
+			const originalManager = SessionManager.create(agentDir, agentDir);
+			originalManager.appendModelChange(`${sonnet.provider}/${sonnet.id}`);
+			originalManager.appendConfiguredModelChain({
+				role: "default",
+				entries: ["removed-provider/old-profile-default"],
+				origin: "profile-activation",
+				identity: "codex-medium",
+				explicitHead: true,
+			});
+			await originalManager.ensureOnDisk();
+			await originalManager.flush();
+			const sessionFile = originalManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted resume session");
+			await originalManager.close();
+			manager = await SessionManager.open(sessionFile);
+
+			const result = await createAgentSession({
+				cwd: process.cwd(),
+				agentDir,
+				settings,
+				authStorage,
+				modelRegistry,
+				sessionManager: manager,
+				disableExtensionDiscovery: true,
+				enableLsp: false,
+				skipPythonPreflight: true,
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				hasUI: false,
+			});
+			session = result.session;
+
+			expect(session.model?.provider).toBe("openai-codex");
+			expect(session.model?.id).toBe("gpt-5.6-sol");
+			expect(session.getActiveModelProfile()).toBe("codex-medium");
+			expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({
+				entries: ["removed-provider/old-profile-default"],
+				origin: "profile-activation",
+				identity: "codex-medium",
 			});
 		} finally {
 			await session?.dispose();

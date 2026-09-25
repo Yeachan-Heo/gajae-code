@@ -102,6 +102,11 @@ function createRuntime() {
 		getActiveModelProfile() {
 			return activeModelProfile;
 		},
+		getEffectiveModelProfileOwnershipMarker() {
+			return activeModelProfile
+				? { kind: "profile" as const, profile: activeModelProfile }
+				: { kind: "inherit" as const };
+		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
 		},
