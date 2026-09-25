@@ -629,6 +629,8 @@ jobs:
         run: |
           bun test ./packages/natives/test/windows-runtime-install.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Windows hidden-console creation-flag unit tests
         shell: pwsh
         run: |
