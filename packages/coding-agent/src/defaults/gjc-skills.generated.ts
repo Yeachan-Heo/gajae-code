@@ -37,6 +37,14 @@ const validationBatchContracts = () =>
 	import("./gjc/skills/ultragoal/validation-batch-contracts.md", { with: { type: "text" } }).then(
 		module => module.default,
 	);
+const boundaryCohortGate = () =>
+	import("./gjc/skills/ultragoal/boundary-cohort-gate.md", { with: { type: "text" } }).then(module => module.default);
+const terminalCriticGate = () =>
+	import("./gjc/skills/ultragoal/terminal-critic-gate.md", { with: { type: "text" } }).then(module => module.default);
+const crossRepositorySuccession = () =>
+	import("./gjc/skills/ultragoal/cross-repository-succession.md", { with: { type: "text" } }).then(
+		module => module.default,
+	);
 const autoresearchIterate = () =>
 	import("./gjc/skills/autoresearch/auto-iterate.md", { with: { type: "text" } }).then(module => module.default);
 const autoresearchCritic = () =>
@@ -94,6 +102,24 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		parentSkillName: "ultragoal",
 		relativePath: "skill-fragments/ultragoal/validation-batch-contracts.md",
 		loadContent: validationBatchContracts,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "ultragoal",
+		relativePath: "skill-fragments/ultragoal/boundary-cohort-gate.md",
+		loadContent: boundaryCohortGate,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "ultragoal",
+		relativePath: "skill-fragments/ultragoal/terminal-critic-gate.md",
+		loadContent: terminalCriticGate,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "ultragoal",
+		relativePath: "skill-fragments/ultragoal/cross-repository-succession.md",
+		loadContent: crossRepositorySuccession,
 	},
 	{
 		kind: "skill-fragment",
