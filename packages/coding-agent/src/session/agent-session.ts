@@ -5450,11 +5450,20 @@ export class AgentSession {
 					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId, {
 						credentialSelector: { kind: "id", value: String(override.rowId) },
 					});
-					if (!isAuthenticated(apiKey)) {
-						throw new Error("Selected managed fallback credential is no longer available");
+					if (isAuthenticated(apiKey)) {
+						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						return apiKey;
 					}
-					if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
-					return apiKey;
+					// The preselected credential is no longer available; try to resolve another one of the same kind.
+					const fallbackApiKey = await this.#resolveManagedFallbackCredentialRow(
+						model,
+						override.credentialKind,
+					);
+					if (fallbackApiKey !== undefined) {
+						if (shouldCapture && model) this.#captureManagedFallbackActiveCredential(model);
+						return fallbackApiKey;
+					}
+					throw new Error("Selected managed fallback credential is no longer available");
 				}
 				const apiKey = await invokeOriginalGetApiKey(provider);
 				if (shouldCapture && model && isAuthenticated(apiKey))
