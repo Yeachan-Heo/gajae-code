@@ -4563,17 +4563,31 @@ export class Broker {
 		requestedOperation: string,
 		idempotencyKey: string | undefined,
 		requestedFingerprint: string,
+		legacyFingerprint?: string,
 	): Promise<BrokerResponse> {
 		if (!idempotencyKey) return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
 		if (requestedOperation === "session.spawn")
 			return error("invalid_input", "session.spawn does not support lifecycle lookup");
 		if (!LIFECYCLE_OPERATIONS.has(requestedOperation)) return error("not_found", "lifecycle operation was not found");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
-		const entry =
+		let entry =
 			this.ledger.get(identity) ??
 			this.ledger.findByOperationKey(`${requestedOperation}\0${idempotencyKey}`, requestedFingerprint);
+		let acceptedFingerprint = requestedFingerprint;
+		if (!entry && legacyFingerprint !== undefined) {
+			// Rows written before target-bound identities (v3) fingerprinted the raw,
+			// un-normalized request and are never expired, so they are matched only
+			// under their exact v3 identity and only against that raw fingerprint.
+			const legacy = this.ledger.get(
+				await deriveLegacyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey),
+			);
+			if (legacy) {
+				entry = legacy;
+				if (legacy.fingerprint === legacyFingerprint) acceptedFingerprint = legacyFingerprint;
+			}
+		}
 		if (!entry) return error("not_found", "lifecycle operation was not found");
-		if (entry.fingerprint !== requestedFingerprint)
+		if (entry.fingerprint !== acceptedFingerprint)
 			return error("idempotency_conflict", "lifecycle request fingerprint differs");
 		if (entry.state === "terminal_uncertain")
 			return error("terminal_uncertain", "lifecycle outcome is still uncertain");
@@ -4634,6 +4648,7 @@ export class Broker {
 				lookup.operation,
 				idempotencyKey,
 				lifecycleFingerprint(lookup.operation, lookupTarget.input),
+				lifecycleFingerprint(lookup.operation, lookup.target),
 			);
 		}
 		const normalization = normalizeBrokerInput(operation, input);

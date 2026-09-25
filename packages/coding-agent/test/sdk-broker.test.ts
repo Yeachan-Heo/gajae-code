@@ -34,7 +34,12 @@ import {
 	registerBrokerOwnerForTest,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import { deriveLegacyIdentity, deriveLegacyTargetIdentity, getBrokerIdentityKey } from "../src/sdk/broker/identity";
+import {
+	deriveIdempotencyIdentity,
+	deriveLegacyIdentity,
+	deriveLegacyTargetIdentity,
+	getBrokerIdentityKey,
+} from "../src/sdk/broker/identity";
 import { completeBrokerProcess } from "../src/sdk/broker/internal";
 import {
 	deriveLifecycleDeadlines,
@@ -2737,6 +2742,85 @@ describe("SDK broker identity and discovery", () => {
 			expect(launchAttempts).toBe(1);
 		} finally {
 			setLifecycleCommandResolverForTest(broker, undefined);
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("public session.lookup recovers a legacy v3 create row fingerprinted over the raw target", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-legacy-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const broker = new Broker({ agentDir });
+		const key = "legacy-v3-create";
+		const target = { cwd };
+		const rawFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.digest("hex");
+		const response = { ok: true, result: { sessionId: "legacy-created", cwd } } as const;
+		try {
+			await broker.start();
+			// Shape written before e2909ee69: v3 identity plus a raw-target fingerprint.
+			const identity = await deriveLegacyIdentity(agentDir, "session.create", key);
+			const begun = await broker.ledger.begin(identity, "legacy-v3-create-request", {
+				operationKey: `session.create\0${key}`,
+				fingerprint: rawFingerprint,
+			});
+			expect(begun.kind).toBe("new");
+			await broker.ledger.transition(identity, "terminal_ok", { response });
+
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual(response);
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { cwd: path.join(root, "other-workspace") } },
+					key,
+				),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+			expect(
+				await broker.handleRequest(
+					"session.lookup",
+					{ operation: "session.create", target: { ...target } },
+					"legacy-v3-create-other-key",
+				),
+			).toEqual({ ok: false, error: { code: "not_found", message: "lifecycle operation was not found" } });
+		} finally {
+			await broker.stop();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+	it("public session.lookup does not accept a raw-target fingerprint for a current create row", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-lookup-current-raw-"));
+		const agentDir = path.join(root, "agent");
+		const cwd = path.join(root, "workspace");
+		const broker = new Broker({ agentDir });
+		const key = "current-create-raw-fingerprint";
+		const target = { cwd };
+		const rawFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: target }))
+			.digest("hex");
+		try {
+			await broker.start();
+			// A current (v4) row must only match its normalized fingerprint; a raw one is a conflict.
+			const identity = await deriveIdempotencyIdentity(agentDir, "session.create", key);
+			await broker.ledger.begin(identity, "current-create-request", {
+				operationKey: `session.create\0${key}`,
+				fingerprint: rawFingerprint,
+			});
+			await broker.ledger.transition(identity, "terminal_ok", {
+				response: { ok: true, result: { sessionId: "current-created", cwd } },
+			});
+			expect(
+				await broker.handleRequest("session.lookup", { operation: "session.create", target: { ...target } }, key),
+			).toEqual({
+				ok: false,
+				error: { code: "idempotency_conflict", message: "lifecycle request fingerprint differs" },
+			});
+		} finally {
 			await broker.stop();
 			await fs.rm(root, { recursive: true, force: true });
 		}
