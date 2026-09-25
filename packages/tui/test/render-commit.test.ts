@@ -566,7 +566,7 @@ describe("generation-scoped render commits", () => {
 					return true;
 				},
 				records: [new TextEncoder().encode("LOSS_RASTER")],
-				abortSuffix: new TextEncoder().encode("LOSS_STALE_ABORT"),
+				abortSuffix: new TextEncoder().encode("LOSS_ABORT"),
 			},
 		});
 		try {
@@ -592,9 +592,11 @@ describe("generation-scoped render commits", () => {
 			await terminal.waitForRender();
 			const output = terminal.getWriteLog().join("");
 			expect(output).not.toContain("LOSS_STALE_RENDER");
-			expect(output).not.toContain("LOSS_STALE_ABORT");
 			expect(output).not.toContain("LOSS_RASTER");
-			expect(output).toContain("LOSS_FRESH_RENDER");
+			// The prefix reached the terminal before the loss, so its balancing
+			// bytes are retained and delivered on restore, ahead of the fresh frame.
+			expect(output.split("LOSS_ABORT").length - 1).toBe(1);
+			expect(output.indexOf("LOSS_ABORT")).toBeLessThan(output.indexOf("LOSS_FRESH_RENDER"));
 		} finally {
 			ingressGate.resolve();
 			await held;

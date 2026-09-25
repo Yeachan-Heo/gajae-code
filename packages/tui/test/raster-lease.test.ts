@@ -398,6 +398,16 @@ describe("TUI raster lease public boundary", () => {
 
 		expect((await pending).status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).toBe("FLUSH_PREFIX");
+
+		// The prefix was emitted, so its balancing bytes survive the loss.
+		available = true;
+		tui.start();
+		await tui.queueTerminalOutput("AFTER_FLUSH_LOSS");
+		const restored = terminal.getWriteLog().join("");
+		expect(restored.split("FLUSH_ABORT").length - 1).toBe(1);
+		expect(restored.indexOf("FLUSH_ABORT")).toBeLessThan(restored.indexOf("AFTER_FLUSH_LOSS"));
+		expect(restored).not.toContain("FLUSH_BODY");
+		tui.stop();
 	});
 	it("unblocks raster ingress when terminal flush ignores lifecycle abort", async () => {
 		const { tui, terminal } = await setup();
@@ -470,6 +480,16 @@ describe("TUI raster lease public boundary", () => {
 
 		expect((await pending).status).toBe("failed");
 		expect(terminal.getWriteLog().join("")).toBe("CALLBACK_PREFIX");
+
+		// The prefix was emitted, so its balancing bytes survive the loss.
+		available = true;
+		tui.start();
+		await tui.queueTerminalOutput("AFTER_CALLBACK_LOSS");
+		const restored = terminal.getWriteLog().join("");
+		expect(restored.split("CALLBACK_ABORT").length - 1).toBe(1);
+		expect(restored.indexOf("CALLBACK_ABORT")).toBeLessThan(restored.indexOf("AFTER_CALLBACK_LOSS"));
+		expect(restored).not.toContain("CALLBACK_BODY");
+		tui.stop();
 	});
 	it("unblocks raster ingress when afterPrefix ignores lifecycle abort", async () => {
 		const { tui, terminal } = await setup();

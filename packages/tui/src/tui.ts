@@ -2113,16 +2113,23 @@ export class TUI extends Container {
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
 				);
 				if (!prefixWritten) return failed();
+				let prefixClosed = false;
 				const abortBarrier = () => {
 					if (this.#inFlightMultipartAbort === abortBarrier) this.#inFlightMultipartAbort = undefined;
 					// Abort/cursor-restoration bytes are terminal writes: never emit
 					// them once the running epoch ended (e.g. a user predicate that
 					// itself stops the terminal before throwing or returning false).
-					if (!isCurrentLifecycle() || !this.terminalAvailable) return;
+					if (prefixClosed || !isCurrentLifecycle()) return;
+					prefixClosed = true;
 					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
-					if (abortSuffix || cursorVisibility)
-						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
+					const cleanup = abortSuffix + cursorVisibility;
+					if (!cleanup) return;
+					// The prefix already reached the terminal (synchronized output, saved
+					// and hidden cursor). If the terminal is unavailable now, retain the
+					// balancing bytes for availability restoration instead of dropping them.
+					if (!this.terminalAvailable || !this.#guardTerminalOperation(() => this.terminal.write(cleanup)))
+						this.#pendingTerminalCleanup.push({ payload: cleanup });
 				};
 				multipartAbortBarrier = abortBarrier;
 				this.#inFlightMultipartAbort = abortBarrier;
