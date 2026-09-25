@@ -137,6 +137,51 @@ describe("goal runtime", () => {
 		expect(harness.persists).toHaveLength(2);
 	});
 
+	it("accounts usage at tool boundaries in memory and persists it once at agent end", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal() },
+		});
+
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		for (let call = 1; call <= 5; call++) {
+			harness.setUsage({ input: call * 10 });
+			harness.advance(1_000);
+			await harness.runtime.onToolCompleted("bash");
+		}
+		await harness.runtime.onGoalToolCompleted();
+
+		expect(harness.getState()?.goal.tokensUsed).toBe(50);
+		expect(harness.getState()?.goal.timeUsedSeconds).toBe(5);
+		expect(harness.events.filter(event => event.type === "goal_updated")).toHaveLength(5);
+		expect(harness.persists).toHaveLength(0);
+
+		// No usage since the last tool boundary: the pending counters are still written.
+		await harness.runtime.onAgentEnd({ currentUsage: createUsage({ input: 50 }) });
+		expect(harness.persists).toHaveLength(1);
+		expect(harness.persists[0]?.mode).toBe("goal");
+		expect(harness.persists[0]?.state?.goal.tokensUsed).toBe(50);
+		expect(harness.persists[0]?.state?.goal.timeUsedSeconds).toBe(5);
+
+		// Nothing new to record: a second end-of-run flush does not append another entry.
+		harness.runtime.onTurnStart("turn-2", createUsage({ input: 50 }));
+		await harness.runtime.onAgentEnd({ currentUsage: createUsage({ input: 50 }) });
+		expect(harness.persists).toHaveLength(1);
+	});
+
+	it("persists tool-boundary usage when the goal is paused mid-run", async () => {
+		const harness = createHarness({
+			state: { enabled: true, mode: "active", goal: createGoal() },
+		});
+
+		harness.runtime.onTurnStart("turn-1", createUsage());
+		harness.setUsage({ input: 30 });
+		await harness.runtime.onToolCompleted("read");
+		await harness.runtime.pauseGoal();
+
+		expect(harness.persists.map(entry => entry.mode)).toEqual(["goal_paused"]);
+		expect(harness.persists[0]?.state?.goal.tokensUsed).toBe(30);
+	});
+
 	it("keeps goals active when usage exceeds a legacy token budget", async () => {
 		const harness = createHarness({
 			state: {
