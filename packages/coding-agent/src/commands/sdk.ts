@@ -495,6 +495,7 @@ export async function runSessionHost(
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
+		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
 	} = {},
 ): Promise<void> {
 	const now = timing.now ?? Date.now;
@@ -503,6 +504,7 @@ export async function runSessionHost(
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
+	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
@@ -585,12 +587,19 @@ export async function runSessionHost(
 	const capability = new SdkStartupCapability(rollback, request.readiness ?? "immediate", effectMarker);
 	const startupOwner: SdkLifecycleStartupOwner = { capability, rollback };
 	let startupComplete = false;
+	let readinessPublicationCleanupComplete = true;
+	let revokePendingReadinessMarker: (() => boolean) | undefined;
 	let startupInterruption: SdkStartupFailure | undefined;
 	const interrupted = Promise.withResolvers<SdkStartupFailure>();
 	const interruptStartup = (failure: SdkStartupFailure): void => {
 		if (startupInterruption !== undefined) return;
 		startupInterruption = failure;
 		capability.cancel(failure);
+		if (revokePendingReadinessMarker) {
+			const revoked = revokePendingReadinessMarker();
+			readinessPublicationCleanupComplete = revoked;
+			if (revoked) revokePendingReadinessMarker = undefined;
+		}
 		interrupted.resolve(failure);
 	};
 	const cutoffFailure = (): SdkStartupFailure => capability.normalizeFailure("startup", "pending");
@@ -678,6 +687,19 @@ export async function runSessionHost(
 		return settlement.value;
 	};
 	let constructionCleanupComplete = true;
+	const runBoundedStartupCleanup = async (cleanup: () => Promise<void>): Promise<boolean> => {
+		const completed = await Promise.race([
+			Promise.resolve()
+				.then(cleanup)
+				.then(
+					() => true,
+					() => false,
+				),
+			Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+		]);
+		if (!completed) constructionCleanupComplete = false;
+		return completed;
+	};
 	const constructionFailure = (error: unknown): SdkStartupFailure => {
 		if (error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error)
 			return error as SdkStartupFailure;
@@ -685,6 +707,8 @@ export async function runSessionHost(
 	};
 
 	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
+	let openedSessionManager: SessionManager | undefined;
+	let sessionManagerTransferred = false;
 	let created: CreateLifecycleAgentSessionResult;
 	let mcpConfigDirectory: string | undefined;
 	try {
@@ -700,34 +724,55 @@ export async function runSessionHost(
 				}
 			},
 		);
+		openedSessionManager = opened.sessionManager;
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
-			mcpConfigDirectory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")));
-			mcpConfigPath = path.join(mcpConfigDirectory, "mcp.json");
-			await Bun.write(
-				mcpConfigPath,
-				JSON.stringify({
-					mcpServers: Object.fromEntries(
-						request.mcpServers.map(server => [
-							server.name,
-							"url" in server
-								? {
-										type: server.type,
-										url: server.url,
-										...(server.headers ? { headers: server.headers } : {}),
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									}
-								: {
-										type: server.type,
-										command: server.command,
-										args: server.args,
-										...(server.env ? { env: server.env } : {}),
-										noInheritEnv: true,
-										timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
-									},
-						]),
-					),
-				}),
+			const temporaryDirectory = await beforeCutoff(
+				() => fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")),
+				async late => {
+					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration directory cleanup did not complete.");
+				},
+			);
+			mcpConfigDirectory = temporaryDirectory;
+			const canonicalDirectory = await beforeCutoff(
+				() => fs.realpath(temporaryDirectory),
+				async late => {
+					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration path cleanup did not complete.");
+				},
+			);
+			mcpConfigDirectory = canonicalDirectory;
+			const configPath = path.join(canonicalDirectory, "mcp.json");
+			mcpConfigPath = configPath;
+			const configContents = JSON.stringify({
+				mcpServers: Object.fromEntries(
+					request.mcpServers.map(server => [
+						server.name,
+						"url" in server
+							? {
+									type: server.type,
+									url: server.url,
+									...(server.headers ? { headers: server.headers } : {}),
+									timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+								}
+							: {
+									type: server.type,
+									command: server.command,
+									args: server.args,
+									...(server.env ? { env: server.env } : {}),
+									noInheritEnv: true,
+									timeout: ACP_MCP_REQUEST_TIMEOUT_MS,
+								},
+					]),
+				),
+			});
+			await beforeCutoff(
+				() => writeMcpConfig(configPath, configContents),
+				async () => {
+					if (!(await runBoundedStartupCleanup(() => fs.rm(canonicalDirectory, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration write cleanup did not complete.");
+				},
 			);
 			throwIfStartupInterrupted();
 		}
@@ -753,8 +798,9 @@ export async function runSessionHost(
 		}
 
 		created = await beforeCutoff(
-			() =>
-				createLifecycleSession(
+			async () => {
+				sessionManagerTransferred = true;
+				const result = await createLifecycleSession(
 					{
 						cwd,
 						agentDir,
@@ -766,7 +812,13 @@ export async function runSessionHost(
 						lifecycleRequestId: effectMarker,
 					},
 					startupOwner,
-				),
+				);
+				if (mcpConfigDirectory) {
+					await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
+					mcpConfigDirectory = undefined;
+				}
+				return result;
+			},
 			async late => {
 				if ("failure" in late) return;
 				try {
@@ -782,14 +834,21 @@ export async function runSessionHost(
 		);
 	} catch (error) {
 		removeStartupSignalHandlers();
+		if (!sessionManagerTransferred && openedSessionManager) {
+			const manager = openedSessionManager;
+			await runBoundedStartupCleanup(() => manager.close());
+		}
+		if (mcpConfigDirectory) {
+			const directory = mcpConfigDirectory;
+			mcpConfigDirectory = undefined;
+			await runBoundedStartupCleanup(() => fs.rm(directory, { recursive: true, force: true }));
+		}
 		const failure = constructionFailure(error);
 		const settled = capability.settleFailure(failure);
 		const durableFailure = settled.status === "failed" ? settled.failure : failure;
 		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 		await writeFailure(durableFailure, rollback.result);
 		throw error;
-	} finally {
-		if (mcpConfigDirectory) await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
 	}
 	if ("failure" in created) {
 		removeStartupSignalHandlers();
@@ -863,7 +922,6 @@ export async function runSessionHost(
 		return disposal ?? Promise.resolve(undefined);
 	};
 	let failureRollback: Promise<void> | undefined;
-	let readinessPublicationCleanupComplete = true;
 	const failAfterRollback = (failure: SdkStartupFailure): Promise<void> => {
 		failureRollback ??= (async () => {
 			const transcript = await disposeAndCapture();
@@ -961,6 +1019,9 @@ export async function runSessionHost(
 						request.sessionId,
 						effectMarker,
 						() => startupInterruption === undefined && now() < request.semanticReadyDeadlineAt,
+						revoke => {
+							revokePendingReadinessMarker = revoke;
+						},
 						() => {
 							readinessPublished = true;
 						},
@@ -985,6 +1046,7 @@ export async function runSessionHost(
 		}
 		readinessPublicationCleanupComplete = true;
 		startupComplete = true;
+		revokePendingReadinessMarker = undefined;
 		removeStartupSignalHandlers();
 		process.once("SIGTERM", onReadySignal);
 		process.once("SIGINT", onReadySignal);
