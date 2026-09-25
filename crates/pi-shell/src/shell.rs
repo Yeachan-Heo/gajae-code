@@ -860,7 +860,7 @@ fn shell_working_dir_matches(shell: &BrushShell, cwd: &str) -> bool {
 	current == requested
 }
 
-async fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> Result<()> {
+fn set_shell_working_dir_if_changed(shell: &mut BrushShell, cwd: &str) -> Result<()> {
 	if shell_working_dir_matches(shell, cwd) {
 		return Ok(());
 	}
@@ -876,7 +876,7 @@ async fn run_shell_command(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, Option<MinimizerResult>, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd)?;
 	}
 
 	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
@@ -1109,7 +1109,7 @@ async fn run_shell_command_streams(
 	cancel_token: CancellationToken,
 ) -> Result<(ExecutionResult, OutputTruncation)> {
 	if let Some(cwd) = options.cwd.as_deref() {
-		set_shell_working_dir_if_changed(&mut session.shell, cwd).await?;
+		set_shell_working_dir_if_changed(&mut session.shell, cwd)?;
 	}
 
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
