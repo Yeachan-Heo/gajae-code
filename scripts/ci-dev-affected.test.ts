@@ -900,7 +900,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const vendored = await runScript(["--matrix-json"], "crates/brush-core-vendored/src/lib.rs");
 		expect(vendored.exitCode).toBe(0);
 		const vendoredKeys = (JSON.parse(vendored.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key);
-		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(5);
+		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(9);
 		expect(vendoredKeys.some(key => key.includes("brush"))).toBe(false);
 	});
 
@@ -929,7 +929,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			expect(exitCode).toBe(0);
 			const entries = JSON.parse(stdout.trim()) as Array<{ key: string }>;
 			expect(entries.filter(entry => entry.key.startsWith("ts-build:")).map(entry => entry.key)).toHaveLength(2);
-			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(5);
+			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(9);
 			expect(entries.filter(entry => entry.key === "native-linux-x64")).toHaveLength(1);
 		}
 	});
@@ -1527,6 +1527,19 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
+	});
+	test("pi-edit matcher changes select the differential and edit behavior suites", () => {
+		const keys = targeted([
+			"crates/pi-edit/src/fuzzy.rs",
+			"crates/pi-natives/src/edit.rs",
+			"packages/coding-agent/src/edit/modes/replace.ts",
+			"packages/coding-agent/src/edit/modes/patch.ts",
+		]).map(task => task.key);
+		expect(keys).toContain("test:packages/natives/test/differential/edit-fuzzy.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/edit-diff.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/apply-patch.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/edit-hotspots-golden.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/tools.test.ts");
 	});
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);

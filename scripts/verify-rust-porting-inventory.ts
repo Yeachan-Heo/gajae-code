@@ -4,7 +4,7 @@
  *
  * `--deps` compares shared Cargo dependencies with the pinned upstream snapshot.
  * The default mode validates the A–E inventory schema and its filesystem evidence;
- * `--final` additionally requires that no row remains candidate or in-progress.
+ * `--final` additionally requires that no row remains candidate, in-progress, or blocked.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -214,8 +214,9 @@ export async function validateInventory(
 		else ids.add(id);
 		if (!values.kind.trim()) add("kind is required");
 		if (!values.status.trim()) add("status is required");
-		if (!["candidate", "in-progress", "adopted", "rejected", "keep-local"].includes(values.status)) add(`unknown status ${values.status}`);
+		if (!["candidate", "in-progress", "blocked", "adopted", "rejected", "keep-local"].includes(values.status)) add(`unknown status ${values.status}`);
 		if (values.status === "rejected" && (!values.reason.trim() || values.reason === "—")) add("rejected rows require a reason");
+		if (values.status === "blocked" && (!values.reason.trim() || values.reason === "—")) add("blocked rows require a reason");
 		if (values.status === "keep-local") {
 			const guards = listedPaths(values["keep-local guards"]);
 			if (guards.length === 0) add("keep-local rows require at least one guard test path");
@@ -253,8 +254,8 @@ export async function validateInventory(
 				if (FALLBACK_MARKERS.some(marker => marker.test(source))) add(`no-fallback path contains an alternative implementation marker: ${relativePath}`);
 			}
 		}
-		if (options.final && ["candidate", "in-progress"].includes(values.status)) {
-			add(`--final requires no candidate or in-progress rows (section ${section})`);
+		if (options.final && ["candidate", "in-progress", "blocked"].includes(values.status)) {
+			add(`--final requires no candidate, in-progress, or blocked rows (section ${section})`);
 		}
 	}
 	return violations;

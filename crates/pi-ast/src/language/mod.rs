@@ -1,5 +1,7 @@
-// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/mod.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: retain full-langs and Perl gating; add pinned Emacs Lisp and Fortran grammars behind full-langs.
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/mod.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain
+// full-langs and Perl gating; add Emacs Lisp/Fortran grammars behind full-langs
+// and infer shell rc paths as Bash.
 //! Vendored and extended language definitions for ast-grep integration.
 //!
 //! Originally derived from `ast-grep-language` v0.39.9, stripped of
@@ -910,10 +912,31 @@ const fn extensions(lang: SupportLang) -> &'static [&'static str] {
 	}
 }
 
-/// Guess language from file extension.
+/// Guess language from an extension or recognized extensionless
+/// source filename.
 fn from_extension(path: &Path) -> Option<SupportLang> {
-	#[cfg(feature = "full-langs")]
 	let name = path.file_name()?.to_str()?;
+	let stem = name.strip_prefix('.').unwrap_or(name);
+	if matches!(
+		stem,
+		"zshrc"
+			| "zshenv"
+			| "zprofile"
+			| "zlogin"
+			| "zlogout"
+			| "zsh_aliases"
+			| "bashrc"
+			| "bash_profile"
+			| "bash_login"
+			| "bash_logout"
+			| "bash_aliases"
+			| "profile"
+			| "kshrc"
+			| "mkshrc"
+			| "shrc"
+	) {
+		return Some(SupportLang::Bash);
+	}
 	#[cfg(feature = "full-langs")]
 	if name == "Makefile" || name == "makefile" || name == "GNUmakefile" {
 		return Some(SupportLang::Make);
@@ -945,7 +968,7 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
 	SupportLang::all_langs()
 		.iter()
 		.copied()
-		.find(|&l| extensions(l).contains(&ext))
+		.find(|&language| extensions(language).contains(&ext))
 }
 
 static CORE_LANG_ALIASES: phf::Map<&'static str, SupportLang> = phf_map! {

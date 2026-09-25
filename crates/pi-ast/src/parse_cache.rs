@@ -1,9 +1,10 @@
-// Vendored from oh-my-pi (MIT) crates/pi-ast/src/parse_cache.rs @ a85bd5228d9f0f619deade1db78fa49420a721e1
-// Local modifications: scope cache documentation to summary because block.rs has no gjc consumer.
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/parse_cache.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain the GJC
+// bounded cache and restore block/summary documentation for pi-edit.
 //! Bounded, content-addressed tree-sitter parse cache.
 //!
-//! The source-summary entry point in this crate ([`crate::summary`]) is
-//! dominated by one cost: `Parser::parse` over the whole
+//! Every structural entry point in this crate ([`crate::block`],
+//! [`crate::summary`]) is dominated by one cost: `Parser::parse` over the whole
 //! file. Measured on an M4 Max (release, warm page cache) that is ~13.5 ms for
 //! an 81 KB / 2057-line TypeScript file and ~187 ms for a 1.05 MB file, while
 //! everything else those functions do totals well under a millisecond.

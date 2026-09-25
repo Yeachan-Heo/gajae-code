@@ -15,9 +15,11 @@ Gajae-Code builds on lessons from a small family of agent harnesses and keeps at
 - [`Markit`](https://github.com/Michaelliv/markit) — MIT-licensed document converter, pinned to `markit-ai` 0.5.3 under `packages/coding-agent/vendor/markit-ai`. Its license, upstream package metadata, integrity/hash inventory and reproducible patch are retained alongside the vendored code.
 - [`pdf-inspector`](https://crates.io/crates/pdf-inspector) — MIT-licensed PDF inspector maintained by Firecrawl, used with its default Rust features for native PDF-to-Markdown conversion.
 - `pi-ast` — MIT-licensed AST language, pattern, and structural-summary support from oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1, vendored under `crates/pi-ast` with its upstream license retained.
+- `crates/pi-ast/src/block.rs` is vendored from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1` as a Rust-only pi-edit dependency; no `blockRange` N-API export is added.
 - `pi-vfs` and `pi-walker` are MIT-licensed crates vendored at `a85bd5228d9f0f619deade1db78fa49420a721e1`; their retained license texts are in `crates/pi-vfs/LICENSE` and `crates/pi-walker/LICENSE`.
 - The local `brush-builtins-vendored` fork selectively reconciles base-builtin behavior from `can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1`; adopted source files retain per-file attribution, while utility builtins remain excluded.
 - Pi-shell's `shell.rs` is selectively reconciled with the pinned source; GJC's process, cancellation, HMAC, minimizer, output-budget, and hidden-console changes remain local. The shell uses upstream `output_decode.rs` for incremental UTF-8 and Windows ANSI-code-page decoding.
+- `crates/pi-edit` is the MIT-licensed crate vendored at `a85bd5228d9f0f619deade1db78fa49420a721e1`; see `crates/pi-edit/LICENSE`. Local matcher bindings do not expose upstream descriptions, grammars, or sloppy mode; GJC prompts and grammars remain authoritative.
 
 ## Vendored Rust from oh-my-pi @ a85bd522
 

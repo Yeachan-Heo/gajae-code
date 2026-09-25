@@ -137,6 +137,11 @@ describe("verify-rust-porting-inventory schema", () => {
 			expect(await validateInventory(withKeepLocal, root)).toEqual([]);
 			const missingGuard = withKeepLocal.replace("`test/guard.test.ts`", "`test/missing.test.ts`");
 			expect((await validateInventory(missingGuard, root)).some(item => item.message.includes("guard path does not exist"))).toBe(true);
+			const blocked = baseInventory.replace("candidate |  |  | — | — | — | — |", "blocked |  |  | surrogate matcher threshold semantics are unresolved | — | — | — |");
+			expect(await validateInventory(blocked, root)).toEqual([]);
+			expect((await validateInventory(blocked, root, { final: true })).some(item => item.message.includes("--final requires"))).toBe(true);
+			const blockedWithoutReason = blocked.replace("surrogate matcher threshold semantics are unresolved", "—");
+			expect((await validateInventory(blockedWithoutReason, root)).some(item => item.message.includes("blocked rows require a reason"))).toBe(true);
 			expect((await validateInventory(baseInventory, root, { final: true })).some(item => item.message.includes("--final requires"))).toBe(true);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-import { generateDiffString, replaceText } from "../../coding-agent/src/edit/diff";
+import { generateDiffString } from "../../coding-agent/src/edit/diff";
 import { findMatch, seekSequence } from "../../coding-agent/src/edit/modes/replace";
 import { formatHashLine, formatHashLines } from "../../coding-agent/src/hashline/hash";
 
@@ -8,7 +8,7 @@ const PASS_SPEEDUP = 2;
 const SCHEMA = "gjc.native-bench-ab/1";
 
 type CandidateId = "H01" | "H02" | "H06";
-type BenchValue = unknown;
+type BenchValue = unknown | Promise<unknown>;
 type BenchFn = () => BenchValue;
 
 interface Candidate {
@@ -34,7 +34,6 @@ const editLines = Array.from({ length: 1400 }, (_, index) => {
 });
 const editContent = editLines.join("\n");
 const h01Target = "    return alphaBetaGamme(value, options);";
-const h02Replacement = "    return nativeCandidate(value, options);";
 const hashText = Array.from({ length: 2500 }, (_, index) => {
 	if (index % 97 === 0) return "";
 	if (index % 89 === 0) return `tabs\tand unicode “quotes” ${index}`;
@@ -54,21 +53,17 @@ const candidates: Candidate[] = [
 		fixture: "multi-line edit corpus",
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), targetBytes: Buffer.byteLength(h01Target) },
 		baselineFn: () => findMatch(editContent, h01Target, { allowFuzzy: true, threshold: 0.9 }),
-		nativeExportNames: ["h01FindBestFuzzyMatch"],
-		nativeArgs: [editContent, h01Target, 0.9],
+		nativeExportNames: ["editFindMatch"],
+		nativeArgs: [editContent, h01Target, true, 0.9],
 	},
 	{
 		id: "H02",
-		name: "replaceText + seekSequence hotspot",
+		name: "seekSequence fuzzy matcher hotspot",
 		fixture: "patch/replace corpus",
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), patternLines: 1 },
-		baselineFn: () => {
-			const replaced = replaceText(editContent, "    return alphaBetaGamma(value, options);", h02Replacement, { fuzzy: true, all: false });
-			const sequence = seekSequence(editLines, ["    return alphaBetaGamme(value, options);"], 0, false, { allowFuzzy: true });
-			return { replaced, sequence };
-		},
-		nativeExportNames: ["h02ScoreSequenceFuzzy"],
-		nativeArgs: [editLines, [h01Target], 0, false],
+		baselineFn: () => seekSequence(editLines, [h01Target], 0, false, { allowFuzzy: true }),
+		nativeExportNames: ["editSeekSequence"],
+		nativeArgs: [editLines, [h01Target], 0, false, true],
 	},
 	{
 		id: "H06",
@@ -88,18 +83,18 @@ function stats(samples: number[]): Timing {
 	return { median, p95 };
 }
 
-function timeSamples(fn: BenchFn, iterations: number): number[] {
+async function timeSamples(fn: BenchFn, iterations: number): Promise<number[]> {
 	const samples: number[] = [];
 	for (let i = 0; i < iterations; i++) {
 		const start = Bun.nanoseconds();
-		void fn();
+		await fn();
 		samples.push((Bun.nanoseconds() - start) / 1e6);
 	}
 	return samples;
 }
 
-function time(fn: BenchFn, iterations: number): Timing {
-	return stats(timeSamples(fn, iterations));
+async function time(fn: BenchFn, iterations: number): Promise<Timing> {
+	return stats(await timeSamples(fn, iterations));
 }
 
 async function resolveNative(candidate: Candidate): Promise<BenchFn | undefined> {
@@ -154,8 +149,8 @@ async function main(): Promise<void> {
 				continue;
 			}
 			try {
-				for (let i = 0; i < WARMUP; i++) nativeFn();
-				cases.push({ id: candidate.id, status: "measured", samples: timeSamples(nativeFn, cli.iterations) });
+				for (let i = 0; i < WARMUP; i++) await nativeFn();
+				cases.push({ id: candidate.id, status: "measured", samples: await timeSamples(nativeFn, cli.iterations) });
 			} catch {
 				cases.push({ id: candidate.id, status: "error", samples: [] });
 				failed = true;
@@ -169,16 +164,16 @@ async function main(): Promise<void> {
 	console.log(`Benchmark: edit hotspots (${cli.iterations} iterations, ${WARMUP} warmup)\n`);
 	console.log("id\tstatus\tbaseline median\tbaseline p95\tnative median\tnative p95\tspeedup\tgate\tfixture");
 	for (const candidate of candidates) {
-		for (let i = 0; i < WARMUP; i++) candidate.baselineFn();
-		const baseline = time(candidate.baselineFn, cli.iterations);
+		for (let i = 0; i < WARMUP; i++) await candidate.baselineFn();
+		const baseline = await time(candidate.baselineFn, cli.iterations);
 		const nativeFn = await resolveNative(candidate);
 		const dims = Object.entries(candidate.dimensions).map(([key, value]) => `${key}=${value}`).join(",");
 		if (!nativeFn) {
 			console.log(`${candidate.id}\tSKIPPED\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t-\t-\t-\tSKIP\t${candidate.fixture} (${dims})`);
 			continue;
 		}
-		for (let i = 0; i < WARMUP; i++) nativeFn();
-		const nativeTiming = time(nativeFn, cli.iterations);
+		for (let i = 0; i < WARMUP; i++) await nativeFn();
+		const nativeTiming = await time(nativeFn, cli.iterations);
 		const speedup = baseline.median / nativeTiming.median;
 		const pass = speedup >= PASS_SPEEDUP;
 		console.log(`${candidate.id}\t${pass ? "PASS" : "FAIL"}\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t${nativeTiming.median.toFixed(3)}ms/op\t${nativeTiming.p95.toFixed(3)}ms/op\t${speedup.toFixed(2)}x\t>=${PASS_SPEEDUP}x\t${candidate.fixture} (${dims})`);

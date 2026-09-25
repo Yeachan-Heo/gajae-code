@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import {
+	editFindMatch,
+	editSeekSequence,
 	h01FindBestFuzzyMatch,
 	h02ScoreSequenceFuzzy,
 	h06FormatHashLines,
@@ -27,4 +29,11 @@ test("h02ScoreSequenceFuzzy returns a result shape", () => {
 	const r = h02ScoreSequenceFuzzy(["function alpha() {}", "x"], ["function alpha() {}"], 0, false);
 	expect(r).toBeTruthy();
 	expect(typeof r.matchCount).toBe("number");
+});
+
+test("pi-edit matcher exports are callable via the native loader", () => {
+	const match = editFindMatch("prefix\nalpha", "alpha", false, 0.95);
+	expect(match.matched).toMatchObject({ actualText: "alpha", startIndex: 7, startLine: 2, confidence: 1 });
+	const sequence = editSeekSequence(["  alpha"], ["alpha"], 0, false, true);
+	expect(sequence).toMatchObject({ index: 0, confidence: 0.98, strategy: "trim" });
 });
