@@ -184,6 +184,42 @@ describe("MonitorTool", () => {
 		).rejects.toThrow(/Use the `read` tool instead/);
 	});
 
+	it("rejects an explicit timeout above the Bash ceiling before creating a job (#5970)", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		await expect(
+			tool.execute("call", {
+				command: "printf 'ready\\n'",
+				kind: "poll",
+				description: "delayed continuation",
+				timeout: 21600,
+				persistent: true,
+			}),
+		).rejects.toThrow(/Monitor timeout 21600s exceeds the 3600s maximum/);
+		expect(manager.getAllJobs()).toHaveLength(0);
+		expect(steered).toHaveLength(0);
+	});
+
+	it("accepts a timeout at the ceiling and an omitted timeout", async () => {
+		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
+		const session = createSession(settings, { steered });
+		const tool = MonitorTool.createIf(session)!;
+		for (const timeout of [3600, undefined]) {
+			const result = expectText(
+				await tool.execute("call", {
+					command: "printf 'ok\\n'",
+					kind: "poll",
+					description: "bounded monitor",
+					timeout,
+				}),
+			);
+			expect(result.text).toStartWith("Monitor started");
+		}
+		await manager.waitForAll();
+		expect(steered).toHaveLength(2);
+	});
+
 	it("persistent monitor coalesces duplicate executable notifications", async () => {
 		const steered: Array<{ customType: string; content: string; details?: unknown }> = [];
 		const session = createSession(settings, { steered });
