@@ -102,6 +102,7 @@ function redactConfigValue(path: string, value: unknown, showSecrets?: boolean):
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
 	if (path === "modelProfile.ownership") return undefined;
+	if (path === "modelProfile.default" && settings.getGlobal("modelProfile.ownership") !== undefined) return undefined;
 	if (!(path in SETTINGS_SCHEMA)) return undefined;
 	const key = path as SettingPath;
 	const ui = getUi(key);
