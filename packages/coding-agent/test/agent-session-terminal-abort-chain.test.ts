@@ -1315,7 +1315,15 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		try {
 			scriptedResponses = [bashCall("controlled second-turn command", "call_second_turn")];
 			const secondPrompt = session.prompt("second turn").catch(() => {});
-			const bashExecution = await bashStarted.promise;
+			// A prompt that ends before dispatching Bash must also settle this gate;
+			// otherwise a failed/short-circuited run leaves bashStarted unresolved
+			// until the test's 60-second timeout.
+			const bashExecution = await Promise.race([
+				bashStarted.promise,
+				secondPrompt.then(() => {
+					throw new Error("second turn settled before the controlled Bash executor started");
+				}),
+			]);
 			expect(bashExecution.signal?.aborted).toBe(false);
 			const handle = session.agent.activeResourceRunId ?? "run";
 			await expect(
