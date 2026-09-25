@@ -295,7 +295,7 @@ The completion-gate cleanup sweep is driven by `ai-slop-cleaner`, an internal Ul
 
 ## Boundary completion cohort gate
 
-Every story boundary runs one frozen-snapshot review generation: verify, freeze the change set, run the cohort lanes (ai-slop-cleaner, `architect` review, `executor` QA/red-team) on the frozen snapshot, then join all lane verdicts before any repair. Validate the gate with `gjc ultragoal quality-gate validate` before checkpointing.
+This heavyweight gate applies only at a boundary: the run's final required goal, or an explicit validation batch's final member. Intermediate stories use the lightweight `deferredToBatch` checkpoint above and never run this cohort. At a boundary, one frozen-snapshot review generation runs: verify, freeze the change set, run the cohort lanes (ai-slop-cleaner, `architect` review, `executor` QA/red-team) on that snapshot, then join all lane verdicts before any repair. Validate the gate with `gjc ultragoal quality-gate validate` before checkpointing.
 
 The full contract lives in the `boundary-cohort-gate` fragment. Read `embedded:gjc/skill-fragments/ultragoal/boundary-cohort-gate.md` before acting on this section; do not act from this summary alone.
 
