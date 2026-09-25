@@ -86,6 +86,7 @@ export const nativeBuildInfo = nativeBindings.nativeBuildInfo;
 export const openRecoveryFsRoot = nativeBindings.openRecoveryFsRoot;
 export const parseKey = nativeBindings.parseKey;
 export const parseKittySequence = nativeBindings.parseKittySequence;
+export const pdfToMarkdown = nativeBindings.pdfToMarkdown;
 export const probeWindowsJobMemory = nativeBindings.probeWindowsJobMemory;
 export const ptyTimeoutCount = nativeBindings.ptyTimeoutCount;
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard;

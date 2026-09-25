@@ -49,6 +49,7 @@ pub mod power;
 
 pub mod iso;
 pub mod path_identity;
+pub mod pdf;
 pub mod prof;
 pub mod ps;
 pub mod pty;
