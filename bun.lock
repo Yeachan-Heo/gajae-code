@@ -146,6 +146,9 @@
     "packages/orchestration-token-benchmark": {
       "name": "@gajae-code/orchestration-token-benchmark",
       "version": "0.0.1",
+      "dependencies": {
+        "@gajae-code/coding-agent": "catalog:",
+      },
       "devDependencies": {
         "@types/bun": "catalog:",
       },

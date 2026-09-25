@@ -148,6 +148,7 @@
     "bench:composer-stability-v3:trace": "bun packages/agent/bench/composer-stability-v3.ts --trace --trace-file packages/agent/test/fixtures/composer-stability-v3/traces/parity.json",
     "bench:orchestration-tokens": "bun --cwd=packages/orchestration-token-benchmark run start",
     "bench:orchestration-tokens:live": "bun --cwd=packages/orchestration-token-benchmark run bench:live",
+    "bench:tool-results:live": "bun --cwd=packages/orchestration-token-benchmark run bench:tool-results:live",
     "stats:sync": "python3 scripts/session-stats/sync.py",
     "stats:tools": "python3 scripts/session-stats/analyze.py tools",
     "stats:edits": "python3 scripts/session-stats/analyze.py edits",
