@@ -2412,6 +2412,32 @@ export interface PatchHunk {
   lines: Array<string>
 }
 
+/** Markdown and inspection metadata produced from a PDF document. */
+export interface PdfMarkdownResult {
+  /** Extracted document content in Markdown format. */
+  markdown: string
+  /** Document title from PDF metadata, when present. */
+  title?: string
+  /** Total number of pages in the document. */
+  pageCount: number
+  /** One-indexed page numbers whose content requires OCR. */
+  pagesNeedingOcr: Array<number>
+  /** Whether the document contains text encoding problems. */
+  hasEncodingIssues: boolean
+}
+
+/**
+ * Convert an in-memory PDF to Markdown and return its inspection metadata.
+ *
+ * Conversion copies the typed array before dispatch so JavaScript mutation
+ * cannot race the native worker.
+ *
+ * # Errors
+ * Returns an error prefixed with `PDF conversion failed:` when the PDF cannot
+ * be parsed or converted.
+ */
+export declare function pdfToMarkdown(input: Uint8Array): Promise<PdfMarkdownResult>
+
 /**
  * Options for starting a power assertion.
  *
