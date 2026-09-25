@@ -107,8 +107,8 @@ async function createSessionHostFixture(
 		"GJC_SDK_TEST_IN_MEMORY_SESSION",
 	] as const;
 	const previous = names.map(name => process.env[name]);
-	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 	await fs.writeFile(
 		path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 		JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -521,7 +521,7 @@ async function liveLifecycleSession(root: string, agentDir: string, sessionId: s
 	spawned.push(child);
 	if (!child.pid) throw new Error("session host has no pid");
 	const childIncarnation = await incarnation(child.pid);
-	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 	if (staleMarkerFirst) {
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
@@ -737,7 +737,7 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
 	const previous = names.map(name => process.env[name]);
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -805,8 +805,8 @@ test("session host joins and cleans a session completing after readiness cutoff"
 	let restoreCloseSpy: (() => void) | undefined;
 	let host: Promise<void> | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -927,8 +927,8 @@ test("session host publishes SIGTERM failure without waiting for hung constructi
 	let releaseLateResult: (() => void) | undefined;
 	let startup: Promise<void> | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1258,8 +1258,8 @@ test("session host keeps startup signal ownership until rollback disposal and re
 	let sessionManager: SessionManager | undefined;
 	let host: Promise<void> | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1366,8 +1366,8 @@ test("profile-stage cutoff joins late work before session rollback evidence", as
 	let sessionManager: SessionManager | undefined;
 	let host: Promise<void> | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1489,8 +1489,8 @@ test("extension-stage cutoff joins initialization before rollback evidence", asy
 	let sessionManager: SessionManager | undefined;
 	let host: Promise<void> | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1609,8 +1609,8 @@ test("session host closes a late manager before writing rollback evidence", asyn
 	let sessionManager: SessionManager | undefined;
 	let restoreCloseSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1694,8 +1694,8 @@ test("session host keeps absence unproven when manager or MCP cleanup fails", as
 	let managerCloseAttempted = false;
 	let restoreCloseSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1816,8 +1816,8 @@ test("session host retries MCP cleanup while retaining exact directory authority
 	let cleanupAttempts = 0;
 	let restoreRemoveSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -1909,8 +1909,8 @@ test("session host keeps rollback unproven when MCP data moves beyond its exact 
 	let sessionManager: SessionManager | undefined;
 	let movedDirectory: string | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -2021,8 +2021,8 @@ test.skipIf(process.platform === "win32")(
 		let sessionManager: SessionManager | undefined;
 		let mcpConfigPath: string | undefined;
 		try {
-			await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-			await fs.mkdir(agentDir, { recursive: true });
+			await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 			await fs.mkdir(realTempDirectory);
 			await fs.symlink(realTempDirectory, linkedTempDirectory, "dir");
 			await fs.writeFile(
@@ -2110,8 +2110,8 @@ test("session host snapshots and removes a partial MCP config after write failur
 	let mcpConfigPath: string | undefined;
 	let restoreWriteSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -2205,8 +2205,8 @@ test("session host removes the raw MCP temp directory when realpath fails", asyn
 	let restoreCloseSpy: (() => void) | undefined;
 	let restoreRealpathSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -2289,7 +2289,7 @@ test("session manager open preserves failed manager-close evidence", async () =>
 	const agentDir = path.join(root, "agent");
 	const stateRoot = path.join(root, ".gjc", "state");
 	await fs.mkdir(cwd, { recursive: true });
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
 	const request: SessionLifecycleLaunchRequest = {
 		operation: "session.create",
@@ -2355,8 +2355,8 @@ test("session host keeps absence unproven when settings close fails after manage
 	});
 	try {
 		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -2434,8 +2434,8 @@ test("session host does not claim absence when factory cleanup is incomplete", a
 	let managerClosed = false;
 	let restoreCloseSpy: (() => void) | undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -2524,7 +2524,7 @@ test("session manager open preserves close failure when scoped settings also fai
 	});
 	try {
 		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
 		const request: SessionLifecycleLaunchRequest = {
 			operation: "session.create",
@@ -3323,7 +3323,7 @@ test("session host opts cached default profiles into lifecycle startup only", as
 		  }
 		| undefined;
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		await fs.writeFile(
 			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
 			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
@@ -3374,7 +3374,7 @@ test("session host fails closed when its lifecycle effect marker is corrupt", as
 	const names = ["GJC_AGENT_DIR", "GJC_STATE_ROOT", "GJC_LIFECYCLE_REQUEST_ID", "GJC_SDK_LIFECYCLE_REQUEST"] as const;
 	const previous = names.map(name => process.env[name]);
 	try {
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), "{");
 		process.env.GJC_AGENT_DIR = agentDir;
 		process.env.GJC_STATE_ROOT = stateRoot;
@@ -6558,7 +6558,7 @@ test("broker rebinds implicit close only for a matching non-empty lifecycle requ
 	const originalHandleRequest = broker.handleRequest.bind(broker);
 	try {
 		await broker.start();
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		for (const [label, initialRequestId, replacementRequestId, successor, expectedCode] of [
 			["same", "request-a", "request-a", false, "close_refused"],
 			["absent", undefined, undefined, false, "endpoint_stale"],
@@ -6950,7 +6950,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 	try {
 		const processIdentity = await incarnation(child.pid!);
 		await broker.start();
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		const marker = { pid: child.pid!, effectMarker: "reconcile-effect", incarnation: processIdentity };
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
@@ -7118,7 +7118,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			hostIncarnation: processIdentity,
 			remoteCreateKey,
 		};
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		const marker = { pid: child.pid, effectMarker: lifecycleRequestId, incarnation: processIdentity };
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
@@ -7280,7 +7280,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 			hostIncarnation: processIdentity,
 			remoteCreateKey,
 		};
-		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true, mode: 0o700 });
 		const marker = { pid: child.pid, effectMarker: lifecycleRequestId, incarnation: processIdentity };
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`), canonicalJson(marker));
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
@@ -8723,7 +8723,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
 	await fs.mkdir(cwd, { recursive: true });
-	await fs.mkdir(agentDir, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 	await Bun.write(
 		path.join(agentDir, "models.yml"),
 		`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    display_name: Agent Dir Only\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
@@ -8779,7 +8779,7 @@ test("child profile activation failures preserve typed codes through readiness a
 		const cwd = path.join(root, "workspace");
 		const agentDir = path.join(root, "agent");
 		await fs.mkdir(cwd, { recursive: true });
-		await fs.mkdir(agentDir, { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
 		await Bun.write(
 			path.join(agentDir, "models.yml"),
 			`providers:\n  fixture:\n    baseUrl: https://example.invalid/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: fixture-model\n        name: Fixture Model\n        contextWindow: 4096\n        maxTokens: 1024\nprofiles:\n  agent-dir-only:\n    required_providers: [fixture]\n    model_mapping:\n      executor: fixture/fixture-model\n`,
