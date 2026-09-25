@@ -20,9 +20,37 @@ import type { Anchor, HashlineCursor, HashlineEdit } from "./types";
 const LID_CAPTURE_RE = new RegExp(`^\\s*[>+\\-*]*\\s*${HL_HASH_CAPTURE_RE_RAW}(?:\\|.*)?\\s*$`);
 const regexEscape = (str: string): string => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const BARE_LINE_REF_RE = /^\s*[>+\-*]*\s*([1-9]\d*)(?:\s*(?:-|\.\.)\s*([1-9]\d*))?\s*$/;
+
+/**
+ * An op referenced lines by number alone, without the content hash. The edit
+ * is never applied on a line number alone; the executor answers with the
+ * current full anchors for {@link lines} so the model can retry without an
+ * extra read.
+ */
+export class HashlineMissingHashError extends Error {
+	constructor(
+		message: string,
+		readonly lines: { start: number; end: number },
+	) {
+		super(message);
+		this.name = "HashlineMissingHashError";
+	}
+}
+
 function parseLid(raw: string, lineNum: number): Anchor {
 	const match = LID_CAPTURE_RE.exec(raw);
 	if (!match) {
+		const bare = BARE_LINE_REF_RE.exec(raw);
+		if (bare) {
+			const start = Number.parseInt(bare[1], 10);
+			const end = bare[2] === undefined ? start : Number.parseInt(bare[2], 10);
+			throw new HashlineMissingHashError(
+				`line ${lineNum}: anchor ${JSON.stringify(raw.trim())} is missing its hash; ` +
+					`use the full anchor such as ${describeAnchorExamples(String(start))}.`,
+				{ start: Math.min(start, end), end: Math.max(start, end) },
+			);
+		}
 		throw new Error(
 			`line ${lineNum}: expected a full anchor such as ${describeAnchorExamples("119")}; ` +
 				`got ${JSON.stringify(raw)}.`,
@@ -37,6 +65,9 @@ interface ParsedRange {
 }
 
 function parseRange(raw: string, lineNum: number): ParsedRange {
+	// Reject an all-numeric range (`16..18`, `16-18`) as a whole so the error
+	// carries the full span rather than just its first endpoint.
+	if (BARE_LINE_REF_RE.test(raw)) parseLid(raw, lineNum);
 	if (!raw.includes("..")) {
 		const start = parseLid(raw, lineNum);
 		return { start, end: { ...start } };

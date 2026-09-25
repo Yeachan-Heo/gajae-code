@@ -13,8 +13,9 @@ import { enforcePlanModeWrite, resolvePlanPath } from "../tools/plan-mode-guard"
 import { HashlineMismatchError } from "./anchors";
 import { applyHashlineEdits, type HashlineApplyResult } from "./apply";
 import { buildCompactHashlineDiffPreview } from "./diff-preview";
+import { formatHashLine } from "./hash";
 import { type HashlineInputSection, splitHashlineInputs } from "./input";
-import { parseHashlineWithWarnings } from "./parser";
+import { HashlineMissingHashError, parseHashlineWithWarnings } from "./parser";
 import { tryRecoverHashlineWithCache } from "./recovery";
 import type {
 	ExecuteHashlineSingleOptions,
@@ -64,6 +65,37 @@ function getEditDetails(result: AgentToolResult<EditToolDetails>): EditToolDetai
 	return result.details ?? { diff: "" };
 }
 
+/** Most current anchors echoed back for a hash-less line reference. */
+const MISSING_HASH_ANCHOR_LIMIT = 20;
+
+/**
+ * Parse an edit section. When an op names lines by number only, answer with
+ * the current full anchors for those lines so the model can retry without
+ * another read. The edit itself is never applied on a line number alone.
+ */
+async function parseHashlineSection(
+	diff: string,
+	absolutePath: string,
+	pathText: string,
+): Promise<{ edits: HashlineEdit[]; warnings: string[] }> {
+	try {
+		return parseHashlineWithWarnings(diff);
+	} catch (err) {
+		if (!(err instanceof HashlineMissingHashError)) throw err;
+		const source = await readHashlineFile(absolutePath, pathText);
+		if (!source.exists) throw err;
+		const fileLines = normalizeToLF(stripBom(source.rawContent).text).split("\n");
+		const start = Math.min(err.lines.start, fileLines.length);
+		if (start < 1) throw err;
+		const end = Math.min(err.lines.end, fileLines.length, start + MISSING_HASH_ANCHOR_LIMIT - 1);
+		const anchors: string[] = [];
+		for (let line = start; line <= end; line++) anchors.push(formatHashLine(line, fileLines[line - 1] ?? ""));
+		throw new Error(
+			`${err.message}\nThe edit was NOT applied. Current anchors for ${pathText}:\n${anchors.join("\n")}`,
+		);
+	}
+}
+
 /**
  * Apply hashline edits with anchor-stale recovery: on `HashlineMismatchError`,
  * consult the read-snapshot cache for the file and 3-way-merge the edits onto
@@ -106,7 +138,7 @@ async function preflightHashlineSection(options: ExecuteHashlineSingleOptions & 
 	const { session, path: sectionPath, diff } = options;
 
 	const absolutePath = resolvePlanPath(session, sectionPath);
-	const { edits } = parseHashlineWithWarnings(diff);
+	const { edits } = await parseHashlineSection(diff, absolutePath, sectionPath);
 	enforcePlanModeWrite(session, sectionPath, { op: "update" });
 
 	const source = await readHashlineFile(absolutePath, sectionPath);
@@ -139,7 +171,7 @@ async function executeHashlineSection(
 	} = options;
 
 	const absolutePath = resolvePlanPath(session, sourcePath);
-	const { edits, warnings: parseWarnings } = parseHashlineWithWarnings(diff);
+	const { edits, warnings: parseWarnings } = await parseHashlineSection(diff, absolutePath, sourcePath);
 	enforcePlanModeWrite(session, sourcePath, { op: "update" });
 
 	const source = await readHashlineFile(absolutePath, sourcePath);
@@ -182,7 +214,7 @@ async function executeHashlineSection(
 	// of the file: the model just received it back as the diff/preview. Cache
 	// it so a follow-up edit anchored against this state can still recover
 	// if the file is touched out-of-band before the next edit lands.
-	getFileReadCache(session).recordContiguous(absolutePath, 1, result.lines.split("\n"));
+	getFileReadCache(session).recordFull(absolutePath, result.lines.split("\n"));
 
 	const diffResult = generateDiffString(originalNormalized, result.lines);
 	const meta = outputMeta()

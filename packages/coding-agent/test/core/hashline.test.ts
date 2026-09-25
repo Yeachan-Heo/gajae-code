@@ -13,6 +13,7 @@ import {
 	generateDiffString,
 	getFileReadCache,
 	HashlineMismatchError,
+	HashlineMissingHashError,
 	HL_BODY_SEP,
 	HL_BODY_SEP_RE_RAW,
 	hashlineEditParamsSchema,
@@ -430,6 +431,46 @@ describe("hashline parser — block op syntax", () => {
 	});
 });
 
+describe("hashline — hash-less line references", () => {
+	it("rejects a bare line number with a typed error carrying the referenced span", () => {
+		let error: unknown;
+		try {
+			parseHashline(`≔16\n${pl("x")}`);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).toBeInstanceOf(HashlineMissingHashError);
+		expect((error as HashlineMissingHashError).lines).toEqual({ start: 16, end: 16 });
+		expect(() => parseHashline(`≔23-25\n${pl("x")}`)).toThrow(HashlineMissingHashError);
+		try {
+			parseHashline(`≔25..23\n${pl("x")}`);
+		} catch (err) {
+			expect((err as HashlineMissingHashError).lines).toEqual({ start: 23, end: 25 });
+		}
+	});
+
+	it("still reports other malformed anchors as plain parse errors", () => {
+		expect(() => parseHashline(`≔sr\n${pl("x")}`)).toThrow(/expected a full anchor/);
+		expect(() => parseHashline(`≔sr\n${pl("x")}`)).not.toThrow(HashlineMissingHashError);
+	});
+
+	it("answers with the current anchors for the referenced lines and leaves the file untouched", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const original = "one\ntwo\nthree\nfour\n";
+			await Bun.write(filePath, original);
+
+			const input = `§a.ts\n≔2..3\n${pl("TWO")}\n`;
+			const run = executeHashlineSingle(hashlineExecuteOptions(tempDir, input));
+			await expect(run).rejects.toThrow(/anchor "2\.\.3" is missing its hash/);
+			await expect(executeHashlineSingle(hashlineExecuteOptions(tempDir, input))).rejects.toThrow(
+				`The edit was NOT applied. Current anchors for a.ts:\n${tag(2, "two")}${outputSep}two\n${tag(3, "three")}${outputSep}three`,
+			);
+			expect(await Bun.file(filePath).text()).toBe(original);
+		});
+	});
+});
+
 describe("hashline — stale anchors", () => {
 	it("throws HashlineMismatchError when a Lid hash no longer matches", () => {
 		const diff = [`≔${sameLineRange(mistag(2, "bbb"))}`, pl("BBB")].join("\n");
@@ -452,6 +493,37 @@ describe("hashline — stale anchors", () => {
 		// rebase, this is a plain mismatch.
 		const diff = [`≔${sameLineRange(`4${collidingHash}`)}`, pl("REPLACED")].join("\n");
 		expect(() => applyDiff(file, diff)).toThrow(HashlineMismatchError);
+	});
+
+	it("points at the unique nearby line an anchor's content moved to", () => {
+		const stale = tag(2, "bbb");
+		const diff = [`≔${sameLineRange(stale)}`, pl("BBB")].join("\n");
+		const file = "aaa\nINSERTED\nbbb\nccc";
+		let error: unknown;
+		try {
+			applyDiff(file, diff);
+		} catch (err) {
+			error = err;
+		}
+		expect(error).toBeInstanceOf(HashlineMismatchError);
+		const message = (error as HashlineMismatchError).message;
+		expect(message).toContain(
+			`Likely moved (marked >; verify the content before reusing): ${stale} -> 3${stale.slice(1)}.`,
+		);
+		expect(message).toContain(`>${tag(3, "bbb")}${outputSep}bbb`);
+		// The file is unchanged: a hash match alone never auto-applies the edit.
+		expect(message).toContain("The edit was NOT applied");
+	});
+
+	it("omits the relocation hint when the anchor's content appears at several nearby lines", () => {
+		const file = ["x = 1", "y = 2", "x = 1", "z = 3", "x = 1", "w = 4"].join("\n");
+		const diff = [`≔${sameLineRange(`4${computeLineHash(1, "x = 1")}`)}`, pl("REPLACED")].join("\n");
+		expect(() => applyDiff(file, diff)).toThrow(HashlineMismatchError);
+		try {
+			applyDiff(file, diff);
+		} catch (err) {
+			expect((err as HashlineMismatchError).message).not.toContain("Likely moved");
+		}
 	});
 });
 
@@ -802,7 +874,7 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 		});
 	});
 
-	it("drops a cached entry when newly recorded lines disagree on overlap", () => {
+	it("starts a new generation when newly recorded lines disagree on overlap", () => {
 		const cache = new FileReadCache();
 		const fakePath = "/tmp/__hashline-cache-conflict__.ts";
 		cache.recordContiguous(fakePath, 1, ["a", "b", "c", "d", "e"]);
@@ -816,11 +888,73 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 
 		const snap = cache.get(fakePath);
 		expect(snap).not.toBeNull();
-		// Old entries dropped; only the divergent record's entries remain.
+		// The newest generation holds only the divergent record's entries.
 		expect(snap?.lines.has(1)).toBe(false);
 		expect(snap?.lines.has(2)).toBe(false);
 		expect(snap?.lines.get(4)).toBe("D-CHANGED");
 		expect(snap?.lines.get(7)).toBe("g");
+		// The previous view survives as an older generation.
+		const generations = cache.generations(fakePath);
+		expect(generations).toHaveLength(2);
+		expect(generations[1]?.lines.get(4)).toBe("d");
+	});
+
+	it("keeps a bounded number of generations per path", () => {
+		const cache = new FileReadCache();
+		const fakePath = "/tmp/__hashline-cache-generations__.ts";
+		for (let version = 0; version < 6; version++) cache.recordFull(fakePath, [`v${version}`]);
+		const generations = cache.generations(fakePath);
+		expect(generations.map(snapshot => snapshot.lines.get(1))).toEqual(["v5", "v4", "v3", "v2"]);
+	});
+
+	it("lands a follow-up edit authored against the original read after this session's own edit shifted lines", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "a.ts");
+			const v0Lines = ["function a() {", "  return 1;", "}", "", "function b() {", "  return 2;", "}"];
+			await Bun.write(filePath, `${v0Lines.join("\n")}\n`);
+			const session = makeHashlineSession(tempDir);
+			getFileReadCache(session).recordContiguous(filePath, 1, [...v0Lines, ""]);
+
+			// First edit inserts a guard clause, shifting every later line down by 3.
+			const first = `§a.ts\n»${tag(1, "function a() {")}\n  if (x) {\n    return 0;\n  }\n`;
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, first, undefined, session));
+
+			// Second edit still uses anchors from the original read: line 6 was
+			// `  return 2;` there but is `}` now.
+			const second = `§a.ts\n≔${sameLineRange(tag(6, "  return 2;"))}\n  return 3;\n`;
+			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, second, undefined, session));
+
+			expect(await Bun.file(filePath).text()).toBe(
+				[
+					"function a() {",
+					"  if (x) {",
+					"    return 0;",
+					"  }",
+					"  return 1;",
+					"}",
+					"",
+					"function b() {",
+					"  return 3;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			expect(toolText(result)).toMatch(/Recovered from stale anchors using a previous read snapshot/);
+		});
+	});
+
+	it("refuses recovery when the replayed hunk would match more than one live location", () => {
+		const cache = new FileReadCache();
+		const fakePath = "/tmp/__hashline-recovery-ambiguous__.ts";
+		const block = ["if (ready) {", "  go();", "}"];
+		cache.recordFull(fakePath, [...block, "tail"]);
+		// The live file now contains the whole snapshot block twice.
+		const currentText = ["head", ...block, "tail", ...block, "tail"].join("\n");
+		const edits = parseHashline(`≔${sameLineRange(tag(2, "  go();"))}\n  stop();`);
+
+		expect(
+			tryRecoverHashlineWithCache({ cache, absolutePath: fakePath, currentText, edits, options: {} }),
+		).toBeNull();
 	});
 
 	it("evicts old paths past the per-session LRU cap", () => {
