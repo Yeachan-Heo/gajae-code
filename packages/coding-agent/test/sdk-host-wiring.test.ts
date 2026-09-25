@@ -6731,25 +6731,41 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			message: "config.patch rejects invalid settings: noSuchSetting (Setting is not recognized by this version.)",
 		},
 	});
-	for (const [id, patch] of [
-		["profile-default-error", { "modelProfile.default": "codex-medium" }],
-		[
-			"profile-ownership-error",
-			{ "modelProfile.ownership": { schemaVersion: 1, version: 2, marker: { kind: "cleared" } } },
-		],
-	] as const) {
-		const patchPath = Object.keys(patch)[0]!;
-		expect(await request(id, { type: "control_request", id, operation: "config.patch", input: { patch } })).toEqual({
-			type: "control_response",
-			id,
-			ok: false,
-			error: {
-				code: "invalid_input",
-				message: `config.patch rejects invalid settings: ${patchPath} (Model-profile ownership is managed separately; use model.profile.set for a session selection or gjc config set/reset for durable ownership.)`,
-			},
-		});
-	}
-	expect(configWrites).toEqual([]);
+	// modelProfile.default is now allowed
+	expect(
+		await request("profile-default-success", {
+			type: "control_request",
+			id: "profile-default-success",
+			operation: "config.patch",
+			input: { patch: { "modelProfile.default": "codex-medium" } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "profile-default-success",
+		ok: true,
+		result: {
+			patched: ["modelProfile.default"],
+			revision: "1",
+		},
+	});
+	// modelProfile.ownership is still rejected
+	expect(
+		await request("profile-ownership-error", {
+			type: "control_request",
+			id: "profile-ownership-error",
+			operation: "config.patch",
+			input: { patch: { "modelProfile.ownership": { schemaVersion: 1, version: 2, marker: { kind: "cleared" } } } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "profile-ownership-error",
+		ok: false,
+		error: {
+			code: "invalid_input",
+			message: `config.patch rejects invalid settings: modelProfile.ownership (The versioned model-profile ownership record is internal and cannot be patched generically.)`,
+		},
+	});
+	expect(configWrites).toEqual([["modelProfile.default", "codex-medium"]]);
 });
 
 test("Q12 records the runtime-turn correlation before a workflow gate is exposed", async () => {

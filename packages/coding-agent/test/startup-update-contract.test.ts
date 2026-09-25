@@ -64,6 +64,7 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		extensionRunner: undefined,
 		getConfiguredModelChain: () => undefined,
 		hasRecoveredDefaultFallbackChain: () => false,
+		getModelProfileOwnershipMarker: () => undefined,
 		setConfiguredModelChain: () => {},
 		seedDefaultFallbackResolution: () => {},
 		setModelTemporary: async (model: typeof testModel) => {
