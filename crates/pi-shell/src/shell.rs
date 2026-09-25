@@ -1,3 +1,9 @@
+// Vendored from
+// can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-shell/
+// src/shell.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil
+// Labs, Inc. Modified for gajae-code: yes, 3-way reconciled cwd handling and
+// output decoding; retained local process, cancellation, HMAC, minimizer, and
+// output-budget hardening.
 //! Runtime-agnostic brush shell execution.
 
 use std::{
@@ -13,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Error, Result};
-use brush_builtins::{BuiltinSet, default_builtins};
+use brush_builtins::{BuiltinSet, ShellBuilderExt};
 use brush_core::{
 	ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
 	ExternalProcessObserver, ProcessGroupPolicy, ProfileLoadBehavior, RcLoadBehavior,
@@ -738,7 +744,7 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 		.contained_process_group(config.contained_process_group)
 		.profile(ProfileLoadBehavior::Skip)
 		.rc(RcLoadBehavior::Skip)
-		.builtins(default_builtins(BuiltinSet::BashMode))
+		.default_builtins(BuiltinSet::BashMode)
 		.build()
 		.await
 		.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
