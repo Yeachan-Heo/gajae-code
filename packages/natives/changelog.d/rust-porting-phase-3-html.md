@@ -1,1 +1,3 @@
-Re-synced the HTML-to-Markdown N-API boundary to consume JavaScript strings directly. Recorded native goldens cover headings, links, clean-content preprocessing, skipped images, and the depth-limit error; conversion behavior and exported TypeScript shape remain unchanged.
+### Changed
+
+- Re-synced the HTML-to-Markdown N-API boundary to consume JavaScript strings directly. Recorded native goldens cover headings, links, clean-content preprocessing, skipped images, and the depth-limit error; conversion behavior and exported TypeScript shape remain unchanged.

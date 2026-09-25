@@ -15,8 +15,8 @@ describe("work profiler re-sync differential golden", () => {
 	it("retains pre-sync HTML/SIXEL region labels in folded profile output", async () => {
 		await htmlToMarkdown("<p>profile golden</p>");
 		encodeSixel(onePixelPng, 1, 1);
-		const stacks = getWorkProfile(60).folded
-			.split("\n")
+		const stacks = getWorkProfile(60)
+			.folded.split("\n")
 			.filter(Boolean)
 			.map(line => line.slice(0, line.lastIndexOf(" ")));
 		expect(stacks).toEqual(expect.arrayContaining(golden.expectedStacks));

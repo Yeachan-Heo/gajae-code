@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { htmlToMarkdown, type HtmlToMarkdownOptions } from "../native/index.js";
+import { type HtmlToMarkdownOptions, htmlToMarkdown } from "../native/index.js";
 
 type GoldenCase = {
 	name: string;
