@@ -218,6 +218,19 @@ describe("model-profile ownership contract", () => {
 		}
 	});
 
+	it("rejects an invalid ownership marker before appending it", async () => {
+		const manager = SessionManager.inMemory();
+		try {
+			expect(() => manager.appendModelProfileOwnershipMarker({ kind: "profile", profile: " " })).toThrow(
+				InvalidModelProfileOwnershipError,
+			);
+			expect(manager.getModelProfileOwnershipMarker()).toBeUndefined();
+			expect(manager.getEntries().some(entry => entry.type === "custom")).toBe(false);
+		} finally {
+			await manager.close();
+		}
+	});
+
 	it("compares inherited and absent session decisions as the same owner", () => {
 		expect(modelProfileOwnershipMarkersEqual(undefined, inherit)).toBe(true);
 		expect(modelProfileOwnershipMarkersEqual(cleared, inherit)).toBe(false);
