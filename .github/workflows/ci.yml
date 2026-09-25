@@ -465,10 +465,10 @@ jobs:
               if [ "$RUNNER_OS" = "Windows" ]; then
                  repack_dir="$RUNNER_TEMP/coding-agent-package-posix"
                  mkdir -p "$repack_dir"
-                 tar -xzf "$package_dir"/*.tgz -C "$repack_dir"
+                 tar --force-local -xzf "$package_dir"/*.tgz -C "$repack_dir"
                  original=$(ls "$package_dir"/*.tgz)
                  rm "$original"
-                 tar --format=ustar --mode='u=rwX,go=rX' --owner=0 --group=0 -czf "$original" -C "$repack_dir" package
+                 tar --force-local --format=ustar --mode='u=rwX,go=rX' --owner=0 --group=0 -czf "$original" -C "$repack_dir" package
               fi
               bun scripts/verify-agpl-removal.ts --payload --tarball "$package_dir"/*.tgz --binary "${{ matrix.binary_path }}" --addon packages/natives/native/*.node --prose-root .
          - name: Smoke memory-guard native route (Windows)
