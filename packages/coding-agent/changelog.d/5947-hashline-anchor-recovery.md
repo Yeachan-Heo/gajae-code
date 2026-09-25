@@ -1,0 +1,5 @@
+### Fixed
+
+- Land a hashline edit whose anchors come from the original read after this session's own earlier edit shifted the file. The read cache now keeps up to 4 snapshot generations per path, and stale-anchor recovery replays against each one, newest first. Replays stay refused unless every anchor matches that snapshot, every hunk's context was actually observed, and each hunk lands at exactly one place in the live file ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
+- Keep anchor-mismatch rejections compact and actionable. When a stale anchor's content uniquely moved within 20 lines, the rejection names the new anchor (`Likely moved ...: 6vp -> 9vp`) and shows that line marked `>`, without applying the edit ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
+- Answer a hashline op that names lines by number only (`≔16`, `≔23-25`) with the current full anchors for those lines instead of a generic parse error, so the model can retry without another read. The edit is never applied on a line number alone ([#5947](https://github.com/Yeachan-Heo/gajae-code/issues/5947)).
