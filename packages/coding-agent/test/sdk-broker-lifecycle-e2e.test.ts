@@ -30,6 +30,7 @@ import {
 	setLifecycleTimingForTest,
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
+	writeSessionLifecycleReady,
 } from "../src/sdk/broker/lifecycle";
 import { parseLifecycleJson } from "../src/sdk/broker/lifecycle-codec";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
@@ -37,10 +38,12 @@ import { SessionIndex, type SessionIndexEvent } from "../src/sdk/broker/session-
 import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
+import type { CreateLifecycleAgentSessionResult } from "../src/sdk/lifecycle-session";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
+import type { AgentSession } from "../src/session/agent-session";
 import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
@@ -65,11 +68,81 @@ async function waitFor<T>(read: () => Promise<T | undefined>, label: string): Pr
 	throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function createSessionHostFixture(
+	sessionId: string,
+	effectMarker: string,
+	mcpServers: { type: "stdio"; name: string; command: string; args: string[] }[] = [],
+) {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-host-fixture-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true });
+	await fs.writeFile(
+		path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+		JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+	);
+	process.env.GJC_AGENT_DIR = agentDir;
+	process.env.GJC_STATE_ROOT = stateRoot;
+	process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+	process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+	process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+		operation: "session.create",
+		sessionId,
+		cwd: root,
+		stateRoot,
+		effectMarker,
+		...(mcpServers.length > 0 ? { mcpServers } : {}),
+		...deadlines,
+	});
+	return {
+		root,
+		sessionId,
+		effectMarker,
+		failurePath: path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`),
+		readyPath: path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`),
+		restore: async () => {
+			names.forEach((name, index) => {
+				const value = previous[index];
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			});
+			await fs.rm(root, { recursive: true, force: true });
+		},
+	};
+}
+
 test("formats cause-bearing diagnostics for children that started and exited", () => {
 	const child = { exitCode: 23, signalCode: null } as never;
 	expect(lifecycleFailureMessage("Session exited before readiness.", child)).toBe(
 		"Session exited before readiness. (exit=23)",
 	);
+});
+
+test("lifecycle ready publication revokes its marker when cutoff wins during directory sync", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-ready-cutoff-"));
+	const sessionId = "ready-cutoff-race";
+	const effectMarker = "ready-cutoff-race-effect";
+	const readyPath = path.join(root, "sdk", `${sessionId}.lifecycle.ready.json`);
+	let cutoffChecks = 0;
+	try {
+		await expect(
+			writeSessionLifecycleReady(root, sessionId, effectMarker, () => ++cutoffChecks === 1),
+		).rejects.toThrow("Lifecycle readiness cutoff passed during publication.");
+		expect(cutoffChecks).toBe(2);
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });
 
 async function incarnation(pid: number): Promise<string> {
@@ -686,6 +759,280 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("session host publishes SIGTERM failure without waiting for hung construction", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-hung-construction-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "hung-construction";
+	const effectMarker = "hung-construction-marker";
+	const deadlines = deriveLifecycleDeadlines(1_000, 10_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const stageStarted = Promise.withResolvers<void>();
+	const neverDeadline = Promise.withResolvers<void>();
+	let releaseLateResult: (() => void) | undefined;
+	let startup: Promise<void> | undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		});
+		const failurePath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async ms => {
+				if (ms > 0) await neverDeadline.promise;
+			},
+			processIncarnation: () => "test-incarnation",
+			createLifecycleAgentSession: async (_options, owner) => {
+				if (!owner) throw new Error("Expected lifecycle startup owner.");
+				const lateResult = Promise.withResolvers<CreateLifecycleAgentSessionResult>();
+				releaseLateResult = () => {
+					const result = owner.capability.result;
+					lateResult.resolve({
+						capability: owner.capability,
+						rollback: owner.rollback,
+						failure:
+							result?.status === "failed"
+								? result.failure
+								: owner.capability.normalizeFailure("startup", "failed", "late construction fixture"),
+					});
+				};
+				const startupSignal = process
+					.listeners("SIGTERM")
+					.find(listener => !previousSigtermListeners.includes(listener));
+				if (!startupSignal) throw new Error("Construction has no owner-bound SIGTERM handler.");
+				stageStarted.resolve();
+				startupSignal.call(process, "SIGTERM");
+				return await lateResult.promise;
+			},
+		});
+
+		await stageStarted.promise;
+		const outcome = await Promise.race([
+			startup.then(
+				() => ({ kind: "resolved" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_500).then(() => ({ kind: "timed_out" as const })),
+		]);
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind !== "rejected") return;
+		expect(outcome.error).toMatchObject({ phase: "startup", reason: "failed" });
+		expect(await Bun.file(failurePath).exists()).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			message: string;
+			rollback: Record<string, unknown>;
+		};
+		expect(failure.message).toBe("SDK lifecycle host terminated.");
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+	} finally {
+		releaseLateResult?.();
+		await startup?.catch(() => {});
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
+test("session host publishes SIGTERM failure without waiting for hung readiness publication", async () => {
+	const fixture = await createSessionHostFixture("hung-readiness", "hung-readiness-marker");
+	const { root, sessionId, effectMarker, failurePath, readyPath } = fixture;
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const readinessStarted = Promise.withResolvers<void>();
+	const releaseLateReadiness = Promise.withResolvers<void>();
+	let readinessMarkerRevoked = false;
+	let startup: Promise<void> | undefined;
+	try {
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			applyStartupModelProfiles: async () => {},
+			createLifecycleAgentSession: async (options, owner) => {
+				if (!owner) throw new Error("Expected lifecycle startup owner.");
+				const openedSessionManager = options?.sessionManager;
+				if (!openedSessionManager) throw new Error("Expected an opened lifecycle session manager.");
+				const sessionManager = {
+					getSessionId: () => sessionId,
+					ensureOnDisk: async () => await openedSessionManager.ensureOnDisk(),
+					getSessionFile: () => openedSessionManager.getSessionFile(),
+				} as unknown as SessionManager;
+				const session = {
+					sessionManager,
+					settings: {},
+					modelRegistry: {},
+					registerToolSessionTransitionCleanup: (_cleanup: () => Promise<void>) => {},
+					dispose: async () => await openedSessionManager.close(),
+					awaitDisposeCompletion: async () => {},
+				} as unknown as AgentSession;
+				owner.capability.settleStarted();
+				return {
+					session,
+					capability: owner.capability,
+					rollback: owner.rollback,
+					startDeferredMemoryBackend: async () => {},
+				};
+			},
+			writeSessionLifecycleReady: async (_root, _id, _effectMarker, canPublish, onPublishing, onPublished) => {
+				if (!canPublish) throw new Error("Readiness publication has no owner-bound cutoff guard.");
+				if (!onPublishing) throw new Error("Readiness publication has no revocation callback.");
+				await fs.writeFile(readyPath, JSON.stringify({ pid: process.pid, effectMarker }));
+				readinessStarted.resolve();
+				const startupSignal = process
+					.listeners("SIGTERM")
+					.find(listener => !previousSigtermListeners.includes(listener));
+				if (!startupSignal) throw new Error("Readiness publication has no owner-bound SIGTERM handler.");
+				startupSignal.call(process, "SIGTERM");
+				onPublishing(() => {
+					syncFs.rmSync(readyPath, { force: true });
+					readinessMarkerRevoked = !syncFs.existsSync(readyPath);
+					return readinessMarkerRevoked;
+				});
+				await releaseLateReadiness.promise;
+				if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
+				onPublished?.();
+			},
+		});
+
+		const reachedReadiness = await Promise.race([
+			readinessStarted.promise.then(() => true),
+			startup.then(
+				() => false,
+				() => false,
+			),
+			Bun.sleep(1_500).then(() => false),
+		]);
+		expect(reachedReadiness).toBe(true);
+		const outcome = await Promise.race([
+			startup.then(
+				() => ({ kind: "resolved" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_500).then(() => ({ kind: "timed_out" as const })),
+		]);
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind !== "rejected") return;
+		expect(outcome.error).toMatchObject({ phase: "startup", reason: "failed" });
+		expect(readinessMarkerRevoked).toBe(true);
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+		};
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: true,
+			runtimeRemoved: true,
+			hostStopped: true,
+			brokerRegistrationReleased: true,
+		});
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		releaseLateReadiness.resolve();
+		await startup?.catch(() => {});
+		await fixture.restore();
+	}
+}, 10_000);
+
+test("session host publishes SIGTERM failure without waiting for hung MCP configuration write", async () => {
+	const fixture = await createSessionHostFixture("hung-mcp-config", "hung-mcp-config-marker", [
+		{ type: "stdio", name: "fixture", command: process.execPath, args: [] },
+	]);
+	const { root, failurePath, readyPath } = fixture;
+	const previousSigtermListeners = process.listeners("SIGTERM");
+	const configWriteStarted = Promise.withResolvers<void>();
+	const releaseLateConfigWrite = Promise.withResolvers<void>();
+	let configDirectory: string | undefined;
+	let startup: Promise<void> | undefined;
+	try {
+		startup = runSessionHost({
+			cwd: root,
+			now: () => 1_000,
+			sleep: async () => await new Promise<void>(() => {}),
+			processIncarnation: () => "test-incarnation",
+			writeMcpConfig: async filePath => {
+				configDirectory = path.dirname(filePath);
+				configWriteStarted.resolve();
+				const startupSignal = process
+					.listeners("SIGTERM")
+					.find(listener => !previousSigtermListeners.includes(listener));
+				if (!startupSignal) throw new Error("MCP configuration write has no owner-bound SIGTERM handler.");
+				startupSignal.call(process, "SIGTERM");
+				await releaseLateConfigWrite.promise;
+				return 0;
+			},
+		});
+
+		const reachedConfigWrite = await Promise.race([
+			configWriteStarted.promise.then(() => true),
+			startup.then(
+				() => false,
+				() => false,
+			),
+			Bun.sleep(1_500).then(() => false),
+		]);
+		expect(reachedConfigWrite).toBe(true);
+		const outcome = await Promise.race([
+			startup.then(
+				() => ({ kind: "resolved" as const }),
+				error => ({ kind: "rejected" as const, error }),
+			),
+			Bun.sleep(1_500).then(() => ({ kind: "timed_out" as const })),
+		]);
+		expect(outcome.kind).toBe("rejected");
+		if (outcome.kind !== "rejected") return;
+		expect(outcome.error).toMatchObject({ phase: "startup", reason: "failed" });
+		const failure = JSON.parse(await fs.readFile(failurePath, "utf8")) as {
+			rollback: Record<string, unknown>;
+		};
+		expect(failure.rollback).toEqual({
+			endpointGeneration: null,
+			fenced: false,
+			runtimeRemoved: false,
+			hostStopped: false,
+			brokerRegistrationReleased: false,
+		});
+		await expect(fs.stat(readyPath)).rejects.toMatchObject({ code: "ENOENT" });
+		if (!configDirectory) throw new Error("MCP configuration directory was not observed.");
+		await expect(fs.stat(configDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+	} finally {
+		releaseLateConfigWrite.resolve();
+		await startup?.catch(() => {});
+		await fixture.restore();
+	}
+}, 10_000);
 
 test("session host opts cached default profiles into lifecycle startup only", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-cached-default-"));

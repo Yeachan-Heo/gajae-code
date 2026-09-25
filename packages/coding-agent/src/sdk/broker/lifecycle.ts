@@ -1758,8 +1758,54 @@ export async function writeEffectMarker(root: string, id: string, marker: Effect
 	}
 }
 
+export class LifecycleReadinessCleanupError extends Error {
+	constructor(cause: unknown) {
+		super("Lifecycle readiness marker cleanup could not be proven.", { cause });
+		this.name = "LifecycleReadinessCleanupError";
+	}
+}
+
+function removeOwnedLifecycleReadyMarker(root: string, id: string, effectMarker: string, incarnation: string): boolean {
+	const directory = path.join(root, "sdk");
+	const readyPath = lifecycleReadyPath(root, id);
+	let ready: LifecycleFileCapture | undefined;
+	try {
+		ready = captureLifecycleFile(readyPath, true, true);
+	} catch {
+		return false;
+	}
+	if (!ready) return !fsSync.existsSync(readyPath);
+	try {
+		const marker = parseLifecycleJson(ready.bytes);
+		if (
+			!isExactEffectMarker(marker) ||
+			marker.pid !== process.pid ||
+			marker.effectMarker !== effectMarker ||
+			marker.incarnation !== incarnation
+		)
+			return false;
+		const parent = lifecycleParentIdentity(directory);
+		if (!parent) return false;
+		return nativeLifecycle().exactUnlinkDirect(readyPath, {
+			...ready.identity,
+			parentDev: BigInt(parent.dev),
+			parentIno: BigInt(parent.ino),
+			quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+		}).ok;
+	} catch {
+		return false;
+	}
+}
+
 /** The child writes this only after its endpoint and semantic ready event are both live. */
-export async function writeSessionLifecycleReady(root: string, id: string, effectMarker: string): Promise<void> {
+export async function writeSessionLifecycleReady(
+	root: string,
+	id: string,
+	effectMarker: string,
+	canPublish: () => boolean = () => true,
+	onPublishing?: (revoke: () => boolean) => void,
+	onPublished?: () => void,
+): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
 	const directory = path.join(root, "sdk");
@@ -1776,11 +1822,21 @@ export async function writeSessionLifecycleReady(root: string, id: string, effec
 	} finally {
 		await handle.close();
 	}
+	let published = false;
 	try {
+		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed before publication.");
 		await fs.rename(temporary, lifecycleReadyPath(root, id));
+		published = true;
+		onPublishing?.(() => removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation));
 		await syncDirectory(directory);
+		if (!canPublish()) throw new Error("Lifecycle readiness cutoff passed during publication.");
+		onPublished?.();
+	} catch (error) {
+		if (published && !removeOwnedLifecycleReadyMarker(root, id, effectMarker, incarnation))
+			throw new LifecycleReadinessCleanupError(error);
+		throw error;
 	} finally {
-		await fs.rm(temporary, { force: true });
+		if (!published) await fs.rm(temporary, { force: true });
 	}
 }
 
