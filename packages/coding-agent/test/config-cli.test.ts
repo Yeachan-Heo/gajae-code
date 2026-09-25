@@ -90,6 +90,20 @@ describe("config CLI schema coverage", () => {
 		expect(plainModelRolesLine).not.toContain("[object Object]");
 	});
 
+	it("hides the internal ownership record from generic config reads and writes", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(process, "exit").mockImplementation(((): never => {
+			throw new Error("process.exit");
+		}) as never);
+
+		await runConfigCommand({ action: "list", flags: { json: true } });
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).not.toHaveProperty("modelProfile.ownership");
+		await expect(
+			runConfigCommand({ action: "set", key: "modelProfile.ownership", value: "{}", flags: { json: true } }),
+		).rejects.toThrow("process.exit");
+		expect(settings.getGlobal("modelProfile.ownership")).toBeUndefined();
+	});
+
 	it("sets and gets record settings as JSON objects", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const recordValue = '{"default":"claude-opus-4-6"}';

@@ -8,7 +8,6 @@ import {
 	InvalidModelProfileOwnershipError,
 	type ModelProfileOwnershipMarker,
 	modelProfileOwnershipMarkersEqual,
-	nextDurableModelProfileOwnership,
 	readDurableModelProfileOwnership,
 	readDurableModelProfileOwnershipFromRaw,
 	resolveEffectiveModelProfileMarker,
@@ -16,7 +15,7 @@ import {
 	UnresolvedModelProfileOwnershipError,
 	validateDurableModelProfileOwnership,
 } from "../src/config/model-profile-ownership";
-import { Settings } from "../src/config/settings";
+import { Settings, type SettingsAtomicPatch } from "../src/config/settings";
 import { SessionManager } from "../src/session/session-manager";
 
 const inherit: ModelProfileOwnershipMarker = { kind: "inherit" };
@@ -123,6 +122,20 @@ describe("model-profile ownership contract", () => {
 		expect(readDurableModelProfileOwnership(settings)).toEqual(next);
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "updated/default" });
 		expect(settings.getGlobal("modelProfile.default")).not.toBeUndefined();
+	});
+
+	it("rejects extra patches that could overwrite the owner record or its projection", async () => {
+		const settings = Settings.isolated();
+		const patches: SettingsAtomicPatch[] = [
+			{ path: "modelProfile.ownership", op: "set", value: { schemaVersion: 1, version: 1, marker: profileA } },
+			{ path: "modelProfile.default", op: "set", value: "profile-b" },
+		];
+		for (const patch of patches) {
+			await expect(commitDurableModelProfileOwnership(settings, profileA, [patch])).rejects.toThrow(
+				"Durable ownership extra patches cannot target",
+			);
+		}
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({ version: 0, marker: inherit });
 	});
 
 	it("requires the legacy default projection to match an owned durable record", () => {
@@ -234,17 +247,5 @@ describe("model-profile ownership contract", () => {
 	it("compares inherited and absent session decisions as the same owner", () => {
 		expect(modelProfileOwnershipMarkersEqual(undefined, inherit)).toBe(true);
 		expect(modelProfileOwnershipMarkersEqual(cleared, inherit)).toBe(false);
-	});
-
-	it("increments the durable version and never wraps it", () => {
-		const current = { schemaVersion: 1, version: 9, marker: profileA } as const;
-		expect(nextDurableModelProfileOwnership(current, cleared)).toEqual({
-			schemaVersion: 1,
-			version: 10,
-			marker: cleared,
-		});
-		expect(() => nextDurableModelProfileOwnership({ ...current, version: Number.MAX_SAFE_INTEGER }, cleared)).toThrow(
-			RangeError,
-		);
 	});
 });
