@@ -831,6 +831,54 @@ describe("startup update contract", () => {
 			}
 		}
 	}, 15_000);
+	it("seeds the automatic title from startup messages but not from skill invocations", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-title-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const stop = new Error("stop startup title harness");
+		const result = fakeSessionResult();
+		const prompted: string[] = [];
+		const events: string[] = [];
+		Object.assign(result.session, {
+			prompt: async (text: string) => {
+				events.push(`prompt:${text}`);
+				prompted.push(text);
+			},
+		});
+		try {
+			await expect(
+				runRootCommand(rootArgs({ messages: ["/skill:demo go", "Explain hash maps"] }), [], {
+					createAgentSession: async () => result,
+					discoverAuthStorage: async () => authStorage,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					stdinIsTTY: true,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					getChangelogForDisplay: async () => undefined,
+					createInteractiveMode: () =>
+						({
+							init: async () => {},
+							showNewVersionNotification: () => {},
+							renderInitialMessages: () => {},
+							showError: (message: string) => {
+								throw new Error(message);
+							},
+							maybeGenerateSessionTitle: (text: string) => {
+								events.push(`title:${text}`);
+							},
+							getUserInput: async () => {
+								throw stop;
+							},
+						}) as unknown as InteractiveMode,
+				}),
+			).rejects.toBe(stop);
+			expect(prompted).toEqual(["/skill:demo go", "Explain hash maps"]);
+			expect(events).toEqual(["prompt:/skill:demo go", "title:Explain hash maps", "prompt:Explain hash maps"]);
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	it("reaches login recovery before a credentialless default profile can abort startup", async () => {
 		using tempDir = TempDir.createSync("@gjc-auth-bootstrap-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
