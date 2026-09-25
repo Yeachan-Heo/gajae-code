@@ -5,12 +5,12 @@ import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
 import {
-	commitDurableModelProfileOwnership,
 	commitDurableModelProfileOwnershipWithResult,
 	type DurableModelProfileOwnership,
 	type DurableModelProfileOwnershipCommit,
 	ModelProfileApplyCommittedError,
 	type ModelProfileOwnershipMarker,
+	modelProfileOwnershipMarkersEqual,
 	type ProfileOwnershipChangedEvent,
 	readDurableModelProfileOwnership,
 } from "./model-profile-ownership";
@@ -55,8 +55,12 @@ type ModelProfileActivationSession = Pick<
 	setActiveModelProfile?: (name: string | undefined) => void;
 	getActiveModelProfile?: () => string | undefined;
 	getModelProfileOwnershipMarker?: () => ModelProfileOwnershipMarker | undefined;
+	getDurableModelProfileOwnershipSnapshot?: () => DurableModelProfileOwnership;
 	commitModelProfileOwnershipMarker?: (marker: ModelProfileOwnershipMarker) => Promise<void>;
+	updateDurableModelProfileOwnershipSnapshot?: (ownership: DurableModelProfileOwnership) => void;
 	markModelProfileOwnershipFailed?: (error: ModelProfileApplyCommittedError) => void;
+	markModelProfileOwnershipReady?: () => void;
+	hasModelProfileOwnershipFailure?: () => boolean;
 	emitProfileOwnershipChanged?: (event: ProfileOwnershipChangedEvent) => void;
 	/** Record which runtime override keys this activation installed (session-scoped). */
 	noteProfileInstalledOverrides?: (
@@ -187,6 +191,7 @@ export interface PreparedModelProfileActivation {
 	agentModelOverrides: Record<string, ModelSelectorValue>;
 	previousActiveModelProfile: string | undefined;
 	previousModelProfileOwnershipMarker: ModelProfileOwnershipMarker | undefined;
+	previousModelProfileOwnershipFailure: boolean;
 	previousDurableModelProfileOwnership: DurableModelProfileOwnership;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
@@ -221,8 +226,11 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getModelProfileOwnershipMarker"
+		| "getDurableModelProfileOwnershipSnapshot"
 		| "commitModelProfileOwnershipMarker"
+		| "updateDurableModelProfileOwnershipSnapshot"
 		| "markModelProfileOwnershipFailed"
+		| "hasModelProfileOwnershipFailure"
 		| "emitProfileOwnershipChanged"
 		| "syncEagerDelegation"
 		| "getDefaultFallbackRuntimeState"
@@ -258,8 +266,11 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
 		| "getModelProfileOwnershipMarker"
+		| "getDurableModelProfileOwnershipSnapshot"
 		| "commitModelProfileOwnershipMarker"
+		| "updateDurableModelProfileOwnershipSnapshot"
 		| "markModelProfileOwnershipFailed"
+		| "hasModelProfileOwnershipFailure"
 		| "emitProfileOwnershipChanged"
 		| "syncEagerDelegation"
 		| "getDefaultFallbackRuntimeState"
@@ -363,6 +374,9 @@ async function commitMaterializedProfileAssignments(
 	agentModelOverrides: Record<string, ModelSelectorValue>,
 ): Promise<boolean> {
 	const oldSessionMarker = options.session.getModelProfileOwnershipMarker?.();
+	const previousOwnershipFailure = options.session.hasModelProfileOwnershipFailure?.() ?? false;
+	const observedDurableOwnership =
+		options.session.getDurableModelProfileOwnershipSnapshot?.() ?? readDurableModelProfileOwnership(options.settings);
 	const previousModelRolesOverride = options.settings.getOverride("modelRoles");
 	const previousAgentModelOverridesOverride = options.settings.getOverride("task.agentModelOverrides");
 	const previousDefaultProfileOverride = options.settings.getOverride("modelProfile.default");
@@ -374,14 +388,22 @@ async function commitMaterializedProfileAssignments(
 	);
 	const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
 	const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
-	const committed = await commitDurableModelProfileOwnership(options.settings, { kind: "cleared" }, [
-		{ path: "modelRoles", op: "set", value: nextModelRoles },
-		{
-			path: "task.agentModelOverrides",
-			op: "set",
-			value: nextAgentModelOverrides,
-		},
-	]);
+	const durableCommit = await commitDurableModelProfileOwnershipWithResult(
+		options.settings,
+		{ kind: "cleared" },
+		[
+			{ path: "modelRoles", op: "set", value: nextModelRoles },
+			{
+				path: "task.agentModelOverrides",
+				op: "set",
+				value: nextAgentModelOverrides,
+			},
+		],
+		undefined,
+		observedDurableOwnership,
+	);
+	const committed = durableCommit.ownership;
+	options.session.updateDurableModelProfileOwnershipSnapshot?.(committed);
 	try {
 		options.settings.clearOverride("modelProfile.default");
 		options.settings.override("modelRoles", nextModelRoles);
@@ -460,24 +482,28 @@ async function commitMaterializedProfileAssignments(
 					);
 		const committedError = new ModelProfileApplyCommittedError(profileName, committed.version, cause);
 		options.session.markModelProfileOwnershipFailed?.(committedError);
-		try {
-			options.session.emitProfileOwnershipChanged?.({
-				type: "profile_ownership_changed",
-				transitionId: globalThis.crypto.randomUUID(),
-				source: "durable",
-				oldMarker: oldSessionMarker ?? { kind: "inherit" },
-				newMarker: { kind: "inherit" },
-				oldSessionId: options.session.sessionId,
-				sessionId: options.session.sessionId,
-				observedDurableVersion: committed.version - 1,
-				committedDurableVersion: committed.version,
-				outcome: "failed",
-			});
-		} catch (eventError) {
-			logger.warn("Failed to emit profile ownership materialization failure", {
-				profile: profileName,
-				error: eventError instanceof Error ? eventError.message : String(eventError),
-			});
+		const ownershipStateChanged =
+			durableCommit.wrote || !modelProfileOwnershipMarkersEqual(oldSessionMarker, { kind: "inherit" });
+		if (ownershipStateChanged) {
+			try {
+				options.session.emitProfileOwnershipChanged?.({
+					type: "profile_ownership_changed",
+					transitionId: globalThis.crypto.randomUUID(),
+					source: durableCommit.wrote ? "durable" : "recovery",
+					oldMarker: oldSessionMarker ?? { kind: "inherit" },
+					newMarker: { kind: "inherit" },
+					oldSessionId: options.session.sessionId,
+					sessionId: options.session.sessionId,
+					observedDurableVersion: durableCommit.wrote ? observedDurableOwnership.version : committed.version,
+					...(durableCommit.wrote ? { committedDurableVersion: committed.version } : {}),
+					outcome: "failed",
+				});
+			} catch (eventError) {
+				logger.warn("Failed to emit profile ownership materialization failure", {
+					profile: profileName,
+					error: eventError instanceof Error ? eventError.message : String(eventError),
+				});
+			}
 		}
 		throw committedError;
 	}
@@ -489,24 +515,30 @@ async function commitMaterializedProfileAssignments(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
-	try {
-		options.session.emitProfileOwnershipChanged?.({
-			type: "profile_ownership_changed",
-			transitionId: globalThis.crypto.randomUUID(),
-			source: "durable",
-			oldMarker: oldSessionMarker ?? { kind: "inherit" },
-			newMarker: { kind: "inherit" },
-			oldSessionId: options.session.sessionId,
-			sessionId: options.session.sessionId,
-			observedDurableVersion: committed.version - 1,
-			committedDurableVersion: committed.version,
-			outcome: "committed",
-		});
-	} catch (error) {
-		logger.warn("Failed to emit profile ownership materialization event", {
-			profile: profileName,
-			error: error instanceof Error ? error.message : String(error),
-		});
+	const ownershipStateChanged =
+		durableCommit.wrote ||
+		previousOwnershipFailure ||
+		!modelProfileOwnershipMarkersEqual(oldSessionMarker, { kind: "inherit" });
+	if (ownershipStateChanged) {
+		try {
+			options.session.emitProfileOwnershipChanged?.({
+				type: "profile_ownership_changed",
+				transitionId: globalThis.crypto.randomUUID(),
+				source: durableCommit.wrote ? "durable" : "recovery",
+				oldMarker: oldSessionMarker ?? { kind: "inherit" },
+				newMarker: { kind: "inherit" },
+				oldSessionId: options.session.sessionId,
+				sessionId: options.session.sessionId,
+				observedDurableVersion: durableCommit.wrote ? observedDurableOwnership.version : committed.version,
+				...(durableCommit.wrote ? { committedDurableVersion: committed.version } : {}),
+				outcome: durableCommit.wrote ? "committed" : "reconciled",
+			});
+		} catch (error) {
+			logger.warn("Failed to emit profile ownership materialization event", {
+				profile: profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 	return true;
 }
@@ -1576,7 +1608,10 @@ export async function prepareModelProfileActivation(
 			agentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
 			previousModelProfileOwnershipMarker: options.session.getModelProfileOwnershipMarker?.(),
-			previousDurableModelProfileOwnership: readDurableModelProfileOwnership(options.settings),
+			previousModelProfileOwnershipFailure: options.session.hasModelProfileOwnershipFailure?.() ?? false,
+			previousDurableModelProfileOwnership:
+				options.session.getDurableModelProfileOwnershipSnapshot?.() ??
+				readDurableModelProfileOwnership(options.settings),
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
@@ -1645,6 +1680,7 @@ async function commitPreparedDurableModelProfileOwnership(
 		marker.kind === "profile"
 			? () => prepared.modelRegistry.assertCurrentModelProfileExists?.(marker.profile)
 			: undefined,
+		prepared.previousDurableModelProfileOwnership,
 	);
 }
 
@@ -1671,6 +1707,7 @@ export async function applyPreparedModelProfileActivation(
 			});
 			committedDurableOwnership = durableCommit.ownership;
 			durableOwnershipVersionAdvanced = durableCommit.wrote;
+			prepared.session.updateDurableModelProfileOwnershipSnapshot?.(committedDurableOwnership);
 		}
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
@@ -1746,7 +1783,12 @@ export async function applyPreparedModelProfileActivation(
 			ownershipMarkerChanged = true;
 			await prepared.session.commitModelProfileOwnershipMarker(nextSessionMarker);
 		}
-		if (options.emitOwnershipEvent !== false) {
+		prepared.session.markModelProfileOwnershipReady?.();
+		const ownershipStateChanged =
+			durableOwnershipVersionAdvanced ||
+			prepared.previousModelProfileOwnershipFailure ||
+			!modelProfileOwnershipMarkersEqual(prepared.previousModelProfileOwnershipMarker, nextSessionMarker);
+		if (options.emitOwnershipEvent !== false && ownershipStateChanged) {
 			const event: ProfileOwnershipChangedEvent = {
 				type: "profile_ownership_changed",
 				transitionId: globalThis.crypto.randomUUID(),

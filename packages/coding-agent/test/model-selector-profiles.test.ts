@@ -118,8 +118,6 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"task.agentModelOverrides": { executor: "provider-a/original-executor" },
 		"modelProfile.default": "old-profile",
 	});
-	const flush = vi.fn(async () => {});
-	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -158,7 +156,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		showError: vi.fn(),
 		restoreComposer: vi.fn(),
 	};
-	return { ctx, settings, session, flush, setCalls };
+	return { ctx, settings, session, setCalls };
 }
 
 async function selectFirstProfile(controller: SelectorController, setDefault = false): Promise<void> {
@@ -891,15 +889,15 @@ describe("model selector profiles", () => {
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
-	test("Set as default persists and flushes modelProfile.default", async () => {
-		const { ctx, flush, setCalls } = createControllerContext();
+	test("Set as default commits modelProfile.default atomically", async () => {
+		const { ctx, settings, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller, true);
 
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
-		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
-		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
+		expect(settings.get("modelProfile.default")).toBe("profile-a");
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+		expect(setCalls).toEqual([]);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
@@ -920,7 +918,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("settings Default Model Profile applies the profile live and persists it", async () => {
-		const { ctx, session, flush, setCalls } = createControllerContext();
+		const { ctx, session, settings, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 
 		controller.handleSettingChange("modelProfile.default", "profile-a");
@@ -928,9 +926,9 @@ describe("model selector profiles", () => {
 
 		expect(session.setModelTemporaryCalls).toHaveLength(1);
 		expect(session.model?.id).toBe("default");
-		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
-		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
+		expect(settings.get("modelProfile.default")).toBe("profile-a");
+		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
+		expect(setCalls).toEqual([]);
 		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
 	});
 

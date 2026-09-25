@@ -16,6 +16,7 @@ import {
 	rewriteSelectorForProxy,
 } from "../src/config/model-profile-activation";
 import {
+	commitDurableModelProfileOwnership,
 	ModelProfileApplyCommittedError,
 	ModelProfileOwnershipConflictError,
 	type ModelProfileOwnershipMarker,
@@ -1536,6 +1537,32 @@ describe("model profile activation", () => {
 		expect(session.model?.id).toBe("initial");
 	});
 
+	test("uses the prepared ownership version instead of rebasing onto a later winner", async () => {
+		const session = fakeSession();
+		const settings = Settings.isolated({ "modelProfile.default": "old-profile" });
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: "winner-profile" });
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toMatchObject({
+			code: "model_profile_ownership_conflict",
+			expectedVersion: 0,
+			actualVersion: 1,
+			actualMarker: { kind: "profile", profile: "winner-profile" },
+		});
+		expect(settings.getGlobal("modelProfile.default")).toBe("winner-profile");
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 1,
+			marker: { kind: "profile", profile: "winner-profile" },
+		});
+		expect(session.getActiveModelProfile()).toBeUndefined();
+		expect(session.model?.id).toBe("initial");
+	});
+
 	test("revalidates the selected profile under the durable commit lock", async () => {
 		const session = fakeSession();
 		const registry = Object.assign(fakeRegistry(), {
@@ -1673,6 +1700,82 @@ describe("model profile activation", () => {
 			observedDurableVersion: 0,
 			committedDurableVersion: 1,
 			outcome: "committed",
+		});
+	});
+
+	test("does not emit a duplicate ownership event for an already-applied durable profile", async () => {
+		const events: ProfileOwnershipChangedEvent[] = [];
+		const session = Object.assign(fakeSession(), {
+			emitProfileOwnershipChanged: (event: ProfileOwnershipChangedEvent) => events.push(event),
+		});
+		const settings = Settings.isolated();
+
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+
+		expect(readDurableModelProfileOwnership(settings)).toMatchObject({
+			version: 1,
+			marker: { kind: "profile", profile: "profile-a" },
+		});
+		expect(events).toHaveLength(1);
+	});
+
+	test("emits reconciliation after a failed durable activation later succeeds without another CAS", async () => {
+		const events: ProfileOwnershipChangedEvent[] = [];
+		let ownershipFailed = false;
+		const session = Object.assign(fakeSession(), {
+			hasModelProfileOwnershipFailure: () => ownershipFailed,
+			markModelProfileOwnershipFailed: () => {
+				ownershipFailed = true;
+			},
+			markModelProfileOwnershipReady: () => {
+				ownershipFailed = false;
+			},
+			emitProfileOwnershipChanged: (event: ProfileOwnershipChangedEvent) => events.push(event),
+		});
+		const settings = Settings.isolated({
+			"modelProfile.default": "profile-a",
+		});
+		const setModelTemporary = session.setModelTemporary.bind(session);
+		let failRuntimeOnce = true;
+		session.setModelTemporary = async (nextModel, thinkingLevel, options) => {
+			if (failRuntimeOnce) {
+				failRuntimeOnce = false;
+				options?.onMutationStarted?.();
+				throw new Error("injected runtime apply failure");
+			}
+			await setModelTemporary(nextModel, thinkingLevel, options);
+		};
+
+		await expect(
+			activateModelProfile(
+				{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+				{ persistDefault: true },
+			),
+		).rejects.toBeInstanceOf(ModelProfileApplyCommittedError);
+		const committed = readDurableModelProfileOwnership(settings);
+		expect(ownershipFailed).toBe(true);
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({ source: "durable", outcome: "failed" });
+
+		await activateModelProfile(
+			{ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" },
+			{ persistDefault: true },
+		);
+
+		expect(ownershipFailed).toBe(false);
+		expect(readDurableModelProfileOwnership(settings)).toEqual(committed);
+		expect(events).toHaveLength(2);
+		expect(events[1]).toMatchObject({
+			source: "recovery",
+			observedDurableVersion: committed.version,
+			outcome: "reconciled",
 		});
 	});
 

@@ -2025,7 +2025,6 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
-					activeModelProfile: options.parentActiveModelProfile,
 					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel

@@ -215,14 +215,22 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:getActiveModelProfile": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getModelProfileOwnershipMarker":
 		"internal persisted profile-ownership snapshot accessor, not a user-facing SDK operation",
+	"agent_session:getDurableModelProfileOwnershipSnapshot":
+		"internal per-session durable owner snapshot accessor, not a user-facing SDK operation",
 	"agent_session:getEffectiveModelProfileOwnershipMarker":
 		"internal ownership resolver accessor shared by startup and lifecycle transitions, not a user-facing SDK operation",
 	"agent_session:getEffectiveModelProfileName":
 		"internal ownership validation accessor that fails closed on deleted profiles, not a user-facing SDK operation",
 	"agent_session:commitModelProfileOwnershipMarker":
 		"internal session transcript persistence boundary for ownership transitions, not a user-facing SDK operation",
+	"agent_session:updateDurableModelProfileOwnershipSnapshot":
+		"internal durable owner snapshot refresh at an explicit activation or lifecycle boundary, not a user-facing SDK operation",
 	"agent_session:markModelProfileOwnershipFailed":
 		"internal fail-closed ownership state setter, not a user-facing SDK operation",
+	"agent_session:markModelProfileOwnershipReady":
+		"internal successful-reconciliation state reset, not a user-facing SDK operation",
+	"agent_session:hasModelProfileOwnershipFailure":
+		"internal fail-closed ownership state query used for reconciliation diagnostics, not a user-facing SDK operation",
 	"agent_session:emitProfileOwnershipChanged":
 		"internal ownership lifecycle event emitter, not a user-facing SDK operation",
 	"agent_session:noteProfileInstalledOverrides":
@@ -303,6 +311,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
 	"agent_session:installRecoveredDefaultFallbackChain":
 		"internal recovered fallback-chain installation during session startup, not a user-facing SDK control seam",
+	"agent_session:installResolvedProfileDefaultFallbackChain":
+		"internal current-owner fallback-chain reconciliation without transcript writes, not a user-facing SDK control seam",
 	"agent_session:markStartupRecoveryBindingsRequired":
 		"internal startup recovery binding marker, not a user-facing SDK control seam",
 	"agent_session:hasRecoveredDefaultFallbackChain":

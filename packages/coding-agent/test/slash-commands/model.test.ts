@@ -14,7 +14,7 @@ function createRuntime() {
 		model: undefined as { provider: string; id: string; contextWindow?: number } | undefined,
 		thinkingLevel: undefined as string | undefined,
 		modelRegistry: {
-			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string) {
+			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string): Promise<string | undefined> {
 				return "test-api-key";
 			},
 			resolveCanonicalModel: (
@@ -25,14 +25,35 @@ function createRuntime() {
 		},
 		getAvailableModels: () => [availableModel],
 		setConfiguredModelChain: () => {},
+		recordResumeDefaultModel: () => {},
 		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
 			this.model = model;
+		},
+		async setModelTemporary(
+			model: { provider: string; id: string },
+			thinkingLevel?: string,
+			options?: { onMutationStarted?: () => void },
+		) {
+			options?.onMutationStarted?.();
+			this.model = model;
+			this.thinkingLevel = thinkingLevel;
 		},
 		setThinkingLevel(thinkingLevel: string) {
 			this.thinkingLevel = thinkingLevel;
 		},
 		getActiveModelProfile() {
 			return activeModelProfile;
+		},
+		getConfiguredModelChainState(_role: string) {
+			return undefined;
+		},
+		getDefaultFallbackRuntimeState() {
+			return undefined;
+		},
+		getEffectiveModelProfileOwnershipMarker() {
+			return activeModelProfile
+				? { kind: "profile" as const, profile: activeModelProfile }
+				: { kind: "inherit" as const };
 		},
 		setActiveModelProfile(name: string | undefined) {
 			activeModelProfile = name;
@@ -49,6 +70,7 @@ function createRuntime() {
 		buildSessionContext: () => ({ messages: [], thinkingLevel: "off", models: {}, injectedTtsrRules: [] }),
 		getUsageStatistics: () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, premiumRequests: 0, cost: 0 }),
 	};
+	Object.assign(session, { sessionManager });
 	return {
 		output,
 		settings,
@@ -137,6 +159,69 @@ describe("/model batch assignments", () => {
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(output).toEqual([
 			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
+		]);
+	});
+
+	test("does not persist rollback state when profile assignment credentials fail before mutation", async () => {
+		const { output, runtime, session, settings, setActiveModelProfile } = createRuntime();
+		const currentModel = { provider: "anthropic", id: "current-model" };
+		session.model = currentModel;
+		settings.set("modelProfile.default", "profile-a");
+		setActiveModelProfile("profile-a");
+		const apiKeySpy = spyOn(session.modelRegistry, "getApiKey").mockResolvedValue(undefined);
+		const setChainSpy = spyOn(session, "setConfiguredModelChain");
+		const resumeDefaultSpy = spyOn(session, "recordResumeDefaultModel");
+		const setActiveSpy = spyOn(session, "setActiveModelProfile");
+
+		await expect(
+			executeAcpBuiltinSlashCommand("/model assign all-targets claude-sonnet:low", runtime),
+		).resolves.toEqual({ consumed: true });
+
+		expect(apiKeySpy).toHaveBeenCalledTimes(1);
+		expect(setChainSpy).not.toHaveBeenCalled();
+		expect(resumeDefaultSpy).not.toHaveBeenCalled();
+		expect(setActiveSpy).not.toHaveBeenCalled();
+		expect(session.model).toBe(currentModel);
+		expect(settings.get("modelProfile.default")).toBe("profile-a");
+		expect(output).toEqual(["Failed to set model: No API key for anthropic/claude-3-5-sonnet"]);
+	});
+
+	test("keeps materialized ownership state after post-commit notification failure", async () => {
+		const { output, runtime, session, settings, setActiveModelProfile } = createRuntime();
+		session.model = { provider: "anthropic", id: "current-model" };
+		settings.set("modelProfile.default", "profile-a");
+		setActiveModelProfile("profile-a");
+		const setChainSpy = spyOn(session, "setConfiguredModelChain");
+		const resumeDefaultSpy = spyOn(session, "recordResumeDefaultModel");
+		runtime.notifyConfigChanged = async () => {
+			throw new Error("configuration refresh failed");
+		};
+
+		await expect(
+			executeAcpBuiltinSlashCommand("/model assign all-targets claude-sonnet:low", runtime),
+		).resolves.toEqual({ consumed: true });
+
+		expect(session.model?.id).toBe("claude-3-5-sonnet");
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
+		expect(settings.get("task.agentModelOverrides")).toEqual({
+			executor: "anthropic/claude-3-5-sonnet:low",
+			architect: "anthropic/claude-3-5-sonnet:low",
+			planner: "anthropic/claude-3-5-sonnet:low",
+			critic: "anthropic/claude-3-5-sonnet:low",
+		});
+		expect(setChainSpy).toHaveBeenCalledTimes(1);
+		expect(setChainSpy).toHaveBeenCalledWith(
+			"default",
+			["anthropic/claude-3-5-sonnet:low"],
+			"modelRoles",
+			undefined,
+			true,
+		);
+		expect(resumeDefaultSpy).not.toHaveBeenCalled();
+		expect(output).toEqual([
+			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
+			"Model assignment committed, but follow-up failed: configuration refresh failed",
 		]);
 	});
 

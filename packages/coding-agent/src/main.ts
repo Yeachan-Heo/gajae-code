@@ -1944,11 +1944,38 @@ export async function runRootCommand(
 		process.exit(1);
 	}
 
+	let sessionManager: SessionManager | undefined = bareResumeSessionManager;
+	if (!sessionManager) {
+		try {
+			sessionManager = await logger.time(
+				"createSessionManager",
+				deps.createSessionManager ?? createSessionManager,
+				parsedArgs,
+				cwd,
+				settingsInstance,
+			);
+		} catch (error) {
+			const message = operatorFacingSessionOpenMessage(error);
+			if (!message) throw error;
+			process.stderr.write(`${message}\n`);
+			if (!deps.suppressProcessExit) process.exitCode = 1;
+			authStorage.close();
+			stopThemeWatcher();
+			await postmortem.cleanup();
+			return;
+		}
+	}
+
 	const startupOwnershipMarker = resolveEffectiveModelProfileMarker(
-		bareResumeSessionManager?.getModelProfileOwnershipMarker(),
+		sessionManager?.getModelProfileOwnershipMarker(),
 		readDurableModelProfileOwnership(settingsInstance),
 	);
 	const hasRootStartupProfile = parsedArgs.mpreset !== undefined || startupOwnershipMarker.kind === "profile";
+	if (hasRootStartupProfile && sessionManager?.getBranch().length) {
+		await logger.time("refreshResumedProfileProviders", () =>
+			modelRegistry.refresh("online-if-uncached", sessionManager?.getSessionId()),
+		);
+	}
 	const startupModelSelectors = resolveStartupModelRefreshSelectors(
 		{
 			model: parsedArgs.model,
@@ -1991,29 +2018,8 @@ export async function runRootCommand(
 		);
 	}
 
-	// Create session manager based on CLI flags. A bare resume was strictly opened
-	// before startup discovery, so it never reaches create-or-open behavior here.
-	let sessionManager: SessionManager | undefined = bareResumeSessionManager;
-	if (!sessionManager) {
-		try {
-			sessionManager = await logger.time(
-				"createSessionManager",
-				deps.createSessionManager ?? createSessionManager,
-				parsedArgs,
-				cwd,
-				settingsInstance,
-			);
-		} catch (error) {
-			const message = operatorFacingSessionOpenMessage(error);
-			if (!message) throw error;
-			process.stderr.write(`${message}\n`);
-			if (!deps.suppressProcessExit) process.exitCode = 1;
-			authStorage.close();
-			stopThemeWatcher();
-			await postmortem.cleanup();
-			return;
-		}
-	}
+	// Session selection is resolved before provider discovery so saved profile markers
+	// participate in startup model refresh for every resume surface.
 
 	// Restore the resumed session's working directory so the HUD branch, the
 	// project path, and the agent's tools all match where the session was
