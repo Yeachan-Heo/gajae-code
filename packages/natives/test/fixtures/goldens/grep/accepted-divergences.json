@@ -1,0 +1,57 @@
+{
+  "schema": "gjc.grep-divergences/1",
+  "upstream": "can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-natives/src/grep.rs",
+  "divergences": [
+    {
+      "caseId": "pcre2-lookahead",
+      "reason": "Pinned upstream PCRE2 fallback accepts positive lookahead, so this pattern now returns fixture matches instead of the pre-sync regex parse error.",
+      "upstreamRationale": "grep.rs compiles with grep-regex first and falls back to grep-pcre2 for lookaround and backreference syntax that Rust regex does not support.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase-2-5-grep.md",
+      "testsUpdated": true,
+      "expected": {
+        "totalMatches": 217,
+        "filesWithMatches": 73,
+        "filesSearched": 79,
+        "limitReached": true,
+        "matches": [
+          {
+            "path": "access-remove-optional-chain-001/input/rubygems.ts",
+            "lineNumber": 39,
+            "line": "export const handleRubyGems: SpecialHandler = async (",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-002/input/render.ts",
+            "lineNumber": 29,
+            "line": "export function renderMCPCall(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-002/input/render.ts",
+            "lineNumber": 51,
+            "line": "export function renderMCPResult(",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          },
+          {
+            "path": "access-remove-optional-chain-003/input/terminal-capabilities.ts",
+            "lineNumber": 4,
+            "line": "export enum ImageProtocol {",
+            "contextBefore": [],
+            "contextAfter": [],
+            "truncated": null,
+            "matchCount": null
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -21,6 +21,7 @@ dashmap.workspace = true
 globset.workspace = true
 heapless.workspace = true
 grep-matcher.workspace = true
+grep-pcre2.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
 html-to-markdown-rs.workspace = true
