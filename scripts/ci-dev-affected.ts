@@ -571,7 +571,10 @@ function taskNeedsRust(key: string): boolean {
 		key === "ci-dry-run" ||
 		key === "affected-selftest" ||
 		key === "affected-dry-run" ||
-		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts" ||
+		// Builds pi-natives with the `task-panic-test` feature via `napi build`; without the
+		// provisioned toolchain and rust-cache the cold compile exceeds the test timeout.
+		key === "test:packages/natives/test/task-panic-to-rejection.test.ts"
 	);
 }
 

@@ -1201,6 +1201,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(unrelatedTask?.rust).toBe(false);
 	});
 
+	test("the native task-panic regression's direct PR task requires Rust", () => {
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const [directTask] = describeTasks([
+			{ key: `test:${testFile}`, description: testFile, command: ["bun", "test", testFile] },
+		]);
+		expect(directTask?.rust).toBe(true);
+	});
+
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
 		const shardOne = "test:@gajae-code/coding-agent:shard-1-of-8";
 		const isolated = "test:@gajae-code/coding-agent:sdk-production-host-isolated";
