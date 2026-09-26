@@ -955,6 +955,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
+			"test:packages/natives/test/task-panic-to-rejection.test.ts",
 			"check:@gajae-code/orchestration-token-benchmark", "test:@gajae-code/orchestration-token-benchmark",
 			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
@@ -1907,6 +1908,25 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		const generalShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
 		expect(generalShards).toHaveLength(8);
 		expect(generalShards.every(entry => !entry.rust)).toBe(true);
+	});
+
+	test("push mode runs the native task-panic regression only as its own Rust task", () => {
+		const natives: WorkspacePackage = {
+			name: "@gajae-code/natives",
+			dir: "packages/natives",
+			manifest: { name: "@gajae-code/natives", scripts: { check: "biome check .", test: "bun test" } },
+		};
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const entries = describeTasks(planTasks(["packages/natives/src/index.ts"], [natives]));
+		const packageTask = entries.find(entry => entry.key === "test:@gajae-code/natives");
+		expect(packageTask).toMatchObject({
+			command: ["bun", "test", "--path-ignore-patterns=test/task-panic-to-rejection.test.ts"],
+			rust: false,
+		});
+		expect(entries.find(entry => entry.key === `test:${testFile}`)).toMatchObject({
+			command: ["bun", "test", testFile],
+			rust: true,
+		});
 	});
 
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {
