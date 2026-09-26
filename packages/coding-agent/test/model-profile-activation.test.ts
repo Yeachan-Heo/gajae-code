@@ -77,7 +77,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
-			model("openai-codex", "gpt-5.6-sol", {
+			model("openai-codex", "gpt-6-sol", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
@@ -87,13 +87,13 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
-			model("openai-codex", "gpt-5.6-luna", {
+			model("openai-codex", "gpt-6-luna", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
-			model("anthropic", "claude-opus-5", {
+			model("anthropic", "claude-opus-5-5", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
@@ -234,11 +234,11 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+	test("built-in claude-opus falls back to Opus 4.6 when Opus 5.5 is absent", async () => {
 		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
 		expect(profile).toBeDefined();
 		const baseRegistry = fakeRegistry({ profiles: [profile!] });
-		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5-5");
 		const session = fakeSession();
 
 		const prepared = await prepareModelProfileActivation({
@@ -254,16 +254,16 @@ describe("model profile activation", () => {
 
 		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
-		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"]);
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "anthropic/claude-sonnet-5",
-			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 		});
 	});
 
-	test("built-in claude-opus retains Opus 5 when the catalog exposes it", async () => {
+	test("built-in claude-opus retains Opus 5.5 when the catalog exposes it", async () => {
 		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
 		expect(profile).toBeDefined();
 
@@ -274,11 +274,11 @@ describe("model profile activation", () => {
 			profileName: "claude-opus",
 		});
 
-		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
-		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
 	});
 
-	test("built-in claude-opus skips a bundled Opus 5 absent from fresh live catalog evidence", async () => {
+	test("built-in claude-opus skips a bundled Opus 5.5 absent from fresh live catalog evidence", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		try {
@@ -307,7 +307,7 @@ describe("model profile activation", () => {
 
 			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
 			// Fresh, authoritative live evidence makes the live catalog the selectable
-			// list, so a bundled Opus 5 the provider did not enroll is not selectable
+			// list, so a bundled Opus 5.5 the provider did not enroll is not selectable
 			// either. The bundled catalog is only the fallback when that evidence is
 			// unavailable (#5720, #5746).
 			expect(
@@ -322,7 +322,7 @@ describe("model profile activation", () => {
 					.getAvailableForProfileActivation()
 					.filter(candidate => candidate.provider === "anthropic")
 					.map(candidate => candidate.id),
-			).not.toContain("claude-opus-5");
+			).not.toContain("claude-opus-5-5");
 			const expectedIds = new Set(["claude-opus-4-6", "claude-sonnet-5"]);
 			expect(
 				registry.getAvailableForProfileActivation().filter(candidate => candidate.provider === "anthropic"),
@@ -344,13 +344,13 @@ describe("model profile activation", () => {
 
 			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
 			expect(prepared.defaultResolutionSkips).toEqual([
-				{ selector: "anthropic/claude-opus-5:xhigh", reason: "unknown_model" },
+				{ selector: "anthropic/claude-opus-5-5:medium", reason: "unknown_model" },
 			]);
 			expect(prepared.agentModelOverrides).toMatchObject({
 				executor: "anthropic/claude-sonnet-5",
-				planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-				critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-				architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:high"],
+				planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+				critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+				architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
 			});
 		} finally {
 			authStorage.close();
@@ -359,13 +359,13 @@ describe("model profile activation", () => {
 	});
 
 	test("materialization resolves a bare assignment against the profile-activation catalog, not the broadened general one", () => {
-		const opus5 = model("anthropic", "claude-opus-5");
+		const opus5 = model("anthropic", "claude-opus-5-5");
 		const opus46 = model("anthropic", "claude-opus-4-6");
 		const baseRegistry = fakeRegistry();
 		const registry = {
 			...baseRegistry,
 			getAll: () => [opus5, opus46, ...baseRegistry.getAll()],
-			// Fresh live descriptor evidence omitted the bundled Opus 5, so the
+			// Fresh live descriptor evidence omitted the bundled Opus 5.5, so the
 			// profile-activation catalog is narrower than the general catalog.
 			getAvailable: () => [opus5, opus46],
 			getAvailableForProfileActivation: () => [opus46],
@@ -386,7 +386,7 @@ describe("model profile activation", () => {
 		});
 
 		expect(materialized).toBe(true);
-		// The broadened general catalog still lists Opus 5, but the assignment is
+		// The broadened general catalog still lists Opus 5.5, but the assignment is
 		// persisted for later profile execution, so it must resolve against the
 		// catalog that fresh live profile evidence narrowed.
 		expect(settings.get("modelRoles")).toMatchObject({ default: "anthropic/claude-opus-4-6" });
@@ -396,7 +396,7 @@ describe("model profile activation", () => {
 		const profile: ModelProfileDefinition = {
 			name: "excluded-bundled-default",
 			requiredProviders: ["anthropic"],
-			modelMapping: { default: "anthropic/claude-opus-5" },
+			modelMapping: { default: "anthropic/claude-opus-5-5" },
 			source: "builtin",
 		};
 		const baseRegistry = fakeRegistry({ profiles: [profile] });
@@ -407,7 +407,7 @@ describe("model profile activation", () => {
 			getAvailableForProfileActivation,
 		} as unknown as ModelRegistry;
 
-		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+		expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5-5")).toBe(true);
 		const recovery = await resolveModelProfileDefaultChain({
 			modelRegistry: registry,
 			settings: Settings.isolated(),
@@ -418,9 +418,9 @@ describe("model profile activation", () => {
 		expect(getAvailableForProfileActivation).toHaveBeenCalledTimes(1);
 		expect(recovery).toMatchObject({
 			profileName: profile.name,
-			entries: ["anthropic/claude-opus-5"],
+			entries: ["anthropic/claude-opus-5-5"],
 			activeIndex: 1,
-			skips: [{ selector: "anthropic/claude-opus-5", reason: "unknown_model" }],
+			skips: [{ selector: "anthropic/claude-opus-5-5", reason: "unknown_model" }],
 		});
 		expect(recovery.model).toBeUndefined();
 	});
@@ -634,7 +634,7 @@ describe("model profile activation", () => {
 				}
 				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
 				discoveryCount += 1;
-				return new Response(JSON.stringify({ data: discoveryCount === 1 ? [{ id: "claude-opus-5" }] : [] }), {
+				return new Response(JSON.stringify({ data: discoveryCount === 1 ? [{ id: "claude-opus-5-5" }] : [] }), {
 					headers: { "Content-Type": "application/json" },
 				});
 			});
@@ -648,7 +648,7 @@ describe("model profile activation", () => {
 			expect(
 				registry
 					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 			const notificationsAfterNonEmpty = catalogNotifications;
 
@@ -657,7 +657,7 @@ describe("model profile activation", () => {
 			expect(
 				registry
 					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(false);
 		} finally {
 			authStorage.close();
@@ -665,7 +665,7 @@ describe("model profile activation", () => {
 		}
 	});
 
-	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
+	test("built-in claude-opus retains bundled Opus 5.5 after live catalog discovery fails", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		try {
@@ -693,7 +693,7 @@ describe("model profile activation", () => {
 				profileName: "claude-opus",
 			});
 
-			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
 			expect(prepared.defaultResolutionSkips).toEqual([]);
 		} finally {
 			authStorage.close();
@@ -714,7 +714,7 @@ describe("model profile activation", () => {
 							baseUrl: "https://custom-anthropic.example.test/v1",
 							api: "anthropic-messages",
 							apiKey: "TEST_ANTHROPIC_KEY",
-							models: [{ id: "claude-opus-5" }],
+							models: [{ id: "claude-opus-5-5" }],
 						},
 					},
 				}),
@@ -736,11 +736,11 @@ describe("model profile activation", () => {
 			const registry = new ModelRegistry(authStorage, modelsPath);
 			await registry.refreshProvider("anthropic", "online");
 
-			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
 			expect(
 				registry
 					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 
 			registry.registerProvider("anthropic", {
@@ -749,8 +749,8 @@ describe("model profile activation", () => {
 				apiKey: "TEST_RUNTIME_ANTHROPIC_KEY",
 				models: [
 					{
-						id: "claude-opus-5",
-						name: "Runtime Opus 5",
+						id: "claude-opus-5-5",
+						name: "Runtime Opus 5.5",
 						reasoning: true,
 						input: ["text"],
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -759,11 +759,11 @@ describe("model profile activation", () => {
 					},
 				],
 			});
-			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
 			expect(
 				registry
 					.getAvailableForProfileActivation()
-					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5-5"),
 			).toBe(true);
 		} finally {
 			authStorage.close();
@@ -1722,8 +1722,8 @@ describe("model profile activation", () => {
 			"codex-eco",
 			{
 				default: "openai-codex/gpt-5.6-terra:low",
-				executor: "openai-codex/gpt-5.6-luna:low",
-				planner: "openai-codex/gpt-5.6-luna:high",
+				executor: "openai-codex/gpt-6-luna:low",
+				planner: "openai-codex/gpt-6-luna:high",
 				critic: "openai-codex/gpt-5.6-terra:xhigh",
 				architect: "openai-codex/gpt-5.6-terra:high",
 			},
@@ -1731,51 +1731,51 @@ describe("model profile activation", () => {
 		[
 			"codex-medium",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6-sol:low",
 				executor: "openai-codex/gpt-5.6-terra:low",
 				planner: "openai-codex/gpt-5.6-terra:high",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"codex-pro",
 			{
-				default: "openai-codex/gpt-5.6-sol:medium",
+				default: "openai-codex/gpt-6-sol:medium",
 				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "openai-codex/gpt-5.6-sol:high",
-				critic: "openai-codex/gpt-5.6-sol:max",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				planner: "openai-codex/gpt-6-sol:high",
+				critic: "openai-codex/gpt-6-sol:max",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
 			"opus-codex",
 			{
-				default: "anthropic/claude-opus-5:xhigh",
+				default: "anthropic/claude-opus-5-5:medium",
 				executor: "openai-codex/gpt-5.6-terra:low",
 				planner: "anthropic/claude-sonnet-5",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"lunamaxxing",
 			{
-				default: "openai-codex/gpt-5.6-luna:medium",
-				executor: "openai-codex/gpt-5.6-luna:xhigh",
-				planner: "openai-codex/gpt-5.6-luna:max",
-				critic: "openai-codex/gpt-5.6-luna:max",
-				architect: "openai-codex/gpt-5.6-luna:max",
+				default: "openai-codex/gpt-6-luna:medium",
+				executor: "openai-codex/gpt-6-luna:xhigh",
+				planner: "openai-codex/gpt-6-luna:max",
+				critic: "openai-codex/gpt-6-luna:max",
+				architect: "openai-codex/gpt-6-luna:max",
 			},
 		],
 		[
 			"codex-opencodego",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
 				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
@@ -1783,9 +1783,9 @@ describe("model profile activation", () => {
 			{
 				default: "anthropic/claude-fable-5-1:high",
 				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "anthropic/claude-opus-5:medium",
-				critic: "anthropic/claude-opus-5:high",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				planner: "anthropic/claude-opus-5-5:medium",
+				critic: "anthropic/claude-opus-5-5:high",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
@@ -3128,19 +3128,19 @@ describe("preset-equivalent profile activation", () => {
 describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 	test("preserves an exported model when native discovery also exposes its wire id", () => {
 		const models = [
-			model("opencodex", "anthropic/claude-opus-5"),
-			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5"), wireModelId: "anthropic/claude-opus-5" },
+			model("opencodex", "anthropic/claude-opus-5-5"),
+			{ ...model("opencodex", "opencodex/anthropic/claude-opus-5-5"), wireModelId: "anthropic/claude-opus-5-5" },
 		];
 		expect(
 			rewriteSelectorForProxy(
-				"anthropic/claude-opus-5",
+				"anthropic/claude-opus-5-5",
 				"opencodex",
 				"always",
 				models,
 				new Set(),
 				new Set(["anthropic"]),
 			),
-		).toBe("opencodex/anthropic/claude-opus-5");
+		).toBe("opencodex/anthropic/claude-opus-5-5");
 	});
 
 	test("retains public proxy aliases when a distinct wire id is configured", () => {
@@ -3187,12 +3187,12 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			profileName: "opus-codex",
 		});
 		expect(prepared.defaultModel?.provider).toBe("opencodex");
-		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
+		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5-5");
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "opencodex/opencodex/gpt-5.6-terra:low",
-			architect: "opencodex/opencodex/gpt-5.6-sol:high",
+			architect: "opencodex/opencodex/gpt-6-sol:high",
 			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
-			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+			critic: "opencodex/opencodex/gpt-6-sol:xhigh",
 		});
 	});
 
