@@ -110,7 +110,26 @@ async function fileExists(filePath: string): Promise<boolean> {
 	}
 }
 
+/**
+ * Embedding bakes the addon into a compiled binary, where the diagnostic loader can
+ * only use the versioned cache slot. Refuse to embed an addon whose bytes are not the
+ * ones the shipped trusted record describes.
+ */
+async function assertTrustedArtifactRecord(): Promise<void> {
+	const script = path.join(import.meta.dir, "..", "..", "..", "scripts", "verify-diagnostic-artifact-provenance.ts");
+	const nativeDir = path.join(import.meta.dir, "..", "native");
+	const result = Bun.spawnSync({
+		cmd: [process.execPath, script, "--verify", nativeDir],
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	if (result.exitCode !== 0) {
+		throw new Error("diagnostic artifact provenance verification failed; refusing to embed");
+	}
+}
+
 async function embedNative(): Promise<void> {
+	await assertTrustedArtifactRecord();
 	if (process.argv.includes("--reset")) {
 		await Bun.write(outputPath, stubContent);
 		return;

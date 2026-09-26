@@ -1495,6 +1495,16 @@ export class Broker {
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
+	/** Public publication-incarnation id, fixed at startup; never the endpoint generation. */
+	#diagnosticGeneration = randomBytes(16).toString("hex");
+	/** Trusted build snapshot captured at startup; unknown buildId stays null. */
+	#startupBuild: { packageVersion: string; buildId: string | null } = {
+		packageVersion: packageJson.version,
+		buildId:
+			typeof process.env.GJC_BUILD_ID === "string" && process.env.GJC_BUILD_ID.length > 0
+				? process.env.GJC_BUILD_ID
+				: null,
+	};
 	#sessionListCursors = new Map<string, SessionListCursor>();
 	#chains = new Map<string, Promise<void>>();
 	#spawnInFlight = new Map<string, SpawnInFlight>();
@@ -3868,6 +3878,10 @@ export class Broker {
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,
+				// Observation capability: the startup-fixed generation and the protocol the
+				// broker answers. An old broker simply omits both.
+				diagnosticGeneration: this.#diagnosticGeneration,
+				diagnosticProtocol: 1,
 				host: "127.0.0.1",
 				port,
 				url: `ws://127.0.0.1:${port}`,
@@ -4728,6 +4742,32 @@ export class Broker {
 			? entry.response
 			: error("terminal_uncertain", "lifecycle outcome has no recorded response");
 	}
+	/**
+	 * Published diagnostics for observation clients (SPEC "Result contract").
+	 *
+	 * Everything here is captured once at startup and never recomputed, so a later source
+	 * or package change cannot alter what a running broker reports. No token, socket
+	 * coordinate, argv or environment value is included; the identity fields are the
+	 * internal owner/process/root binding the observer already knows from discovery.
+	 */
+	#publishedDiagnostics(): Promise<BrokerResponse> {
+		// Observation is answered ONLY from an already-owned healthy retained publication.
+		// A broker that owns no publication refuses here and recovers nothing: it does not
+		// publish, ensure, restart or touch the authority to answer.
+		if (this.#publication === null || this.#publicationState !== "healthy-owned") {
+			return Promise.resolve(error("unavailable", "broker publication authority is not owned"));
+		}
+		return Promise.resolve({
+			ok: true,
+			result: {
+				diagnosticProtocol: 1,
+				generation: this.#diagnosticGeneration,
+				build: this.#startupBuild,
+				identity: { ownerId: this.#owner, pid: process.pid, agentRoot: this.settings.agentDir },
+			},
+		});
+	}
+
 	// Wire requests are readiness-gated by BrokerTransport before reaching this dispatcher.
 	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
 		if (operation === "broker.status") return Promise.resolve({ ok: true, result: this.status() });
@@ -4768,6 +4808,7 @@ export class Broker {
 			const spawnClose = await this.#maybeCloseSpawnChild(input);
 			if (spawnClose) return spawnClose;
 		}
+		if (operation === "broker.diagnostics") return this.#publishedDiagnostics();
 		if (operation === "session.control") return this.#sessionControl(input, idempotencyKey);
 		if (operation === "session.lookup") {
 			const lookup = publicLifecycleLookupInput(input);

@@ -100,7 +100,9 @@ runs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
            name: pi-natives-${{ inputs.platform }}-${{ inputs.arch }}${{ inputs.variant && format('-{0}', inputs.variant) || '' }}-h${{ inputs.hash }}
-           path: packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.node
+           path: |
+              packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.node
+              packages/natives/native/pi_natives.${{ inputs.platform }}-${{ inputs.arch }}*.node.provenance.json
            if-no-files-found: error
            # Explicit so the rust-hash canary lookup keeps working even if org
            # defaults shift; bump if Rust source ever stays stable for >90 days

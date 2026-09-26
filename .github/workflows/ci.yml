@@ -442,6 +442,14 @@ jobs:
               pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           # The binaries matrix includes a Windows runner, whose default shell is
+           # PowerShell; this body is Bash.
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Verify memory-guard native loader export
            run: bun test packages/natives/test/memory-guard-native.test.ts
 
@@ -631,6 +639,11 @@ jobs:
               pattern: pi-natives-*
               path: packages/natives/native
               merge-multiple: true
+         - name: Rebuild the diagnostic artifact provenance record
+           run: |
+              set -euo pipefail
+              bun scripts/verify-diagnostic-artifact-provenance.ts --rebuild-from-sidecars packages/natives/native
+              bun scripts/verify-diagnostic-artifact-provenance.ts --verify packages/natives/native
          - name: Prepare immutable package evidence
            env:
               RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}

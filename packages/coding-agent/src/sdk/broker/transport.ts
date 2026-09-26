@@ -7,6 +7,8 @@ const PROTOCOL_VERSION = 3;
 const MAX_BROKER_JSON_FRAME_BYTES = 4 * 1024 * 1024;
 
 const BROKER_OPERATIONS = new Set([
+	// Observation-only published diagnostics; it starts, ensures and recovers nothing.
+	"broker.diagnostics",
 	"session.list",
 	"session.get_endpoint",
 	"session.create",
