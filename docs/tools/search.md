@@ -25,6 +25,7 @@
 | `i` | `boolean` | No | Case-insensitive search. Defaults to `false`. Passed to native `ignoreCase`. |
 | `gitignore` | `boolean` | No | Respect `.gitignore` during directory scans. Defaults to `true`. Passed to native `gitignore`. |
 | `skip` | `number` | No | Global match offset. Defaults to `0`. `search.ts` floors finite numbers and rejects negative or non-finite values. |
+| `timeout` | `number` | No | Search timeout in seconds, `0.5`–`60` (schema-validated). Defaults to `5` (`DEFAULT_SEARCH_TIMEOUT_MS`). On timeout the tool fails with `Search timed out after <n>s; increase timeout or narrow paths/pattern`. |
 
 ## Outputs
 The tool returns a single text block in `content[0].text` plus structured `details`.

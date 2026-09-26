@@ -30,6 +30,7 @@
 | `context` | `string` | No | Shared background prepended to every subagent system prompt. Trimmed before use. |
 | `schema` | `string` | No | JSON-encoded JTD schema. Overrides agent/session output schema when this mode allows task-level schemas. |
 | `isolated` | `boolean` | No | Only present when the tool is created with isolation enabled. Requests isolated execution for the whole batch. |
+| `spawnPlan` | `{ whyParallel: string; whyNotLocal: string; independence: string; expectedReceiptShape: string; maxInlineTokens: number }` | No | Required when a batch has more than 4 tasks (`DEFAULT_SPAWN_THRESHOLD` in `task/spawn-gate.ts`). The four strings must be non-empty and `maxInlineTokens` a positive finite number; otherwise the batch is rejected with `Task spawn gate rejected this batch: ...` naming the missing fields. |
 
 `tasks[].description` is UI-only. `tasks[].assignment` is the actual per-task instruction.
 
@@ -74,6 +75,7 @@ Same as default, except `schema` is rejected by `validateTaskModeParams(...)` in
 | `agent` | `string` | Yes | Exact agent name. |
 | `tasks` | `Array<{ id: string; description: string; assignment: string }>` | Yes | Same item shape, but each `assignment` must carry all required background because shared `context` is disabled. |
 | `isolated` | `boolean` | No | Same conditional field as above. |
+| `spawnPlan` | `object` | No | Same spawn gate as above: required for batches of more than 4 tasks. |
 
 In this mode both `context` and `schema` are rejected.
 
