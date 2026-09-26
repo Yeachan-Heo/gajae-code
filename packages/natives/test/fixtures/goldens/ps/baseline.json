@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "source": "pre-sync pi-natives darwin-arm64 output",
+  "normalization": "Host-specific pids and incarnation values are reduced to stable booleans; process state and observation states are exact.",
+  "result": {
+    "status": "running",
+    "pidMatches": true,
+    "ppidPositive": true,
+    "incarnationPresent": true,
+    "observationStatus": "present",
+    "observationIncarnationPresent": true,
+    "runningEnum": "running"
+  }
+}

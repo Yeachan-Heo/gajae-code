@@ -8,6 +8,7 @@ const CONCURRENCY = 8;
 const packages = path.resolve(import.meta.dir, "../..");
 
 interface BenchCase {
+	id: string;
 	name: string;
 	path: string;
 	pattern: string;
@@ -18,9 +19,28 @@ interface BenchCase {
 	concurrency?: number;
 }
 
+function parseCli(args: string[]): { json: boolean; strict: boolean; iterations: number } {
+	let json = false;
+	let strict = false;
+	let iterations = ITERATIONS;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--json") json = true;
+		else if (arg === "--strict") strict = true;
+		else if (arg === "--iterations") {
+			const count = Number(args[index + 1]);
+			if (!Number.isInteger(count) || count < 1) throw new Error("--iterations must be a positive integer");
+			iterations = count;
+			index++;
+		} else throw new Error(`unknown option ${arg}`);
+	}
+	return { json, strict, iterations };
+}
+
 const cases: BenchCase[] = [
-	{ name: "Medium content uncached (50 files)", path: path.resolve(packages, "tui/src"), pattern: "export", glob: "*.ts" },
+	{ id: "G01", name: "Medium content uncached (50 files)", path: path.resolve(packages, "tui/src"), pattern: "export", glob: "*.ts" },
 	{
+		id: "G02",
 		name: "Medium filesWithMatches uncached (50 files)",
 		path: path.resolve(packages, "tui/src"),
 		pattern: "export",
@@ -28,6 +48,7 @@ const cases: BenchCase[] = [
 		mode: GrepOutputMode.FilesWithMatches,
 	},
 	{
+		id: "G03",
 		name: "Medium content cached (50 files)",
 		path: path.resolve(packages, "tui/src"),
 		pattern: "export",
@@ -35,12 +56,14 @@ const cases: BenchCase[] = [
 		cache: true,
 	},
 	{
+		id: "G04",
 		name: "Large content uncached (200+ files)",
 		path: path.resolve(packages, "coding-agent/src"),
 		pattern: "import",
 		glob: "*.ts",
 	},
 	{
+		id: "G05",
 		name: "Large filesWithMatches uncached (200+ files)",
 		path: path.resolve(packages, "coding-agent/src"),
 		pattern: "import",
@@ -48,6 +71,7 @@ const cases: BenchCase[] = [
 		mode: GrepOutputMode.FilesWithMatches,
 	},
 	{
+		id: "G06",
 		name: "Large count uncached (200+ files)",
 		path: path.resolve(packages, "coding-agent/src"),
 		pattern: "import",
@@ -55,6 +79,7 @@ const cases: BenchCase[] = [
 		mode: GrepOutputMode.Count,
 	},
 	{
+		id: "G07",
 		name: "Large content cached (200+ files)",
 		path: path.resolve(packages, "coding-agent/src"),
 		pattern: "import",
@@ -64,9 +89,12 @@ const cases: BenchCase[] = [
 ];
 
 const cargoRegistry = path.join(Bun.env.HOME ?? "", ".cargo/registry/src");
+let registryAvailable = false;
 try {
 	if ((await fs.stat(cargoRegistry)).isDirectory()) {
+		registryAvailable = true;
 		cases.push({
+			id: "G08",
 			name: "Cargo registry content uncached",
 			path: cargoRegistry,
 			pattern: "pub mod modal|pub mod dialog|pub mod drawer",
@@ -75,15 +103,46 @@ try {
 		});
 	}
 } catch {
-	// Skip the registry case in environments without a local Cargo registry.
+	registryAvailable = false;
 }
+let cli: ReturnType<typeof parseCli>;
+try {
+	cli = parseCli(process.argv.slice(2));
+} catch (error) {
+	console.error(error instanceof Error ? error.message : String(error));
+	process.exit(2);
+}
+
 
 // Warm per-root state before timing so the benchmark measures steady-state search.
 for (const c of cases) {
 	await grep({ pattern: c.pattern, path: c.path, glob: c.glob, mode: c.mode, cache: c.cache, gitignore: false });
 }
+if (cli.json) {
+	const measured: Array<{ id: string; status: "measured" | "skipped" | "error"; samples: number[] }> = [];
+	for (const c of cases) {
+		const grepArgs = { pattern: c.pattern, path: c.path, glob: c.glob, mode: c.mode, cache: c.cache, gitignore: false };
+		const samples: number[] = [];
+		try {
+			for (let index = 0; index < (c.iterations ?? cli.iterations); index++) {
+				const start = Bun.nanoseconds();
+				await grep(grepArgs);
+				samples.push((Bun.nanoseconds() - start) / 1e6);
+			}
+			measured.push({ id: c.id, status: "measured", samples });
+		} catch {
+			measured.push({ id: c.id, status: "error", samples: [] });
+		}
+	}
+	if (!registryAvailable) measured.push({ id: "G08", status: "skipped", samples: [] });
+	console.log(JSON.stringify({ schema: "gjc.native-bench-ab/1", suite: "grep", cases: measured }));
+	if (cli.strict && measured.some(item => item.status !== "measured")) process.exitCode = 2;
+} else {
+	console.log(`Benchmark: ${ITERATIONS} default iterations per case\n`);
+}
 
-console.log(`Benchmark: ${ITERATIONS} default iterations per case\n`);
+
+if (cli.json) process.exit(process.exitCode ?? 0);
 
 for (const c of cases) {
 	const grepArgs = { pattern: c.pattern, path: c.path, glob: c.glob, mode: c.mode, cache: c.cache, gitignore: false };

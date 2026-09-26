@@ -65,7 +65,6 @@
     "fast-xml-parser": "^5.5.9",
     "jszip": "^3.10.1",
     "mammoth": "^1.9.0",
-    "mupdf": "^1.27.0",
     "music-metadata": "^11.12.3",
     "rss-parser": "^3.13.0",
     "turndown": "^7.2.0",

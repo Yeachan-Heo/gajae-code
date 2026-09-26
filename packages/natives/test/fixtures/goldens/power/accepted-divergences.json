@@ -1,0 +1,24 @@
+{
+	"divergences": [
+		{
+			"case": "Power assertion public class name",
+			"preSync": "The N-API class was exported as MacOSPowerAssertion.",
+			"postSync": "The class is exported as PowerAssertion and its existing GJC caller uses the new native name.",
+			"reason": "Adopted the pinned upstream cross-platform API; no compatibility alias is retained.",
+			"changelog": [
+				"packages/natives/changelog.d/rust-porting-phase-3-power.md",
+				"packages/coding-agent/changelog.d/cross-platform-power-assertions.md"
+			]
+		},
+		{
+			"case": "Linux and Windows power inhibition",
+			"preSync": "The local native power handle was a no-op outside macOS and the coding-agent caller never acquired it outside macOS.",
+			"postSync": "Pinned upstream supports login1/ScreenSaver inhibition on Linux and thread-affine execution state on Windows; the existing lazy coding-agent consumer now uses those supported platforms.",
+			"reason": "Adopted as an upstream improvement that makes existing prevent-sleep settings effective on supported non-macOS platforms.",
+			"changelog": [
+				"packages/natives/changelog.d/rust-porting-phase-3-power.md",
+				"packages/coding-agent/changelog.d/cross-platform-power-assertions.md"
+			]
+		}
+	]
+}

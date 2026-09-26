@@ -58,6 +58,43 @@ test("does not skip a Cursor single-entry selection when managed fallback is req
 	expect(resolution.skips).toEqual([]);
 });
 
+test("skips an unavailable credential without probing another account, but accepts an explicit fallback", async () => {
+	const calls: string[] = [];
+	const registry = {
+		getAvailable: () => [mockModels[0], mockModels[1]],
+		getApiKey: async (model: Model) => {
+			calls.push(model.provider);
+			return "key";
+		},
+		isSelectorCircuitOpen: () => false,
+	} as never;
+	const options = { managedFallback: true, isCredentialUnavailable: (provider: string) => provider === "anthropic" };
+	const resolution = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5", "openai/gpt-4o"],
+		registry,
+		undefined,
+		"resumed-session",
+		options,
+	);
+	expect(resolution.model).toBe(mockModels[1]);
+	expect(resolution.skips).toEqual([{ selector: "anthropic/claude-sonnet-4-5", reason: "credential_unavailable" }]);
+	expect(calls).toEqual(["openai"]);
+
+	const unresolved = await resolveModelChainWithAuth(
+		["anthropic/claude-sonnet-4-5"],
+		registry,
+		undefined,
+		"resumed-session",
+		options,
+	);
+	expect(unresolved.model).toBeUndefined();
+	expect(calls).toEqual(["openai"]);
+
+	const available = await resolveModelChainWithAuth(["anthropic/claude-sonnet-4-5"], registry);
+	expect(available.model).toBe(mockModels[0]);
+	expect(calls).toEqual(["openai", "anthropic"]);
+});
+
 test("uses provider credential session separately from canonical stickiness", async () => {
 	const alpha = { ...mockModels[1], provider: "alpha", id: "org/shared-model" } as Model;
 	const beta = { ...mockModels[1], provider: "beta", id: "org/shared-model" } as Model;

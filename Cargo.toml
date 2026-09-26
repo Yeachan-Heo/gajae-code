@@ -48,6 +48,12 @@ codegen-units = 16
 incremental = true
 strip = false
 
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+strip = false
+
 [profile.dev]
 opt-level = 0
 lto = false
@@ -177,8 +183,12 @@ too_many_lines = "allow"     # Arbitrary limits don't account for necessary comp
 # Internal Libraries
 # ──────────────────────────────────────────────────────────────────────────────
 pi-ast = { path = "crates/pi-ast" }
+pi-diff = { path = "crates/pi-diff" }
+pi-edit = { path = "crates/pi-edit" }
 pi-iso = { path = "crates/pi-iso" }
 pi-shell = { path = "crates/pi-shell" }
+pi-vfs = { path = "crates/pi-vfs" }
+pi-walker = { path = "crates/pi-walker" }
 brush-core = { path = "crates/brush-core-vendored" }
 brush-builtins = { path = "crates/brush-builtins-vendored" }
 
@@ -205,6 +215,7 @@ toml = "1.1"
 anyhow = "1.0"
 bytes = "1"
 futures-util = "0.3"
+thiserror = "2"
 tokio-tungstenite = "0.24"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -220,10 +231,12 @@ similar = "3.2.0"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+xutf = "1.5"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Structures - Collections
 # ──────────────────────────────────────────────────────────────────────────────
+heapless = "0.9"
 phf = { version = "0.14", features = ["macros"] }
 smallvec = { version = "1.16.1", features = [
    "serde",
@@ -248,6 +261,7 @@ memmap2 = "0.9"
 # System & Platform
 # ──────────────────────────────────────────────────────────────────────────────
 libc = "0.2"
+log = "0.4"
 os_pipe = "1"
 windows-sys = { version = "0.61", features = [
    "Win32_Foundation",
@@ -270,6 +284,7 @@ windows-sys = { version = "0.61", features = [
 # breaking Windows builds. Mirrors the upstream pin recorded in docs/rust-porting-inventory.md.
 find-msvc-tools = "=0.1.12"
 winreg = "0.56"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Node.js Bindings (NAPI)
@@ -282,6 +297,7 @@ napi-derive = "3"
 # Terminal & PTY
 # ──────────────────────────────────────────────────────────────────────────────
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+clipboard-win = "5.4"
 icy_sixel = "0.7"
 portable-pty = "0.9"
 
@@ -290,11 +306,15 @@ portable-pty = "0.9"
 # ──────────────────────────────────────────────────────────────────────────────
 globset = "0.4"
 grep-matcher = "0.1"
+grep-pcre2 = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PDF inspection
+pdf-inspector = "1"
+
 # Image Processing & Syntax Highlighting
 # ──────────────────────────────────────────────────────────────────────────────
 image = { version = "0.25", default-features = false, features = [
@@ -303,6 +323,8 @@ image = { version = "0.25", default-features = false, features = [
    "gif",
    "webp",
 ] }
+png = "0.18"
+resvg = "0.48"
 # Not used directly: activates zune-jpeg's 'log' feature so image's JPEG decoder
 # compiles (0.5.15 no-log stub macros are not expression-safe).
 zune-jpeg = { version = "0.5", default-features = false, features = ["log"] }
@@ -344,8 +366,11 @@ tree-sitter-css = "0.25"
 tree-sitter-dart = "0.2"
 tree-sitter-diff = "0.1"
 tree-sitter-dockerfile = { version = "0.2.0", package = "tree-sitter-dockerfile-updated" }
+# Added for the full-langs AST grammar set at the pi-ast pin.
+tree-sitter-elisp = "1.7.2"
 tree-sitter-elixir = "0.3"
 tree-sitter-erlang = "0.16.0"
+tree-sitter-fortran = "0.6.0"
 tree-sitter-go = "0.25"
 tree-sitter-graphql = "0.1.0"
 tree-sitter-haskell = "0.23"

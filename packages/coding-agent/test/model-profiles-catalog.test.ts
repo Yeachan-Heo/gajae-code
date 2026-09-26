@@ -319,11 +319,11 @@ const expectedProfiles: Array<{
 		name: "claude-opus",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			default: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"],
 			executor: "anthropic/claude-sonnet-5",
-			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 		},
 	},
 	{
@@ -671,7 +671,7 @@ const expectedProfiles: Array<{
 		name: "opus-codex",
 		requiredProviders: ["anthropic", "openai-codex"],
 		mapping: {
-			default: "anthropic/claude-opus-5:xhigh",
+			default: "anthropic/claude-opus-5-5:medium",
 			executor: "openai-codex/gpt-5.6-terra:low",
 			planner: "anthropic/claude-sonnet-5",
 			critic: "openai-codex/gpt-6-sol:xhigh",
@@ -695,8 +695,8 @@ const expectedProfiles: Array<{
 		mapping: {
 			default: "anthropic/claude-fable-5-1:high",
 			executor: "openai-codex/gpt-5.6-terra:medium",
-			planner: "anthropic/claude-opus-5:medium",
-			critic: "anthropic/claude-opus-5:high",
+			planner: "anthropic/claude-opus-5-5:medium",
+			critic: "anthropic/claude-opus-5-5:high",
 			architect: "openai-codex/gpt-6-sol:xhigh",
 		},
 	},
@@ -717,7 +717,7 @@ const expectedProfiles: Array<{
 		mapping: {
 			default: "openai-codex/gpt-6-astra:medium",
 			executor: "openai-codex/gpt-6-luna:max",
-			planner: "anthropic/claude-opus-5:medium",
+			planner: "anthropic/claude-opus-5-5:medium",
 			critic: "anthropic/claude-fable-5-1:xhigh",
 			architect: "anthropic/claude-fable-5-1:xhigh",
 		},
@@ -791,7 +791,7 @@ function substituteCodexFamily(selector: string, source: "sol" | "terra", target
 
 const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> = {
 	"opus-codex": {
-		default: "anthropic/claude-opus-5:xhigh",
+		default: "anthropic/claude-opus-5-5:medium",
 		planner: "anthropic/claude-sonnet-5",
 	},
 	"codex-opencodego": {
@@ -801,15 +801,15 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 	},
 	"fable-opus-codex": {
 		default: "anthropic/claude-fable-5-1:high",
-		planner: "anthropic/claude-opus-5:medium",
-		critic: "anthropic/claude-opus-5:high",
+		planner: "anthropic/claude-opus-5-5:medium",
+		critic: "anthropic/claude-opus-5-5:high",
 	},
 	"astra-fable": {
 		critic: "anthropic/claude-fable-5-1:xhigh",
 		architect: "anthropic/claude-fable-5-1:xhigh",
 	},
 	"astra-fable-opus": {
-		planner: "anthropic/claude-opus-5:medium",
+		planner: "anthropic/claude-opus-5-5:medium",
 		critic: "anthropic/claude-fable-5-1:xhigh",
 		architect: "anthropic/claude-fable-5-1:xhigh",
 	},

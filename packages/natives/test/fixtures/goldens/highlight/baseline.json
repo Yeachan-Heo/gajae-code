@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "source": "pre-sync pi-natives darwin-arm64 output",
+  "cases": [
+    {
+      "id": "rust",
+      "language": "rust",
+      "code": "/// greeting\npub fn greet(name: &str) -> String {\n    let count = 42;\n    format!(\"hello {name}: {count}\")\n}\n",
+      "output": "<p>///\u001b[39m<c> greeting\n\u001b[39m<k>pub\u001b[39m <k>fn\u001b[39m <f>greet\u001b[39m<p>(\u001b[39m<v>name\u001b[39m<p>:\u001b[39m <k>&\u001b[39m<k>str\u001b[39m<p>)\u001b[39m <p>->\u001b[39m String <p>{\u001b[39m\n    <k>let\u001b[39m count <k>=\u001b[39m <n>42\u001b[39m<p>;\u001b[39m\n    format!<p>(\u001b[39m<p>\"\u001b[39m<s>hello \u001b[39m<n>{name}\u001b[39m<s>: \u001b[39m<n>{count}\u001b[39m<p>\"\u001b[39m<p>)\u001b[39m\n<p>}\u001b[39m\n"
+    },
+    {
+      "id": "typescript",
+      "language": "ts",
+      "code": "export interface User { name: string; age?: number }\nexport const greet = (user: User) => `hello ${user.name}`;\n",
+      "output": "<k>export\u001b[39m <v>interface\u001b[39m <v>User\u001b[39m <p>{\u001b[39m <v>name\u001b[39m<p>:\u001b[39m <v>string\u001b[39m<p>;\u001b[39m <v>age\u001b[39m<k>?\u001b[39m<k>:\u001b[39m <v>number\u001b[39m <p>}\u001b[39m\n<k>export\u001b[39m <k>const\u001b[39m <f>greet\u001b[39m <k>=\u001b[39m <p>(\u001b[39m<v>user\u001b[39m: <v>User\u001b[39m<p>)\u001b[39m <k>=>\u001b[39m <p>`\u001b[39m<s>hello \u001b[39m<p>${\u001b[39m<v>user\u001b[39m<o>.\u001b[39m<s>name\u001b[39m<p>}\u001b[39m<p>`\u001b[39m<p>;\u001b[39m\n"
+    },
+    {
+      "id": "tsx",
+      "language": "tsx",
+      "code": "export function Badge({ name }: { name: string }) {\n  return <span className=\"badge\">{name}</span>;\n}\n",
+      "output": "<k>export\u001b[39m <v>function\u001b[39m <f>Badge\u001b[39m<p>(\u001b[39m<p>{\u001b[39m<f> \u001b[39m<v>name\u001b[39m<f> \u001b[39m<p>}\u001b[39m<f>: \u001b[39m<p>{\u001b[39m<f> \u001b[39m<f>name\u001b[39m<p>:\u001b[39m<f> \u001b[39m<v>string\u001b[39m<f> \u001b[39m<p>}\u001b[39m<p>)\u001b[39m <p>{\u001b[39m\n  <k>return\u001b[39m <k><\u001b[39m<v>span\u001b[39m <v>className\u001b[39m<k>=\u001b[39m<p>\"\u001b[39m<s>badge\u001b[39m<p>\"\u001b[39m<k>>\u001b[39m<p>{\u001b[39m<v>name\u001b[39m<p>}\u001b[39m<k><\u001b[39m<p>/\u001b[39m<s>span>;\n\u001b[39m<s>}\n\u001b[39m"
+    },
+    {
+      "id": "python",
+      "language": "python",
+      "code": "@dataclass\nclass User:\n    name: str\n    def greet(self):\n        return f\"hello {self.name}\"  # greeting\n",
+      "output": "<p>@\u001b[39m<v>dataclass\u001b[39m\n<k>class\u001b[39m <t>User\u001b[39m<p>:\u001b[39m\n    name<p>:\u001b[39m <t>str\u001b[39m\n    <k>def\u001b[39m <f>greet\u001b[39m<p>(\u001b[39m<v>self\u001b[39m<p>)\u001b[39m<p>:\u001b[39m\n        <k>return\u001b[39m <k>f\u001b[39m<p>\"\u001b[39m<s>hello \u001b[39m<p>{\u001b[39m<v>self\u001b[39m<o>.\u001b[39m<s>name\u001b[39m<p>}\u001b[39m<p>\"\u001b[39m  <p>#\u001b[39m<c> greeting\n\u001b[39m"
+    },
+    {
+      "id": "nix",
+      "language": "nix",
+      "code": "{ pkgs ? import <nixpkgs> {} }:\nlet message = \"hello\"; in pkgs.writeText \"msg\" message # greeting\n",
+      "output": "{ pkgs ? import <nixpkgs> {} }:\nlet message = \"hello\"; in pkgs.writeText \"msg\" message # greeting\n"
+    },
+    {
+      "id": "julia",
+      "language": "julia",
+      "code": "function greet(name::String)\n    message = \"hello $name\" # greeting\n    return message\nend\n",
+      "output": "function greet(name::String)\n    message = \"hello $name\" # greeting\n    return message\nend\n"
+    },
+    {
+      "id": "mermaid",
+      "language": "mermaid",
+      "code": "graph TD\n  A[\"Start\"] --> B\n  %% note\n",
+      "output": "graph TD\n  A[\"Start\"] --> B\n  %% note\n"
+    },
+    {
+      "id": "astro",
+      "language": "astro",
+      "code": "---\nimport { Menu } from '@lucide/astro';\nconst locale = localeOf(path);\n---\n<a class=\"nav\">{locale}</a>\n",
+      "output": "---\nimport { Menu } from '@lucide/astro';\nconst locale = localeOf(path);\n---\n<p><\u001b[39m<v>a\u001b[39m class<p>=\u001b[39m<p>\"\u001b[39m<s>nav\u001b[39m<p>\"\u001b[39m<p>>\u001b[39m{locale}<p></\u001b[39m<v>a\u001b[39m<p>>\u001b[39m\n"
+    },
+    {
+      "id": "diff",
+      "language": "diff",
+      "code": "--- a/example.ts\n+++ b/example.ts\n@@ -1 +1 @@\n-const oldValue = 1;\n+const newValue = 2;\n",
+      "output": "<p>---\u001b[39m<k> a/example.ts\n\u001b[39m<p>+++\u001b[39m<k> b/example.ts\n\u001b[39m<p>@@\u001b[39m<k> \u001b[39m<k>-1 +1\u001b[39m<k> \u001b[39m<p>@@\u001b[39m<k>\n\u001b[39m<p>-\u001b[39m<d>const oldValue = 1;\n\u001b[39m<p>+\u001b[39m<i>const newValue = 2;\n\u001b[39m"
+    }
+  ]
+}

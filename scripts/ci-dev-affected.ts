@@ -164,14 +164,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	// at parse time with `SyntaxError: Unexpected identifier 'init_model_registry'`.
 	// Basename matching would never reach that test from this file, which is how
 	// #5674 shipped to dev. Compile-and-run coverage must run on any change here.
-	"packages/coding-agent/src/utils/mupdf-wasm.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
-	"packages/coding-agent/src/utils/mupdf-wasm-embedded.ts": [
-		"packages/coding-agent/test/mupdf-wasm-embedding.test.ts",
-		"packages/coding-agent/test/ooo-bridge-installed-flow.test.ts",
-	],
+	"crates/pi-natives/src/pdf.rs": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
+	"packages/coding-agent/src/utils/markit.ts": ["packages/coding-agent/test/pdf-native.test.ts"],
+	"packages/coding-agent/src/utils/pdf.ts": ["packages/coding-agent/test/pdf-native.test.ts", "packages/coding-agent/test/pdf-native-compiled.test.ts"],
 	"packages/coding-agent/src/modes/components/model-selector.ts": [
 		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
 		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",
@@ -182,7 +177,39 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 		"packages/ai/test/anthropic-stream-envelope.test.ts",
 	],
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
+	"crates/pi-natives/src/fd.rs": ["packages/natives/test/fd-workspace-golden.test.ts"],
+	"crates/pi-natives/src/iofs.rs": ["packages/natives/test/native.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
+	"crates/pi-natives/src/svg.rs": ["packages/natives/test/native.test.ts"],
+	"crates/pi-natives/src/tty_writer.rs": ["packages/tui/test/terminal-writer.test.ts"],
+	"crates/pi-edit/src/fuzzy.rs": ["packages/natives/test/differential/edit-fuzzy.test.ts"],
+	"crates/pi-edit/src/modes/replace.rs": ["packages/natives/test/differential/edit-fuzzy.test.ts"],
+	"crates/pi-natives/src/edit.rs": [
+		"packages/natives/test/differential/edit-fuzzy.test.ts",
+		"packages/coding-agent/test/core/native-embed-smoke.test.ts",
+	],
+	"packages/coding-agent/src/cli/native-smoke.ts": ["packages/coding-agent/test/core/native-embed-smoke.test.ts"],
+	"packages/coding-agent/src/edit/diff.ts": [
+		"packages/coding-agent/test/edit-diff.test.ts",
+		"packages/coding-agent/test/tools/edit-diff.test.ts",
+	],
+	"packages/coding-agent/src/edit/modes/patch.ts": [
+		"packages/coding-agent/test/core/apply-patch.test.ts",
+		"packages/coding-agent/test/core/apply-patch-regression.test.ts",
+		"packages/coding-agent/test/tools.test.ts",
+	],
+	"packages/coding-agent/src/edit/modes/replace.ts": [
+		"packages/coding-agent/test/edit-diff.test.ts",
+		"packages/coding-agent/test/core/edit-hotspots-golden.test.ts",
+		"packages/coding-agent/test/core/h02-fuzzy-parity.test.ts",
+		"packages/coding-agent/test/core/native-embed-smoke.test.ts",
+		"packages/coding-agent/test/tools.test.ts",
+		"packages/coding-agent/test/tools/edit-diff.test.ts",
+	],
+	"crates/pi-natives/src/workspace.rs": [
+		"packages/natives/test/fd-workspace-golden.test.ts",
+		"packages/coding-agent/test/workspace-tree.test.ts",
+	],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
@@ -544,9 +571,14 @@ function taskNeedsRust(key: string): boolean {
 		key === "ci-dry-run" ||
 		key === "affected-selftest" ||
 		key === "affected-dry-run" ||
-		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts" ||
+		// Builds pi-natives with the `task-panic-test` feature via `napi build`; without the
+		// provisioned toolchain and rust-cache the cold compile exceeds the test timeout.
+		key === `test:${NATIVE_TASK_PANIC_TEST}`
 	);
 }
+
+const NATIVE_TASK_PANIC_TEST = "packages/natives/test/task-panic-to-rejection.test.ts";
 
 // Build the machine-readable descriptor list for the current changed-path plan.
 // `cwd` is emitted repo-relative so the JSON stays portable across runners.
@@ -636,6 +668,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/dirs.ts" ||
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
+		// 2.3 walker Rayon pool failures are constrained-host-sensitive: only the
+		// Windows Job Object test can prove that no implicit worker threads spawn.
+		changedPath.startsWith("crates/pi-vfs/") ||
+		changedPath.startsWith("crates/pi-walker/") ||
+		changedPath === "crates/pi-natives/src/iofs.rs" ||
+		changedPath === "crates/pi-natives/src/glob.rs" ||
+		changedPath.startsWith("packages/natives/test/walker-pool-unavailable") ||
 		changedPath === "packages/natives/native/loader-state.js" ||
 		changedPath === "scripts/host-detect.ts" ||
 		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the
@@ -656,7 +695,9 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "Cargo.lock" ||
 		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
 		changedPath === "crates/pi-shell/Cargo.toml" ||
-		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
+		changedPath === "packages/natives/test/windows-runtime-install.windows.test.ts" ||
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts" ||
+		changedPath === "packages/natives/test/windows-shell-path.windows.test.ts"
 	);
 }
 
@@ -1248,6 +1289,27 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 				"--file-timeout=300000",
 				"--concurrency=1",
 			],
+		);
+		return;
+	}
+	if (workspacePackage.name === "@gajae-code/natives") {
+		// The task-panic regression builds pi-natives with Cargo; it runs only as its own
+		// Rust-provisioned task, never inside the Rust-less package shard.
+		add(
+			tasks,
+			`test:${workspacePackage.name}`,
+			`Test ${workspacePackage.name}`,
+			["bun", "test", `--path-ignore-patterns=${NATIVE_TASK_PANIC_TEST.slice("packages/natives/".length)}`],
+			resolvePackageCwd(workspacePackage.dir),
+		);
+		// Use the separate build script that compiles the native addon outside the test timeout.
+		add(
+			tasks,
+			`test:${NATIVE_TASK_PANIC_TEST}`,
+			`Test ${NATIVE_TASK_PANIC_TEST}`,
+			["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			undefined,
+			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: false },
 		);
 		return;
 	}

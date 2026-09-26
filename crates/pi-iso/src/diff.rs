@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/diff.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain secure
+// plain-tree traversal and symlink-safe patch generation.
 //! Backend-agnostic change capture.
 //!
 //! Two code paths, both producing a [`Diff`] = list of [`FileChange`]:
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 use crate::{
-	IsoError, IsoResult,
+	IsoError, IsoResult, command_failed,
 	plain_tree::{PlainEntry, PlainTree, index_tree},
 };
 
@@ -151,18 +154,22 @@ const fn git_null_path() -> &'static str {
 	"/dev/null"
 }
 
+/// Format a failed `git` invocation, rendering a signal death as `exit ?`.
+fn git_failure(args: &[&str], output: &std::process::Output) -> IsoError {
+	command_failed(
+		format_args!("git {}", args.join(" ")),
+		output
+			.status
+			.code()
+			.map_or_else(|| "?".into(), |code| code.to_string()),
+		&output.stderr,
+	)
+}
+
 async fn git_run(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 	let output = git_spawn(cwd, args).await?;
 	if !output.status.success() {
-		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-		return Err(IsoError::other(format!(
-			"git {} (exit {}): {stderr}",
-			args.join(" "),
-			output
-				.status
-				.code()
-				.map_or_else(|| "?".into(), |c| c.to_string())
-		)));
+		return Err(git_failure(args, &output));
 	}
 	Ok(output.stdout)
 }
@@ -174,15 +181,7 @@ async fn git_run_allow_exit1(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
 	if output.status.success() || output.status.code() == Some(1) {
 		return Ok(output.stdout);
 	}
-	let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-	Err(IsoError::other(format!(
-		"git {} (exit {}): {stderr}",
-		args.join(" "),
-		output
-			.status
-			.code()
-			.map_or_else(|| "?".into(), |c| c.to_string())
-	)))
+	Err(git_failure(args, &output))
 }
 
 async fn git_spawn(cwd: &Path, args: &[&str]) -> IsoResult<std::process::Output> {

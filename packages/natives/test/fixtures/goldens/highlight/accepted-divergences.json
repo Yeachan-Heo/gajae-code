@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "divergences": [
+    {
+      "caseId": "typescript",
+      "reason": "The pinned TypeScript grammar now colors TypeScript-specific declarations and annotations instead of using the JavaScript grammar.",
+      "upstreamRationale": "The pinned upstream syntax set adds TypeScript.sublime-syntax and maps ts/mts/cts/typescript to it.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    },
+    {
+      "caseId": "tsx",
+      "reason": "The pinned TypeScriptReact grammar distinguishes TS annotations, JSX tags, and JSX attributes from the old JavaScript fallback.",
+      "upstreamRationale": "The pinned upstream syntax set adds TypeScriptReact.sublime-syntax and maps tsx to it.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    },
+    {
+      "caseId": "nix",
+      "reason": "Nix snippets are now syntax colored instead of being returned unchanged.",
+      "upstreamRationale": "The pinned upstream syntax set adds Nix.sublime-syntax and maps nix to Nix.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    },
+    {
+      "caseId": "julia",
+      "reason": "Julia snippets are now syntax colored instead of being returned unchanged.",
+      "upstreamRationale": "The pinned upstream syntax set adds Julia.sublime-syntax and maps jl/julia to Julia.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    },
+    {
+      "caseId": "mermaid",
+      "reason": "Mermaid snippets are now syntax colored instead of being returned unchanged.",
+      "upstreamRationale": "The pinned upstream syntax set adds Mermaid.sublime-syntax and maps mermaid/mmd to Mermaid.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    },
+    {
+      "caseId": "astro",
+      "reason": "Astro frontmatter and template content now receive embedded TypeScript and HTML highlighting instead of plain-text frontmatter plus the generic HTML fallback.",
+      "upstreamRationale": "The pinned upstream syntax set adds Astro.sublime-syntax and maps astro to Astro.",
+      "changelog": "packages/natives/changelog.d/rust-porting-phase3-highlight.md",
+      "testsUpdated": "packages/natives/test/phase3-highlight-golden.test.ts"
+    }
+  ]
+}

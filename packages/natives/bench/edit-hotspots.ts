@@ -1,13 +1,14 @@
-import { generateDiffString, replaceText } from "../../coding-agent/src/edit/diff";
+import { generateDiffString } from "../../coding-agent/src/edit/diff";
 import { findMatch, seekSequence } from "../../coding-agent/src/edit/modes/replace";
 import { formatHashLine, formatHashLines } from "../../coding-agent/src/hashline/hash";
 
-const ITERATIONS = Number(Bun.env.EDIT_HOTSPOTS_BENCH_ITERATIONS ?? "200");
-const WARMUP = Number(Bun.env.EDIT_HOTSPOTS_BENCH_WARMUP ?? "25");
+const DEFAULT_ITERATIONS = Number(Bun.env.EDIT_HOTSPOTS_BENCH_ITERATIONS ?? "200");
+const WARMUP = Number(Bun.env.EDIT_HOTSPOTS_BENCH_WARMUP ?? "100");
 const PASS_SPEEDUP = 2;
+const SCHEMA = "gjc.native-bench-ab/1";
 
 type CandidateId = "H01" | "H02" | "H06";
-type BenchValue = unknown;
+type BenchValue = unknown | Promise<unknown>;
 type BenchFn = () => BenchValue;
 
 interface Candidate {
@@ -33,8 +34,6 @@ const editLines = Array.from({ length: 1400 }, (_, index) => {
 });
 const editContent = editLines.join("\n");
 const h01Target = "    return alphaBetaGamme(value, options);";
-const h02Replacement = "    return nativeCandidate(value, options);";
-
 const hashText = Array.from({ length: 2500 }, (_, index) => {
 	if (index % 97 === 0) return "";
 	if (index % 89 === 0) return `tabs\tand unicode “quotes” ${index}`;
@@ -54,24 +53,17 @@ const candidates: Candidate[] = [
 		fixture: "multi-line edit corpus",
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), targetBytes: Buffer.byteLength(h01Target) },
 		baselineFn: () => findMatch(editContent, h01Target, { allowFuzzy: true, threshold: 0.9 }),
-		nativeExportNames: ["h01FindBestFuzzyMatch"],
-		nativeArgs: [editContent, h01Target, 0.9],
+		nativeExportNames: ["editFindMatch"],
+		nativeArgs: [editContent, h01Target, true, 0.9],
 	},
 	{
 		id: "H02",
-		name: "replaceText + seekSequence hotspot",
+		name: "seekSequence fuzzy matcher hotspot",
 		fixture: "patch/replace corpus",
 		dimensions: { lines: editLines.length, bytes: Buffer.byteLength(editContent), patternLines: 1 },
-		baselineFn: () => {
-			const replaced = replaceText(editContent, "    return alphaBetaGamma(value, options);", h02Replacement, {
-				fuzzy: true,
-				all: false,
-			});
-			const sequence = seekSequence(editLines, ["    return alphaBetaGamme(value, options);"], 0, false, { allowFuzzy: true });
-			return { replaced, sequence };
-		},
-		nativeExportNames: ["h02ScoreSequenceFuzzy"],
-		nativeArgs: [editLines, [h01Target], 0, false],
+		baselineFn: () => seekSequence(editLines, [h01Target], 0, false, { allowFuzzy: true }),
+		nativeExportNames: ["editSeekSequence"],
+		nativeArgs: [editLines, [h01Target], 0, false, true],
 	},
 	{
 		id: "H06",
@@ -91,14 +83,18 @@ function stats(samples: number[]): Timing {
 	return { median, p95 };
 }
 
-function time(fn: BenchFn, iterations: number): Timing {
+async function timeSamples(fn: BenchFn, iterations: number): Promise<number[]> {
 	const samples: number[] = [];
 	for (let i = 0; i < iterations; i++) {
 		const start = Bun.nanoseconds();
-		void fn();
+		await fn();
 		samples.push((Bun.nanoseconds() - start) / 1e6);
 	}
-	return stats(samples);
+	return samples;
+}
+
+async function time(fn: BenchFn, iterations: number): Promise<Timing> {
+	return stats(await timeSamples(fn, iterations));
 }
 
 async function resolveNative(candidate: Candidate): Promise<BenchFn | undefined> {
@@ -110,37 +106,79 @@ async function resolveNative(candidate: Candidate): Promise<BenchFn | undefined>
 	}
 	for (const exportName of candidate.nativeExportNames) {
 		const nativeFn = nativeModule[exportName];
-		if (typeof nativeFn === "function") {
-			return () => nativeFn(...candidate.nativeArgs);
-		}
+		if (typeof nativeFn === "function") return () => nativeFn(...candidate.nativeArgs);
 	}
 	return undefined;
 }
 
-console.log(`Benchmark: edit hotspots (${ITERATIONS} iterations, ${WARMUP} warmup)\n`);
-console.log("id\tstatus\tbaseline median\tbaseline p95\tnative median\tnative p95\tspeedup\tgate\tfixture");
-
-for (const candidate of candidates) {
-	for (let i = 0; i < WARMUP; i++) candidate.baselineFn();
-	const baseline = time(candidate.baselineFn, ITERATIONS);
-	const nativeFn = await resolveNative(candidate);
-	const dims = Object.entries(candidate.dimensions).map(([key, value]) => `${key}=${value}`).join(",");
-
-	if (!nativeFn) {
-		console.log(
-			`${candidate.id}\tSKIPPED\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t-\t-\t-\tSKIP\t${candidate.fixture} (${dims})`,
-		);
-		continue;
+function parseCli(args: string[]): { json: boolean; strict: boolean; iterations: number } {
+	let json = false;
+	let strict = false;
+	let iterations = DEFAULT_ITERATIONS;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--json") json = true;
+		else if (arg === "--strict") strict = true;
+		else if (arg === "--iterations") {
+			const count = Number(args[index + 1]);
+			if (!Number.isInteger(count) || count < 1) throw new Error("--iterations must be a positive integer");
+			iterations = count;
+			index++;
+		} else throw new Error(`unknown option ${arg}`);
 	}
-
-	for (let i = 0; i < WARMUP; i++) nativeFn();
-	const nativeTiming = time(nativeFn, ITERATIONS);
-	const speedup = baseline.median / nativeTiming.median;
-	const pass = speedup >= PASS_SPEEDUP;
-	console.log(
-		`${candidate.id}\t${pass ? "PASS" : "FAIL"}\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t${nativeTiming.median.toFixed(3)}ms/op\t${nativeTiming.p95.toFixed(3)}ms/op\t${speedup.toFixed(2)}x\t>=${PASS_SPEEDUP}x\t${candidate.fixture} (${dims})`,
-	);
+	if (!Number.isInteger(iterations) || iterations < 1) throw new Error("EDIT_HOTSPOTS_BENCH_ITERATIONS must be a positive integer");
+	return { json, strict, iterations };
 }
 
-// Keep generateDiffString in the measured dependency closure for the Phase 0 edit-hotspot story.
-void generateDiffString("a\n", "b\n");
+async function main(): Promise<void> {
+	let cli: ReturnType<typeof parseCli>;
+	try {
+		cli = parseCli(process.argv.slice(2));
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(2);
+	}
+	if (cli.json) {
+		const cases: Array<{ id: CandidateId; status: "measured" | "skipped" | "error"; samples: number[] }> = [];
+		let failed = false;
+		for (const candidate of candidates) {
+			const nativeFn = await resolveNative(candidate);
+			if (!nativeFn) {
+				cases.push({ id: candidate.id, status: "skipped", samples: [] });
+				failed = true;
+				continue;
+			}
+			try {
+				for (let i = 0; i < WARMUP; i++) await nativeFn();
+				cases.push({ id: candidate.id, status: "measured", samples: await timeSamples(nativeFn, cli.iterations) });
+			} catch {
+				cases.push({ id: candidate.id, status: "error", samples: [] });
+				failed = true;
+			}
+		}
+		console.log(JSON.stringify({ schema: SCHEMA, suite: "edit-hotspots", cases }));
+		if (cli.strict && failed) process.exitCode = 2;
+		return;
+	}
+
+	console.log(`Benchmark: edit hotspots (${cli.iterations} iterations, ${WARMUP} warmup)\n`);
+	console.log("id\tstatus\tbaseline median\tbaseline p95\tnative median\tnative p95\tspeedup\tgate\tfixture");
+	for (const candidate of candidates) {
+		for (let i = 0; i < WARMUP; i++) await candidate.baselineFn();
+		const baseline = await time(candidate.baselineFn, cli.iterations);
+		const nativeFn = await resolveNative(candidate);
+		const dims = Object.entries(candidate.dimensions).map(([key, value]) => `${key}=${value}`).join(",");
+		if (!nativeFn) {
+			console.log(`${candidate.id}\tSKIPPED\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t-\t-\t-\tSKIP\t${candidate.fixture} (${dims})`);
+			continue;
+		}
+		for (let i = 0; i < WARMUP; i++) await nativeFn();
+		const nativeTiming = await time(nativeFn, cli.iterations);
+		const speedup = baseline.median / nativeTiming.median;
+		const pass = speedup >= PASS_SPEEDUP;
+		console.log(`${candidate.id}\t${pass ? "PASS" : "FAIL"}\t${baseline.median.toFixed(3)}ms/op\t${baseline.p95.toFixed(3)}ms/op\t${nativeTiming.median.toFixed(3)}ms/op\t${nativeTiming.p95.toFixed(3)}ms/op\t${speedup.toFixed(2)}x\t>=${PASS_SPEEDUP}x\t${candidate.fixture} (${dims})`);
+	}
+	void generateDiffString("a\n", "b\n");
+}
+
+if (import.meta.main) await main();

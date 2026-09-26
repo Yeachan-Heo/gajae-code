@@ -33,7 +33,8 @@ There is no current `packages/natives/src` TypeScript wrapper layer. Consumers i
 Current capability groups in the generated API include:
 
 - **Search/text/code primitives**: `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `astGrep`, `astEdit`, text width/slicing/wrapping/sanitization, syntax highlighting.
-- **Execution/process/terminal primitives**: `executeShell`, `Shell`, `PtySession`, process-tree helpers, key parsing.
+- **Execution/process/terminal primitives**: `executeShell`, `Shell`, `PtySession`, `TtyWriter`, process-tree helpers, key parsing.
+The TUI lazily loads `TtyWriter` on the first Unix terminal write and routes terminal escape output through its FIFO queue; Windows continues to write through stdout.
 - **System/media/conversion primitives**: clipboard, image resize/encode/SIXEL, HTML-to-Markdown, macOS appearance/power helpers, work profiling, Windows ProjFS overlay helpers.
 
 ## Loader layer
@@ -121,6 +122,7 @@ The current loader does not perform a separate post-`require` export validation 
 - `task`
 - `text`
 - `tokens`
+- `tty_writer`
 - `utils` (crate-private helpers)
 
 N-API exports are generated from Rust `#[napi]` functions/classes/objects/enums. Snake_case Rust names are exposed as camelCase JavaScript names unless explicitly configured by napi-rs.

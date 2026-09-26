@@ -52,6 +52,43 @@ export declare class ComputerController {
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
 
+/**
+ * Incrementally ingests old/new text and computes an exact line diff on a
+ * worker thread once both sides finish.
+ *
+ * Complete lines are observable during ingestion. Only equal leading lines
+ * are declared stable before EOF; future input can change Myers alignment
+ * after the first mismatch.
+ */
+export declare class DiffStream {
+  /** Create an empty two-sided stream. */
+  constructor()
+  /** Append a JavaScript text chunk to one side. */
+  push(side: DiffSide, chunk: string): DiffStreamProgress
+  /** Append a UTF-8 subprocess/file chunk without a JS string conversion. */
+  pushBytes(side: DiffSide, chunk: Uint8Array): DiffStreamProgress
+  /** Mark one side complete; an unfinished final line then becomes visible. */
+  finishSide(side: DiffSide): DiffStreamProgress
+  /** Mark one side too large and complete without further ingestion. */
+  markTooLarge(side: DiffSide): DiffStreamProgress
+  /** Current ingestion state. */
+  progress(): DiffStreamProgress
+  /** Complete display lines from `from`, excluding newline terminators. */
+  lines(side: DiffSide, from: number, limit?: number | undefined | null): Array<string>
+  /** Snapshot all ingested text for one side. */
+  text(side: DiffSide): string
+  /**
+   * Read a filesystem path directly into one side on the native worker pool.
+   *
+   * JavaScript can poll [`DiffStream::progress`] and [`DiffStream::lines`]
+   * while this promise is pending; file bytes never need to cross into JS
+   * and back into the differ.
+   */
+  openFile(side: DiffSide, path: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<DiffStreamProgress>
+  /** Compute exact Myers runs and unified hunks off the JavaScript thread. */
+  finish(context?: number | undefined | null): Promise<DiffStreamResult>
+}
+
 export declare class DoctorJournalAuthority {
   static createExact(root: string, runId: string): DoctorJournalCreateResult
   append(record: string): void
@@ -73,27 +110,6 @@ export declare class DoctorJournalAuthority {
  */
 export declare class MacAppearanceObserver {
   static start(callback: (err: null | Error, appearance: MacOSAppearance) => void): MacAppearanceObserver
-  stop(): void
-}
-
-/**
- * Long-lived macOS power assertion.
- *
- * On macOS this acquires one or more `IOKit` assertions that prevent the
- * requested sleep modes until the handle is stopped or dropped. On other
- * platforms it is a no-op handle so the caller can keep one cross-platform
- * code path.
- */
-export declare class MacOSPowerAssertion {
-  /**
-   * Acquire a macOS power assertion. On non-macOS platforms returns a
-   * no-op handle so callers can stay cross-platform.
-   */
-  static start(options?: MacOSPowerAssertionOptions | undefined | null): MacOSPowerAssertion
-  /**
-   * Release every assertion held by this handle. Safe to call multiple
-   * times; subsequent calls are a no-op.
-   */
   stop(): void
 }
 
@@ -350,6 +366,26 @@ export declare class NotificationServer {
   stopAndWait(): Promise<void>
 }
 
+/**
+ * Long-lived cross-platform power assertion.
+ *
+ * macOS uses `IOKit`, Linux holds login1 and desktop `ScreenSaver` inhibitors,
+ * and Windows holds thread-affine execution state until the handle is stopped
+ * or dropped. Other platforms return a no-op handle.
+ */
+export declare class PowerAssertion {
+  /**
+   * Acquire a power assertion. Unsupported platforms return a no-op handle
+   * so callers can stay cross-platform.
+   */
+  static start(options?: PowerAssertionOptions | undefined | null): PowerAssertion
+  /**
+   * Release every assertion held by this handle. Safe to call multiple
+   * times; subsequent calls are a no-op.
+   */
+  stop(): void
+}
+
 /** Stable process reference. */
 export declare class Process {
   /** Open a stable process reference from a PID. */
@@ -561,6 +597,53 @@ export declare class Shell {
    */
   close(): Promise<void>
 }
+
+/**
+ * Dedicated writer thread for one terminal fd.
+ *
+ * Constructed by the TUI's `ProcessTerminal` around stdout. The fd is
+ * `dup(2)`'d at construction and closed on drop, so later manipulation of the
+ * original descriptor does not affect the pump.
+ */
+export declare class TtyWriter {
+  /**
+   * Start a pump thread for `fd` (typically 1). Fails on non-Unix hosts and
+   * when the descriptor cannot be duplicated.
+   */
+  constructor(fd: number)
+  /**
+   * Enqueue terminal output; never blocks. Returns the total bytes now
+   * pending (including this chunk).
+   *
+   * Reads the JS string as UTF-16 and transcodes it with `xutf` straight into
+   * the shared back buffer.
+   */
+  write(data: string): number
+  /** Bytes accepted but not yet written to the terminal. */
+  pending(): number
+  /** True once a write failed (dead PTY); queued output has been dropped. */
+  get dead(): boolean
+  /**
+   * Block the calling thread until the queue drains, the writer dies, or
+   * `timeout_ms` elapses. Returns true when fully drained. Exit paths only.
+   */
+  flushSync(timeoutMs: number): boolean
+  /**
+   * Flush (bounded by `flush_timeout_ms`), stop the pump thread, and join it.
+   *
+   * A pump stuck in a blocked `write(2)` (stalled-but-alive PTY consumer)
+   * cannot be joined without freezing the caller: when the bounded flush
+   * times out the thread is detached instead and its dup'd fd is leaked —
+   * closing it under a blocked write would race kernel fd reuse.
+   */
+  stop(flushTimeoutMs: number): void
+}
+
+/**
+ * Install the bounded Tokio runtime and probed Rayon pool after the addon is
+ * loaded, before any native consumer can start async or parallel work.
+ */
+export declare function __gjcInstallTokioRuntime(): void
 
 /**
  * Publish-result wire-contract sentinel.
@@ -907,11 +990,94 @@ export interface DependentIdleDeliveryResult {
  */
 export declare function detectMacOSAppearance(): MacOSAppearance | null
 
+/** One jsdiff change object: a run of added, removed, or common tokens. */
+export interface DiffChange {
+  /** Joined token text for this run (lines keep their `
+  ` terminators). */
+  value: string
+  /** Number of tokens in this run. */
+  count: number
+  /** True when this run exists only in the new text. */
+  added: boolean
+  /** True when this run exists only in the old text. */
+  removed: boolean
+}
+
 /**
- * Compute a line-level diff byte-identical to jsdiff `Diff.diffLines(old,
- * new)` with default options. Returns ordered `{added, removed, value}` parts.
+ * Diff `oldText.split("
+")` against `newText.split("
+")` with jsdiff
+ * `diffArrays` semantics (exact code-unit equality, empty lines preserved),
+ * returning only run lengths.
+ *
+ * Callers that map line numbers — like hashline recovery — need the counts,
+ * not another copy of the text.
  */
-export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
+export declare function diffLineRuns(oldText: string, newText: string): Array<DiffRun>
+
+/**
+ * Line diff with jsdiff `diffLines(oldText, newText)` semantics (default
+ * options). Change values keep line terminators, and common runs are joined
+ * from the new text.
+ */
+export declare function diffLines(oldText: string, newText: string): Array<DiffChange>
+
+/** A change run without its token text, for callers that only need counts. */
+export interface DiffRun {
+  /** Number of tokens in this run. */
+  count: number
+  /** True when this run exists only in the new text. */
+  added: boolean
+  /** True when this run exists only in the old text. */
+  removed: boolean
+}
+
+/** One side of a streamed line diff. */
+export declare enum DiffSide {
+  /** Original/base text. */
+  Old = 'Old',
+  /** Updated/target text. */
+  New = 'New'
+}
+
+/** Observable ingestion state for [`DiffStream`]. */
+export interface DiffStreamProgress {
+  /** Complete old-side lines available for rendering. */
+  oldLines: number
+  /** Complete new-side lines available for rendering. */
+  newLines: number
+  /** Leading complete lines proven equal on both sides. */
+  stableCommonLines: number
+  /** Whether old-side ingestion has finished. */
+  oldDone: boolean
+  /** Whether new-side ingestion has finished. */
+  newDone: boolean
+  /** Whether either side contains a NUL byte/code unit. */
+  binary: boolean
+  /** Whether either native file exceeded its caller-provided size limit. */
+  tooLarge: boolean
+}
+
+/** Exact line-diff output produced when a [`DiffStream`] finishes. */
+export interface DiffStreamResult {
+  /** Line-token Myers runs used to align the complete files. */
+  runs: Array<DiffRun>
+  /** Unified hunks for the requested context. */
+  hunks: Array<PatchHunk>
+  /** Whether the old text ends in a newline. */
+  oldEndsNewline: boolean
+  /** Whether the new text ends in a newline. */
+  newEndsNewline: boolean
+}
+
+/**
+ * Word diff with jsdiff `diffWords(oldText, newText)` semantics (default
+ * options).
+ *
+ * Tokens carry surrounding whitespace, equality ignores it, and the
+ * post-pass dedupes whitespace across change boundaries.
+ */
+export declare function diffWords(oldText: string, newText: string): Array<DiffChange>
 
 export interface DoctorJournalCreateResult {
   authority?: DoctorJournalAuthority
@@ -924,6 +1090,51 @@ export interface DoctorLinkSwapResult {
   changed: boolean
   verified: boolean
   code?: string
+}
+
+export interface EditApplyPatchEntry {
+  path: string
+  op: string
+  rename?: string
+  diff?: string
+}
+
+export declare function editFindMatch(content: string, target: string, allowFuzzy: boolean, threshold?: number | undefined | null): EditFindMatchResult
+
+export interface EditFindMatchResult {
+  matched?: EditFuzzyMatch
+  closest?: EditFuzzyMatch
+  occurrences?: number
+  occurrenceLines?: Array<number>
+  occurrencePreviews?: Array<string>
+  fuzzyMatches?: number
+  dominantFuzzy?: boolean
+}
+
+export interface EditFuzzyMatch {
+  actualText: string
+  startIndex: number
+  startLine: number
+  confidence: number
+}
+
+export declare function editParseApplyPatch(input: string, streaming: boolean): Array<EditApplyPatchEntry>
+
+export declare function editPatchApplyText(content: string, path: string, diff: string, threshold: number, allowFuzzy: boolean): EditPatchApplyTextResult
+
+export interface EditPatchApplyTextResult {
+  content: string
+  warnings: Array<string>
+}
+
+export declare function editSeekSequence(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean, allowFuzzy: boolean): EditSeekSequenceResult
+
+export interface EditSeekSequenceResult {
+  index?: number
+  confidence: number
+  matchCount?: number
+  matchIndices?: Array<number>
+  strategy?: string
 }
 
 /** Ellipsis strategy for [`truncate_to_width`]. */
@@ -1116,7 +1327,7 @@ export interface FuzzyFindOptions {
   hidden?: boolean
   /** Respect .gitignore (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
+  /** Enable the pi-walker shared scan cache (default: false). */
   cache?: boolean
   /** Maximum number of matches to return (default: 100). */
   maxResults?: number
@@ -1160,8 +1371,8 @@ export declare function getWorkProfile(lastSeconds: number): WorkProfile
  * Resolves the search root, scans entries, applies glob and optional file-type
  * filters, and optionally streams each accepted match through `on_match`.
  *
- * If `sortByMtime` is enabled, all matching entries are collected, sorted by
- * descending mtime, then truncated to `maxResults`.
+ * When `sortByMtime` is enabled, entries are ordered by mtime after the
+ * budget-checked filesystem scan and final symlink-aware type filtering.
  *
  * # Errors
  * Returns an error when the search path cannot be resolved, the path is not a
@@ -1176,10 +1387,7 @@ export interface GlobMatch {
   path: string
   /** Resolved filesystem type for the match. */
   fileType: FileType
-  /**
-   * Modification time in milliseconds since Unix epoch (from
-   * `symlink_metadata`).
-   */
+  /** Modification time in milliseconds since Unix epoch. */
   mtime?: number
   /** File size in bytes for regular files. */
   size?: number
@@ -1189,7 +1397,7 @@ export interface GlobMatch {
 export interface GlobOptions {
   /** Glob pattern to match (e.g., "*.ts"). */
   pattern: string
-  /** Directory to search. */
+  /** Directory to search: a host path or an absolute `scheme://` URL. */
   path: string
   /**
    * Filter by file type: "file", "dir", or "symlink". Symlinks are
@@ -1204,7 +1412,7 @@ export interface GlobOptions {
   maxResults?: number
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
+  /** Enable walker scan caching (default: false). */
   cache?: boolean
   /** Sort results by mtime (most recent first) before applying limit. */
   sortByMtime?: boolean
@@ -1261,7 +1469,7 @@ export interface GrepMatch {
 export interface GrepOptions {
   /** Regex pattern to search for. */
   pattern: string
-  /** Directory or file to search. */
+  /** Directory or file to search: a host path or an absolute `scheme://` URL. */
   path: string
   /** Glob filter for filenames (e.g., "*.ts"). */
   glob?: string
@@ -1275,7 +1483,7 @@ export interface GrepOptions {
   hidden?: boolean
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
+  /** Enable the shared filesystem scan cache (default: false). */
   cache?: boolean
   /** Maximum number of matches to return. */
   maxCount?: number
@@ -1291,6 +1499,12 @@ export interface GrepOptions {
   maxColumns?: number
   /** Output mode (content, filesWithMatches, or count). */
   mode?: GrepOutputMode
+  /**
+   * Maximum matches collected per file (content mode). Keeps one hot file
+   * from exhausting the global `max_count` budget before other files are
+   * reached.
+   */
+  maxCountPerFile?: number
   /** Abort signal for cancelling the operation. */
   signal?: unknown
   /** Timeout in milliseconds for the operation. */
@@ -1322,31 +1536,6 @@ export interface GrepResult {
   filesSearched: number
   /** Whether the limit/offset stopped the search early. */
   limitReached?: boolean
-}
-
-export interface H01BestFuzzyMatch {
-  actualText: string
-  startIndex: number
-  startLine: number
-  confidence: number
-}
-
-export interface H01BestFuzzyMatchResult {
-  best?: H01BestFuzzyMatch
-  aboveThresholdCount: number
-  secondBestScore: number
-}
-
-export declare function h01FindBestFuzzyMatch(content: string, target: string, threshold: number): H01BestFuzzyMatchResult
-
-export declare function h02ScoreSequenceFuzzy(lines: Array<string>, pattern: Array<string>, start: number, eof: boolean): H02SequenceFuzzyResult
-
-export interface H02SequenceFuzzyResult {
-  index?: number
-  confidence: number
-  matchCount: number
-  matchIndices: Array<number>
-  secondBestScore: number
 }
 
 export declare function h06FormatHashLines(text: string, startLine?: number | undefined | null): string
@@ -1488,7 +1677,8 @@ export interface InboundImageEvent {
 }
 
 /**
- * Installs a Rust panic hook only when `GJC_NATIVE_CRASH_DIAGNOSTICS` is set.
+ * Installs Rust panic and allocation-error hooks only when
+ * `GJC_NATIVE_CRASH_DIAGNOSTICS` is set.
  *
  * This is an opt-in structured panic report, not a minidump/signal handler.
  * It intentionally avoids always-on work and does not attempt to recover from
@@ -1503,13 +1693,13 @@ export declare function initNativeCrashDiagnostics(): boolean
 export declare function inspectConfigFilePermissionRepair(path: string, identity: NativeExactFileIdentity, expectedMode: number): NativePermissionRepairResult
 
 /**
- * Invalidate the filesystem scan cache.
+ * Invalidate the walker scan cache.
  *
  * When called with a path, removes entries for roots containing that path.
  * When called without a path, clears the entire cache.
  *
- * Intended to be called after agent file mutations (write, edit, rename,
- * delete).
+ * Intended to be called after agent file mutations: write, edit, rename, or
+ * delete.
  */
 export declare function invalidateFsScanCache(path?: string | undefined | null): void
 
@@ -1641,16 +1831,6 @@ export interface KnownGoodFrameStats {
 }
 
 /**
- * One diff component, mirroring jsdiff's change object (sans `count`, which
- * the TS `generateDiffString` formatter does not consume).
- */
-export interface LineDiffPart {
-  added: boolean
-  removed: boolean
-  value: string
-}
-
-/**
  * Publish a staged regular file under a destination name that must not already
  * exist, using `linkat(2)` instead of a rename flag. This is the stand-in for
  * `rename_no_replace_path` on filesystems that implement no rename flag at all
@@ -1725,30 +1905,6 @@ export declare enum MacOSAppearance {
   Light = 'light'
 }
 
-/**
- * Options for starting a macOS power assertion.
- *
- * Each boolean maps to a `caffeinate(8)` flag and a corresponding `IOKit`
- * `IOPMAssertion` type. Multiple flags can be combined; when set, one
- * assertion is taken per flag and all are released together when the
- * handle is stopped or dropped.
- *
- * If every flag is unset (or omitted), the handle behaves as if `idle`
- * were `true` — preserving the historical default of `caffeinate -i`.
- */
-export interface MacOSPowerAssertionOptions {
-  /** Human-readable reason shown in macOS power diagnostics. */
-  reason?: string
-  /** `caffeinate -i`: prevent the system from idle-sleeping. */
-  idle?: boolean
-  /** `caffeinate -s`: prevent the system from sleeping (AC power only). */
-  system?: boolean
-  /** `caffeinate -u`: declare the user is active (wakes the display). */
-  user?: boolean
-  /** `caffeinate -d`: prevent the display from idle-sleeping. */
-  display?: boolean
-}
-
 /** A single match in the content. */
 export interface Match {
   /** 1-indexed line number. */
@@ -1784,6 +1940,36 @@ export declare function matchesKittySequence(data: string, expectedCodepoint: nu
  * Returns true only when the byte sequence maps to the exact key identifier.
  */
 export declare function matchesLegacySequence(data: string, keyName: string): boolean
+
+/**
+ * Options for [`render_mermaid_ascii`]; every field defaults like the
+ * TypeScript renderer (`useAscii: false`, paddings 5, border padding 1,
+ * `colorMode: "auto"`).
+ */
+export interface MermaidRenderOptions {
+  /** `+-|>` instead of Unicode box-drawing characters. */
+  useAscii?: boolean
+  paddingX?: number
+  paddingY?: number
+  boxBorderPadding?: number
+  /** Force the flowchart/state layout direction. */
+  direction?: 'TD' | 'TB' | 'LR' | 'BT' | 'RL'
+  /** `auto` (or omitted) detects from the terminal environment. */
+  colorMode?: 'none' | 'auto' | 'ansi16' | 'ansi256' | 'truecolor' | 'html'
+  theme?: MermaidTheme
+}
+
+/** Theme colors for [`render_mermaid_ascii`]; hex strings, all optional. */
+export interface MermaidTheme {
+  fg?: string
+  border?: string
+  line?: string
+  arrow?: string
+  accent?: string
+  bg?: string
+  corner?: string
+  junction?: string
+}
 
 /** N-API opt-in handle for the minimizer. */
 export interface MinimizerOptions {
@@ -2200,6 +2386,73 @@ export declare function parseKey(data: string, kittyProtocolActive: boolean): st
  */
 export declare function parseKittySequence(data: string): ParsedKittyResult | null
 
+/** One hunk of a unified diff, matching jsdiff `structuredPatch` hunks. */
+export interface PatchHunk {
+  /** 1-based first line of the hunk in the old text. */
+  oldStart: number
+  /** Number of old-text lines covered by the hunk. */
+  oldLines: number
+  /** 1-based first line of the hunk in the new text. */
+  newStart: number
+  /** Number of new-text lines covered by the hunk. */
+  newLines: number
+  /**
+   * Hunk body: `+`/`-`/` `-prefixed lines without trailing newlines, plus
+   * `\ No newline at end of file` markers where applicable.
+   */
+  lines: Array<string>
+}
+
+/** Markdown and inspection metadata produced from a PDF document. */
+export interface PdfMarkdownResult {
+  /** Extracted document content in Markdown format. */
+  markdown: string
+  /** Document title from PDF metadata, when present. */
+  title?: string
+  /** Total number of pages in the document. */
+  pageCount: number
+  /** One-indexed page numbers whose content requires OCR. */
+  pagesNeedingOcr: Array<number>
+  /** Whether the document contains text encoding problems. */
+  hasEncodingIssues: boolean
+}
+
+/**
+ * Convert an in-memory PDF to Markdown and return its inspection metadata.
+ *
+ * Conversion copies the typed array before dispatch so JavaScript mutation
+ * cannot race the native worker.
+ *
+ * # Errors
+ * Returns an error prefixed with `PDF conversion failed:` when the PDF cannot
+ * be parsed or converted.
+ */
+export declare function pdfToMarkdown(input: Uint8Array): Promise<PdfMarkdownResult>
+
+/**
+ * Options for starting a power assertion.
+ *
+ * Each boolean maps to a `caffeinate(8)` flag and the closest corresponding
+ * platform capability. Multiple flags can be combined; when set, one
+ * assertion is taken per flag and all are released together when the
+ * handle is stopped or dropped.
+ *
+ * If every flag is unset (or omitted), the handle behaves as if `idle`
+ * were `true` — preserving the historical default of `caffeinate -i`.
+ */
+export interface PowerAssertionOptions {
+  /** Human-readable reason shown in platform power diagnostics. */
+  reason?: string
+  /** `caffeinate -i`: prevent the system from idle-sleeping. */
+  idle?: boolean
+  /** `caffeinate -s`: prevent the system from sleeping (AC power only). */
+  system?: boolean
+  /** `caffeinate -u`: declare the user is active (wakes the display). */
+  user?: boolean
+  /** `caffeinate -d`: prevent the display from idle-sleeping. */
+  display?: boolean
+}
+
 /**
  * Opaque in-process presentation capability.
  *
@@ -2281,6 +2534,18 @@ export interface PtyStartOptions {
 }
 
 export declare function ptyTimeoutCount(): bigint
+
+/**
+ * Rasterize SVG/SVGZ bytes into a bounded PNG without resolving local files.
+ *
+ * Conversion runs on the native blocking pool so parsing and rendering do not
+ * stall the JavaScript event loop.
+ *
+ * # Errors
+ * Returns an error for invalid SVG data, zero/oversized limits, allocation
+ * failure, or PNG encoding failure.
+ */
+export declare function rasterizeSvg(input: Uint8Array, maxWidthPx: number, maxHeightPx: number): Promise<Uint8Array>
 
 /**
  * Read an image from the system clipboard.
@@ -2405,6 +2670,16 @@ export declare function renameNoReplacePath(sourcePath: string, destinationPath:
 export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
 
 /**
+ * Render Mermaid diagram text (flowchart, state, sequence, class, ER, or
+ * xychart) to ASCII/Unicode art. Synchronous: callers render inside the
+ * TUI compositor.
+ *
+ * # Errors
+ * Unparseable flowchart source or an unknown `direction`/`colorMode` value.
+ */
+export declare function renderMermaidAscii(text: string, options?: MermaidRenderOptions | undefined | null): string
+
+/**
  * Remove only group/other permission bits from an exact, user-owned regular
  * file.
  */
@@ -2498,6 +2773,8 @@ export interface SearchResult {
   /** Error message, if any. */
   error?: string
 }
+
+export declare function setHangulCompatJamoWidthOverride(value: number): void
 
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
@@ -2599,6 +2876,13 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
+/**
+ * Unified-diff hunks with jsdiff
+ * `structuredPatch(_, _, oldText, newText, _, _, { context }).hunks`
+ * semantics. `context` defaults to 4 like jsdiff.
+ */
+export declare function structuredPatchHunks(oldText: string, newText: string, context?: number | undefined | null): Array<PatchHunk>
+
 export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 
 export interface SummaryOptions {
@@ -2674,6 +2958,12 @@ export declare function visibleWidth(text: string, tabWidth: number): number
 
 /** Calculate visible widths of many strings, excluding ANSI escape sequences. */
 export declare function visibleWidths(lines: Array<string>, tabWidth: number): Array<number>
+
+/**
+ * Reports walker Rayon pool initialization without triggering pool
+ * construction.
+ */
+export declare function walkerPoolStatus(): string
 
 export interface WindowsJobMemoryProbeResult {
   kind: string

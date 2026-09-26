@@ -10,7 +10,6 @@ import { ImageConverter } from "./converters/image.js";
 import { IpynbConverter } from "./converters/ipynb.js";
 import { IWorkConverter } from "./converters/iwork.js";
 import { JsonConverter } from "./converters/json.js";
-import { PdfConverter } from "./converters/pdf/index.js";
 import { PlainTextConverter } from "./converters/plain-text.js";
 import { PptxConverter } from "./converters/pptx.js";
 import { RssConverter } from "./converters/rss.js";
@@ -29,7 +28,6 @@ export class Markit {
         const pluginConverters = plugins.flatMap((p) => p.converters);
         // Built-in converters: specific formats first, generic last.
         const specific = [
-            new PdfConverter(),
             new DocxConverter(),
             new PptxConverter(),
             new XlsxConverter(),

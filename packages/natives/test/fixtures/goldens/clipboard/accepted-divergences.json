@@ -1,0 +1,18 @@
+{
+	"divergences": [
+		{
+			"case": "Windows CF_DIB and CF_DIBV5 clipboard images",
+			"preSync": "The native image path depended entirely on arboard and returned an error for certain Qt BI_BITFIELDS DIB layouts.",
+			"postSync": "The pinned upstream DIB fallback synthesizes a BMP file header with an explicit pixel offset and returns the decoded PNG.",
+			"reason": "Adopted as an upstream improvement: V4/V5 headers embed masks that arboard's header-less BMP decode misplaces.",
+			"changelog": "packages/coding-agent/changelog.d/native-windows-clipboard-dib.md"
+		},
+		{
+			"case": "Linux X11 clipboard ownership",
+			"preSync": "Text copy dropped its transient arboard handle immediately, which can stop the X11 selection owner from serving requests.",
+			"postSync": "The native implementation retains one arboard Clipboard instance for the process lifetime.",
+			"reason": "Adopted as an upstream improvement (issue #2075) so copied selections survive after the copy call returns.",
+			"changelog": "packages/coding-agent/changelog.d/native-windows-clipboard-dib.md"
+		}
+	]
+}

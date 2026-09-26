@@ -9,6 +9,7 @@ Implementation:
 - Threshold/evidence ledger: `packages/coding-agent/bench/perf-threshold.ledger.ts`
 - Tests: `packages/coding-agent/test/perf-corpus.test.ts`
 - Deterministic memory surface workloads: `packages/coding-agent/bench/memory-baseline-workloads.ts`
+- Session replay profiling harness: [`packages/coding-agent/bench/session-replay/replay.bench.ts`](../packages/coding-agent/bench/session-replay/replay.bench.ts), with report aggregation, replay fidelity, provenance, and stability comparison in [`profile-report.ts`](../packages/coding-agent/bench/session-replay/profile-report.ts). Run it with `bun run bench:profile -- --scenario all`; output is isolated under `.gjc/profiles/<git-sha>/`.
 
 ## Evidence taxonomy
 

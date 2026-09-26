@@ -1,0 +1,43 @@
+{
+  "source": "pre-sync pi-natives fd/workspace implementation backed by fs_cache",
+  "normalization": "fuzzy rows are ordered [path,isDirectory,score]; workspace hashes ordered [path,fileType,size|null] and omits mtime; symlink rows are isolated",
+  "scenarios": {
+    "fuzzyVisible": {
+      "matchCount": 1028,
+      "totalMatches": 1028,
+      "sha256": "c885211cd728126540cb03f421e453e4285eb8f681d755bf50f7794a80be75f3"
+    },
+    "fuzzyAll": {
+      "matchCount": 1032,
+      "totalMatches": 1032,
+      "sha256": "b70dc42c2ec915488ff5ca2437d147f9d4e6f846233ebcc006a9326f7d25e4bb"
+    },
+    "fuzzySymlinks": {
+      "matchCount": 1,
+      "fileSymlinkIncluded": true,
+      "sha256": "04b373d1d1fccd37ca8f397437ad0fbdb3ff837bd7b778ff4f4ddfec882c7e89"
+    },
+    "workspaceVisible": {
+      "entryCount": 1031,
+      "agentsMdFiles": [
+        "src/AGENTS.md"
+      ],
+      "truncated": false,
+      "sha256": "91f29bf42a3f6e8c4f502b1acc4110eb068459482e78a5fcdce014159b484d4c"
+    },
+    "workspaceAll": {
+      "entryCount": 1040,
+      "agentsMdFiles": [
+        ".hidden-dir/AGENTS.md",
+        "ignored-dir/AGENTS.md",
+        "src/AGENTS.md"
+      ],
+      "truncated": false,
+      "sha256": "5a1377e55cc5a0f34a490bf0ef17dc019214751295d912b53338792fc09041b4"
+    },
+    "workspaceSymlinks": {
+      "entryCount": 2,
+      "sha256": "81ccc43bc2bd0656fdb45de386f24421a73e97dd70049a579cb67243e62b9409"
+    }
+  }
+}

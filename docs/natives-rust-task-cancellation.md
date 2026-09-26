@@ -142,6 +142,8 @@ Error path:
 2. `Task::compute()` returns `Err`.
 3. `AsyncTask` rejects JS promise.
 
+
+`Blocking::compute()` catches panics from the work closure before they can unwind across napi-rs' `extern "C"` async-work callback and converts them into a rejected promise.
 Typical error strings:
 
 - `Aborted: Timeout`

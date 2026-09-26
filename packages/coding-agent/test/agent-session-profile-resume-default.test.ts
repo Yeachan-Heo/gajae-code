@@ -62,7 +62,7 @@ describe("AgentSession profile resume defaults", () => {
 
 	function resolveModels(): { base: Model; profileMain: Model } {
 		const base = modelRegistry.find("openai-codex", "gpt-5.5");
-		const profileMain = modelRegistry.find("anthropic", "claude-opus-5");
+		const profileMain = modelRegistry.find("anthropic", "claude-opus-5-5");
 		if (!base || !profileMain) {
 			throw new Error("Expected codex and anthropic opus models to exist");
 		}
@@ -82,7 +82,7 @@ describe("AgentSession profile resume defaults", () => {
 		await session.setModelTemporary(profileMain, undefined, { persistAsSessionDefault: true });
 
 		// The default that resume restores is now the profile's main model.
-		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-5");
+		expect(session.sessionManager.buildSessionContext().models.default).toBe("anthropic/claude-opus-5-5");
 		// Global default setting is untouched (apply-for-this-session semantics).
 		expect(session.settings.getModelRole("default")).toBe(globalDefaultBefore);
 	});
@@ -96,7 +96,7 @@ describe("AgentSession profile resume defaults", () => {
 		await session.setModelTemporary(profileMain);
 
 		expect(session.model?.provider).toBe("anthropic");
-		expect(session.model?.id).toBe("claude-opus-5");
+		expect(session.model?.id).toBe("claude-opus-5-5");
 		// Resume still restores the explicit base default, not the transient model.
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
 	});
@@ -141,7 +141,7 @@ describe("AgentSession profile resume defaults", () => {
 		// activation already recorded as the session default before throwing.
 		const base = modelRegistry.find("openai-codex", "gpt-5.5");
 		const transient = modelRegistry.find("anthropic", "claude-sonnet-4-6");
-		const profileMain = modelRegistry.find("anthropic", "claude-opus-5");
+		const profileMain = modelRegistry.find("anthropic", "claude-opus-5-5");
 		if (!base || !transient || !profileMain) {
 			throw new Error("Expected codex gpt-5.5 + anthropic sonnet/opus models to exist");
 		}
@@ -165,7 +165,7 @@ describe("AgentSession profile resume defaults", () => {
 		});
 		expect(prepared.previousModel?.id).toBe("claude-sonnet-4-6");
 		expect(prepared.previousSessionDefaultModel).toBe("openai-codex/gpt-5.5");
-		expect(prepared.defaultModel?.id).toBe("claude-opus-5");
+		expect(prepared.defaultModel?.id).toBe("claude-opus-5-5");
 
 		// Force the activation to fail after the live model changes but before the
 		// profile main model is committed as the session resume default.

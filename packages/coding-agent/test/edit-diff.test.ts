@@ -13,121 +13,121 @@ import {
 
 describe("findMatch", () => {
 	describe("exact matching", () => {
-		test("finds exact match", () => {
+		test("finds exact match", async () => {
 			const content = "line1\nline2\nline3";
 			const target = "line2";
-			const result = findMatch(content, target, { allowFuzzy: false });
+			const result = await findMatch(content, target, { allowFuzzy: false });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBe(1);
 			expect(result.match!.startLine).toBe(2);
 		});
 
-		test("reports multiple occurrences", () => {
+		test("reports multiple occurrences", async () => {
 			const content = "foo\nbar\nfoo";
 			const target = "foo";
-			const result = findMatch(content, target, { allowFuzzy: false });
+			const result = await findMatch(content, target, { allowFuzzy: false });
 			expect(result.match).toBeUndefined();
 			expect(result.occurrences).toBe(2);
 		});
 
-		test("returns empty for no match", () => {
+		test("returns empty for no match", async () => {
 			const content = "line1\nline2";
 			const target = "notfound";
-			const result = findMatch(content, target, { allowFuzzy: false });
+			const result = await findMatch(content, target, { allowFuzzy: false });
 			expect(result.match).toBeUndefined();
 			expect(result.occurrences).toBeUndefined();
 		});
 	});
 
 	describe("tab/space normalization", () => {
-		test("matches tabs in file with spaces in target", () => {
+		test("matches tabs in file with spaces in target", async () => {
 			const content = "\tfoo\n\t\tbar\n\tbaz";
 			const target = "  foo\n    bar\n  baz";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 
-		test("matches spaces in file with tabs in target", () => {
+		test("matches spaces in file with tabs in target", async () => {
 			const content = "  foo\n    bar\n  baz";
 			const target = "\tfoo\n\t\tbar\n\tbaz";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 
-		test("matches different space counts with same relative structure", () => {
+		test("matches different space counts with same relative structure", async () => {
 			const content = "   foo\n      bar\n   baz";
 			const target = "  foo\n    bar\n  baz";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 
-		test("matches single line with different indentation", () => {
+		test("matches single line with different indentation", async () => {
 			const content = 'prefix\n\t\t\t"value",\nsuffix';
 			const target = '          "value",';
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 	});
 
 	describe("fallback for inconsistent indentation", () => {
-		test("matches despite one line with wrong indentation in file", () => {
+		test("matches despite one line with wrong indentation in file", async () => {
 			const content = "\t\t\tline1\n\t\t\tline2\n\t\tline3\n\t\t\tline4";
 			const target = "      line1\n      line2\n      line3\n      line4";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 
-		test("matches when target has consistent indent but file varies", () => {
+		test("matches when target has consistent indent but file varies", async () => {
 			const content = "  a\n    b\n   c\n    d";
 			const target = "  a\n    b\n    c\n    d";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 		});
 	});
 
 	describe("content matching", () => {
-		test("collapses internal whitespace", () => {
+		test("collapses internal whitespace", async () => {
 			const content = "foo   bar    baz";
 			const target = "foo bar baz";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBeGreaterThanOrEqual(DEFAULT_FUZZY_THRESHOLD);
 		});
 
-		test("matches with trailing whitespace differences", () => {
+		test("matches with trailing whitespace differences", async () => {
 			const content = "line1  \nline2\t";
 			const target = "line1\nline2";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeDefined();
 		});
 	});
 
 	describe("threshold behavior", () => {
-		test("respects custom similarity threshold", () => {
+		test("respects custom similarity threshold", async () => {
 			const content = "function foo() {}";
 			const target = "function bar() {}";
-			const strictResult = findMatch(content, target, {
+			const strictResult = await findMatch(content, target, {
 				allowFuzzy: true,
 				threshold: 0.99,
 			});
 			expect(strictResult.match).toBeUndefined();
 
-			const lenientResult = findMatch(content, target, {
+			const lenientResult = await findMatch(content, target, {
 				allowFuzzy: true,
 				threshold: 0.7,
 			});
 			expect(lenientResult.match).toBeDefined();
 		});
 
-		test("reports fuzzyMatches count when multiple above threshold", () => {
+		test("reports fuzzyMatches count when multiple above threshold", async () => {
 			const content = "  item1\n  item2\n  item3";
 			const target = "  itemX";
-			const result = findMatch(content, target, {
+			const result = await findMatch(content, target, {
 				allowFuzzy: true,
 				threshold: 0.7,
 			});
@@ -136,24 +136,24 @@ describe("findMatch", () => {
 	});
 
 	describe("edge cases", () => {
-		test("handles empty target", () => {
+		test("handles empty target", async () => {
 			const content = "some content";
-			const result = findMatch(content, "", { allowFuzzy: true });
+			const result = await findMatch(content, "", { allowFuzzy: true });
 			expect(result).toEqual({});
 		});
 
-		test("handles empty lines in content", () => {
+		test("handles empty lines in content", async () => {
 			const content = "line1\n\nline3";
 			const target = "line1\n\nline3";
-			const result = findMatch(content, target, { allowFuzzy: false });
+			const result = await findMatch(content, target, { allowFuzzy: false });
 			expect(result.match).toBeDefined();
 			expect(result.match!.confidence).toBe(1);
 		});
 
-		test("handles target longer than content", () => {
+		test("handles target longer than content", async () => {
 			const content = "short";
 			const target = "this is much longer than the content";
-			const result = findMatch(content, target, { allowFuzzy: true });
+			const result = await findMatch(content, target, { allowFuzzy: true });
 			expect(result.match).toBeUndefined();
 		});
 	});

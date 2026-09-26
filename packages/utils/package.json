@@ -32,7 +32,6 @@
 	},
 	"dependencies": {
 		"@gajae-code/natives": "catalog:",
-		"beautiful-mermaid": "catalog:",
 		"handlebars": "catalog:",
 		"winston": "catalog:",
 		"winston-daily-rotate-file": "catalog:"

@@ -48,9 +48,12 @@ export interface TurnPromptInput {
 }
 
 /**
- * Terminal outcome is preserved exactly; active records never age into terminal. A
- * prompt that is active at process restart is finalized from its durable pending
+ * Terminal outcome is preserved exactly; active records never age into terminal. An
+ * ordinary prompt active at process restart is finalized from its durable pending
  * outcome (or `prompt_failed` when it has none), so it never reports as unknown.
+ * A `deadlineRecoveryPending` prompt is the safety exception: its status remains
+ * accepted/in-flight and its pending outcome stays private until exact execution
+ * settlement is proven.
  */
 import type { ReceiptState } from "./receipt-state";
 

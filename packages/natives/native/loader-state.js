@@ -748,6 +748,11 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.__gjcInstallTokioRuntime !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required runtime installation capability '__gjcInstallTokioRuntime'.`,
+		);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}
@@ -906,6 +911,9 @@ export function loadNative(options = {}) {
 			try {
 				validateStagedCandidate(ctx, candidate);
 				const bindings = options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+				if (typeof bindings.__gjcInstallTokioRuntime === "function") {
+					bindings.__gjcInstallTokioRuntime();
+				}
 				return releaseLease ? { [STAGED_CANDIDATE_ATTEMPT]: true, bindings, release: releaseLease } : bindings;
 			} catch (error) {
 				releaseLease?.();

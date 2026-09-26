@@ -1,0 +1,3 @@
+### Fixed
+
+- Native panic diagnostics remain opt-in through `GJC_NATIVE_CRASH_DIAGNOSTICS`. When enabled, allocation failures also write a structured report under `~/.gjc/logs`; no panic or allocation hook is installed when the setting is absent.

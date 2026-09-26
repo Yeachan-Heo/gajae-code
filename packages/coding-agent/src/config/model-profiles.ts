@@ -255,11 +255,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "gpt-5.6-luna:xhigh",
 	}),
 	profile("claude-opus", ["anthropic"], {
-		default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+		default: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:xhigh"],
 		executor: "anthropic/claude-sonnet-5",
-		planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-		critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-		architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+		planner: ["anthropic/claude-opus-5-5:medium", "anthropic/claude-opus-4-6:low"],
+		critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:high"],
+		architect: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-4-6:xhigh"],
 	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5-1:xhigh",
@@ -489,7 +489,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "alibaba-token-plan/glm-5.2:xhigh",
 	}),
 	profile("opus-codex", ["anthropic", "openai-codex"], {
-		default: "anthropic/claude-opus-5:xhigh",
+		default: "anthropic/claude-opus-5-5:medium",
 		executor: "openai-codex/gpt-5.6-terra:low",
 		planner: "anthropic/claude-sonnet-5",
 		critic: "openai-codex/gpt-6-sol:xhigh",
@@ -505,8 +505,8 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("fable-opus-codex", ["anthropic", "openai-codex"], {
 		default: "anthropic/claude-fable-5-1:high",
 		executor: "openai-codex/gpt-5.6-terra:medium",
-		planner: "anthropic/claude-opus-5:medium",
-		critic: "anthropic/claude-opus-5:high",
+		planner: "anthropic/claude-opus-5-5:medium",
+		critic: "anthropic/claude-opus-5-5:high",
 		architect: "openai-codex/gpt-6-sol:xhigh",
 	}),
 	profile("astra-fable", ["openai-codex", "anthropic"], {
@@ -519,7 +519,7 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 	profile("astra-fable-opus", ["openai-codex", "anthropic"], {
 		default: "openai-codex/gpt-6-astra:medium",
 		executor: "openai-codex/gpt-6-luna:max",
-		planner: "anthropic/claude-opus-5:medium",
+		planner: "anthropic/claude-opus-5-5:medium",
 		critic: "anthropic/claude-fable-5-1:xhigh",
 		architect: "anthropic/claude-fable-5-1:xhigh",
 	}),

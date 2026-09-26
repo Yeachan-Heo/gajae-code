@@ -502,8 +502,11 @@ describe("executeBash", () => {
 
 	it("does not expose ownership ledger secrets to shell commands or their supervisor parent", async () => {
 		if (process.platform !== "linux") return;
+		// Simple-command pipelines keep this independent of environment size: a brace
+		// group as a non-final pipeline stage runs in-process and deadlocks once it
+		// writes more than one pipe buffer (64 KiB), which large CI environments exceed.
 		const result = await executeBash(
-			`{ env; tr '\\0' '\\n' < /proc/$PPID/environ; } | grep 'GJC_SHELL_OWNERSHIP_LEDGER_' || true`,
+			"env | grep 'GJC_SHELL_OWNERSHIP_LEDGER_'; tr '\\0' '\\n' < /proc/$PPID/environ | grep 'GJC_SHELL_OWNERSHIP_LEDGER_'; true",
 			{ cwd: tempDir, timeout: 5_000, sessionKey: "ownership-secret-scrub" },
 		);
 		expect(result).toMatchObject({ exitCode: 0, output: "" });

@@ -9,7 +9,7 @@
 	},
 	"patch": {
 		"path": "../markit-ai.patch",
-		"sha256": "daca8ed30ae124f85aa06d0f1b4601e487f97bdfad72aa4983807a0bd2c5d1a9"
+		"sha256": "71f03efa3fbd8622d5c05f8d326c2acaae8c18386a855892e48fec75e00ec942"
 	},
 	"files": [
 		{
@@ -153,66 +153,6 @@
 			"sha256": "61ab4ef81485b7d353f207ef4aa37c023ebd05a5bdfa32550a83c799a97ab5b7"
 		},
 		{
-			"path": "dist/converters/pdf/columns.d.ts",
-			"sha256": "5c41d029f26232103d095fb9bd7f74d3e3dbaaa6e4a5df04e58facfc6868b1a0"
-		},
-		{
-			"path": "dist/converters/pdf/columns.js",
-			"sha256": "03ea41e4c4ae524f1b71df8dd9f783eba523cb5e10608423c8841a870add874a"
-		},
-		{
-			"path": "dist/converters/pdf/extract.d.ts",
-			"sha256": "4c81563a7f892ec7ac0688d871c2cc90f72825b71c61e830e14b35c8dab16119"
-		},
-		{
-			"path": "dist/converters/pdf/extract.js",
-			"sha256": "d361c2685f5684e64d1ffd2c8f64d5e2cb3931aae67cd154f12576cee14b9b84"
-		},
-		{
-			"path": "dist/converters/pdf/grid.d.ts",
-			"sha256": "538eff55772bec3cdf209e7eb99f2982e04cf08b3fb8c931e18b04d976c701bb"
-		},
-		{
-			"path": "dist/converters/pdf/grid.js",
-			"sha256": "8f70c8aea07d1ee83fd07fe2dd352ddc99bdc71c9c49d4ef04789c1cf9e40c3b"
-		},
-		{
-			"path": "dist/converters/pdf/headers.d.ts",
-			"sha256": "8fa5cd12989ee2859995fca20145d37a24a82a6f17f7dcd725357f54944ffc90"
-		},
-		{
-			"path": "dist/converters/pdf/headers.js",
-			"sha256": "8b3d366dabdb435323b94b795ee369d8664c478c1b710e2e51521dd2c39d0b29"
-		},
-		{
-			"path": "dist/converters/pdf/index.d.ts",
-			"sha256": "6554cc9544543099a55bf54247b2638365c859c911b60d5250070aae8dafbffc"
-		},
-		{
-			"path": "dist/converters/pdf/index.js",
-			"sha256": "903c55e04f31366e28e454abb96d99f7d058368672b1bfe2a79052e90a2d452a"
-		},
-		{
-			"path": "dist/converters/pdf/mupdf-loader.js",
-			"sha256": "f15708fa360fc9e678d0d511ae4d634dc5a15da9bfa47d3e335857315f87660a"
-		},
-		{
-			"path": "dist/converters/pdf/render.d.ts",
-			"sha256": "a153b8fc0920fdb10a02cfac94bc7410b6ee2b727281c604e7a39354fdffd5b1"
-		},
-		{
-			"path": "dist/converters/pdf/render.js",
-			"sha256": "d1521833206e3e8a3efd4d8bb54a809f267e5c29939204b26c8c83df26195b42"
-		},
-		{
-			"path": "dist/converters/pdf/types.d.ts",
-			"sha256": "24ed9a2b95fece655de02fcff61ad394727a25fda7be9ed1445f038d4725dd7f"
-		},
-		{
-			"path": "dist/converters/pdf/types.js",
-			"sha256": "8e609bb71c20b858c77f0e9f90bb1319db8477b13f9f965f1a1e18524bf50881"
-		},
-		{
 			"path": "dist/converters/plain-text.d.ts",
 			"sha256": "8047bbbc2b527caf7bd2e059dced0563365713a9f1f9626e6a970949690c3831"
 		},
@@ -278,11 +218,11 @@
 		},
 		{
 			"path": "dist/index.d.ts",
-			"sha256": "2ab8371cc561e1c804a3d4141307fc84c94b6cf732ef09cc929041f51c032cb6"
+			"sha256": "1647295febf06756ea801d254b0563d138f1653be71df4eaf59f48783c25ae56"
 		},
 		{
 			"path": "dist/index.js",
-			"sha256": "89def6be0f8d77dbce617523684584221f2f57b0db3181cabb43056ed9605773"
+			"sha256": "5d9a28ef2a84e7030b8919f1148b613e6b5f29f263441ce7218b54905c2628ac"
 		},
 		{
 			"path": "dist/main.d.ts",
@@ -298,7 +238,7 @@
 		},
 		{
 			"path": "dist/markit.js",
-			"sha256": "aeca6d69d6c7cd0d475e52b889e3ceef5a3fd952f65aadef1cc68096efacc610"
+			"sha256": "d04cfd9bfda25a14cbb061f0395292c99b8d1c3c6e4baf4d1c7c2131d409422b"
 		},
 		{
 			"path": "dist/plugins/api.d.ts",
@@ -406,7 +346,7 @@
 		},
 		{
 			"path": "package.json",
-			"sha256": "c6c028214b6a498a7e1f616375a1d413ee727661ecaeec5e7b93b97fbe6786e3"
+			"sha256": "eb9b6de6ebb01ff823b930685f6bba15ba970009380b4607aeb941f2ba9665d7"
 		}
 	]
 }

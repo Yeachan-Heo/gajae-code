@@ -1,0 +1,11 @@
+{
+	"divergences": [
+		{
+			"case": "native allocation failure diagnostics",
+			"preSync": "The local opt-in panic hook did not install an allocation-error hook, so allocation failures had no structured native report.",
+			"postSync": "When GJC_NATIVE_CRASH_DIAGNOSTICS is enabled, allocation failures emit the canonical stderr line and a structured size/alignment/backtrace report under ~/.gjc/logs.",
+			"reason": "Adopted the pinned upstream alloc-error-hook recording while preserving D8's opt-in gate and GJC path.",
+			"changelog": "packages/natives/changelog.d/rust-porting-phase-3-crash.md"
+		}
+	]
+}
