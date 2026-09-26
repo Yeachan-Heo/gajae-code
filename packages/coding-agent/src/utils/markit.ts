@@ -66,8 +66,26 @@ function finalizeConversion(markdown?: string): MarkitConversionResult {
 	return { content: "", ok: false, error: "Conversion produced no output" };
 }
 
-function finalizePdfConversion(result: PdfMarkdownResult): MarkitConversionResult {
-	if (result.markdown.trim().length > 0) return { content: result.markdown, ok: true };
+function pdfExtractionWarnings(result: PdfMarkdownResult): string[] {
+	const warnings: string[] = [];
+	if (result.pagesNeedingOcr.length > 0) {
+		warnings.push(
+			`page${result.pagesNeedingOcr.length === 1 ? "" : "s"} ${result.pagesNeedingOcr.join(", ")} contain no extractable text (scanned; OCR required) and are missing from this output`,
+		);
+	}
+	if (result.hasEncodingIssues) warnings.push("some text may be garbled (font encoding issues detected)");
+	return warnings;
+}
+
+export function finalizePdfConversion(result: PdfMarkdownResult): MarkitConversionResult {
+	if (result.markdown.trim().length > 0) {
+		const warnings = pdfExtractionWarnings(result);
+		const content =
+			warnings.length === 0
+				? result.markdown
+				: `> [!WARNING]\n> Incomplete PDF extraction: ${warnings.join("; ")}.\n\n${result.markdown}`;
+		return { content, ok: true };
+	}
 	if (result.pagesNeedingOcr.length > 0) {
 		return {
 			content: "",

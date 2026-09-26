@@ -907,20 +907,33 @@ async function renderUrl(
 						notes,
 					};
 				}
-				const imageBytes =
-					imageMimeType === "image/svg+xml" ? await rasterizeSvgInputBytes(binary.buffer) : binary.buffer;
+				let imageBytes: Uint8Array | undefined = binary.buffer;
+				if (imageMimeType === "image/svg+xml") {
+					try {
+						imageBytes = await rasterizeSvgInputBytes(binary.buffer);
+					} catch (error) {
+						notes.push(`SVG rasterization failed: ${error instanceof Error ? error.message : String(error)}`);
+						imageBytes = undefined;
+					}
+				}
 
-				const resized = await resizeImage(
-					{
-						type: "image",
-						data: Buffer.from(imageBytes).toBase64(),
-						mimeType: imageMimeType === "image/svg+xml" ? "image/png" : imageMimeType,
-					},
-					{ maxBytes: MAX_INLINE_IMAGE_OUTPUT_BYTES },
-				);
+				const resized = imageBytes
+					? await resizeImage(
+							{
+								type: "image",
+								data: Buffer.from(imageBytes).toBase64(),
+								mimeType: imageMimeType === "image/svg+xml" ? "image/png" : imageMimeType,
+							},
+							{ maxBytes: MAX_INLINE_IMAGE_OUTPUT_BYTES },
+						)
+					: undefined;
 				const isDecodedImage =
-					resized.originalWidth > 0 && resized.originalHeight > 0 && resized.width > 0 && resized.height > 0;
-				if (!isDecodedImage) {
+					resized !== undefined &&
+					resized.originalWidth > 0 &&
+					resized.originalHeight > 0 &&
+					resized.width > 0 &&
+					resized.height > 0;
+				if (!isDecodedImage || resized === undefined) {
 					notes.push(`Fetched payload could not be decoded as ${imageMimeType}; returning text metadata only`);
 					const output = finalizeOutput(
 						convertedText ??

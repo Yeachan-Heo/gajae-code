@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pdfFixture, pdfGoldenCorpus } from "../../natives/test/pdf-fixtures";
-import { convertBufferWithMarkit, convertFileWithMarkit } from "../src/utils/markit";
+import { convertBufferWithMarkit, convertFileWithMarkit, finalizePdfConversion } from "../src/utils/markit";
 
 describe("native PDF conversion", () => {
 	it("routes PDF buffers and files through the native inspector", async () => {
@@ -45,5 +45,32 @@ describe("native PDF conversion", () => {
 		const result = await convertBufferWithMarkit(Buffer.from("<h1>Retained HTML conversion</h1>"), ".html");
 		expect(result.ok).toBe(true);
 		expect(result.content).toContain("Retained HTML conversion");
+	});
+});
+
+describe("partial PDF extraction warnings", () => {
+	it("surfaces OCR-needed pages and encoding issues alongside extracted text", () => {
+		const result = finalizePdfConversion({
+			markdown: "# Page 1\n\nhello",
+			pageCount: 3,
+			pagesNeedingOcr: [2, 3],
+			hasEncodingIssues: true,
+		});
+		expect(result.ok).toBe(true);
+		expect(result.content).toStartWith(
+			"> [!WARNING]\n> Incomplete PDF extraction: pages 2, 3 contain no extractable text",
+		);
+		expect(result.content).toContain("font encoding issues");
+		expect(result.content).toEndWith("# Page 1\n\nhello");
+	});
+
+	it("leaves complete extractions unchanged", () => {
+		const result = finalizePdfConversion({
+			markdown: "full text",
+			pageCount: 1,
+			pagesNeedingOcr: [],
+			hasEncodingIssues: false,
+		});
+		expect(result).toEqual({ content: "full text", ok: true });
 	});
 });

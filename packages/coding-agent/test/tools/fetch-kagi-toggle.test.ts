@@ -288,6 +288,31 @@ describe("read tool URL handling", () => {
 		expect(imageBlock?.mimeType).toBe("image/png");
 	});
 
+	it("returns invalid-image metadata when a fetched SVG cannot be rasterized", async () => {
+		const session = createSession();
+		const tool = new ReadTool(session);
+		const resizeSpy = vi.spyOn(imageResize, "resizeImage");
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+			ok: true,
+			status: 200,
+			contentType: "image/svg+xml",
+			finalUrl: "https://example.com/broken.svg",
+			content: "",
+		});
+		vi.spyOn(scraperUtils, "fetchBinary").mockResolvedValue({
+			ok: true,
+			buffer: Buffer.from("<svg not really xml"),
+		});
+		vi.spyOn(scraperUtils, "convertWithMarkit").mockResolvedValue({ ok: false, content: "", error: "unused" });
+
+		const result = await tool.execute("fetch-broken-svg", { path: "https://example.com/broken.svg" });
+
+		expect(resizeSpy).not.toHaveBeenCalled();
+		expect(result.details?.method).toBe("image-invalid");
+		expect(result.details?.notes?.some(note => note.startsWith("SVG rasterization failed:"))).toBe(true);
+		expect(result.content.some(content => content.type === "image")).toBe(false);
+	});
+
 	it("keeps markit extracted text for image responses", async () => {
 		const session = createSession();
 		const tool = new ReadTool(session);
