@@ -1,3 +1,4 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/read.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, preserves cancellation, timeout, and readiness guards.
 use std::{
 	collections::VecDeque,
 	io::{Read, Write},
@@ -84,12 +85,6 @@ impl builtins::Command for ReadCommand {
 		&self,
 		context: brush_core::ExecutionContext<'_, SE>,
 	) -> Result<brush_core::ExecutionResult, Self::Error> {
-		if self.use_readline {
-			return error::unimp("read -e");
-		}
-		if self.initial_text.is_some() {
-			return error::unimp("read -i");
-		}
 
 		// Validate timeout value if provided.
 		if let Some(result) = self.validate_timeout(&context)? {
@@ -105,6 +100,16 @@ impl builtins::Command for ReadCommand {
 		let input_stream = context
 			.try_fd(fd_num)
 			.ok_or_else(|| ErrorKind::BadFileDescriptor(fd_num))?;
+		// Readline flags are accepted for redirected input, where there is no
+		// terminal line editor to activate. Initial text is only meaningful with
+		// `-e`; on a terminal that combination remains unsupported.
+		if self.use_readline && input_stream.is_terminal() {
+			return error::unimp(if self.initial_text.is_some() {
+				"read -e -i"
+			} else {
+				"read -e"
+			});
+		}
 
 		// Retrieve effective value of IFS for splitting.
 		// We convert to owned String to release the borrow before the mutable borrow
@@ -272,6 +277,7 @@ fn build_variable_fields(
 ///
 /// This enum clearly represents all possible outcomes of `read_line()`,
 /// making the contract with callers explicit.
+#[derive(Debug)]
 enum ReadResult {
 	/// Successfully read a complete line (delimiter or char limit reached).
 	Line(String),

@@ -1,0 +1,62 @@
+{
+	"schemaVersion": 1,
+	"tokens": [
+		{
+			"id": "packageIdentifier",
+			"value": "mupdf",
+			"reason": "Removed PDF runtime package and active source identifiers."
+		},
+		{
+			"id": "wasmConfigurationGlobal",
+			"value": "$libmupdf_wasm_Module",
+			"reason": "Removed global WebAssembly loader configuration."
+		},
+		{
+			"id": "wasmEmbedScript",
+			"value": "embed-mupdf",
+			"reason": "Removed the WebAssembly embedding build script."
+		},
+		{
+			"id": "releaseMaterialsEnvironment",
+			"value": "GJC_MUPDF_RELEASE_MATERIALS_DIR",
+			"reason": "Removed the source-material release build input."
+		},
+		{
+			"id": "releaseCiJob",
+			"value": "mupdf_source",
+			"reason": "Removed the source-material CI job."
+		}
+	],
+	"signatures": {
+		"npmPackageIntegrity": "sha512-ACUnbpECaQ5JLq04pwd89lS+0IGMest5qL5tb08g9TAR7bDtfqflHEkb2Xm3o4rvC/szguLiV+WEbW9kstj8Sg==",
+		"embeddedWasmSha256": "f7d39be2ea7bf8f65ffe1b11f405547d0a5b7e3b94d4c1ef59d16687411bdebf"
+	},
+	"allowlist": [
+		{
+			"type": "glob",
+			"pattern": "packages/*/changelog.d/*.md",
+			"reason": "Release fragments must name removals and user-visible changes."
+		},
+		{
+			"type": "glob",
+			"pattern": "packages/*/CHANGELOG.md",
+			"reason": "Published release history is append-only."
+		},
+		{
+			"type": "heading",
+			"pattern": "NOTICE.md",
+			"heading": "## Notice history",
+			"reason": "The notice records the release that removed the separately licensed engine."
+		},
+		{
+			"type": "glob",
+			"pattern": "docs/rust-porting-*.md",
+			"reason": "Porting plans and inventories are historical project records."
+		},
+		{
+			"type": "file",
+			"pattern": "scripts/agpl-removal-patterns.json",
+			"reason": "The audit configuration must name the signatures it rejects."
+		}
+	]
+}

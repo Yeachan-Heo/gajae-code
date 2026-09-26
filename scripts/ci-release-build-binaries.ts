@@ -3,8 +3,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildReleaseCompileArgs } from "../packages/coding-agent/scripts/compile-args";
-import { generateMuPdfAsset, resetMuPdfAsset } from "../packages/coding-agent/scripts/embed-mupdf";
-import { verifyMuPdfReleaseMaterials } from "./mupdf-release-materials";
 import { signMacOSBinary } from "./macos-code-signing";
 
 interface BinaryTarget {
@@ -151,17 +149,12 @@ async function resetArtifacts(): Promise<void> {
 	if (isDryRun) {
 		console.log("DRY RUN bun --cwd=packages/natives run embed:native --reset");
 		console.log("DRY RUN bun --cwd=packages/stats scripts/generate-client-bundle.ts --reset");
-		console.log("DRY RUN bun packages/coding-agent/scripts/embed-mupdf.ts --reset");
 		return;
 	}
 	try {
 		await runCommand(["bun", "--cwd=packages/natives", "run", "embed:native", "--reset"], repoRoot);
 	} finally {
-		try {
-			await resetMuPdfAsset();
-		} finally {
-			await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
-		}
+		await runCommand(["bun", "--cwd=packages/stats", "scripts/generate-client-bundle.ts", "--reset"], repoRoot);
 	}
 }
 
@@ -193,12 +186,6 @@ async function main(): Promise<void> {
 	await fs.mkdir(binariesDir, { recursive: true });
 	try {
 		await generateBundle();
-		if (isDryRun) console.log("DRY RUN bun packages/coding-agent/scripts/embed-mupdf.ts");
-		else {
-			const { directory, wasmPath } = await verifyMuPdfReleaseMaterials();
-			console.log(`Verified MuPDF corresponding-source materials: ${directory}`);
-			await generateMuPdfAsset({ wasmPath });
-		}
 		for (const target of selectedTargets) {
 			await buildBinary(target);
 		}

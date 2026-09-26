@@ -1,6 +1,7 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/cd.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, uses the local synchronous host filesystem API.
 use std::{io::Write, path::PathBuf};
 
-use brush_core::{ExecutionResult, builtins, error};
+use brush_core::{ExecutionResult, builtins};
 use clap::Parser;
 
 /// Change the current shell working directory.
@@ -19,10 +20,6 @@ pub(crate) struct CdCommand {
 	#[arg(short = 'e')]
 	exit_on_failed_cwd_resolution: bool,
 
-	/// Show file with extended attributes as a dir with extended
-	/// attributes.
-	#[arg(short = '@')]
-	file_with_xattr_as_dir: bool,
 
 	/// By default it is the value of the HOME shell variable. If `TARGET_DIR` is
 	/// "-", it is converted to $OLDPWD.
@@ -36,10 +33,6 @@ impl builtins::Command for CdCommand {
 		&self,
 		context: brush_core::ExecutionContext<'_, SE>,
 	) -> Result<ExecutionResult, Self::Error> {
-		// TODO(cd): implement 'cd -@'
-		if self.file_with_xattr_as_dir {
-			return error::unimp("cd -@");
-		}
 
 		let mut should_print = false;
 		let mut target_dir = if let Some(target_dir) = &self.target_dir {
@@ -73,9 +66,6 @@ impl builtins::Command for CdCommand {
 				.do_not_resolve_symlinks_when_changing_dir
 		{
 			// -e is only relevant in physical mode.
-			if self.exit_on_failed_cwd_resolution {
-				return error::unimp("cd -e");
-			}
 
 			target_dir = context.shell.absolute_path(target_dir).canonicalize()?;
 		}

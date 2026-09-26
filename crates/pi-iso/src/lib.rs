@@ -1,7 +1,11 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/lib.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain gjc
+// naming and the local plain-tree module.
 //! Cross-platform isolation PAL.
 //!
 //! A backend gives the caller a writable "merged" view of a read-only
-//! "lower" tree without paying for a deep copy:
+//! "lower" tree without paying for a deep copy. Tree-cloning backends can also
+//! create copy-on-write clones while omitting selected top-level entries:
 //!
 //! - **macOS** uses `clonefile(2)` to seed an APFS copy-on-write clone.
 //! - **Linux** mounts a kernel `overlay` filesystem, falling back to
@@ -67,6 +71,11 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+	/// Whether this backend can clone a directory tree in place.
+	pub const fn clones_tree(self) -> bool {
+		matches!(self, Self::Apfs | Self::LinuxReflink | Self::WindowsBlockClone)
+	}
+
 	/// Short, stable string identifier. Used by the napi shim.
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -209,6 +218,20 @@ impl std::error::Error for IsoError {}
 
 pub type IsoResult<T> = Result<T, IsoError>;
 
+/// Build the [`IsoError::Other`] for a failed external command, rendered as
+/// `<what> (exit <code>): <trimmed stderr>`.
+///
+/// `stderr` is decoded lossily. `code` is preformatted by the caller so
+/// per-site conventions for signal deaths (`-1` vs `?`) are preserved.
+pub(crate) fn command_failed(
+	what: impl fmt::Display,
+	code: impl fmt::Display,
+	stderr: &[u8],
+) -> IsoError {
+	let stderr = String::from_utf8_lossy(stderr);
+	IsoError::other(format!("{what} (exit {code}): {}", stderr.trim()))
+}
+
 /// Backend contract.
 ///
 /// `lower` is the read-only source tree; `merged` is the destination where
@@ -232,6 +255,17 @@ pub trait IsolationBackend: Send + Sync {
 	fn probe(&self) -> ProbeResult;
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()>;
+
+	/// Clone `lower` into `merged` copy-on-write, omitting named top-level
+	/// entries.
+	fn clone_tree(
+		&self,
+		_lower: &Path,
+		_merged: &Path,
+		_skip: &[&std::ffi::OsStr],
+	) -> IsoResult<()> {
+		Err(IsoError::unavailable(format!("{} cannot clone a directory tree in place", self.kind())))
+	}
 
 	fn stop(&self, merged: &Path) -> IsoResult<()>;
 
@@ -323,6 +357,26 @@ pub struct Resolution {
 	pub candidates: Vec<BackendKind>,
 	pub fell_back:  bool,
 	pub reason:     Option<String>,
+}
+
+/// Host-available tree-cloning backends in fallback order.
+///
+/// A preferred cloning backend is tried first when available. Non-cloning
+/// backends are excluded.
+pub fn clone_candidates(preferred: Option<BackendKind>) -> Vec<BackendKind> {
+	let mut candidates = Vec::new();
+	if let Some(kind) = preferred
+		&& kind.clones_tree()
+		&& backend(kind).probe().available
+	{
+		candidates.push(kind);
+	}
+	for &kind in auto_order() {
+		if Some(kind) != preferred && kind.clones_tree() && backend(kind).probe().available {
+			candidates.push(kind);
+		}
+	}
+	candidates
 }
 
 /// Pick the best backend whose host-level prerequisites are available.

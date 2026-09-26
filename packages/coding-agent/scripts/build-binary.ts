@@ -3,7 +3,6 @@
 import * as path from "node:path";
 import { signMacOSBinary } from "../../../scripts/macos-code-signing";
 import { buildDevCompileArgs } from "./compile-args";
-import { generateMuPdfAsset, resetMuPdfAsset } from "./embed-mupdf";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "gjc");
@@ -35,7 +34,6 @@ async function main(): Promise<void> {
 	try {
 		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--generate"]);
 		try {
-			await generateMuPdfAsset();
 			await runCommand(["bun", "--cwd=../natives", "run", "embed:native"]);
 			const buildEnv = shouldAdhocSignDarwinBinary() ? { ...Bun.env, BUN_NO_CODESIGN_MACHO_BINARY: "1" } : Bun.env;
 			await runCommand(buildDevCompileArgs(), buildEnv);
@@ -49,11 +47,7 @@ async function main(): Promise<void> {
 			await runCommand(["bun", "--cwd=../natives", "run", "embed:native", "--reset"]);
 		}
 	} finally {
-		try {
-			await resetMuPdfAsset();
-		} finally {
-			await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
-		}
+		await runCommand(["bun", "--cwd=../stats", "scripts/generate-client-bundle.ts", "--reset"]);
 	}
 }
 

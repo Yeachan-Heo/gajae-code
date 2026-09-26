@@ -184,15 +184,31 @@ export interface NativePublishDiagnostic {
 }
 
 const requiredGeneratedBindingSymbols = [
+	"DiffChange",
+	"DiffRun",
+	"DiffSide",
+	"DiffStream",
+	"DiffStreamProgress",
+	"DiffStreamResult",
+	"PatchHunk",
 	"RecoveryFsRoot",
 	"RecoveryFsIdentity",
 	"RecoveryFsResult",
 	"NativePublishDiagnostic",
 	"NativePublishSyncFailure",
+	"editFindMatch",
+	"editSeekSequence",
+	"diffLines",
+	"diffWords",
 	"openRecoveryFsRoot",
+	"rasterizeSvg",
+	"TtyWriter",
 	"repairOwnerOnlyPathSecurityExpected",
+	"structuredPatchHunks",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
+	"__gjcInstallTokioRuntime",
+	"PowerAssertion",
 	"currentExecutablePath",
 ] as const;
 
@@ -280,6 +296,7 @@ if (!cargoPathResolution) {
 	);
 }
 Bun.env.PATH = cargoPathResolution.pathValue;
+Bun.env.PCRE2_SYS_STATIC = "1";
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);

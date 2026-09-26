@@ -20,6 +20,7 @@ import {
 	createGoldenReleaseEvidence,
 
 	inspectPackageTarball,
+	readPackageTarballMembers,
 	packageEvidenceFromTarball,
 	parseReleaseEvidenceCli,
 	goldenReleaseEvidenceBytes,
@@ -59,7 +60,7 @@ function writeOctal(header: Buffer, offset: number, length: number, value: numbe
 	header[offset + length - 1] = 0;
 }
 
-function tarHeader(memberPath: string, data: Buffer, mode = 0o644): Buffer {
+function tarHeader(memberPath: string, data: Buffer, mode = 0o644, typeByte = "0"): Buffer {
 	const header = Buffer.alloc(512);
 	header.write(memberPath, 0, "utf8");
 	writeOctal(header, 100, 8, mode);
@@ -68,7 +69,7 @@ function tarHeader(memberPath: string, data: Buffer, mode = 0o644): Buffer {
 	writeOctal(header, 124, 12, data.length);
 	writeOctal(header, 136, 12, 1_700_000_000);
 	header.fill(0x20, 148, 156);
-	header[156] = "0".charCodeAt(0);
+	header[156] = typeByte.charCodeAt(0);
 	header.write("ustar", 257, "ascii");
 	header[262] = 0;
 	header.write("00", 263, "ascii");
@@ -80,10 +81,12 @@ function tarHeader(memberPath: string, data: Buffer, mode = 0o644): Buffer {
 	return header;
 }
 
-function fixtureTarballEntries(files: readonly { path: string; data: Buffer }[]): Buffer {
+function fixtureTarballEntries(
+	files: readonly { path: string; data: Buffer; mode?: number; typeByte?: string }[],
+): Buffer {
 	const parts: Buffer[] = [];
 	for (const file of files) {
-		parts.push(tarHeader(file.path, file.data));
+		parts.push(tarHeader(file.path, file.data, file.mode ?? 0o644, file.typeByte ?? "0"));
 		parts.push(file.data);
 		const padding = (512 - (file.data.length % 512)) % 512;
 		if (padding > 0) parts.push(Buffer.alloc(padding));
@@ -102,6 +105,81 @@ function fixtureTarball(manifest: string): Buffer {
 function tarballLimits(overrides: Partial<TarballLimits>): TarballLimits {
 	return { ...RELEASE_TARBALL_LIMITS, ...overrides };
 }
+function paxPathRecord(memberPath: string): Buffer {
+	let length = Buffer.byteLength(`path=${memberPath}\n`, "utf8") + 2;
+	for (;;) {
+		const record = Buffer.from(`${length} path=${memberPath}\n`, "utf8");
+		if (record.byteLength === length) return record;
+		length = record.byteLength;
+	}
+}
+
+
+describe("readPackageTarballMembers", () => {
+	test("returns regular files in archive order and omits directories", () => {
+		const first = Buffer.from("export const first = 1;\n");
+		const manifest = Buffer.from('{"name":"fixture","version":"1.2.3"}\n');
+		const tarball = fixtureTarballEntries([
+			{ path: "package/index.js", data: first, mode: 0o640 },
+			{ path: "package/subdir", data: Buffer.alloc(0), mode: 0o755, typeByte: "5" },
+			{ path: "package/package.json", data: manifest },
+		]);
+		expect(readPackageTarballMembers(tarball)).toEqual([
+			{ path: "package/index.js", mode: 0o640, data: first },
+			{ path: "package/package.json", mode: 0o644, data: manifest },
+		]);
+	});
+
+	test("rejects oversized members, aggregate limits, and file-count limits", () => {
+		const oversized = fixtureTarballEntries([{ path: "package/large.js", data: Buffer.alloc(129) }]);
+		expect(() => readPackageTarballMembers(oversized, tarballLimits({ maxUnpackedBytes: 10_000, maxEntryBytes: 128 }))).toThrow(
+			"exceeds 128",
+		);
+
+		const entries = fixtureTarballEntries([
+			{ path: "package/first.js", data: Buffer.from("abc") },
+			{ path: "package/second.js", data: Buffer.from("def") },
+		]);
+		expect(() => readPackageTarballMembers(entries, tarballLimits({ maxUnpackedBytes: 4, maxEntryBytes: 4 }))).toThrow();
+		expect(() => readPackageTarballMembers(entries, tarballLimits({ maxFileCount: 1 }))).toThrow("more than 1 files");
+	});
+
+	test("rejects all nine traversal paths, including PAX and GNU path overrides", () => {
+		const backslashPath = `package${String.fromCharCode(92)}escape.js`;
+		const unsafePaths = [
+			"package/../escape.js",
+			"../package/escape.js",
+			"/package/escape.js",
+			"package/./escape.js",
+			"package//escape.js",
+			backslashPath,
+			"other/escape.js",
+		];
+		for (const memberPath of unsafePaths) {
+			expect(() => readPackageTarballMembers(fixtureTarballEntries([{ path: memberPath, data: Buffer.from("x") }]))).toThrow(
+				"tar member path is unsafe",
+			);
+		}
+
+		const paxTarball = fixtureTarballEntries([
+			{ path: "PaxHeader", data: paxPathRecord("package/../../escape.js"), typeByte: "x" },
+			{ path: "package/safe.js", data: Buffer.from("x") },
+		]);
+		expect(() => readPackageTarballMembers(paxTarball)).toThrow("tar member path is unsafe");
+
+		const gnuTarball = fixtureTarballEntries([
+			{ path: "LongPath", data: Buffer.concat([Buffer.from("package/../escape.js"), Buffer.from([0])]), typeByte: "L" },
+			{ path: "package/safe.js", data: Buffer.from("x") },
+		]);
+		expect(() => readPackageTarballMembers(gnuTarball)).toThrow("tar member path is unsafe");
+	});
+
+	test("rejects symbolic links", () => {
+		const tarball = fixtureTarballEntries([{ path: "package/link.js", data: Buffer.from("target"), typeByte: "2" }]);
+		expect(() => readPackageTarballMembers(tarball)).toThrow("unsupported type");
+	});
+});
+
 
 function expectedRecord(definition: (typeof PUBLIC_PACKAGE_DEFINITIONS)[number], dependencies: Record<string, string> = {}): PackageEvidenceRecord {
 	const manifest = `{"name":"${definition.name}","version":"1.2.3","dependencies":${JSON.stringify(dependencies)}}\n`;

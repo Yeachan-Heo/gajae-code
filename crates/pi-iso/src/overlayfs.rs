@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-iso/src/overlayfs.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: retain local
+// kernel/fuse backend dispatch.
 //! Linux overlayfs-based isolation.
 //!
 //! Tries to stack a kernel `overlay` filesystem at `merged` over the
@@ -84,7 +87,7 @@ mod imp {
 
 	use parking_lot::Mutex;
 
-	use crate::{IsoError, IsoResult, ProbeResult};
+	use crate::{IsoError, IsoResult, ProbeResult, command_failed};
 
 	#[derive(Clone, Copy)]
 	enum MountFlavor {
@@ -262,11 +265,11 @@ mod imp {
 		if output.status.success() {
 			return Ok(());
 		}
-		let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-		Err(IsoError::other(format!(
-			"fuse-overlayfs mount failed (exit {}): {stderr}",
-			output.status.code().unwrap_or(-1)
-		)))
+		Err(command_failed(
+			"fuse-overlayfs mount failed",
+			output.status.code().unwrap_or(-1),
+			&output.stderr,
+		))
 	}
 
 	fn fuse_umount(merged: &Path) -> IsoResult<()> {

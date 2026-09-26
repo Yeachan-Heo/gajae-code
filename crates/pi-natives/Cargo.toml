@@ -19,13 +19,17 @@ ast-grep-core.workspace = true
 clap.workspace = true
 dashmap.workspace = true
 globset.workspace = true
+heapless.workspace = true
 grep-matcher.workspace = true
+grep-pcre2.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
 html-to-markdown-rs.workspace = true
 icy_sixel.workspace = true
 ignore.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["bmp"] }
+png.workspace = true
+resvg.workspace = true
 # Feature activation only (see workspace manifest): zune-jpeg needs `log` to compile.
 zune-jpeg.workspace = true
 # Upstream pinning only (see workspace manifest): tinyvec 1.13.0 is broken.
@@ -36,10 +40,15 @@ memmap2.workspace = true
 napi.workspace = true
 napi-derive.workspace = true
 parking_lot.workspace = true
+pdf-inspector.workspace = true
 phf.workspace = true
 pi-ast.workspace = true
+pi-diff = { path = "../pi-diff" }
+pi-edit.workspace = true
 pi-iso.workspace = true
 pi-shell.workspace = true
+pi-vfs.workspace = true
+pi-walker.workspace = true
 portable-pty.workspace = true
 rayon.workspace = true
 regex.workspace = true
@@ -55,15 +64,21 @@ toml.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+xutf.workspace = true
 xxhash-rust.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+log.workspace = true
+zbus.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 sha2 = { workspace = true, features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
+clipboard-win.workspace = true
 winreg.workspace = true
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_Power"] }
 
 [build-dependencies]
 # Transitive-only pin: see find-msvc-tools in the root workspace manifest.
@@ -72,7 +87,11 @@ napi-build.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+async-trait.workspace = true
+
 [features]
 default = []
 full-langs = ["pi-ast/full-langs"]
 prof-flamegraph = ["dep:inferno"]
+task-panic-test = []

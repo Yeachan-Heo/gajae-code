@@ -11,6 +11,7 @@ const CI_WORKFLOW = ".github/workflows/ci.yml";
 const DEV_CI_WORKFLOW = ".github/workflows/dev-ci.yml";
 const PR_VALIDATION_WORKFLOW = ".github/workflows/pr-validation.yml";
 const SPOOFED_VERSION_WORKFLOW = ".github/workflows/spoofed-version-sync.yml";
+
 const repoRoot = `${import.meta.dir}/..`;
 
 async function parsedWorkflow(file: string): Promise<Record<string, unknown>> {
@@ -39,6 +40,7 @@ describe("workflow permission policy", () => {
 		expect(workflows.map(workflow => workflow.file)).toEqual([
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
+			".github/workflows/native-bench-ab.yml",
 			".github/workflows/pr-validation.yml",
 			".github/workflows/public-site-sync.yml",
 			".github/workflows/spoofed-version-sync.yml",
@@ -105,6 +107,16 @@ describe("workflow permission policy", () => {
 		expect(document.permissions).toEqual({ contents: "read" });
 		expect(jobWriteScopes(document)).toEqual([]);
 		expect(JOB_WRITE_ALLOWLIST.some(entry => entry.workflow === SPOOFED_VERSION_WORKFLOW)).toBe(false);
+	});
+
+	test("native-bench-ab.yml has an exact read-scoped workflow default and no write job scope", async () => {
+		const workflows = await readWorkflowDocuments();
+		const nativeBench = workflows.find(workflow => workflow.file === ".github/workflows/native-bench-ab.yml");
+		expect(nativeBench).toBeDefined();
+		const document = documentRecord(nativeBench!.document);
+
+		expect(document.permissions).toEqual({ contents: "read" });
+		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
 	test("detects a ci.yml workflow contents write mutation", async () => {

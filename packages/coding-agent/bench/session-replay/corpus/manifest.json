@@ -1,0 +1,87 @@
+{
+  "schema": "gjc.session-replay-corpus/1",
+  "sanitizerVersion": "1",
+  "entries": [
+    {
+      "id": "real-compaction-01",
+      "sourceClass": "sanitized-real",
+      "sourceSha256": "b23ebf499ad715452a4626949d2eacc21a093a6b93f153c8383ba20588ca0571",
+      "sanitizerVersion": "1",
+      "redactionNotes": "redacted 784 text values; rewrote 246 path values; replaced 0 binary blocks (0 bytes); privacy scan checked 512/2904 distinct words",
+      "file": "real-compaction-01.jsonl",
+      "assistantTurns": 48,
+      "toolCalls": 43,
+      "toolKinds": [
+        "find",
+        "goal",
+        "read",
+        "search",
+        "write"
+      ],
+      "hasCompaction": true,
+      "bytes": 587385,
+      "toolCallSeqSha256": "93f96cee515ff6273c28b6d34f288b3bc7de69e137d005483c9284271396b78d"
+    },
+    {
+      "id": "real-long-01",
+      "sourceClass": "sanitized-real",
+      "sourceSha256": "29a64af865f7b48f2dfd3d00843b49c7fb9d43be61697162be945bbc15a86a34",
+      "sanitizerVersion": "1",
+      "redactionNotes": "redacted 587 text values; rewrote 24 path values; replaced 0 binary blocks (0 bytes); privacy scan checked 512/1507 distinct words",
+      "file": "real-long-01.jsonl",
+      "assistantTurns": 51,
+      "toolCalls": 53,
+      "toolKinds": [
+        "bash",
+        "edit",
+        "find",
+        "read",
+        "write"
+      ],
+      "hasCompaction": false,
+      "bytes": 180039,
+      "toolCallSeqSha256": "ede6ff759ecb68db09f6176154fed32435496f477d410e7aba7d1f5fce8b64c0"
+    },
+    {
+      "id": "real-tools-01",
+      "sourceClass": "sanitized-real",
+      "sourceSha256": "3a9985d2f1794af2046721beb8446369c1bd1071053d9503706ac3cac38a571f",
+      "sanitizerVersion": "1",
+      "redactionNotes": "redacted 187 text values; rewrote 44 path values; replaced 0 binary blocks (0 bytes); privacy scan checked 512/836 distinct words",
+      "file": "real-tools-01.jsonl",
+      "assistantTurns": 24,
+      "toolCalls": 20,
+      "toolKinds": [
+        "bash",
+        "edit",
+        "find",
+        "read",
+        "search"
+      ],
+      "hasCompaction": false,
+      "bytes": 140567,
+      "toolCallSeqSha256": "83e84bd174ba6063b560c0a17adb82b37ba6e6e2597a09ecd49c6b4302e4fe27"
+    },
+    {
+      "id": "synthetic-stress-01",
+      "sourceClass": "synthetic",
+      "sourceSha256": "74fcb89f356c4c864c49aa20274cf251661f90e95472e7ae1d64f4b3b09dd61f",
+      "sanitizerVersion": "1",
+      "redactionNotes": "redacted 100 text values; rewrote 21 path values; replaced 0 binary blocks (0 bytes)",
+      "file": "synthetic-stress-01.jsonl",
+      "assistantTurns": 20,
+      "toolCalls": 20,
+      "toolKinds": [
+        "bash",
+        "edit",
+        "glob",
+        "grep",
+        "read",
+        "search"
+      ],
+      "hasCompaction": false,
+      "bytes": 31758,
+      "toolCallSeqSha256": "072d27ff2dc4523b2be86747043a20723aff51ac9ffdd19e30e0146e42bbd2d1"
+    }
+  ]
+}

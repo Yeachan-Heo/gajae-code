@@ -1,3 +1,6 @@
+// Vendored from oh-my-pi (MIT) crates/pi-ast/src/language/parsers.rs @
+// a85bd5228d9f0f619deade1db78fa49420a721e1 Local modifications: preserve
+// full-langs Perl gating and add the pinned Emacs Lisp/Fortran grammars.
 //! Tree-sitter parser functions for all supported languages.
 
 use ast_grep_core::tree_sitter::TSLanguage;
@@ -48,6 +51,16 @@ pub fn language_elixir() -> TSLanguage {
 #[cfg(feature = "full-langs")]
 pub fn language_erlang() -> TSLanguage {
 	tree_sitter_erlang::LANGUAGE.into()
+}
+
+#[cfg(feature = "full-langs")]
+pub fn language_fortran() -> TSLanguage {
+	tree_sitter_fortran::LANGUAGE.into()
+}
+
+#[cfg(feature = "full-langs")]
+pub fn language_elisp() -> TSLanguage {
+	tree_sitter_elisp::LANGUAGE.into()
 }
 pub fn language_go() -> TSLanguage {
 	tree_sitter_go::LANGUAGE.into()

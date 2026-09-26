@@ -155,25 +155,11 @@ describe("handled-error crash store excludes designed tool outcomes (#5938)", ()
 	});
 
 	test("ambiguous and empty replace refusals are not crashes", async () => {
-		const ambiguous = (() => {
-			try {
-				replaceText("x\nx\n", "x", "y", { fuzzy: false, all: false });
-			} catch (thrown) {
-				return thrown;
-			}
-			throw new Error("expected ambiguous replace refusal");
-		})();
+		const ambiguous = await captureRejection(replaceText("x\nx\n", "x", "y", { fuzzy: false, all: false }));
 		expect((ambiguous as Error).message).toContain("2 occurrences");
 		finishWithError(ambiguous, "edit");
 
-		const empty = (() => {
-			try {
-				replaceText("x\n", "", "y", { fuzzy: false, all: false });
-			} catch (thrown) {
-				return thrown;
-			}
-			throw new Error("expected empty old_text refusal");
-		})();
+		const empty = await captureRejection(replaceText("x\n", "", "y", { fuzzy: false, all: false }));
 		finishWithError(empty, "edit");
 		expect(await crashStoreExists()).toBe(false);
 	});

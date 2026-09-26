@@ -1,0 +1,1688 @@
+{
+  "schema": 1,
+  "recordedFrom": "pi-natives 0.17.6 before the pinned text.rs/keys.rs re-sync",
+  "corpus": [
+    {
+      "id": "plain-ascii-wrap",
+      "input": {
+        "text": "alpha beta gamma",
+        "tabWidth": 3,
+        "wrapWidths": [
+          5,
+          8
+        ]
+      },
+      "visibleWidth": 16,
+      "wraps": [
+        {
+          "width": 5,
+          "lines": [
+            "alpha",
+            "beta",
+            "gamma"
+          ]
+        },
+        {
+          "width": 8,
+          "lines": [
+            "alpha",
+            "beta",
+            "gamma"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "a"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "a"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "al…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "al…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "alp"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "alp"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "alpha b…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "alpha b…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "alpha..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "alpha..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "alpha be"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "alpha be"
+        }
+      ],
+      "slice": {
+        "text": "lpha ",
+        "width": 5
+      },
+      "segments": {
+        "before": "al",
+        "beforeWidth": 2,
+        "after": "a bet",
+        "afterWidth": 5
+      }
+    },
+    {
+      "id": "tabs-and-trailing-space",
+      "input": {
+        "text": "a\tb  c\t",
+        "tabWidth": 4,
+        "wrapWidths": [
+          4,
+          7
+        ]
+      },
+      "visibleWidth": 13,
+      "wraps": [
+        {
+          "width": 4,
+          "lines": [
+            "a",
+            "\t",
+            "b",
+            "c",
+            "\t"
+          ]
+        },
+        {
+          "width": 7,
+          "lines": [
+            "a\tb",
+            "c\t"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "a"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "a"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "a…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "a… "
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "a"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "a  "
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "a\tb …"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "a\tb …"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "a\t..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "a\t..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "a\tb  "
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "a\tb  "
+        }
+      ],
+      "slice": {
+        "text": "\tb",
+        "width": 5
+      },
+      "segments": {
+        "before": "a\t",
+        "beforeWidth": 5,
+        "after": "b  c",
+        "afterWidth": 4
+      }
+    },
+    {
+      "id": "ansi-sgr-and-reset",
+      "input": {
+        "text": "\u001b[1;38;2;240;20;80mRED wide界 text\u001b[22;39m plain",
+        "tabWidth": 3,
+        "wrapWidths": [
+          6,
+          10
+        ]
+      },
+      "visibleWidth": 21,
+      "wraps": [
+        {
+          "width": 6,
+          "lines": [
+            "\u001b[1;38;2;240;20;80mRED",
+            "\u001b[1;38;2;240;20;80mwide界",
+            "\u001b[1;38;2;240;20;80mtext\u001b[22;39m",
+            "plain"
+          ]
+        },
+        {
+          "width": 10,
+          "lines": [
+            "\u001b[1;38;2;240;20;80mRED wide界",
+            "\u001b[1;38;2;240;20;80mtext\u001b[22;39m plain"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mR\u001b[0m"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mR\u001b[0m"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mRE\u001b[0m…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mRE\u001b[0m…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mRED\u001b[0m"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mRED\u001b[0m"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mRED wid\u001b[0m…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mRED wid\u001b[0m…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mRED w\u001b[0m..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mRED w\u001b[0m..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "\u001b[1;38;2;240;20;80mRED wide\u001b[0m"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "\u001b[1;38;2;240;20;80mRED wide\u001b[0m"
+        }
+      ],
+      "slice": {
+        "text": "\u001b[1;38;2;240;20;80mED wi\u001b[22;39m",
+        "width": 5
+      },
+      "segments": {
+        "before": "\u001b[1;38;2;240;20;80mRE",
+        "beforeWidth": 2,
+        "after": "\u001b[1;38;2;240;20;80mwide",
+        "afterWidth": 4
+      }
+    },
+    {
+      "id": "osc8-hyperlink",
+      "input": {
+        "text": "docs \u001b]8;;https://example.test/한글\u0007https://example.test/한글\u001b]8;;\u001b\\ tail",
+        "tabWidth": 3,
+        "wrapWidths": [
+          12,
+          20
+        ]
+      },
+      "visibleWidth": 35,
+      "wraps": [
+        {
+          "width": 12,
+          "lines": [
+            "docs",
+            "\u001b]8;;https://example.test/한글\u0007https://exam\u001b]8;;\u0007",
+            "\u001b]8;;https://example.test/한글\u0007ple.test/한\u001b]8;;\u0007",
+            "\u001b]8;;https://example.test/한글\u0007글\u001b]8;;\u001b\\ tail"
+          ]
+        },
+        {
+          "width": 20,
+          "lines": [
+            "docs",
+            "\u001b]8;;https://example.test/한글\u0007https://example.test\u001b]8;;\u0007",
+            "\u001b]8;;https://example.test/한글\u0007/한글\u001b]8;;\u001b\\ tail"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "d"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "d"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "do…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "do…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "doc"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "doc"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "docs \u001b]8;;https://example.test/한글\u0007ht…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "docs \u001b]8;;https://example.test/한글\u0007ht…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "docs ..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "docs ..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "docs \u001b]8;;https://example.test/한글\u0007htt"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "docs \u001b]8;;https://example.test/한글\u0007htt"
+        }
+      ],
+      "slice": {
+        "text": "ocs \u001b]8;;https://example.test/한글\u0007h\u001b]8;;\u001b\\",
+        "width": 5
+      },
+      "segments": {
+        "before": "do",
+        "beforeWidth": 2,
+        "after": " \u001b]8;;https://example.test/한글\u0007http",
+        "afterWidth": 5
+      }
+    },
+    {
+      "id": "cjk-wide-cells",
+      "input": {
+        "text": "日本語の端末幅測定と漢字",
+        "tabWidth": 3,
+        "wrapWidths": [
+          5,
+          9
+        ]
+      },
+      "visibleWidth": 24,
+      "wraps": [
+        {
+          "width": 5,
+          "lines": [
+            "日本",
+            "語の",
+            "端末",
+            "幅測",
+            "定と",
+            "漢字"
+          ]
+        },
+        {
+          "width": 9,
+          "lines": [
+            "日本語の",
+            "端末幅測",
+            "定と漢字"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": " "
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "日…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "日…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "日"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "日 "
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "日本語…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "日本語… "
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "日本..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "日本... "
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "日本語の"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "日本語の"
+        }
+      ],
+      "slice": {
+        "text": "本語",
+        "width": 4
+      },
+      "segments": {
+        "before": "日",
+        "beforeWidth": 2,
+        "after": "語の",
+        "afterWidth": 4
+      }
+    },
+    {
+      "id": "emoji-graphemes",
+      "input": {
+        "text": "A👩🏽‍💻 B 🇰🇷 ✅ 1️⃣ 👨‍👩‍👧‍👦",
+        "tabWidth": 3,
+        "wrapWidths": [
+          4,
+          8
+        ]
+      },
+      "visibleWidth": 17,
+      "wraps": [
+        {
+          "width": 4,
+          "lines": [
+            "A👩🏽‍💻",
+            "B 🇰🇷",
+            "✅",
+            "1️⃣",
+            "👨‍👩‍👧‍👦"
+          ]
+        },
+        {
+          "width": 8,
+          "lines": [
+            "A👩🏽‍💻 B 🇰🇷",
+            "✅ 1️⃣ 👨‍👩‍👧‍👦"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "A"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "A"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "A…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "A… "
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "A👩🏽‍💻"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "A👩🏽‍💻"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "A👩🏽‍💻 B …"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "A👩🏽‍💻 B … "
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "A👩🏽‍💻 B..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "A👩🏽‍💻 B..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "A👩🏽‍💻 B 🇰🇷"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "A👩🏽‍💻 B 🇰🇷"
+        }
+      ],
+      "slice": {
+        "text": "👩🏽‍💻 B ",
+        "width": 5
+      },
+      "segments": {
+        "before": "A👩🏽‍💻",
+        "beforeWidth": 3,
+        "after": "B 🇰🇷 ",
+        "afterWidth": 5
+      }
+    },
+    {
+      "id": "hangul-jamo",
+      "input": {
+        "text": "한글 ㄱㅎ ㅤ 끝",
+        "tabWidth": 3,
+        "wrapWidths": [
+          4,
+          8
+        ]
+      },
+      "visibleWidth": 15,
+      "wraps": [
+        {
+          "width": 4,
+          "lines": [
+            "한글",
+            "ㄱㅎ",
+            "ㅤ",
+            "끝"
+          ]
+        },
+        {
+          "width": 8,
+          "lines": [
+            "한글",
+            "ㄱㅎ ㅤ",
+            "끝"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": " "
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "한…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "한…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "한"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "한 "
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "한글 ㄱ…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "한글 ㄱ…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "한글 ..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "한글 ..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "한글 ㄱ"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "한글 ㄱ "
+        }
+      ],
+      "slice": {
+        "text": "글 ㄱ",
+        "width": 5
+      },
+      "segments": {
+        "before": "한",
+        "beforeWidth": 2,
+        "after": " ㄱㅎ",
+        "afterWidth": 5
+      }
+    },
+    {
+      "id": "combining-and-decomposed-hangul",
+      "input": {
+        "text": "é a̧ 각",
+        "tabWidth": 3,
+        "wrapWidths": [
+          2,
+          5
+        ]
+      },
+      "visibleWidth": 6,
+      "wraps": [
+        {
+          "width": 2,
+          "lines": [
+            "é",
+            "a̧",
+            "각"
+          ]
+        },
+        {
+          "width": 5,
+          "lines": [
+            "é a̧",
+            "각"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "é"
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "é"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "é …"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "é …"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "é a̧"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "é a̧"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "é a̧ 각"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "é a̧ 각\u0000  "
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "é a̧ 각"
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "é a̧ 각\u0000  "
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "é a̧ 각"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "é a̧ 각\u0000  "
+        }
+      ],
+      "slice": {
+        "text": " a̧ 각",
+        "width": 5
+      },
+      "segments": {
+        "before": "é ",
+        "beforeWidth": 2,
+        "after": "각",
+        "afterWidth": 2
+      }
+    },
+    {
+      "id": "inline-math-with-cjk",
+      "input": {
+        "text": "비정상성: $C$와 $\\kappa$는 제도",
+        "tabWidth": 3,
+        "wrapWidths": [
+          8,
+          12
+        ]
+      },
+      "visibleWidth": 31,
+      "wraps": [
+        {
+          "width": 8,
+          "lines": [
+            "비정상성",
+            ": $C$와",
+            "$\\kappa$",
+            "는 제도"
+          ]
+        },
+        {
+          "width": 12,
+          "lines": [
+            "비정상성:",
+            "$C$와",
+            "$\\kappa$는",
+            "제도"
+          ]
+        }
+      ],
+      "truncations": [
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 0,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 1,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 0,
+          "ellipsis": 2,
+          "pad": true,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "…"
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "."
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": false,
+          "text": ""
+        },
+        {
+          "width": 1,
+          "ellipsis": 2,
+          "pad": true,
+          "text": " "
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "비…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "비…"
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "..."
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "비"
+        },
+        {
+          "width": 3,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "비 "
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": false,
+          "text": "비정상…"
+        },
+        {
+          "width": 8,
+          "ellipsis": 0,
+          "pad": true,
+          "text": "비정상… "
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": false,
+          "text": "비정..."
+        },
+        {
+          "width": 8,
+          "ellipsis": 1,
+          "pad": true,
+          "text": "비정... "
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": false,
+          "text": "비정상성"
+        },
+        {
+          "width": 8,
+          "ellipsis": 2,
+          "pad": true,
+          "text": "비정상성"
+        }
+      ],
+      "slice": {
+        "text": "정상",
+        "width": 4
+      },
+      "segments": {
+        "before": "비",
+        "beforeWidth": 2,
+        "after": "상성:",
+        "afterWidth": 5
+      }
+    }
+  ]
+}

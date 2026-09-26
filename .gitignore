@@ -62,6 +62,7 @@ packages/ai/test/.temp-images/
 .gjc/_session-*/
 .gjc/backlog-*/
 .gjc/rss-checkpoints/
+.gjc/profiles/
 .gjc/metrics.json
 **/.gjc/settings.json.fallback-invalid
 **/.gjc/settings.json.config-root.fallback-invalid

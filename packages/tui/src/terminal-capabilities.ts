@@ -1,5 +1,6 @@
 import type { encodeSixel as encodeSixelFn } from "@gajae-code/natives";
 import { $env, $pickenv } from "@gajae-code/utils";
+import { writeTerminalOutput } from "./terminal-writer";
 
 type NativeEncodeSixel = typeof encodeSixelFn;
 let nativeEncodeSixel: NativeEncodeSixel | undefined;
@@ -57,7 +58,7 @@ export class TerminalInfo {
 
 	sendNotification(message: string): void {
 		if (isNotificationSuppressed()) return;
-		process.stdout.write(this.formatNotification(message));
+		writeTerminalOutput(this.formatNotification(message));
 	}
 }
 
@@ -462,16 +463,13 @@ export function resetKittyTransmissions(): void {
 }
 
 let kittyTransmitWriter: (sequence: string) => void = sequence => {
-	process.stdout.write(sequence);
+	writeTerminalOutput(sequence);
 };
 
 /**
  * Override where out-of-band kitty data transmissions (`a=t`) are written.
- * The default writes directly to stdout: a transmit-only escape is
- * cursor-neutral (it uploads pixel data without drawing anything), so the
- * only ordering requirement is that it reaches the terminal before the
- * placement escape that references it — which the synchronous write during
- * render guarantees. Tests use this to capture transmissions.
+ * The default uses the shared terminal output path, which preserves FIFO order
+ * with ProcessTerminal frame writes. Tests use this to capture transmissions.
  */
 export function setKittyTransmitWriter(writer: (sequence: string) => void): void {
 	kittyTransmitWriter = writer;

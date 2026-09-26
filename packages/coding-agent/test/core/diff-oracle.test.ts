@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import * as Diff from "diff";
 import { generateDiffString, generateUnifiedDiffString } from "../../src/edit/diff";
+import { getNativeDiffBindings } from "../../src/internal/native-diff";
 import { renderDiff } from "../../src/modes/components/diff";
 import { initTheme } from "../../src/modes/theme/theme";
 
@@ -75,12 +75,19 @@ beforeAll(async () => {
 });
 
 function oracle(oldText: string, newText: string) {
+	const native = getNativeDiffBindings();
 	const generated = generateDiffString(oldText, newText, 2);
 	const unified = generateUnifiedDiffString(oldText, newText, 2);
 	return {
-		diffLines: Diff.diffLines(oldText, newText),
-		structuredPatch: Diff.structuredPatch("old.txt", "new.txt", oldText, newText, "old", "new", { context: 2 }),
-		diffWords: Diff.diffWords(oldText, newText),
+		diffLines: native.diffLines(oldText, newText),
+		structuredPatch: {
+			oldFileName: "old.txt",
+			newFileName: "new.txt",
+			oldHeader: "old",
+			newHeader: "new",
+			hunks: native.structuredPatchHunks(oldText, newText, 2),
+		},
+		diffWords: native.diffWords(oldText, newText),
 		generateDiffString: generated,
 		generateUnifiedDiffString: unified,
 		renderedGenerateDiffString: renderDiff(generated.diff, { filePath: "fixture.ts" }),

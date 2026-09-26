@@ -1,0 +1,940 @@
+{
+  "schema": 1,
+  "recordedFrom": "pi-natives 0.17.6 before the pinned text.rs/keys.rs re-sync",
+  "corpus": [
+    {
+      "id": "plain-letter",
+      "input": {
+        "data": "a",
+        "kitty": false,
+        "keyIds": [
+          "a",
+          "ctrl+a"
+        ]
+      },
+      "parsedKey": "a",
+      "matches": [
+        {
+          "keyId": "a",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+a",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "ctrl-c",
+      "input": {
+        "data": "\u0003",
+        "kitty": false,
+        "keyIds": [
+          "ctrl+c",
+          "c"
+        ]
+      },
+      "parsedKey": "ctrl+c",
+      "matches": [
+        {
+          "keyId": "ctrl+c",
+          "matches": true
+        },
+        {
+          "keyId": "c",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "backspace-bs-08",
+      "input": {
+        "data": "\b",
+        "kitty": false,
+        "keyIds": [
+          "backspace",
+          "ctrl+h"
+        ]
+      },
+      "parsedKey": "backspace",
+      "matches": [
+        {
+          "keyId": "backspace",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+h",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": false,
+      "kittyMatch": null
+    },
+    {
+      "id": "backspace-del-7f",
+      "input": {
+        "data": "",
+        "kitty": false,
+        "keyIds": [
+          "backspace",
+          "ctrl+backspace"
+        ]
+      },
+      "parsedKey": "backspace",
+      "matches": [
+        {
+          "keyId": "backspace",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+backspace",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "tab-and-enter",
+      "input": {
+        "data": "\t",
+        "kitty": false,
+        "keyIds": [
+          "tab",
+          "ctrl+i"
+        ]
+      },
+      "parsedKey": "tab",
+      "matches": [
+        {
+          "keyId": "tab",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+i",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "escape",
+      "input": {
+        "data": "\u001b",
+        "kitty": false,
+        "keyIds": [
+          "escape",
+          "ctrl+["
+        ]
+      },
+      "parsedKey": "escape",
+      "matches": [
+        {
+          "keyId": "escape",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+[",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "shift-tab",
+      "input": {
+        "data": "\u001b[Z",
+        "kitty": false,
+        "keyIds": [
+          "shift+tab",
+          "tab"
+        ]
+      },
+      "parsedKey": "shift+tab",
+      "matches": [
+        {
+          "keyId": "shift+tab",
+          "matches": true
+        },
+        {
+          "keyId": "tab",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "legacy-arrow-csi",
+      "input": {
+        "data": "\u001b[A",
+        "kitty": false,
+        "keyIds": [
+          "up",
+          "alt+up"
+        ]
+      },
+      "parsedKey": "up",
+      "matches": [
+        {
+          "keyId": "up",
+          "matches": true
+        },
+        {
+          "keyId": "alt+up",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "legacy-arrow-ss3",
+      "input": {
+        "data": "\u001bOD",
+        "kitty": false,
+        "keyIds": [
+          "left",
+          "ctrl+left"
+        ]
+      },
+      "parsedKey": "left",
+      "matches": [
+        {
+          "keyId": "left",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+left",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "legacy-page-up",
+      "input": {
+        "data": "\u001b[5~",
+        "kitty": false,
+        "keyIds": [
+          "pageUp",
+          "pageDown"
+        ]
+      },
+      "parsedKey": "pageUp",
+      "matches": [
+        {
+          "keyId": "pageUp",
+          "matches": true
+        },
+        {
+          "keyId": "pageDown",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": -12,
+        "modifier": 0
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "legacy-f1",
+      "input": {
+        "data": "\u001bOP",
+        "kitty": false,
+        "keyIds": [
+          "f1",
+          "ctrl+f1"
+        ]
+      },
+      "parsedKey": "f1",
+      "matches": [
+        {
+          "keyId": "f1",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+f1",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-enter-lf",
+      "input": {
+        "data": "\u001b\n",
+        "kitty": false,
+        "keyIds": [
+          "alt+enter",
+          "ctrl+alt+j"
+        ]
+      },
+      "parsedKey": "alt+enter",
+      "matches": [
+        {
+          "keyId": "alt+enter",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+alt+j",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-backspace",
+      "input": {
+        "data": "\u001b",
+        "kitty": true,
+        "keyIds": [
+          "alt+backspace",
+          "backspace"
+        ]
+      },
+      "parsedKey": "alt+backspace",
+      "matches": [
+        {
+          "keyId": "alt+backspace",
+          "matches": true
+        },
+        {
+          "keyId": "backspace",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-space-mixed-mode",
+      "input": {
+        "data": "\u001b ",
+        "kitty": true,
+        "keyIds": [
+          "alt+space",
+          "space"
+        ]
+      },
+      "parsedKey": "alt+space",
+      "matches": [
+        {
+          "keyId": "alt+space",
+          "matches": true
+        },
+        {
+          "keyId": "space",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-navigation-alias",
+      "input": {
+        "data": "\u001bb",
+        "kitty": false,
+        "keyIds": [
+          "alt+left",
+          "alt+b"
+        ]
+      },
+      "parsedKey": "alt+left",
+      "matches": [
+        {
+          "keyId": "alt+left",
+          "matches": true
+        },
+        {
+          "keyId": "alt+b",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-navigation-alias-mixed-mode",
+      "input": {
+        "data": "\u001bb",
+        "kitty": true,
+        "keyIds": [
+          "alt+left",
+          "alt+b"
+        ]
+      },
+      "parsedKey": "alt+left",
+      "matches": [
+        {
+          "keyId": "alt+left",
+          "matches": true
+        },
+        {
+          "keyId": "alt+b",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-navigation-uppercase-legacy",
+      "input": {
+        "data": "\u001bB",
+        "kitty": false,
+        "keyIds": [
+          "alt+left",
+          "alt+shift+b"
+        ]
+      },
+      "parsedKey": "alt+shift+b",
+      "matches": [
+        {
+          "keyId": "alt+left",
+          "matches": false
+        },
+        {
+          "keyId": "alt+shift+b",
+          "matches": true
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "alt-navigation-uppercase-mixed-mode",
+      "input": {
+        "data": "\u001bB",
+        "kitty": true,
+        "keyIds": [
+          "alt+left",
+          "alt+shift+b"
+        ]
+      },
+      "parsedKey": "alt+shift+b",
+      "matches": [
+        {
+          "keyId": "alt+left",
+          "matches": false
+        },
+        {
+          "keyId": "alt+shift+b",
+          "matches": true
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "ctrl-alt-a-mixed-mode",
+      "input": {
+        "data": "\u001b\u0001",
+        "kitty": true,
+        "keyIds": [
+          "ctrl+alt+a"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "ctrl+alt+a",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "ctrl-dash-legacy",
+      "input": {
+        "data": "\u001f",
+        "kitty": false,
+        "keyIds": [
+          "ctrl+-",
+          "ctrl+_"
+        ]
+      },
+      "parsedKey": "ctrl+_",
+      "matches": [
+        {
+          "keyId": "ctrl+-",
+          "matches": false
+        },
+        {
+          "keyId": "ctrl+_",
+          "matches": true
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-cyrillic-layout",
+      "input": {
+        "data": "\u001b[1089::99u",
+        "kitty": true,
+        "keyIds": [
+          "c"
+        ]
+      },
+      "parsedKey": "c",
+      "matches": [
+        {
+          "keyId": "c",
+          "matches": true
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 1089,
+        "modifier": 0,
+        "baseLayoutKey": 99
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": true
+    },
+    {
+      "id": "meta-wrapped-arrow",
+      "input": {
+        "data": "\u001b\u001b[A",
+        "kitty": true,
+        "keyIds": [
+          "alt+up",
+          "up"
+        ]
+      },
+      "parsedKey": "alt+up",
+      "matches": [
+        {
+          "keyId": "alt+up",
+          "matches": true
+        },
+        {
+          "keyId": "up",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-dvorak-ctrl-k",
+      "input": {
+        "data": "\u001b[107::118;5u",
+        "kitty": true,
+        "keyIds": [
+          "ctrl+k",
+          "ctrl+v"
+        ]
+      },
+      "parsedKey": "ctrl+k",
+      "matches": [
+        {
+          "keyId": "ctrl+k",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+v",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 107,
+        "modifier": 4,
+        "baseLayoutKey": 118
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": true
+    },
+    {
+      "id": "kitty-dvorak-ctrl-slash",
+      "input": {
+        "data": "\u001b[47::91;5u",
+        "kitty": true,
+        "keyIds": [
+          "ctrl+/",
+          "ctrl+["
+        ]
+      },
+      "parsedKey": "ctrl+/",
+      "matches": [
+        {
+          "keyId": "ctrl+/",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+[",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 47,
+        "modifier": 4,
+        "baseLayoutKey": 91
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-korean-dubeolsik",
+      "input": {
+        "data": "\u001b[12621;5u",
+        "kitty": true,
+        "keyIds": [
+          "ctrl+v",
+          "ctrl+b"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "ctrl+v",
+          "matches": false
+        },
+        {
+          "keyId": "ctrl+b",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 12621,
+        "modifier": 4
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-super-p",
+      "input": {
+        "data": "\u001b[112;9u",
+        "kitty": true,
+        "keyIds": [
+          "super+p",
+          "p"
+        ]
+      },
+      "parsedKey": "super+p",
+      "matches": [
+        {
+          "keyId": "super+p",
+          "matches": true
+        },
+        {
+          "keyId": "p",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 112,
+        "modifier": 8
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": true
+    },
+    {
+      "id": "kitty-release-backspace",
+      "input": {
+        "data": "\u001b[127;1:3u",
+        "kitty": true,
+        "keyIds": [
+          "backspace"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "backspace",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 127,
+        "modifier": 0,
+        "eventType": 3
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-repeat-backspace",
+      "input": {
+        "data": "\u001b[127;1:2u",
+        "kitty": true,
+        "keyIds": [
+          "backspace"
+        ]
+      },
+      "parsedKey": "backspace",
+      "matches": [
+        {
+          "keyId": "backspace",
+          "matches": true
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 127,
+        "modifier": 0,
+        "eventType": 2
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-unsupported-event",
+      "input": {
+        "data": "\u001b[112;1:4u",
+        "kitty": true,
+        "keyIds": [
+          "p"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "p",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-numlock-digit",
+      "input": {
+        "data": "\u001b[57400;129u",
+        "kitty": true,
+        "keyIds": [
+          "1",
+          "end"
+        ]
+      },
+      "parsedKey": "1",
+      "matches": [
+        {
+          "keyId": "1",
+          "matches": true
+        },
+        {
+          "keyId": "end",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 57400,
+        "modifier": 128
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-numlock-keypad-unmodified",
+      "input": {
+        "data": "\u001b[57400u",
+        "kitty": true,
+        "keyIds": [
+          "1",
+          "end"
+        ]
+      },
+      "parsedKey": "end",
+      "matches": [
+        {
+          "keyId": "1",
+          "matches": false
+        },
+        {
+          "keyId": "end",
+          "matches": true
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 57400,
+        "modifier": 0
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-keypad-operator",
+      "input": {
+        "data": "\u001b[57413;5u",
+        "kitty": true,
+        "keyIds": [
+          "ctrl++",
+          "+"
+        ]
+      },
+      "parsedKey": "ctrl++",
+      "matches": [
+        {
+          "keyId": "ctrl++",
+          "matches": true
+        },
+        {
+          "keyId": "+",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 57413,
+        "modifier": 4
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "kitty-ctrl-shift-enter",
+      "input": {
+        "data": "\u001b[13;6u",
+        "kitty": true,
+        "keyIds": [
+          "ctrl+shift+enter",
+          "alt+enter"
+        ]
+      },
+      "parsedKey": "shift+ctrl+enter",
+      "matches": [
+        {
+          "keyId": "ctrl+shift+enter",
+          "matches": true
+        },
+        {
+          "keyId": "alt+enter",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 13,
+        "modifier": 5
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "mok-super-p",
+      "input": {
+        "data": "\u001b[27;9;112~",
+        "kitty": false,
+        "keyIds": [
+          "super+p",
+          "ctrl+p"
+        ]
+      },
+      "parsedKey": "super+p",
+      "matches": [
+        {
+          "keyId": "super+p",
+          "matches": true
+        },
+        {
+          "keyId": "ctrl+p",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "mok-alt-i",
+      "input": {
+        "data": "\u001b[27;3;105~",
+        "kitty": true,
+        "keyIds": [
+          "alt+i",
+          "alt+shift+i"
+        ]
+      },
+      "parsedKey": "alt+i",
+      "matches": [
+        {
+          "keyId": "alt+i",
+          "matches": true
+        },
+        {
+          "keyId": "alt+shift+i",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "unsupported-modifier",
+      "input": {
+        "data": "\u001b[99;17u",
+        "kitty": true,
+        "keyIds": [
+          "c"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "c",
+          "matches": false
+        }
+      ],
+      "parsedKitty": {
+        "codepoint": 99,
+        "modifier": 16
+      },
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    },
+    {
+      "id": "malformed-csi",
+      "input": {
+        "data": "\u001b[97;4294967297u",
+        "kitty": true,
+        "keyIds": [
+          "a"
+        ]
+      },
+      "parsedKey": null,
+      "matches": [
+        {
+          "keyId": "a",
+          "matches": false
+        }
+      ],
+      "parsedKitty": null,
+      "legacyBackspaceMatch": null,
+      "kittyMatch": null
+    }
+  ]
+}

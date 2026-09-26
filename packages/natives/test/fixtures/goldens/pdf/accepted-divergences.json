@@ -1,0 +1,13 @@
+{
+	"schemaVersion": 1,
+	"cases": [
+		{
+			"caseId": "pdf-one-page-title",
+			"reason": "The native converter adds page markers and merges adjacent text runs while preserving normalized text."
+		},
+		{
+			"caseId": "pdf-two-pages",
+			"reason": "The native converter keeps page boundaries explicit and merges adjacent text runs while preserving normalized text."
+		}
+	]
+}

@@ -24,6 +24,41 @@ const repoRoot = path.join(import.meta.dir, "..");
 
 const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 	{
+		dir: "crates/brush-builtins-vendored",
+		packageName: "brush-builtins",
+		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
+	},
+	{
+		dir: "crates/brush-core-vendored",
+		packageName: "brush-core",
+		rationale: "Vendored Rust shell runtime dependency for the native shell boundary.",
+	},
+	{
+		dir: "crates/gjc-sdk",
+		packageName: "gjc-sdk",
+		rationale: "Gajae-Code SDK Rust core for loopback WebSocket transport, endpoint discovery, and planned N-API integration.",
+	},
+	{
+		dir: "crates/pi-ast",
+		packageName: "pi-ast",
+		rationale: "Tree-sitter parsing and summarization hot paths shared by native code.",
+	},
+	{
+		dir: "crates/pi-diff",
+		packageName: "pi-diff",
+		rationale: "Diff algorithms and patch primitives shared by native editing and review tools.",
+	},
+	{
+		dir: "crates/pi-edit",
+		packageName: "pi-edit",
+		rationale: "Native edit matcher and replace engine behind the coding-agent edit tool.",
+	},
+	{
+		dir: "crates/pi-iso",
+		packageName: "pi-iso",
+		rationale: "Native filesystem isolation backends such as clone, reflink, overlay, and ProjFS.",
+	},
+	{
 		dir: "crates/pi-natives",
 		packageName: "pi-natives",
 		rationale: "N-API addon boundary for native, CPU-bound, blocking I/O, and OS integration primitives.",
@@ -34,29 +69,14 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		rationale: "Embedded shell, PTY, and process-management runtime used behind native bindings.",
 	},
 	{
-		dir: "crates/pi-ast",
-		packageName: "pi-ast",
-		rationale: "Tree-sitter parsing and summarization hot paths shared by native code.",
+		dir: "crates/pi-vfs",
+		packageName: "pi-vfs",
+		rationale: "Virtual filesystem abstraction and platform adapters for native filesystem operations.",
 	},
 	{
-		dir: "crates/pi-iso",
-		packageName: "pi-iso",
-		rationale: "Native filesystem isolation backends such as clone, reflink, overlay, and ProjFS.",
-	},
-	{
-		dir: "crates/gjc-sdk",
-		packageName: "gjc-sdk",
-		rationale: "Gajae-Code SDK Rust core for loopback WebSocket transport, endpoint discovery, and planned N-API integration.",
-	},
-	{
-		dir: "crates/brush-core-vendored",
-		packageName: "brush-core",
-		rationale: "Vendored Rust shell runtime dependency for the native shell boundary.",
-	},
-	{
-		dir: "crates/brush-builtins-vendored",
-		packageName: "brush-builtins",
-		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
+		dir: "crates/pi-walker",
+		packageName: "pi-walker",
+		rationale: "Vendored upstream filesystem traversal infrastructure behind the native addon boundary.",
 	},
 ] as const;
 

@@ -257,8 +257,10 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/natives/test/windows-runtime-install.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
+		expect(windowsJob).toContain("bun test ./packages/natives/test/walker-pool-unavailable.windows.test.ts");
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
 		expect(requiredLines.length).toBe(2);
 		for (const line of requiredLines) expect(line).toContain("|| needs.affected-plan.outputs.has_windows_session_path == 'true'");
@@ -898,7 +900,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 		const vendored = await runScript(["--matrix-json"], "crates/brush-core-vendored/src/lib.rs");
 		expect(vendored.exitCode).toBe(0);
 		const vendoredKeys = (JSON.parse(vendored.stdout.trim()) as Array<{ key: string }>).map(entry => entry.key);
-		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(5);
+		expect(vendoredKeys.filter(key => key.startsWith("cargo-build:"))).toHaveLength(9);
 		expect(vendoredKeys.some(key => key.includes("brush"))).toBe(false);
 	});
 
@@ -927,7 +929,7 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			expect(exitCode).toBe(0);
 			const entries = JSON.parse(stdout.trim()) as Array<{ key: string }>;
 			expect(entries.filter(entry => entry.key.startsWith("ts-build:")).map(entry => entry.key)).toHaveLength(2);
-			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(5);
+			expect(entries.filter(entry => entry.key.startsWith("cargo-build:")).map(entry => entry.key)).toHaveLength(9);
 			expect(entries.filter(entry => entry.key === "native-linux-x64")).toHaveLength(1);
 		}
 	});
@@ -953,6 +955,8 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			...Array.from({ length: 8 }, (_, index) => `test:@gajae-code/coding-agent:shard-${index + 1}-of-8`),
 			"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 			"check:@gajae-code/natives", "test:@gajae-code/natives",
+			"test:packages/natives/test/task-panic-to-rejection.test.ts",
+			"check:@gajae-code/orchestration-token-benchmark", "test:@gajae-code/orchestration-token-benchmark",
 			"check:@gajae-code/stats", "test:@gajae-code/stats",
 			"check:@gajae-code/tui", "test:@gajae-code/tui",
 			"check:@gajae-code/typescript-edit-benchmark", "test:@gajae-code/typescript-edit-benchmark",
@@ -1198,6 +1202,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(unrelatedTask?.rust).toBe(false);
 	});
 
+	test("the native task-panic regression's direct PR task requires Rust", () => {
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const [directTask] = describeTasks([
+			{ key: `test:${testFile}`, description: testFile, command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"], capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false } },
+		]);
+		expect(directTask?.rust).toBe(true);
+	});
+
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
 		const shardOne = "test:@gajae-code/coding-agent:shard-1-of-8";
 		const isolated = "test:@gajae-code/coding-agent:sdk-production-host-isolated";
@@ -1347,7 +1359,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"Cargo.lock",
 			"crates/brush-core-vendored/Cargo.toml",
 			"crates/pi-shell/Cargo.toml",
+			// 2.3: native walker pool failure requires the Windows Job Object live test.
+			"crates/pi-vfs/Cargo.toml",
+			"crates/pi-vfs/src/native/windows.rs",
+			"crates/pi-walker/Cargo.toml",
+			"crates/pi-walker/src/cache.rs",
+			"crates/pi-natives/src/iofs.rs",
+			"crates/pi-natives/src/glob.rs",
+			"packages/natives/test/walker-pool-unavailable.test.ts",
+			"packages/natives/test/walker-pool-unavailable.windows.test.ts",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",
+			"packages/natives/test/windows-shell-path.windows.test.ts",
+			"packages/natives/test/windows-runtime-install.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1514,6 +1537,30 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
+	});
+	test("pi-edit matcher changes select the differential and edit behavior suites", () => {
+		const keys = targeted([
+			"crates/pi-edit/src/fuzzy.rs",
+			"crates/pi-natives/src/edit.rs",
+			"packages/coding-agent/src/edit/modes/replace.ts",
+			"packages/coding-agent/src/edit/modes/patch.ts",
+		]).map(task => task.key);
+		expect(keys).toContain("test:packages/natives/test/differential/edit-fuzzy.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/edit-diff.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/apply-patch.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/core/edit-hotspots-golden.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/tools.test.ts");
+	});
+	test("fd, iofs, and workspace walker changes select their behavioral suites", () => {
+		const fd = targeted(["crates/pi-natives/src/fd.rs"]).map(task => task.key);
+		expect(fd).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+
+		const iofs = targeted(["crates/pi-natives/src/iofs.rs"]).map(task => task.key);
+		expect(iofs).toContain("test:packages/natives/test/native.test.ts");
+
+		const workspace = targeted(["crates/pi-natives/src/workspace.rs"]).map(task => task.key);
+		expect(workspace).toContain("test:packages/natives/test/fd-workspace-golden.test.ts");
+		expect(workspace).toContain("test:packages/coding-agent/test/workspace-tree.test.ts");
 	});
 	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
 		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
@@ -1861,6 +1908,29 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		const generalShards = entries.filter(entry => entry.key.startsWith("test:@gajae-code/coding-agent:shard-"));
 		expect(generalShards).toHaveLength(8);
 		expect(generalShards.every(entry => !entry.rust)).toBe(true);
+	});
+
+	test("push mode runs the native task-panic regression only as its own Rust task", () => {
+		const natives: WorkspacePackage = {
+			name: "@gajae-code/natives",
+			dir: "packages/natives",
+			manifest: { name: "@gajae-code/natives", scripts: { check: "biome check .", test: "bun test" } },
+		};
+		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
+		const entries = describeTasks(planTasks(["packages/natives/src/index.ts"], [natives]));
+		const packageTask = entries.find(entry => entry.key === "test:@gajae-code/natives");
+		expect(packageTask).toMatchObject({
+			command: ["bun", "test", "--path-ignore-patterns=test/task-panic-to-rejection.test.ts"],
+			rust: false,
+		});
+		expect(entries.find(entry => entry.key === `test:${testFile}`)).toMatchObject({
+			command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			rust: true,
+			// It compiles its own addon, but it is a test shard, not the shared native
+			// producer: producer tasks are filtered out of the shard matrix.
+			nativeBuild: false,
+		});
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).not.toContain(`test:${testFile}`);
 	});
 
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {

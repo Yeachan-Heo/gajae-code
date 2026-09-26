@@ -1,6 +1,7 @@
+// Vendored from can1357/oh-my-pi@a85bd5228d9f0f619deade1db78fa49420a721e1:crates/pi-builtins/src/enable.rs — MIT (c) 2025 Mario Zechner, 2025-2026 Can Bölük, 2026 Stencil Labs, Inc. Modified for gajae-code: yes, uses local builtin-registry APIs.
 use std::io::Write;
 
-use brush_core::{ExecutionResult, builtins, error};
+use brush_core::{ExecutionResult, builtins};
 use clap::Parser;
 use itertools::Itertools;
 
@@ -44,15 +45,27 @@ impl builtins::Command for EnableCommand {
 	) -> Result<ExecutionResult, Self::Error> {
 		let mut result = ExecutionResult::success();
 
-		if self.shared_object_path.is_some() {
-			return error::unimp("enable -f");
-		}
-		if self.remove_loaded_builtin {
-			return error::unimp("enable -d");
+		if let Some(shared_object_path) = &self.shared_object_path {
+			writeln!(
+				context.stderr(),
+				"{}: cannot open shared object {shared_object_path}: dynamic loading is not supported",
+				context.command_name
+			)?;
+			return Ok(ExecutionResult::general_error());
 		}
 
 		if !self.names.is_empty() {
 			for name in &self.names {
+				if self.remove_loaded_builtin {
+					if context.shell.builtins().contains_key(name) {
+						writeln!(context.stderr(), "{name}: not dynamically loaded")?;
+					} else {
+					writeln!(context.stderr(), "{name}: not a shell builtin")?;
+					}
+					result = ExecutionResult::general_error();
+					continue;
+				}
+
 				if let Some(builtin) = context.shell.builtin_mut(name) {
 					builtin.disabled = self.disable;
 				} else {
@@ -88,6 +101,7 @@ impl builtins::Command for EnableCommand {
 				writeln!(context.stdout(), "enable {prefix}{builtin_name}")?;
 			}
 		}
+
 
 		Ok(result)
 	}

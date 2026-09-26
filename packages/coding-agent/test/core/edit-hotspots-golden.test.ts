@@ -84,13 +84,13 @@ function stable(value: JsonValue): JsonValue {
 	return JSON.parse(JSON.stringify(value));
 }
 
-function runCase(c: (typeof cases)[number]) {
+async function runCase(c: (typeof cases)[number]) {
 	const normalizedContent = normalizeToLF(c.content);
 	const lines = normalizedContent.split("\n");
 	const pattern = normalizeToLF(c.target).split("\n");
 	let replaceResult: JsonValue;
 	try {
-		replaceResult = replaceText(c.content, c.target, c.replacement, {
+		replaceResult = await replaceText(c.content, c.target, c.replacement, {
 			fuzzy: true,
 			all: false,
 			threshold: c.threshold,
@@ -101,19 +101,19 @@ function runCase(c: (typeof cases)[number]) {
 	return {
 		name: c.name,
 		formatHashLines: formatHashLines(c.content, c.startLine),
-		findMatchStrict: stable(findMatch(c.content, c.target, { allowFuzzy: false, threshold: c.threshold })),
-		findMatchFuzzy: stable(findMatch(c.content, c.target, { allowFuzzy: true, threshold: c.threshold })),
+		findMatchStrict: stable(await findMatch(c.content, c.target, { allowFuzzy: false, threshold: c.threshold })),
+		findMatchFuzzy: stable(await findMatch(c.content, c.target, { allowFuzzy: true, threshold: c.threshold })),
 		replaceText: replaceResult,
 		seekSequence: stable(
-			seekSequence(lines, pattern, c.name === "non-1 startLine" ? 1 : 0, Boolean(c.eof), { allowFuzzy: true }),
+			await seekSequence(lines, pattern, c.name === "non-1 startLine" ? 1 : 0, Boolean(c.eof), { allowFuzzy: true }),
 		),
 	};
 }
 
 describe("edit hotspot golden oracle", () => {
 	for (const c of cases) {
-		test(c.name, () => {
-			expect(runCase(c)).toMatchSnapshot();
+		test(c.name, async () => {
+			expect(await runCase(c)).toMatchSnapshot();
 		});
 	}
 });

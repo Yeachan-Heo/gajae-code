@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "source": "pre-sync pi-natives darwin-arm64 output",
+  "normalization": "PTY CRLF sequences are normalized to LF; output and exit state are otherwise exact.",
+  "result": {
+    "output": "pty-phase3-golden\n",
+    "exitCode": 7,
+    "cancelled": false,
+    "timedOut": false
+  }
+}

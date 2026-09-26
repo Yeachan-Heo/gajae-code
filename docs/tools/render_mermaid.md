@@ -6,7 +6,7 @@
 - Entry: `packages/coding-agent/src/tools/render-mermaid.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/render-mermaid.md`
 - Key collaborators:
-  - `packages/utils/src/mermaid-ascii.ts` — thin wrapper over renderer package.
+  - `packages/utils/src/mermaid-ascii.ts` — lazy wrapper around the native render binding.
   - `packages/coding-agent/src/tools/index.ts` — tool registration and enablement gate.
   - `packages/coding-agent/src/sdk/session.ts` — session-facing artifact allocation hook.
   - `packages/coding-agent/src/session/session-manager.ts` — persistent-session artifact path allocation.
@@ -45,7 +45,7 @@ No image path, SVG, PNG, or binary payload is returned. Stored artifacts are pla
 1. `RenderMermaidTool.execute()` in `packages/coding-agent/src/tools/render-mermaid.ts` receives `mermaid` and optional `config`.
 2. `sanitizeRenderConfig()` normalizes `paddingX`, `paddingY`, and `boxBorderPadding` to non-negative integers; `useAscii` is passed through.
 3. The tool calls `renderMermaidAscii()` from `@gajae-code/utils`.
-4. `packages/utils/src/mermaid-ascii.ts` forwards directly to `renderMermaidASCII()` from the `beautiful-mermaid` package.
+4. `packages/utils/src/mermaid-ascii.ts` calls `renderMermaidAscii()` from `@gajae-code/natives` on first use.
 5. The tool optionally asks the session for an artifact slot with `allocateOutputArtifact("render_mermaid")`.
 6. If a path is returned, `Bun.write()` persists the full rendered text to that file.
 7. The tool returns the rendered text, plus an `artifact://` line and `details.artifactId` when persistence succeeded.
@@ -67,7 +67,7 @@ No image path, SVG, PNG, or binary payload is returned. Stored artifacts are pla
 ## Limits & Caps
 - No tool-local timeout, retry, truncation, or streaming path.
 - Numeric config fields are quantized to integers with `Math.floor()` and clamped to `0` minimum in `sanitizeRenderConfig()`.
-- Renderer engine is `beautiful-mermaid@1.1.3` per root `package.json` / `bun.lock`.
+- Renderer implementation is vendored under `crates/pi-natives/src/mermaid/` from the pinned upstream source revision; accepted output differences are recorded in the native golden ledger.
 - The tool is registered as discoverable and gated by `renderMermaid.enabled` in `packages/coding-agent/src/tools/index.ts`.
 
 ## Errors
@@ -78,5 +78,5 @@ No image path, SVG, PNG, or binary payload is returned. Stored artifacts are pla
 
 ## Notes
 - The tool summary string says `Render a Mermaid diagram to an image`, but the implementation and prompt both produce text, not images.
-- Despite the name, this tool does not use Puppeteer, browser rendering, Mermaid CLI, or native bindings; rendering stays in-process through the JS package wrapper.
+- Despite the name, this tool does not use Puppeteer, browser rendering, or Mermaid CLI; its Rust native binding loads lazily on first render.
 - `docs/render-mermaid.md` covers operator-facing behavior and enablement; keep this file focused on the tool contract and runtime path.
