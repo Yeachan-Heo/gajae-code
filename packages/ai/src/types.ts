@@ -1,4 +1,5 @@
 import type { ZodType, z } from "zod/v4";
+import type { ProviderDiagnostic } from "./provider-diagnostic";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -871,6 +872,15 @@ export interface AssistantMessage {
 	bufferOverflow?: AssistantBufferOverflowDiagnostic;
 	/** HTTP status surfaced by the provider when the request failed. Populated by every provider's catch block alongside `errorMessage` so consumers (auth retry, telemetry, UI) can branch without regex-scraping the message. */
 	errorStatus?: number;
+	/**
+	 * Bounded, redaction-safe provider failure family, minted ONLY by a provider
+	 * adapter from structured provider metadata (SDK error fields or an explicit
+	 * SSE protocol error envelope). It is additive diagnostics: it never changes
+	 * the terminal outcome, the fixed error message, retry admission, or the
+	 * legacy heuristic `errorStatus`, and it is absent whenever the provider
+	 * supplied no trustworthy structured evidence.
+	 */
+	providerDiagnostic?: ProviderDiagnostic;
 	/** Typed upstream failure facts retained for retry classification without parsing errorMessage. */
 	transportFailure?: TransportFailureFacts;
 	/**

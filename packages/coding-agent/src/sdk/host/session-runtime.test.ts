@@ -8121,6 +8121,176 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("publishes the provider diagnostic on the real agent_failed frame", async () => {
+		// R4: the wire frame is built by the publisher, not by the reconciler, and
+		// it used the code/message-only sanitizer. A client therefore never saw the
+		// classification the adapter produced, however well the durable row kept it.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-publish-"));
+		try {
+			const harness = await invocationHarness("diagnostic-publish", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const submitted = await harness.control("turn.prompt", { text: "failing", clientRef: "publish-ref" });
+			expect(submitted.ok).toBe(true);
+			const ids = { commandId: submitted.result?.commandId, turnId: submitted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected sk-ant-secret-PUBLISH"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "auth",
+						httpStatus: 401,
+						code: "authentication_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+
+			const frames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(frames).toHaveLength(1);
+			expect(frames[0]).toMatchObject({
+				kind: "agent_failed",
+				payload: {
+					type: "agent_failed",
+					sessionId: "diagnostic-publish",
+					...ids,
+					error: {
+						code: "provider_rejected",
+						message: "Prompt submission failed.",
+						providerDiagnostic: {
+							category: "auth",
+							httpStatus: 401,
+							code: "authentication_error",
+							evidence: "structured_code",
+						},
+					},
+				},
+			});
+			// The published frame carries the bounded classification and nothing else.
+			expect(JSON.stringify(frames[0])).not.toContain("sk-ant-secret-PUBLISH");
+			expect(JSON.stringify(frames[0])).not.toContain("provider rejected");
+
+			await harness.emit("agent_end");
+			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "publish-ref" });
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_rejected");
+			expect(
+				(settled as { outcome?: { providerDiagnostic?: Record<string, unknown> } }).outcome?.providerDiagnostic,
+			).toEqual({
+				category: "auth",
+				httpStatus: 401,
+				code: "authentication_error",
+				evidence: "structured_code",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps the provider diagnostic through failed-write recovery and rejects a forged one", async () => {
+		// R4: when the first agent_failed write fails, the reason is replayed from
+		// an in-memory record before the boundary. That replay rebuilt a bare Error
+		// from code/message, so the diagnostic was lost exactly when durability was
+		// already in doubt.
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-recovery-"));
+		let failedWrites = 0;
+		try {
+			const harness = await invocationHarness("diagnostic-recovery", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_failed") {
+						failedWrites += 1;
+						throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
+					}
+				},
+				agentFailedWriteFailures: 1,
+			});
+			const submitted = await harness.control("turn.prompt", { text: "run", clientRef: "recovery-ref" });
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider exploded"), {
+					code: "provider_unavailable",
+					providerDiagnostic: {
+						category: "provider_unavailable",
+						httpStatus: 503,
+						code: "overloaded_error",
+						evidence: "structured_code",
+					},
+				}),
+			});
+			await harness.emit("agent_end");
+
+			const settled = await settledStatus(harness, "turn.prompt_status", { clientRef: "recovery-ref" });
+			expect(failedWrites).toBeGreaterThan(0);
+			expect(settled.status).toBe("failed");
+			expect(settled.error?.code).toBe("provider_unavailable");
+			expect(
+				(settled as { outcome?: { providerDiagnostic?: Record<string, unknown> } }).outcome?.providerDiagnostic,
+			).toEqual({
+				category: "provider_unavailable",
+				httpStatus: 503,
+				code: "overloaded_error",
+				evidence: "structured_code",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("never publishes a malformed or forged diagnostic from a failure cause", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-diagnostic-forged-"));
+		try {
+			const harness = await invocationHarness("diagnostic-forged", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const submitted = await harness.control("turn.prompt", { text: "failing", clientRef: "forged-ref" });
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider rejected"), {
+					code: "provider_rejected",
+					providerDiagnostic: {
+						category: "quota",
+						evidence: "message_text",
+						detail: "sk-ant-secret-FORGED",
+						requestId: "req_leak",
+					},
+				}),
+			});
+
+			const frames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(frames).toHaveLength(1);
+			expect((frames[0]?.payload as { error?: Record<string, unknown> })?.error).toEqual({
+				code: "provider_rejected",
+				message: "Prompt submission failed.",
+			});
+			expect(JSON.stringify(frames[0])).not.toContain("sk-ant-secret-FORGED");
+			expect(JSON.stringify(frames[0])).not.toContain("req_leak");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("agent_failed is diagnostic until agent_end terminalizes the run", async () => {
 		// Exact-head review (#4668 P1): agent_failed is an additive diagnostic;
 		// ownership, lifecycle state, and the deadline remain until agent_end.

@@ -341,8 +341,44 @@ type SdkPromptTerminalOutcome =
 		phase: "submission" | "post_start";
 		category: "provider_transport" | "provider_rejected" | "agent_runtime" | "deadline" | "unknown";
 		providerCode?: string;
+			providerDiagnostic?: {
+				category:
+					| "auth"
+					| "rate_limit"
+					| "quota"
+					| "context_limit"
+					| "invalid_request"
+					| "provider_unavailable"
+					| "unknown";
+				httpStatus?: number;
+				code?: string;
+				evidence: "structured_status" | "structured_code";
+			};
 	  };
 ```
+
+`providerDiagnostic` is an optional, purely additive classification of *why* the
+provider refused, so a caller can distinguish an auth rejection from a rate
+limit or an upstream outage without parsing text. It is minted only by a
+provider adapter from structured provider metadata (an SDK HTTP error or an
+explicit SSE protocol error envelope); message text, response headers, request
+IDs and the legacy heuristic HTTP status never produce one. `httpStatus` is an
+integer in `400..599` and is absent for an error delivered inside an HTTP 200
+stream. `code` is a canonical token from a closed allowlist, never a raw
+provider string. Contradictory evidence (a status that disagrees with the code,
+a conflicting nested code, an out-of-range status, an unreadable field) yields
+no diagnostic at all rather than a guess, and an unsupported code is discarded
+while an independently valid status may still classify. `billing_error` maps to
+`unknown`, not `quota`; `quota` and `context_limit` are reserved and are not
+emitted by the current adapter.
+
+The field never changes the outcome it accompanies: `code`, `message`,
+`provenance`, `phase`, `category`, `providerCode`, receipt state, retry and
+fallback behaviour and CLI exit codes are identical with or without it. Records
+without the field stay valid, and a decoded or persisted diagnostic that fails
+revalidation is stripped rather than invalidating the record. A late
+`agent_failed` may fill a diagnostic that a settled failure is missing; it never
+replaces an existing one and never rewrites the settled terminal.
 
 `turn.prompt` returns `{ accepted: true, commandId, turnId, clientRef? }` only after
 its asynchronous preflight accepts the prompt. That receipt is a durable,

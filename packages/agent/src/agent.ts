@@ -11,7 +11,9 @@ import {
 	type ImageContent,
 	type Message,
 	type Model,
+	type ProviderDiagnostic,
 	type ProviderSessionState,
+	readProviderDiagnostic,
 	type ServiceTier,
 	type SimpleStreamOptions,
 	streamSimple,
@@ -95,7 +97,10 @@ const PROVIDER_ACCEPTABLE_FAILURE_CODES = new Set([
 	"execution",
 ]);
 
-function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): { code: string; message: string } {
+function sanitizeAgentFailure(
+	error: unknown,
+	runtimeClassifiedCode?: string,
+): { code: string; message: string; providerDiagnostic?: ProviderDiagnostic } {
 	let code = "agent_failed";
 	try {
 		if (runtimeClassifiedCode !== undefined) {
@@ -115,7 +120,14 @@ function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): {
 	} catch {
 		// Untrusted provider errors may expose throwing accessors.
 	}
-	return { code, message: "Agent run failed." };
+	// Provenance is the adapter's private carrier, never a property the error
+	// declares about itself: a foreign error cannot label its own failure family.
+	const providerDiagnostic = readProviderDiagnostic(error);
+	return {
+		code,
+		message: "Agent run failed.",
+		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
+	};
 }
 
 /** Only runtime-authenticated built-in constructors may contribute a name. */
@@ -2301,6 +2313,7 @@ export class Agent {
 				errorCode: sanitized.code,
 				...(errorName ? { errorName } : {}),
 				errorStatus: safeErrorStatus(err),
+				...(sanitized.providerDiagnostic === undefined ? {} : { providerDiagnostic: sanitized.providerDiagnostic }),
 				// Local-diagnostic authority (`errorKind` + structured
 				// `bufferOverflow`) comes from ONE identity check: a foreign error
 				// that self-declares a local kind gets neither field, so the parent

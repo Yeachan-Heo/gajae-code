@@ -5,7 +5,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { isContinuingMidRunMaintenanceOutcome, isNonDispatchedToolEvent, ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
+import type { Api, ImageContent, Model, ProviderDiagnostic } from "@gajae-code/ai/core";
+
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
@@ -75,9 +76,13 @@ import {
 	assistantFailureCode,
 	failedPromptOutcome,
 	failureEvidence,
+	failureProviderDiagnostic,
 	formatPromptFailureForLocalLog,
 	PROMPT_FAILURE_MESSAGE_SUBMISSION,
 	type PromptFailureEvidence,
+	providerDiagnosticField,
+	publicTerminalOutcome,
+	publishedPromptFailure,
 	rephaseFailedOutcome,
 	sanitizePromptFailure,
 } from "../prompt-failure";
@@ -757,10 +762,11 @@ const isPreservedProviderFailure = (code: string | undefined): boolean =>
  * classifier so a failed terminal can never be quarantined on reload.
  */
 function canonicalFailedOutcome(
-	failure?: { code?: unknown; message?: unknown; providerCode?: unknown },
+	failure?: { code?: unknown; message?: unknown; providerCode?: unknown; providerDiagnostic?: unknown },
 	provenance: "agent_failed" | "deadline" = "agent_failed",
 	evidence: PromptFailureEvidence = {},
 	providerCode?: string,
+	providerDiagnostic?: unknown,
 ): InvocationOutcome {
 	const deadline = provenance === "deadline" || failure?.code === "prompt_deadline_exceeded";
 	const known = typeof failure?.code === "string" ? failure.code : undefined;
@@ -774,6 +780,7 @@ function canonicalFailedOutcome(
 				? { providerCode: known }
 				: {}),
 		evidence,
+		...providerDiagnosticField(providerDiagnostic ?? failure?.providerDiagnostic),
 	});
 }
 
@@ -803,6 +810,7 @@ function canonicalTerminalOutcome(
 				candidate.provenance === "deadline" ? "deadline" : "agent_failed",
 				evidence,
 				typeof candidate.providerCode === "string" ? candidate.providerCode : undefined,
+				(outcome as { providerDiagnostic?: unknown }).providerDiagnostic,
 			);
 	}
 	if (failure !== undefined) return canonicalFailedOutcome(failure, "agent_failed", evidence);
@@ -821,6 +829,8 @@ interface InvocationRecord extends InvocationCorrelation {
 	content?: TurnResultContent;
 	receiptState?: Exclude<ReceiptState, "absent">;
 	outcome?: unknown;
+	/** Adapter-classified failure family recorded before the terminal boundary. */
+	providerDiagnostic?: ProviderDiagnostic;
 }
 export interface InvocationReconciliation {
 	/** Shared v2 reconciliation owner; present for durable terminal admission. */
@@ -885,6 +895,57 @@ export interface InvocationReconciliation {
 		isCurrent?: () => boolean,
 		deadlineMaxAt?: number,
 	): Promise<void>;
+}
+
+/**
+ * Durable rows are untrusted input at hydrate time: the new optional diagnostic
+ * is re-validated and rebuilt on `outcome` and `pendingOutcome`, and dropped
+ * when it fails. The legacy row itself — status, receipt, terminal time, error
+ * — is never invalidated by a bad diagnostic.
+ */
+/**
+ * A late diagnostic may only be credited to the failure it describes: either
+ * the record has no primary classifier yet, or the incoming classifier is
+ * exactly the recorded one.
+ */
+function diagnosticForSamePrimaryCode(record: { error?: { code: string } }, failure: { code: string }): boolean {
+	return record.error === undefined || record.error.code === failure.code;
+}
+
+/**
+ * Additive late enrichment: fill a MISSING diagnostic on an already settled
+ * failed outcome. An existing diagnostic is never replaced, and no other field
+ * of the terminal is touched.
+ */
+function enrichOutcomeDiagnostic(outcome: unknown, diagnostic: unknown): unknown {
+	if (!outcome || typeof outcome !== "object") return outcome;
+	const failed = outcome as { kind?: unknown; providerDiagnostic?: unknown };
+	if (failed.kind !== "failed" || failed.providerDiagnostic !== undefined) return outcome;
+	const field = providerDiagnosticField(diagnostic);
+	return field.providerDiagnostic === undefined ? outcome : { ...(outcome as object), ...field };
+}
+
+function canonicalizeHydratedDiagnostics(record: InvocationRecord): InvocationRecord {
+	const canonical = { ...record };
+	const rewrite = (value: unknown): SdkPromptTerminalOutcome | undefined => {
+		if (!value || typeof value !== "object") return undefined;
+		const outcome = value as SdkPromptTerminalOutcome;
+		if (outcome.kind !== "failed") return outcome;
+		// Remove first, then re-add only a validated canonical snapshot, so a
+		// rejected value can never survive by being spread over with nothing.
+		const next = { ...outcome };
+		delete next.providerDiagnostic;
+		const field = providerDiagnosticField((outcome as { providerDiagnostic?: unknown }).providerDiagnostic);
+		if (field.providerDiagnostic !== undefined) next.providerDiagnostic = field.providerDiagnostic;
+		return next;
+	};
+	if (canonical.outcome !== undefined) canonical.outcome = rewrite(canonical.outcome);
+	const pending = (canonical as { pendingOutcome?: unknown }).pendingOutcome;
+	if (pending !== undefined) (canonical as { pendingOutcome?: unknown }).pendingOutcome = rewrite(pending);
+	const recordDiagnostic = providerDiagnosticField(canonical.providerDiagnostic);
+	if (recordDiagnostic.providerDiagnostic === undefined) delete canonical.providerDiagnostic;
+	else canonical.providerDiagnostic = recordDiagnostic.providerDiagnostic;
+	return canonical;
 }
 
 export function createInvocationReconciliation(
@@ -1016,7 +1077,7 @@ export function createInvocationReconciliation(
 				// Never re-hydrate a failure reason that could contain provider secrets
 				// into a fresh process (origin/dev sanitization preserved).
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
-				records.set(key(kind, candidate), record);
+				records.set(key(kind, candidate), canonicalizeHydratedDiagnostics(record));
 			}
 			cleanup();
 			return;
@@ -1057,7 +1118,7 @@ export function createInvocationReconciliation(
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
 				record.revision = typeof record.revision === "number" ? record.revision : ++mutationRevision;
 				mutationRevision = Math.max(mutationRevision, record.revision);
-				records.set(key(record.kind, record), { ...record });
+				records.set(key(record.kind, record), canonicalizeHydratedDiagnostics({ ...record }));
 			}
 		}
 		cleanup();
@@ -1344,6 +1405,31 @@ export function createInvocationReconciliation(
 				// never resurrect (status/terminalAt untouched), and first reason wins.
 				if (frame.type === "agent_failed") {
 					const failure = sanitizePromptFailure(frame.error);
+					// Attribution first: a same-code late frame may fill a MISSING
+					// diagnostic on the settled terminal without touching status,
+					// terminalAt, receipt, owner or the primary classifier. A
+					// different-code frame belongs to another failure and is ignored.
+					const lateDiagnostic = diagnosticForSamePrimaryCode(record, failure)
+						? failureProviderDiagnostic(frame.error)
+						: undefined;
+					const enrichedOutcome = enrichOutcomeDiagnostic(record.outcome, lateDiagnostic);
+					if (enrichedOutcome !== record.outcome) {
+						const settled: InvocationRecord = {
+							...record,
+							revision: ++mutationRevision,
+							outcome: enrichedOutcome,
+						};
+						if (settled.providerDiagnostic === undefined && lateDiagnostic !== undefined)
+							settled.providerDiagnostic = lateDiagnostic;
+						records.set(recordKey, settled);
+						try {
+							await persist();
+						} catch (error) {
+							if (records.get(recordKey) === settled) records.set(recordKey, record);
+							throw error;
+						}
+						record = settled;
+					}
 					if (
 						record.error !== undefined &&
 						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
@@ -1381,6 +1467,11 @@ export function createInvocationReconciliation(
 				next.startedAt = Date.now();
 			} else if (frame.type === "agent_failed") {
 				// Failure is diagnostic only; agent_end remains the terminal boundary.
+				const failureForDiagnostic = sanitizePromptFailure(frame.error);
+				const diagnostic = diagnosticForSamePrimaryCode(next, failureForDiagnostic)
+					? failureProviderDiagnostic(frame.error)
+					: undefined;
+				if (next.providerDiagnostic === undefined && diagnostic !== undefined) next.providerDiagnostic = diagnostic;
 				logger.error("SDK invocation failed", {
 					kind,
 					commandId: correlation.commandId,
@@ -1411,7 +1502,13 @@ export function createInvocationReconciliation(
 					// the provider code.
 					const recordErrorOutcome =
 						next.error !== undefined && next.error.code !== "prompt_deadline_exceeded"
-							? canonicalFailedOutcome(next.error, "agent_failed", failureEvidence(next))
+							? canonicalFailedOutcome(
+									next.error,
+									"agent_failed",
+									failureEvidence(next),
+									undefined,
+									next.providerDiagnostic,
+								)
 							: undefined;
 					const preferRecordError =
 						recordErrorOutcome?.kind === "failed" &&
@@ -1423,7 +1520,13 @@ export function createInvocationReconciliation(
 					else next.error = { code: next.error.code, message: incomingOutcome.message };
 					next.status = "failed";
 				} else if (next.error !== undefined) {
-					next.outcome = canonicalFailedOutcome(next.error);
+					next.outcome = canonicalFailedOutcome(
+						next.error,
+						"agent_failed",
+						{},
+						undefined,
+						next.providerDiagnostic,
+					);
 					next.status = "failed";
 				} else if (
 					kind === "prompt" &&
@@ -1485,7 +1588,9 @@ export function createInvocationReconciliation(
 				...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
 				terminalAt: record.terminalAt,
 				receiptState: record.receiptState ?? "unknown",
-				...(record.outcome === undefined ? {} : { outcome: record.outcome }),
+				...(record.outcome === undefined
+					? {}
+					: { outcome: publicTerminalOutcome(record.outcome as SdkPromptTerminalOutcome) }),
 				...(reportableTurnResultContent(record.content) ? { content: record.content } : {}),
 				...(record.error === undefined ? {} : { error: record.error }),
 			};
@@ -1667,6 +1772,8 @@ export function createInvocationReconciliation(
 							"agent_failed",
 							failureEvidence(record, evidence?.hasActivity),
 							requestedProviderCode,
+							record.providerDiagnostic ??
+								(requestedOutcome?.kind === "failed" ? requestedOutcome.providerDiagnostic : undefined),
 						)
 					: requestedOutcome?.kind === "stopped"
 						? requestedOutcome
@@ -1680,6 +1787,8 @@ export function createInvocationReconciliation(
 									"agent_failed",
 									failureEvidence(record, evidence?.hasActivity),
 									requestedProviderCode,
+									record.providerDiagnostic ??
+										(requestedOutcome?.kind === "failed" ? requestedOutcome.providerDiagnostic : undefined),
 								)
 							: requestedOutcome;
 			const previousRecord = { ...record };
@@ -2498,9 +2607,9 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
  * after retry/fallback policy has settled, so this is the safe boundary at which
  * to publish the additive failure diagnostic before terminal reconciliation.
  */
-function providerFailureFromAgentEnd(
+export function providerFailureFromAgentEnd(
 	event: unknown,
-): { code: string; message: string; providerCode?: string } | undefined {
+): { code: string; message: string; providerCode?: string; providerDiagnostic?: ProviderDiagnostic } | undefined {
 	try {
 		if (!event || typeof event !== "object") return undefined;
 		const messages = (event as { messages?: unknown }).messages;
@@ -2564,22 +2673,35 @@ function providerFailureFromAgentEnd(
 			}
 		}
 		const providerCode = assistantFailureCode(assistant);
+		// Additive only: the adapter's own bounded classification, revalidated
+		// here. It never participates in choosing the primary code below.
+		let providerDiagnostic: { providerDiagnostic?: ProviderDiagnostic } = {};
+		try {
+			providerDiagnostic = providerDiagnosticField(
+				(assistant as { providerDiagnostic?: unknown }).providerDiagnostic,
+			);
+		} catch {
+			// A throwing accessor leaves the failure undiagnosed, never unterminalized.
+		}
 		if (status === 402 || status === 429)
 			return {
 				code: `provider_http_${status}`,
 				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
 				...(providerCode !== undefined ? { providerCode } : {}),
+				...providerDiagnostic,
 			};
 		if (status !== undefined)
 			return {
 				code: "provider_rejected",
 				message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
 				...(providerCode !== undefined ? { providerCode } : {}),
+				...providerDiagnostic,
 			};
 		return {
 			code: "provider_rejected",
 			message: PROMPT_FAILURE_MESSAGE_SUBMISSION,
 			...(providerCode !== undefined ? { providerCode } : {}),
+			...providerDiagnostic,
 		};
 	} catch {
 		// Provider metadata is untrusted: an SDK/provider adapter may expose a
@@ -4513,7 +4635,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
 				 * the record classifies terminal_ok (exact-head review P1). */
-				unrecordedFailureReasons?: Map<string, { code: string; message: string }>;
+				unrecordedFailureReasons?: Map<
+					string,
+					{ code: string; message: string; providerDiagnostic?: ProviderDiagnostic }
+				>;
 		  }
 		| undefined;
 	type RuntimeState = NonNullable<typeof active>;
@@ -5274,7 +5399,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							try {
 								await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, {
 									type: "agent_failed",
-									error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
+									error: Object.assign(new Error(unrecorded.message), {
+										code: unrecorded.code,
+										...(unrecorded.providerDiagnostic === undefined
+											? {}
+											: { providerDiagnostic: unrecorded.providerDiagnostic }),
+									}),
 								} as never);
 								current.unrecordedFailureReasons?.delete(reasonKey);
 							} catch (error) {
@@ -5375,7 +5505,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						if (current.unrecordedFailureReasons === undefined) current.unrecordedFailureReasons = new Map();
 						current.unrecordedFailureReasons.set(
 							`${invocation.correlation.commandId}:${invocation.correlation.turnId}`,
-							sanitizePromptFailure(failureCause),
+							publishedPromptFailure(failureCause),
 						);
 					}
 				}
@@ -5389,7 +5519,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
 			// Publish one safe frame per invocation so clients can attribute a shared
 			// run's failure without receiving provider text or an uncorrelated signal.
-			const error = sanitizePromptFailure(
+			// Publication carries the same bounded code/message plus the validated
+			// optional diagnostic: the frame is what a client actually observes.
+			const error = publishedPromptFailure(
 				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
 			);
 			for (const invocation of transitions) {

@@ -15,6 +15,7 @@ import {
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
 	SERVER_OVERLOADED_PROVIDER_CODE,
+	sanitizeProviderDiagnostic,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
@@ -2154,6 +2155,11 @@ function managedAssistantShell(
 	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
+	// The provider diagnostic crosses the snapshot only through the closed
+	// validator: the raw snapshot value is dropped so a provider/stream payload
+	// cannot smuggle arbitrary shape or text through this metadata copy.
+	delete safeMetadata.providerDiagnostic;
+	const providerDiagnostic = sanitizeProviderDiagnostic(managedProperty(source, "providerDiagnostic"));
 	const rebuilt: AssistantMessage = {
 		...safeMetadata,
 		role: "assistant",
@@ -2168,6 +2174,7 @@ function managedAssistantShell(
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
 		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
+		...(providerDiagnostic === undefined ? {} : { providerDiagnostic }),
 	};
 	// The closed-literal copy above is fed by the stream-exit provenance
 	// sanitize, so an unauthenticated label never reaches here. Mark the

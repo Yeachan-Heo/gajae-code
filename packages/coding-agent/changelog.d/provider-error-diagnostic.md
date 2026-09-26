@@ -1,0 +1,3 @@
+### Added
+
+- Failed prompt outcomes now carry an optional bounded `providerDiagnostic` (`category`, `httpStatus`, `code`, `evidence`) when the provider adapter classified the failure from its own structured metadata. It survives the prompt sanitizer, both reconciliation implementations, durable persistence and reload, pending-outcome restart settlement, and the public status projection, and a late `agent_failed` may fill a missing diagnostic on an already settled failure without touching its status, terminal time, receipt or classifier. Primary failure code, category, phase, message, retry behaviour and CLI exit codes are unchanged, and a malformed or forged diagnostic is stripped instead of invalidating the record.

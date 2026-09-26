@@ -21,6 +21,11 @@ import {
 	readSseEvents,
 } from "@gajae-code/utils";
 import {
+	anthropicProviderDiagnosticFromError,
+	anthropicProviderDiagnosticFromSseErrorData,
+	attachProviderDiagnostic,
+} from "../adapter-internals/provider-diagnostic";
+import {
 	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -32,6 +37,7 @@ import {
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
 } from "../model-thinking";
 import { calculateCost } from "../models";
+import { readProviderDiagnostic } from "../provider-diagnostic";
 import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
@@ -1444,7 +1450,11 @@ async function* iterateAnthropicEvents(
 	for await (const sse of readSseEvents(response.body, signal)) {
 		notifyRawSseEvent(onSseEvent, sse);
 		if (sse.event === "error") {
-			throw new Error(sse.data);
+			// Classify the explicit protocol envelope BEFORE it collapses into an
+			// Error message: the structured `error.type` is the only trustworthy
+			// evidence here, and recovering it later from message text would be
+			// provenance laundering. The thrown error itself is unchanged.
+			throw attachProviderDiagnostic(new Error(sse.data), anthropicProviderDiagnosticFromSseErrorData(sse.data));
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
@@ -1490,6 +1500,28 @@ type AnthropicStreamWithResponseRequest = {
 
 function hasAnthropicStreamWithResponseRequest(request: unknown): request is AnthropicStreamWithResponseRequest {
 	return isRecord(request) && typeof request.withResponse === "function";
+}
+
+/**
+ * The ONLY seam allowed to mint an HTTP-sourced diagnostic.
+ *
+ * Provenance is where the error came from, not what shape it has: the public
+ * SDK constructor and `APIError.generate` are callable by anyone, and a forged
+ * `APIError.prototype` object passes `instanceof` just as well, so an adapter
+ * callback (onPayload/onStreamCreated) or a compat layer could otherwise inject
+ * a fully trusted classification for a request that never reached the wire.
+ * Only a rejection raised while awaiting the SDK's own request/response is
+ * classified here; everything else reaches the outer catch with no carrier and
+ * stays undiagnosed.
+ */
+async function awaitAnthropicTransportResponse<T>(request: () => Promise<T>): Promise<T> {
+	try {
+		return await request();
+	} catch (error) {
+		if (typeof error === "object" && error !== null)
+			attachProviderDiagnostic(error, anthropicProviderDiagnosticFromError(error));
+		throw error;
+	}
 }
 
 async function getAnthropicStreamResponse(
@@ -2137,6 +2169,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				output.responseId = undefined;
 				output.errorKind = undefined;
 				output.errorStatus = undefined;
+				output.providerDiagnostic = undefined;
 				output.errorMessage = strictFallbackErrorMessage;
 				output.providerPayload = undefined;
 				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
@@ -2199,10 +2232,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						events: anthropicStream,
 						response,
 						requestId,
-					} = await getAnthropicStreamResponse(
-						anthropicRequest,
-						requestSignal,
-						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
+					} = await awaitAnthropicTransportResponse(() =>
+						getAnthropicStreamResponse(
+							anthropicRequest,
+							requestSignal,
+							options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
+						),
 					);
 					await notifyProviderResponse(options, response, model, requestId);
 					firstEventWaitStartedAt = Date.now();
@@ -3047,6 +3082,17 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const localAbortReason = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
+			// Additive provider classification. A caller abort or a local managed
+			// failure keeps its existing precedence and is never relabelled with
+			// provider evidence; the SSE carrier wins over a fresh read because it
+			// saw the protocol envelope before it became a message.
+			if (localAbortReason === undefined && !activeAbortTracker.wasCallerAbort()) {
+				// Carrier only. This catch also sees callback, compat and local
+				// failures, so re-reading the error's shape here would credit them
+				// with HTTP provenance they never had.
+				const diagnostic = readProviderDiagnostic(error);
+				if (diagnostic !== undefined) output.providerDiagnostic = diagnostic;
+			}
 			output.transportFailure = transportFailureFacts(localAbortReason ?? error) ?? output.transportFailure;
 			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
 				output.errorMessage =

@@ -55,6 +55,7 @@ export interface TurnPromptInput {
  * accepted/in-flight and its pending outcome stays private until exact execution
  * settlement is proven.
  */
+import type { ProviderDiagnostic } from "@gajae-code/ai/core";
 import type { ReceiptState } from "./receipt-state";
 
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
@@ -99,6 +100,14 @@ export type SdkPromptTerminalOutcome =
 			category: SdkPromptFailureCategory;
 			/** Bounded safe provider/transport classifier when the provider supplied one. */
 			providerCode?: string;
+			/**
+			 * Bounded provider failure family, present only when the provider adapter
+			 * classified the failure from its own structured metadata. Purely
+			 * additive: `code`, `message`, `phase`, `category` and `providerCode`
+			 * are identical with or without it, and a malformed value is dropped
+			 * rather than invalidating the outcome.
+			 */
+			providerDiagnostic?: ProviderDiagnostic;
 	  };
 
 /** Exactly one selector per lookup. */
