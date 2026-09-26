@@ -2853,11 +2853,6 @@ pub(crate) mod platform {
 		Cow::Borrowed(path)
 	}
 
-	/// Open each component through retained directory descriptors. Every name is
-	/// lstat'd and then opened no-follow; the two identities must agree. `..`
-	/// is never accepted, so a pathname cannot escape the authority selected at
-	/// the start of this operation.
-	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	#[cfg(all(test, target_os = "macos"))]
 	pub(super) static WRITE_FALLBACK_ATTEMPTS: std::sync::atomic::AtomicUsize =
 		std::sync::atomic::AtomicUsize::new(0);
@@ -2872,6 +2867,11 @@ pub(crate) mod platform {
 		ReadOnly,
 	}
 
+	/// Open each component through retained directory descriptors. Every name is
+	/// lstat'd and then opened no-follow; the two identities must agree. `..`
+	/// is never accepted, so a pathname cannot escape the authority selected at
+	/// the start of this operation.
+	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	fn checked_file(
 		path: &Path,
 		kind: &str,
@@ -2879,6 +2879,7 @@ pub(crate) mod platform {
 		checked_file_with_policy(path, kind, AcquisitionPolicy::RepairableWrite)
 	}
 
+	#[allow(clippy::result_large_err, reason = "preserves structured native security evidence")]
 	fn checked_file_with_policy(
 		path: &Path,
 		kind: &str,
@@ -7609,7 +7610,8 @@ pub(crate) mod platform {
 		)
 	}
 
-	// ================= read-only broker diagnostic snapshot (DESIGN §B3) =================
+	// ================= read-only broker diagnostic snapshot (DESIGN §B3)
+	// =================
 	//
 	// A narrow read-only view over the retained `checked_file` descriptor chain:
 	// no write method, no exposed descriptor, no publication authority token. The
@@ -7648,7 +7650,9 @@ pub(crate) mod platform {
 
 	/// The one publication this adapter may resolve. The peer never supplies a
 	/// leaf name, operation or path segment.
-	fn diagnostic_publication_path(agent_dir: &str) -> Result<std::path::PathBuf, DiagnosticFailure> {
+	fn diagnostic_publication_path(
+		agent_dir: &str,
+	) -> Result<std::path::PathBuf, DiagnosticFailure> {
 		if agent_dir.is_empty()
 			|| agent_dir.contains('\0')
 			|| !agent_dir.starts_with('/')
@@ -7690,8 +7694,11 @@ pub(crate) mod platform {
 		fn acl_valid(acl: *mut libc::c_void) -> libc::c_int;
 		fn acl_get_permset_mask_np(entry: *mut libc::c_void, mask: *mut u64) -> libc::c_int;
 		fn acl_size(acl: *mut libc::c_void) -> libc::ssize_t;
-		fn acl_copy_ext_native(buf: *mut libc::c_void, acl: *mut libc::c_void, size: libc::ssize_t)
-		-> libc::ssize_t;
+		fn acl_copy_ext_native(
+			buf: *mut libc::c_void,
+			acl: *mut libc::c_void,
+			size: libc::ssize_t,
+		) -> libc::ssize_t;
 	}
 
 	/// Selector for the last entry.
@@ -7702,13 +7709,14 @@ pub(crate) mod platform {
 	#[cfg(target_os = "macos")]
 	const ACL_ERRNO_END_OF_ITERATION: i32 = libc::EINVAL;
 
-	/// Bounded external ACL representation (`kauth_filesec`, magic `0x012cc16d`).
+	/// Bounded external ACL representation (`kauth_filesec`, magic
+	/// `0x012cc16d`).
 	///
-	/// Layout from the platform SDK (`sys/kauth.h`): `u32 magic`, `guid_t owner`,
-	/// `guid_t group`, then `struct kauth_acl { u32 entrycount; u32 flags; kauth_ace ace[] }`
-	/// with `struct kauth_ace { guid_t applicable; u32 flags; u32 rights }`. A one-entry ACL
-	/// is exactly 68 bytes, confirmed against a real ACL on this runtime before this parser
-	/// was relied on.
+	/// Layout from the platform SDK (`sys/kauth.h`): `u32 magic`, `guid_t
+	/// owner`, `guid_t group`, then `struct kauth_acl { u32 entrycount; u32
+	/// flags; kauth_ace ace[] }` with `struct kauth_ace { guid_t applicable;
+	/// u32 flags; u32 rights }`. A one-entry ACL is exactly 68 bytes, confirmed
+	/// against a real ACL on this runtime before this parser was relied on.
 	#[cfg(target_os = "macos")]
 	const KAUTH_FILESEC_MAGIC: u32 = 0x012c_c16d;
 
@@ -7721,7 +7729,8 @@ pub(crate) mod platform {
 	#[cfg(target_os = "macos")]
 	const KAUTH_ACL_MAX_ENTRIES: u32 = 128;
 
-	/// The only entry-flag value the approved exception may carry: the deny tag alone.
+	/// The only entry-flag value the approved exception may carry: the deny tag
+	/// alone.
 	#[cfg(target_os = "macos")]
 	const KAUTH_ACE_DENY_ONLY: u32 = 2;
 
@@ -7745,16 +7754,16 @@ pub(crate) mod platform {
 		entries:      Vec<ParsedAclEntry>,
 	}
 
-	/// Parse and structurally validate the bounded external representation. Total length,
-	/// magic and the entry count are all checked against each other; nothing is
-	/// reinterpreted beyond the documented layout.
+	/// Parse and structurally validate the bounded external representation.
+	/// Total length, magic and the entry count are all checked against each
+	/// other; nothing is reinterpreted beyond the documented layout.
 	#[cfg(target_os = "macos")]
 	pub(super) fn parse_acl_representation(bytes: &[u8]) -> Option<ParsedAclRepresentation> {
 		if bytes.len() < KAUTH_FILESEC_HEADER_BYTES {
 			return None;
 		}
 		let payload = bytes.len() - KAUTH_FILESEC_HEADER_BYTES;
-		if payload % KAUTH_ACE_BYTES != 0 {
+		if !payload.is_multiple_of(KAUTH_ACE_BYTES) {
 			return None;
 		}
 		let read_u32 = |offset: usize| -> u32 {
@@ -7786,9 +7795,10 @@ pub(crate) mod platform {
 		Some(ParsedAclRepresentation { count, header_flags: read_u32(40), entries })
 	}
 
-	/// Decide a parsed representation by full-field equality: exactly one entry, ACL header
-	/// flags entirely zero, entry flags exactly the deny tag, rights exactly DELETE and the
-	/// everyone GUID. A missing or malformed representation proves nothing.
+	/// Decide a parsed representation by full-field equality: exactly one entry,
+	/// ACL header flags entirely zero, entry flags exactly the deny tag, rights
+	/// exactly DELETE and the everyone GUID. A missing or malformed
+	/// representation proves nothing.
 	#[cfg(target_os = "macos")]
 	pub(super) fn classify_acl_representation(
 		parsed: Option<&ParsedAclRepresentation>,
@@ -7821,7 +7831,8 @@ pub(crate) mod platform {
 		unsafe { *libc::__error() = 0 };
 	}
 
-	/// Capture `errno` immediately after a failable call, before any other FFI call.
+	/// Capture `errno` immediately after a failable call, before any other FFI
+	/// call.
 	#[cfg(target_os = "macos")]
 	fn capture_errno() -> i32 {
 		#[cfg(test)]
@@ -7904,11 +7915,12 @@ pub(crate) mod platform {
 
 	/// Strict ACL classification for diagnostics.
 	///
-	/// Unlike `has_extended_acl`, a bare `acl_get_entry == -1` is NOT accepted as
-	/// proof of emptiness: only a genuinely empty ACL, proven by `acl_valid` plus a
-	/// bounded byte-equal `acl_to_text` comparison against `acl_init(0)` on this
-	/// same runtime, classifies as absent. Every other errno (ENOTSUP, EBADF,
-	/// EACCES, ENOMEM, EIO, unknown) is an inspection failure, never emptiness.
+	/// Unlike `has_extended_acl`, a bare `acl_get_entry == -1` is NOT accepted
+	/// as proof of emptiness: only a genuinely empty ACL, proven by `acl_valid`
+	/// plus a bounded byte-equal `acl_to_text` comparison against `acl_init(0)`
+	/// on this same runtime, classifies as absent. Every other errno (ENOTSUP,
+	/// EBADF, EACCES, ENOMEM, EIO, unknown) is an inspection failure, never
+	/// emptiness.
 	#[cfg(target_os = "macos")]
 	pub(super) fn strict_acl_inspection(fd: libc::c_int) -> StrictAclInspection {
 		// SAFETY: fd is a live caller-retained descriptor; the returned ACL is freed
@@ -7987,7 +7999,8 @@ pub(crate) mod platform {
 	pub(super) enum AncestorAclDecision {
 		/// No extended ACL at all.
 		Absent,
-		/// Exactly one non-inheriting everyone DENY DELETE entry, fully validated.
+		/// Exactly one non-inheriting everyone DENY DELETE entry, fully
+		/// validated.
 		SingleEveryoneDenyDelete,
 		/// Understood, but outside the approved allowlist.
 		NotAllowlisted,
@@ -7995,8 +8008,8 @@ pub(crate) mod platform {
 		InspectionFailed,
 	}
 
-	/// Classify a trusted ancestor's ACL: absent, the single approved deny-delete ACE, or
-	/// fail closed.
+	/// Classify a trusted ancestor's ACL: absent, the single approved
+	/// deny-delete ACE, or fail closed.
 	#[cfg(target_os = "macos")]
 	pub(super) fn ancestor_acl_decision(fd: libc::c_int) -> AncestorAclDecision {
 		match strict_acl_inspection(fd) {
@@ -8024,13 +8037,14 @@ pub(crate) mod platform {
 			return AncestorAclDecision::InspectionFailed;
 		}
 		let decision = ancestor_acl_decision_for_acl(acl);
-		// SAFETY: frees the allocation from acl_get_fd exactly once, after every capture.
+		// SAFETY: frees the allocation from acl_get_fd exactly once, after every
+		// capture.
 		unsafe { acl_free(acl) };
 		#[cfg(test)]
 		{
 			note_acl_free_for_test();
-			// The cleanup step is allowed to clobber errno; every decision above was already
-			// captured, so this must not be able to change the outcome.
+			// The cleanup step is allowed to clobber errno; every decision above was
+			// already captured, so this must not be able to change the outcome.
 			if let Some(errno) = acl_fault_for_test().errno_after_free {
 				// SAFETY: __error returns this thread's errno location.
 				unsafe { *libc::__error() = errno };
@@ -8039,16 +8053,21 @@ pub(crate) mod platform {
 		decision
 	}
 
-	/// Decide a live ACL. Completeness comes from the bounded external representation, and
-	/// the cardinality is cross-checked on the live object with strict errno discipline:
-	/// reset immediately before each failable call, capture immediately after and before any
-	/// other FFI call or free. `-1` alone never proves a single entry.
+	/// Decide a live ACL. Completeness comes from the bounded external
+	/// representation, and the cardinality is cross-checked on the live object
+	/// with strict errno discipline: reset immediately before each failable
+	/// call, capture immediately after and before any other FFI call or free.
+	/// `-1` alone never proves a single entry.
 	#[cfg(target_os = "macos")]
 	fn ancestor_acl_decision_for_acl(acl: *mut libc::c_void) -> AncestorAclDecision {
 		// SAFETY: acl is a live allocation owned by the caller.
 		let valid = unsafe { acl_valid(acl) };
 		#[cfg(test)]
-		let valid = if acl_fault_for_test().invalid_acl { 1 } else { valid };
+		let valid = if acl_fault_for_test().invalid_acl {
+			1
+		} else {
+			valid
+		};
 		if valid != 0 {
 			return AncestorAclDecision::InspectionFailed;
 		}
@@ -8066,8 +8085,7 @@ pub(crate) mod platform {
 		let mut buffer = vec![0u8; size as usize];
 		reset_errno();
 		// SAFETY: buffer is writable with exactly `size` bytes and acl is live.
-		let copied =
-			unsafe { acl_copy_ext_native(buffer.as_mut_ptr().cast(), acl, size) };
+		let copied = unsafe { acl_copy_ext_native(buffer.as_mut_ptr().cast(), acl, size) };
 		let copy_errno = capture_errno();
 		#[cfg(test)]
 		let copied = acl_fault_for_test().copied.unwrap_or(copied);
@@ -8173,39 +8191,41 @@ pub(crate) mod platform {
 		AncestorAclDecision::SingleEveryoneDenyDelete
 	}
 
-	/// Test-only fault record for the call boundaries of the ACL decision above, so the
-	/// errno discipline and every failure branch can be observed on the production path.
-	/// Release builds contain none of this.
+	/// Test-only fault record for the call boundaries of the ACL decision above,
+	/// so the errno discipline and every failure branch can be observed on the
+	/// production path. Release builds contain none of this.
 	#[cfg(all(test, target_os = "macos"))]
 	#[derive(Clone, Copy, Default)]
 	pub(super) struct AclFaultForTest {
 		/// Force `acl_get_fd` to look like it returned NULL.
-		pub handle_null:        bool,
+		pub handle_null: bool,
 		/// Force `acl_valid` to report a non-zero (invalid) result.
-		pub invalid_acl:        bool,
+		pub invalid_acl: bool,
 		/// Replace the `acl_size` return value.
-		pub size:               Option<libc::ssize_t>,
+		pub size: Option<libc::ssize_t>,
 		/// Replace the `acl_copy_ext_native` return value.
-		pub copied:             Option<libc::ssize_t>,
+		pub copied: Option<libc::ssize_t>,
 		/// Replace the FIRST iteration result and its captured errno.
-		pub first:              Option<(libc::c_int, i32)>,
+		pub first: Option<(libc::c_int, i32)>,
 		/// Make the FIRST entry pointer look NULL even though the call succeeded.
-		pub first_entry_null:   bool,
+		pub first_entry_null: bool,
 		/// Replace the LAST iteration result and its captured errno.
-		pub last:               Option<(libc::c_int, i32)>,
+		pub last: Option<(libc::c_int, i32)>,
 		/// Make the LAST entry pointer look NULL even though the call succeeded.
-		pub last_entry_null:    bool,
+		pub last_entry_null: bool,
 		/// Make LAST report a different entry than FIRST.
 		pub last_entry_mismatch: bool,
 		/// Replace the NEXT iteration result and its captured errno.
-		pub next:               Option<(libc::c_int, i32)>,
+		pub next: Option<(libc::c_int, i32)>,
 		/// Replace the permission mask getter result.
-		pub mask_result:        Option<libc::c_int>,
+		pub mask_result: Option<libc::c_int>,
 		/// Replace the reported permission mask.
-		pub mask:               Option<u64>,
-		/// Have the free step change errno, to prove capture happens before cleanup.
-		pub errno_after_free:   Option<i32>,
-		/// Simulate cleanup-before-capture at the iterator boundary (negative control).
+		pub mask: Option<u64>,
+		/// Have the free step change errno, to prove capture happens before
+		/// cleanup.
+		pub errno_after_free: Option<i32>,
+		/// Simulate cleanup-before-capture at the iterator boundary (negative
+		/// control).
 		pub clobber_errno_before_capture: bool,
 	}
 
@@ -8249,10 +8269,11 @@ pub(crate) mod platform {
 		note_acl_trace_for_test("free");
 	}
 
-	/// Ordered record of the ACL call-boundary events, so the reset -> call -> capture
-	/// order can be asserted instead of argued. Test builds only.
+	/// Ordered record of the ACL call-boundary events, so the reset -> call ->
+	/// capture order can be asserted instead of argued. Test builds only.
 	#[cfg(all(test, target_os = "macos"))]
-	static ACL_TRACE_FOR_TEST: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+	static ACL_TRACE_FOR_TEST: std::sync::Mutex<Vec<&'static str>> =
+		std::sync::Mutex::new(Vec::new());
 
 	#[cfg(all(test, target_os = "macos"))]
 	fn note_acl_trace_for_test(event: &'static str) {
@@ -8318,8 +8339,7 @@ pub(crate) mod platform {
 			return Err(DiagnosticFailure::Unsupported);
 		}
 		let flags = u64::from(info.f_flags);
-		if flags & (libc::MNT_LOCAL as u64) == 0 || flags & (libc::MNT_IGNORE_OWNERSHIP as u64) != 0
-		{
+		if flags & (libc::MNT_LOCAL as u64) == 0 || flags & (libc::MNT_IGNORE_OWNERSHIP as u64) != 0 {
 			return Err(DiagnosticFailure::Unsupported);
 		}
 		Ok(())
@@ -8343,8 +8363,9 @@ pub(crate) mod platform {
 	pub(super) enum AncestorAclPolicy {
 		/// agentDir, sdk and the publication leaf: no extended ACL at all.
 		Strict,
-		/// Trusted ancestors STRICTLY ABOVE agentDir: absent, or exactly one validated
-		/// non-inheriting everyone DENY DELETE entry (user-approved exception).
+		/// Trusted ancestors STRICTLY ABOVE agentDir: absent, or exactly one
+		/// validated non-inheriting everyone DENY DELETE entry (user-approved
+		/// exception).
 		TrustedAboveAgentDir,
 	}
 
@@ -8368,8 +8389,9 @@ pub(crate) mod platform {
 			AncestorAclPolicy::Strict => strict_acl_absent(directory.as_raw_fd()),
 			AncestorAclPolicy::TrustedAboveAgentDir => {
 				match ancestor_acl_decision(directory.as_raw_fd()) {
-					AncestorAclDecision::Absent
-					| AncestorAclDecision::SingleEveryoneDenyDelete => Ok(()),
+					AncestorAclDecision::Absent | AncestorAclDecision::SingleEveryoneDenyDelete => {
+						Ok(())
+					},
 					AncestorAclDecision::NotAllowlisted => Err(DiagnosticFailure::UnsafeDiscovery),
 					AncestorAclDecision::InspectionFailed => Err(DiagnosticFailure::Unsupported),
 				}
@@ -8409,12 +8431,7 @@ pub(crate) mod platform {
 			// SAFETY: fd is live, the destination slice is writable, `remaining` bounds
 			// the write, and pread does not move the shared file offset.
 			let read = unsafe {
-				libc::pread(
-					fd,
-					buffer[filled..].as_mut_ptr().cast(),
-					remaining,
-					filled as libc::off_t,
-				)
+				libc::pread(fd, buffer[filled..].as_mut_ptr().cast(), remaining, filled as libc::off_t)
 			};
 			if read < 0 {
 				let error = std::io::Error::last_os_error();
@@ -8435,7 +8452,8 @@ pub(crate) mod platform {
 		Ok(buffer)
 	}
 
-	/// Exclusive read-only ownership of one validated publication descriptor chain.
+	/// Exclusive read-only ownership of one validated publication descriptor
+	/// chain.
 	#[cfg(target_os = "macos")]
 	pub(super) struct DiagnosticSnapshotLease {
 		authority: CheckedPathAuthority,
@@ -8446,14 +8464,14 @@ pub(crate) mod platform {
 	pub(super) enum DiagnosticSnapshotLease {}
 
 	/// Whether this build admits the diagnostic snapshot capability at all. The
-	/// observation contract was established for Darwin on arm64 only; a Darwin x64
-	/// build reports unsupported before any path is opened.
+	/// observation contract was established for Darwin on arm64 only; a Darwin
+	/// x64 build reports unsupported before any path is opened.
 	pub(super) const fn diagnostic_runtime_supported() -> bool {
 		cfg!(all(target_os = "macos", target_arch = "aarch64"))
 	}
 
-	/// The retained directory chain of an authority: the walk root followed by every
-	/// opened component, ending at the directory holding the publication.
+	/// The retained directory chain of an authority: the walk root followed by
+	/// every opened component, ending at the directory holding the publication.
 	#[cfg(target_os = "macos")]
 	pub(in crate::path_identity::platform) fn retained_directories(
 		authority: &CheckedPathAuthority,
@@ -8468,13 +8486,15 @@ pub(crate) mod platform {
 		directories
 	}
 
-	/// Prove the retained directory chain against its CURRENT metadata: ownership,
-	/// permission bits, sticky bit, mount semantics and absence of an extended ACL for
-	/// every ancestor, plus exact current-uid 0700 for agentDir and sdk.
+	/// Prove the retained directory chain against its CURRENT metadata:
+	/// ownership, permission bits, sticky bit, mount semantics and absence of
+	/// an extended ACL for every ancestor, plus exact current-uid 0700 for
+	/// agentDir and sdk.
 	///
-	/// This runs on every use of a lease, not only at open: a directory that becomes
-	/// group-writable or gains an ACL after the descriptors were retained keeps its
-	/// dev/ino identity, so the identity-only revalidation cannot see it.
+	/// This runs on every use of a lease, not only at open: a directory that
+	/// becomes group-writable or gains an ACL after the descriptors were
+	/// retained keeps its dev/ino identity, so the identity-only revalidation
+	/// cannot see it.
 	#[cfg(target_os = "macos")]
 	pub(in crate::path_identity::platform) fn diagnostic_chain_admitted(
 		authority: &CheckedPathAuthority,
@@ -8485,9 +8505,9 @@ pub(crate) mod platform {
 			return Err(DiagnosticFailure::Unsupported);
 		}
 		let mut current_stats = Vec::with_capacity(directories.len());
-		// The last two retained directories are agentDir and sdk; they stay strict. Only
-		// the trusted ancestors strictly above agentDir may carry the approved single
-		// everyone DENY DELETE entry.
+		// The last two retained directories are agentDir and sdk; they stay strict.
+		// Only the trusted ancestors strictly above agentDir may carry the approved
+		// single everyone DENY DELETE entry.
 		let strict_from = directories.len() - 2;
 		for (index, directory) in directories.iter().enumerate() {
 			let current =
@@ -8530,11 +8550,14 @@ pub(crate) mod platform {
 	static AFTER_DIAGNOSTIC_READ_HOOK: std::sync::Mutex<Option<DiagnosticReadHook>> =
 		std::sync::Mutex::new(None);
 
-	/// Install a barrier that pauses a diagnostic read after its bytes are copied and
-	/// before the post-read metadata comparison, so a test can mutate the same inode.
+	/// Install a barrier that pauses a diagnostic read after its bytes are
+	/// copied and before the post-read metadata comparison, so a test can
+	/// mutate the same inode.
 	#[cfg(all(test, target_os = "macos"))]
 	pub(super) fn set_after_diagnostic_read_hook_for_test(hook: Option<DiagnosticReadHook>) {
-		*AFTER_DIAGNOSTIC_READ_HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+		*AFTER_DIAGNOSTIC_READ_HOOK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
 	}
 
 	#[cfg(all(test, target_os = "macos"))]
@@ -8550,10 +8573,12 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(all(test, target_os = "macos"))]
-	static INJECTED_READ_INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+	static INJECTED_READ_INTERRUPTS: std::sync::atomic::AtomicU32 =
+		std::sync::atomic::AtomicU32::new(0);
 
 	#[cfg(all(test, target_os = "macos"))]
-	static INJECTED_SHORT_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+	static INJECTED_SHORT_READ: std::sync::atomic::AtomicBool =
+		std::sync::atomic::AtomicBool::new(false);
 
 	/// Queue `count` interrupted `pread` results for the next diagnostic reads.
 	#[cfg(all(test, target_os = "macos"))]
@@ -8573,8 +8598,8 @@ pub(crate) mod platform {
 		INJECTED_SHORT_READ.store(enabled, std::sync::atomic::Ordering::SeqCst);
 	}
 
-	/// How many interrupted reads one snapshot may absorb. The byte budget alone is
-	/// not a work budget: without this an EINTR storm would spin forever.
+	/// How many interrupted reads one snapshot may absorb. The byte budget alone
+	/// is not a work budget: without this an EINTR storm would spin forever.
 	#[cfg(target_os = "macos")]
 	const DIAGNOSTIC_READ_RETRY_BUDGET: u32 = 16;
 
@@ -8583,8 +8608,9 @@ pub(crate) mod platform {
 		attempts > DIAGNOSTIC_READ_RETRY_BUDGET
 	}
 
-	/// Whether two observations of the same descriptor describe the same unchanged
-	/// file, and whether the copied length is exactly that file's size.
+	/// Whether two observations of the same descriptor describe the same
+	/// unchanged file, and whether the copied length is exactly that file's
+	/// size.
 	#[cfg(target_os = "macos")]
 	pub(super) fn diagnostic_snapshot_is_stable(
 		before: &libc::stat,
@@ -8604,12 +8630,14 @@ pub(crate) mod platform {
 		before.st_size >= 0 && u64::try_from(filled).is_ok_and(|read| read == before.st_size as u64)
 	}
 
-	/// One bounded, stability-checked read of the retained publication descriptor.
+	/// One bounded, stability-checked read of the retained publication
+	/// descriptor.
 	///
-	/// A publication that is truncated, grown or rewritten in place while it is being
-	/// copied is NOT a snapshot: the same inode can hold a mixture of two documents
-	/// well below the byte cap, and a later semantic generation comparison cannot
-	/// repair token/endpoint bytes that were spliced together here.
+	/// A publication that is truncated, grown or rewritten in place while it is
+	/// being copied is NOT a snapshot: the same inode can hold a mixture of two
+	/// documents well below the byte cap, and a later semantic generation
+	/// comparison cannot repair token/endpoint bytes that were spliced together
+	/// here.
 	#[cfg(target_os = "macos")]
 	pub(super) fn diagnostic_read_stable(
 		fd: libc::c_int,
@@ -8671,12 +8699,7 @@ pub(crate) mod platform {
 			// SAFETY: fd is live, the destination slice is writable, `remaining` bounds
 			// the write, and pread does not move the shared file offset.
 			let read = unsafe {
-				libc::pread(
-					fd,
-					buffer[filled..].as_mut_ptr().cast(),
-					remaining,
-					filled as libc::off_t,
-				)
+				libc::pread(fd, buffer[filled..].as_mut_ptr().cast(), remaining, filled as libc::off_t)
 			};
 			if read < 0 {
 				let error = std::io::Error::last_os_error();
@@ -8736,7 +8759,8 @@ pub(crate) mod platform {
 		}
 
 		pub(super) fn revalidate_edges(&self) -> Result<(), &'static str> {
-			self.deadline_remaining()
+			self
+				.deadline_remaining()
 				.and_then(|()| self.admitted())
 				.map_err(DiagnosticFailure::reason)
 		}
@@ -8868,10 +8892,11 @@ pub(crate) mod platform {
 
 		/// Whether this build admits the capability at all.
 		///
-		/// The whole test module compiles for every macOS architecture, but the product
-		/// refuses before opening anything unless the build is arm64. Shape and positive
-		/// expectations below are therefore arm64-only, and every other architecture is
-		/// asserted to fail closed with `Unsupported` before a path is touched.
+		/// The whole test module compiles for every macOS architecture, but the
+		/// product refuses before opening anything unless the build is arm64.
+		/// Shape and positive expectations below are therefore arm64-only, and
+		/// every other architecture is asserted to fail closed with
+		/// `Unsupported` before a path is touched.
 		const ARCH_ADMITTED: bool = cfg!(target_arch = "aarch64");
 
 		/// The failure an unsupported architecture must produce for any selector.
@@ -8921,10 +8946,7 @@ pub(crate) mod platform {
 				unsupported_before_open(&agent);
 				return;
 			}
-			assert_eq!(
-				open_diagnostic_lease(&agent, 2000).err(),
-				Some(DiagnosticFailure::Absent),
-			);
+			assert_eq!(open_diagnostic_lease(&agent, 2000).err(), Some(DiagnosticFailure::Absent),);
 		}
 
 		#[test]
@@ -8934,10 +8956,7 @@ pub(crate) mod platform {
 			fs::write(&plain, b"plain").expect("write plain file");
 			fs::set_permissions(&plain, fs::Permissions::from_mode(0o600)).expect("restrict plain");
 			let plain_file = fs::File::open(&plain).expect("open plain file");
-			assert_eq!(
-				strict_acl_inspection(plain_file.as_raw_fd()),
-				StrictAclInspection::Absent,
-			);
+			assert_eq!(strict_acl_inspection(plain_file.as_raw_fd()), StrictAclInspection::Absent,);
 
 			let guarded = root.0.join("guarded");
 			fs::write(&guarded, b"guarded").expect("write guarded file");
@@ -8949,10 +8968,7 @@ pub(crate) mod platform {
 				.expect("fixture chmod runs");
 			assert!(applied.success(), "fixture ACL must be installed");
 			let guarded_file = fs::File::open(&guarded).expect("open guarded file");
-			assert_eq!(
-				strict_acl_inspection(guarded_file.as_raw_fd()),
-				StrictAclInspection::Present,
-			);
+			assert_eq!(strict_acl_inspection(guarded_file.as_raw_fd()), StrictAclInspection::Present,);
 
 			// A closed descriptor cannot prove emptiness: EBADF is an inspection
 			// failure, never "no ACL".
@@ -9081,8 +9097,7 @@ pub(crate) mod platform {
 
 			// Read-only acquisition: zero write-authority attempts.
 			WRITE_FALLBACK_ATTEMPTS.store(0, Ordering::Relaxed);
-			let readonly =
-				checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly);
+			let readonly = checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly);
 			assert!(readonly.is_err(), "read-only acquisition must fail closed on EACCES");
 			assert_eq!(
 				WRITE_FALLBACK_ATTEMPTS.load(Ordering::Relaxed),
@@ -9111,8 +9126,9 @@ pub(crate) mod platform {
 		}
 
 		/// A disposable ancestor chain entirely inside the task fixture:
-		/// `<temp>/above/agent/sdk/broker.json`. Only `above` receives ACL fixtures, so
-		/// the approved exception can be exercised without touching any existing path.
+		/// `<temp>/above/agent/sdk/broker.json`. Only `above` receives ACL
+		/// fixtures, so the approved exception can be exercised without
+		/// touching any existing path.
 		struct AncestorFixture {
 			root:  TempDir,
 			above: PathBuf,
@@ -9126,8 +9142,7 @@ pub(crate) mod platform {
 				let agent = above.join("agent");
 				let sdk = agent.join("sdk");
 				fs::create_dir_all(&sdk).expect("create fixture chain");
-				fs::set_permissions(&above, fs::Permissions::from_mode(0o755))
-					.expect("ancestor mode");
+				fs::set_permissions(&above, fs::Permissions::from_mode(0o755)).expect("ancestor mode");
 				for directory in [&agent, &sdk] {
 					fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
 						.expect("restrict publication directory");
@@ -9155,20 +9170,25 @@ pub(crate) mod platform {
 		impl Drop for AncestorFixture {
 			fn drop(&mut self) {
 				// Disposable metadata is always released, whatever the assertions did.
-				let _ = Command::new("/bin/chmod").args(["-N", self.above.to_str().unwrap_or(".")]).status();
-				let _ = Command::new("/bin/chmod").args(["-N", self.agent.to_str().unwrap_or(".")]).status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.above.to_str().unwrap_or(".")])
+					.status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.agent.to_str().unwrap_or(".")])
+					.status();
 				let _ = fs::set_permissions(&self.above, fs::Permissions::from_mode(0o755));
 				let _ = fs::set_permissions(&self.agent, fs::Permissions::from_mode(0o700));
 				let _ = &self.root;
 			}
 		}
 
-		/// The exact ACE the approved contract allows on a trusted ancestor above agentDir.
+		/// The exact ACE the approved contract allows on a trusted ancestor above
+		/// agentDir.
 		const APPROVED_ANCESTOR_ACE: &str = "everyone deny delete";
 
-		/// Fixture helper source: writes an extended ACL with chosen header flags, entry
-		/// flags and rights through the platform's own ACL API. Test-side only; production
-		/// never sets an ACL.
+		/// Fixture helper source: writes an extended ACL with chosen header
+		/// flags, entry flags and rights through the platform's own ACL API.
+		/// Test-side only; production never sets an ACL.
 		const CRAFT_SOURCE: &str = r#"#include <errno.h>
 #include <sys/acl.h>
 #include <sys/kauth.h>
@@ -9209,7 +9229,13 @@ int main(int argc, char **argv) {
 			binary
 		}
 
-		fn craft_acl(tool: &std::path::Path, target: &std::path::Path, header: u32, flags: u32, rights: u32) {
+		fn craft_acl(
+			tool: &std::path::Path,
+			target: &std::path::Path,
+			header: u32,
+			flags: u32,
+			rights: u32,
+		) {
 			let applied = Command::new(tool)
 				.args([
 					target.to_str().expect("utf8"),
@@ -9227,8 +9253,8 @@ int main(int argc, char **argv) {
 			super::ancestor_acl_decision(handle.as_raw_fd())
 		}
 
-		/// ACL-FULL-MASK: completeness is proven over the whole fields, not a walk over the
-		/// bits this code happens to enumerate.
+		/// ACL-FULL-MASK: completeness is proven over the whole fields, not a
+		/// walk over the bits this code happens to enumerate.
 		#[test]
 		fn diagnostic_snapshot_acl_completeness_is_full_field() {
 			if !ARCH_ADMITTED {
@@ -9241,11 +9267,29 @@ int main(int argc, char **argv) {
 			let cases: [(&str, u32, u32, u32, super::AncestorAclDecision); 4] = [
 				("approved", 0, deny, delete, super::AncestorAclDecision::SingleEveryoneDenyDelete),
 				// The ACL header flag field was never inspected at all.
-				("header-no-inherit", 1 << 17, deny, delete, super::AncestorAclDecision::NotAllowlisted),
+				(
+					"header-no-inherit",
+					1 << 17,
+					deny,
+					delete,
+					super::AncestorAclDecision::NotAllowlisted,
+				),
 				// An entry flag outside the enumerated set.
-				("unknown-entry-flag", 0, deny | (1 << 28), delete, super::AncestorAclDecision::NotAllowlisted),
+				(
+					"unknown-entry-flag",
+					0,
+					deny | (1 << 28),
+					delete,
+					super::AncestorAclDecision::NotAllowlisted,
+				),
 				// A right outside the enumerated set.
-				("unknown-right", 0, deny, delete | (1 << 30), super::AncestorAclDecision::NotAllowlisted),
+				(
+					"unknown-right",
+					0,
+					deny,
+					delete | (1 << 30),
+					super::AncestorAclDecision::NotAllowlisted,
+				),
 			];
 			for (label, header, flags, rights, expected) in cases {
 				let directory = root.0.join(format!("case-{label}"));
@@ -9253,15 +9297,26 @@ int main(int argc, char **argv) {
 				fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).expect("case mode");
 				craft_acl(&tool, &directory, header, flags, rights);
 				assert_eq!(acl_decision_for(&directory), expected, "case {label}");
-				let _ = Command::new("/bin/chmod").args(["-N", directory.to_str().unwrap_or(".")]).status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", directory.to_str().unwrap_or(".")])
+					.status();
 			}
 		}
 
-		/// ACL-COUNT-ERROR / ACL-FULL-MASK pure layer: the representation decides, and every
-		/// malformed or out-of-contract shape fails closed.
+		/// ACL-COUNT-ERROR / ACL-FULL-MASK pure layer: the representation
+		/// decides, and every malformed or out-of-contract shape fails closed.
 		#[test]
 		fn diagnostic_snapshot_acl_representation_rows() {
-			fn build(count: u32, entries: usize, header: u32, flags: u32, rights: u32, magic: u32, guid_byte: u8, trailing: usize) -> Vec<u8> {
+			fn build(
+				count: u32,
+				entries: usize,
+				header: u32,
+				flags: u32,
+				rights: u32,
+				magic: u32,
+				guid_byte: u8,
+				trailing: usize,
+			) -> Vec<u8> {
 				let mut bytes = vec![0u8; 44 + 24 * entries + trailing];
 				bytes[0..4].copy_from_slice(&magic.to_le_bytes());
 				bytes[36..40].copy_from_slice(&count.to_le_bytes());
@@ -9349,15 +9404,19 @@ int main(int argc, char **argv) {
 
 		impl Drop for FixtureAclGuard {
 			fn drop(&mut self) {
-				let _ = Command::new("/bin/chmod").args(["-N", self.0.to_str().unwrap_or(".")]).status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", self.0.to_str().unwrap_or(".")])
+					.status();
 			}
 		}
 
-		/// ACL-REGRESSION-MATRIX bundle 1: the COUNT call boundary on the production path.
+		/// ACL-REGRESSION-MATRIX bundle 1: the COUNT call boundary on the
+		/// production path.
 		///
-		/// Every row runs the real decision function with one injected fault at the exact
-		/// call site, with an unchanged control before and after. These are call-boundary
-		/// injections, not kernel faults and not an exploit.
+		/// Every row runs the real decision function with one injected fault at
+		/// the exact call site, with an unchanged control before and after.
+		/// These are call-boundary injections, not kernel faults and not an
+		/// exploit.
 		#[test]
 		fn diagnostic_snapshot_acl_count_call_boundary_matrix() {
 			if !ARCH_ADMITTED {
@@ -9372,7 +9431,8 @@ int main(int argc, char **argv) {
 			assert_eq!(acl_decision_for(&directory), approved, "control before the matrix");
 
 			let einval = ACL_ERRNO_END_OF_ITERATION_FOR_TEST;
-			let mut rows: Vec<(String, super::AclFaultForTest, super::AncestorAclDecision)> = Vec::new();
+			let mut rows: Vec<(String, super::AclFaultForTest, super::AncestorAclDecision)> =
+				Vec::new();
 			for (label, errno) in
 				[("einval", einval), ("eio", libc::EIO), ("ebadf", libc::EBADF), ("unknown", 1234)]
 			{
@@ -9443,7 +9503,6 @@ int main(int argc, char **argv) {
 			// Cleanup must not be able to rewrite a captured errno: the free step changes
 			// errno here and the valid terminator still stands.
 
-
 			assert_eq!(rows.len(), 20, "pinned row count");
 			for (label, fault, expected) in rows {
 				let observed = with_fault(fault, || acl_decision_for(&directory));
@@ -9461,13 +9520,19 @@ int main(int argc, char **argv) {
 			let ordered = acl_decision_for(&directory);
 			let errno_after = super::observed_errno_for_test();
 			super::inject_acl_fault_for_test(None);
-			assert_eq!(ordered, approved, "a clobbered errno after cleanup must not change the decision");
+			assert_eq!(
+				ordered, approved,
+				"a clobbered errno after cleanup must not change the decision"
+			);
 			assert_eq!(errno_after, libc::EIO, "the cleanup clobber must really have happened");
-			let _ = Command::new("/bin/chmod").args(["-N", directory.to_str().unwrap_or(".")]).status();
+			let _ = Command::new("/bin/chmod")
+				.args(["-N", directory.to_str().unwrap_or(".")])
+				.status();
 		}
 
-		/// ACL-REGRESSION-MATRIX bundle 3: every FFI failure on the production path closes
-		/// as unproven, releases no decision and frees the handle exactly once.
+		/// ACL-REGRESSION-MATRIX bundle 3: every FFI failure on the production
+		/// path closes as unproven, releases no decision and frees the handle
+		/// exactly once.
 		#[test]
 		fn diagnostic_snapshot_acl_ffi_failure_matrix() {
 			if !ARCH_ADMITTED {
@@ -9494,16 +9559,36 @@ int main(int argc, char **argv) {
 					unproven,
 					1,
 				),
-				("size-negative", super::AclFaultForTest { size: Some(-1), ..Default::default() }, unproven, 1),
-				("size-zero", super::AclFaultForTest { size: Some(0), ..Default::default() }, unproven, 1),
+				(
+					"size-negative",
+					super::AclFaultForTest { size: Some(-1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"size-zero",
+					super::AclFaultForTest { size: Some(0), ..Default::default() },
+					unproven,
+					1,
+				),
 				(
 					"size-oversize",
 					super::AclFaultForTest { size: Some((1 << 20) + 1), ..Default::default() },
 					unproven,
 					1,
 				),
-				("copy-negative", super::AclFaultForTest { copied: Some(-1), ..Default::default() }, unproven, 1),
-				("copy-short", super::AclFaultForTest { copied: Some(24), ..Default::default() }, unproven, 1),
+				(
+					"copy-negative",
+					super::AclFaultForTest { copied: Some(-1), ..Default::default() },
+					unproven,
+					1,
+				),
+				(
+					"copy-short",
+					super::AclFaultForTest { copied: Some(24), ..Default::default() },
+					unproven,
+					1,
+				),
 				(
 					"copy-oversize",
 					super::AclFaultForTest { copied: Some(1 << 21), ..Default::default() },
@@ -9534,12 +9619,15 @@ int main(int argc, char **argv) {
 				assert_eq!(frees, expected_frees, "ffi row {label} must free the handle exactly once");
 				assert_eq!(acl_decision_for(&directory), approved, "control after {label}");
 			}
-			let _ = Command::new("/bin/chmod").args(["-N", directory.to_str().unwrap_or(".")]).status();
+			let _ = Command::new("/bin/chmod")
+				.args(["-N", directory.to_str().unwrap_or(".")])
+				.status();
 		}
 
-		/// Raw-trace predicate: the nine ancestor boundary events must appear in order with
-		/// NO cleanup interleaved, and a cleanup must follow the window's final capture.
-		/// Nothing is filtered out of the trace before checking.
+		/// Raw-trace predicate: the nine ancestor boundary events must appear in
+		/// order with NO cleanup interleaved, and a cleanup must follow the
+		/// window's final capture. Nothing is filtered out of the trace before
+		/// checking.
 		fn raw_order_verdict(trace: &[&str]) -> Result<(), &'static str> {
 			const EXPECTED: [&str; 9] = [
 				"reset",
@@ -9560,7 +9648,9 @@ int main(int argc, char **argv) {
 				return Err("no reset before the ancestor FIRST call");
 			}
 			let start = ancestor_first - 1;
-			let window = trace.get(start..start + EXPECTED.len()).ok_or("window truncated")?;
+			let window = trace
+				.get(start..start + EXPECTED.len())
+				.ok_or("window truncated")?;
 			if window.iter().any(|event| *event == "free") {
 				return Err("cleanup inside the ancestor window");
 			}
@@ -9568,18 +9658,25 @@ int main(int argc, char **argv) {
 				return Err("window order differs");
 			}
 			let final_capture = start + EXPECTED.len() - 1;
-			if trace[start..final_capture].iter().any(|event| *event == "free") {
+			if trace[start..final_capture]
+				.iter()
+				.any(|event| *event == "free")
+			{
 				return Err("cleanup inside the ancestor window");
 			}
-			if !trace[final_capture + 1..].iter().any(|event| *event == "free") {
+			if !trace[final_capture + 1..]
+				.iter()
+				.any(|event| *event == "free")
+			{
 				return Err("no cleanup after the final capture");
 			}
 			Ok(())
 		}
 
-		/// ACL-REGRESSION-MATRIX order: the recorded boundary events show reset -> call ->
-		/// capture at each iterator step, with every cleanup after those captures. The
-		/// negative control injects the forbidden order and must fail closed.
+		/// ACL-REGRESSION-MATRIX order: the recorded boundary events show reset
+		/// -> call -> capture at each iterator step, with every cleanup after
+		/// those captures. The negative control injects the forbidden order and
+		/// must fail closed.
 		#[test]
 		fn diagnostic_snapshot_acl_boundary_order_trace() {
 			if !ARCH_ADMITTED {
@@ -9600,8 +9697,9 @@ int main(int argc, char **argv) {
 			assert_eq!(raw_order_verdict(&trace), Ok(()), "raw ancestor boundary order: {trace:?}");
 
 			// Negative sensitivity control: cleanup recorded and errno clobbered BEFORE the
-			// iterator capture. The trace shows the forbidden order and the decision closes.
-			// This is a sensitivity check on the instrumentation, not a restored history.
+			// iterator capture. The trace shows the forbidden order and the decision
+			// closes. This is a sensitivity check on the instrumentation, not a restored
+			// history.
 			super::inject_acl_fault_for_test(Some(super::AclFaultForTest {
 				clobber_errno_before_capture: true,
 				..Default::default()
@@ -9624,11 +9722,18 @@ int main(int argc, char **argv) {
 			);
 		}
 
-		/// ACL-REGRESSION-MATRIX bundle 2: a finite bit walk over every field, plus the
-		/// structural rows. Pure, so JS and native can assert the same expectations.
+		/// ACL-REGRESSION-MATRIX bundle 2: a finite bit walk over every field,
+		/// plus the structural rows. Pure, so JS and native can assert the same
+		/// expectations.
 		#[test]
 		fn diagnostic_snapshot_acl_full_field_bit_walk() {
-			fn representation(count: u32, entries: usize, header: u32, flags: u32, rights: u32) -> Vec<u8> {
+			fn representation(
+				count: u32,
+				entries: usize,
+				header: u32,
+				flags: u32,
+				rights: u32,
+			) -> Vec<u8> {
 				let mut bytes = vec![0u8; 44 + 24 * entries];
 				bytes[0..4].copy_from_slice(&0x012c_c16d_u32.to_le_bytes());
 				bytes[36..40].copy_from_slice(&count.to_le_bytes());
@@ -9663,7 +9768,11 @@ int main(int argc, char **argv) {
 			for bit in 0..32u32 {
 				let solo = 1u32 << bit;
 				if solo != 2 {
-					assert_eq!(decide(&representation(1, 1, 0, solo, 1 << 4)), refused, "entry solo bit {bit}");
+					assert_eq!(
+						decide(&representation(1, 1, 0, solo, 1 << 4)),
+						refused,
+						"entry solo bit {bit}"
+					);
 				}
 				let combined = 2u32 | solo;
 				if combined != 2 {
@@ -9679,7 +9788,11 @@ int main(int argc, char **argv) {
 			for bit in 0..32u32 {
 				let solo = 1u32 << bit;
 				if solo != 1 << 4 {
-					assert_eq!(decide(&representation(1, 1, 0, 2, solo)), refused, "rights solo bit {bit}");
+					assert_eq!(
+						decide(&representation(1, 1, 0, 2, solo)),
+						refused,
+						"rights solo bit {bit}"
+					);
 				}
 				let combined = (1u32 << 4) | solo;
 				if combined != 1 << 4 {
@@ -9696,12 +9809,32 @@ int main(int argc, char **argv) {
 			// do not support is unproven.
 			for count in [0u32, 2, 5, 128] {
 				let expected = if count == 1 { approved } else { refused };
-				assert_eq!(decide(&representation(count, count as usize, 0, 2, 1 << 4)), expected, "count {count}");
+				assert_eq!(
+					decide(&representation(count, count as usize, 0, 2, 1 << 4)),
+					expected,
+					"count {count}"
+				);
 			}
-			assert_eq!(decide(&representation(129, 129, 0, 2, 1 << 4)), unproven, "count 129 exceeds the maximum");
-			assert_eq!(decide(&representation(0xffff_ffff, 1, 0, 2, 1 << 4)), unproven, "NOACL sentinel count");
-			assert_eq!(decide(&representation(2, 1, 0, 2, 1 << 4)), unproven, "count exceeds the byte length");
-			assert_eq!(decide(&representation(1, 2, 0, 2, 1 << 4)), unproven, "byte length exceeds the count");
+			assert_eq!(
+				decide(&representation(129, 129, 0, 2, 1 << 4)),
+				unproven,
+				"count 129 exceeds the maximum"
+			);
+			assert_eq!(
+				decide(&representation(0xffff_ffff, 1, 0, 2, 1 << 4)),
+				unproven,
+				"NOACL sentinel count"
+			);
+			assert_eq!(
+				decide(&representation(2, 1, 0, 2, 1 << 4)),
+				unproven,
+				"count exceeds the byte length"
+			);
+			assert_eq!(
+				decide(&representation(1, 2, 0, 2, 1 << 4)),
+				unproven,
+				"byte length exceeds the count"
+			);
 
 			// Magic and framing.
 			let mut swapped = representation(1, 1, 0, 2, 1 << 4);
@@ -9728,8 +9861,9 @@ int main(int argc, char **argv) {
 			assert_eq!(decide(&stranger), refused, "wrong principal");
 		}
 
-		/// ACL-CONTRACT: exactly one non-inheriting everyone DENY DELETE ACE on a trusted
-		/// ancestor strictly above agentDir is admitted; absence stays admitted too.
+		/// ACL-CONTRACT: exactly one non-inheriting everyone DENY DELETE ACE on a
+		/// trusted ancestor strictly above agentDir is admitted; absence stays
+		/// admitted too.
 		#[test]
 		fn diagnostic_snapshot_admits_single_everyone_deny_delete_ancestor() {
 			if !ARCH_ADMITTED {
@@ -9747,13 +9881,15 @@ int main(int argc, char **argv) {
 			let admitted = open_diagnostic_lease(&fixture.selector(), 2000);
 			assert!(
 				admitted.is_ok(),
-				"a single non-inheriting everyone deny delete ACE above agentDir must be admitted: {:?}",
+				"a single non-inheriting everyone deny delete ACE above agentDir must be admitted: \
+				 {:?}",
 				admitted.err(),
 			);
 		}
 
-		/// ACL-CONTRACT: a real positive lease returns the published bytes, revalidates and
-		/// closes, with the fixture unchanged by the observation.
+		/// ACL-CONTRACT: a real positive lease returns the published bytes,
+		/// revalidates and closes, with the fixture unchanged by the
+		/// observation.
 		#[test]
 		fn diagnostic_snapshot_positive_lease_reads_and_revalidates() {
 			if !ARCH_ADMITTED {
@@ -9778,14 +9914,12 @@ int main(int argc, char **argv) {
 			let after = fs::metadata(fixture.publication()).expect("publication metadata");
 			assert_eq!(before.mode(), after.mode(), "observation must not change modes");
 			assert_eq!(before.len(), after.len(), "observation must not change bytes");
-			assert_eq!(
-				fs::read(fixture.publication()).expect("read publication"),
-				payload.to_vec(),
-			);
+			assert_eq!(fs::read(fixture.publication()).expect("read publication"), payload.to_vec(),);
 		}
 
-		/// ACL-CONTRACT: after a successful lease, mutating the task fixture's own metadata
-		/// makes the next read and revalidate refuse and withhold bytes.
+		/// ACL-CONTRACT: after a successful lease, mutating the task fixture's
+		/// own metadata makes the next read and revalidate refuse and withhold
+		/// bytes.
 		#[test]
 		fn diagnostic_snapshot_refuses_after_fixture_mutation() {
 			if !ARCH_ADMITTED {
@@ -9794,7 +9928,14 @@ int main(int argc, char **argv) {
 				return;
 			}
 			let payload = b"{\"generation\":\"mutation\"}";
-			for mutation in ["agent-mode-0755", "sdk-mode-0770", "agent-acl", "sdk-acl", "above-allow-acl", "above-mode"] {
+			for mutation in [
+				"agent-mode-0755",
+				"sdk-mode-0770",
+				"agent-acl",
+				"sdk-acl",
+				"above-allow-acl",
+				"above-mode",
+			] {
 				let fixture = AncestorFixture::new(payload);
 				install_acl_spec(&fixture.above, APPROVED_ANCESTOR_ACE);
 				let lease = match open_diagnostic_lease(&fixture.selector(), 2000) {
@@ -9826,11 +9967,14 @@ int main(int argc, char **argv) {
 				let read = lease.read_bytes();
 				assert!(read.is_err(), "{mutation}: read must refuse, got {read:?}");
 				assert!(lease.revalidate_edges().is_err(), "{mutation}: revalidate must refuse");
-				let _ = Command::new("/bin/chmod").args(["-N", fixture.sdk().to_str().unwrap_or(".")]).status();
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", fixture.sdk().to_str().unwrap_or(".")])
+					.status();
 			}
 		}
 
-		/// ACL-CONTRACT: every ancestor ACL shape outside the exact allowlist fails closed.
+		/// ACL-CONTRACT: every ancestor ACL shape outside the exact allowlist
+		/// fails closed.
 		#[test]
 		fn diagnostic_snapshot_rejects_non_allowlisted_ancestor_acls() {
 			if !ARCH_ADMITTED {
@@ -9852,15 +9996,12 @@ int main(int argc, char **argv) {
 					install_acl_spec(&fixture.above, spec);
 				}
 				let outcome = open_diagnostic_lease(&fixture.selector(), 2000);
-				assert!(
-					outcome.is_err(),
-					"ancestor ACL case {label} must fail closed, got a lease",
-				);
+				assert!(outcome.is_err(), "ancestor ACL case {label} must fail closed, got a lease",);
 			}
 		}
 
-		/// ACL-CONTRACT: the exception stops at agentDir. agentDir, sdk and the leaf keep
-		/// strict ACL absence even for the otherwise approved ACE.
+		/// ACL-CONTRACT: the exception stops at agentDir. agentDir, sdk and the
+		/// leaf keep strict ACL absence even for the otherwise approved ACE.
 		#[test]
 		fn diagnostic_snapshot_keeps_agent_boundary_strict() {
 			if !ARCH_ADMITTED {
@@ -9878,21 +10019,21 @@ int main(int argc, char **argv) {
 				};
 				install_acl_spec(&path, APPROVED_ANCESTOR_ACE);
 				let outcome = open_diagnostic_lease(&fixture.selector(), 2000);
-				assert!(
-					outcome.is_err(),
-					"the approved ACE must NOT be accepted on {target}",
-				);
-				let _ = Command::new("/bin/chmod").args(["-N", path.to_str().unwrap_or(".")]).status();
+				assert!(outcome.is_err(), "the approved ACE must NOT be accepted on {target}",);
+				let _ = Command::new("/bin/chmod")
+					.args(["-N", path.to_str().unwrap_or(".")])
+					.status();
 			}
 		}
 
 		/// R3: retained-ancestor policy is re-proved against CURRENT metadata.
 		///
-		/// The end-to-end lease form of this proof needs a whole-chain positive lease,
-		/// which the stock home `everyone deny delete` ACL still refuses (that ACL is
-		/// deliberately unchanged and the relaxation is not approved), so the two halves
-		/// are proved separately here: the identity-only revalidation accepts a loosened
-		/// or newly ACL-bearing directory, while the diagnostics ancestor policy applied
+		/// The end-to-end lease form of this proof needs a whole-chain positive
+		/// lease, which the stock home `everyone deny delete` ACL still refuses
+		/// (that ACL is deliberately unchanged and the relaxation is not
+		/// approved), so the two halves are proved separately here: the
+		/// identity-only revalidation accepts a loosened or newly ACL-bearing
+		/// directory, while the diagnostics ancestor policy applied
 		/// to the current metadata refuses it.
 		#[test]
 		fn diagnostic_snapshot_reverifies_every_retained_ancestor() {
@@ -9900,14 +10041,17 @@ int main(int argc, char **argv) {
 			let agent = root.publish(b"{}");
 			let sdk = agent.join("sdk");
 			let publication = sdk.join("broker.json");
-			let authority = match checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly) {
-				Ok(authority) => authority,
-				Err(_) => panic!("retain the fixture publication chain"),
-			};
+			let authority =
+				match checked_file_with_policy(&publication, "file", AcquisitionPolicy::ReadOnly) {
+					Ok(authority) => authority,
+					Err(_) => panic!("retain the fixture publication chain"),
+				};
 
 			for directory in [&sdk, &agent] {
 				let handle = fs::File::open(directory).expect("open retained directory");
-				let baseline = super::fstat(handle.as_raw_fd()).ok().expect("fstat directory");
+				let baseline = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
 				assert_eq!(
 					super::diagnostic_ancestor_admitted(&handle, &baseline),
 					Ok(()),
@@ -9918,7 +10062,9 @@ int main(int argc, char **argv) {
 				// retained directory. (Exact 0700 for agentDir/sdk is the chain policy.)
 				fs::set_permissions(directory, fs::Permissions::from_mode(0o770))
 					.expect("loosen retained directory");
-				let loosened = super::fstat(handle.as_raw_fd()).ok().expect("fstat directory");
+				let loosened = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
 				// Identity-only revalidation cannot see this: dev/ino/uid/type are intact.
 				assert!(
 					super::revalidate_authority(&authority).is_ok(),
@@ -9933,7 +10079,9 @@ int main(int argc, char **argv) {
 					.expect("restore retained directory");
 
 				install_acl(directory);
-				let with_acl = super::fstat(handle.as_raw_fd()).ok().expect("fstat directory");
+				let with_acl = super::fstat(handle.as_raw_fd())
+					.ok()
+					.expect("fstat directory");
 				assert!(
 					super::revalidate_authority(&authority).is_ok(),
 					"identity-only revalidation must still accept the ACL-bearing chain",
@@ -9960,9 +10108,9 @@ int main(int argc, char **argv) {
 			// unsupported. Collapsing them would assert a failure mode the product does not
 			// produce.
 			// Follows the approved contract: trusted ancestors strictly above agentDir may
-			// carry exactly one validated everyone DENY DELETE entry, while agentDir and sdk
-			// stay strict. The expectation is derived from the same decision the product
-			// makes, position by position.
+			// carry exactly one validated everyone DENY DELETE entry, while agentDir and
+			// sdk stay strict. The expectation is derived from the same decision the
+			// product makes, position by position.
 			let mut chain_acl_present = false;
 			let mut chain_acl_unproven = false;
 			let retained = super::retained_directories(&authority);
@@ -9991,8 +10139,16 @@ int main(int argc, char **argv) {
 			} else {
 				Ok(())
 			};
-			assert_eq!(super::diagnostic_chain_admitted(&authority), expected, "chain_has_acl={chain_has_acl}");
-			assert_eq!(diagnostic_reverify_authority(&authority), expected, "chain_has_acl={chain_has_acl}");
+			assert_eq!(
+				super::diagnostic_chain_admitted(&authority),
+				expected,
+				"chain_has_acl={chain_has_acl}"
+			);
+			assert_eq!(
+				diagnostic_reverify_authority(&authority),
+				expected,
+				"chain_has_acl={chain_has_acl}"
+			);
 
 			// An ACL installed on a retained directory by this test is always refused,
 			// whatever the surrounding environment looks like.
@@ -10005,9 +10161,9 @@ int main(int argc, char **argv) {
 			assert_eq!(super::diagnostic_chain_admitted(&authority), expected);
 		}
 
-		/// R4: interrupted reads are retried within a bounded budget, and a short read
-		/// is never reported as a stable snapshot. The faults are injected into the real
-		/// production read loop, not into a helper copy of it.
+		/// R4: interrupted reads are retried within a bounded budget, and a short
+		/// read is never reported as a stable snapshot. The faults are injected
+		/// into the real production read loop, not into a helper copy of it.
 		#[test]
 		fn diagnostic_snapshot_read_bounds_interrupts_and_short_reads() {
 			let root = TempDir::new();
@@ -10057,10 +10213,7 @@ int main(int argc, char **argv) {
 			fs::set_permissions(&stable, fs::Permissions::from_mode(0o600)).expect("restrict");
 			let file = fs::File::open(&stable).expect("open stable payload");
 			let far = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-			assert_eq!(
-				diagnostic_read_stable(file.as_raw_fd(), far),
-				Ok(b"stable-bytes".to_vec()),
-			);
+			assert_eq!(diagnostic_read_stable(file.as_raw_fd(), far), Ok(b"stable-bytes".to_vec()),);
 
 			// An already expired deadline forbids the read outright.
 			assert_eq!(
@@ -10079,9 +10232,14 @@ int main(int argc, char **argv) {
 				super::set_after_diagnostic_read_hook_for_test(Some((entered_tx, resume_rx)));
 				let fd = handle.as_raw_fd();
 				let reader = std::thread::spawn(move || {
-					diagnostic_read_stable(fd, std::time::Instant::now() + std::time::Duration::from_millis(5000))
+					diagnostic_read_stable(
+						fd,
+						std::time::Instant::now() + std::time::Duration::from_millis(5000),
+					)
 				});
-				entered_rx.recv().expect("reader reached the post-read barrier");
+				entered_rx
+					.recv()
+					.expect("reader reached the post-read barrier");
 				if mutation == "truncate" {
 					fs::write(&target, b"012").expect("truncate payload");
 				} else {
@@ -10098,8 +10256,9 @@ int main(int argc, char **argv) {
 			}
 		}
 
-		/// R6: the native capability is gated on the supported runtime tuple, and the
-		/// assertion follows the build's own architecture instead of hard-coding arm64.
+		/// R6: the native capability is gated on the supported runtime tuple, and
+		/// the assertion follows the build's own architecture instead of
+		/// hard-coding arm64.
 		#[test]
 		fn diagnostic_snapshot_runtime_tuple_is_gated() {
 			assert_eq!(
@@ -10138,10 +10297,7 @@ int main(int argc, char **argv) {
 			assert_eq!(local_ownership_filesystem(directory.as_raw_fd()), Ok(()));
 			let closed = directory.as_raw_fd();
 			drop(directory);
-			assert_eq!(
-				local_ownership_filesystem(closed),
-				Err(DiagnosticFailure::Unsupported),
-			);
+			assert_eq!(local_ownership_filesystem(closed), Err(DiagnosticFailure::Unsupported),);
 		}
 
 		#[test]
@@ -10205,8 +10361,8 @@ int main(int argc, char **argv) {
 			);
 			fs::remove_file(&publication).expect("drop symlink");
 
-			let fifo = std::ffi::CString::new(publication.to_str().expect("utf8 path"))
-				.expect("fifo path");
+			let fifo =
+				std::ffi::CString::new(publication.to_str().expect("utf8 path")).expect("fifo path");
 			// SAFETY: the path is NUL-terminated and mkfifo only creates the node.
 			assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0, "create fifo");
 			assert_eq!(
@@ -10237,10 +10393,10 @@ int main(int argc, char **argv) {
 		}
 
 		/// The stock macOS home directory carries a `group:everyone deny delete`
-		/// ACL, so the strict no-ACL ancestor policy refuses a publication below it
-		/// instead of downgrading to an inspection failure. A positive whole-chain
-		/// fixture needs an ACL-free root outside the user's home, which is an
-		/// unapproved path in this task.
+		/// ACL, so the strict no-ACL ancestor policy refuses a publication below
+		/// it instead of downgrading to an inspection failure. A positive
+		/// whole-chain fixture needs an ACL-free root outside the user's home,
+		/// which is an unapproved path in this task.
 		#[test]
 		fn diagnostic_snapshot_rejects_ancestor_with_extended_acl() {
 			let root = TempDir::new();
@@ -13319,7 +13475,6 @@ mod platform {
 	) -> Result<DiagnosticSnapshotLease, &'static str> {
 		Err("unsupported")
 	}
-
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -13442,7 +13597,6 @@ mod platform {
 	) -> Result<DiagnosticSnapshotLease, &'static str> {
 		Err("unsupported")
 	}
-
 }
 #[cfg(all(test, windows))]
 mod owner_only_security_tests {
@@ -15753,7 +15907,7 @@ pub struct NativeDiagnosticSnapshot {
 #[napi]
 impl NativeDiagnosticSnapshot {
 	#[napi(getter)]
-	pub fn ok(&self) -> bool {
+	pub const fn ok(&self) -> bool {
 		self.reason.is_none()
 	}
 
@@ -15768,7 +15922,12 @@ impl NativeDiagnosticSnapshot {
 		let Some(lease) = guard.as_ref() else {
 			return NativeDiagnosticSnapshotRead {
 				ok:     false,
-				reason: Some(self.reason.clone().unwrap_or_else(|| "unsafe_discovery".to_owned())),
+				reason: Some(
+					self
+						.reason
+						.clone()
+						.unwrap_or_else(|| "unsafe_discovery".to_owned()),
+				),
 				bytes:  None,
 			};
 		};
@@ -15792,14 +15951,18 @@ impl NativeDiagnosticSnapshot {
 		let Some(lease) = guard.as_ref() else {
 			return NativeDiagnosticSnapshotStatus {
 				ok:     false,
-				reason: Some(self.reason.clone().unwrap_or_else(|| "unsafe_discovery".to_owned())),
+				reason: Some(
+					self
+						.reason
+						.clone()
+						.unwrap_or_else(|| "unsafe_discovery".to_owned()),
+				),
 			};
 		};
 		match lease.revalidate_edges() {
 			Ok(()) => NativeDiagnosticSnapshotStatus { ok: true, reason: None },
-			Err(reason) => NativeDiagnosticSnapshotStatus {
-				ok:     false,
-				reason: Some(reason.to_owned()),
+			Err(reason) => {
+				NativeDiagnosticSnapshotStatus { ok: false, reason: Some(reason.to_owned()) }
 			},
 		}
 	}
@@ -15810,16 +15973,16 @@ impl NativeDiagnosticSnapshot {
 	}
 }
 
-/// Open a read-only lease over the single fixed broker publication under
-/// `agentDir`. The caller supplies only the agent directory: the publication
-/// name, the ancestor policy and the read budget are fixed by this adapter.
+/// Open a read-only lease over the fixed broker publication under `agentDir`.
+///
+/// The caller supplies only the agent directory: the publication name, the
+/// ancestor policy and the read budget are fixed by this adapter.
 #[napi]
 pub fn diagnostic_snapshot_open(agent_dir: String, budget_ms: u32) -> NativeDiagnosticSnapshot {
 	match platform::open_diagnostic_snapshot(&agent_dir, budget_ms) {
 		Ok(lease) => NativeDiagnosticSnapshot { lease: Mutex::new(Some(lease)), reason: None },
-		Err(reason) => NativeDiagnosticSnapshot {
-			lease:  Mutex::new(None),
-			reason: Some(reason.to_owned()),
+		Err(reason) => {
+			NativeDiagnosticSnapshot { lease: Mutex::new(None), reason: Some(reason.to_owned()) }
 		},
 	}
 }

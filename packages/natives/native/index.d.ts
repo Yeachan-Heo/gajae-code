@@ -993,7 +993,7 @@ export declare function detectMacOSAppearance(): MacOSAppearance | null
 /** One jsdiff change object: a run of added, removed, or common tokens. */
 export interface DiffChange {
   /** Joined token text for this run (lines keep their `
-  ` terminators). */
+` terminators). */
   value: string
   /** Number of tokens in this run. */
   count: number
@@ -1002,6 +1002,14 @@ export interface DiffChange {
   /** True when this run exists only in the old text. */
   removed: boolean
 }
+
+/**
+ * Open a read-only lease over the fixed broker publication under `agentDir`.
+ *
+ * The caller supplies only the agent directory: the publication name, the
+ * ancestor policy and the read budget are fixed by this adapter.
+ */
+export declare function diagnosticSnapshotOpen(agentDir: string, budgetMs: number): NativeDiagnosticSnapshot
 
 /**
  * Diff `oldText.split("
