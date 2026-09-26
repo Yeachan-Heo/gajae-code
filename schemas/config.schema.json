@@ -1367,6 +1367,14 @@
 				"maxAttempts": {
 					"type": "number",
 					"default": 3
+				},
+				"circuitCooldownMs": {
+					"type": "number",
+					"default": 60000
+				},
+				"circuitMaxCooldownMs": {
+					"type": "number",
+					"default": 1800000
 				}
 			},
 			"additionalProperties": false

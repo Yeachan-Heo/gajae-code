@@ -49,7 +49,7 @@ function normalizePremiumRequests(n: number): number {
  */
 async function printStats(): Promise<void> {
 	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder, byAgent } = stats;
+	const { overall, failures, byModel, byFolder, byAgent } = stats;
 
 	console.log("\n=== AI Usage Statistics ===\n");
 
@@ -67,6 +67,15 @@ async function printStats(): Promise<void> {
 	if (overall.avgTokensPerSecond !== null) {
 		console.log(`  Avg Tokens/s: ${overall.avgTokensPerSecond.toFixed(1)}`);
 	}
+
+	console.log("\nProvider Failures:");
+	console.log(
+		`  Error+Abort Share: ${formatPercent(failures.failureShare)} (${formatNumber(failures.erroredRequests)} errors, ${formatNumber(failures.abortedRequests)} aborts)`,
+	);
+	console.log(`  Failed Duration: ${formatDuration(failures.failedDurationMs)}`);
+	console.log(
+		`  Post-Failure Full-Miss Tokens: ${formatNumber(failures.postFailureFullMissTokens)} (${formatNumber(failures.postFailureFullMissRequests)}/${formatNumber(failures.postFailureRequests)} requests)`,
+	);
 
 	if (byModel.length > 0) {
 		console.log("\nBy Model:");

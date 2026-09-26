@@ -58,6 +58,7 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		getAvailableModelProfileNames: () => [...profiles.keys()],
 		getApiKeyForProvider: async () => (options.missingCredentials ? undefined : "key"),
 		getApiKey: async () => "key",
+		isSelectorCircuitOpen: (_selector: string) => false,
 	};
 }
 

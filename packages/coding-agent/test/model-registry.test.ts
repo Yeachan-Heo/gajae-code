@@ -24,7 +24,7 @@ import {
 	requiresExplicitThinkingChoice,
 } from "@gajae-code/coding-agent/config/model-registry";
 import {
-	type ModelLookupRegistry,
+	type ChainResolutionRegistry,
 	resolveModelFromString,
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
@@ -1698,10 +1698,11 @@ describe("ModelRegistry", () => {
 			const fixtureModels = () => fixtureCandidates(registry);
 			const childA = "subagent:parent-session:child-a";
 			const childB = "subagent:parent-session:child-b";
-			const lookup: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey"> = {
+			const lookup: ChainResolutionRegistry = {
 				// Pin availability to fixture providers so ambient host credentials
 				// (e.g. OpenGateway) cannot change canonical resolution in this test.
 				getAvailable: () => fixtureModels(),
+				isSelectorCircuitOpen: registry.isSelectorCircuitOpen.bind(registry),
 				resolveCanonicalModel: registry.resolveCanonicalModel.bind(registry),
 				seedCanonicalVariant: registry.seedCanonicalVariant.bind(registry),
 				getApiKey: async model => (model.provider === "alpha" ? "test-key" : undefined),
