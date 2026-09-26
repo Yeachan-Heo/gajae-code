@@ -14,6 +14,7 @@ import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
 import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
 import type { QueuedMessageEditEntry } from "../src/session/agent-session";
+import { ManagedAppendIdentityMismatchError } from "../src/session/internal/managed-session-storage";
 import type { LoadedPastedImageBatch, LoadPastedImageBatchOptions } from "../src/utils/pasted-image-loading";
 import { formatPastedImageReference } from "../src/utils/pasted-image-path";
 
@@ -953,6 +954,24 @@ describe("InputController keybinding setup", () => {
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
+
+	it("reports a rejected streaming Enter submission instead of leaking an unhandled rejection", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "steer" });
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		const mismatch = new ManagedAppendIdentityMismatchError("session.jsonl");
+		spies.prompt.mockImplementationOnce(async () => {
+			throw mismatch;
+		});
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await expect(editor.onSubmit?.("steer while taken over")).resolves.toBeUndefined();
+
+		expect(ctx.showError).toHaveBeenCalledWith(mismatch.message);
+		expect(ctx.locallySubmittedUserSignatures.has("steer while taken over\u00000")).toBe(false);
+	});
+
 	it("deletes an attached image placeholder atomically and restores its attachment on undo", async () => {
 		const { InputController, ctx, spies } = await createContext();
 		const image: InteractiveModeContext["pendingImages"][number] = {
