@@ -102,7 +102,9 @@ export async function createLifecycleAgentSession(
 			// Explicit model pin (#4707): resolve through the staged selector
 			// resolver after extension providers register (modelPattern), so the
 			// pin matches CLI `--model` semantics instead of bypassing them.
-			...(modelId !== undefined ? { modelPattern: modelId } : {}),
+			// Defer startup profile activation so pin validation happens first,
+			// before the default profile could be activated in place of the pin.
+			...(modelId !== undefined ? { modelPattern: modelId, deferModelProfileActivation: true } : {}),
 			// Memory startup (rollout summarisation) issues one LLM request per
 			// claimed rollout, so its duration scales with the backlog. Keeping it
 			// inside the broker's readiness window is what kills the child at the

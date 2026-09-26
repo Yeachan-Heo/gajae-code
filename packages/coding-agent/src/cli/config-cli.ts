@@ -18,6 +18,7 @@ import {
 } from "../config/autorouting-contract";
 import { loadEffectiveModelProfiles } from "../config/model-preset-registry";
 import { resolveModelProfileName } from "../config/model-profile-contract";
+import { commitDurableModelProfileOwnership } from "../config/model-profile-ownership";
 import { ModelsConfigFile } from "../config/model-registry";
 import {
 	getDefault,
@@ -102,7 +103,6 @@ function redactConfigValue(path: string, value: unknown, showSecrets?: boolean):
 /** Find setting definition by path */
 function findSettingDef(path: string): CliSettingDef | undefined {
 	if (path === "modelProfile.ownership") return undefined;
-	if (path === "modelProfile.default" && settings.getGlobal("modelProfile.ownership") !== undefined) return undefined;
 	if (!(path in SETTINGS_SCHEMA)) return undefined;
 	const key = path as SettingPath;
 	const ui = getUi(key);
@@ -228,7 +228,7 @@ function getTypeDisplay(def: CliSettingDef): string {
 // Schema-Driven Value Parsing
 // =============================================================================
 
-function parseAndSetValue(path: SettingPath, rawValue: string): void {
+function parseSettingValue(path: SettingPath, rawValue: string): unknown {
 	const schemaType = getType(path);
 	let parsedValue: unknown;
 
@@ -304,7 +304,7 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 		throw new Error(`Invalid value for ${path}: ${issues.map(issue => `${issue.path}: ${issue.detail}`).join("; ")}`);
 	}
 
-	settings.set(path, parsedValue as SettingValue<typeof path>);
+	return parsedValue;
 }
 
 // =============================================================================
@@ -491,15 +491,42 @@ async function handleSet(
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
 		process.exit(1);
 	}
+	if (def.path === "modelProfile.ownership") {
+		console.error(chalk.red("modelProfile.ownership is managed internally; set modelProfile.default instead."));
+		process.exit(1);
+	}
 
+	let parsedValue: unknown;
 	try {
-		parseAndSetValue(def.path, value);
+		parsedValue = parseSettingValue(def.path, value);
 	} catch (err) {
 		console.error(chalk.red(String(err)));
 		process.exit(1);
 	}
 
-	await persistOrExit();
+	if (def.path === "modelProfile.default") {
+		try {
+			if (typeof parsedValue === "string" && parsedValue.trim() !== "") {
+				const profileName = resolveModelProfileName(
+					parsedValue.trim(),
+					loadEffectiveModelProfiles(ModelsConfigFile.load()?.profiles),
+				);
+				if (!profileName) throw new Error(`Unknown model profile "${parsedValue}".`);
+				await commitDurableModelProfileOwnership(settings, { kind: "profile", profile: profileName }, [], () => {
+					if (!loadEffectiveModelProfiles(ModelsConfigFile.load()?.profiles).has(profileName))
+						throw new Error(`Model profile "${profileName}" was removed before the durable switch committed.`);
+				});
+			} else {
+				await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+			}
+		} catch (err) {
+			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+			process.exit(1);
+		}
+	} else {
+		settings.set(def.path, parsedValue as SettingValue<typeof def.path>);
+		await persistOrExit();
+	}
 
 	const newValue = settings.get(def.path);
 	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
@@ -518,10 +545,31 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 		process.exit(1);
 	}
 
+	// Special handling for modelProfile.default: allow reset even when ownership is set
+	if (key === "modelProfile.default") {
+		const defaultValue = getDefault(key as SettingPath);
+		try {
+			await commitDurableModelProfileOwnership(settings, { kind: "cleared" });
+		} catch (err) {
+			console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+			process.exit(1);
+		}
+		if (flags.json) {
+			console.log(JSON.stringify({ key, value: defaultValue }));
+		} else {
+			console.log(chalk.green(`${theme.status.success} Reset ${key} to ${formatValue(defaultValue)}`));
+		}
+		return;
+	}
+
 	const def = findSettingDef(key);
 	if (!def) {
 		console.error(chalk.red(`Unknown setting: ${key}`));
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+	if (def.path === "modelProfile.ownership") {
+		console.error(chalk.red("modelProfile.ownership is managed internally; reset modelProfile.default instead."));
 		process.exit(1);
 	}
 
@@ -529,7 +577,6 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 	const defaultValue = getDefault(path);
 	if (defaultValue === undefined) settings.unset(path);
 	else settings.set(path, defaultValue as SettingValue<typeof path>);
-
 	await persistOrExit();
 
 	if (flags.json) {

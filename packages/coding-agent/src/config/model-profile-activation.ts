@@ -5,6 +5,16 @@ import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
 import {
+	commitDurableModelProfileOwnershipWithResult,
+	type DurableModelProfileOwnership,
+	type DurableModelProfileOwnershipCommit,
+	ModelProfileApplyCommittedError,
+	type ModelProfileOwnershipMarker,
+	modelProfileOwnershipMarkersEqual,
+	type ProfileOwnershipChangedEvent,
+	readDurableModelProfileOwnership,
+} from "./model-profile-ownership";
+import {
 	aggregateModelProfileRequiredProviders,
 	deriveModelProfileMappedProviders,
 	formatModelProfileDisplayLabel,
@@ -34,7 +44,7 @@ import {
 	splitSelectorThinkingSuffix,
 } from "./model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
-import type { Settings } from "./settings";
+import type { Settings, SettingsAtomicPatch } from "./settings";
 
 type ModelProfileActivationSession = Pick<
 	AgentSession,
@@ -44,6 +54,14 @@ type ModelProfileActivationSession = Pick<
 	setModelTemporary?: AgentSession["setModelTemporary"];
 	setActiveModelProfile?: (name: string | undefined) => void;
 	getActiveModelProfile?: () => string | undefined;
+	getModelProfileOwnershipMarker?: () => ModelProfileOwnershipMarker | undefined;
+	getDurableModelProfileOwnershipSnapshot?: () => DurableModelProfileOwnership;
+	commitModelProfileOwnershipMarker?: (marker: ModelProfileOwnershipMarker) => Promise<void>;
+	updateDurableModelProfileOwnershipSnapshot?: (ownership: DurableModelProfileOwnership) => void;
+	markModelProfileOwnershipFailed?: (error: ModelProfileApplyCommittedError) => void;
+	markModelProfileOwnershipReady?: () => void;
+	hasModelProfileOwnershipFailure?: () => boolean;
+	emitProfileOwnershipChanged?: (event: ProfileOwnershipChangedEvent) => void;
 	/** Record which runtime override keys this activation installed (session-scoped). */
 	noteProfileInstalledOverrides?: (
 		modelRoles: readonly string[],
@@ -110,6 +128,7 @@ export interface PrepareModelProfileActivationOptions {
 				| "restoreSessionCanonicalVariant"
 				| "getConfiguredProviderIds"
 				| "isKnownProvider"
+				| "assertCurrentModelProfileExists"
 			>
 		> & {
 			getError?: ModelRegistry["getError"];
@@ -120,13 +139,28 @@ export interface PrepareModelProfileActivationOptions {
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
+	/** Session marker to commit after apply; startup of a durable baseline uses inherit. */
+	ownershipMarker?: ModelProfileOwnershipMarker;
+	/** Startup reconciliation installs runtime state without persisting another session marker. */
+	commitOwnershipMarker?: boolean;
+	/** Reconciliation never replays a transition-success event. */
+	emitOwnershipEvent?: boolean;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
 	session: ModelProfileActivationSession & { setModelTemporary: AgentSession["setModelTemporary"] };
 	settings: Pick<
 		Settings,
-		"clearOverride" | "get" | "getGlobal" | "getOverride" | "override" | "set" | "unset" | "flush" | "flushOrThrow"
+		| "clearOverride"
+		| "commitAtomicBatchWithCurrent"
+		| "get"
+		| "getGlobal"
+		| "getOverride"
+		| "override"
+		| "set"
+		| "unset"
+		| "flush"
+		| "flushOrThrow"
 	>;
 	previousModel: Model<Api> | undefined;
 	previousThinkingLevel: ThinkingLevel | undefined;
@@ -156,6 +190,9 @@ export interface PreparedModelProfileActivation {
 	modelRoles: Record<string, ModelSelectorValue>;
 	agentModelOverrides: Record<string, ModelSelectorValue>;
 	previousActiveModelProfile: string | undefined;
+	previousModelProfileOwnershipMarker: ModelProfileOwnershipMarker | undefined;
+	previousModelProfileOwnershipFailure: boolean;
+	previousDurableModelProfileOwnership: DurableModelProfileOwnership;
 	/**
 	 * The session resume default ("provider/id") captured BEFORE activation —
 	 * the model resume would restore prior to this profile. Snapshotted
@@ -188,12 +225,30 @@ export interface MaterializeModelProfileAssignmentOptions {
 		| "setConfiguredModelChain"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
+		| "getModelProfileOwnershipMarker"
+		| "getDurableModelProfileOwnershipSnapshot"
+		| "commitModelProfileOwnershipMarker"
+		| "updateDurableModelProfileOwnershipSnapshot"
+		| "markModelProfileOwnershipFailed"
+		| "hasModelProfileOwnershipFailure"
+		| "emitProfileOwnershipChanged"
+		| "syncEagerDelegation"
 		| "getDefaultFallbackRuntimeState"
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
 		| "clearProfileInstalledOverrides"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "getOverride" | "override" | "set" | "unset">;
+	settings: Pick<
+		Settings,
+		| "clearOverride"
+		| "commitAtomicBatchWithCurrent"
+		| "get"
+		| "getGlobal"
+		| "getOverride"
+		| "override"
+		| "set"
+		| "unset"
+	>;
 	role: GjcModelAssignmentTargetId;
 	selector: string;
 }
@@ -210,12 +265,30 @@ export interface MaterializeModelProfileAssignmentsOptions {
 		| "setConfiguredModelChain"
 		| "setActiveModelProfile"
 		| "getActiveModelProfile"
+		| "getModelProfileOwnershipMarker"
+		| "getDurableModelProfileOwnershipSnapshot"
+		| "commitModelProfileOwnershipMarker"
+		| "updateDurableModelProfileOwnershipSnapshot"
+		| "markModelProfileOwnershipFailed"
+		| "hasModelProfileOwnershipFailure"
+		| "emitProfileOwnershipChanged"
+		| "syncEagerDelegation"
 		| "getDefaultFallbackRuntimeState"
 		| "restoreDefaultFallbackRuntimeState"
 		| "modelRegistry"
 		| "clearProfileInstalledOverrides"
 	>;
-	settings: Pick<Settings, "clearOverride" | "get" | "getGlobal" | "getOverride" | "override" | "set" | "unset">;
+	settings: Pick<
+		Settings,
+		| "clearOverride"
+		| "commitAtomicBatchWithCurrent"
+		| "get"
+		| "getGlobal"
+		| "getOverride"
+		| "override"
+		| "set"
+		| "unset"
+	>;
 	assignments: ReadonlyMap<GjcModelAssignmentTargetId, string> | Partial<Record<GjcModelAssignmentTargetId, string>>;
 }
 
@@ -294,14 +367,16 @@ function concretizeMaterializedAssignmentValues(
 	);
 }
 
-function commitMaterializedProfileAssignments(
+async function commitMaterializedProfileAssignments(
 	options: MaterializeModelProfileAssignmentOptions | MaterializeModelProfileAssignmentsOptions,
+	profileName: string,
 	modelRoles: Record<string, ModelSelectorValue>,
 	agentModelOverrides: Record<string, ModelSelectorValue>,
-): boolean {
-	const previousPersistedModelRoles = options.settings.getGlobal("modelRoles");
-	const previousPersistedAgentModelOverrides = options.settings.getGlobal("task.agentModelOverrides");
-	const previousPersistedDefaultProfile = options.settings.getGlobal("modelProfile.default");
+): Promise<boolean> {
+	const oldSessionMarker = options.session.getModelProfileOwnershipMarker?.();
+	const previousOwnershipFailure = options.session.hasModelProfileOwnershipFailure?.() ?? false;
+	const observedDurableOwnership =
+		options.session.getDurableModelProfileOwnershipSnapshot?.() ?? readDurableModelProfileOwnership(options.settings);
 	const previousModelRolesOverride = options.settings.getOverride("modelRoles");
 	const previousAgentModelOverridesOverride = options.settings.getOverride("task.agentModelOverrides");
 	const previousDefaultProfileOverride = options.settings.getOverride("modelProfile.default");
@@ -309,14 +384,27 @@ function commitMaterializedProfileAssignments(
 	const previousChain = options.session.getConfiguredModelChainState?.("default");
 	const previousFallbackRuntimeState = options.session.getDefaultFallbackRuntimeState?.();
 	const previousCanonicalVariant = options.session.modelRegistry?.getSessionCanonicalVariant?.(
-		(options.session as { sessionId?: string }).sessionId ?? "",
+		options.session.sessionId,
 	);
+	const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
+	const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
+	const durableCommit = await commitDurableModelProfileOwnershipWithResult(
+		options.settings,
+		{ kind: "cleared" },
+		[
+			{ path: "modelRoles", op: "set", value: nextModelRoles },
+			{
+				path: "task.agentModelOverrides",
+				op: "set",
+				value: nextAgentModelOverrides,
+			},
+		],
+		undefined,
+		observedDurableOwnership,
+	);
+	const committed = durableCommit.ownership;
+	options.session.updateDurableModelProfileOwnershipSnapshot?.(committed);
 	try {
-		const nextModelRoles = concretizeMaterializedAssignmentValues(options, modelRoles);
-		const nextAgentModelOverrides = concretizeMaterializedAssignmentValues(options, agentModelOverrides);
-		options.settings.set("modelRoles", nextModelRoles);
-		options.settings.set("task.agentModelOverrides", nextAgentModelOverrides);
-		options.settings.unset("modelProfile.default");
 		options.settings.clearOverride("modelProfile.default");
 		options.settings.override("modelRoles", nextModelRoles);
 		options.settings.override("task.agentModelOverrides", nextAgentModelOverrides);
@@ -328,7 +416,8 @@ function commitMaterializedProfileAssignments(
 			true,
 		);
 		options.session.setActiveModelProfile?.(undefined);
-		return true;
+		await options.session.commitModelProfileOwnershipMarker?.({ kind: "inherit" });
+		options.session.clearProfileInstalledOverrides?.();
 	} catch (error) {
 		const rollbackErrors: unknown[] = [];
 		const restore = (action: () => void): void => {
@@ -350,32 +439,6 @@ function commitMaterializedProfileAssignments(
 		if (previousFallbackRuntimeState) {
 			restore(() => options.session.restoreDefaultFallbackRuntimeState?.(previousFallbackRuntimeState));
 		}
-		if (options.session.modelRegistry) {
-			restore(() => {
-				const sessionId = (options.session as { sessionId?: string }).sessionId;
-				if (!sessionId) return;
-				if (previousCanonicalVariant) {
-					options.session.modelRegistry?.restoreSessionCanonicalVariant?.(sessionId, previousCanonicalVariant);
-				} else {
-					options.session.modelRegistry?.clearCanonicalVariant?.(sessionId);
-				}
-			});
-		}
-		restore(() =>
-			previousPersistedModelRoles === undefined
-				? options.settings.unset("modelRoles")
-				: options.settings.set("modelRoles", previousPersistedModelRoles),
-		);
-		restore(() =>
-			previousPersistedAgentModelOverrides === undefined
-				? options.settings.unset("task.agentModelOverrides")
-				: options.settings.set("task.agentModelOverrides", previousPersistedAgentModelOverrides),
-		);
-		restore(() =>
-			previousPersistedDefaultProfile === undefined
-				? options.settings.unset("modelProfile.default")
-				: options.settings.set("modelProfile.default", previousPersistedDefaultProfile),
-		);
 		restore(() =>
 			previousModelRolesOverride === undefined
 				? options.settings.clearOverride("modelRoles")
@@ -392,18 +455,98 @@ function commitMaterializedProfileAssignments(
 				: options.settings.override("modelProfile.default", previousDefaultProfileOverride),
 		);
 		restore(() => options.session.setActiveModelProfile?.(previousActiveProfile));
-		if (rollbackErrors.length > 0) {
-			throw new AggregateError(
-				[error, ...rollbackErrors],
-				"Failed to materialize model profile and fully restore prior state",
+		if (options.session.modelRegistry) {
+			restore(() =>
+				previousCanonicalVariant !== undefined &&
+				options.session.modelRegistry?.restoreSessionCanonicalVariant?.(
+					options.session.sessionId,
+					previousCanonicalVariant,
+				) !== true
+					? options.session.modelRegistry?.clearCanonicalVariant?.(options.session.sessionId)
+					: previousCanonicalVariant === undefined
+						? options.session.modelRegistry?.clearCanonicalVariant?.(options.session.sessionId)
+						: undefined,
 			);
 		}
-		throw error;
+		try {
+			await options.session.commitModelProfileOwnershipMarker?.(oldSessionMarker ?? { kind: "inherit" });
+		} catch (rollbackError) {
+			rollbackErrors.push(rollbackError);
+		}
+		const cause =
+			rollbackErrors.length === 0
+				? error
+				: new AggregateError(
+						[error, ...rollbackErrors],
+						"Durable profile materialization committed; runtime rollback was incomplete.",
+					);
+		const committedError = new ModelProfileApplyCommittedError(profileName, committed.version, cause);
+		options.session.markModelProfileOwnershipFailed?.(committedError);
+		const ownershipStateChanged =
+			durableCommit.wrote || !modelProfileOwnershipMarkersEqual(oldSessionMarker, { kind: "inherit" });
+		if (ownershipStateChanged) {
+			try {
+				options.session.emitProfileOwnershipChanged?.({
+					type: "profile_ownership_changed",
+					transitionId: globalThis.crypto.randomUUID(),
+					source: durableCommit.wrote ? "durable" : "recovery",
+					oldMarker: oldSessionMarker ?? { kind: "inherit" },
+					newMarker: { kind: "inherit" },
+					oldSessionId: options.session.sessionId,
+					sessionId: options.session.sessionId,
+					observedDurableVersion: durableCommit.wrote ? observedDurableOwnership.version : committed.version,
+					...(durableCommit.wrote ? { committedDurableVersion: committed.version } : {}),
+					outcome: "failed",
+				});
+			} catch (eventError) {
+				logger.warn("Failed to emit profile ownership materialization failure", {
+					profile: profileName,
+					error: eventError instanceof Error ? eventError.message : String(eventError),
+				});
+			}
+		}
+		throw committedError;
 	}
+	try {
+		await options.session.syncEagerDelegation?.();
+	} catch (error) {
+		logger.warn("Failed to refresh delegation after durable profile materialization", {
+			profile: profileName,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	const ownershipStateChanged =
+		durableCommit.wrote ||
+		previousOwnershipFailure ||
+		!modelProfileOwnershipMarkersEqual(oldSessionMarker, { kind: "inherit" });
+	if (ownershipStateChanged) {
+		try {
+			options.session.emitProfileOwnershipChanged?.({
+				type: "profile_ownership_changed",
+				transitionId: globalThis.crypto.randomUUID(),
+				source: durableCommit.wrote ? "durable" : "recovery",
+				oldMarker: oldSessionMarker ?? { kind: "inherit" },
+				newMarker: { kind: "inherit" },
+				oldSessionId: options.session.sessionId,
+				sessionId: options.session.sessionId,
+				observedDurableVersion: durableCommit.wrote ? observedDurableOwnership.version : committed.version,
+				...(durableCommit.wrote ? { committedDurableVersion: committed.version } : {}),
+				outcome: durableCommit.wrote ? "committed" : "reconciled",
+			});
+		} catch (error) {
+			logger.warn("Failed to emit profile ownership materialization event", {
+				profile: profileName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return true;
 }
 
-export function materializeActiveModelProfileAssignment(options: MaterializeModelProfileAssignmentOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
+export async function materializeActiveModelProfileAssignment(
+	options: MaterializeModelProfileAssignmentOptions,
+): Promise<boolean> {
+	const activeProfile = options.session.getActiveModelProfile?.();
 	if (!activeProfile) return false;
 
 	const nextModelRoles = { ...options.settings.get("modelRoles") };
@@ -423,13 +566,13 @@ export function materializeActiveModelProfileAssignment(options: MaterializeMode
 		nextAgentModelOverrides[options.role] = options.selector;
 	}
 
-	const committed = commitMaterializedProfileAssignments(options, nextModelRoles, nextAgentModelOverrides);
-	if (committed) options.session.clearProfileInstalledOverrides?.();
-	return committed;
+	return commitMaterializedProfileAssignments(options, activeProfile, nextModelRoles, nextAgentModelOverrides);
 }
 
-export function materializeActiveModelProfileAssignments(options: MaterializeModelProfileAssignmentsOptions): boolean {
-	const activeProfile = options.session.getActiveModelProfile?.() ?? options.settings.get("modelProfile.default");
+export async function materializeActiveModelProfileAssignments(
+	options: MaterializeModelProfileAssignmentsOptions,
+): Promise<boolean> {
+	const activeProfile = options.session.getActiveModelProfile?.();
 	if (!activeProfile) return false;
 
 	const materializedAssignments = getMaterializedAssignments(options.assignments);
@@ -453,9 +596,7 @@ export function materializeActiveModelProfileAssignments(options: MaterializeMod
 		}
 	}
 
-	const committed = commitMaterializedProfileAssignments(options, nextModelRoles, nextAgentModelOverrides);
-	if (committed) options.session.clearProfileInstalledOverrides?.();
-	return committed;
+	return commitMaterializedProfileAssignments(options, activeProfile, nextModelRoles, nextAgentModelOverrides);
 }
 
 export class ModelProfileCredentialError extends Error {
@@ -648,10 +789,11 @@ export function requiresQualifiedModelProfileRoleResolution(profile: Pick<ModelP
 	return profile.source === "user" || profile.source === "registry";
 }
 
-/** Resolve a removed saved-session default through the durable profile without mutating persistent state. */
+/** Resolve a removed saved-session default through its already-resolved owner without mutating persistent state. */
 export async function resolveMissingSessionModelRecovery(options: {
 	modelRegistry: PrepareModelProfileActivationOptions["modelRegistry"];
 	settings: Pick<Settings, "get" | "getModelRole">;
+	profileName: string;
 	defaultEntries: readonly string[];
 	skips: Array<{ selector: string; reason: string }>;
 	savedDefault: string | undefined;
@@ -697,13 +839,12 @@ export async function resolveMissingSessionModelRecovery(options: {
 				model.provider.toLowerCase() === savedConcreteDefault.provider.toLowerCase() &&
 				model.id.toLowerCase() === savedConcreteDefault.id.toLowerCase(),
 		);
-	const durableProfile = options.settings.get("modelProfile.default");
-	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !durableProfile)
-		return undefined;
+	const profileName = options.profileName;
+	if (!savedSelectorsMissingFromCatalog || !savedConcreteDefaultMissingFromCatalog || !profileName) return undefined;
 	return resolveModelProfileDefaultChain({
 		modelRegistry: options.modelRegistry,
 		settings: options.settings,
-		profileName: durableProfile,
+		profileName,
 		credentialSessionId: options.credentialSessionId,
 	});
 }
@@ -1177,64 +1318,6 @@ async function preflightModelProfileRoleBindings(options: {
 	};
 }
 
-async function concretizeProfileSelectorValue(
-	selectorValue: ModelSelectorValue,
-	prepared: PreparedModelProfileActivation,
-): Promise<ModelSelectorValue> {
-	const candidates = prepared.modelRegistry.getAvailable?.() ?? prepared.modelRegistry.getAll();
-	const credentialSessionId = prepared.session.credentialSessionId ?? prepared.session.sessionId;
-	const concrete = await Promise.all(
-		normalizeModelSelectorValue(selectorValue).map(async selector => {
-			const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
-			const resolved = bareAlias
-				? await resolveModelChainWithAuth(
-						[selector],
-						{
-							getAvailable: () => candidates,
-							getApiKey: model =>
-								prepared.modelRegistry.getApiKeyForProvider(model.provider, credentialSessionId, model.baseUrl),
-							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel.bind(prepared.modelRegistry),
-							resolveModelByLookupAlias: prepared.modelRegistry.resolveModelByLookupAlias?.bind(
-								prepared.modelRegistry,
-							),
-							lookupAliasExists: prepared.modelRegistry.lookupAliasExists?.bind(prepared.modelRegistry),
-							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
-						},
-						prepared.settings as Settings,
-						credentialSessionId,
-						{
-							managedFallback: true,
-							aliasIntent: "preset-equivalent",
-							canonicalSessionId: prepared.session.sessionId,
-							credentialSessionId,
-						},
-					)
-				: resolveModelRoleValue(selector, candidates, {
-						settings: prepared.settings as Settings,
-						modelRegistry: prepared.modelRegistry,
-						sessionId: prepared.session.sessionId,
-						credentialSessionId,
-						aliasIntent: "preset-equivalent",
-					});
-			if (!resolved.model) {
-				if (bareAlias) return undefined;
-				return selector;
-			}
-			const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
-			return resolved.explicitThinkingLevel && resolved.thinkingLevel
-				? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
-				: concreteSelector;
-		}),
-	);
-	const resolvedConcrete = concrete.filter((selector): selector is string => selector !== undefined);
-	if (resolvedConcrete.length === 0) {
-		throw new Error(
-			`Model profile deletion could not concretize authenticated selector: ${normalizeModelSelectorValue(selectorValue)[0]}`,
-		);
-	}
-	return resolvedConcrete.length === 1 && typeof selectorValue === "string" ? resolvedConcrete[0]! : resolvedConcrete;
-}
-
 /**
  * Restore the session's canonical sticky variant after a failed activation.
  * The exact pre-clear sticky selector (snapshotted verbatim, never re-derived
@@ -1524,6 +1607,11 @@ export async function prepareModelProfileActivation(
 			modelRoles,
 			agentModelOverrides,
 			previousActiveModelProfile: options.session.getActiveModelProfile?.(),
+			previousModelProfileOwnershipMarker: options.session.getModelProfileOwnershipMarker?.(),
+			previousModelProfileOwnershipFailure: options.session.hasModelProfileOwnershipFailure?.() ?? false,
+			previousDurableModelProfileOwnership:
+				options.session.getDurableModelProfileOwnershipSnapshot?.() ??
+				readDurableModelProfileOwnership(options.settings),
 			previousSessionDefaultModel: options.session.getSessionDefaultModelSelector?.(),
 			previousDefaultFallbackRuntimeState: options.session.getDefaultFallbackRuntimeState?.(),
 		};
@@ -1575,19 +1663,52 @@ function incompleteModelProfileRollbackError(
 	);
 }
 
+async function commitPreparedDurableModelProfileOwnership(
+	prepared: PreparedModelProfileActivation,
+	marker: ModelProfileOwnershipMarker,
+): Promise<DurableModelProfileOwnershipCommit> {
+	const thinkingPatches: SettingsAtomicPatch[] =
+		marker.kind === "profile" &&
+		prepared.defaultThinkingLevel !== undefined &&
+		prepared.defaultThinkingLevel !== ThinkingLevel.Inherit
+			? [{ path: "defaultThinkingLevel", op: "set", value: prepared.defaultThinkingLevel }]
+			: [];
+	return commitDurableModelProfileOwnershipWithResult(
+		prepared.settings,
+		marker,
+		thinkingPatches,
+		marker.kind === "profile"
+			? () => prepared.modelRegistry.assertCurrentModelProfileExists?.(marker.profile)
+			: undefined,
+		prepared.previousDurableModelProfileOwnership,
+	);
+}
+
 export async function applyPreparedModelProfileActivation(
 	prepared: PreparedModelProfileActivation,
 	options: ApplyModelProfileActivationOptions = {},
 ): Promise<void> {
 	let activationStage = "default chain";
+	let committedDurableOwnership: DurableModelProfileOwnership | undefined;
+	let durableOwnershipVersionAdvanced = false;
 	let modelMutationStarted = false;
 	let overridesChanged = false;
 	let modelRolesChanged = false;
-	let persistentMutationStarted = false;
 	let defaultChainChanged = false;
 	let resumeDefaultChanged = false;
+	let ownershipMarkerChanged = false;
 
 	try {
+		if (options.persistDefault) {
+			activationStage = "commit durable profile ownership";
+			const durableCommit = await commitPreparedDurableModelProfileOwnership(prepared, {
+				kind: "profile",
+				profile: prepared.profileName,
+			});
+			committedDurableOwnership = durableCommit.ownership;
+			durableOwnershipVersionAdvanced = durableCommit.wrote;
+			prepared.session.updateDurableModelProfileOwnershipSnapshot?.(committedDurableOwnership);
+		}
 		const ownedDefaultChain =
 			prepared.defaultChain.length > 0
 				? prepared.defaultChain
@@ -1639,21 +1760,6 @@ export async function applyPreparedModelProfileActivation(
 			...prepared.agentModelOverrides,
 		});
 		overridesChanged = true;
-		if (options.persistDefault) {
-			persistentMutationStarted = true;
-			activationStage = "persist model roles";
-			prepared.settings.set("modelRoles", {});
-			activationStage = "persist agent roles";
-			prepared.settings.set("task.agentModelOverrides", {});
-			if (prepared.defaultThinkingLevel !== undefined && prepared.defaultThinkingLevel !== ThinkingLevel.Inherit) {
-				activationStage = "persist thinking level";
-				prepared.settings.set("defaultThinkingLevel", prepared.defaultThinkingLevel);
-			}
-			activationStage = "persist default profile";
-			prepared.settings.set("modelProfile.default", prepared.profileName);
-			activationStage = "forward settings flush";
-			await prepared.settings.flushOrThrow();
-		}
 		activationStage = "active profile marker";
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
@@ -1669,6 +1775,46 @@ export async function applyPreparedModelProfileActivation(
 			Object.keys(prepared.agentModelOverrides),
 			prepared.previousModel,
 		);
+		const nextSessionMarker: ModelProfileOwnershipMarker =
+			options.ownershipMarker ??
+			(options.persistDefault ? { kind: "inherit" } : { kind: "profile", profile: prepared.profileName });
+		if (options.commitOwnershipMarker !== false && prepared.session.commitModelProfileOwnershipMarker) {
+			activationStage = "persist session ownership marker";
+			ownershipMarkerChanged = true;
+			await prepared.session.commitModelProfileOwnershipMarker(nextSessionMarker);
+		}
+		prepared.session.markModelProfileOwnershipReady?.();
+		const ownershipStateChanged =
+			durableOwnershipVersionAdvanced ||
+			prepared.previousModelProfileOwnershipFailure ||
+			!modelProfileOwnershipMarkersEqual(prepared.previousModelProfileOwnershipMarker, nextSessionMarker);
+		if (options.emitOwnershipEvent !== false && ownershipStateChanged) {
+			const event: ProfileOwnershipChangedEvent = {
+				type: "profile_ownership_changed",
+				transitionId: globalThis.crypto.randomUUID(),
+				source: options.persistDefault ? (durableOwnershipVersionAdvanced ? "durable" : "recovery") : "session",
+				oldMarker: prepared.previousModelProfileOwnershipMarker ?? { kind: "inherit" },
+				newMarker: nextSessionMarker,
+				oldSessionId: prepared.session.sessionId,
+				sessionId: prepared.session.sessionId,
+				observedDurableVersion:
+					options.persistDefault && !durableOwnershipVersionAdvanced
+						? (committedDurableOwnership?.version ?? prepared.previousDurableModelProfileOwnership.version)
+						: prepared.previousDurableModelProfileOwnership.version,
+				...(durableOwnershipVersionAdvanced && committedDurableOwnership
+					? { committedDurableVersion: committedDurableOwnership.version }
+					: {}),
+				outcome: options.persistDefault && !durableOwnershipVersionAdvanced ? "reconciled" : "committed",
+			};
+			try {
+				prepared.session.emitProfileOwnershipChanged?.(event);
+			} catch (error) {
+				logger.warn("Failed to emit model-profile ownership event after commit", {
+					profile: prepared.profileName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 	} catch (error) {
 		const rollbackErrors: Array<{ stage: string; error: unknown }> = [];
 		const restore = (stage: string, action: () => void): void => {
@@ -1678,28 +1824,6 @@ export async function applyPreparedModelProfileActivation(
 				rollbackErrors.push({ stage, error: rollbackError });
 			}
 		};
-		if (persistentMutationStarted) {
-			restore("restore default profile setting", () =>
-				prepared.previousPersistedDefaultProfile === undefined
-					? prepared.settings.unset("modelProfile.default")
-					: prepared.settings.set("modelProfile.default", prepared.previousPersistedDefaultProfile),
-			);
-			restore("restore model role setting", () =>
-				prepared.previousPersistedModelRoles === undefined
-					? prepared.settings.unset("modelRoles")
-					: prepared.settings.set("modelRoles", prepared.previousPersistedModelRoles),
-			);
-			restore("restore agent role setting", () =>
-				prepared.previousPersistedAgentModelOverrides === undefined
-					? prepared.settings.unset("task.agentModelOverrides")
-					: prepared.settings.set("task.agentModelOverrides", prepared.previousPersistedAgentModelOverrides),
-			);
-			restore("restore thinking level setting", () =>
-				prepared.previousPersistedDefaultThinkingLevel === undefined
-					? prepared.settings.unset("defaultThinkingLevel")
-					: prepared.settings.set("defaultThinkingLevel", prepared.previousPersistedDefaultThinkingLevel),
-			);
-		}
 		if (modelRolesChanged) {
 			restore("restore model role overrides", () =>
 				prepared.previousModelRolesOverride === undefined
@@ -1762,12 +1886,53 @@ export async function applyPreparedModelProfileActivation(
 		restore("restore canonical model variant", () =>
 			restoreCanonicalVariant(prepared.modelRegistry, prepared.session.sessionId, prepared.previousCanonicalVariant),
 		);
-		if (persistentMutationStarted) {
+		if (ownershipMarkerChanged) {
 			try {
-				await prepared.settings.flushOrThrow();
+				await prepared.session.commitModelProfileOwnershipMarker?.(
+					prepared.previousModelProfileOwnershipMarker ?? { kind: "inherit" },
+				);
 			} catch (rollbackError) {
-				rollbackErrors.push({ stage: "restore settings flush", error: rollbackError });
+				rollbackErrors.push({ stage: "restore session ownership marker", error: rollbackError });
 			}
+		}
+		if (committedDurableOwnership) {
+			const cause =
+				rollbackErrors.length > 0
+					? new AggregateError(
+							[error, ...rollbackErrors.map(item => item.error)],
+							"Durable profile ownership committed, runtime application failed, and session rollback was incomplete.",
+						)
+					: error;
+			const committedError = new ModelProfileApplyCommittedError(
+				prepared.profileName,
+				committedDurableOwnership.version,
+				cause,
+			);
+			prepared.session.markModelProfileOwnershipFailed?.(committedError);
+			try {
+				prepared.session.emitProfileOwnershipChanged?.({
+					type: "profile_ownership_changed",
+					transitionId: globalThis.crypto.randomUUID(),
+					source: durableOwnershipVersionAdvanced ? "durable" : "recovery",
+					oldMarker: prepared.previousModelProfileOwnershipMarker ?? { kind: "inherit" },
+					newMarker: { kind: "inherit" },
+					oldSessionId: prepared.session.sessionId,
+					sessionId: prepared.session.sessionId,
+					observedDurableVersion: durableOwnershipVersionAdvanced
+						? prepared.previousDurableModelProfileOwnership.version
+						: committedDurableOwnership.version,
+					...(durableOwnershipVersionAdvanced
+						? { committedDurableVersion: committedDurableOwnership.version }
+						: {}),
+					outcome: "failed",
+				});
+			} catch (eventError) {
+				logger.warn("Failed to emit model-profile ownership failure diagnostic", {
+					profile: prepared.profileName,
+					error: eventError instanceof Error ? eventError.message : String(eventError),
+				});
+			}
+			throw committedError;
 		}
 		if (rollbackErrors.length > 0) {
 			throw incompleteModelProfileRollbackError("activation", activationStage, error, rollbackErrors);
@@ -1786,6 +1951,64 @@ export async function applyPreparedModelProfileActivation(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
+}
+
+async function concretizeProfileSelectorValue(
+	selectorValue: ModelSelectorValue,
+	prepared: PreparedModelProfileActivation,
+): Promise<ModelSelectorValue> {
+	const candidates = prepared.modelRegistry.getAvailable?.() ?? prepared.modelRegistry.getAll();
+	const credentialSessionId = prepared.session.credentialSessionId ?? prepared.session.sessionId;
+	const concrete = await Promise.all(
+		normalizeModelSelectorValue(selectorValue).map(async selector => {
+			const bareAlias = !splitSelectorThinkingSuffix(selector).selector.includes("/");
+			const resolved = bareAlias
+				? await resolveModelChainWithAuth(
+						[selector],
+						{
+							getAvailable: () => candidates,
+							getApiKey: model =>
+								prepared.modelRegistry.getApiKeyForProvider(model.provider, credentialSessionId, model.baseUrl),
+							resolveCanonicalModel: prepared.modelRegistry.resolveCanonicalModel.bind(prepared.modelRegistry),
+							resolveModelByLookupAlias: prepared.modelRegistry.resolveModelByLookupAlias?.bind(
+								prepared.modelRegistry,
+							),
+							lookupAliasExists: prepared.modelRegistry.lookupAliasExists?.bind(prepared.modelRegistry),
+							clearCanonicalVariant: prepared.modelRegistry.clearCanonicalVariant?.bind(prepared.modelRegistry),
+						},
+						prepared.settings as Settings,
+						credentialSessionId,
+						{
+							managedFallback: true,
+							aliasIntent: "preset-equivalent",
+							canonicalSessionId: prepared.session.sessionId,
+							credentialSessionId,
+						},
+					)
+				: resolveModelRoleValue(selector, candidates, {
+						settings: prepared.settings as Settings,
+						modelRegistry: prepared.modelRegistry,
+						sessionId: prepared.session.sessionId,
+						credentialSessionId,
+						aliasIntent: "preset-equivalent",
+					});
+			if (!resolved.model) {
+				if (bareAlias) return undefined;
+				return selector;
+			}
+			const concreteSelector = `${resolved.model.provider}/${resolved.model.id}`;
+			return resolved.explicitThinkingLevel && resolved.thinkingLevel
+				? formatModelSelectorValue(concreteSelector, resolved.thinkingLevel)
+				: concreteSelector;
+		}),
+	);
+	const resolvedConcrete = concrete.filter((selector): selector is string => selector !== undefined);
+	if (resolvedConcrete.length === 0) {
+		throw new Error(
+			`Model profile deletion could not concretize authenticated selector: ${normalizeModelSelectorValue(selectorValue)[0]}`,
+		);
+	}
+	return resolvedConcrete.length === 1 && typeof selectorValue === "string" ? resolvedConcrete[0]! : resolvedConcrete;
 }
 
 export interface MaterializeModelProfileForDeletionResult {

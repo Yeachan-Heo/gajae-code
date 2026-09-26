@@ -1,12 +1,14 @@
-# Model-profile ownership invariants (PM proposal)
+# Model-profile ownership invariants
 
-Status: **PM PROPOSAL — awaiting upstream design approval. Not implemented and not approved behavior.**
+Status: **APPROVED — owner-approved implementation contract.**
 
 Issue: [#5585](https://github.com/Yeachan-Heo/gajae-code/issues/5585)
 
+Approval: [signed owner decision](https://github.com/Yeachan-Heo/gajae-code/issues/5585#issuecomment-5812891069)
+
 Measured `dev`: [`5b26c07d98c78b550b9847d473b9d798a2689c2b`](https://github.com/Yeachan-Heo/gajae-code/tree/5b26c07d98c78b550b9847d473b9d798a2689c2b)
 
-No profile-lifecycle implementation should begin until upstream approves this ownership contract. This document records the requested product decisions; it does not independently approve them.
+This contract is approved for implementation. The product decisions below are normative.
 
 ## Problem and current behavior
 
@@ -18,7 +20,7 @@ Startup and SDK also derive profile identity in different places: CLI startup re
 
 ## Proposed state model and invariants
 
-Every invariant in this section is a **PM PROPOSAL awaiting upstream design approval**.
+Every invariant in this section is approved behavior.
 
 | State | Owner and lifetime | Marker | Precedence | Persistence rule |
 | --- | --- | --- | --- | --- |
@@ -64,7 +66,7 @@ The durable baseline is one CAS-owned record with a monotonically increasing ver
 | Validation fails before write | Unchanged | Restore old effective state | Failure diagnostic only |
 | CAS succeeds, runtime apply succeeds | New version retained | Install new effective state | One success event after both are ready |
 | CAS conflicts | Newer writer retained | Old session state or recomputed state, per explicit operation contract | Conflict diagnostic; no success event |
-| CAS succeeds, runtime apply fails in the same live process, transition still owns version | CAS rollback to a new compensating version or fail closed, as upstream chooses | Restore old effective state | Failure diagnostic records compensation |
+| CAS succeeds, runtime apply fails in the same live process | Keep the committed version; never compensate | Fail closed for the requesting session until an explicit successful replacement or restart reconciliation | Typed `model_profile_apply_committed` error plus failure diagnostic; no success event |
 | CAS succeeds, runtime apply fails, newer write exists | Newer writer retained; never overwrite it | Recompute from newer durable state while preserving explicit session marker | Conflict/failure diagnostic; no stale rollback write |
 | Session persistence fails | Durable state untouched unless separately and explicitly committed | Restore complete old effective snapshot | No success event |
 
@@ -86,7 +88,7 @@ A retry after an unknown outcome first reads the current durable version and des
 
 | Input chain | Proposed result |
 | --- | --- |
-| Session `profile(P)`; `P` is deleted | Preserve the marker as unresolved diagnostic intent; fail closed or require explicit replacement. Do not fall through silently. |
+| Session `profile(P)`; `P` is deleted | Preserve the marker as unresolved diagnostic intent and fail closed until the user explicitly chooses a replacement. Do not fall through silently. |
 | Session `cleared`; any durable state | Remain cleared. |
 | Session `inherit`; durable `profile(P)`; `P` is deleted | Durable owner performs an explicit CAS transition to a replacement or `cleared`; sessions do not materialize `P` into ordinary settings. |
 | Session `inherit`; durable `cleared` | Remain cleared. |
@@ -107,7 +109,7 @@ PR [#5512](https://github.com/Yeachan-Heo/gajae-code/pull/5512) is separate, unm
 
 CLI, TUI, and SDK must call one ownership resolver/transition contract. They may adapt errors and presentation, but may not reconstruct ownership independently.
 
-## Test plan (no executable tests in this proposal)
+## Required regression tests
 
 | Area | Planned evidence |
 | --- | --- |
@@ -122,10 +124,10 @@ CLI, TUI, and SDK must call one ownership resolver/transition contract. They may
 | Startup/SDK parity | Feed identical snapshots to CLI and SDK construction/resume and assert identical ownership/effective results |
 | Recovery separation | With #5512 behavior available, prove recovery changes only runtime fallback state and emits no profile lifecycle mutation/event |
 
-These are planned contract tests for a later approved implementation, not tests claimed to exist or pass in this documentation change.
+Each row is required implementation coverage. Tests must be deterministic: coordinate races with explicit barriers and inject failure at the relevant persistence/runtime boundary; do not use sleeps or weaken assertions.
 
-## Approval questions and scope
+## Resolved owner decisions and scope
 
-Upstream must approve the event name/payload, whether a still-live owner may compensate its own failed durable commit with a new version or must fail closed, and the operator-facing behavior for references to deleted profiles. Crash/restart recovery is not an owner and always treats the current durable version as authoritative. Until those questions and the invariants above are approved, lifecycle implementation is explicitly unresolved and must not start.
+The owner approved the matrix as written, selected fail-closed after a durable CAS followed by runtime-apply failure (no compensation; preserve the committed version and surface a typed error), approved the `profile_ownership_changed` event name and payload above, and required unresolved saved references to deleted profiles to fail closed until an explicit replacement. Crash/restart recovery is not an owner and always treats the current durable version as authoritative.
 
-Out of scope: model discovery, compaction, and implementation of #5512. This proposal does not merge or close either issue or PR.
+Out of scope: model discovery and compaction. Missing saved-model recovery is separate from profile lifecycle and must never replay profile activation; the recovery behavior from [#5512](https://github.com/Yeachan-Heo/gajae-code/pull/5512) is already merged in commit [`196a7c8d61dcae7de93458fb2de2d6dda67e988d`](https://github.com/Yeachan-Heo/gajae-code/commit/196a7c8d61dcae7de93458fb2de2d6dda67e988d).

@@ -7,6 +7,7 @@ import { PET_SKIN_IDS, PET_SKINS, type PetMode, replaceTabs, Spacer, Text } from
 import { sanitizeDisplayLine, setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import { ModelProfileApplyCommittedError } from "../config/model-profile-ownership";
 import { formatModelProfileDisplayLabel } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
@@ -14,7 +15,6 @@ import {
 	type GjcModelAssignmentTargetId,
 	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
-
 import {
 	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
@@ -22,6 +22,7 @@ import {
 	parseModelString,
 	splitSelectorThinkingSuffix,
 } from "../config/model-resolver";
+import type { SettingValue } from "../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { DynamicBorder } from "../modes/components/dynamic-border";
 import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
@@ -34,7 +35,7 @@ import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, u
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
-import type { AgentSession, ExactMcpStatusSnapshot } from "../session/agent-session";
+import type { AgentSession, DefaultFallbackRuntimeState, ExactMcpStatusSnapshot } from "../session/agent-session";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
 import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
 import {
@@ -79,6 +80,16 @@ export type { BuiltinSlashCommand, SubcommandDef } from "./types";
 /** TUI-specific runtime accepted by `executeBuiltinSlashCommand`. */
 export type BuiltinSlashCommandRuntime = TuiSlashCommandRuntime & {
 	composer?: ComposerSubmissionOptions;
+};
+
+type ModelProfileAssignmentRollbackSnapshot = {
+	model: Model | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	defaultChain: { entries: readonly string[]; origin: string; identity?: string; explicitHead: boolean } | undefined;
+	resumeDefault: string | undefined;
+	fallbackRuntimeState: DefaultFallbackRuntimeState;
+	modelRolesOverride: SettingValue<"modelRoles"> | undefined;
+	agentOverridesOverride: SettingValue<"task.agentModelOverrides"> | undefined;
 };
 
 function canClearComposer(runtime: BuiltinSlashCommandRuntime): boolean {
@@ -1094,9 +1105,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						runtime,
 					);
 				}
+				let sessionOwnsProfile = false;
+				let profileRollbackSnapshot: ModelProfileAssignmentRollbackSnapshot | undefined;
+				let defaultMutationStarted = false;
+				let profileMaterializationCommitted = false;
 				try {
 					const includesDefault = targetIds.includes("default");
 					const includesRoleAgent = targetIds.some(role => role !== "default");
+					sessionOwnsProfile = runtime.session.getEffectiveModelProfileOwnershipMarker().kind === "profile";
+					if (sessionOwnsProfile) {
+						profileRollbackSnapshot = {
+							model: runtime.session.model,
+							thinkingLevel: runtime.session.thinkingLevel,
+							defaultChain: runtime.session.getConfiguredModelChainState("default"),
+							resumeDefault: runtime.session.sessionManager.buildSessionContext().models.default,
+							fallbackRuntimeState: runtime.session.getDefaultFallbackRuntimeState(),
+							modelRolesOverride: structuredClone(runtime.settings.getOverride("modelRoles")),
+							agentOverridesOverride: structuredClone(runtime.settings.getOverride("task.agentModelOverrides")),
+						};
+					}
 					if (includesRoleAgent) {
 						const apiKey = await runtime.session.modelRegistry.getApiKey(
 							selection.model,
@@ -1112,7 +1139,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					const existingDefaultThinkingLevel =
 						selection.thinkingLevel !== undefined
 							? selection.thinkingLevel
-							: runtime.session.getActiveModelProfile?.()
+							: sessionOwnsProfile
 								? undefined
 								: extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
 					const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
@@ -1127,22 +1154,36 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					}
 
 					if (includesDefault) {
-						await runtime.session.setModel(selection.model, "default", {
-							selector: selection.selector,
-							thinkingLevel: existingDefaultThinkingLevel,
-							cause: "user-selection",
-						});
-						if (existingDefaultThinkingLevel) {
-							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+						if (sessionOwnsProfile) {
+							await runtime.session.setModelTemporary(selection.model, existingDefaultThinkingLevel, {
+								persistAsSessionDefault: true,
+								cause: "user-selection",
+								onMutationStarted: () => {
+									defaultMutationStarted = true;
+								},
+							});
+						} else {
+							await runtime.session.setModel(selection.model, "default", {
+								selector: selection.selector,
+								thinkingLevel: existingDefaultThinkingLevel,
+								cause: "user-selection",
+							});
+							if (existingDefaultThinkingLevel) {
+								runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+							}
 						}
 					}
 
-					const materializedProfile = materializeActiveModelProfileAssignments({
+					const materializedProfile = await materializeActiveModelProfileAssignments({
 						session: runtime.session,
 						settings: runtime.settings,
 						assignments,
 					});
+					profileMaterializationCommitted = materializedProfile;
 					if (!materializedProfile) {
+						if (sessionOwnsProfile) {
+							throw new Error("The current model-profile owner could not be materialized safely.");
+						}
 						for (const [targetId, selector] of assignments) {
 							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
 							if (target.settingsPath === "modelRoles") {
@@ -1163,6 +1204,70 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					await runtime.notifyConfigChanged?.();
 					return commandConsumed();
 				} catch (err) {
+					const rollbackSnapshot = profileRollbackSnapshot;
+					if (
+						sessionOwnsProfile &&
+						defaultMutationStarted &&
+						!profileMaterializationCommitted &&
+						rollbackSnapshot &&
+						!(err instanceof ModelProfileApplyCommittedError)
+					) {
+						const rollbackErrors: unknown[] = [];
+						const attemptRollback = (rollback: () => void): void => {
+							try {
+								rollback();
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+						};
+						attemptRollback(() =>
+							runtime.session.setConfiguredModelChain(
+								"default",
+								rollbackSnapshot.defaultChain?.entries ?? [],
+								rollbackSnapshot.defaultChain?.origin ?? "rollback",
+								rollbackSnapshot.defaultChain?.identity,
+								rollbackSnapshot.defaultChain?.explicitHead ?? true,
+							),
+						);
+						attemptRollback(() => runtime.session.recordResumeDefaultModel(rollbackSnapshot.resumeDefault));
+						if (rollbackSnapshot.fallbackRuntimeState) {
+							attemptRollback(() =>
+								runtime.session.restoreDefaultFallbackRuntimeState(rollbackSnapshot.fallbackRuntimeState),
+							);
+						}
+						attemptRollback(() =>
+							rollbackSnapshot.modelRolesOverride === undefined
+								? runtime.settings.clearOverride("modelRoles")
+								: runtime.settings.override("modelRoles", rollbackSnapshot.modelRolesOverride),
+						);
+						attemptRollback(() =>
+							rollbackSnapshot.agentOverridesOverride === undefined
+								? runtime.settings.clearOverride("task.agentModelOverrides")
+								: runtime.settings.override(
+										"task.agentModelOverrides",
+										rollbackSnapshot.agentOverridesOverride,
+									),
+						);
+						if (defaultMutationStarted) {
+							try {
+								await runtime.session.restoreModelSelectionForRollback(
+									rollbackSnapshot.model,
+									rollbackSnapshot.thinkingLevel,
+								);
+							} catch (rollbackError) {
+								rollbackErrors.push(rollbackError);
+							}
+						}
+						if (rollbackErrors.length > 0) {
+							return usage(
+								`Failed to set model and rollback was incomplete: ${errorMessage(new AggregateError([err, ...rollbackErrors]))}`,
+								runtime,
+							);
+						}
+					}
+					if (profileMaterializationCommitted) {
+						return usage(`Model assignment committed, but follow-up failed: ${errorMessage(err)}`, runtime);
+					}
 					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
 				}
 			}

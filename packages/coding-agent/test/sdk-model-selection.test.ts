@@ -1429,9 +1429,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
-	test("resumes a bare profile alias through preset-equivalent resolution when a startup profile is configured", async () => {
-		// Slash-prefixed catalog id keeps the alias out of the exact canonical-id
-		// path, so resolution must pass through the final-segment alias stage.
+	test("re-resolves a saved profile chain from the current owner without rewriting its stale alias", async () => {
 		modelRegistry.registerProvider("alias-provider", {
 			baseUrl: "http://127.0.0.1:9/v1",
 			apiKey: "ALIAS_KEY",
@@ -1449,8 +1447,9 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			],
 		});
 		authStorage.setRuntimeApiKey("alias-provider", "test-key");
-		const profileName = modelRegistry.getAvailableModelProfileNames()[0];
-		if (!profileName) throw new Error("Expected at least one registered model profile");
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const profileName = "codex-medium";
+		if (!modelRegistry.getModelProfile(profileName)) throw new Error("Expected the bundled Codex profile");
 
 		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
 		sessionManager.appendConfiguredModelChain({
@@ -1478,16 +1477,82 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		});
 
 		try {
-			expect(session.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
-			// The persisted bare alias must be resolved through the preset-equivalent
-			// alias stage (real registry), not left to exact/fuzzy matching.
-			expect(lookupAliasSpy).toHaveBeenCalled();
-			expect(resolveAliasSpy).toHaveBeenCalled();
+			expect(session.model).toMatchObject({ provider: "openai-codex", id: "gpt-5.6-sol" });
+			expect(lookupAliasSpy).not.toHaveBeenCalled();
+			expect(resolveAliasSpy).not.toHaveBeenCalled();
 			expect(session.getActiveModelProfile()).toBe(profileName);
-			expect(modelRegistry.getSessionCanonicalVariant("provider-affinity")).toBe(
-				"alias-provider/synthetic/flare-alias",
-			);
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({
+				entries: ["flare-alias"],
+				origin: "profile-activation",
+				identity: profileName,
+			});
+			expect(session.getDefaultFallbackRuntimeState().chain).toMatchObject({
+				entries: ["openai-codex/gpt-5.6-sol:low"],
+				origin: "profile-activation",
+				identity: profileName,
+			});
 			expect(modelRegistry.getSessionCanonicalVariant(resumedManager.getSessionId())).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("recovers a deleted saved model through the current owner without rewriting saved intent", async () => {
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const profileName = "codex-medium";
+		const sol = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const terra = getBundledModel("openai-codex", "gpt-5.6-terra");
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!sol || !terra || !sonnet) throw new Error("Expected bundled models for the profile recovery test");
+		const currentCatalog = [sol, terra];
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(currentCatalog);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue(currentCatalog);
+		vi.spyOn(modelRegistry, "getAvailableForProfileActivation").mockReturnValue(currentCatalog);
+		const settings = Settings.isolated({
+			"modelProfile.default": profileName,
+			"session.resumeModelBehavior": "keepSessionModel",
+			"compaction.enabled": false,
+		});
+		const originalManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		originalManager.appendModelChange(`${sonnet.provider}/${sonnet.id}`, "default");
+		originalManager.appendConfiguredModelChain({
+			role: "default",
+			entries: [`${sonnet.provider}/${sonnet.id}`],
+			origin: "profile-activation",
+			identity: profileName,
+			explicitHead: true,
+		});
+		await originalManager.ensureOnDisk();
+		await originalManager.flush();
+		const sessionFile = originalManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted recovery session");
+		await originalManager.close();
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session, modelFallbackMessage } = await createAgentSession({
+			...buildSessionOptions(undefined, resumedManager),
+			settings,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: "openai-codex", id: sol.id });
+			expect(modelFallbackMessage).toBe(
+				"Saved session model is no longer registered; restored the active ownership profile at runtime.",
+			);
+			expect(session.getModelProfileOwnershipMarker()).toBeUndefined();
+			expect(session.getActiveModelProfile()).toBe(profileName);
+			expect(session.getConfiguredModelChainState("default")).toMatchObject({
+				entries: [`${sonnet.provider}/${sonnet.id}`],
+				origin: "profile-activation",
+				identity: profileName,
+			});
+			expect(session.getDefaultFallbackRuntimeState().chain).toMatchObject({
+				entries: [`${sol.provider}/${sol.id}:low`],
+				origin: "runtime",
+				identity: profileName,
+			});
+			expect(settings.getGlobal("modelProfile.default")).toBe(profileName);
+			expect(settings.getGlobal("modelProfile.ownership")).toBeUndefined();
 		} finally {
 			await session.dispose();
 		}
