@@ -7,10 +7,12 @@
  * and every outcome is a fixed bounded string with a fixed exit code.
  *
  * Observation itself must never start, ensure, retire, restart or recover a
- * broker. Until the read-only observation facade (DESIGN §B3) is wired in, the
- * capability check below fails closed with the fixed `unsupported` outcome: this
- * command can report only what a supporting broker publishes to a read-only
- * reader, and this build has no such reader.
+ * broker. The read-only observation facade (DESIGN §B3) is wired: `observe()`
+ * below routes to it and to nothing else, so this command can report only what a
+ * supporting broker publishes to the read-only reader. An unsupported runtime
+ * tuple, a missing or mismatched native artifact and an old broker without a
+ * published generation all still fail closed with the fixed `unsupported`
+ * outcome.
  */
 
 const USAGE_FAMILY = `usage: gjc sdk diagnostics <command>
@@ -200,9 +202,10 @@ function renderText(observation: BrokerObservation): string {
  * Observe an already running broker.
  *
  * The read-only observation reader (narrow native snapshot adapter + read-only
- * loader) is not part of this build, so the supported-capability check fails
- * closed for every input, including a valid explicit agent directory. No path is
- * opened, no socket is created and no state is written on this route.
+ * loader) is part of this build, so a valid explicit agent directory reaches the
+ * facade. A missing `--agent-dir` still returns the fixed `absent` outcome
+ * without opening a path, creating a socket or writing any state: exact
+ * selection never authorizes an alternative-root scan.
  */
 async function observe(options: {
 	agentDir: string | undefined;

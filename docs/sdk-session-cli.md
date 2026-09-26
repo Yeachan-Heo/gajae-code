@@ -474,9 +474,15 @@ unavailability instead of acquiring the authority to reply.
 Selection is exact. Without `--agent-dir` no alternative root is scanned, and a
 replacement publication observed mid-request fails closed rather than
 reconnecting. A second observation is a new explicit invocation, never an
-automatic retry. `--timeout-ms` (1..10000, default 2000) is one absolute
-deadline for the whole observation, including the native lease, connect,
-authentication and the final identity recheck.
+automatic retry.
+
+`--timeout-ms` (1..10000, default 2000) is one absolute budget for the whole
+observation — the native lease, connect, authentication and the final identity
+recheck all draw from it, and expiry outranks a later refusal. It is a **work
+budget, not a guaranteed wall-clock return**: the unchanged SDK client close
+grace can extend settlement past the budget, and a synchronous kernel read
+already in flight is not forcibly cancelled. Expect the observation to stop
+doing new work at the deadline, not to return at exactly that instant.
 
 The result is `schema: gjc.broker-observation`, `version: 1`, an `observedAt`
 client timestamp, and exactly one of:
@@ -485,11 +491,17 @@ client timestamp, and exactly one of:
   startup — not the endpoint generation and not the package version),
   `build.packageVersion`, `build.buildId` (startup-captured trusted metadata, or
   `null`), and `diagnosticProtocol: 1`.
-- `unavailable`: `reason` plus a fixed message keyed by that reason. Reasons are
-  `absent`, `stale`, `incompatible`, `authentication_failed`, `unsupported`,
-  `generation_mismatch`, `transport_unavailable`, `timeout`, `invalid_response`,
-  `unsafe_discovery` and `invalid_arguments`. Messages are literals, never
+- `unavailable`: `reason` plus a fixed message keyed by that reason. The reasons
+  are exactly `absent`, `stale`, `incompatible`, `authentication_failed`,
+  `unsupported`, `generation_mismatch`, `transport_unavailable`, `timeout`,
+  `invalid_response` and `unsafe_discovery`. Messages are literals, never
   exception text.
+
+Malformed input is **not** an unavailable reason. Bad argv is a usage error: the
+CLI prints the fixed usage block and exits `2` without observing anything, and
+the SDK facade rejects the same inputs by throwing a typed options error to the
+caller before any observation begins. `invalid_arguments` is that caller-error
+surface, not a value the result DTO can carry.
 
 Exit codes are `0` for an observed broker, `1` for typed unavailability, and `2`
 for malformed argv. All output stays within 8192 UTF-8 bytes and identifying
