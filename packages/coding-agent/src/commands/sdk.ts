@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, postmortem } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
+import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
@@ -43,7 +43,7 @@ import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
-import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
+import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -1192,214 +1192,10 @@ function parsePositiveTimeout(raw: string | undefined, flagName: string): number
 	return value;
 }
 
-class SdkServeHelp extends Command {
-	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
-	static flags = {
-		stdio: Flags.boolean({ description: "Serve SDK frames over standard input and output" }),
-		socket: Flags.string({ description: "Serve SDK frames over a Unix socket path" }),
-		session: Flags.string({ description: "Attach to a specific SDK session" }),
-		"pending-ceiling": Flags.string({ description: "Maximum queued relay bytes per direction" }),
-	};
-	async run(): Promise<void> {}
-}
+// Unused Command scaffolding classes removed - all logic moved to Sdk.run() dispatcher
 
-class SdkSessionHelp extends Command {
-	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|close|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
-	static args = {
-		verb: Args.string({
-			description: "Session verb",
-			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "close", "retire", "raw"],
-		}),
-		target: Args.string({
-			description: "Session id (or the raw kind control|query|global for `raw`)",
-			required: false,
-		}),
-		opRef: Args.string({
-			description: "Operation reference for status, or session id for raw control/query",
-			required: false,
-		}),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		repo: Flags.string({
-			description: "Workspace directory for saved-session resolution (default: current directory)",
-		}),
-		op: Flags.string({ description: "Raw control or global operation" }),
+// SdkGuidesHelp and SdkGuidesCommand unused; guides logic moved to Sdk.run() dispatcher
 
-		query: Flags.string({ description: "Raw query name" }),
-		"json-input": Flags.string({ description: "SDK request JSON object" }),
-		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
-		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
-		"idempotency-key": Flags.string({
-			description: "Caller idempotency key required for lifecycle globals and terminal abort controls",
-		}),
-		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
-		cursor: Flags.string({
-			description:
-				"Raw query continuation/search cursor, or session tail checkpoint claim (tail also requires --after-transcript-id)",
-		}),
-		scope: Flags.string({
-			description:
-				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
-		}),
-		limit: Flags.integer({ description: "Search or raw session.list page size from 1 to 100" }),
-		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
-		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
-		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
-		wait: Flags.boolean({
-			description: "send --wait: poll turn.result with kind=prompt until terminal or the wait window elapses",
-		}),
-		"timeout-ms": Flags.string({ description: "Wait window for send --wait, status, and live tail follow" }),
-		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
-		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
-		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
-		"after-transcript-id": Flags.string({
-			description:
-				"tail --cursor (required): omit transcript rows up to and including this row id (the caller already has them)",
-		}),
-		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkSpawnCommand extends Command {
-	static description = "Spawn a task-seeded background child session (local interactive master only).";
-	static flags = {
-		cwd: Flags.string({ description: "Working directory for the spawned child" }),
-		prompt: Flags.string({ description: "Seed task delivered once to the child" }),
-		model: Flags.string({ description: "Model selector for the child" }),
-		profile: Flags.string({ description: "Model profile name for the child" }),
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		"idempotency-key": Flags.string({
-			description: "Idempotency key for replaying an uncertain session.spawn result",
-		}),
-		json: Flags.boolean({ description: "Render the safe spawn result as JSON" }),
-	};
-	async run(): Promise<void> {
-		const { flags } = await this.parse(SdkSpawnCommand);
-		try {
-			const spawn = await runSdkSpawn({
-				cwd: flags.cwd,
-				prompt: flags.prompt,
-				model: flags.model,
-				profile: flags.profile,
-				agentDir: flags["agent-dir"],
-				idempotencyKey: flags["idempotency-key"],
-			});
-			process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
-			if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;
-		} catch (error) {
-			if (error instanceof SdkMasterCliError) {
-				process.stderr.write(`Error: ${error.code}: ${error.message}\n`);
-				process.exitCode = error.exitCode;
-				return;
-			}
-			throw error;
-		}
-	}
-}
-
-class SdkSearchCommand extends Command {
-	static description = "Search broker-visible SDK sessions within an exact repo, pwd, or global scope.";
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		repo: Flags.string({ description: "Workspace directory for scope resolution (default: current directory)" }),
-		scope: Flags.string({ description: "Search scope: repo, pwd, or global (default: repo)" }),
-		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
-		cursor: Flags.string({ description: "Frozen scoped search continuation cursor" }),
-		json: Flags.boolean({ description: "Render exactly the SdkSearchResultV1 JSON envelope" }),
-	};
-	async run(): Promise<void> {
-		const { flags } = await this.parse(SdkSearchCommand);
-		const scope = flags.scope;
-		if (scope !== undefined && scope !== "repo" && scope !== "pwd" && scope !== "global")
-			throw new CliParseError("--scope must be repo, pwd, or global.");
-		const search = await runSdkSearch({
-			agentDir: flags["agent-dir"],
-			repo: flags.repo,
-			scope,
-			limit: flags.limit,
-			cursor: flags.cursor,
-		});
-		process.stdout.write(`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`);
-		if (search.exitCode !== 0) process.exitCode = search.exitCode;
-	}
-}
-
-class SdkSessionCommand extends Command {
-	static description = SdkSessionHelp.description;
-	static args = SdkSessionHelp.args;
-	static flags = SdkSessionHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkSessionCommand);
-		const verb = args.verb;
-		const target = args.target;
-		const flagRec = flags as Record<string, unknown>;
-		await runSdkSessionCli({
-			action: verb,
-			...(verb === "raw"
-				? {
-						rawAction: target,
-						sessionId: target === "control" || target === "query" ? args.opRef : undefined,
-					}
-				: { sessionId: verb === "list" ? undefined : target }),
-			opRef: verb === "status" ? args.opRef : (flagRec["op-ref"] as string | undefined),
-			operation: flagRec.op as string | undefined,
-			query: flagRec.query as string | undefined,
-			text: flagRec.text as string | undefined,
-			jsonInput: flagRec["json-input"] as string | undefined,
-			jsonInputFile: flagRec["json-input-file"] as string | undefined,
-			jsonInputStdin: Boolean(flagRec["json-input-stdin"]),
-			confirm: Boolean(flagRec.confirm),
-			idempotencyKey: flagRec["idempotency-key"] as string | undefined,
-			cursor: flagRec.cursor as string | undefined,
-			wait: Boolean(flagRec.wait),
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
-			strict: Boolean(flagRec.strict),
-			untilIdle: Boolean(flagRec["until-idle"]),
-			allEvents: Boolean(flagRec["all-events"]),
-			afterTranscriptId: flagRec["after-transcript-id"] as string | undefined,
-			page: Boolean(flagRec.page),
-			limit: flagRec.limit as number | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			repo: flagRec.repo as string | undefined,
-			scope: flagRec.scope as string | undefined,
-		});
-	}
-}
-
-class SdkGuidesHelp extends Command {
-	static description = "Manage verified advisory SDK guides: refresh, list, show, status, or trust.";
-	static args = {
-		action: Args.string({ required: false, options: ["refresh", "list", "show", "status", "trust"] }),
-		guideId: Args.string({ required: false, description: "Guide id for show" }),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK state directory for the verified guide cache" }),
-		url: Flags.string({ description: "HTTPS allowlisted manifest URL for refresh" }),
-		"timeout-ms": Flags.string({ description: "Bounded refresh timeout in milliseconds" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkGuidesCommand extends Command {
-	static description = SdkGuidesHelp.description;
-	static args = SdkGuidesHelp.args;
-	static flags = SdkGuidesHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkGuidesCommand);
-		const flagRec = flags as Record<string, unknown>;
-		await runSdkGuidesCli({
-			action: args.action,
-			guideId: args.guideId,
-			url: flagRec.url as string | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
-		});
-	}
-}
 export default class Sdk extends Command {
 	static description = "SDK command runtime; public grammar and help are registry-owned.";
 	static hidden = false;
