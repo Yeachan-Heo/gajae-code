@@ -193,6 +193,7 @@ describe("model onboarding guidance", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {
 				getApiKey: async () => undefined,
+				getModelProfiles: () => new Map(),
 			} as never,
 		});
 		try {

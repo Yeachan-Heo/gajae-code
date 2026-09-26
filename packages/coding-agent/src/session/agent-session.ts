@@ -18300,7 +18300,7 @@ export class AgentSession {
 	#persistedModelProfileAliasIntent(role: string): { aliasIntent: "preset-equivalent" } | undefined {
 		const runtimeDefaultIdentity = this.#defaultFallbackController?.chain;
 		const effectiveMarker = this.getEffectiveModelProfileOwnershipMarker();
-		const profileName = effectiveMarker.kind === "profile" ? effectiveMarker.profile : undefined;
+		const profileName = effectiveMarker.kind === "profile" ? effectiveMarker.profile : this.getActiveModelProfile();
 		if (!profileName) return undefined;
 		const profile = this.#modelRegistry.getModelProfile?.(profileName);
 		if (!profile) return undefined;

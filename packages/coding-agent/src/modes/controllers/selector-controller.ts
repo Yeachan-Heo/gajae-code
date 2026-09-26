@@ -2929,7 +2929,7 @@ export class SelectorController {
 									},
 								});
 								assignmentMutationStarted = true;
-								const materializedProfile = materializeActiveModelProfileAssignment({
+								const materializedProfile = await materializeActiveModelProfileAssignment({
 									session: this.ctx.session,
 									settings: this.ctx.settings,
 									role,
