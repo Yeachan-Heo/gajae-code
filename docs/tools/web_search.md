@@ -43,6 +43,16 @@
 | `max_tokens` | `number` | No | Passed through as `maxOutputTokens` / `max_tokens` only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `temperature` | `number` | No | Passed through only by Anthropic, Gemini, and Perplexity API-key mode. Ignored by the other providers. |
 | `num_search_results` | `number` | No | Requested upstream search breadth. For most providers this is the same count used for returned sources. Perplexity is the only adapter that keeps it distinct from `limit`. |
+| `xai_search_mode` | `"web" \| "x" \| "web_and_x"` | No | xAI only. Selects xAI's `web_search`, `x_search`, or both. When omitted, `prepareXaiTools()` infers it from the options below: web-only options → `web`, X-only options → `x`, both → `web_and_x`, neither → `web`. An explicit mode that conflicts with the supplied options fails with a 400 `SearchProviderError`. |
+| `allowed_domains` / `excluded_domains` | `string[]` (max 5) | No | xAI `web_search` only. Domain allow/deny filters; the two are mutually exclusive. |
+| `allowed_x_handles` / `excluded_x_handles` | `string[]` (max 20) | No | xAI `x_search` only. X handle allow/deny filters; the two are mutually exclusive. |
+| `from_date` / `to_date` | `string` (ISO 8601) | No | xAI `x_search` only. Date range for X posts, combined with `recency` by `xDateRange()`. |
+| `enable_image_understanding` | `boolean` | No | xAI only. Passed to whichever of `web_search` / `x_search` is active. |
+| `enable_image_search` | `boolean` | No | xAI `web_search` only. Search for and embed image results. |
+| `enable_video_understanding` | `boolean` | No | xAI `x_search` only. Analyze videos in X posts. |
+| `no_inline_citations` | `boolean` | No | xAI only. Sends `include: ["no_inline_citations"]` to disable inline citation markdown in the answer. |
+
+The xAI-specific fields are passed to every provider in the chain by `executeSearchUnscoped()` (`web/search/index.ts`), but only `providers/xai.ts` reads them; other providers ignore them.
 
 ## Outputs
 The tool returns a single text content block plus structured `details`.

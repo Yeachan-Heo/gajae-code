@@ -90,6 +90,9 @@ describe("modelRoles fallback chain e2e", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"fallback.maxAttempts": 1,
+			// Budget restart across turns is the contract here; the circuit breaker
+			// (which would skip the just-failed head) is covered by the upstream-count e2e.
+			"fallback.circuitCooldownMs": 0,
 			"retry.baseDelayMs": 1,
 		});
 		settings.set("modelRoles", { default: [selector(primary), selector(fallback)] });

@@ -3,28 +3,31 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
-import { logger } from "@gajae-code/utils";
-import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
+import { logger, postmortem } from "@gajae-code/utils";
+import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
 import { isSafeSdkInternalAgentDir, scanPublicCommand } from "../cli/public-command-entry";
 import { PublicCommandFailure } from "../cli/public-command-errors";
 import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
+import { usePostmortemSignalExitAuthority } from "../lsp/client";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
 import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
+import {
+	type BrokerStartupExitRecord,
+	type BrokerStartupExitWriteStatus,
+	writeBrokerStartupExitRecordBounded,
+} from "../sdk/broker/broker-exit";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
 import {
 	emitBrokerStartupTestSignal,
 	reconcileBrokerGenerationForStartup,
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
-import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
-	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -40,7 +43,7 @@ import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkStderrDrainer } from "../sdk/broker/stderr-drainer";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
-import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
+import { renderSpawnTable, runSdkSpawn } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import {
 	type CreateLifecycleAgentSessionResult,
@@ -56,7 +59,7 @@ import {
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
-import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
+import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -109,6 +112,27 @@ export async function lifecycleArgs(
  */
 export const SESSION_HOST_BROKER_ABSENCE_GRACE_MS = 10 * 60_000;
 const SESSION_HOST_BROKER_POLL_MS = 15_000;
+const BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS = 1_000;
+const BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS = 2_000;
+
+async function writeBrokerStartupFailureMarkerBounded(
+	agentDir: string,
+	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
+): Promise<boolean> {
+	const settled = Promise.withResolvers<boolean>();
+	const abortController = new AbortController();
+	const timer = setTimeout(() => {
+		abortController.abort();
+		settled.resolve(false);
+	}, BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS);
+	void writeBrokerStartupFailureMarker(agentDir, failure, abortController.signal).then(
+		written => settled.resolve(written),
+		() => settled.resolve(false),
+	);
+	const written = await settled.promise;
+	clearTimeout(timer);
+	return written;
+}
 
 async function waitForBrokerStartupTestGate(gateFile: string): Promise<void> {
 	if (await Bun.file(gateFile).exists()) return;
@@ -406,20 +430,6 @@ async function revalidateLifecycleTranscript(snapshot: ResumeSessionIdentity): P
 		throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 }
 
-class LifecycleSessionManagerCleanupError extends Error {
-	constructor(cause: unknown) {
-		super("Lifecycle session manager cleanup could not be proven.", { cause });
-		this.name = "LifecycleSessionManagerCleanupError";
-	}
-}
-
-type OwnedMcpConfigDirectory = {
-	path: string;
-	directoryIdentity?: { dev: bigint; ino: bigint };
-	parentIdentity?: { dev: bigint; ino: bigint };
-	snapshot?: NativeDirectoryTreeSnapshot;
-};
-
 /** Opens lifecycle-authorized history without letting replacement content reach readiness. */
 export async function openLifecycleSessionManager(
 	request: SessionLifecycleLaunchRequest,
@@ -449,7 +459,12 @@ export async function openLifecycleSessionManager(
 				if (opened.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 				sessionManager = opened.manager;
-				await revalidateLifecycleTranscript(snapshot.identity);
+				try {
+					await revalidateLifecycleTranscript(snapshot.identity);
+				} catch (error) {
+					await sessionManager.close();
+					throw error;
+				}
 			} else {
 				const forked = await SessionManager.forkFromCaptured(
 					snapshot,
@@ -472,23 +487,9 @@ export async function openLifecycleSessionManager(
 		await lifecycleSettings.close();
 	} catch (error) {
 		cleanupError = error;
+		await sessionManager?.close().catch(() => undefined);
 	}
-	let sessionManagerCloseError: unknown;
-	if ((operationError !== undefined || cleanupError !== undefined) && sessionManager) {
-		try {
-			await sessionManager.close();
-		} catch (error) {
-			sessionManagerCloseError = error;
-		}
-	}
-	if (sessionManagerCloseError !== undefined || cleanupError !== undefined) {
-		throw new LifecycleSessionManagerCleanupError(
-			new AggregateError(
-				[operationError, cleanupError, sessionManagerCloseError].filter(error => error !== undefined),
-				"Lifecycle session-manager open failed and owned cleanup did not complete.",
-			),
-		);
-	}
+	if (cleanupError !== undefined) throw cleanupError;
 	if (operationError !== undefined) throw operationError;
 	if (!result) throw new Error("Lifecycle session manager result was not produced.");
 	return result;
@@ -519,8 +520,6 @@ export async function runSessionHost(
 		processIncarnation?: (pid: number) => string | undefined;
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
 		initTheme?: typeof initTheme;
-		initializeLifecycleExtensions?: typeof initializeExtensions;
-		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
@@ -531,13 +530,10 @@ export async function runSessionHost(
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
 	const initializeTheme = timing.initTheme ?? initTheme;
-	const initializeSessionExtensions = timing.initializeLifecycleExtensions ?? initializeExtensions;
-	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
-	let constructionCleanupComplete = true;
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
@@ -589,20 +585,15 @@ export async function runSessionHost(
 		transcript?: LifecycleTranscriptEvidence,
 	): Promise<void> => {
 		if (!request.effectMarker) return;
-		try {
-			await writeSessionLifecycleFailure(
-				request.stateRoot,
-				request.sessionId,
-				effectMarker,
-				failure,
-				rollback,
-				transcript,
-				incarnation,
-			);
-		} catch (error) {
-			if (error instanceof LifecycleFailurePublicationCleanupError) constructionCleanupComplete = false;
-			throw error;
-		}
+		await writeSessionLifecycleFailure(
+			request.stateRoot,
+			request.sessionId,
+			effectMarker,
+			failure,
+			rollback,
+			transcript,
+			incarnation,
+		);
 	};
 
 	if (now() >= request.semanticReadyDeadlineAt) {
@@ -646,7 +637,7 @@ export async function runSessionHost(
 			);
 	};
 	const interruptStartup = (failure: SdkStartupFailure): void => {
-		if (startupComplete || startupInterruption !== undefined) return;
+		if (startupInterruption !== undefined) return;
 		startupInterruption = failure;
 		capability.cancel(failure);
 		if (revokePendingReadinessMarker) startReadinessRevocation(revokePendingReadinessMarker);
@@ -660,8 +651,8 @@ export async function runSessionHost(
 		process.removeListener("SIGTERM", onStartupSignal);
 		process.removeListener("SIGINT", onStartupSignal);
 	};
-	process.on("SIGTERM", onStartupSignal);
-	process.on("SIGINT", onStartupSignal);
+	process.once("SIGTERM", onStartupSignal);
+	process.once("SIGINT", onStartupSignal);
 	void sleep(Math.max(0, request.semanticReadyDeadlineAt - now())).then(
 		() => {
 			if (!startupComplete) interruptStartup(cutoffFailure());
@@ -672,7 +663,6 @@ export async function runSessionHost(
 	);
 	const interruptedStageCleanupGraceMs = 100;
 	const throwIfStartupInterrupted = (): void => {
-		if (startupComplete) return;
 		if (startupInterruption !== undefined) throw startupInterruption;
 		if (now() >= request.semanticReadyDeadlineAt) {
 			interruptStartup(cutoffFailure());
@@ -682,7 +672,7 @@ export async function runSessionHost(
 	const beforeCutoff = async <T>(
 		stage: () => Promise<T>,
 		cleanupLateResult?: (value: T) => Promise<void>,
-		options: { processLocalOnly?: boolean; readinessPublication?: boolean } = {},
+		options: { processLocalOnly?: boolean } = {},
 	): Promise<T> => {
 		throwIfStartupInterrupted();
 		const pending = Promise.resolve()
@@ -696,15 +686,8 @@ export async function runSessionHost(
 			interrupted.promise.then(failure => ({ failure }) as const),
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
-			if (options.processLocalOnly || options.readinessPublication) return;
-			// Wait for the late stage to complete or timeout, even if there's no cleanup callback.
-			// This ensures that stages like applyModelProfiles get a chance to finish before
-			// we proceed with session disposal and rollback.
-			const stageCompleted = await Promise.race([
-				lateStage.then(() => true),
-				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
-			]);
-			if (!stageCompleted) {
+			if (options.processLocalOnly) return;
+			if (!cleanupLateResult) {
 				constructionCleanupComplete = false;
 				return;
 			}
@@ -712,9 +695,6 @@ export async function runSessionHost(
 				.then(async late => {
 					if ("error" in late) {
 						constructionCleanupComplete = false;
-						return;
-					}
-					if (!cleanupLateResult) {
 						return;
 					}
 					try {
@@ -729,14 +709,18 @@ export async function runSessionHost(
 				.catch(() => {
 					constructionCleanupComplete = false;
 				});
-			await cleanup;
+			const cleanupCompleted = await Promise.race([
+				cleanup.then(() => true),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+			]);
+			if (!cleanupCompleted) constructionCleanupComplete = false;
 		};
 		if ("failure" in result) {
 			await cleanupLateStage(pending);
 			throw result.failure;
 		}
 		const settlement = result.settlement;
-		if (startupInterruption !== undefined || (!startupComplete && now() >= request.semanticReadyDeadlineAt)) {
+		if (startupInterruption !== undefined || now() >= request.semanticReadyDeadlineAt) {
 			const failure = startupInterruption ?? cutoffFailure();
 			interruptStartup(failure);
 			await cleanupLateStage(Promise.resolve(settlement));
@@ -745,6 +729,7 @@ export async function runSessionHost(
 		if ("error" in settlement) throw settlement.error;
 		return settlement.value;
 	};
+	let constructionCleanupComplete = true;
 	const runBoundedStartupCleanup = async (cleanup: () => Promise<void>): Promise<boolean> => {
 		const completed = await Promise.race([
 			Promise.resolve()
@@ -764,260 +749,44 @@ export async function runSessionHost(
 		return capability.normalizeFailure("registration", "failed", error);
 	};
 
-	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
+	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
 	let openedSessionManager: SessionManager | undefined;
 	let sessionManagerTransferred = false;
-	let created: CreateLifecycleAgentSessionResult | undefined;
-	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
-	let openedSessionManagerClosed = false;
-	const closeSessionManager = async (manager: SessionManager | undefined): Promise<void> => {
-		if (!manager || (manager === opened?.sessionManager && openedSessionManagerClosed)) return;
-		if (!(await runBoundedStartupCleanup(() => manager.close())))
-			throw new LifecycleSessionManagerCleanupError(
-				new Error("Lifecycle session manager cleanup did not complete."),
-			);
-		if (manager === opened?.sessionManager) openedSessionManagerClosed = true;
-	};
-	const removeMcpConfigDirectory = async (): Promise<void> => {
-		const directory = mcpConfigDirectory;
-		if (!directory) return;
-		let cleanupFailure: { error: unknown } | undefined;
-		const cleanupComplete = await runBoundedStartupCleanup(async () => {
-			try {
-				const identity = directory.directoryIdentity;
-				const parentIdentity = directory.parentIdentity;
-				const snapshot = directory.snapshot;
-				if (!identity || !parentIdentity || !snapshot)
-					throw new Error("MCP temporary directory cleanup lacks exact creation authority.");
-				const parent = await fs.lstat(path.dirname(directory.path), { bigint: true });
-				if (
-					!parent.isDirectory() ||
-					parent.isSymbolicLink() ||
-					parent.dev !== parentIdentity.dev ||
-					parent.ino !== parentIdentity.ino
-				)
-					throw new Error("MCP temporary directory parent changed before cleanup.");
-				const current = await fs.lstat(directory.path, { bigint: true }).catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-					throw error;
-				});
-				if (
-					current &&
-					(!current.isDirectory() ||
-						current.isSymbolicLink() ||
-						current.dev !== identity.dev ||
-						current.ino !== identity.ino)
-				)
-					throw new Error("MCP temporary directory identity changed before cleanup.");
-				const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
-				if (removed.ok) {
-					mcpConfigDirectory = undefined;
-					return;
-				}
-				if (
-					removed.code === "cleanup_pending" &&
-					removed.payloadDurable === true &&
-					removed.detachedPath === `${directory.path}.removing`
-				) {
-					const detached = await fs.lstat(removed.detachedPath, { bigint: true }).catch(error => {
-						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-						throw error;
-					});
-					const originalAfter = await fs.lstat(directory.path, { bigint: true }).catch(error => {
-						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-						throw error;
-					});
-					const parentAfter = await fs.lstat(path.dirname(directory.path), { bigint: true });
-					const retained = snapshotDirectoryTree(removed.detachedPath);
-					const originalEntries = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
-					const retainedTreeIsScrubbed =
-						retained.ok &&
-						retained.snapshot !== undefined &&
-						retained.snapshot.entries.length === snapshot.entries.length &&
-						retained.snapshot.entries.every(entry => {
-							const originalEntry = originalEntries.get(entry.relativePath);
-							if (
-								!originalEntry ||
-								entry.kind !== originalEntry.kind ||
-								entry.dev !== originalEntry.dev ||
-								entry.ino !== originalEntry.ino
-							)
-								return false;
-							if (entry.kind === "directory") return true;
-							return (
-								entry.kind === "file" &&
-								entry.size === "0" &&
-								entry.sha256 === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-							);
-						});
-					if (
-						!detached ||
-						originalAfter !== undefined ||
-						!detached.isDirectory() ||
-						detached.isSymbolicLink() ||
-						detached.dev !== identity.dev ||
-						detached.ino !== identity.ino ||
-						parentAfter.dev !== parentIdentity.dev ||
-						parentAfter.ino !== parentIdentity.ino ||
-						!retained.ok ||
-						!retained.snapshot ||
-						retained.snapshot.rootDev !== identity.dev.toString() ||
-						retained.snapshot.rootIno !== identity.ino.toString() ||
-						!retainedTreeIsScrubbed
-					)
-						throw new Error("MCP temporary directory retained unresolved cleanup authority.");
-					mcpConfigDirectory = undefined;
-					return;
-				}
-				throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
-			} catch (error) {
-				constructionCleanupComplete = false;
-				cleanupFailure = { error };
-				throw error;
-			}
-		});
-		if (!cleanupComplete) {
-			if (cleanupFailure) throw cleanupFailure.error;
-			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
-		}
-	};
-	const captureMcpConfigDirectoryIdentity = async (
-		owned: OwnedMcpConfigDirectory,
-	): Promise<{ directoryIdentity: { dev: bigint; ino: bigint } }> => {
-		const [directoryStat, parentStat] = await Promise.all([
-			fs.lstat(owned.path, { bigint: true }),
-			fs.lstat(path.dirname(owned.path), { bigint: true }),
-		]);
-		if (
-			!directoryStat.isDirectory() ||
-			directoryStat.isSymbolicLink() ||
-			!parentStat.isDirectory() ||
-			parentStat.isSymbolicLink()
-		)
-			throw new Error("MCP temporary directory identity is unavailable.");
-		if (
-			(owned.directoryIdentity !== undefined &&
-				(directoryStat.dev !== owned.directoryIdentity.dev || directoryStat.ino !== owned.directoryIdentity.ino)) ||
-			(owned.parentIdentity !== undefined &&
-				(parentStat.dev !== owned.parentIdentity.dev || parentStat.ino !== owned.parentIdentity.ino))
-		)
-			throw new Error("MCP temporary directory identity changed during setup.");
-		const directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
-		owned.directoryIdentity = directoryIdentity;
-		owned.parentIdentity = { dev: parentStat.dev, ino: parentStat.ino };
-		return { directoryIdentity };
-	};
-	const captureMcpConfigDirectory = async (owned: OwnedMcpConfigDirectory): Promise<void> => {
-		const { directoryIdentity } = await captureMcpConfigDirectoryIdentity(owned);
-		const captured = snapshotDirectoryTree(owned.path);
-		if (
-			!captured.ok ||
-			!captured.snapshot ||
-			captured.snapshot.rootDev !== directoryIdentity.dev.toString() ||
-			captured.snapshot.rootIno !== directoryIdentity.ino.toString()
-		)
-			throw new Error(`MCP temporary directory snapshot failed: ${captured.code ?? "identity_mismatch"}.`);
-		owned.snapshot = captured.snapshot;
-	};
-	const disposeConstructedSession = async (session: AgentSession): Promise<void> => {
-		const disposed = await runBoundedStartupCleanup(async () => {
-			try {
-				await session.dispose();
-			} catch (error) {
-				if (!isSessionDisposalIncompleteError(error)) throw error;
-				await session.awaitDisposeCompletion();
-			}
-		});
-		if (!disposed) throw new Error("Lifecycle session disposal did not complete.");
-	};
-	const cleanupConstructionResources = async (): Promise<unknown | undefined> => {
-		let cleanupError: unknown;
-		try {
-			await removeMcpConfigDirectory();
-		} catch (error) {
-			cleanupError = error;
-		}
-		if (created && "failure" in created && !created.cleanupComplete) constructionCleanupComplete = false;
-		let sessionDisposalComplete = false;
-		if (created && !("failure" in created)) {
-			try {
-				await disposeConstructedSession(created.session);
-				sessionDisposalComplete = true;
-			} catch (error) {
-				cleanupError ??= error;
-			}
-		}
-		const managerCleanupRequired =
-			!sessionManagerTransferred ||
-			(created !== undefined && "failure" in created && !created.cleanupComplete) ||
-			(created !== undefined && !("failure" in created) && !sessionDisposalComplete);
-		if (managerCleanupRequired) {
-			try {
-				await closeSessionManager(opened?.sessionManager);
-			} catch (error) {
-				cleanupError ??= error;
-			}
-		}
-		return cleanupError;
-	};
+	let created: CreateLifecycleAgentSessionResult;
+	let mcpConfigDirectory: string | undefined;
 	try {
 		let mcpConfigPath: string | undefined;
 		opened = await beforeCutoff(
-			() => openLifecycleSession(request, cwd, agentDir),
+			() => openLifecycleSessionManager(request, cwd, agentDir),
 			async late => {
 				try {
-					await closeSessionManager(late.sessionManager);
+					await late.sessionManager?.close();
 				} catch (error) {
 					constructionCleanupComplete = false;
 					throw error;
 				}
 			},
 		);
-		if (!opened) throw new Error("Lifecycle session manager was not opened.");
 		openedSessionManager = opened.sessionManager;
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
-			const temporaryRoot = await beforeCutoff(() => fs.realpath(os.tmpdir()));
-			const ownedDirectory = await beforeCutoff(
-				async () => {
-					const owned: OwnedMcpConfigDirectory = {
-						path: await fs.mkdtemp(path.join(temporaryRoot, "gjc-acp-mcp-")),
-					};
-					mcpConfigDirectory = owned;
-					await captureMcpConfigDirectoryIdentity(owned);
-					await captureMcpConfigDirectory(owned);
-					return owned;
-				},
+			const temporaryDirectory = await beforeCutoff(
+				() => fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")),
 				async late => {
-					mcpConfigDirectory = late;
-					await removeMcpConfigDirectory();
+					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration directory cleanup did not complete.");
 				},
 			);
-			mcpConfigDirectory = ownedDirectory;
-			const resolvedMcpConfigDirectory = await beforeCutoff(
-				async () => {
-					try {
-						return await fs.realpath(ownedDirectory.path);
-					} catch (realpathError) {
-						try {
-							await captureMcpConfigDirectory(ownedDirectory);
-						} catch (snapshotError) {
-							throw new AggregateError(
-								[realpathError, snapshotError],
-								"MCP temporary directory resolution and cleanup snapshot both failed.",
-							);
-						}
-						throw realpathError;
-					}
-				},
-				async () => {
-					mcpConfigDirectory = ownedDirectory;
-					await removeMcpConfigDirectory();
+			mcpConfigDirectory = temporaryDirectory;
+			const canonicalDirectory = await beforeCutoff(
+				() => fs.realpath(temporaryDirectory),
+				async late => {
+					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration path cleanup did not complete.");
 				},
 			);
-			ownedDirectory.path = resolvedMcpConfigDirectory;
-			await captureMcpConfigDirectory(ownedDirectory);
-			const configPath = path.join(ownedDirectory.path, "mcp.json");
+			mcpConfigDirectory = canonicalDirectory;
+			const configPath = path.join(canonicalDirectory, "mcp.json");
 			mcpConfigPath = configPath;
 			const configContents = JSON.stringify({
 				mcpServers: Object.fromEntries(
@@ -1041,34 +810,13 @@ export async function runSessionHost(
 					]),
 				),
 			});
-			const configOutcome = await beforeCutoff(
+			await beforeCutoff(
+				() => writeMcpConfig(configPath, configContents),
 				async () => {
-					let writeFailure: { error: unknown } | undefined;
-					try {
-						await writeMcpConfig(configPath, configContents);
-					} catch (error) {
-						writeFailure = { error };
-					}
-					let snapshotFailure: { error: unknown } | undefined;
-					try {
-						await captureMcpConfigDirectory(ownedDirectory);
-					} catch (error) {
-						snapshotFailure = { error };
-					}
-					return { writeFailure, snapshotFailure };
-				},
-				async () => {
-					mcpConfigDirectory = ownedDirectory;
-					await removeMcpConfigDirectory();
+					if (!(await runBoundedStartupCleanup(() => fs.rm(canonicalDirectory, { recursive: true, force: true }))))
+						throw new Error("Late MCP configuration write cleanup did not complete.");
 				},
 			);
-			if (configOutcome.writeFailure && configOutcome.snapshotFailure)
-				throw new AggregateError(
-					[configOutcome.writeFailure.error, configOutcome.snapshotFailure.error],
-					"MCP configuration write and ownership snapshot both failed.",
-				);
-			if (configOutcome.snapshotFailure) throw configOutcome.snapshotFailure.error;
-			if (configOutcome.writeFailure) throw configOutcome.writeFailure.error;
 			throwIfStartupInterrupted();
 		}
 
@@ -1099,7 +847,7 @@ export async function runSessionHost(
 					{
 						cwd,
 						agentDir,
-						sessionManager: opened?.sessionManager,
+						sessionManager: opened.sessionManager,
 						...(mcpConfigPath ? { mcpConfigPath } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
@@ -1108,73 +856,65 @@ export async function runSessionHost(
 					},
 					startupOwner,
 				);
-				if (mcpConfigDirectory) await removeMcpConfigDirectory();
+				if (mcpConfigDirectory) {
+					await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
+					mcpConfigDirectory = undefined;
+				}
 				return result;
 			},
 			async late => {
-				if ("failure" in late) {
-					if (!late.cleanupComplete) constructionCleanupComplete = false;
-					return;
+				if ("failure" in late) return;
+				try {
+					await late.session.dispose();
+				} catch (error) {
+					if (!isSessionDisposalIncompleteError(error)) {
+						constructionCleanupComplete = false;
+						throw error;
+					}
+					await late.session.awaitDisposeCompletion();
 				}
-				await disposeConstructedSession(late.session);
-				await closeSessionManager(opened?.sessionManager);
 			},
 		);
-		await removeMcpConfigDirectory();
 	} catch (error) {
-		if (error instanceof LifecycleSessionManagerCleanupError || error instanceof LifecycleReadinessCleanupError)
-			constructionCleanupComplete = false;
-		const cleanupError = await cleanupConstructionResources();
-		const baseFailure = startupInterruption ?? constructionFailure(error);
-		const failure =
-			cleanupError === undefined
-				? baseFailure
-				: capability.normalizeFailure(baseFailure.phase, baseFailure.reason, cleanupError);
-		try {
-			const settled = capability.settleFailure(failure);
-			const durableFailure = settled.status === "failed" ? settled.failure : failure;
-			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-			await writeFailure(durableFailure, rollback.result);
-		} finally {
-			removeStartupSignalHandlers();
+		removeStartupSignalHandlers();
+		if (!sessionManagerTransferred && openedSessionManager) {
+			const manager = openedSessionManager;
+			await runBoundedStartupCleanup(() => manager.close());
 		}
+		if (mcpConfigDirectory) {
+			const directory = mcpConfigDirectory;
+			mcpConfigDirectory = undefined;
+			await runBoundedStartupCleanup(() => fs.rm(directory, { recursive: true, force: true }));
+		}
+		const failure = constructionFailure(error);
+		const settled = capability.settleFailure(failure);
+		const durableFailure = settled.status === "failed" ? settled.failure : failure;
+		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+		await writeFailure(durableFailure, rollback.result);
 		throw error;
 	}
-	if (!opened || !created) throw new Error("Lifecycle construction did not produce a result.");
 	if ("failure" in created) {
-		if (created.capability !== capability || created.rollback !== rollback || !created.cleanupComplete)
-			constructionCleanupComplete = false;
-		let failure = startupInterruption ?? created.failure;
-		try {
-			await closeSessionManager(opened.sessionManager);
-		} catch (error) {
-			failure = capability.normalizeFailure(failure.phase, failure.reason, error);
-		}
-		try {
-			const settled = capability.settleFailure(failure);
-			const durableFailure = settled.status === "failed" ? settled.failure : failure;
-			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-			await writeFailure(durableFailure, rollback.result);
-		} finally {
-			removeStartupSignalHandlers();
-		}
-		throw failure;
+		removeStartupSignalHandlers();
+		created.rollback.recordAbsent();
+		capability.settleFailure(created.failure);
+		await writeFailure(created.failure, created.rollback.result);
+		throw created.failure;
 	}
 	if (created.capability !== capability || created.rollback !== rollback) {
-		const cleanupError = await cleanupConstructionResources();
-		const failure = cleanupError
-			? capability.normalizeFailure("registration", "failed", cleanupError)
-			: capability.normalizeFailure(
-					"registration",
-					"failed",
-					"Lifecycle startup owner changed during construction.",
-				);
+		removeStartupSignalHandlers();
 		try {
-			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-			await writeFailure(failure, rollback.result);
-		} finally {
-			removeStartupSignalHandlers();
+			await created.session.dispose();
+		} catch (error) {
+			if (!isSessionDisposalIncompleteError(error)) throw error;
+			await created.session.awaitDisposeCompletion();
 		}
+		const failure = capability.normalizeFailure(
+			"registration",
+			"failed",
+			"Lifecycle startup owner changed during construction.",
+		);
+		if (rollback.generation === undefined) rollback.recordAbsent();
+		await writeFailure(failure, rollback.result);
 		throw failure;
 	}
 	const { parsed } = opened;
@@ -1234,9 +974,8 @@ export async function runSessionHost(
 				]);
 				if (!revoked) readinessPublicationCleanupComplete = false;
 			}
-			if (!readinessPublicationCleanupComplete) constructionCleanupComplete = false;
 			const transcript = await disposeAndCapture();
-			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			if (rollback.generation === undefined && readinessPublicationCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
 		})();
 		return failureRollback;
@@ -1301,7 +1040,7 @@ export async function runSessionHost(
 					}),
 		);
 		await beforeCutoff(() =>
-			initializeSessionExtensions(session, {
+			initializeExtensions(session, {
 				reportSendError: () => {},
 				reportRuntimeError: () => {},
 				onShutdown: stop,
@@ -1350,7 +1089,6 @@ export async function runSessionHost(
 				readinessPublicationCleanupComplete =
 					!outcome.published && !(outcome.error instanceof LifecycleReadinessCleanupError);
 			},
-			{ readinessPublication: true },
 		);
 		if (!readinessOutcome.published) {
 			readinessPublicationCleanupComplete = !(readinessOutcome.error instanceof LifecycleReadinessCleanupError);
@@ -1368,20 +1106,14 @@ export async function runSessionHost(
 		process.once("SIGTERM", onReadySignal);
 		process.once("SIGINT", onReadySignal);
 	} catch (error) {
-		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
+		removeStartupSignalHandlers();
 		const failure =
 			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
 				? (error as SdkStartupFailure)
 				: capability.normalizeFailure("startup", "failed", error);
-		try {
-			const settled = capability.settleFailure(failure);
-			const durableFailure = settled.status === "failed" ? settled.failure : failure;
-			await failAfterRollback(durableFailure);
-		} finally {
-			removeStartupSignalHandlers();
-			process.removeListener("SIGTERM", onReadySignal);
-			process.removeListener("SIGINT", onReadySignal);
-		}
+		const settled = capability.settleFailure(failure);
+		const durableFailure = settled.status === "failed" ? settled.failure : failure;
+		await failAfterRollback(durableFailure);
 		throw error;
 	}
 	// Readiness is published; the session is live. Memory startup issues one LLM
@@ -1460,214 +1192,10 @@ function parsePositiveTimeout(raw: string | undefined, flagName: string): number
 	return value;
 }
 
-class SdkServeHelp extends Command {
-	static description = "gjc sdk serve --stdio | --socket <path> [--session <id>] [--pending-ceiling <bytes>]";
-	static flags = {
-		stdio: Flags.boolean({ description: "Serve SDK frames over standard input and output" }),
-		socket: Flags.string({ description: "Serve SDK frames over a Unix socket path" }),
-		session: Flags.string({ description: "Attach to a specific SDK session" }),
-		"pending-ceiling": Flags.string({ description: "Maximum queued relay bytes per direction" }),
-	};
-	async run(): Promise<void> {}
-}
+// Unused Command scaffolding classes removed - all logic moved to Sdk.run() dispatcher
 
-class SdkSessionHelp extends Command {
-	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|close|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
-	static args = {
-		verb: Args.string({
-			description: "Session verb",
-			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "close", "retire", "raw"],
-		}),
-		target: Args.string({
-			description: "Session id (or the raw kind control|query|global for `raw`)",
-			required: false,
-		}),
-		opRef: Args.string({
-			description: "Operation reference for status, or session id for raw control/query",
-			required: false,
-		}),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		repo: Flags.string({
-			description: "Workspace directory for saved-session resolution (default: current directory)",
-		}),
-		op: Flags.string({ description: "Raw control or global operation" }),
+// SdkGuidesHelp and SdkGuidesCommand unused; guides logic moved to Sdk.run() dispatcher
 
-		query: Flags.string({ description: "Raw query name" }),
-		"json-input": Flags.string({ description: "SDK request JSON object" }),
-		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
-		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
-		"idempotency-key": Flags.string({
-			description: "Caller idempotency key required for lifecycle globals and terminal abort controls",
-		}),
-		confirm: Flags.boolean({ description: "Confirm a destructive local CLI control operation" }),
-		cursor: Flags.string({
-			description:
-				"Raw query continuation/search cursor, or session tail checkpoint claim (tail also requires --after-transcript-id)",
-		}),
-		scope: Flags.string({
-			description:
-				"session list scope: repo (default), cwd, worktree, or all; search scope: repo (default), pwd, or global",
-		}),
-		limit: Flags.integer({ description: "Search or raw session.list page size from 1 to 100" }),
-		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
-		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
-		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
-		wait: Flags.boolean({
-			description: "send --wait: poll turn.result with kind=prompt until terminal or the wait window elapses",
-		}),
-		"timeout-ms": Flags.string({ description: "Wait window for send --wait, status, and live tail follow" }),
-		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
-		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
-		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
-		"after-transcript-id": Flags.string({
-			description:
-				"tail --cursor (required): omit transcript rows up to and including this row id (the caller already has them)",
-		}),
-		page: Flags.boolean({ description: "raw global session.list: return exactly one broker page" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkSpawnCommand extends Command {
-	static description = "Spawn a task-seeded background child session (local interactive master only).";
-	static flags = {
-		cwd: Flags.string({ description: "Working directory for the spawned child" }),
-		prompt: Flags.string({ description: "Seed task delivered once to the child" }),
-		model: Flags.string({ description: "Model selector for the child" }),
-		profile: Flags.string({ description: "Model profile name for the child" }),
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		"idempotency-key": Flags.string({
-			description: "Idempotency key for replaying an uncertain session.spawn result",
-		}),
-		json: Flags.boolean({ description: "Render the safe spawn result as JSON" }),
-	};
-	async run(): Promise<void> {
-		const { flags } = await this.parse(SdkSpawnCommand);
-		try {
-			const spawn = await runSdkSpawn({
-				cwd: flags.cwd,
-				prompt: flags.prompt,
-				model: flags.model,
-				profile: flags.profile,
-				agentDir: flags["agent-dir"],
-				idempotencyKey: flags["idempotency-key"],
-			});
-			process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
-			if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;
-		} catch (error) {
-			if (error instanceof SdkMasterCliError) {
-				process.stderr.write(`Error: ${error.code}: ${error.message}\n`);
-				process.exitCode = error.exitCode;
-				return;
-			}
-			throw error;
-		}
-	}
-}
-
-class SdkSearchCommand extends Command {
-	static description = "Search broker-visible SDK sessions within an exact repo, pwd, or global scope.";
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
-		repo: Flags.string({ description: "Workspace directory for scope resolution (default: current directory)" }),
-		scope: Flags.string({ description: "Search scope: repo, pwd, or global (default: repo)" }),
-		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
-		cursor: Flags.string({ description: "Frozen scoped search continuation cursor" }),
-		json: Flags.boolean({ description: "Render exactly the SdkSearchResultV1 JSON envelope" }),
-	};
-	async run(): Promise<void> {
-		const { flags } = await this.parse(SdkSearchCommand);
-		const scope = flags.scope;
-		if (scope !== undefined && scope !== "repo" && scope !== "pwd" && scope !== "global")
-			throw new CliParseError("--scope must be repo, pwd, or global.");
-		const search = await runSdkSearch({
-			agentDir: flags["agent-dir"],
-			repo: flags.repo,
-			scope,
-			limit: flags.limit,
-			cursor: flags.cursor,
-		});
-		process.stdout.write(`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`);
-		if (search.exitCode !== 0) process.exitCode = search.exitCode;
-	}
-}
-
-class SdkSessionCommand extends Command {
-	static description = SdkSessionHelp.description;
-	static args = SdkSessionHelp.args;
-	static flags = SdkSessionHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkSessionCommand);
-		const verb = args.verb;
-		const target = args.target;
-		const flagRec = flags as Record<string, unknown>;
-		await runSdkSessionCli({
-			action: verb,
-			...(verb === "raw"
-				? {
-						rawAction: target,
-						sessionId: target === "control" || target === "query" ? args.opRef : undefined,
-					}
-				: { sessionId: verb === "list" ? undefined : target }),
-			opRef: verb === "status" ? args.opRef : (flagRec["op-ref"] as string | undefined),
-			operation: flagRec.op as string | undefined,
-			query: flagRec.query as string | undefined,
-			text: flagRec.text as string | undefined,
-			jsonInput: flagRec["json-input"] as string | undefined,
-			jsonInputFile: flagRec["json-input-file"] as string | undefined,
-			jsonInputStdin: Boolean(flagRec["json-input-stdin"]),
-			confirm: Boolean(flagRec.confirm),
-			idempotencyKey: flagRec["idempotency-key"] as string | undefined,
-			cursor: flagRec.cursor as string | undefined,
-			wait: Boolean(flagRec.wait),
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
-			strict: Boolean(flagRec.strict),
-			untilIdle: Boolean(flagRec["until-idle"]),
-			allEvents: Boolean(flagRec["all-events"]),
-			afterTranscriptId: flagRec["after-transcript-id"] as string | undefined,
-			page: Boolean(flagRec.page),
-			limit: flagRec.limit as number | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			repo: flagRec.repo as string | undefined,
-			scope: flagRec.scope as string | undefined,
-		});
-	}
-}
-
-class SdkGuidesHelp extends Command {
-	static description = "Manage verified advisory SDK guides: refresh, list, show, status, or trust.";
-	static args = {
-		action: Args.string({ required: false, options: ["refresh", "list", "show", "status", "trust"] }),
-		guideId: Args.string({ required: false, description: "Guide id for show" }),
-	};
-	static flags = {
-		"agent-dir": Flags.string({ description: "SDK state directory for the verified guide cache" }),
-		url: Flags.string({ description: "HTTPS allowlisted manifest URL for refresh" }),
-		"timeout-ms": Flags.string({ description: "Bounded refresh timeout in milliseconds" }),
-	};
-	async run(): Promise<void> {}
-}
-
-class SdkGuidesCommand extends Command {
-	static description = SdkGuidesHelp.description;
-	static args = SdkGuidesHelp.args;
-	static flags = SdkGuidesHelp.flags;
-	async run(): Promise<void> {
-		const { args, flags } = await this.parse(SdkGuidesCommand);
-		const flagRec = flags as Record<string, unknown>;
-		await runSdkGuidesCli({
-			action: args.action,
-			guideId: args.guideId,
-			url: flagRec.url as string | undefined,
-			agentDir: flagRec["agent-dir"] as string | undefined,
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
-		});
-	}
-}
 export default class Sdk extends Command {
 	static description = "SDK command runtime; public grammar and help are registry-owned.";
 	static hidden = false;
@@ -1777,6 +1305,7 @@ export default class Sdk extends Command {
 		}
 
 		const internal = parseSdkInternalArgv(this.argv);
+		if (internal.action === "broker-internal") usePostmortemSignalExitAuthority();
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();
 			return;
@@ -1787,6 +1316,148 @@ export default class Sdk extends Command {
 		}
 		const agentDir = path.resolve(internal.agentDir);
 		let broker: Broker | undefined;
+		let runningBroker: Broker | undefined;
+		let stopSweep: (() => void) | undefined;
+		let startupExitRequested = false;
+		let startupExitReason: "startup-deadline" | "startup-signal" | undefined;
+		let startupExitLogged = false;
+		let pendingShutdownSignal: "SIGTERM" | "SIGINT" | undefined;
+		let startupExitTask: Promise<boolean> | undefined;
+		const startupStartedAt = process.hrtime.bigint();
+		let startupExitWrite: Promise<BrokerStartupExitWriteStatus> | undefined;
+		const startupAbortController = new AbortController();
+		let candidateStartTask: Promise<unknown> | undefined;
+		const waitForStartupAbortCleanup = async (): Promise<void> => {
+			const task = candidateStartTask;
+			if (!task) return;
+			await Promise.race([
+				task.then(
+					() => undefined,
+					() => undefined,
+				),
+				Bun.sleep(BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS),
+			]);
+		};
+		const startupSignalExitCode = (signal: "SIGTERM" | "SIGINT"): 130 | 143 => (signal === "SIGINT" ? 130 : 143);
+		const makeStartupExitRecord = (
+			reason: "startup-deadline" | "startup-signal",
+			exitCode: 1 | 130 | 143,
+			signal: "SIGTERM" | "SIGINT" | null,
+			timeoutMs?: number,
+		): BrokerStartupExitRecord & Record<string, unknown> => ({
+			version: 1,
+			reason,
+			mode: "startup",
+			fenceReason: null,
+			fencedForMs: 0,
+			uptimeMs: Math.max(0, Number((process.hrtime.bigint() - startupStartedAt) / 1_000_000n)),
+			pid: process.pid,
+			signal,
+			exitCode,
+			timeoutMs: timeoutMs ?? null,
+			writtenAt: Date.now(),
+		});
+		const beginStartupExitRecordWrite = (record: BrokerStartupExitRecord): Promise<BrokerStartupExitWriteStatus> => {
+			const testDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_EXIT_RECORD_DELAY_MS ?? 0);
+			const beforeWriteForTest =
+				Number.isSafeInteger(testDelayMs) && testDelayMs > 0 && testDelayMs <= 10_000
+					? async () => {
+							await emitBrokerStartupTestSignal("startup-exit-record-fallback-waiting");
+							await Bun.sleep(testDelayMs);
+						}
+					: undefined;
+			startupExitWrite ??= writeBrokerStartupExitRecordBounded(
+				agentDir,
+				record,
+				record.reason === "startup-signal"
+					? BROKER_STARTUP_SIGNAL_EXIT_RECORD_WRITE_TIMEOUT_MS
+					: BROKER_STARTUP_MARKER_WRITE_TIMEOUT_MS,
+				beforeWriteForTest,
+			);
+			return startupExitWrite;
+		};
+		const brokerReadyForSignal = (): Broker | undefined =>
+			runningBroker ?? (broker?.ownsDiscovery ? broker : undefined);
+		const writeStartupExitLog = (
+			record: BrokerStartupExitRecord & Record<string, unknown>,
+			message: string,
+		): void => {
+			if (startupExitLogged) return;
+			startupExitLogged = true;
+			const level = record.exitCode === 1 ? "error" : "warn";
+			if (record.exitCode === 1) logger.error("sdk broker: startup watchdog forcing exit", record);
+			else logger.warn("sdk broker: startup interrupted", record);
+			process.stderr.write(`${JSON.stringify({ level, message, ...record })}\n`);
+		};
+		const exitDuringStartup = (
+			reason: "startup-deadline" | "startup-signal",
+			exitCode: 1 | 130 | 143,
+			signal: "SIGTERM" | "SIGINT" | null,
+			timeoutMs?: number,
+		): Promise<boolean> => {
+			// The first startup exit cause owns both the persisted reason and the process exit code.
+			if (startupExitTask) return startupExitReason === reason ? startupExitTask : Promise.resolve(false);
+			if (startupExitRequested) return Promise.resolve(false);
+			startupExitRequested = true;
+			startupExitReason = reason;
+			const exitRecord = makeStartupExitRecord(reason, exitCode, signal, timeoutMs);
+			const message =
+				reason === "startup-deadline"
+					? `SDK broker startup exceeded its ${timeoutMs}ms fence deadline.`
+					: `SDK broker startup interrupted by ${signal} before readiness.`;
+			writeStartupExitLog(exitRecord, message);
+			startupExitTask = (async () => {
+				const exitRecordWrite = await beginStartupExitRecordWrite(exitRecord);
+				const exitRecordWritten = exitRecordWrite.kind === "written";
+				if (!exitRecordWritten)
+					logger.error("sdk broker: startup exit record write timed out", {
+						reason: "startup-exit-record-write-failed-or-timed-out",
+						exitReason: reason,
+						exitRecordWriteStatus: exitRecordWrite.kind,
+						...(exitRecordWrite.kind === "failed" && exitRecordWrite.code
+							? { exitRecordWriteErrorCode: exitRecordWrite.code }
+							: {}),
+						pid: process.pid,
+						exitCode,
+					});
+				return true;
+			})();
+			return startupExitTask;
+		};
+		const unregisterPostmortem = postmortem.register("sdk-broker:exit", async reason => {
+			const signal =
+				reason === postmortem.Reason.SIGTERM
+					? "SIGTERM"
+					: reason === postmortem.Reason.SIGINT
+						? "SIGINT"
+						: pendingShutdownSignal;
+			if (!signal) return;
+			pendingShutdownSignal = signal;
+			if (startupExitTask && startupExitReason === "startup-deadline") {
+				await startupExitTask;
+				await waitForStartupAbortCleanup();
+				process.exit(1);
+				return;
+			}
+			const activeBroker = brokerReadyForSignal();
+			if (activeBroker) {
+				runningBroker = activeBroker;
+				stopSweep?.();
+				await activeBroker.stop({ kind: "signal", signal });
+				return;
+			}
+			startupAbortController.abort();
+			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+			// Startup may remain blocked in awaited I/O after abort. Bound best-effort
+			// rollback so shared postmortem can exit with the original signal status.
+			await waitForStartupAbortCleanup();
+		});
+		const finishPendingStartupSignal = async (): Promise<boolean> => {
+			const signal = pendingShutdownSignal;
+			if (!signal) return false;
+			await exitDuringStartup("startup-signal", startupSignalExitCode(signal), signal);
+			return true;
+		};
 		try {
 			const startupOperation = async (deadline: number): Promise<Broker | undefined> => {
 				const remainingMs = Math.max(1, deadline - Date.now());
@@ -1796,14 +1467,39 @@ export default class Sdk extends Command {
 						? testWatchdogMs
 						: remainingMs;
 				const startupWatchdog = setTimeout(() => {
-					process.stderr.write(`SDK broker startup exceeded its ${watchdogMs}ms fence deadline.\n`);
-					process.exit(1);
+					startupAbortController.abort();
+					void exitDuringStartup("startup-deadline", 1, null, watchdogMs).then(async started => {
+						if (!started) {
+							// A prior startup signal owns the exit cause; its postmortem callback
+							// returns after bounded cleanup and preserves the signal status.
+							return;
+						}
+						await waitForStartupAbortCleanup();
+						process.exit(1);
+					});
 				}, watchdogMs);
 				try {
-					if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
+					const existing = await reconcileBrokerGenerationForStartup({ agentDir }, deadline);
+					if (startupAbortController.signal.aborted) return undefined;
+					if (existing) {
+						logger.info("sdk broker: startup reused an existing owner", {
+							reason: "existing-owner-reused",
+							ownerId: existing.ownerId,
+							pid: existing.pid,
+							exitCode: 0,
+						});
+						return undefined;
+					}
 					if (process.env.GJC_SDK_TEST_BROKER_STARTUP_STALL === "1") {
 						const stalled = Promise.withResolvers<void>();
 						await stalled.promise;
+					}
+					const testStartupSignal = process.env.GJC_SDK_TEST_BROKER_STARTUP_SIGNAL;
+					if (testStartupSignal === "SIGTERM" || testStartupSignal === "SIGINT") {
+						await emitBrokerStartupTestSignal("startup-signal-ready");
+						process.kill(process.pid, testStartupSignal);
+						const waiting = Promise.withResolvers<void>();
+						await waiting.promise;
 					}
 					const startupGateFile = process.env.GJC_SDK_TEST_BROKER_STARTUP_GATE_FILE;
 					if (startupGateFile) {
@@ -1812,8 +1508,10 @@ export default class Sdk extends Command {
 						await emitBrokerStartupTestSignal("startup-gate-released");
 					}
 					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
-					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
+					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000) {
 						await Bun.sleep(startupDelayMs);
+					}
+					if (startupAbortController.signal.aborted) return undefined;
 					// The real broker-internal entry point is the only place that reads this
 					// launcher-supplied environment variable; it is validated here and handed
 					// to Broker as a typed setting, never read a second time inside broker.ts
@@ -1823,8 +1521,49 @@ export default class Sdk extends Command {
 						typeof restartRequestEnv === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(restartRequestEnv)
 							? restartRequestEnv
 							: undefined;
+					const testPostPublicationDelayMs = Number(
+						process.env.GJC_SDK_TEST_BROKER_POST_PUBLICATION_DELAY_MS ?? 0,
+					);
+					const startupPostPublicationDelayMs =
+						Number.isSafeInteger(testPostPublicationDelayMs) &&
+						testPostPublicationDelayMs > 0 &&
+						testPostPublicationDelayMs <= 10_000
+							? testPostPublicationDelayMs
+							: undefined;
+					const testPrePublicationDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_PRE_PUBLICATION_DELAY_MS ?? 0);
+					const startupPrePublicationDelayMs =
+						Number.isSafeInteger(testPrePublicationDelayMs) &&
+						testPrePublicationDelayMs > 0 &&
+						testPrePublicationDelayMs <= 10_000
+							? testPrePublicationDelayMs
+							: undefined;
+					const testAfterDiscoveryWriteDelayMs = Number(
+						process.env.GJC_SDK_TEST_BROKER_AFTER_DISCOVERY_WRITE_DELAY_MS ?? 0,
+					);
+					const startupAfterDiscoveryWriteTestHook =
+						Number.isSafeInteger(testAfterDiscoveryWriteDelayMs) &&
+						testAfterDiscoveryWriteDelayMs > 0 &&
+						testAfterDiscoveryWriteDelayMs <= 10_000
+							? async () => {
+									await emitBrokerStartupTestSignal("discovery-written-before-retain");
+									const signal = startupAbortController.signal;
+									if (signal.aborted) return;
+									const wait = Promise.withResolvers<void>();
+									const timer = setTimeout(wait.resolve, testAfterDiscoveryWriteDelayMs);
+									const onAbort = (): void => wait.resolve();
+									signal.addEventListener("abort", onAbort, { once: true });
+									try {
+										await wait.promise;
+									} finally {
+										clearTimeout(timer);
+										signal.removeEventListener("abort", onAbort);
+									}
+								}
+							: undefined;
 					const candidate = new Broker({
 						agentDir,
+						startupAbortSignal: startupAbortController.signal,
+						onStartupReady: () => clearTimeout(startupWatchdog),
 						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
 							"sdk.masterOrphanGraceMs",
 						),
@@ -1837,10 +1576,22 @@ export default class Sdk extends Command {
 								await settings.close();
 							}
 						},
+						...(startupPrePublicationDelayMs === undefined
+							? {}
+							: {
+									startupPrePublicationDelayMs,
+									startupPrePublicationTestHook: async () => {
+										await emitBrokerStartupTestSignal("pre-publication-ready");
+									},
+								}),
+						...(startupAfterDiscoveryWriteTestHook === undefined ? {} : { startupAfterDiscoveryWriteTestHook }),
+						...(startupPostPublicationDelayMs === undefined ? {} : { startupPostPublicationDelayMs }),
 						...(restartRequestId === undefined ? {} : { restartRequestId }),
 					});
 					broker = candidate;
-					await candidate.start();
+					candidateStartTask = candidate.start();
+					await candidateStartTask;
+					if (candidate.ownsDiscovery) runningBroker = candidate;
 					return candidate;
 				} finally {
 					clearTimeout(startupWatchdog);
@@ -1851,9 +1602,13 @@ export default class Sdk extends Command {
 				onContended: () => void emitBrokerStartupTestSignal("fence-contended"),
 			});
 		} catch (error) {
+			if (pendingShutdownSignal) {
+				await finishPendingStartupSignal();
+				return;
+			}
 			if (broker) {
 				try {
-					await broker.stop();
+					await broker.stop({ kind: "startup-failure" });
 				} catch {
 					// Preserve the startup/fence failure that made this bootstrap unusable.
 				}
@@ -1861,47 +1616,61 @@ export default class Sdk extends Command {
 			// This process spawns detached with stdio ignored (see ensure.ts), so the
 			// durable marker is the only channel the caller has to see why start()
 			// failed instead of a bare exit code (#3963).
-			const incarnation = processIncarnation(process.pid);
-			if (incarnation)
-				await writeBrokerStartupFailureMarker(agentDir, {
-					reason: error instanceof Error ? error.message : String(error),
-					exitCode: 1,
-					signal: null,
-					pid: process.pid,
-					incarnation,
-				});
+			const startupFailureIncarnation = processIncarnation(process.pid);
+			const markerWritten = await writeBrokerStartupFailureMarkerBounded(agentDir, {
+				reason: error instanceof Error ? error.message : String(error),
+				exitCode: 1,
+				signal: null,
+				pid: process.pid,
+				...(startupFailureIncarnation === undefined ? {} : { incarnation: startupFailureIncarnation }),
+			});
+			logger.error("sdk broker: startup failed", {
+				reason: "startup-failure",
+				pid: process.pid,
+				exitCode: 1,
+				markerWritten,
+			});
+			unregisterPostmortem();
 			throw error;
 		}
-		if (!broker) return;
-		const runningBroker = broker;
-		if (!runningBroker.ownsDiscovery) {
+		if (!broker) {
+			if (pendingShutdownSignal) {
+				await finishPendingStartupSignal();
+				return;
+			}
+			unregisterPostmortem();
+			return;
+		}
+		if (!broker.ownsDiscovery) {
+			if (pendingShutdownSignal) {
+				if (runningBroker) await runningBroker.completion;
+				else await finishPendingStartupSignal();
+				return;
+			}
 			// Another broker owns discovery; this process exits cleanly (code 0) as
 			// the race loser. Record why so a caller polling for a winner that never
 			// appears can diagnose the loss instead of seeing only a bare exit 0.
-			const incarnation = processIncarnation(process.pid);
-			if (incarnation)
-				await writeBrokerStartupFailureMarker(agentDir, {
-					reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
-					exitCode: 0,
-					signal: null,
-					pid: process.pid,
-					incarnation,
-				});
+			const losingIncarnation = processIncarnation(process.pid);
+			await writeBrokerStartupFailureMarkerBounded(agentDir, {
+				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
+				exitCode: 0,
+				signal: null,
+				pid: process.pid,
+				...(losingIncarnation === undefined ? {} : { incarnation: losingIncarnation }),
+			});
+			unregisterPostmortem();
 			return;
 		}
+		runningBroker = broker;
 		// A live broker must not keep advertising sessions whose host process is
 		// gone; the sweep is the broker-side half of the host reaping bound.
-		const stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
-		const stop = () => {
-			stopSweep();
-			void runningBroker.stop();
-		};
-		process.once("SIGTERM", stop);
-		process.once("SIGINT", stop);
+		stopSweep = startBrokerDeadRegistrationSweep(runningBroker);
 		try {
-			await completeBrokerProcess(runningBroker);
+			await runningBroker.completion;
 		} finally {
-			stopSweep();
+			stopSweep?.();
+			if (!pendingShutdownSignal) unregisterPostmortem();
 		}
+		if (!pendingShutdownSignal) process.exit(0);
 	}
 }

@@ -54,7 +54,7 @@ export const CURATED_TIER_LABELS = {
 		{ tier: "fast", effort: "low", rank: 1 },
 		{ tier: "balanced", effort: "medium", rank: 1 },
 	],
-	"openai-codex/gpt-5.6-sol": [{ tier: "strong", effort: "high", rank: 1 }],
+	"openai-codex/gpt-6-sol": [{ tier: "strong", effort: "high", rank: 1 }],
 	"google/gemini-3.5-flash-lite": [{ tier: "fast", rank: 1 }],
 	"google/gemini-2.5-flash-lite": [{ tier: "fast", rank: 2 }],
 	"google/gemini-3.5-flash": [{ tier: "balanced", rank: 1 }],
@@ -887,7 +887,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"nvidia/upstage/solar-10.7b-instruct": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"openai-codex/gpt-6-astra": { rationale: "GPT-6 Astra catalog addition (2026-09-03 release); not yet curated" },
 	"openai-codex/gpt-6-luna": { rationale: "GPT-6 Luna catalog addition (2026-09-22 release); not yet curated" },
-	"openai-codex/gpt-6-sol": { rationale: "GPT-6 Sol catalog addition (2026-09-22 release); not yet curated" },
+	"openai-codex/gpt-5.6-sol": { rationale: "Retained legacy Codex model; superseded by GPT-6 Sol" },
 	"openai-codex/gpt-daybreak-blue-latest": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/deepseek-v4-flash-vision-exp": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",

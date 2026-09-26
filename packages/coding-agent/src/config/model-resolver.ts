@@ -1075,25 +1075,69 @@ export function resolveModelOverride(
  */
 export interface ModelChainResolutionOptions {
 	managedFallback?: boolean;
+	/** Session that claims a half-open entry's probe lease when resolution selects it. */
+	circuitProbeOwner?: string;
 	aliasIntent?: "preset-equivalent" | "reject";
 	canonicalSessionId?: string | null;
 	credentialSessionId?: string;
 	signal?: AbortSignal;
 }
 
-export async function resolveModelChainWithAuth(
-	modelPatterns: readonly string[],
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
-	settings?: Settings,
-	sessionId?: string,
-	options?: ModelChainResolutionOptions,
-): Promise<{
+/**
+ * Chain resolution must see fallback circuit state: adapters that wrap the
+ * registry are required to forward it so managed resolution never selects an
+ * entry whose circuit is open.
+ */
+export type ChainResolutionRegistry = ModelLookupRegistry & Pick<ModelRegistry, "getApiKey" | "isSelectorCircuitOpen">;
+
+interface ModelChainResolution {
 	model?: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
 	explicitThinkingLevel: boolean;
 	activeIndex: number;
 	skips: Array<{ selector: string; reason: string }>;
-}> {
+}
+
+export async function resolveModelChainWithAuth(
+	modelPatterns: readonly string[],
+	modelRegistry: ChainResolutionRegistry,
+	settings?: Settings,
+	sessionId?: string,
+	options?: ModelChainResolutionOptions,
+): Promise<ModelChainResolution> {
+	// A managed chain skips entries whose fallback circuit is open (they recently
+	// failed out of a chain). When every remaining entry is open, resolve again
+	// from the first open entry so the chain degrades to probing instead of
+	// refusing the turn outright.
+	const skipOpenCircuits = options?.managedFallback === true && modelPatterns.length > 1;
+	const resolution = await resolveModelChainEntries(modelPatterns, modelRegistry, settings, sessionId, options, 0, {
+		skipOpenCircuits,
+	});
+	const { firstOpenCircuit, ...result } = resolution;
+	if (result.model || firstOpenCircuit === undefined) return result;
+	const { firstOpenCircuit: _unused, ...probe } = await resolveModelChainEntries(
+		modelPatterns,
+		modelRegistry,
+		settings,
+		sessionId,
+		options,
+		firstOpenCircuit.index,
+		{ skipOpenCircuits: false },
+	);
+	return probe.model
+		? { ...probe, skips: [...result.skips.slice(0, firstOpenCircuit.skipCount), ...probe.skips] }
+		: result;
+}
+
+async function resolveModelChainEntries(
+	modelPatterns: readonly string[],
+	modelRegistry: ChainResolutionRegistry,
+	settings: Settings | undefined,
+	sessionId: string | undefined,
+	options: ModelChainResolutionOptions | undefined,
+	startIndex: number,
+	circuitPolicy: { skipOpenCircuits: boolean },
+): Promise<ModelChainResolution & { firstOpenCircuit?: { index: number; skipCount: number } }> {
 	const availableModels = modelRegistry.getAvailable();
 	const matchPreferences = { usageOrder: settings?.getStorage()?.getModelUsageOrder() };
 	const skips: Array<{ selector: string; reason: string }> = [];
@@ -1101,8 +1145,14 @@ export async function resolveModelChainWithAuth(
 	const canonicalSessionId =
 		options?.canonicalSessionId === null ? undefined : (options?.canonicalSessionId ?? sessionId);
 	const credentialSessionId = options?.credentialSessionId ?? sessionId;
-	for (let activeIndex = 0; activeIndex < modelPatterns.length; activeIndex += 1) {
+	let firstOpenCircuit: { index: number; skipCount: number } | undefined;
+	for (let activeIndex = startIndex; activeIndex < modelPatterns.length; activeIndex += 1) {
 		const selector = modelPatterns[activeIndex];
+		if (circuitPolicy.skipOpenCircuits && modelRegistry.isSelectorCircuitOpen(selector, options?.circuitProbeOwner)) {
+			firstOpenCircuit ??= { index: activeIndex, skipCount: skips.length };
+			skips.push({ selector, reason: "circuit_open" });
+			continue;
+		}
 		const suffix = splitSelectorThinkingSuffix(selector);
 		const aliasSelector = suffix.thinkingLevel ? suffix.selector : selector;
 		const aliasKey = aliasSelector.includes("/") ? undefined : getFinalSlashSegmentAliasKey(aliasSelector);
@@ -1146,7 +1196,7 @@ export async function resolveModelChainWithAuth(
 			if (stickySessionId) modelRegistry.clearCanonicalVariant?.(stickySessionId);
 		}
 	}
-	return { explicitThinkingLevel: false, activeIndex: modelPatterns.length, skips };
+	return { explicitThinkingLevel: false, activeIndex: modelPatterns.length, skips, firstOpenCircuit };
 }
 export function isExplicitProviderModelSelector(pattern: string): boolean {
 	const normalized = pattern.trim();
@@ -1198,7 +1248,7 @@ export function isExplicitProviderModelOverride(modelPatterns: readonly string[]
 export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
 	parentActiveModelPattern: string | undefined,
-	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
+	modelRegistry: ChainResolutionRegistry,
 	settings?: Settings,
 	authSessionId?: string,
 	options?: ModelChainResolutionOptions,
@@ -1235,6 +1285,16 @@ export async function resolveModelOverrideWithAuthFallback(
 		}
 	}
 	for (const pattern of modelPatterns) {
+		// Skip entries with open circuits in managed fallback chains
+		if (
+			options?.managedFallback &&
+			modelPatterns.length > 1 &&
+			modelRegistry.isSelectorCircuitOpen?.(pattern, options.circuitProbeOwner)
+		) {
+			skips.push({ selector: pattern, reason: "circuit_open" });
+			activeIndex += 1;
+			continue;
+		}
 		const candidate = resolveModelRoleValue(pattern, availableModels, {
 			settings,
 			matchPreferences,

@@ -1165,14 +1165,16 @@ export const SETTINGS_SCHEMA = {
 
 	"tools.maxInlineResultBytes": {
 		type: "number",
-		default: 0,
+		default: 12,
 		ui: {
 			tab: "tools",
 			label: "Max inline tool-result size (KB)",
 			description:
-				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
+				"Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. Default 12 KB (live A/B, #5945); 0 disables.",
 			options: [
 				{ value: "0", label: "Off", description: "Disabled; no absolute inline cap" },
+				{ value: "8", label: "8 KB", description: "~2K tokens" },
+				{ value: "12", label: "12 KB", description: "Default; ~3K tokens" },
 				{ value: "20", label: "20 KB", description: "~5K tokens" },
 				{ value: "30", label: "30 KB", description: "~7.5K tokens" },
 				{ value: "50", label: "50 KB", description: "~12.5K tokens" },
@@ -1553,6 +1555,19 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 3,
 		validate: (value: number) => Number.isInteger(value) && value > 0,
+	},
+	// Circuit breaker: an entry that fails out of a managed fallback chain is
+	// skipped by later turns and sibling sessions until its cooldown elapses.
+	// Consecutive opens double the cooldown up to the max. 0 disables the breaker.
+	"fallback.circuitCooldownMs": {
+		type: "number",
+		default: 60_000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"fallback.circuitMaxCooldownMs": {
+		type: "number",
+		default: 30 * 60 * 1000,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
 
 	// Retries

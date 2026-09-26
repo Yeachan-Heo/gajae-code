@@ -32,7 +32,10 @@
 | `reviewer` | `string[]` | No | Used only by `pr_create`; each entry becomes `--reviewer`. |
 | `assignee` | `string[]` | No | Used only by `pr_create`; each entry becomes `--assignee`. |
 | `label` | `string[]` | No | Used only by `pr_create`; each entry becomes `--label`. |
-| `query` | `string` | No | Used by all `search_*` ops. Required there. |
+| `query` | `string` | No | Used by all `search_*` ops. Required for `search_code`; `search_issues`, `search_prs`, `search_commits`, and `search_repos` accept `since`/`until` in place of a query (at least one of the three is required). |
+| `since` | `string` | No | Lower date bound for `search_issues`, `search_prs`, `search_commits`, and `search_repos`. Accepts a relative duration (`30m`, `12h`, `3d`, `2w`, `6mo`, `1y`), an ISO date `YYYY-MM-DD`, or an ISO datetime; it is appended to the query as a date qualifier (for example `created:>=2026-05-09`). `search_code` rejects `since`/`until` because GitHub code search has no date qualifier. |
+| `until` | `string` | No | Upper date bound; same formats and ops as `since`. With both bounds the qualifier becomes a range (`<field>:<since>..<until>`). |
+| `dateField` | `"created" \| "updated"` | No | Date the `since`/`until` bounds apply to. Defaults to `created`. `search_commits` always uses `committer-date`; `search_repos` maps `updated` to `pushed`. |
 | `limit` | `number` | No | Used by all `search_*` ops. Defaults to `10`, floored, clamped to `50`, and must be `> 0`. |
 | `run` | `string` | No | Used only by `run_watch`. Must be a numeric run ID or full GitHub Actions run URL. |
 | `tail` | `number` | No | Used only by `run_watch`. Defaults to `15`, floored, clamped to `200`, and must be `> 0`. |

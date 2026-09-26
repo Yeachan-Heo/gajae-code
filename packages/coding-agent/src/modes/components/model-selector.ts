@@ -1385,6 +1385,7 @@ export class ModelSelectorComponent extends Container {
 			resolveModelByLookupAlias: this.#modelRegistry.resolveModelByLookupAlias?.bind(this.#modelRegistry),
 			lookupAliasExists: this.#modelRegistry.lookupAliasExists?.bind(this.#modelRegistry),
 			clearCanonicalVariant: this.#modelRegistry.clearCanonicalVariant?.bind(this.#modelRegistry),
+			isSelectorCircuitOpen: this.#modelRegistry.isSelectorCircuitOpen?.bind(this.#modelRegistry) ?? (() => false),
 		};
 	}
 

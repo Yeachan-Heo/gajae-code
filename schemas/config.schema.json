@@ -818,8 +818,8 @@
 				},
 				"maxInlineResultBytes": {
 					"type": "number",
-					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. 0 disables (default; opt-in pending measurement).",
-					"default": 0
+					"description": "Absolute backstop cap on inline tool-result text, enforced after artifact spill for every tool (including read and tools that set their own partial artifact meta). Output above this size is force-saved as an artifact and truncated to head+tail. Default 12 KB (live A/B, #5945); 0 disables.",
+					"default": 12
 				},
 				"intentTracing": {
 					"type": "boolean",
@@ -1367,6 +1367,14 @@
 				"maxAttempts": {
 					"type": "number",
 					"default": 3
+				},
+				"circuitCooldownMs": {
+					"type": "number",
+					"default": 60000
+				},
+				"circuitMaxCooldownMs": {
+					"type": "number",
+					"default": 1800000
 				}
 			},
 			"additionalProperties": false

@@ -96026,7 +96026,7 @@
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "low",
-				"maxLevel": "high"
+				"maxLevel": "xhigh"
 			}
 		},
 		"grok-beta": {
