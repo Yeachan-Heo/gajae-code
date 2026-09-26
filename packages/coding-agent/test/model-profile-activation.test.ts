@@ -736,7 +736,9 @@ describe("model profile activation", () => {
 			const registry = new ModelRegistry(authStorage, modelsPath);
 			await registry.refreshProvider("anthropic", "online");
 
-			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe(
+				"https://custom-anthropic.example.test/v1",
+			);
 			expect(
 				registry
 					.getAvailableForProfileActivation()
@@ -759,7 +761,9 @@ describe("model profile activation", () => {
 					},
 				],
 			});
-			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
+			expect(registry.find("anthropic", "claude-opus-5-5")?.baseUrl).toBe(
+				"https://runtime-anthropic.example.test/v1",
+			);
 			expect(
 				registry
 					.getAvailableForProfileActivation()
