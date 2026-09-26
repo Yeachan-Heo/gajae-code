@@ -6,7 +6,10 @@ import { resolveCargoToolchainPath } from "../scripts/rust-toolchain-path";
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const packageDir = path.join(repoRoot, "packages/natives");
 const nativeDir = path.join(packageDir, "native");
-const testTimeoutMs = 300_000;
+// The test compiles pi-natives with the `ci` profile (thin LTO) and the
+// task-panic-test feature; on a cold 4-core CI runner that exceeds 5 minutes.
+// The affected-task job budget is 90 minutes.
+const testTimeoutMs = 1_200_000;
 
 setDefaultTimeout(testTimeoutMs);
 
@@ -14,8 +17,6 @@ describe("blocking task panic rejection", () => {
 	it(
 		"rejects the native Promise and keeps the child process alive",
 		async () => {
-			// Native builds can take significant time; log progress for visibility
-			const startTime = Date.now();
 			const cargo = await resolveCargoToolchainPath({ cwd: repoRoot, currentPath: process.env.PATH ?? "" });
 			if (!cargo) throw new Error("Could not resolve Cargo from rustup for the native panic test.");
 
