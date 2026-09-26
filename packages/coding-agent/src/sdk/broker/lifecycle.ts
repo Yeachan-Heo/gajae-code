@@ -2925,7 +2925,7 @@ function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
+export function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original: string): boolean {
 	const directory = path.join(path.resolve(root), "sdk");
 	if (path.dirname(original) !== directory) return false;
 	const basename = path.basename(original);
@@ -2933,8 +2933,8 @@ function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original:
 		basename === `${id}.json` ||
 		basename === `${id}.lifecycle.json` ||
 		basename === `${id}.lifecycle.ready.json` ||
-		new RegExp(`^${escapeRegExp(id)}\.lifecycle\.failure\.[A-Za-z0-9._-]{1,128}\.json$`).test(basename) ||
-		new RegExp(`^${escapeRegExp(id)}\.lifecycle\.failure\.[A-Za-z0-9._-]{1,128}\.json\.promoting$`).test(basename)
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename) ||
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json\\.promoting$`).test(basename)
 	);
 }
 
