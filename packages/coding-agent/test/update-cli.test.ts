@@ -2019,6 +2019,23 @@ describe("update-cli download durability", () => {
 });
 
 describe("update-cli binary update flow", () => {
+	it("keeps the executable extension on a Windows staging path", async () => {
+		const targetPath = path.join(await makeTempDir(), "gjc.exe");
+		let downloadedPath: string | undefined;
+		const flow: BinaryUpdateFlow = {
+			download: async (_url, tempPath) => {
+				downloadedPath = tempPath;
+			},
+			fsync: async () => {},
+			replace: async options => options.verifyInstalledVersion(options.expectedVersion),
+			verifyInstalledVersion: async expected => ({ ok: true, actual: expected, path: targetPath }),
+		};
+
+		await runBinaryUpdateFlow(targetPath, "https://example.test/gjc.exe", "1.2.3", flow);
+
+		expect(downloadedPath).toMatch(/gjc\.new\.[0-9a-f-]+\.exe$/u);
+	});
+
 	it("downloads, fsyncs, then replaces and verifies in that order", async () => {
 		const calls: string[] = [];
 		const targetPath = path.join(await makeTempDir(), "gjc");
