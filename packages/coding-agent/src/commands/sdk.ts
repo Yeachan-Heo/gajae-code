@@ -899,7 +899,12 @@ export async function runSessionHost(
 	}
 	if ("failure" in created) {
 		removeStartupSignalHandlers();
-		created.rollback.recordAbsent();
+		if (created.cleanupComplete && created.rollback.generation === undefined) created.rollback.recordAbsent();
+		if (!created.cleanupComplete) constructionCleanupComplete = false;
+		if (openedSessionManager) {
+			const manager = openedSessionManager;
+			await runBoundedStartupCleanup(() => manager.close());
+		}
 		capability.settleFailure(created.failure);
 		await writeFailure(created.failure, created.rollback.result);
 		throw created.failure;
@@ -910,6 +915,7 @@ export async function runSessionHost(
 			await created.session.dispose();
 		} catch (error) {
 			if (!isSessionDisposalIncompleteError(error)) throw error;
+			constructionCleanupComplete = false;
 			await created.session.awaitDisposeCompletion();
 		}
 		const failure = capability.normalizeFailure(
@@ -917,7 +923,7 @@ export async function runSessionHost(
 			"failed",
 			"Lifecycle startup owner changed during construction.",
 		);
-		if (rollback.generation === undefined) rollback.recordAbsent();
+		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 		await writeFailure(failure, rollback.result);
 		throw failure;
 	}
@@ -979,6 +985,10 @@ export async function runSessionHost(
 				if (!revoked) readinessPublicationCleanupComplete = false;
 			}
 			const transcript = await disposeAndCapture();
+			if (openedSessionManager) {
+				const manager = openedSessionManager;
+				await runBoundedStartupCleanup(() => manager.close()).catch(() => {});
+			}
 			if (rollback.generation === undefined && readinessPublicationCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
 		})();
