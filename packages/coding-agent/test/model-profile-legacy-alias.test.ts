@@ -26,8 +26,8 @@ const codexModel = {
 
 const codexSolModel = {
 	...codexModel,
-	id: "gpt-5.6-sol",
-	name: "gpt-5.6-sol",
+	id: "gpt-6-sol",
+	name: "gpt-6-sol",
 	contextWindow: 373_000,
 } satisfies Model<"openai-codex-responses">;
 
