@@ -2632,6 +2632,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#inputController.handleBackgroundCommand();
 	}
 
+	maybeGenerateSessionTitle(text: string): void {
+		this.#inputController.maybeGenerateSessionTitle(text);
+	}
+
 	handleImagePaste(): Promise<boolean> {
 		return this.#inputController.handleImagePaste();
 	}

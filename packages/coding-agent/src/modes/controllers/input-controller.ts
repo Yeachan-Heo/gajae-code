@@ -95,6 +95,7 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#autoTitleInFlight = false;
 	#deferredSubmission?: {
 		text: string;
 		images?: InteractiveModeContext["pendingImages"];
@@ -1162,6 +1163,9 @@ export class InputController {
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.ctx.session.isStreaming) {
 			invalidateSessionTitleGeneration(this.ctx.sessionManager);
+			// A turn started by a skill command has no user message yet, so the
+			// first typed message can arrive here instead of the idle path.
+			this.maybeGenerateSessionTitle(text);
 			if (this.#canModifyComposer(composer)) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
@@ -1190,32 +1194,7 @@ export class InputController {
 		// First, move any pending bash components to chat
 		this.ctx.flushPendingBashComponents();
 
-		// Generate session title on first message
-		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-		if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) {
-			const registry = this.ctx.session.modelRegistry;
-			generateSessionTitle(
-				text,
-				registry,
-				this.ctx.settings,
-				this.ctx.session.credentialSessionId,
-				this.ctx.session.model,
-				provider => this.ctx.session.agent.metadataForProvider(provider),
-			)
-				.then(async title => {
-					if (title) {
-						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-						if (applied) {
-							setSessionTerminalTitle(
-								this.ctx.sessionManager.getSessionName()!,
-								this.ctx.sessionManager.getCwd(),
-							);
-							this.ctx.updateEditorBorderColor();
-						}
-					}
-				})
-				.catch(() => {});
-		}
+		this.maybeGenerateSessionTitle(text);
 
 		if (this.ctx.onInputCallback) {
 			// Include any pending images from clipboard paste
@@ -1619,6 +1598,39 @@ export class InputController {
 	}
 
 	/**
+	 * Generate the automatic session title from the first user message. Called
+	 * from the editor submit and queue-shortcut paths (idle and streaming) and
+	 * from interactive startup messages; it is a no-op once the session has a
+	 * user message, a name, or a title request already in flight.
+	 */
+	maybeGenerateSessionTitle(text: string): void {
+		if (this.#autoTitleInFlight || this.ctx.sessionManager.getSessionName()) return;
+		if ($pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) return;
+		if (this.ctx.session.messages.some((m: AgentMessage) => m.role === "user")) return;
+		this.#autoTitleInFlight = true;
+		generateSessionTitle(
+			text,
+			this.ctx.session.modelRegistry,
+			this.ctx.settings,
+			this.ctx.session.credentialSessionId,
+			this.ctx.session.model,
+			provider => this.ctx.session.agent.metadataForProvider(provider),
+		)
+			.then(async title => {
+				if (!title) return;
+				const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
+				if (applied) {
+					setSessionTerminalTitle(this.ctx.sessionManager.getSessionName()!, this.ctx.sessionManager.getCwd());
+					this.ctx.updateEditorBorderColor();
+				}
+			})
+			.catch(() => {})
+			.finally(() => {
+				this.#autoTitleInFlight = false;
+			});
+	}
+
+	/**
 	 * Dispatch skill slash invocation(s) (`/skill:<name>`) through custom messages
 	 * using the supplied `streamingBehavior`. Returns true if the text contains a
 	 * recognised canonical skill command or command chain and was dispatched. A
@@ -1751,6 +1763,7 @@ export class InputController {
 			return;
 		}
 
+		this.maybeGenerateSessionTitle(text);
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.addToHistory(text);
 			this.ctx.editor.setText("");

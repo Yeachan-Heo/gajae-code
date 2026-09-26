@@ -52,6 +52,7 @@ import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } 
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
+import { isNamespacedSkillSlashCommandName } from "./extensibility/skills";
 import { releaseLaunchWorktreeReservationAfterRegistration } from "./gjc-runtime/launch-worktree-reservation";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
 import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
@@ -975,6 +976,13 @@ export async function runInteractiveMode(
 		);
 	}
 
+	// Startup input bypasses the editor submit path, so seed the automatic title
+	// here. Skill invocations are skipped exactly as they are on the editor path.
+	const maybeGenerateStartupTitle = (text: string): void => {
+		if (text.startsWith("/") && isNamespacedSkillSlashCommandName(text.slice(1))) return;
+		mode.maybeGenerateSessionTitle(text);
+	};
+
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -988,6 +996,7 @@ export async function runInteractiveMode(
 
 		if (initialMessage !== undefined) {
 			try {
+				maybeGenerateStartupTitle(initialMessage);
 				await session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -1004,6 +1013,7 @@ export async function runInteractiveMode(
 				});
 				if (slashResult === true) continue;
 				if (typeof slashResult === "string") text = slashResult;
+				maybeGenerateStartupTitle(text);
 				await session.prompt(text);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
