@@ -217,10 +217,6 @@ where
 	fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
 		Ok(output)
 	}
-
-	fn reject(&mut self, _env: Env, err: Error) -> Result<Self::JsValue> {
-		Err(err)
-	}
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
