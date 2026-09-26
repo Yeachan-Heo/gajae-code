@@ -121,8 +121,14 @@ describe("G5 gjc state receipts", () => {
 			const handoffEntries = entries.filter(
 				entry => entry.category === "state" && entry.verb === "handoff" && entry.owner === "gjc-state-cli",
 			);
-			expect(handoffEntries).toHaveLength(2);
+			expect(handoffEntries).toHaveLength(3);
 			for (const entry of handoffEntries) expectAuditEntry(entry, "handoff");
+			const aggregate = handoffEntries.find(entry => Array.isArray(entry.paths) && entry.paths.length === 3);
+			expect(aggregate).toMatchObject({ skill: "deep-interview", forced: false });
+			const aggregatePaths = aggregate?.paths;
+			expect(Array.isArray(aggregatePaths)).toBe(true);
+			expect(aggregatePaths).toContain(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"));
+			expect(aggregatePaths).toContain(statePath);
 		});
 	});
 });

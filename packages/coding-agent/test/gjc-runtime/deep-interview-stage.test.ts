@@ -1,10 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { appendOrMergeDeepInterviewRound } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-recorder";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import { deepInterviewDraftPath } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-stage";
 import { ENVELOPE_RESERVED_STATE_KEYS } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-state";
-import { modeStatePath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import { modeStatePath, sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 
 const TEST_SESSION_ID = "stage-test-session";
 const tempRoots: string[] = [];
@@ -697,6 +698,9 @@ describe("deep-interview staged transitions", () => {
 					"write",
 					"--input",
 					JSON.stringify({
+						current_phase: "handoff",
+						spec_path: "/tmp/legacy-spec.md",
+						spec_sha256: "a".repeat(64),
 						state: { note_a: "kept", established_facts: [{ id: "f1", statement: "fact", round: 1 }] },
 					}),
 					"--json",
@@ -726,6 +730,191 @@ describe("deep-interview staged transitions", () => {
 		expect(afterState.fresh).toBe(true);
 		expect(afterState.note_a).toBeUndefined();
 		expect(afterState.note_b).toBeUndefined();
+		expect(after.current_phase).not.toBe("handoff");
+		expect(after.spec_path).toBeUndefined();
+		expect(after.spec_sha256).toBeUndefined();
+	});
+
+	it("reset retains confirmed ordinary intent without retaining old execution authority", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await appendOrMergeDeepInterviewRound(
+			root,
+			statePath,
+			{
+				round: 0,
+				questionId: "intent-confirmation",
+				questionText: "Confirm locked intent",
+				component: "review-topology",
+				dimension: "topology",
+				selectedOptions: ["Confirm"],
+				intent_contract: {
+					items: [
+						{ id: "artifact:report", category: "artifact", statement: "Produce an audit report" },
+						{ id: "surface:review", category: "surface", statement: "Provide a reviewer surface" },
+					],
+					confirmation_options: ["Confirm"],
+				},
+			},
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const confirmed = await readState(root);
+		const contract = (confirmed.state as Record<string, unknown>).intent_contract;
+		expect(contract).toMatchObject({ confirmation_round: 0 });
+		expect((confirmed.state as Record<string, unknown>).intent_contract_required).toBe(true);
+		const fullSpec = "# Full\nartifact:report\nsurface:review";
+		expect(
+			(await run(root, ["--write", "--stage", "final", "--slug", "old", "--spec", fullSpec, "--json"])).status,
+		).toBe(0);
+		const old = await readState(root);
+		// Model persisted ordinary approval metadata from before the reset.
+		(old.state as Record<string, unknown>).execution_approval = "approved";
+		(old.state as Record<string, unknown>).execution_approval_receipt = { mutation_id: "old-approval" };
+		await fs.writeFile(statePath, `${JSON.stringify(old)}\n`, "utf8");
+		const reset = await run(root, [
+			"write",
+			"--reset",
+			"--input",
+			JSON.stringify({ state: { fresh: true, intent_contract: null, intent_contract_required: false } }),
+			"--json",
+		]);
+		expect(reset.status).toBe(0);
+		const after = await readState(root);
+		const inner = after.state as Record<string, unknown>;
+		expect(inner.intent_contract).toEqual(contract);
+		expect(inner.intent_contract_required).toBe(true);
+		expect(inner.fresh).toBe(true);
+		expect(inner.initial_idea).toBeUndefined();
+		expect(inner.rounds ?? []).toEqual([]);
+		expect(inner.intent_review).toBeUndefined();
+		expect(inner.execution_approval).toBeUndefined();
+		expect(inner.execution_approval_receipt).toBeUndefined();
+		expect(after.current_phase).not.toBe("handoff");
+		for (const key of ["spec_path", "spec_sha256", "spec_slug", "spec_stage", "spec_persisted_at"]) {
+			expect(after[key]).toBeUndefined();
+		}
+		const omitted = await run(root, [
+			"--write",
+			"--stage",
+			"final",
+			"--slug",
+			"omitted",
+			"--spec",
+			"# Reduced\nartifact:report",
+			"--json",
+		]);
+		expect(omitted.status).toBe(2);
+		expect(omitted.stderr).toContain("locked intent blocks spec persistence: missing intent review");
+		await expect(
+			fs.access(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-omitted.md")),
+		).rejects.toThrow();
+		expect(await readState(root)).toEqual(after);
+		const faithful = await run(root, [
+			"--write",
+			"--stage",
+			"final",
+			"--slug",
+			"faithful",
+			"--spec",
+			fullSpec,
+			"--json",
+		]);
+		expect(faithful.status).toBe(0);
+		expect(
+			await fs.readFile(path.join(sessionSpecsDir(root, TEST_SESSION_ID), "deep-interview-faithful.md"), "utf8"),
+		).toBe(`${fullSpec}\n`);
+		const published = (await readState(root)).state as Record<string, unknown>;
+		expect(published.intent_contract).toEqual(contract);
+		expect(published.intent_contract_required).toBe(true);
+		expect(published.intent_review).toMatchObject({ status: "not_required", removed_locked_ids: [] });
+		expect(published.execution_approval).toBeUndefined();
+		expect(published.execution_approval_receipt).toBeUndefined();
+	});
+	it("reset preserves canonical Crystal and spec ownership metadata", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const state = await readState(root);
+		state.spec_path = "/tmp/crystal.md";
+		state.spec_sha256 = "a".repeat(64);
+		state.spec_slug = "crystal";
+		state.spec_stage = "final";
+		state.state = { crystal: { lifecycle: "ready", schema_version: 1 }, execution_approval: "not-approved" };
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const reset = parse(
+			(await run(root, ["write", "--reset", "--input", JSON.stringify({ state: { fresh: true } }), "--json"]))
+				.stderr,
+		);
+		expect(reset.ok).toBe(false);
+		expect(reset.code).toBe("DI_STAGE_MERGE_REJECTED");
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).crystal).toEqual({ lifecycle: "ready", schema_version: 1 });
+		expect(after.spec_path).toBe("/tmp/crystal.md");
+		expect((after.state as Record<string, unknown>).execution_approval).toBe("not-approved");
+	});
+
+	it("rejects reset without deleting approved Crystal provenance", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const state = await readState(root);
+		state.state = {
+			crystal: { lifecycle: "ready", schema_version: 1 },
+			execution_approval: "approved",
+			execution_approval_receipt: { method: "explicit-state-action", mutation_id: "approval-1" },
+		};
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const before = await fs.readFile(statePath, "utf8");
+		const reset = await run(root, ["write", "--reset", "--input", JSON.stringify({ state: {} }), "--json"]);
+		expect(reset.status).toBe(2);
+		expect(await fs.readFile(statePath, "utf8")).toBe(before);
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).execution_approval_receipt).toEqual({
+			method: "explicit-state-action",
+			mutation_id: "approval-1",
+		});
+	});
+
+	it("revokes pre-v2 Crystal authority before staged apply", async () => {
+		const root = await tempDir();
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		await fs.mkdir(path.dirname(statePath), { recursive: true });
+		await fs.writeFile(
+			statePath,
+			`${JSON.stringify({
+				version: 1,
+				skill: "deep-interview",
+				active: true,
+				current_phase: "handoff",
+				spec_path: "/tmp/forged.md",
+				spec_sha256: "a".repeat(64),
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "approved",
+					execution_approval_receipt: { method: "explicit-state-action" },
+				},
+			})}\n`,
+			"utf8",
+		);
+		const staged = await run(root, [
+			"stage",
+			"--for",
+			"merge-state",
+			"--input",
+			JSON.stringify({ state: { note: "safe repair" } }),
+			"--json",
+		]);
+		expect(staged.status).toBe(0);
+		const applied = await run(root, ["apply", "--json"]);
+		expect(applied.status).toBe(0);
+		const after = await readState(root);
+		expect(after.current_phase).toBe("interviewing");
+		expect(after.spec_path).toBeUndefined();
+		const inner = after.state as Record<string, unknown>;
+		expect(inner.crystal).toBeUndefined();
+		expect(inner.execution_approval).toBe("not-approved");
+		expect(inner.execution_approval_receipt).toBeUndefined();
 	});
 
 	it("write refuses while a staged draft is pending and strips runtime-owned keys", async () => {
@@ -761,9 +950,12 @@ describe("deep-interview staged transitions", () => {
 		if (read.exists) {
 			expect((read.envelope as Record<string, unknown>).active).toBe(false);
 		}
+		const staged = await run(root, ["write", "--input", JSON.stringify({ state: { revived: true } }), "--json"]);
+		expect(staged.status).not.toBe(0);
+		expect(staged.stderr).toContain("cannot stage after deep-interview handoff or completion");
 	});
 
-	it("strips recorder-owned intent keys from staged payloads", async () => {
+	it("strips runtime-owned intent and execution approval keys from staged payloads", async () => {
 		const root = await tempDir();
 		await seed(root);
 		const staged = parse(
@@ -775,6 +967,8 @@ describe("deep-interview staged transitions", () => {
 						state: {
 							intent_contract: { version: 1, status: "confirmed", items: [] },
 							intent_review: { version: 1, status: "approved" },
+							execution_approval: "approved",
+							execution_approval_receipt: { method: "forged" },
 							note: "payload with fabricated contract",
 						},
 					}),
@@ -784,12 +978,19 @@ describe("deep-interview staged transitions", () => {
 		);
 		expect(staged.ok).toBe(true);
 		expect(staged.ignored_runtime_owned_keys).toEqual(
-			expect.arrayContaining(["state.intent_contract", "state.intent_review"]),
+			expect.arrayContaining([
+				"state.intent_contract",
+				"state.intent_review",
+				"state.execution_approval",
+				"state.execution_approval_receipt",
+			]),
 		);
 		const after = await readState(root);
 		const state = after.state as Record<string, unknown>;
 		expect(state.intent_contract).toBeUndefined();
 		expect(state.intent_review).toBeUndefined();
+		expect(state.execution_approval).toBeUndefined();
+		expect(state.execution_approval_receipt).toBeUndefined();
 		expect(state.note).toBe("payload with fabricated contract");
 	});
 

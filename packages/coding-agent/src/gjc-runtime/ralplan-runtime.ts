@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -36,10 +36,14 @@ import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session
 import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
-	appendJsonlIdempotent,
+	type AppendJsonlIdempotentOptions,
+	type AppendJsonlIdempotentResult,
+	appendJsonl,
+	detectWorkflowEnvelopeIntegrityMismatch,
 	readExistingStateForMutation,
 	withWorkflowStateLock,
 	writeArtifact,
+	writeTextAtomic,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
@@ -347,6 +351,53 @@ export async function countRalplanOnDiskLaneArtifacts(
  * signals so callers can fail closed when the ledger is empty/malformed while
  * opener artifacts already exist on disk.
  */
+async function readRalplanIndexBounded(indexPath: string): Promise<string | undefined> {
+	let lexical: fssync.BigIntStats;
+	try {
+		lexical = await fs.lstat(indexPath, { bigint: true });
+	} catch (error) {
+		if (getErrorCode(error) === "ENOENT") return undefined;
+		throw error;
+	}
+	if (lexical.isSymbolicLink() || !lexical.isFile() || lexical.size > BigInt(RALPLAN_MAX_INDEX_RECOVERY_BYTES))
+		throw new RalplanCommandError(2, "ralplan index exceeds its bounded recovery limit");
+	const flags = fssync.constants.O_RDONLY | (process.platform === "win32" ? 0 : (fssync.constants.O_NOFOLLOW ?? 0));
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(indexPath, flags);
+		const opened = await handle.stat({ bigint: true });
+		const same = (left: fssync.BigIntStats, right: fssync.BigIntStats) =>
+			left.dev === right.dev &&
+			left.ino === right.ino &&
+			left.mode === right.mode &&
+			left.size === right.size &&
+			left.mtimeNs === right.mtimeNs &&
+			left.ctimeNs === right.ctimeNs &&
+			left.nlink === right.nlink;
+		if (!opened.isFile() || !same(lexical, opened))
+			throw new RalplanCommandError(2, "ralplan index identity changed");
+		const buffer = Buffer.alloc(Number(opened.size));
+		let offset = 0;
+		while (offset < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) throw new RalplanCommandError(2, "ralplan index changed during bounded read");
+			offset += bytesRead;
+		}
+		const afterDescriptor = await handle.stat({ bigint: true });
+		const afterPath = await fs.lstat(indexPath, { bigint: true });
+		if (
+			afterPath.isSymbolicLink() ||
+			!afterPath.isFile() ||
+			!same(opened, afterDescriptor) ||
+			!same(opened, afterPath)
+		)
+			throw new RalplanCommandError(2, "ralplan index changed during bounded read");
+		return buffer.toString("utf8");
+	} finally {
+		await handle?.close();
+	}
+}
+
 export async function loadRalplanIndexForCap(
 	cwd: string,
 	sessionId: string,
@@ -360,7 +411,8 @@ export async function loadRalplanIndexForCap(
 }> {
 	const indexPath = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId, "index.jsonl");
 	try {
-		const text = await fs.readFile(indexPath, "utf8");
+		const text = await readRalplanIndexBounded(indexPath);
+		if (text === undefined) return { rows: [], indexPresent: false, parseableLines: 0, rawLineCount: 0 };
 		const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
 		const rows: RalplanIndexRow[] = [];
 		for (const line of lines) {
@@ -1010,6 +1062,13 @@ async function persistActiveRunId(cwd: string, sessionId: string, runId: string,
 				}
 				delete existing.planning_stuck;
 				delete existing.auto_handoff;
+				// Initial run establishment retains the incoming handoff; only a replacement run severs it.
+				if (existing.run_id !== undefined) {
+					delete existing.handoff_from;
+					delete existing.handoff_at;
+					delete existing.upstream_handoff_at;
+				}
+				delete existing.final_admission_phase_transition;
 			}
 			if (
 				existing.run_id === runId &&
@@ -1354,7 +1413,7 @@ async function recordRalplanPlanningStuck(
 	reason: string,
 ): Promise<void> {
 	const runDir = path.join(sessionPlansDir(cwd, sessionId), "ralplan", runId);
-	await appendJsonlIdempotent(
+	await appendRalplanIndexIdempotent(
 		path.join(runDir, "index.jsonl"),
 		{
 			event: "planning_stuck",
@@ -1439,6 +1498,7 @@ async function persistRalplanFinalAdmission(
 	sessionId: string,
 	runId: string,
 	admission: RalplanAutoHandoffResolution,
+	publication: { id: string; sha256: string },
 ): Promise<void> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	await withWorkflowStateLock(
@@ -1453,7 +1513,64 @@ async function persistRalplanFinalAdmission(
 			}
 			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
 			if (existing.run_id !== runId) return;
+			const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
+			if (getSkillManifest("ralplan").phaseLock.includes(phase) && (phase !== "final" || existing.active === false))
+				return;
+			const pending =
+				existing.final_publication_pending &&
+				typeof existing.final_publication_pending === "object" &&
+				!Array.isArray(existing.final_publication_pending)
+					? (existing.final_publication_pending as Record<string, unknown>)
+					: undefined;
+			if (
+				pending?.publication_id !== publication.id ||
+				pending.final_sha256 !== publication.sha256 ||
+				pending.run_id !== runId
+			)
+				throw new RalplanCommandError(2, "final publication was superseded by a concurrent writer");
+			const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+			let lastFinalSha: string | undefined;
+			for (const line of index.rawText?.split(/\r?\n/) ?? []) {
+				if (!line.trim()) continue;
+				try {
+					const row = JSON.parse(line) as Record<string, unknown>;
+					if (row.stage === "final" && typeof row.sha256 === "string") lastFinalSha = row.sha256;
+				} catch {
+					throw new RalplanCommandError(2, "final publication index is malformed");
+				}
+			}
+			if (lastFinalSha !== publication.sha256)
+				throw new RalplanCommandError(2, "final publication index does not match the active writer");
+			const currentAdmission = parseRalplanFinalAdmission(existing.auto_handoff);
+			const receipt =
+				existing.receipt && typeof existing.receipt === "object" && !Array.isArray(existing.receipt)
+					? (existing.receipt as Record<string, unknown>)
+					: undefined;
+			const checksum =
+				receipt?.content_sha256 &&
+				typeof receipt.content_sha256 === "object" &&
+				!Array.isArray(receipt.content_sha256)
+					? (receipt.content_sha256 as Record<string, unknown>)
+					: undefined;
+			if (
+				currentAdmission &&
+				existing.final_publication_pending === undefined &&
+				JSON.stringify(currentAdmission) === JSON.stringify(admission) &&
+				receipt?.skill === "ralplan" &&
+				receipt.owner === "gjc-runtime" &&
+				receipt.command === "gjc ralplan final-admission" &&
+				checksum?.algorithm === "sha256" &&
+				typeof checksum.value === "string" &&
+				/^[0-9a-f]{64}$/.test(checksum.value) &&
+				checksum.covered_path === path.resolve(statePath) &&
+				typeof checksum.computed_at === "string" &&
+				checksum.computed_at.trim() !== "" &&
+				!(await detectWorkflowEnvelopeIntegrityMismatch(statePath))
+			) {
+				return;
+			}
 			existing.auto_handoff = admission;
+			delete existing.final_publication_pending;
 			existing = migrateWorkflowState(existing, "ralplan").state;
 			existing.updated_at = new Date().toISOString();
 			await writeWorkflowEnvelopeAtomic(statePath, existing, {
@@ -1462,6 +1579,87 @@ async function persistRalplanFinalAdmission(
 				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-admission", sessionId },
 				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
 			});
+		},
+		{ cwd },
+	);
+}
+
+async function markRalplanFinalPublicationPending(
+	cwd: string,
+	sessionId: string,
+	runId: string,
+	publication: { id: string; sha256: string },
+	recovery = false,
+): Promise<boolean> {
+	const statePath = ralplanStatePath(cwd, sessionId);
+	return await withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingRead = await readExistingStateForMutation(statePath);
+			if (existingRead.kind === "corrupt")
+				throw new RalplanCommandError(2, `existing ralplan state is corrupt or tampered (${existingRead.error})`);
+			let existing: Record<string, unknown> = existingRead.kind === "valid" ? existingRead.value : {};
+			const phase = typeof existing.current_phase === "string" ? existing.current_phase.trim() : "";
+			// Active final is publication/approval, not a terminal lifecycle despite its stage phase lock.
+			const phaseLocked =
+				getSkillManifest("ralplan").phaseLock.includes(phase) && (phase !== "final" || existing.active === false);
+			if (recovery) {
+				// A receipt lookup may repair its current projection, never select a historical run.
+				if (phaseLocked || (existingRead.kind === "valid" && existing.run_id !== runId)) return false;
+				const pending = existing.final_publication_pending;
+				if (
+					pending !== undefined &&
+					(!pending ||
+						typeof pending !== "object" ||
+						Array.isArray(pending) ||
+						(pending as Record<string, unknown>).run_id !== runId ||
+						(pending as Record<string, unknown>).final_sha256 !== publication.sha256)
+				)
+					return false;
+				const index = await loadRalplanIndexForCap(cwd, sessionId, runId);
+				let lastFinalSha: unknown;
+				for (const line of index.rawText?.split(/\r?\n/) ?? []) {
+					if (!line.trim()) continue;
+					const row = JSON.parse(line) as Record<string, unknown>;
+					if (row.stage === "final") lastFinalSha = row.sha256;
+				}
+				if (lastFinalSha !== publication.sha256) return false;
+			} else if (existing.run_id === runId && phaseLocked) {
+				throw new RalplanCommandError(2, "cannot publish a new final after the Ralplan run reached a locked phase");
+			}
+			if (existing.run_id !== runId) {
+				delete existing.planning_stuck;
+				delete existing.auto_handoff;
+				// A first final may establish the run directly after a planning handoff.
+				if (existing.run_id !== undefined) {
+					delete existing.handoff_from;
+					delete existing.handoff_at;
+					delete existing.upstream_handoff_at;
+				}
+				delete existing.final_admission_phase_transition;
+			}
+			existing.skill = "ralplan";
+			existing.version = WORKFLOW_STATE_VERSION;
+			existing.session_id = sessionId;
+			existing.run_id = runId;
+			existing.active = true;
+			existing.current_phase = "final";
+			const startedAt = new Date().toISOString();
+			existing.updated_at = startedAt;
+			existing.final_publication_pending = {
+				run_id: runId,
+				publication_id: publication.id,
+				final_sha256: publication.sha256,
+				started_at: startedAt,
+			};
+			existing = migrateWorkflowState(existing, "ralplan").state;
+			await writeWorkflowEnvelopeAtomic(statePath, existing, {
+				cwd,
+				lockHeld: true,
+				receipt: { cwd, skill: "ralplan", owner: "gjc-runtime", command: "gjc ralplan final-pending", sessionId },
+				audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "ralplan", sessionId },
+			});
+			return true;
 		},
 		{ cwd },
 	);
@@ -1592,6 +1790,10 @@ interface PersistedArtifact {
 	pendingApprovalPath?: string;
 }
 
+/** Keep the writer-side ralplan ledger within the bound enforced by state-runtime. */
+const RALPLAN_MAX_INDEX_BYTES = 1024 * 1024;
+const RALPLAN_MAX_INDEX_RECOVERY_BYTES = 8 * 1024 * 1024;
+
 /**
  * Content-addressed identity for an `index.jsonl` row: a repeated `--write` of the
  * same `(stage, stage_n)` at identical content (same sha256) is the #638 duplicate
@@ -1603,6 +1805,93 @@ function ralplanIndexKey(entry: unknown): string | undefined {
 	const { stage, stage_n, sha256 } = record;
 	if (typeof stage !== "string" || typeof stage_n !== "number" || typeof sha256 !== "string") return undefined;
 	return `${stage}\u0000${stage_n}\u0000${sha256}`;
+}
+
+function serializeRalplanIndexEntries(entries: readonly unknown[]): string {
+	return entries.map(entry => `${JSON.stringify(entry)}\n`).join("");
+}
+
+/**
+ * Compact the append-only ralplan ledger without dropping the current final receipt.
+ * The newest row and newest planning-stuck marker are also retained so a write can
+ * never report success while silently losing the receipt it just persisted.
+ */
+function compactRalplanIndexEntries(entries: readonly unknown[]): unknown[] {
+	let latestFinal = -1;
+	let latestPlanningStuck = -1;
+	for (const [index, entry] of entries.entries()) {
+		if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+			const record = entry as Record<string, unknown>;
+			if (record.stage === "final") latestFinal = index;
+			if (record.planning_stuck === true) latestPlanningStuck = index;
+		}
+	}
+	const retained = entries.map((entry, index) => ({
+		entry,
+		bytes: Buffer.byteLength(`${JSON.stringify(entry)}\n`, "utf8"),
+		protected: index === entries.length - 1 || index === latestFinal || index === latestPlanningStuck,
+	}));
+	let totalBytes = retained.reduce((total, item) => total + item.bytes, 0);
+	while (totalBytes > RALPLAN_MAX_INDEX_BYTES) {
+		const removable = retained.findIndex(item => !item.protected);
+		if (removable < 0) {
+			throw new RalplanCommandError(2, "ralplan index live receipt set exceeds the 1 MiB bound");
+		}
+		totalBytes -= retained[removable]!.bytes;
+		retained.splice(removable, 1);
+	}
+	return retained.map(item => item.entry);
+}
+
+/** Append a ralplan index row under the ledger lock, compacting before the write. */
+async function appendRalplanIndexIdempotent(
+	targetPath: string,
+	entry: unknown,
+	options: AppendJsonlIdempotentOptions,
+): Promise<AppendJsonlIdempotentResult> {
+	const { key, equals, ...writeOptions } = options;
+	const resolvedTargetPath = path.resolve(options.cwd ?? process.cwd(), targetPath);
+	return await withWorkflowStateLock(
+		targetPath,
+		async () => {
+			const raw = (await readRalplanIndexBounded(resolvedTargetPath)) ?? "";
+			const existing: unknown[] = [];
+			let malformed = false;
+			for (const line of raw.split(/\r?\n/)) {
+				const trimmed = line.trim();
+				if (!trimmed) continue;
+				try {
+					existing.push(JSON.parse(trimmed));
+				} catch {
+					malformed = true;
+				}
+			}
+			const candidateKey = key ? key(entry) : undefined;
+			const duplicate = equals
+				? existing.find(item => equals(entry, item))
+				: candidateKey === undefined
+					? undefined
+					: existing.find(item => key?.(item) === candidateKey);
+			const candidateLine = `${JSON.stringify(entry)}\n`;
+			if (Buffer.byteLength(raw, "utf8") + Buffer.byteLength(candidateLine, "utf8") <= RALPLAN_MAX_INDEX_BYTES) {
+				if (duplicate !== undefined) return { path: resolvedTargetPath, appended: false, duplicate };
+				await appendJsonl(targetPath, entry, writeOptions);
+				return { path: resolvedTargetPath, appended: true };
+			}
+			if (malformed) throw new RalplanCommandError(2, "oversized ralplan index contains malformed JSON");
+			const next = duplicate === undefined ? [...existing, entry] : existing;
+			const compacted = compactRalplanIndexEntries(next);
+			const serialized = serializeRalplanIndexEntries(compacted);
+			const existingSerialized = serializeRalplanIndexEntries(existing);
+			if (serialized !== existingSerialized) {
+				await writeTextAtomic(targetPath, serialized, writeOptions);
+			}
+			return duplicate === undefined
+				? { path: resolvedTargetPath, appended: true }
+				: { path: resolvedTargetPath, appended: false, duplicate };
+		},
+		options,
+	);
 }
 
 async function persistArtifact(
@@ -1636,7 +1925,7 @@ async function persistArtifact(
 		sha256,
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
-	await appendJsonlIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
+	await appendRalplanIndexIdempotent(path.join(runDir, "index.jsonl"), indexEntry, {
 		cwd,
 		audit: {
 			category: "ledger",
@@ -1837,7 +2126,7 @@ async function repairMissingStageArtifactLedger(
 		sha256: onDisk.sha256,
 		...(finalAdmission ? { auto_handoff: finalAdmission } : {}),
 	};
-	const result = await appendJsonlIdempotent(
+	const result = await appendRalplanIndexIdempotent(
 		path.join(sessionPlansDir(cwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
 		indexEntry,
 		{
@@ -2034,6 +2323,7 @@ async function handleArtifactWrite(
 	args: readonly string[],
 	cwd: string,
 	agentDir?: string,
+	finalPublicationLockHeld = false,
 ): Promise<RalplanCommandResult> {
 	// #4693: explicit --worktree-root binds every persistence root to the selected
 	// canonical worktree; the invocation cwd survives only for --artifact input
@@ -2044,6 +2334,17 @@ async function handleArtifactWrite(
 	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
 		confineArtifactRoot: target.explicit ? cwd : undefined,
 	});
+	if (resolved.stage === "final" && !finalPublicationLockHeld) {
+		const publicationLockPath = path.join(
+			sessionPlansDir(persistCwd, resolved.sessionId),
+			"ralplan",
+			resolved.runId,
+			"final-publication",
+		);
+		return await withWorkflowStateLock(publicationLockPath, () => handleArtifactWrite(args, cwd, agentDir, true), {
+			cwd: persistCwd,
+		});
+	}
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
@@ -2093,7 +2394,55 @@ async function handleArtifactWrite(
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
 			);
 		}
-		if (resolved.stage === "final") await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+		if (resolved.stage === "final") {
+			await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+			await appendRalplanIndexIdempotent(
+				path.join(sessionPlansDir(persistCwd, resolved.sessionId), "ralplan", resolved.runId, "index.jsonl"),
+				{
+					stage: "final",
+					stage_n: resolved.stageN,
+					path: existingArtifact.path,
+					created_at: existingArtifact.createdAt,
+					sha256: existingArtifact.sha256,
+					...(existingArtifact.autoHandoff ? { auto_handoff: existingArtifact.autoHandoff } : {}),
+				},
+				{
+					cwd: persistCwd,
+					key: ralplanIndexKey,
+					audit: {
+						category: "ledger",
+						verb: "append",
+						owner: "gjc-runtime",
+						skill: "ralplan",
+						sessionId: resolved.sessionId,
+					},
+				},
+			);
+			// The artifact and its authenticated ledger receipt are durable before the
+			// current-session admission projection. Repair that projection after a
+			// crash in the gap, before returning the deduplicated receipt.
+			if (existingArtifact.autoHandoff) {
+				const planningStuck = await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId);
+				const publication = { id: randomUUID(), sha256: existingArtifact.sha256 };
+				if (
+					await markRalplanFinalPublicationPending(
+						persistCwd,
+						resolved.sessionId,
+						resolved.runId,
+						publication,
+						true,
+					)
+				) {
+					await persistRalplanFinalAdmission(
+						persistCwd,
+						resolved.sessionId,
+						resolved.runId,
+						applyRalplanPlanningStuckOverride(existingArtifact.autoHandoff, planningStuck),
+						publication,
+					);
+				}
+			}
+		}
 		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
 	}
 
@@ -2115,6 +2464,26 @@ async function handleArtifactWrite(
 			onDiskArtifact,
 			resolved.stage === "final" ? unavailableRalplanFinalAdmission() : undefined,
 		);
+		if (resolved.stage === "final") {
+			const recoveryPublication = { id: randomUUID(), sha256 };
+			if (
+				await markRalplanFinalPublicationPending(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+					recoveryPublication,
+					true,
+				)
+			) {
+				await persistRalplanFinalAdmission(
+					persistCwd,
+					resolved.sessionId,
+					resolved.runId,
+					unavailableRalplanFinalAdmission(),
+					recoveryPublication,
+				);
+			}
+		}
 		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 		if (
 			persistedRoleState &&
@@ -2189,6 +2558,7 @@ async function handleArtifactWrite(
 	}
 
 	let autoHandoff: RalplanAutoHandoffResolution | undefined;
+	let finalPublication: { id: string; sha256: string } | undefined;
 	if (resolved.stage === "final") {
 		// Resolve and validate the configured admission before any final artifact or
 		// state write. The ledger row below is the durable receipt for deduplicated
@@ -2197,6 +2567,8 @@ async function handleArtifactWrite(
 			agentDir,
 			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
 		});
+		finalPublication = { id: randomUUID(), sha256 };
+		await markRalplanFinalPublicationPending(persistCwd, resolved.sessionId, resolved.runId, finalPublication);
 	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
 	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
@@ -2208,7 +2580,13 @@ async function handleArtifactWrite(
 		await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict);
 	}
 	if (autoHandoff) {
-		await persistRalplanFinalAdmission(persistCwd, resolved.sessionId, resolved.runId, autoHandoff);
+		await persistRalplanFinalAdmission(
+			persistCwd,
+			resolved.sessionId,
+			resolved.runId,
+			autoHandoff,
+			finalPublication!,
+		);
 	}
 	await writeSessionActivityMarker(persistCwd, resolved.sessionId, {
 		writer: "ralplan-runtime",
@@ -2385,51 +2763,68 @@ async function seedRalplanState(
 	explicitTarget = false,
 ): Promise<{ statePath: string; runId: string; repositoryBinding: RepositoryBinding }> {
 	const statePath = ralplanStatePath(cwd, resolved.sessionId);
-	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
-	// orphan in-progress artifacts under a fresh run id.
-	const existingRunId = await readActiveRunId(cwd, resolved.sessionId);
-	const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
-	assertSafePathComponent(runId, "run-id");
-	const now = new Date().toISOString();
-	// When an active seed already carries authority, re-entry must match it (fail closed).
-	// Otherwise stamp the current cwd as the durable binding for this run.
-	const repositoryBinding = existingRunId
-		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
-		: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
-	const payload: Record<string, unknown> = {
-		active: true,
-		current_phase: "planner",
-		skill: "ralplan",
-		version: WORKFLOW_STATE_VERSION,
-		mode: resolved.deliberate ? "deliberate" : "short",
-		interactive: resolved.interactive,
-		task: resolved.task,
-		run_id: runId,
-		updated_at: now,
-		repository_binding: repositoryBinding,
-	};
-	if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
-	if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
-	if (resolved.sessionId) payload.session_id = resolved.sessionId;
-	await writeWorkflowEnvelopeAtomic(statePath, payload, {
-		cwd,
-		receipt: {
-			cwd,
-			skill: "ralplan",
-			owner: "gjc-runtime",
-			command: "gjc ralplan seed",
-			sessionId: resolved.sessionId,
+	return withWorkflowStateLock(
+		statePath,
+		async () => {
+			const existingStateRead = await readExistingStateForMutation(statePath);
+			if (existingStateRead.kind === "corrupt")
+				throw new RalplanCommandError(
+					2,
+					`existing ralplan state is corrupt or tampered (${existingStateRead.error}); refusing to overwrite ${statePath}`,
+				);
+			const existingRunId =
+				existingStateRead.kind === "valid" && typeof existingStateRead.value.run_id === "string"
+					? existingStateRead.value.run_id.trim() || undefined
+					: undefined;
+			const runId = existingRunId ?? resolved.sessionId ?? defaultRunId();
+			assertSafePathComponent(runId, "run-id");
+			const now = new Date().toISOString();
+			const repositoryBinding = existingRunId
+				? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
+				: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+			const payload: Record<string, unknown> = {
+				active: true,
+				current_phase: "planner",
+				skill: "ralplan",
+				version: WORKFLOW_STATE_VERSION,
+				mode: resolved.deliberate ? "deliberate" : "short",
+				interactive: resolved.interactive,
+				task: resolved.task,
+				run_id: runId,
+				updated_at: now,
+				repository_binding: repositoryBinding,
+			};
+			if (existingStateRead.kind === "valid" && existingStateRead.value.active === true) {
+				for (const field of ["handoff_from", "handoff_at"] as const) {
+					if (typeof existingStateRead.value[field] === "string") payload[field] = existingStateRead.value[field];
+				}
+			}
+			if (resolved.architectKind) payload.architect_kind = resolved.architectKind;
+			if (resolved.criticKind) payload.critic_kind = resolved.criticKind;
+			if (resolved.sessionId) payload.session_id = resolved.sessionId;
+			await writeWorkflowEnvelopeAtomic(statePath, payload, {
+				cwd,
+				lockHeld: true,
+				receipt: {
+					cwd,
+					skill: "ralplan",
+					owner: "gjc-runtime",
+					command: "gjc ralplan seed",
+					sessionId: resolved.sessionId,
+				},
+				audit: {
+					category: "state",
+					verb: "write",
+					owner: "gjc-runtime",
+					skill: "ralplan",
+					sessionId: resolved.sessionId,
+				},
+			});
+			await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
+			return { statePath, runId, repositoryBinding };
 		},
-		audit: {
-			category: "state",
-			verb: "write",
-			owner: "gjc-runtime",
-			skill: "ralplan",
-			sessionId: resolved.sessionId,
-		},
-	});
-	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: statePath });
-	return { statePath, runId, repositoryBinding };
+		{ cwd },
+	);
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {

@@ -174,16 +174,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "kickoff",
-          "write-spec",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "read",
-          "write"
+          "doctor"
         ],
         "name": "session-id",
         "type": "string"
@@ -415,6 +406,11 @@
         "verb": "write-spec"
       },
       {
+        "from": "interviewing",
+        "to": "handoff",
+        "verb": "crystallize"
+      },
+      {
         "from": "handoff",
         "to": "complete",
         "verb": "clear"
@@ -426,14 +422,6 @@
       }
     ],
     "typedArgs": [
-      {
-        "appliesToVerbs": [
-          "write",
-          "api"
-        ],
-        "name": "input",
-        "type": "string"
-      },
       {
         "appliesToVerbs": [
           "read",
@@ -462,13 +450,10 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "write-artifact",
           "stage",
           "check",
           "apply",
-          "discard",
-          "read",
-          "write"
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
@@ -560,6 +545,13 @@
         "appliesToVerbs": [
           "kickoff"
         ],
+        "name": "trace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "kickoff"
+        ],
         "name": "threshold",
         "type": "number"
       },
@@ -589,6 +581,14 @@
       },
       {
         "appliesToVerbs": [
+          "crystallize"
+        ],
+        "name": "slug",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "write-spec"
         ],
         "name": "spec",
@@ -614,7 +614,16 @@
       },
       {
         "appliesToVerbs": [
+          "write-spec"
+        ],
+        "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "kickoff",
           "write-spec",
+          "crystallize",
           "stage",
           "check",
           "apply",
@@ -622,18 +631,45 @@
           "read",
           "write",
           "clear",
-          "handoff"
+          "handoff",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
       },
       {
         "appliesToVerbs": [
+          "api"
+        ],
+        "name": "input",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
           "stage",
-          "write"
+          "crystallize"
         ],
         "name": "input",
         "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "approve-execution"
+        ],
+        "enumValues": [
+          "deep-interview"
+        ],
+        "name": "mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "crystallize",
+          "approve-execution"
+        ],
+        "name": "session-id",
         "type": "string"
       },
       {
@@ -702,6 +738,10 @@
         "surface": "command-flag"
       },
       {
+        "name": "crystallize",
+        "surface": "command-flag"
+      },
+      {
         "name": "stage",
         "surface": "command-positional"
       },
@@ -731,6 +771,10 @@
       },
       {
         "name": "handoff",
+        "surface": "command-positional"
+      },
+      {
+        "name": "approve-execution",
         "surface": "command-positional"
       },
       {
@@ -1017,14 +1061,7 @@
           "handoff",
           "doctor",
           "kickoff",
-          "write-spec",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "read",
-          "write"
+          "write-artifact"
         ],
         "name": "session-id",
         "type": "string"
@@ -1403,16 +1440,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "kickoff",
-          "write-spec",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "read",
-          "write"
+          "doctor"
         ],
         "name": "session-id",
         "type": "string"
