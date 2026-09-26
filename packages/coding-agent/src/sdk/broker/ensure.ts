@@ -14,7 +14,6 @@ import {
 	readBrokerDiscovery,
 	readBrokerRestartIntent,
 } from "./discovery";
-import { isProcessIncarnation, observeProcessIncarnation } from "./process-incarnation";
 import {
 	isSdkInternalRuntimeImagePresent,
 	resolveSdkInternalSpawnCommand,
@@ -27,6 +26,30 @@ import {
 	clearBrokerStartupFailureMarker,
 	readBrokerStartupFailureMarker,
 } from "./startup-failure";
+
+/**
+ * On Windows, spawning a detached process requires an intermediate launcher.
+ * This is because `detached: true` on Windows keeps the child in the parent's
+ * process tree (issue #6007). Using `cmd /c start` creates the broker as a
+ * descendant of cmd rather than the parent, allowing it to survive parent termination.
+ *
+ * Returns the file and arguments to spawn. On Windows, wraps the real command
+ * in `cmd /c start`. On other platforms, returns the original command and arguments.
+ */
+function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
+	if (process.platform !== "win32") {
+		return { file, args: Array.from(args) };
+	}
+	// On Windows, use cmd /c start /b to spawn without a new console window
+	// and detached from the parent process. This prevents taskkill /T on the
+	// parent from killing the broker and all its children.
+	// Format: cmd /c start /b <file> <args...>
+	const cmdArgs = [file, ...args];
+	return {
+		file: "cmd",
+		args: ["/c", "start", "/b", ...cmdArgs],
+	};
+}
 
 function resolveExpectedBrokerGeneration(): string {
 	const v = (packageJson as { version?: unknown }).version;
@@ -372,7 +395,6 @@ interface BrokerOwner {
 	stop(): Promise<void>;
 	canReuse(discovery: BrokerDiscovery | null): boolean;
 	markReady(discovery: BrokerDiscovery): boolean;
-	setTarget(pid: number, incarnation: string): void;
 }
 type EnsureInitiator = "discovery" | "fixture-lease";
 type EnsureOutcome =
@@ -457,60 +479,25 @@ async function reapSpawnedBroker(child: ChildProcess, timing: ReapTiming = DEFAU
 	throw new Error(`Detached SDK broker (pid ${child.pid}) did not exit after SIGKILL during reap.`);
 }
 
-async function reapSpawnedBrokerIdentity(
-	pid: number,
-	incarnation: string,
-	timing: ReapTiming = DEFAULT_REAP_TIMING,
-): Promise<void> {
-	const matches = (): boolean => {
-		const observed = observeProcessIncarnation(pid);
-		return observed.status === "present" && observed.incarnation === incarnation;
-	};
-	const gone = (): boolean => observeProcessIncarnation(pid).status === "absent";
-	const signal = (sig: NodeJS.Signals): void => {
-		if (!matches()) return;
-		try {
-			process.kill(pid, sig);
-		} catch {
-			// already exited between identity check and signal delivery
-		}
-	};
-	if (gone() || !matches()) return;
-	// A reported trampoline has already detached this broker from the retained
-	// child handle, so graceful shutdown cannot be observed or reaped reliably.
-	// Force termination keeps discovery-timeout cleanup within its caller's
-	// bounded deadline while the identity check still prevents PID reuse.
-	signal("SIGKILL");
-	await Promise.race([waitForProcessAbsence(pid), sleep(timing.killVerifyMs)]);
-	if (!gone()) throw new Error(`Detached SDK broker (pid ${pid}) did not exit after SIGKILL during reap.`);
-}
-
-async function waitForProcessAbsence(pid: number): Promise<void> {
-	while (observeProcessIncarnation(pid).status !== "absent") await Bun.sleep(10);
-}
-
 function registerBrokerOwner(
 	agentDir: string,
 	child: ChildProcess,
 	timing: ReapTiming = DEFAULT_REAP_TIMING,
 ): BrokerOwner {
-	let targetPid = child.pid;
-	let targetIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+	const incarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
 	let state: "starting" | "ready" | "cleanup-unverified" = "starting";
 	const matches = (discovery: BrokerDiscovery | null): boolean =>
 		Boolean(
 			discovery &&
-				targetPid !== undefined &&
-				targetIncarnation !== undefined &&
-				discovery.pid === targetPid &&
-				discovery.incarnation === targetIncarnation,
+				child.pid !== undefined &&
+				incarnation &&
+				discovery.pid === child.pid &&
+				discovery.incarnation === incarnation,
 		);
 	const owner: BrokerOwner = {
 		async stop(): Promise<void> {
 			try {
-				if (targetPid !== undefined && targetIncarnation !== undefined && targetPid !== child.pid)
-					await reapSpawnedBrokerIdentity(targetPid, targetIncarnation, timing);
-				else await reapSpawnedBroker(child, timing);
+				await reapSpawnedBroker(child, timing);
 			} catch (error) {
 				state = "cleanup-unverified";
 				throw error;
@@ -524,10 +511,6 @@ function registerBrokerOwner(
 			if (!matches(discovery)) return false;
 			state = "ready";
 			return true;
-		},
-		setTarget(pid, incarnation): void {
-			targetPid = pid;
-			targetIncarnation = incarnation;
 		},
 	};
 	owners.set(agentDir, owner);
@@ -731,95 +714,36 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		// that finished between our first read and the lock acquisition.
 		const discoveredUnderLock = await reconcileBrokerGenerationForStartup(settings, deadline);
 		if (discoveredUnderLock) return { kind: "external-discovery", discovery: discoveredUnderLock };
-		const command = resolveSdkInternalSpawnCommand(
-			process.platform === "win32" || initiator === "fixture-lease"
-				? "broker-internal"
-				: "broker-trampoline-internal",
-		);
+		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		spawnLog = await openBrokerSpawnLog(settings.agentDir);
 		// A stale marker must never be misattributed to this spawn; clear it first.
 		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
 		const childSpawnedAt = Date.now();
-		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
-			detached: true,
-			stdio: ["ignore", process.platform === "win32" ? "ignore" : "pipe", spawnLog ? spawnLog.handle.fd : "ignore"],
+		const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, [
+			...command.args,
+			"--agent-dir",
+			settings.agentDir,
+		]);
+		const child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+			detached: process.platform !== "win32",
+			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
 			env: brokerSpawnEnvironment(command, settings.env),
 			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 		});
-		const isTrampoline = process.platform !== "win32" && initiator !== "fixture-lease";
 		let spawnError: Error | undefined;
-		let childExited = false;
-		let childExitCode: number | null = null;
-		let childSignalCode: NodeJS.Signals | null = null;
-		let brokerDeathObserved = false;
 		child.once("error", error => {
 			spawnError = error;
 		});
-		child.once("close", (code, signal) => {
-			childExited = true;
-			childExitCode = code;
-			childSignalCode = signal;
-		});
-		let trampolineReported = !isTrampoline;
-		let spawnedBrokerPid = isTrampoline ? undefined : child.pid;
-		let spawnedBrokerIncarnation =
-			isTrampoline || child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
+		const childIncarnation = child.pid === undefined ? undefined : brokerProcessIncarnation(child.pid);
 		const owner = registerBrokerOwner(settings.agentDir, child);
-		if (isTrampoline && child.stdout) {
-			let output = "";
-			child.stdout.on("data", chunk => {
-				output += Buffer.from(chunk).toString("utf8");
-				const newline = output.indexOf("\n");
-				if (newline < 0) return;
-				const line = output.slice(0, newline).trim();
-				const [rawPid, rawIncarnation] = line?.split("\t") ?? [];
-				const pid = rawPid ? Number(rawPid) : NaN;
-				if (!Number.isSafeInteger(pid) || pid <= 0) return;
-				if (isProcessIncarnation(rawIncarnation)) {
-					const incarnation = rawIncarnation;
-					trampolineReported = true;
-					spawnedBrokerPid = pid;
-					spawnedBrokerIncarnation = incarnation;
-					owner.setTarget(pid, incarnation);
-				}
-			});
-		}
 		child.unref();
 		// The child holds its own duplicate of the descriptor. Failure to close the
 		// parent's diagnostic handle must not discard exact ownership of a live child.
 		await spawnLog?.handle.close().catch(() => undefined);
 		let discoveryError: unknown;
 		while (ensureBrokerTiming.now() < deadline) {
-			if (
-				spawnError ||
-				(isTrampoline && childExited && (!trampolineReported || childExitCode !== 0 || childSignalCode !== null)) ||
-				(!isTrampoline && process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null))
-			)
-				break;
-			if (
-				isTrampoline &&
-				trampolineReported &&
-				spawnedBrokerPid !== undefined &&
-				spawnedBrokerIncarnation !== undefined
-			) {
-				const observed = observeProcessIncarnation(spawnedBrokerPid);
-				if (observed.status === "present" && observed.incarnation !== spawnedBrokerIncarnation) {
-					brokerDeathObserved = true;
-					break;
-				}
-				if (observed.status === "absent") {
-					brokerDeathObserved = true;
-					break;
-				}
-			}
-			// The trampoline's stdout line identifies the real broker. Do not read
-			// discovery until that line has been parsed, or a marker from the
-			// trampoline could be trusted as the broker's own startup evidence.
-			if (isTrampoline && !trampolineReported) {
-				await ensureBrokerTiming.sleep(50);
-				continue;
-			}
+			if (spawnError || child.exitCode !== null || child.signalCode !== null) break;
 			try {
 				const discovered = await readBrokerDiscoveryBeforeDeadline(
 					settings.agentDir,
@@ -830,20 +754,6 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					if (!(await isBrokerReusable(discovered))) {
 						await ensureBrokerTiming.sleep(50);
 						continue;
-					}
-					if (isTrampoline && !childExited) {
-						await ensureBrokerTiming.sleep(50);
-						continue;
-					}
-					if (isTrampoline && spawnedBrokerPid !== undefined && spawnedBrokerIncarnation !== undefined) {
-						const observed = observeProcessIncarnation(spawnedBrokerPid);
-						if (
-							observed.status === "absent" ||
-							(observed.status === "present" && observed.incarnation !== spawnedBrokerIncarnation)
-						) {
-							brokerDeathObserved = true;
-							break;
-						}
 					}
 					if (owner.markReady(discovered)) {
 						return initiator === "fixture-lease"
@@ -858,13 +768,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			}
 			await ensureBrokerTiming.sleep(50);
 		}
-		const exitedBeforeDiscovery =
-			(isTrampoline &&
-				(!trampolineReported ||
-					(childExited && (childExitCode !== 0 || childSignalCode !== null)) ||
-					brokerDeathObserved)) ||
-			(!isTrampoline && process.platform === "win32" && (child.exitCode !== null || child.signalCode !== null));
-		if (!isTrampoline && exitedBeforeDiscovery && childExitCode === 0) {
+		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
+		if (exitedBeforeDiscovery && child.exitCode === 0) {
 			// A clean exit means another broker won the ownership lock (two ACP
 			// processes racing a cold broker state, e.g. a provider probe and an
 			// agent launch). The winner may publish its discovery right after our
@@ -891,16 +796,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const startupExitRecord = await readBrokerStartupExitRecord(settings.agentDir);
 		const trustedMarker =
 			marker &&
-			spawnedBrokerPid !== undefined &&
-			spawnedBrokerIncarnation !== undefined &&
-			marker.pid === spawnedBrokerPid &&
-			marker.incarnation === spawnedBrokerIncarnation
+			child.pid !== undefined &&
+			childIncarnation !== undefined &&
+			marker.pid === child.pid &&
+			marker.incarnation === childIncarnation
 				? marker
 				: undefined;
 		const trustedStartupExitRecord =
 			startupExitRecord &&
-			spawnedBrokerPid !== undefined &&
-			startupExitRecord.pid === spawnedBrokerPid &&
+			child.pid !== undefined &&
+			startupExitRecord.pid === child.pid &&
 			startupExitRecord.writtenAt >= childSpawnedAt
 				? startupExitRecord
 				: undefined;
@@ -954,20 +859,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
-						exitCode: isTrampoline
-							? (trustedStartupExitRecord?.exitCode ??
-								trustedMarker?.exitCode ??
-								childExitCode ??
-								child.exitCode ??
-								null)
-							: (childExitCode ?? child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null),
-						signal: isTrampoline
-							? (trustedStartupExitRecord?.signal ??
-								trustedMarker?.signal ??
-								childSignalCode ??
-								child.signalCode ??
-								null)
-							: (childSignalCode ?? child.signalCode ?? trustedStartupExitRecord?.signal ?? null),
+						exitCode: child.exitCode ?? trustedStartupExitRecord?.exitCode ?? null,
+						signal: child.signalCode ?? trustedStartupExitRecord?.signal ?? null,
 						reason:
 							brokerStartupExitReason(trustedStartupExitRecord) ?? brokerStartupFailureReason(trustedMarker),
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
@@ -1028,9 +921,10 @@ export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSetting
  */
 export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
 	if (!command.file || !Array.isArray(command.args)) throw new Error("Invalid fixture broker command.");
-	const child = spawn(command.file, [...command.args], {
+	const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, command.args);
+	const child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
 		cwd: command.cwd,
-		detached: true,
+		detached: process.platform !== "win32",
 		stdio: ["ignore", "ignore", "ignore", "pipe"],
 		env: command.env,
 	});
@@ -1102,4 +996,11 @@ export function registerBrokerOwnerForTest(
 /** Test hook: exercises the same trusted-marker reason reconstruction used by ensureBroker. */
 export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
 	return brokerStartupFailureReason(marker);
+}
+/** Test hook: verifies the broker spawn-option selection for Windows vs non-Windows platforms. */
+export function resolveBrokerSpawnOptionsForTest(
+	file: string,
+	args: readonly string[],
+): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptions(file, args);
 }
