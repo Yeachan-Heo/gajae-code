@@ -4895,45 +4895,40 @@ export class ModelRegistry {
 		});
 	}
 	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
-		const finalized = models.map(model => {
-			const restored = { ...this.#restoreDeclaredThinking(model) };
+		const finalized = models.map((model): Model<Api> => {
+			const restored: Model<Api> = { ...this.#restoreDeclaredThinking(model) };
 			// Preserve models with endpoint-provided reasoning effort maps to avoid overriding
 			// with inferred defaults. enrichModelThinking would infer wider ranges based on
 			// provider/API defaults rather than the endpoint's advertised values.
-			const hasEndpointReasoningMap =
-				isRecord(restored.compat) &&
-				"reasoningEffortMap" in restored.compat &&
-				restored.compat.reasoningEffortMap &&
-				Object.keys(restored.compat.reasoningEffortMap as Record<string, unknown>).length > 0;
-			if (!hasEndpointReasoningMap) {
+			const compat: unknown = restored.compat;
+			const reasoningEffortMap =
+				isRecord(compat) && isRecord(compat.reasoningEffortMap) ? compat.reasoningEffortMap : undefined;
+			if (!reasoningEffortMap || Object.keys(reasoningEffortMap).length === 0) {
 				return enrichModelThinking(restored);
 			}
 			// For models with endpoint reasoning efforts, if thinking is not set,
 			// reconstruct it from the endpoint-provided reasoning effort map.
 			if (restored.thinking === undefined && restored.reasoning) {
-				const reasoningEffortMap = restored.compat.reasoningEffortMap as Record<string, string> | undefined;
-				if (reasoningEffortMap) {
-					const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
-					const supportedEfforts = Object.keys(reasoningEffortMap)
-						.filter(effort => effort !== "undefined" && effort !== "null")
-						.sort((a, b) => effortOrder.indexOf(a as Effort) - effortOrder.indexOf(b as Effort));
-					if (supportedEfforts.length > 0) {
-						const minLevel = supportedEfforts[0] as Effort;
-						const maxLevel = supportedEfforts[supportedEfforts.length - 1] as Effort;
-						const defaultLevel = supportedEfforts.includes(Effort.Medium)
-							? Effort.Medium
-							: supportedEfforts[Math.floor(supportedEfforts.length / 2)];
-						return {
-							...restored,
-							thinking: {
-								mode: "effort" as const,
-								minLevel,
-								maxLevel,
-								defaultLevel,
-								levels: supportedEfforts as Effort[],
-							},
-						};
-					}
+				const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+				const supportedEfforts = Object.keys(reasoningEffortMap)
+					.filter(effort => effort !== "undefined" && effort !== "null")
+					.sort((a, b) => effortOrder.indexOf(a as Effort) - effortOrder.indexOf(b as Effort)) as Effort[];
+				if (supportedEfforts.length > 0) {
+					const minLevel = supportedEfforts[0];
+					const maxLevel = supportedEfforts[supportedEfforts.length - 1];
+					const defaultLevel = supportedEfforts.includes(Effort.Medium)
+						? Effort.Medium
+						: supportedEfforts[Math.floor(supportedEfforts.length / 2)];
+					return {
+						...restored,
+						thinking: {
+							mode: "effort" as const,
+							minLevel,
+							maxLevel,
+							defaultLevel,
+							levels: supportedEfforts,
+						},
+					};
 				}
 			}
 			return restored;
