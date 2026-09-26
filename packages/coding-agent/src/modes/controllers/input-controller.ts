@@ -975,7 +975,17 @@ export class InputController {
 	}
 
 	setupEditorSubmitHandler(): void {
-		this.ctx.editor.onSubmit = text => this.submitText(text, { ownsComposer: true, editor: this.ctx.editor });
+		// The editor drops the returned promise, so a rejected submission (for example
+		// a session whose transcript was taken over by another process) must be
+		// reported here instead of escaping as a process-fatal unhandled rejection.
+		this.ctx.editor.onSubmit = text =>
+			this.submitText(text, { ownsComposer: true, editor: this.ctx.editor }).catch(error => {
+				this.#reportSubmissionError(error);
+			});
+	}
+
+	#reportSubmissionError(error: unknown): void {
+		this.ctx.showError(error instanceof Error ? error.message : String(error));
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
