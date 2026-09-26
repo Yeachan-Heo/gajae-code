@@ -1749,7 +1749,8 @@ function createQuerySurface(
 				resolveModelByLookupAlias: ctx.modelRegistry.resolveModelByLookupAlias?.bind(ctx.modelRegistry),
 				lookupAliasExists: ctx.modelRegistry.lookupAliasExists?.bind(ctx.modelRegistry),
 				clearCanonicalVariant: ctx.modelRegistry.clearCanonicalVariant?.bind(ctx.modelRegistry),
-				isSelectorCircuitOpen: ctx.modelRegistry.isSelectorCircuitOpen.bind(ctx.modelRegistry),
+				isSelectorCircuitOpen: (selector: string, probeOwner?: string) =>
+					ctx.modelRegistry.isSelectorCircuitOpen?.call(ctx.modelRegistry, selector, probeOwner) ?? false,
 			};
 			let defaultModel: Model<Api> | undefined;
 			for (const assignment of assignments) {
