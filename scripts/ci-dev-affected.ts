@@ -1309,7 +1309,7 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 			`Test ${NATIVE_TASK_PANIC_TEST}`,
 			["bun", "packages/natives/scripts/run-task-panic-test.ts"],
 			undefined,
-			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: true },
+			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: false },
 		);
 		return;
 	}

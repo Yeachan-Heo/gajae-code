@@ -1205,7 +1205,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("the native task-panic regression's direct PR task requires Rust", () => {
 		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
 		const [directTask] = describeTasks([
-			{ key: `test:${testFile}`, description: testFile, command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"], capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: true } },
+			{ key: `test:${testFile}`, description: testFile, command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"], capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: false } },
 		]);
 		expect(directTask?.rust).toBe(true);
 	});
@@ -1926,7 +1926,11 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(entries.find(entry => entry.key === `test:${testFile}`)).toMatchObject({
 			command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"],
 			rust: true,
+			// It compiles its own addon, but it is a test shard, not the shared native
+			// producer: producer tasks are filtered out of the shard matrix.
+			nativeBuild: false,
 		});
+		expect(entries.filter(entry => entry.nativeBuild).map(entry => entry.key)).not.toContain(`test:${testFile}`);
 	});
 
 	test("push mode runs the AI suite with the same fresh-process boundary", () => {
