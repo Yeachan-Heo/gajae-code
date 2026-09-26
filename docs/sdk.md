@@ -459,6 +459,37 @@ cannot be proven, Q26 remains `accepted` or `in_flight`, the pending outcome
 stays private, and no terminal frame is published until recovery proves
 settlement.
 
+## Read-only broker observation
+
+`observeExistingBroker({ agentDir, expectedGeneration?, timeoutMs? })` reports what an
+already running broker publishes about itself and does nothing else. It owns discovery
+and authentication internally, so callers never receive credentials, socket coordinates
+or private discovery objects, and it is the only broker entry point that cannot start,
+ensure, retire, restart or recover a broker, spawn a host, replay a lifecycle operation
+or write error evidence. It never enters `SessionRouter`, `SessionLifecycleService`,
+`ensureBroker`, `Broker.start`, retirement, recovery, lifecycle lookup, model resolution
+or session enumeration.
+
+The returned value is a detached frozen snapshot, not the broker's mutable discovery
+object: `schema: "gjc.broker-observation"`, `version: 1`, `ok`, `observedAt`, and either
+a `broker` record (`generation`, `build.packageVersion`, `build.buildId | null`,
+`diagnosticProtocol: 1`) or an `unavailable` record whose `message` is a fixed literal
+keyed by `reason`. `generation` is the broker's publication-incarnation id fixed at its
+startup — not `endpointGeneration`, not the package version — and the initial
+publication, the authenticated response and the final publication must all agree on it
+and on the internal owner/process/root identity. An `expectedGeneration` mismatch, or a
+replacement publication observed during the request, fails closed without reconnecting
+or ensuring.
+
+`timeoutMs` (1..10000, default 2000) is a single absolute budget for the whole
+observation; expiry outranks a later refusal. A broker that publishes no generation or
+diagnostic protocol is `unsupported` rather than a synthesized compatibility success.
+The CLI projection of this facade is `gjc sdk diagnostics broker` — see
+[SDK session CLI](sdk-session-cli.md). Observation qualifies on darwin arm64 with Bun
+1.4.0 on a local ownership-enforcing APFS volume and activates only the fixed package or
+cached native artifact; a missing or mismatched artifact is `unsupported`, never
+extracted or repaired. This is observation, not signed supply-chain attestation.
+
 ## Skill invoke reconciliation
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
