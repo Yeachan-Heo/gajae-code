@@ -1637,11 +1637,14 @@ export async function loadManagedEnrollmentRecord(agentDir: string): Promise<Man
 	// directories is absent: any symlink, non-directory ancestor, or non-file leaf fails closed below.
 	if (process.platform !== "linux" && (await isAbsentBeneathRealDirectories(agent, target)))
 		return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };
+	// Existing enrollment reads remain cross-process locked on every platform; privateDurable
+	// is only valid for the Linux publication path.
+	const lockOptions =
+		process.platform === "linux"
+			? { cwd: agent, privateDurable: { directory: path.dirname(target) } }
+			: { cwd: agent };
 	try {
-		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), {
-			cwd: agent,
-			privateDurable: { directory: path.dirname(target) },
-		});
+		return await withWorkflowStateLock(target, () => loadEnrollmentIndexUnderLock(target), lockOptions);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT")
 			return { controlRoots: [], establishedRoots: [], publishingRoots: [], nativeIdentities: [], byRoot: {} };

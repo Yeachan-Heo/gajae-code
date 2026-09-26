@@ -234,7 +234,7 @@ export function runMemoryGuardNativeSmokeFastPath(
 
 async function runMemoryGuardNativeSmokeFastPathFromCli(): Promise<void> {
 	const { runMemoryGuardNativeSmoke } = await import("./cli/native-smoke");
-	runMemoryGuardNativeSmoke();
+	await runMemoryGuardNativeSmoke();
 }
 
 function isLaunchWorktreeSelector(arg: string): boolean {

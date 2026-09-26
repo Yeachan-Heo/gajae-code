@@ -632,6 +632,9 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 		} else {
 			notice = `Showing ${truncation.outputLines} of ${rangeTotal}${truncation.rangeBase === "window" ? "" : " lines"}; ${formatBytes(elidedBytes)} middle bytes elided`;
 		}
+		if (truncation.nextOffset != null) {
+			notice += `. Use :${truncation.nextOffset} to continue`;
+		}
 		if (hasArtifactNotice(truncation)) {
 			notice += `. ${formatTruncationArtifactNotice(truncation)}`;
 		}
@@ -926,14 +929,24 @@ async function spillLargeResultToArtifact(
 				maxLines: tailLines,
 			});
 
-	// Replace text blocks with single truncated block, keep images
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
@@ -1003,8 +1016,9 @@ function stripBodyOwnedTruncationFooter(text: string, details: unknown): string 
  * closes those gaps: when `tools.maxInlineResultBytes` is configured (> 0), any
  * final result whose inline text exceeds the cap is force-saved to an artifact
  * (reusing an existing artifactId to avoid double-artifacting) and truncated to a
- * head+tail view that fits the cap. Disabled by default (opt-in pending
- * measurement); a 0 cap returns the result untouched.
+ * head+tail view that fits the cap. Defaults to 12 KB, chosen by the live
+ * tool-result A/B in #5945; a 0 cap, or a context that cannot store an
+ * artifact, returns the result untouched.
  */
 async function enforceInlineResultBackstop(
 	result: AgentToolResult,
@@ -1035,6 +1049,9 @@ async function enforceInlineResultBackstop(
 	if (!artifactId && artifactCapability) {
 		artifactId = (await artifactCapability.saveArtifact(fullText, toolName)) ?? undefined;
 	}
+	// Without an artifact the elided text would be unrecoverable (e.g. standalone
+	// `gjc read` has no session store), so an uncapped result beats silent loss.
+	if (!artifactId) return result;
 
 	// Budget head+tail below the cap, reserving room for the elision marker so the
 	// composed `<head>\n<marker>\n<tail>` view never exceeds the configured cap.
@@ -1055,40 +1072,78 @@ async function enforceInlineResultBackstop(
 		truncated = truncateTail(fullText, { maxBytes: maxInlineBytes, maxLines: tailLines });
 	}
 
+	// Rebuild content preserving original block order while replacing text content.
 	const newContent: (TextContent | ImageContent)[] = [];
+	let textReplaced = false;
 	for (const block of result.content) {
-		if (block.type !== "text") {
+		if (block.type === "text") {
+			// Replace the first text block with truncated content, keep subsequent blocks in order.
+			if (!textReplaced) {
+				newContent.push({ type: "text", text: truncated.content });
+				textReplaced = true;
+			}
+		} else {
 			newContent.push(block);
 		}
 	}
-	newContent.push({ type: "text", text: truncated.content });
+	// If there was no text block (edge case), add the truncated text at the end.
+	if (!textReplaced) {
+		newContent.push({ type: "text", text: truncated.content });
+	}
 
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+
+	// If a prior truncation exists from spillLargeResultToArtifact (not from tool-owned window
+	// metadata like read with explicit ranges), preserve its totals instead of using the
+	// intermediate truncated view's totals. The intermediate view was already truncated by the
+	// spill step, so its totalLines/totalBytes do not reflect the original full output.
+	// Tool-owned windows have different semantics: totalLines is file-relative but totalBytes
+	// are window-relative, and they include a nextOffset for pagination. We must keep them as-is
+	// and only update outputLines/outputBytes to reflect the new backstop truncation level.
+	const priorTruncation = existingMeta?.truncation;
+	// Detect tool-owned window metadata by checking for nextOffset (present in read windows).
+	// The read tool produces nextOffset for pagination, which must survive the backstop.
+	const isToolOwnedWindow = priorTruncation?.nextOffset !== undefined;
+	// Preserve prior totals when they exist (either from spill or tool-owned window).
+	// The backstop's truncated view has reduced totalLines/totalBytes that don't reflect
+	// the original full output or window.
+	const realTotalLines = priorTruncation?.totalLines ?? truncated.totalLines;
+	const realTotalBytes = priorTruncation?.totalBytes ?? truncated.totalBytes;
+	const elidedLines = Math.max(0, realTotalLines - outputLines);
+	const elidedBytes = Math.max(0, realTotalBytes - outputBytes);
+
+	const nextOffsetProp =
+		isToolOwnedWindow && priorTruncation?.nextOffset !== undefined ? { nextOffset: priorTruncation.nextOffset } : {};
+
 	const truncationMeta: TruncationMeta =
 		truncated.truncatedBy === "middle"
 			? {
 					direction: "middle",
 					truncatedBy: "middle",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					elidedLines: truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines),
-					elidedBytes: truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes),
+					headRange: undefined,
+					tailRange: undefined,
+					elidedLines,
+					elidedBytes,
 					artifactId,
+					...nextOffsetProp,
 				}
 			: {
 					direction: "tail",
 					truncatedBy: truncated.truncatedBy ?? "bytes",
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
+					totalLines: realTotalLines,
+					totalBytes: realTotalBytes,
 					outputLines,
 					outputBytes,
 					maxBytes: maxInlineBytes,
-					shownRange: { start: truncated.totalLines - outputLines + 1, end: truncated.totalLines },
+					shownRange: { start: realTotalLines - outputLines + 1, end: realTotalLines },
 					artifactId,
+					...nextOffsetProp,
 				};
 
 	const newMeta: OutputMeta = { ...(existingMeta ?? {}), truncation: truncationMeta };

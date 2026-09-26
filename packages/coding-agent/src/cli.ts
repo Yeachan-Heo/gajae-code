@@ -113,7 +113,7 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv.length === 3 && argv[0] === "internal" && argv[1] === "memory-guard-native-smoke" && argv[2] === "--json") {
 		const { runMemoryGuardNativeSmoke } = await import("./cli/native-smoke");
-		runMemoryGuardNativeSmoke();
+		await runMemoryGuardNativeSmoke();
 		return;
 	}
 	if (argv.length === 1 && argv[0] === TMUX_OWNER_ISOLATION_ARG) {

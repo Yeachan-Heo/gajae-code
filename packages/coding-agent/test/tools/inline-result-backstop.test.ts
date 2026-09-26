@@ -52,13 +52,52 @@ function inlineText(result: AgentToolResult): string {
 }
 
 describe("inline-result backstop (Finding 12)", () => {
-	test("disabled by default: oversized output passes through untouched, no artifact saved", async () => {
+	test("default settings cap a 40KB read below the 50KB spill threshold at 12KB with artifact recovery (#5945)", async () => {
 		const full = bigText(40);
 		const saved: Array<{ content: string; toolType: string }> = [];
-		const tool = wrapToolWithMetaNotice(makeTool("mytool", { content: [{ type: "text", text: full }] }));
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
 		const ctx = makeContext(Settings.isolated(), saved);
 
 		const result = await tool.execute("c1", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		expect(result.details?.meta?.truncation?.maxBytes).toBe(12 * 1024);
+		expect(text).toContain(HEAD_MARKER);
+		expect(text).toContain(TAIL_MARKER);
+		expect(text).toContain("artifact://art-1");
+		expect(saved).toEqual([{ content: full, toolType: "read" }]);
+	});
+
+	test("default settings leave results at or below 12KB untouched", async () => {
+		const small = bigText(11);
+		const saved: Array<{ content: string; toolType: string }> = [];
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: small }] }));
+
+		const result = await tool.execute("c1b", {}, undefined, undefined, makeContext(Settings.isolated(), saved));
+
+		expect(inlineText(result)).toBe(small);
+		expect(saved).toHaveLength(0);
+	});
+
+	test("leaves output uncapped when no artifact can be stored (standalone gjc read)", async () => {
+		const full = bigText(40);
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
+
+		const result = await tool.execute("c1d", {}, undefined, undefined, {
+			settings: Settings.isolated(),
+		} as AgentToolContext);
+
+		expect(inlineText(result)).toBe(full);
+		expect(result.details?.meta?.truncation).toBeUndefined();
+	});
+
+	test("a 0 cap disables the backstop", async () => {
+		const full = bigText(40);
+		const saved: Array<{ content: string; toolType: string }> = [];
+		const tool = wrapToolWithMetaNotice(makeTool("read", { content: [{ type: "text", text: full }] }));
+		const ctx = makeContext(Settings.isolated({ "tools.maxInlineResultBytes": 0 }), saved);
+
+		const result = await tool.execute("c1c", {}, undefined, undefined, ctx);
 
 		expect(inlineText(result)).toBe(full);
 		expect(saved).toHaveLength(0);
@@ -142,5 +181,182 @@ describe("inline-result backstop (Finding 12)", () => {
 
 		expect(inlineText(result)).toBe(small);
 		expect(saved).toHaveLength(0);
+	});
+
+	test("read-range window metadata with nextOffset survives backstop truncation (#5966 blocker item 2)", async () => {
+		// Simulate a read tool that returns a 20KB window of a 3000-line file, with nextOffset indicator.
+		// The detection is based on nextOffset presence, not rangeBase (which is not set for explicit ranges).
+		const windowText = bigText(20);
+		const textWithOffset = `${windowText}\n\n[2700 more lines in file. Use :304 to continue]`;
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("read", {
+				content: [{ type: "text", text: textWithOffset }],
+				details: {
+					meta: {
+						// Simulate read tool's window metadata:
+						// totalLines = file lines (3000), totalBytes = window bytes
+						// nextOffset: indicates tool-owned window, not from spill
+						truncation: {
+							direction: "tail",
+							truncatedBy: "lines",
+							totalLines: 3000, // full file
+							totalBytes: 3000 * 128, // full file ~384KB
+							outputLines: 303, // shown window
+							outputBytes: Buffer.byteLength(textWithOffset, "utf-8"),
+							shownRange: { start: 1, end: 303 },
+							nextOffset: 304, // KEY: marks this as tool-owned window, not from spill
+						},
+					},
+				},
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c6", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		// The backstop should cap at 12KB
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(12 * 1024);
+		// The artifact holds the FULL 20KB window (the original input to backstop),
+		// not the 3000-line file (which never existed)
+		expect(saved).toHaveLength(1);
+		expect(Buffer.byteLength(saved[0]!.content, "utf-8")).toBeGreaterThan(12 * 1024);
+		expect(saved[0]!.content).toContain("Use :304 to continue"); // the nextOffset is preserved in the saved artifact
+		// The truncation metadata should preserve the file line count from the original window,
+		// NOT the backstop truncation's reduced line count.
+		// The nextOffset must survive so the model can request the next page.
+		const truncMeta = result.details?.meta?.truncation;
+		expect(truncMeta?.nextOffset).toBe(304); // pagination hint survives backstop
+		expect(truncMeta?.totalLines).toBe(3000); // file lines preserved, not mixed with window lines
+		expect(truncMeta?.totalBytes).toBeGreaterThan(12 * 1024); // artifact size
+		expect(truncMeta?.artifactId).toBe("art-1");
+	});
+
+	test("over-50KB non-read tool spill preserves totals through backstop (regression: #5945 part 1/2)", async () => {
+		// Simulate spillLargeResultToArtifact followed by backstop:
+		// A 100KB non-read tool result spills at 50KB threshold, then backstop applies 12KB cap.
+		const full = bigText(100);
+		const spilled40KBHeadTail = bigText(20) + "\n...(elided)...\n" + bigText(20);
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("mytool", {
+				content: [{ type: "text", text: spilled40KBHeadTail }],
+				details: {
+					meta: {
+						// Simulate spillLargeResultToArtifact output:
+						// This has totalLines/totalBytes from the FULL output (100KB),
+						// not from the head+tail view (40KB)
+						truncation: {
+							direction: "middle",
+							truncatedBy: "middle",
+							totalLines: 3200, // full output
+							totalBytes: full.length, // full output ~100KB
+							outputLines: 1600, // head+tail shown
+							outputBytes: Buffer.byteLength(spilled40KBHeadTail, "utf-8"),
+							artifactId: "art-full-output", // points to the 100KB full output
+							headRange: { start: 1, end: 800 },
+							tailRange: { start: 2400, end: 3200 },
+							// NO rangeBase: "window" - this is from spill, not tool-owned window
+						},
+					},
+				},
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c7", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		// The backstop should cap at 12KB
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(12 * 1024);
+		// The artifact should be the FULL 100KB output, not re-saved
+		expect(saved).toHaveLength(0); // no new artifact (existing one is reused)
+		// The truncation metadata should PRESERVE the original spill totals (3200 lines, 100KB),
+		// even though the current inline view is much smaller (12KB)
+		const truncMeta = result.details?.meta?.truncation;
+		expect(truncMeta?.totalLines).toBe(3200); // preserved from spill
+		expect(truncMeta?.totalBytes).toBe(full.length); // preserved from spill
+		expect(truncMeta?.artifactId).toBe("art-full-output"); // the original artifact
+	});
+
+	test("explicit read range (no rangeBase) with nextOffset survives backstop truncation (#5966 blocker)", async () => {
+		// The real read tool produces nextOffset for explicit ranges like :1-300,
+		// WITHOUT setting rangeBase: "window" (only set for pagination scrolling).
+		// The backstop must preserve nextOffset so pagination hints survive.
+		const windowText = bigText(20);
+		const textWithOffset = `${windowText}\n\n[2700 more lines in file. Use :304 to continue]`;
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("read", {
+				content: [{ type: "text", text: textWithOffset }],
+				details: {
+					meta: {
+						// Simulate real read tool for explicit range :1-300:
+						// totalLines = file lines (3000), totalBytes = window bytes
+						// nextOffset = pagination hint, rangeBase is UNDEFINED (not "window")
+						truncation: {
+							direction: "tail",
+							truncatedBy: "lines",
+							totalLines: 3000, // full file
+							totalBytes: 3000 * 128, // full file ~384KB
+							outputLines: 303, // shown window
+							outputBytes: Buffer.byteLength(textWithOffset, "utf-8"),
+							shownRange: { start: 1, end: 303 },
+							nextOffset: 304, // pagination hint - this triggers tool-owned window detection
+							// NO rangeBase here - this is the real read tool for explicit ranges
+						},
+					},
+				},
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c7", {}, undefined, undefined, ctx);
+		const text = inlineText(result);
+
+		// The backstop should cap at 12KB
+		expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(12 * 1024);
+		// The artifact holds the full 20KB window (the original input to backstop)
+		expect(saved).toHaveLength(1);
+		expect(Buffer.byteLength(saved[0]!.content, "utf-8")).toBeGreaterThan(12 * 1024);
+		expect(saved[0]!.content).toContain("Use :304 to continue"); // nextOffset text preserved
+		// The nextOffset should be preserved in metadata so the notice can reference it
+		const truncMeta = result.details?.meta?.truncation;
+		expect(truncMeta?.nextOffset).toBe(304); // CRITICAL: must survive backstop
+		// Since nextOffset was detected, the window totals (file-relative lines) should be kept
+		expect(truncMeta?.totalLines).toBe(3000); // NOT mixed with window lines
+		expect(truncMeta?.artifactId).toBe("art-1");
+	});
+
+	test("content block order is preserved when truncating (text then image stays text then image)", async () => {
+		const textLarge = bigText(15); // large text that will be truncated
+		const imageData =
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="; // 1x1 PNG
+		const saved: Array<{ content: string; toolType: string }> = [];
+
+		const tool = wrapToolWithMetaNotice(
+			makeTool("fetch", {
+				content: [
+					{ type: "text", text: textLarge },
+					{ type: "image", data: imageData, mimeType: "image/png" },
+				],
+			}),
+		);
+		const ctx = makeContext(Settings.isolated(), saved); // default 12KB backstop
+
+		const result = await tool.execute("c8", {}, undefined, undefined, ctx);
+
+		// Verify content block order: text first, then image
+		expect(result.content).toHaveLength(2);
+		expect(result.content[0]?.type).toBe("text"); // text is first
+		expect(result.content[1]?.type).toBe("image"); // image is second
+		// The image data should be preserved exactly
+		if (result.content[1]?.type === "image") {
+			expect(result.content[1].data).toBe(imageData);
+		}
 	});
 });

@@ -264,6 +264,11 @@ async function rollbackPublishedBrokerDiscovery(agentDir: string, discovery: Bro
 	}
 }
 
+/** Remove only the exact discovery record this broker published. */
+export async function rollbackBrokerDiscoveryIfCurrent(agentDir: string, discovery: BrokerDiscovery): Promise<void> {
+	await rollbackPublishedBrokerDiscovery(agentDir, discovery);
+}
+
 class NativeRetainedBrokerDiscovery implements RetainedBrokerDiscovery {
 	#closed = false;
 	#publication: NativeRetainedBrokerPublication;
@@ -468,21 +473,33 @@ export async function publishBrokerDiscovery(
 	agentDir: string,
 	discovery: BrokerDiscoveryWrite,
 	platform: NodeJS.Platform = process.platform,
+	signal?: AbortSignal,
+	afterWriteForTest?: () => Promise<void>,
 ): Promise<RetainedBrokerDiscovery> {
+	if (signal?.aborted) throw new Error("Broker startup was interrupted before discovery publication.");
 	const incarnation = discovery.incarnation ?? brokerProcessIncarnation(discovery.pid);
 	if (!incarnation) throw new Error(`Broker process incarnation is unavailable for pid ${discovery.pid}.`);
-	await writeBrokerDiscovery(agentDir, { ...discovery, incarnation });
-	const published: BrokerDiscovery = {
-		...discovery,
-		incarnation,
-		rootDigest: await canonicalServiceRootDigest(agentDir),
-	};
-	if (platform === "win32") return new LegacyWindowsBrokerDiscovery(agentDir, published);
+	const expectedPublication: BrokerDiscovery = { ...discovery, incarnation };
+	let retained: RetainedBrokerDiscovery | undefined;
 	try {
-		return new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
+		await writeBrokerDiscovery(agentDir, expectedPublication);
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		await afterWriteForTest?.();
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		const published: BrokerDiscovery = {
+			...discovery,
+			incarnation,
+			rootDigest: await canonicalServiceRootDigest(agentDir),
+		};
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		if (platform === "win32") retained = new LegacyWindowsBrokerDiscovery(agentDir, published);
+		else retained = new NativeRetainedBrokerDiscovery(requireRetainedBrokerPublication(agentDir));
+		if (signal?.aborted) throw new Error("Broker startup was interrupted before retained publication.");
+		return retained;
 	} catch (error) {
+		retained?.close();
 		try {
-			await rollbackPublishedBrokerDiscovery(agentDir, published);
+			await rollbackPublishedBrokerDiscovery(agentDir, expectedPublication);
 		} catch (rollbackError) {
 			// The aggregate message is the only thing the durable startup-failure
 			// marker persists (`AggregateError.errors` is not serialized), so the named
