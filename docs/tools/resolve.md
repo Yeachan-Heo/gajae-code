@@ -17,6 +17,7 @@
 | --- | --- | --- | --- |
 | `action` | `"apply" | "discard"` | Yes | Whether to commit or reject the queued preview. |
 | `reason` | `string` | Yes | Required explanation passed through to the queued callback. |
+| `extra` | `Record<string, unknown>` | No | Free-form metadata passed to the queued action's `apply(reason, extra)` / `reject(reason, extra)` callback alongside `reason`. |
 
 ## Outputs
 - Single-shot result.

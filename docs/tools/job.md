@@ -20,6 +20,7 @@
 | `poll` | `string[]` | No | Job ids to watch. Cannot be combined with `list`. If omitted (and `cancel` is also omitted), the tool watches all running jobs. If provided, missing ids are silently filtered out before waiting. |
 | `cancel` | `string[]` | No | Job ids to cancel before any polling. Missing ids are reported as `not_found`; non-running ids as `already_completed`. |
 | `list` | `boolean` | No | Return an immediate snapshot of every job spawned by the calling agent (running + completed within retention) without waiting. Read-only — cannot be combined with `poll` or `cancel`. |
+| `tail` | `string[]` | No | Job ids whose retained output is included in the result without waiting on them. Alone (no `poll`/`cancel`) it returns immediately with just those jobs; it can also be combined with `list`, `poll`, or `cancel`. |
 
 ## Outputs
 The tool returns one text block plus `details`.
