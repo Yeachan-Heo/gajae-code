@@ -501,7 +501,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not subscribe to caller-owned storage when scoped settings fail", async () => {
+	it("releases its caller-owned storage subscription when scoped settings fail", async () => {
 		const dirs = makeDirs("settings-failure");
 		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const close = vi.spyOn(authStorage, "close");
@@ -524,8 +524,12 @@ describe("createAgentSession credential_disabled subscription", () => {
 
 		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
 
-		expect(subscriptions).toBe(0);
-		expect(unsubscriptions).toBe(0);
+		// The SDK listener is registered before scoped settings load so a shared-storage
+		// credential_disabled emitted while settings are pending is not lost (#5893
+		// review). A settings failure must then release exactly that one subscription
+		// and leave the caller-owned storage open.
+		expect(subscriptions).toBe(1);
+		expect(unsubscriptions).toBe(1);
 		expect(close).not.toHaveBeenCalled();
 	});
 

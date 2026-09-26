@@ -523,6 +523,8 @@ export async function runSessionHost(
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
+		openLifecycleSessionManager?: () => Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }>;
+		initializeLifecycleExtensions?: () => Promise<void>;
 	} = {},
 ): Promise<void> {
 	const now = timing.now ?? Date.now;
@@ -537,6 +539,8 @@ export async function runSessionHost(
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
+	const openLifecycleManager =
+		timing.openLifecycleSessionManager ?? (() => openLifecycleSessionManager(request, cwd, agentDir));
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
 	if (
@@ -757,7 +761,7 @@ export async function runSessionHost(
 	try {
 		let mcpConfigPath: string | undefined;
 		opened = await beforeCutoff(
-			() => openLifecycleSessionManager(request, cwd, agentDir),
+			() => openLifecycleManager(),
 			async late => {
 				try {
 					await late.sessionManager?.close();
@@ -1039,13 +1043,15 @@ export async function runSessionHost(
 						preferCachedDefaultProfile: true,
 					}),
 		);
-		await beforeCutoff(() =>
-			initializeExtensions(session, {
-				reportSendError: () => {},
-				reportRuntimeError: () => {},
-				onShutdown: stop,
-			}),
-		);
+		const initializeLifecycleExt =
+			timing.initializeLifecycleExtensions ??
+			(() =>
+				initializeExtensions(session, {
+					reportSendError: () => {},
+					reportRuntimeError: () => {},
+					onShutdown: stop,
+				}));
+		await beforeCutoff(() => initializeLifecycleExt());
 		throwIfStartupInterrupted();
 		if (session.sessionManager.getSessionId() !== request.sessionId)
 			throw new Error(
