@@ -1672,17 +1672,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		throw primary;
 	};
-	const settingsResult = await settingsOutcome;
-	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
-	const settings = settingsResult.value;
-	const closeOwnedSettings = async (): Promise<void> => {
-		if (!ownsScopedSettings) return;
-		try {
-			await settings.close();
-		} finally {
-			releaseSettingsScope(settings);
-		}
-	};
 	// Subscribe before owned-registry construction as its first catalog pass may
 	// probe credentials. Embedder handlers disable AuthStorage's no-listener
 	// buffer, so the SDK listener must already be present before any startup probe.
@@ -1695,8 +1684,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		});
 	} catch (error) {
-		return await failInitialSetup(error, settings);
+		const settingsAfterSubscriptionFailure = await settingsOutcome;
+		if (!settingsAfterSubscriptionFailure.ok)
+			return await failInitialSetup(
+				new AggregateError(
+					[error, settingsAfterSubscriptionFailure.error],
+					"Credential listener registration and scoped settings initialization both failed.",
+				),
+			);
+		return await failInitialSetup(error, settingsAfterSubscriptionFailure.value);
 	}
+	const settingsResult = await settingsOutcome;
+	if (!settingsResult.ok) return await failInitialSetup(settingsResult.error);
+	const settings = settingsResult.value;
+	const closeOwnedSettings = async (): Promise<void> => {
+		if (!ownsScopedSettings) return;
+		try {
+			await settings.close();
+		} finally {
+			releaseSettingsScope(settings);
+		}
+	};
 	const startupAuthConfigResult = await startupAuthConfigOutcome;
 	if (!startupAuthConfigResult.ok) return await failInitialSetup(startupAuthConfigResult.error, settings);
 	const startupAuthConfig = startupAuthConfigResult.value;
