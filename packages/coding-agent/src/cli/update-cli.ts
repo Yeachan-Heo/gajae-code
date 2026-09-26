@@ -1129,6 +1129,12 @@ export interface BinaryUpdateFlow {
 	beforeReplace?(): void;
 }
 
+function binaryStagingPath(targetPath: string, stamp: string): string {
+	const extension = path.extname(targetPath);
+	if (!extension) return `${targetPath}.new.${stamp}`;
+	return `${targetPath.slice(0, -extension.length)}.new.${stamp}${extension}`;
+}
+
 /**
  * Orchestrate download → fsync → replace → verify with a strict ordering
  * contract: the downloaded temp binary MUST be flushed to stable storage
@@ -1145,7 +1151,7 @@ export async function runBinaryUpdateFlow(
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
 	const stamp = randomUUID();
-	const tempPath = `${targetPath}.new.${stamp}`;
+	const tempPath = binaryStagingPath(targetPath, stamp);
 	const backupPath = `${targetPath}.bak.${stamp}`;
 	const releaseLock = await acquireBinaryUpdateLock(targetPath);
 	try {
