@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { streamKiroCodeWhisperer } from "../src/providers/kiro-codewhisperer";
-import type { Context } from "../src/types";
+import type { Context, Model } from "../src/types";
 
 const originalFetch = globalThis.fetch;
 
@@ -27,9 +27,14 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 				name: "Test",
 				api: "kiro-codewhisperer-stream" as const,
 				provider: "kiro" as const,
+				baseUrl: "",
+				reasoning: false,
 				input: ["text"],
 				output: ["text"],
-			};
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 8_192,
+			} satisfies Model<"kiro-codewhisperer-stream">;
 
 			const context: Context = {
 				messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -70,9 +75,14 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 				name: "Test",
 				api: "kiro-codewhisperer-stream" as const,
 				provider: "kiro" as const,
+				baseUrl: "",
+				reasoning: false,
 				input: ["text"],
 				output: ["text"],
-			};
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 8_192,
+			} satisfies Model<"kiro-codewhisperer-stream">;
 
 			const context: Context = {
 				messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -112,9 +122,14 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 				name: "Test",
 				api: "kiro-codewhisperer-stream" as const,
 				provider: "kiro" as const,
+				baseUrl: "",
+				reasoning: false,
 				input: ["text"],
 				output: ["text"],
-			};
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 200_000,
+				maxTokens: 8_192,
+			} satisfies Model<"kiro-codewhisperer-stream">;
 
 			const context: Context = {
 				messages: [{ role: "user", content: "hello", timestamp: 1 }],
