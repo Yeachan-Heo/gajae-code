@@ -18375,7 +18375,11 @@ export class AgentSession {
 		if (!options?.preserveDefaultConfiguredChain && defaultChain && defaultChain.identity !== undefined) {
 			this.setConfiguredModelChain("default", [], "user-selection");
 		}
-		this.setActiveModelProfile(undefined);
+		// Preserve active model profile if there's a durable profile ownership marker (#5919).
+		const ownershipMarker = this.getModelProfileOwnershipMarker();
+		if (!ownershipMarker || ownershipMarker.kind !== "profile") {
+			this.setActiveModelProfile(undefined);
+		}
 		this.#preProfileModel = undefined;
 	}
 
