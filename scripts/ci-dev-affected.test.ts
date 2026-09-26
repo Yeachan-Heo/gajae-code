@@ -1205,7 +1205,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("the native task-panic regression's direct PR task requires Rust", () => {
 		const testFile = "packages/natives/test/task-panic-to-rejection.test.ts";
 		const [directTask] = describeTasks([
-			{ key: `test:${testFile}`, description: testFile, command: ["bun", "test", testFile] },
+			{ key: `test:${testFile}`, description: testFile, command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"], capabilities: { rust: true, nextest: false, nativeConsumer: false, nativeProducer: true } },
 		]);
 		expect(directTask?.rust).toBe(true);
 	});
@@ -1924,7 +1924,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			rust: false,
 		});
 		expect(entries.find(entry => entry.key === `test:${testFile}`)).toMatchObject({
-			command: ["bun", "test", testFile],
+			command: ["bun", "packages/natives/scripts/run-task-panic-test.ts"],
 			rust: true,
 		});
 	});
