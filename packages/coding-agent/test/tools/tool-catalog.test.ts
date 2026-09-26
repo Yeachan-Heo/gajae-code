@@ -12,6 +12,18 @@ describe("generated tool catalog", () => {
 		const regenerated = await generateToolCatalogData();
 		expect(regenerated).toEqual(TOOL_CATALOG);
 	});
+	test("advertised descriptions contain no unrendered or undefined template values", () => {
+		// TOOL_CATALOG is exported, and deferred (discoverable) tools advertise its description
+		// until they materialize, so a template variable missing from the generator's
+		// settings must not render as "undefined" or a raw {{PLACEHOLDER}}.
+		for (const [name, entry] of Object.entries(TOOL_CATALOG)) {
+			const description = entry.description ?? "";
+			expect({ name, match: description.match(/\b(?:undefined|NaN)\b|\{\{[^}]*\}\}/)?.[0] }).toEqual({
+				name,
+				match: undefined,
+			});
+		}
+	});
 	test("move_session is generated with essential loadMode and exclusive non-abortable metadata", () => {
 		expect(TOOL_CATALOG.move_session?.loadMode).toBe("essential");
 		expect(TOOL_CATALOG.move_session?.deferrable).toBe(false);
