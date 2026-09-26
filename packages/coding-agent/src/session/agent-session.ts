@@ -227,6 +227,7 @@ import {
 	validateModelProfileName,
 } from "../config/model-profile-contract";
 import {
+	commitDurableModelProfileOwnership,
 	type DurableModelProfileOwnership,
 	type ModelProfileOwnershipMarker,
 	modelProfileOwnershipMarkersEqual,
@@ -18762,6 +18763,8 @@ export class AgentSession {
 			// configured defaultLevel; otherwise re-clamp the current level.
 			this.setThinkingLevel(thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 			if (options?.persistAsSessionDefault === true && options.cause !== "profile-activation") {
+				// Concrete model selection clears session-scoped profile state (#5919).
+				this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
 				const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
 				this.setConfiguredModelChain(
 					"default",
@@ -18861,6 +18864,11 @@ export class AgentSession {
 
 	#publishDefaultModelSelection(model: Model, thinkingLevel: ThinkingLevel, systemPrompt: string[] | undefined): void {
 		this.#clearActiveRetryFallback();
+		// Concrete model selection clears session-scoped profile state (#5919).
+		// IMPORTANT: This is called AFTER durable persistence completes, so the
+		// session-scoped updates occur during the promotion phase after ownership
+		// is committed. Session ownership is captured in the promotion logic above.
+		this.#resetSessionScopedModelProfileState({ preserveDefaultConfiguredChain: true, force: true });
 		this.#setModelWithProviderSessionReset(model);
 		this.#seedSessionCanonicalVariant(model);
 		const thinkingLevelChanged = this.#thinkingLevel !== thinkingLevel;
@@ -19056,6 +19064,18 @@ export class AgentSession {
 								},
 							});
 						}
+					}
+					// Concrete model selection clears durable profile ownership (#5919).
+					try {
+						await commitDurableModelProfileOwnership(this.settings, { kind: "cleared" });
+						this.#updateDurableModelProfileOwnershipSnapshot(
+							readDurableModelProfileOwnership(this.settings),
+						);
+					} catch (error) {
+						logger.warn("Failed to commit cleared durable profile ownership after model selection", {
+							code: "default_model_selection_ownership_commit_failed",
+							disposition: "continue",
+						});
 					}
 					options?.onAfterMutation?.();
 					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
