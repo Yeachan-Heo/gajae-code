@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
-import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest } from "@gajae-code/coding-agent/config/settings";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("OpenAI Models List Discovery - Reasoning Effort", () => {
@@ -132,7 +132,7 @@ describe("OpenAI Models List Discovery - ModelRegistry Integration", () => {
 		);
 
 		// Mock the /models endpoint to return reasoning_efforts
-		using _hook = hookFetch((input) => {
+		using _hook = hookFetch(input => {
 			const url = String(input);
 			if (url === "https://api.test.example.com/v1/models") {
 				return new Response(
@@ -155,7 +155,7 @@ describe("OpenAI Models List Discovery - ModelRegistry Integration", () => {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
 					},
-			);
+				);
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		});
@@ -187,9 +187,7 @@ describe("OpenAI Models List Discovery - ModelRegistry Integration", () => {
 
 		// Verify getAll() returns the model with thinking config
 		const allModels = registry.getAll();
-		const modelFromAll = allModels.find(
-			m => m.provider === "test-provider" && m.id === "b-ai/deepseek-v4.1-flash",
-		);
+		const modelFromAll = allModels.find(m => m.provider === "test-provider" && m.id === "b-ai/deepseek-v4.1-flash");
 		expect(modelFromAll).toBeDefined();
 		expect(modelFromAll?.thinking).toBeDefined();
 		expect(modelFromAll?.thinking?.mode).toBe("effort");
