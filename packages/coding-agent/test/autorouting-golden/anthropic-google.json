@@ -3,6 +3,7 @@
     { "provider": "anthropic", "id": "claude-haiku-4-5", "reasoning": true },
     { "provider": "anthropic", "id": "claude-sonnet-5", "reasoning": true },
     { "provider": "anthropic", "id": "claude-sonnet-4-6", "reasoning": true },
+    { "provider": "anthropic", "id": "claude-opus-5-5", "reasoning": true },
     { "provider": "anthropic", "id": "claude-opus-5", "reasoning": true },
     { "provider": "anthropic", "id": "claude-opus-4-8", "reasoning": true },
     { "provider": "google", "id": "gemini-3.5-flash-lite", "reasoning": true },
@@ -16,7 +17,7 @@
   "expectedTiers": {
     "fast": ["anthropic/claude-haiku-4-5", "google/gemini-3.5-flash-lite", "google/gemini-2.5-flash-lite"],
     "balanced": ["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4-6", "google/gemini-3.5-flash", "google/gemini-2.5-flash"],
-    "strong": ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-8:high", "google/gemini-3.1-pro-preview", "google/gemini-2.5-pro"]
+    "strong": ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-5:high", "anthropic/claude-opus-4-8:high", "google/gemini-3.1-pro-preview", "google/gemini-2.5-pro"]
   },
-  "expectedCanonicalBytes": "{\"balanced\":[\"anthropic/claude-sonnet-5\",\"anthropic/claude-sonnet-4-6\",\"google/gemini-3.5-flash\",\"google/gemini-2.5-flash\"],\"fast\":[\"anthropic/claude-haiku-4-5\",\"google/gemini-3.5-flash-lite\",\"google/gemini-2.5-flash-lite\"],\"strong\":[\"anthropic/claude-opus-5:high\",\"anthropic/claude-opus-4-8:high\",\"google/gemini-3.1-pro-preview\",\"google/gemini-2.5-pro\"]}"
+  "expectedCanonicalBytes": "{\"balanced\":[\"anthropic/claude-sonnet-5\",\"anthropic/claude-sonnet-4-6\",\"google/gemini-3.5-flash\",\"google/gemini-2.5-flash\"],\"fast\":[\"anthropic/claude-haiku-4-5\",\"google/gemini-3.5-flash-lite\",\"google/gemini-2.5-flash-lite\"],\"strong\":[\"anthropic/claude-opus-5-5:high\",\"anthropic/claude-opus-5:high\",\"anthropic/claude-opus-4-8:high\",\"google/gemini-3.1-pro-preview\",\"google/gemini-2.5-pro\"]}"
 }
