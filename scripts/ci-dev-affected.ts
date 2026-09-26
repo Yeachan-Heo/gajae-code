@@ -571,9 +571,14 @@ function taskNeedsRust(key: string): boolean {
 		key === "ci-dry-run" ||
 		key === "affected-selftest" ||
 		key === "affected-dry-run" ||
-		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts"
+		key === "test:packages/coding-agent/test/tools/bash-master-owner-session-id.test.ts" ||
+		// Builds pi-natives with the `task-panic-test` feature via `napi build`; without the
+		// provisioned toolchain and rust-cache the cold compile exceeds the test timeout.
+		key === `test:${NATIVE_TASK_PANIC_TEST}`
 	);
 }
+
+const NATIVE_TASK_PANIC_TEST = "packages/natives/test/task-panic-to-rejection.test.ts";
 
 // Build the machine-readable descriptor list for the current changed-path plan.
 // `cwd` is emitted repo-relative so the JSON stays portable across runners.
@@ -1284,6 +1289,27 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 				"--file-timeout=300000",
 				"--concurrency=1",
 			],
+		);
+		return;
+	}
+	if (workspacePackage.name === "@gajae-code/natives") {
+		// The task-panic regression builds pi-natives with Cargo; it runs only as its own
+		// Rust-provisioned task, never inside the Rust-less package shard.
+		add(
+			tasks,
+			`test:${workspacePackage.name}`,
+			`Test ${workspacePackage.name}`,
+			["bun", "test", `--path-ignore-patterns=${NATIVE_TASK_PANIC_TEST.slice("packages/natives/".length)}`],
+			resolvePackageCwd(workspacePackage.dir),
+		);
+		// Use the separate build script that compiles the native addon outside the test timeout.
+		add(
+			tasks,
+			`test:${NATIVE_TASK_PANIC_TEST}`,
+			`Test ${NATIVE_TASK_PANIC_TEST}`,
+			["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			undefined,
+			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: true },
 		);
 		return;
 	}
