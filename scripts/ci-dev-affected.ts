@@ -1302,7 +1302,15 @@ function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: Workspa
 			["bun", "test", `--path-ignore-patterns=${NATIVE_TASK_PANIC_TEST.slice("packages/natives/".length)}`],
 			resolvePackageCwd(workspacePackage.dir),
 		);
-		addTestFileTask(tasks, NATIVE_TASK_PANIC_TEST);
+		// Use the separate build script that compiles the native addon outside the test timeout.
+		add(
+			tasks,
+			`test:${NATIVE_TASK_PANIC_TEST}`,
+			`Test ${NATIVE_TASK_PANIC_TEST}`,
+			["bun", "packages/natives/scripts/run-task-panic-test.ts"],
+			undefined,
+			{ rust: true, nextest: false, nativeConsumer: false, nativeProducer: true },
+		);
 		return;
 	}
 	if (workspacePackage.name !== "@gajae-code/coding-agent") {
