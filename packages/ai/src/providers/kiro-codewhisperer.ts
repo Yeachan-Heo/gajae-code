@@ -136,7 +136,6 @@ interface ErrorPayload {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_REGION = "us-east-1";
-const STREAMING_SERVICE_NAME = "amazoncodewhispererstreamingservice";
 
 type Block = (TextContent | ToolCall) & { index?: number; partialJson?: string };
 
@@ -207,8 +206,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				requestBody = replacementPayload as typeof requestBody;
 			}
 
-			const host = `${STREAMING_SERVICE_NAME}.${region}.amazonaws.com`;
-			const url = `https://${host}/`;
+			const url = `https://codewhisperer.${region}.amazonaws.com/`;
 
 			const bodyText = JSON.stringify(requestBody);
 			const body = new TextEncoder().encode(bodyText);

@@ -613,7 +613,7 @@ if (process.argv[2] === CHILD_FLAG) {
 			[
 				"codewhisperer",
 				"us-iso-east-1",
-				"https://amazoncodewhispererstreamingservice.us-iso-east-1.amazonaws.com/",
+				"https://codewhisperer.us-iso-east-1.amazonaws.com/",
 				"bearer",
 				"AmazonCodeWhispererService.GenerateAssistantResponse",
 			],
