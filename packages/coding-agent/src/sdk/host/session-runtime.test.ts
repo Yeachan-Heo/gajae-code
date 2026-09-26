@@ -231,7 +231,7 @@ test("session.last_assistant returns the latest projected readable text past non
 	});
 });
 
-test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {
+test("session.last_assistant returns null when the projected transcript has no readable assistant text", async () => {
 	const sessionId = "last-assistant-empty";
 	const ctx = extensionContext(sessionId, "/tmp", {
 		transcript: [
@@ -252,7 +252,7 @@ test("session.last_assistant returns resource_gone when the projected transcript
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: false, error: { code: "resource_gone" } });
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: true, page: { items: [null] } });
 });
 
 test("native prompt reconciliation fails closed for an explicitly empty assistant result", () => {
@@ -3803,6 +3803,7 @@ describe("SessionSdkSessionRuntime", () => {
 interface PreflightHooks {
 	onPreflightAccepted?: () => void;
 	onPreflightAcceptCommit?: () => void | Promise<void>;
+	expectedSdkRunToken?: string;
 }
 
 interface ResponseFrame {
@@ -4088,6 +4089,43 @@ async function settledStatus(
 function neverSettlingPromise(): Promise<void> {
 	return Promise.withResolvers<void>().promise;
 }
+
+test("SDK turn.steer preserves its expected run token and propagates a stale-run rejection", async () => {
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-turn-steer-run-token-"));
+	const staleToken = "ended-command:ended-turn";
+	const clientRef = "stale-steer-ref";
+	const calls: Array<{ content: unknown; deliverAs?: string; expectedSdkRunToken?: string }> = [];
+	let harness: InvocationHarness | undefined;
+	try {
+		harness = await invocationHarness("steer-run-token", cwd, {
+			sendUserMessage: async (content, options) => {
+				calls.push({
+					content,
+					deliverAs: options?.deliverAs,
+					expectedSdkRunToken: options?.expectedSdkRunToken,
+				});
+				if (options?.expectedSdkRunToken === staleToken)
+					throw Object.assign(new Error("The expected SDK run is not active."), { code: "turn_not_active" });
+				return "completed";
+			},
+		});
+
+		const rejected = await harness.control("turn.steer", {
+			text: "stale steer",
+			expectedSdkRunToken: staleToken,
+			clientRef,
+		});
+		expect(rejected).toMatchObject({ ok: false, error: { code: "turn_not_active" } });
+		expect(calls).toEqual([{ content: "stale steer", deliverAs: "steer", expectedSdkRunToken: staleToken }]);
+		expect(await harness.query("turn.steer_status", { clientRef })).toMatchObject({
+			ok: true,
+			result: { status: "rejected" },
+		});
+	} finally {
+		if (harness) await harness.stop();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 describe("post-acceptance invocation terminalization", () => {
 	test.each([

@@ -9,6 +9,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
+import { createSdkRunCapability } from "../src/session/sdk-run-capability-internal";
 
 function userMessage(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
@@ -96,6 +97,124 @@ describe("AgentSession steer-on-interrupt", () => {
 		await session.abort({ cause: "user_interrupt" });
 		await session.waitForIdle();
 		expect(assistantCount(session)).toBe(1);
+	});
+
+	it("rejects a steer bound to an ended SDK run instead of delivering it to a successor", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const successorStarted = Promise.withResolvers<void>();
+		const releaseSuccessor = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					firstStarted.resolve();
+					await releaseFirst.promise;
+					return { content: ["first completed"] };
+				},
+				async () => {
+					successorStarted.resolve();
+					await releaseSuccessor.promise;
+					return { content: ["successor completed"] };
+				},
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const endedToken = "command-first:turn-first";
+		const successorToken = "command-successor:turn-successor";
+		const sendBoundSteer = (text: string, expectedSdkRunToken: string) =>
+			session!.sendUserMessage(text, { deliverAs: "steer", expectedSdkRunToken } as never);
+
+		let first: Promise<void> | undefined;
+		let successor: Promise<void> | undefined;
+		try {
+			first = session.sendUserMessage("first task", { sdkRunCapability: createSdkRunCapability(endedToken) });
+			await firstStarted.promise;
+			releaseFirst.resolve();
+			await first;
+			await session.waitForIdle();
+
+			successor = session.sendUserMessage("successor task", {
+				sdkRunCapability: createSdkRunCapability(successorToken),
+			});
+			await successorStarted.promise;
+			await expect(sendBoundSteer("stale steer from first run", endedToken)).rejects.toMatchObject({
+				code: "turn_not_active",
+			});
+
+			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(
+				mock.calls[1]!.context.messages.some(
+					message =>
+						message.role === "user" && JSON.stringify(message.content).includes("stale steer from first run"),
+				),
+			).toBe(false);
+			releaseSuccessor.resolve();
+			await successor;
+			await session.waitForIdle();
+			expect(mock.calls).toHaveLength(2);
+		} finally {
+			releaseFirst.resolve();
+			releaseSuccessor.resolve();
+			await Promise.all([first?.catch(() => {}), successor?.catch(() => {})]);
+		}
+	});
+
+	it("admits an SDK-bound steer when its expected run token is live", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				async () => {
+					firstStarted.resolve();
+					await releaseFirst.promise;
+					return { content: ["first completed"] };
+				},
+				{ content: ["handled live steer"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const liveToken = "command-live:turn-live";
+		const sendBoundSteer = (text: string) =>
+			session!.sendUserMessage(text, { deliverAs: "steer", expectedSdkRunToken: liveToken } as never);
+
+		let running: Promise<void> | undefined;
+		try {
+			running = session.sendUserMessage("first task", { sdkRunCapability: createSdkRunCapability(liveToken) });
+			await firstStarted.promise;
+			await sendBoundSteer("steer this live run");
+			expect(session.getQueuedMessages()).toEqual({ steering: ["steer this live run"], followUp: [] });
+			releaseFirst.resolve();
+			await running.catch(() => {});
+			await session.waitForIdle();
+
+			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+			expect(
+				session.agent.state.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("steer this live run"),
+				),
+			).toBe(true);
+		} finally {
+			releaseFirst.resolve();
+			await running?.catch(() => {});
+		}
 	});
 
 	it("delivers a steer queued while the agent is idle without a user interrupt", async () => {

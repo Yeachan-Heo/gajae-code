@@ -93,6 +93,7 @@ const IDEMPOTENCY_TTL_MS = 15 * 60 * 1_000;
 const MAX_IDEMPOTENCY_ENTRIES = 256;
 
 const sessionChains = new WeakMap<ControlSurface, Promise<void>>();
+const pendingReplacementBarriers = new WeakMap<ControlSurface, Promise<void>>();
 interface IdempotencyEntry {
 	hash: string;
 	expiresAt: number;
@@ -189,6 +190,19 @@ function invalidInput(message: string): never {
 	throw new TypedControlError("invalid_input", message);
 }
 
+const EXPECTED_SDK_RUN_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}:[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+
+function enqueueReplacementBarrier(surface: ControlSurface): () => void {
+	const previous = pendingReplacementBarriers.get(surface) ?? Promise.resolve();
+	const { promise: current, resolve: resolveCurrent } = Promise.withResolvers<void>();
+	const barrier = previous.then(() => current);
+	pendingReplacementBarriers.set(surface, barrier);
+	return () => {
+		resolveCurrent();
+		if (pendingReplacementBarriers.get(surface) === barrier) pendingReplacementBarriers.delete(surface);
+	};
+}
+
 /**
  * C04 `turn.abort` dispatch.
  *
@@ -244,7 +258,11 @@ function invoke(
 		case "turn.prompt":
 			return surface.prompt(text(input), input.images, input.clientRef as string | undefined);
 		case "turn.steer":
-			return surface.steer(text(input), typeof input.clientRef === "string" ? input.clientRef : undefined);
+			return surface.steer(
+				text(input),
+				typeof input.clientRef === "string" ? input.clientRef : undefined,
+				Object.hasOwn(input, "expectedSdkRunToken") ? (input.expectedSdkRunToken as string) : undefined,
+			);
 		case "turn.follow_up":
 			return surface.followUp(text(input));
 		case "turn.abort":
@@ -487,6 +505,15 @@ export function dispatchControl(
 	if (!isInput(request.input))
 		return Promise.resolve(failure(request.id, "invalid_input", "Control input must be an object."));
 	if (
+		row.sdkId === "turn.steer" &&
+		Object.hasOwn(request.input, "expectedSdkRunToken") &&
+		(typeof request.input.expectedSdkRunToken !== "string" ||
+			!EXPECTED_SDK_RUN_TOKEN_PATTERN.test(request.input.expectedSdkRunToken))
+	)
+		return Promise.resolve(
+			failure(request.id, "invalid_input", "expectedSdkRunToken must be a commandId:turnId pair."),
+		);
+	if (
 		row.sdkId === "turn.abort" &&
 		((brokerAbortFieldPresent && !brokerAbortAuthorized) ||
 			(request.input.operator === true && !brokerAbortAuthorized))
@@ -538,10 +565,31 @@ export function dispatchControl(
 	const work = () => execute(surface, row, dispatchRequest);
 	if (row.sdkId === "turn.abort_and_prompt") {
 		const cancellable = surface as PreflightCancellableSurface;
-		if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
-		return serialize(surface, work);
+		const releaseBarrier = enqueueReplacementBarrier(surface);
+		try {
+			if (Object.hasOwn(cancellable, "cancelPendingPreflights")) cancellable.cancelPendingPreflights?.();
+			return serialize(surface, async () => {
+				try {
+					return await work();
+				} finally {
+					releaseBarrier();
+				}
+			});
+		} catch (error) {
+			releaseBarrier();
+			throw error;
+		}
 	}
 	if (row.idempotency === "idempotent" && dispatchRequest.idempotencyKey)
 		return idempotent(surface, row, dispatchRequest, work);
-	return row.idempotency === "ordered" && row.sdkId !== "retry.now" ? serialize(surface, work) : work();
+	if (row.sdkId === "turn.steer") {
+		const replacementBarrier = pendingReplacementBarriers.get(surface);
+		return replacementBarrier ? replacementBarrier.then(work) : work();
+	}
+	// Active feedback must reach the worker even while an earlier ordered control
+	// waits for that worker. Correlated steer admission remains deduplicated by
+	// the runtime reconciliation store, independently of this dispatch chain.
+	return row.idempotency === "ordered" && row.sdkId !== "retry.now" && row.sdkId !== "turn.steer"
+		? serialize(surface, work)
+		: work();
 }
