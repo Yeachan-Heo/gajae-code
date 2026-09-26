@@ -6,7 +6,7 @@ import { resolveCargoToolchainPath } from "../scripts/rust-toolchain-path";
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const packageDir = path.join(repoRoot, "packages/natives");
 const nativeDir = path.join(packageDir, "native");
-const testTimeoutMs = 300_000;
+const testTimeoutMs = 120_000;
 
 setDefaultTimeout(testTimeoutMs);
 
