@@ -922,11 +922,7 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
 	const grokGeneration = parseDirectXaiReasoningEffortGeneration(model);
 	if (grokGeneration !== undefined) {
-		if (
-			grokGeneration.major === 4 &&
-			grokGeneration.minor >= 6 &&
-			!GROK_4_20_REASONING_MODEL_IDS.has(model.id)
-		) {
+		if (grokGeneration.major === 4 && grokGeneration.minor >= 6 && !GROK_4_20_REASONING_MODEL_IDS.has(model.id)) {
 			return GROK_4_6_PLUS_EFFORTS;
 		}
 		if (GROK_4_20_REASONING_MODEL_IDS.has(model.id)) {
