@@ -532,11 +532,11 @@ describe("preset landing adversarial QA", () => {
 
 		const text = await rendered(selector);
 		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-terra");
-		expect(text).toContain("EXECUTOR: openai-codex/gpt-5.6-luna");
-		expect(text).toContain("PLANNER: openai-codex/gpt-5.6-luna");
+		expect(text).toContain("EXECUTOR: openai-codex/gpt-6-luna");
+		expect(text).toContain("PLANNER: openai-codex/gpt-6-luna");
 		expect(text).toContain("CRITIC: openai-codex/gpt-5.6-terra");
 		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-terra");
-		expect(text).not.toContain("gpt-5.6-sol");
+		expect(text).not.toContain("gpt-6-sol");
 	});
 
 	test("built-in Codex + OpenCodeGo preview preserves provider role models", async () => {
@@ -548,11 +548,11 @@ describe("preset landing adversarial QA", () => {
 		selector.refreshPresetProfiles("codex-opencodego");
 
 		const text = await rendered(selector);
-		expect(text).toContain("DEFAULT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("DEFAULT: openai-codex/gpt-6-sol");
 		expect(text).toContain("EXECUTOR: opencode-go/deepseek-v4-pro");
 		expect(text).toContain("PLANNER: opencode-go/kimi-k3");
 		expect(text).toContain("CRITIC: opencode-go/mimo-v2.5-pro");
-		expect(text).toContain("ARCHITECT: openai-codex/gpt-5.6-sol");
+		expect(text).toContain("ARCHITECT: openai-codex/gpt-6-sol");
 	});
 
 	test("#688 Down crossing a group boundary lands on the destination group header", async () => {

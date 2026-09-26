@@ -77,7 +77,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
 			}),
-			model("openai-codex", "gpt-5.6-sol", {
+			model("openai-codex", "gpt-6-sol", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
@@ -87,7 +87,7 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
-			model("openai-codex", "gpt-5.6-luna", {
+			model("openai-codex", "gpt-6-luna", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
@@ -1722,8 +1722,8 @@ describe("model profile activation", () => {
 			"codex-eco",
 			{
 				default: "openai-codex/gpt-5.6-terra:low",
-				executor: "openai-codex/gpt-5.6-luna:low",
-				planner: "openai-codex/gpt-5.6-luna:high",
+				executor: "openai-codex/gpt-6-luna:low",
+				planner: "openai-codex/gpt-6-luna:high",
 				critic: "openai-codex/gpt-5.6-terra:xhigh",
 				architect: "openai-codex/gpt-5.6-terra:high",
 			},
@@ -1731,21 +1731,21 @@ describe("model profile activation", () => {
 		[
 			"codex-medium",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6-sol:low",
 				executor: "openai-codex/gpt-5.6-terra:low",
 				planner: "openai-codex/gpt-5.6-terra:high",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"codex-pro",
 			{
-				default: "openai-codex/gpt-5.6-sol:medium",
+				default: "openai-codex/gpt-6-sol:medium",
 				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "openai-codex/gpt-5.6-sol:high",
-				critic: "openai-codex/gpt-5.6-sol:max",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				planner: "openai-codex/gpt-6-sol:high",
+				critic: "openai-codex/gpt-6-sol:max",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
@@ -1754,28 +1754,28 @@ describe("model profile activation", () => {
 				default: "anthropic/claude-opus-5:xhigh",
 				executor: "openai-codex/gpt-5.6-terra:low",
 				planner: "anthropic/claude-sonnet-5",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"lunamaxxing",
 			{
-				default: "openai-codex/gpt-5.6-luna:medium",
-				executor: "openai-codex/gpt-5.6-luna:xhigh",
-				planner: "openai-codex/gpt-5.6-luna:max",
-				critic: "openai-codex/gpt-5.6-luna:max",
-				architect: "openai-codex/gpt-5.6-luna:max",
+				default: "openai-codex/gpt-6-luna:medium",
+				executor: "openai-codex/gpt-6-luna:xhigh",
+				planner: "openai-codex/gpt-6-luna:max",
+				critic: "openai-codex/gpt-6-luna:max",
+				architect: "openai-codex/gpt-6-luna:max",
 			},
 		],
 		[
 			"codex-opencodego",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
 				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
@@ -1785,7 +1785,7 @@ describe("model profile activation", () => {
 				executor: "openai-codex/gpt-5.6-terra:medium",
 				planner: "anthropic/claude-opus-5:medium",
 				critic: "anthropic/claude-opus-5:high",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
@@ -3190,9 +3190,9 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "opencodex/opencodex/gpt-5.6-terra:low",
-			architect: "opencodex/opencodex/gpt-5.6-sol:high",
+			architect: "opencodex/opencodex/gpt-6-sol:high",
 			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
-			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+			critic: "opencodex/opencodex/gpt-6-sol:xhigh",
 		});
 	});
 
