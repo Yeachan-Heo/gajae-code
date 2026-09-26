@@ -1974,6 +1974,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
 		const hasModelApiKey = async (candidate: Model): Promise<boolean> => {
+			if (authStorage.hasSessionCredentialUnavailable(candidate.provider, credentialSessionId)) return false;
 			const availabilityKey = getModelAvailabilityKey(candidate);
 			const cached = modelApiKeyAvailability.get(availabilityKey);
 			if (cached !== undefined) {
@@ -2240,10 +2241,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					{
 						managedFallback: defaultModelEntries.length > 1,
 						canonicalSessionId: providerSessionId,
+						isCredentialUnavailable: provider =>
+							authStorage.hasSessionCredentialUnavailable(provider, credentialSessionId),
 						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 					},
 				);
 				model = restoredDefaultResolution.model;
+				if (restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+					modelFallbackMessage =
+						"Saved session credential is unavailable. Re-pin a credential or select AUTO explicitly.";
+				}
 				// A restored session model from a different provider than an active
 				// `--prefer-credential` preference is discarded rather than kept: the
 				// preference names one provider's account, and silently resuming on
@@ -2278,7 +2285,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						deferredMissingSessionRecovery = true;
 					}
 				}
-				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				if (!model && !restoredDefaultResolution.skips.some(skip => skip.reason === "credential_unavailable")) {
+					modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
+				}
 			});
 		}
 
@@ -2288,6 +2297,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!hasExplicitModel &&
 			!model &&
 			defaultRoleSpec.model &&
+			!authStorage.hasSessionCredentialUnavailable(defaultRoleSpec.model.provider, credentialSessionId) &&
 			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
 		) {
 			const settingsDefaultModel = defaultRoleSpec.model;
@@ -4226,6 +4236,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				{
 					managedFallback: defaultModelEntries.length > 1,
 					canonicalSessionId: providerSessionId,
+					isCredentialUnavailable: provider =>
+						authStorage.hasSessionCredentialUnavailable(provider, credentialSessionId),
 					...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
 				},
 			);

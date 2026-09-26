@@ -404,6 +404,58 @@ describe("startup credential pin handoff", () => {
 		}
 	});
 
+	test("resumes a saved model with a removed pin without selecting the settings default on that provider", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-pin-saved-resume-");
+		const fixture = await createCredentialFixture(tempDir.path());
+		const savedManager = SessionManager.create(fixture.root, path.join(fixture.root, "sessions"));
+		const credentialScope = savedManager.getSessionId();
+		savedManager.appendModelChange(`${fixture.provider}/entitled-model`, "default");
+		savedManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId: credentialScope,
+			provider: fixture.provider,
+			pin: { kind: "id", value: String(fixture.paidRowId) },
+			credentialStoreIdentity: "fixture-store",
+		});
+		await savedManager.ensureOnDisk();
+		await savedManager.flush();
+		const sessionFile = savedManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await savedManager.close();
+		expect(fixture.authStorage.disableCredentialById(fixture.paidRowId, "removed by test")).toBe(true);
+
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		settings.setModelRole("default", `${fixture.provider}/entitled-model`);
+		let session: AgentSession | undefined;
+		using _blockedFetch = hookFetch(() => {
+			throw new Error("Resume must not call a provider with another credential");
+		});
+		try {
+			const resumedManager = await SessionManager.open(sessionFile, fixture.root);
+			const result = await createAgentSession({
+				...sessionOptions(fixture),
+				modelPattern: undefined,
+				credentialSessionId: credentialScope,
+				settings,
+				sessionManager: resumedManager,
+				startupAuthConfig: snapshot(fixture.provider, `id:${fixture.wrongRowId}`),
+				modelRegistryStartupMutation: { owner: "cli-root", onAttempt: () => {} },
+			});
+			session = result.session;
+			expect(session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toContain("Re-pin a credential or select AUTO explicitly");
+			expect(fixture.authStorage.hasSessionCredentialUnavailable(fixture.provider, credentialScope)).toBe(true);
+			expect(
+				await fixture.authStorage.peekApiKey(fixture.provider, {
+					sessionId: credentialScope,
+					owner: fixture.modelRegistry.getAuthStorageOwner(),
+				}),
+			).toBeUndefined();
+		} finally {
+			await disposeFixture(fixture, session);
+		}
+	});
+
 	test("an explicit credential selector overrides the global paid pin", async () => {
 		using tempDir = TempDir.createSync("@gjc-startup-pin-explicit-");
 		const fixture = await createCredentialFixture(tempDir.path());
