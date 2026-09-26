@@ -2934,7 +2934,9 @@ export function isCanonicalLifecycleCleanupOriginal(root: string, id: string, or
 		basename === `${id}.lifecycle.json` ||
 		basename === `${id}.lifecycle.ready.json` ||
 		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename) ||
-		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json\\.promoting$`).test(basename)
+		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json\\.promoting$`).test(
+			basename,
+		)
 	);
 }
 
