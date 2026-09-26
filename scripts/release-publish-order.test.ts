@@ -274,6 +274,12 @@ describe("unscoped gajae-code package publication", () => {
 			"native/index.d.ts",
 			"native/loader-state.js",
 			"native/loader-state.d.ts",
+			// Read-only diagnostic loader plus its trusted artifact digest record. These are
+			// package data, not binaries: the loader activates only an already verified
+			// cached artifact, so the delegation assertion below still holds.
+			"native/diagnostic-loader.d.ts",
+			"native/diagnostic-loader.js",
+			"native/diagnostic-artifact.json",
 			"native/embedded-addon.js",
 			"README.md",
 		]);
