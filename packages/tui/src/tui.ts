@@ -2145,7 +2145,8 @@ export class TUI extends Container {
 				if (!isCurrentLifecycle()) return failed();
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
 				if (!currentLease || currentLease.revoked || currentLease.token !== request.token) {
-					if (isCurrentLifecycle() && !isLeaseInvalidatedDueToTerminalLoss(request.token?.ownerId ?? "")) abortBarrier();
+					const ownerId = request.token?.ownerId ?? "";
+					if (isCurrentLifecycle() && !isLeaseInvalidatedDueToTerminalLoss(ownerId)) abortBarrier();
 					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "failed" };
 				}
 				if (op.shouldWrite !== undefined) {
