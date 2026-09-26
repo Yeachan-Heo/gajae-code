@@ -77,7 +77,7 @@ async function main(): Promise<void> {
 		}
 
 		// Find the built .node file
-		const addons = (await fs.readdir(outputDir)).filter((file) => file.endsWith(".node"));
+		const addons = (await fs.readdir(outputDir)).filter(file => file.endsWith(".node"));
 		if (addons.length !== 1) {
 			throw new Error(`Expected exactly one .node file in ${outputDir}, got ${addons.length}`);
 		}
@@ -102,7 +102,7 @@ async function main(): Promise<void> {
 	}
 }
 
-main().catch((error) => {
+main().catch(error => {
 	console.error(error);
 	process.exitCode = 1;
 });
