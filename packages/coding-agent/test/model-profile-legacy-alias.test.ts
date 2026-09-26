@@ -68,6 +68,7 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
+		isSelectorCircuitOpen: () => false,
 	};
 }
 

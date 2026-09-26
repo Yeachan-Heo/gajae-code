@@ -23190,6 +23190,8 @@ export class AgentSession {
 				return beginAttempt(formatModelString(model), String(++this.#fallbackInvocationId));
 			},
 			onManagedAttemptAccepted: () => {
+				const acceptedSelector = controller.currentSelector();
+				if (acceptedSelector) this.#modelRegistry.closeSelectorCircuit(acceptedSelector);
 				controller.resetAttemptBudget();
 				this.#escapedNonAsciiManagedRetries = 0;
 				this.#overflowMaintenanceAttempts = 0;
@@ -23210,10 +23212,12 @@ export class AgentSession {
 			if (controller.chain.entries.length > 1) await this.#advanceDefaultFallback(controller, "new_turn", 0);
 			return;
 		}
+		const head = controller.chain.entries[0] ?? "";
 		if (
 			this.settings.get("retry.fallbackRevertPolicy") === "cooldown-expiry" &&
 			controller.activeIndex > 0 &&
-			this.#modelRegistry.getSelectorSuppressionStatus(controller.chain.entries[0] ?? "") === "expired"
+			(this.#modelRegistry.getSelectorSuppressionStatus(head) === "expired" ||
+				this.#modelRegistry.isSelectorCircuitHalfOpen(head))
 		) {
 			controller.resetForNewTurn();
 		}
@@ -23244,6 +23248,7 @@ export class AgentSession {
 			{
 				managedFallback: true,
 				canonicalSessionId: this.sessionId,
+				circuitProbeOwner: this.sessionId,
 				...(this.#persistedModelProfileAliasIntent("default") ?? {}),
 			},
 		);
@@ -23686,6 +23691,16 @@ export class AgentSession {
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
+			// Skip an entry whose circuit is open (it recently failed out of a chain
+			// in this or a sibling session). The final entry always stays eligible so
+			// an all-open chain degrades to probing rather than refusing the turn.
+			if (
+				controller.activeIndex < controller.chain.entries.length - 1 &&
+				this.#modelRegistry.isSelectorCircuitOpen(selector, this.sessionId)
+			) {
+				controller.onResolutionSkip("circuit_open");
+				continue;
+			}
 			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
 			const profileResolution = profileAliasIntent
 				? await (async () => {
@@ -24480,6 +24495,20 @@ export class AgentSession {
 			) {
 				outcome = "retry";
 			}
+		}
+		// An entry that failed out of the chain opens its circuit so later turns,
+		// chain restarts, and sibling sessions sharing this registry skip it
+		// instead of re-spending its whole attempt budget on a known-bad route.
+		// A typed Retry-After is authoritative: the circuit stays open exactly
+		// until the provider-specified instant, so sibling sessions honour it too.
+		const circuitCooldownMs = this.settings.get("fallback.circuitCooldownMs");
+		if (managedFallback && outcome !== "retry" && failedSelector && circuitCooldownMs > 0) {
+			this.#modelRegistry.openSelectorCircuit(
+				failedSelector,
+				circuitCooldownMs,
+				this.settings.get("fallback.circuitMaxCooldownMs"),
+				trigger.retryAfterMs === undefined ? undefined : Date.now() + trigger.retryAfterMs,
+			);
 		}
 		if (outcome === "advance") {
 			this.#providerRetryMaxAttempts = undefined;

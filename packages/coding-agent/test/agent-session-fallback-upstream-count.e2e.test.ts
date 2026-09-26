@@ -1115,6 +1115,153 @@ describe("AgentSession fallback upstream request counts", () => {
 		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
 	});
 
+	it("opens the circuit of an entry that failed out of the chain so a sibling session skips it", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary) ? rateLimitStream(model) : successfulStream(model);
+		};
+		const { primary, fallback } = createSession(2, streamFn);
+
+		await session!.prompt("First session burns the failing head");
+		await session!.waitForIdle();
+		expect(calls).toEqual([selector(primary), selector(primary), selector(fallback)]);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(fallback))).toBe(false);
+
+		// A sibling session sharing the registry (e.g. a subagent) starts on the head.
+		await session!.dispose();
+		calls.length = 0;
+		createSession(2, streamFn);
+		await session!.prompt("Sibling session starts fresh");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(fallback)]);
+		expect(session!.model).toMatchObject({ provider: fallback.provider, id: fallback.id });
+	});
+
+	it("probes the head again once its circuit half-opens and closes it on success", async () => {
+		const calls: string[] = [];
+		let headHealthy = false;
+		const { primary, fallback } = createSession(
+			1,
+			model => {
+				calls.push(selector(model));
+				return selector(model) === selector(primary) && !headHealthy
+					? rateLimitStream(model)
+					: successfulStream(model);
+			},
+			{ "fallback.circuitCooldownMs": 1 },
+		);
+
+		await session!.prompt("Head fails once");
+		await session!.waitForIdle();
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		await Bun.sleep(5);
+		expect(modelRegistry.isSelectorCircuitHalfOpen(selector(primary))).toBe(true);
+
+		headHealthy = true;
+		await session!.prompt("Head recovered");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary), selector(fallback), selector(primary)]);
+		expect(session!.model).toMatchObject({ provider: primary.provider, id: primary.id });
+		expect(modelRegistry.isSelectorCircuitHalfOpen(selector(primary))).toBe(false);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(false);
+	});
+
+	it("still probes the chain when every entry's circuit is open", async () => {
+		const calls: string[] = [];
+		const { primary, fallback } = createSession(1, model => {
+			calls.push(selector(model));
+			return successfulStream(model);
+		});
+		modelRegistry.openSelectorCircuit(selector(primary), 60_000, 60_000);
+		modelRegistry.openSelectorCircuit(selector(fallback), 60_000, 60_000);
+
+		await session!.prompt("Everything is cooling down");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(primary)]);
+		expect(session!.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary))).toBe(false);
+	});
+
+	it("keeps a Retry-After exhausted head closed to sibling sessions until the provider's retry time", async () => {
+		const calls: string[] = [];
+		const streamFn: AgentOptions["streamFn"] = model => {
+			calls.push(selector(model));
+			return selector(model) === selector(primary) ? typedRateLimitStream(model, 600_000) : successfulStream(model);
+		};
+		// Local cooldown is tiny; the provider's 10-minute Retry-After must win.
+		const { primary, fallback } = createSession(1, streamFn, { "fallback.circuitCooldownMs": 1 });
+
+		await session!.prompt("Head is rate limited for ten minutes");
+		await session!.waitForIdle();
+		expect(calls).toEqual([selector(primary), selector(fallback)]);
+		await Bun.sleep(5);
+
+		await session!.dispose();
+		calls.length = 0;
+		createSession(1, streamFn, { "fallback.circuitCooldownMs": 1 });
+		await session!.prompt("Sibling must not retry the rate-limited head");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(fallback)]);
+	});
+
+	it("lets exactly one session claim a half-open probe", () => {
+		const head = "anthropic/claude-sonnet-4-5";
+		modelRegistry.openSelectorCircuit(head, 1, 1, Date.now() - 1);
+
+		expect(modelRegistry.isSelectorCircuitHalfOpen(head)).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-a")).toBe(false);
+		// The lease now belongs to session-a: siblings skip, the owner is re-admitted.
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-b")).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head)).toBe(true);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-a")).toBe(false);
+		expect(modelRegistry.isSelectorCircuitHalfOpen(head)).toBe(false);
+
+		modelRegistry.closeSelectorCircuit(head);
+		expect(modelRegistry.isSelectorCircuitOpen(head, "session-b")).toBe(false);
+	});
+
+	it("skips a half-open head in a sibling session while another session holds its probe", async () => {
+		const calls: string[] = [];
+		const { primary, fallback } = createSession(1, model => {
+			calls.push(selector(model));
+			return successfulStream(model);
+		});
+		modelRegistry.openSelectorCircuit(selector(primary), 60_000, 60_000, Date.now() - 1);
+		expect(modelRegistry.isSelectorCircuitOpen(selector(primary), "another-session")).toBe(false);
+
+		await session!.prompt("Another session is probing the head");
+		await session!.waitForIdle();
+
+		expect(calls).toEqual([selector(fallback)]);
+	});
+
+	it("doubles the cooldown on consecutive opens up to the configured ceiling", () => {
+		const before = Date.now();
+		const first = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini:high", 1_000, 3_000) - before;
+		const second = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini", 1_000, 3_000) - before;
+		const third = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini", 1_000, 3_000) - before;
+		const capped = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini", 1_000, 3_000) - before;
+
+		expect(first).toBeGreaterThanOrEqual(1_000);
+		expect(first).toBeLessThan(2_000);
+		expect(second).toBeGreaterThanOrEqual(2_000);
+		expect(second).toBeLessThan(3_000);
+		expect(third).toBeGreaterThanOrEqual(3_000);
+		expect(capped).toBeGreaterThanOrEqual(3_000);
+		expect(capped).toBeLessThan(4_000);
+
+		modelRegistry.closeSelectorCircuit("openai/gpt-4o-mini:low");
+		expect(modelRegistry.isSelectorCircuitOpen("openai/gpt-4o-mini")).toBe(false);
+		const reset = modelRegistry.openSelectorCircuit("openai/gpt-4o-mini", 1_000, 3_000) - Date.now();
+		expect(reset).toBeLessThanOrEqual(1_000);
+	});
+
 	it("emits one switch when an exhausted chain restarts with an unavailable head", async () => {
 		const events: Array<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>> = [];
 		let headUnavailable = false;

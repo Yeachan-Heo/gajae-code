@@ -1646,6 +1646,14 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 	} as Model<Api>);
 }
 
+interface SelectorCircuit {
+	openUntil: number;
+	consecutiveOpens: number;
+	cooldownMs: number;
+	/** Half-open probe lease: only `owner` may route to the selector until `leaseUntil`. */
+	probe: { owner: string; leaseUntil: number } | undefined;
+}
+
 function normalizeSuppressedSelector(selector: string): string {
 	const trimmed = selector.trim();
 	if (!trimmed) return trimmed;
@@ -1775,6 +1783,7 @@ export class ModelRegistry {
 	#registeredProviderSources: Set<string> = new Set();
 	#cacheDbPath?: string;
 	#suppressedSelectors: Map<string, number> = new Map();
+	#selectorCircuits: Map<string, SelectorCircuit> = new Map();
 	#backgroundRefresh?: Promise<void>;
 	#catalogMutationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogMutations = 0;
@@ -1914,6 +1923,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
@@ -1947,6 +1957,7 @@ export class ModelRegistry {
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
+				this.#selectorCircuits.clear();
 				await this.#refreshRuntimeDiscoveries(
 					strategy,
 					undefined,
@@ -1997,6 +2008,11 @@ export class ModelRegistry {
 				for (const selector of this.#suppressedSelectors.keys()) {
 					if (selector.startsWith(`${providerId}/`)) {
 						this.#suppressedSelectors.delete(selector);
+					}
+				}
+				for (const selector of this.#selectorCircuits.keys()) {
+					if (selector.startsWith(`${providerId}/`)) {
+						this.#selectorCircuits.delete(selector);
 					}
 				}
 				await this.#refreshRuntimeDiscoveries(
@@ -6560,6 +6576,57 @@ export class ModelRegistry {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Open the fallback-chain circuit for a selector after it failed out of a
+	 * managed chain. Consecutive opens without an intervening success double the
+	 * cooldown up to `maxCooldownMs`. A provider Retry-After instant (`retryAt`)
+	 * is authoritative and replaces the local cooldown window. Returns the instant
+	 * the circuit half-opens.
+	 */
+	openSelectorCircuit(selector: string, baseCooldownMs: number, maxCooldownMs: number, retryAt?: number): number {
+		const key = normalizeSuppressedSelector(selector);
+		const consecutiveOpens = (this.#selectorCircuits.get(key)?.consecutiveOpens ?? 0) + 1;
+		const cooldownMs = Math.min(
+			baseCooldownMs * 2 ** (consecutiveOpens - 1),
+			Math.max(baseCooldownMs, maxCooldownMs),
+		);
+		const openUntil = retryAt ?? Date.now() + cooldownMs;
+		this.#selectorCircuits.set(key, { openUntil, consecutiveOpens, cooldownMs, probe: undefined });
+		return openUntil;
+	}
+
+	/**
+	 * Whether chain resolution must skip a selector. It is skipped while its
+	 * circuit cools down, and while half-open once another owner holds the probe
+	 * lease. Passing `probeOwner` atomically claims the half-open probe for that
+	 * owner (re-admitting the same owner), so exactly one session probes a
+	 * recovered entry at a time; omit it for read-only availability checks.
+	 */
+	isSelectorCircuitOpen(selector: string, probeOwner?: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		if (!circuit) return false;
+		const now = Date.now();
+		if (circuit.openUntil > now) return true;
+		const probe = circuit.probe;
+		if (probe && probe.leaseUntil > now && probe.owner !== probeOwner) return true;
+		if (probeOwner !== undefined) {
+			circuit.probe = { owner: probeOwner, leaseUntil: now + Math.max(circuit.cooldownMs, 1) };
+		}
+		return false;
+	}
+
+	/** Whether a selector's cooldown elapsed with no live probe lease (half-open, probe available). */
+	isSelectorCircuitHalfOpen(selector: string): boolean {
+		const circuit = this.#selectorCircuits.get(normalizeSuppressedSelector(selector));
+		const now = Date.now();
+		return circuit !== undefined && circuit.openUntil <= now && !(circuit.probe && circuit.probe.leaseUntil > now);
+	}
+
+	/** Close a selector's circuit after an accepted response, resetting its escalation. */
+	closeSelectorCircuit(selector: string): void {
+		this.#selectorCircuits.delete(normalizeSuppressedSelector(selector));
 	}
 
 	/** Return whether a selector has an active, expired, or no rate-limit suppression. */
