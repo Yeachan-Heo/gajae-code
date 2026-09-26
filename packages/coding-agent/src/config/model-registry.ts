@@ -4905,7 +4905,38 @@ export class ModelRegistry {
 				"reasoningEffortMap" in restored.compat &&
 				restored.compat.reasoningEffortMap &&
 				Object.keys(restored.compat.reasoningEffortMap as Record<string, unknown>).length > 0;
-			return hasEndpointReasoningMap ? restored : enrichModelThinking(restored);
+			if (!hasEndpointReasoningMap) {
+				return enrichModelThinking(restored);
+			}
+			// For models with endpoint reasoning efforts, if thinking is not set,
+			// reconstruct it from the endpoint-provided reasoning effort map.
+			if (restored.thinking === undefined && restored.reasoning) {
+				const reasoningEffortMap = restored.compat.reasoningEffortMap as Record<string, string> | undefined;
+				if (reasoningEffortMap) {
+					const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
+					const supportedEfforts = Object.keys(reasoningEffortMap)
+						.filter(effort => effort !== "undefined" && effort !== "null")
+						.sort((a, b) => effortOrder.indexOf(a as Effort) - effortOrder.indexOf(b as Effort));
+					if (supportedEfforts.length > 0) {
+						const minLevel = supportedEfforts[0] as Effort;
+						const maxLevel = supportedEfforts[supportedEfforts.length - 1] as Effort;
+						const defaultLevel = supportedEfforts.includes(Effort.Medium)
+							? Effort.Medium
+							: supportedEfforts[Math.floor(supportedEfforts.length / 2)];
+						return {
+							...restored,
+							thinking: {
+								mode: "effort" as const,
+								minLevel,
+								maxLevel,
+								defaultLevel,
+								levels: supportedEfforts as Effort[],
+							},
+						};
+					}
+				}
+			}
+			return restored;
 		});
 		const result = applyFinalCodexGpt56ContextCap(finalized, undefined, this.#codexContextWindowOverrides);
 		for (let index = 0; index < result.length; index++) {
