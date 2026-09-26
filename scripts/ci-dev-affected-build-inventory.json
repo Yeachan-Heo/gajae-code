@@ -5,8 +5,6 @@
     { "id": "stats", "name": "@gajae-code/stats", "dir": "packages/stats", "nativeConsumer": false, "nativeProducer": false }
   ],
   "cargo": [
-    { "id": "brush-builtins-vendored", "name": "brush-builtins", "manifestPath": "crates/brush-builtins-vendored/Cargo.toml", "supported": false, "nativeAddonSource": false },
-    { "id": "brush-core-vendored", "name": "brush-core", "manifestPath": "crates/brush-core-vendored/Cargo.toml", "supported": false, "nativeAddonSource": false },
     { "id": "gjc-sdk", "name": "gjc-sdk", "manifestPath": "crates/gjc-sdk/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-ast", "name": "pi-ast", "manifestPath": "crates/pi-ast/Cargo.toml", "supported": true, "nativeAddonSource": false },
     { "id": "pi-diff", "name": "pi-diff", "manifestPath": "crates/pi-diff/Cargo.toml", "supported": true, "nativeAddonSource": false },
