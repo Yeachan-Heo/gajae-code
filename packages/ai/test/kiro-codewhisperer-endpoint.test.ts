@@ -106,7 +106,11 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 	});
 
 	test("respects AWS_REGION environment variable when region not explicitly provided", async () => {
+		// KIRO_REGION takes precedence over AWS_REGION, so clear it for the duration of
+		// the test and restore both exactly (deleting keys that were originally unset).
 		const originalRegion = process.env.AWS_REGION;
+		const originalKiroRegion = process.env.KIRO_REGION;
+		delete process.env.KIRO_REGION;
 		process.env.AWS_REGION = "ap-southeast-1";
 
 		let capturedUrl: string | undefined;
@@ -144,10 +148,13 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 			}
 		} catch {
 			// Expected to fail
+		} finally {
+			globalThis.fetch = originalFetch;
+			if (originalRegion === undefined) delete process.env.AWS_REGION;
+			else process.env.AWS_REGION = originalRegion;
+			if (originalKiroRegion === undefined) delete process.env.KIRO_REGION;
+			else process.env.KIRO_REGION = originalKiroRegion;
 		}
-
-		globalThis.fetch = originalFetch;
-		process.env.AWS_REGION = originalRegion;
 
 		expect(capturedUrl).toBe("https://codewhisperer.ap-southeast-1.amazonaws.com/");
 	});
