@@ -386,7 +386,7 @@ describe("config doctor vendor-separated delegation advisory", () => {
 			await doctorAdvisories([
 				"configSchemaVersion: 2",
 				"modelRoles:",
-				"  default: openai-codex/gpt-5.6-sol:low",
+				"  default: openai-codex/gpt-6-sol:low",
 				"task:",
 				"  eager: false",
 				"  agentModelOverrides:",
