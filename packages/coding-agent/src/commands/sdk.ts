@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exactRemoveDirectoryTree, type NativeDirectoryTreeSnapshot, snapshotDirectoryTree } from "@gajae-code/natives";
 import { logger, postmortem } from "@gajae-code/utils";
 import { CliParseError, Command } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
@@ -28,6 +29,7 @@ import {
 	withBrokerStartupLock,
 } from "../sdk/broker/ensure";
 import {
+	LifecycleFailurePublicationCleanupError,
 	LifecycleReadinessCleanupError,
 	type LifecycleTranscriptEvidence,
 	readSessionLifecycleLaunchRequest,
@@ -59,7 +61,7 @@ import {
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
 import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
-import { isSessionDisposalIncompleteError } from "../session/agent-session";
+import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -430,6 +432,20 @@ async function revalidateLifecycleTranscript(snapshot: ResumeSessionIdentity): P
 		throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 }
 
+class LifecycleSessionManagerCleanupError extends Error {
+	constructor(cause: unknown) {
+		super("Lifecycle session manager cleanup could not be proven.", { cause });
+		this.name = "LifecycleSessionManagerCleanupError";
+	}
+}
+
+type OwnedMcpConfigDirectory = {
+	path: string;
+	directoryIdentity?: { dev: bigint; ino: bigint };
+	parentIdentity?: { dev: bigint; ino: bigint };
+	snapshot?: NativeDirectoryTreeSnapshot;
+};
+
 /** Opens lifecycle-authorized history without letting replacement content reach readiness. */
 export async function openLifecycleSessionManager(
 	request: SessionLifecycleLaunchRequest,
@@ -459,12 +475,7 @@ export async function openLifecycleSessionManager(
 				if (opened.kind === "error")
 					throw new Error("Lifecycle saved session authority changed while the session host opened it.");
 				sessionManager = opened.manager;
-				try {
-					await revalidateLifecycleTranscript(snapshot.identity);
-				} catch (error) {
-					await sessionManager.close();
-					throw error;
-				}
+				await revalidateLifecycleTranscript(snapshot.identity);
 			} else {
 				const forked = await SessionManager.forkFromCaptured(
 					snapshot,
@@ -487,9 +498,23 @@ export async function openLifecycleSessionManager(
 		await lifecycleSettings.close();
 	} catch (error) {
 		cleanupError = error;
-		await sessionManager?.close().catch(() => undefined);
 	}
-	if (cleanupError !== undefined) throw cleanupError;
+	let sessionManagerCloseError: unknown;
+	if ((operationError !== undefined || cleanupError !== undefined) && sessionManager) {
+		try {
+			await sessionManager.close();
+		} catch (error) {
+			sessionManagerCloseError = error;
+		}
+	}
+	if (sessionManagerCloseError !== undefined || cleanupError !== undefined) {
+		throw new LifecycleSessionManagerCleanupError(
+			new AggregateError(
+				[operationError, cleanupError, sessionManagerCloseError].filter(error => error !== undefined),
+				"Lifecycle session-manager open failed and owned cleanup did not complete.",
+			),
+		);
+	}
 	if (operationError !== undefined) throw operationError;
 	if (!result) throw new Error("Lifecycle session manager result was not produced.");
 	return result;
@@ -520,11 +545,11 @@ export async function runSessionHost(
 		processIncarnation?: (pid: number) => string | undefined;
 		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
 		initTheme?: typeof initTheme;
+		initializeLifecycleExtensions?: typeof initializeExtensions;
+		openLifecycleSessionManager?: typeof openLifecycleSessionManager;
 		createLifecycleAgentSession?: typeof createLifecycleAgentSession;
 		writeSessionLifecycleReady?: typeof writeSessionLifecycleReady;
 		writeMcpConfig?: (filePath: string, contents: string) => Promise<number>;
-		openLifecycleSessionManager?: () => Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }>;
-		initializeLifecycleExtensions?: () => Promise<void>;
 	} = {},
 ): Promise<void> {
 	const now = timing.now ?? Date.now;
@@ -532,15 +557,16 @@ export async function runSessionHost(
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
 	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
 	const initializeTheme = timing.initTheme ?? initTheme;
+	const initializeSessionExtensions = timing.initializeLifecycleExtensions ?? initializeExtensions;
+	const openLifecycleSession = timing.openLifecycleSessionManager ?? openLifecycleSessionManager;
 	const createLifecycleSession = timing.createLifecycleAgentSession ?? createLifecycleAgentSession;
 	const writeLifecycleReady = timing.writeSessionLifecycleReady ?? writeSessionLifecycleReady;
 	const writeMcpConfig = timing.writeMcpConfig ?? ((filePath, contents) => Bun.write(filePath, contents));
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
+	let constructionCleanupComplete = true;
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
 	const cwd = timing.cwd ?? process.cwd();
-	const openLifecycleManager =
-		timing.openLifecycleSessionManager ?? (() => openLifecycleSessionManager(request, cwd, agentDir));
 	if ((await fs.realpath(request.cwd)) !== (await fs.realpath(cwd)))
 		throw new Error(`Lifecycle worktree mismatch: expected ${request.cwd}, got ${cwd}.`);
 	if (
@@ -589,15 +615,20 @@ export async function runSessionHost(
 		transcript?: LifecycleTranscriptEvidence,
 	): Promise<void> => {
 		if (!request.effectMarker) return;
-		await writeSessionLifecycleFailure(
-			request.stateRoot,
-			request.sessionId,
-			effectMarker,
-			failure,
-			rollback,
-			transcript,
-			incarnation,
-		);
+		try {
+			await writeSessionLifecycleFailure(
+				request.stateRoot,
+				request.sessionId,
+				effectMarker,
+				failure,
+				rollback,
+				transcript,
+				incarnation,
+			);
+		} catch (error) {
+			if (error instanceof LifecycleFailurePublicationCleanupError) constructionCleanupComplete = false;
+			throw error;
+		}
 	};
 
 	if (now() >= request.semanticReadyDeadlineAt) {
@@ -641,7 +672,7 @@ export async function runSessionHost(
 			);
 	};
 	const interruptStartup = (failure: SdkStartupFailure): void => {
-		if (startupInterruption !== undefined) return;
+		if (startupComplete || startupInterruption !== undefined) return;
 		startupInterruption = failure;
 		capability.cancel(failure);
 		if (revokePendingReadinessMarker) startReadinessRevocation(revokePendingReadinessMarker);
@@ -655,8 +686,8 @@ export async function runSessionHost(
 		process.removeListener("SIGTERM", onStartupSignal);
 		process.removeListener("SIGINT", onStartupSignal);
 	};
-	process.once("SIGTERM", onStartupSignal);
-	process.once("SIGINT", onStartupSignal);
+	process.on("SIGTERM", onStartupSignal);
+	process.on("SIGINT", onStartupSignal);
 	void sleep(Math.max(0, request.semanticReadyDeadlineAt - now())).then(
 		() => {
 			if (!startupComplete) interruptStartup(cutoffFailure());
@@ -667,6 +698,7 @@ export async function runSessionHost(
 	);
 	const interruptedStageCleanupGraceMs = 100;
 	const throwIfStartupInterrupted = (): void => {
+		if (startupComplete) return;
 		if (startupInterruption !== undefined) throw startupInterruption;
 		if (now() >= request.semanticReadyDeadlineAt) {
 			interruptStartup(cutoffFailure());
@@ -676,7 +708,7 @@ export async function runSessionHost(
 	const beforeCutoff = async <T>(
 		stage: () => Promise<T>,
 		cleanupLateResult?: (value: T) => Promise<void>,
-		options: { processLocalOnly?: boolean } = {},
+		options: { processLocalOnly?: boolean; readinessPublication?: boolean } = {},
 	): Promise<T> => {
 		throwIfStartupInterrupted();
 		const pending = Promise.resolve()
@@ -690,8 +722,15 @@ export async function runSessionHost(
 			interrupted.promise.then(failure => ({ failure }) as const),
 		]);
 		const cleanupLateStage = async (lateStage: typeof pending): Promise<void> => {
-			if (options.processLocalOnly) return;
-			if (!cleanupLateResult) {
+			if (options.processLocalOnly || options.readinessPublication) return;
+			// Wait for the late stage to complete or timeout, even if there's no cleanup callback.
+			// This ensures that stages like applyModelProfiles get a chance to finish before
+			// we proceed with session disposal and rollback.
+			const stageCompleted = await Promise.race([
+				lateStage.then(() => true),
+				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
+			]);
+			if (!stageCompleted) {
 				constructionCleanupComplete = false;
 				return;
 			}
@@ -699,6 +738,9 @@ export async function runSessionHost(
 				.then(async late => {
 					if ("error" in late) {
 						constructionCleanupComplete = false;
+						return;
+					}
+					if (!cleanupLateResult) {
 						return;
 					}
 					try {
@@ -713,18 +755,14 @@ export async function runSessionHost(
 				.catch(() => {
 					constructionCleanupComplete = false;
 				});
-			const cleanupCompleted = await Promise.race([
-				cleanup.then(() => true),
-				Bun.sleep(interruptedStageCleanupGraceMs).then(() => false),
-			]);
-			if (!cleanupCompleted) constructionCleanupComplete = false;
+			await cleanup;
 		};
 		if ("failure" in result) {
 			await cleanupLateStage(pending);
 			throw result.failure;
 		}
 		const settlement = result.settlement;
-		if (startupInterruption !== undefined || now() >= request.semanticReadyDeadlineAt) {
+		if (startupInterruption !== undefined || (!startupComplete && now() >= request.semanticReadyDeadlineAt)) {
 			const failure = startupInterruption ?? cutoffFailure();
 			interruptStartup(failure);
 			await cleanupLateStage(Promise.resolve(settlement));
@@ -733,7 +771,6 @@ export async function runSessionHost(
 		if ("error" in settlement) throw settlement.error;
 		return settlement.value;
 	};
-	let constructionCleanupComplete = true;
 	const runBoundedStartupCleanup = async (cleanup: () => Promise<void>): Promise<boolean> => {
 		const completed = await Promise.race([
 			Promise.resolve()
@@ -753,44 +790,260 @@ export async function runSessionHost(
 		return capability.normalizeFailure("registration", "failed", error);
 	};
 
-	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined };
+	let opened: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
 	let openedSessionManager: SessionManager | undefined;
 	let sessionManagerTransferred = false;
-	let created: CreateLifecycleAgentSessionResult;
-	let mcpConfigDirectory: string | undefined;
+	let created: CreateLifecycleAgentSessionResult | undefined;
+	let mcpConfigDirectory: OwnedMcpConfigDirectory | undefined;
+	let openedSessionManagerClosed = false;
+	const closeSessionManager = async (manager: SessionManager | undefined): Promise<void> => {
+		if (!manager || (manager === opened?.sessionManager && openedSessionManagerClosed)) return;
+		if (!(await runBoundedStartupCleanup(() => manager.close())))
+			throw new LifecycleSessionManagerCleanupError(
+				new Error("Lifecycle session manager cleanup did not complete."),
+			);
+		if (manager === opened?.sessionManager) openedSessionManagerClosed = true;
+	};
+	const removeMcpConfigDirectory = async (): Promise<void> => {
+		const directory = mcpConfigDirectory;
+		if (!directory) return;
+		let cleanupFailure: { error: unknown } | undefined;
+		const cleanupComplete = await runBoundedStartupCleanup(async () => {
+			try {
+				const identity = directory.directoryIdentity;
+				const parentIdentity = directory.parentIdentity;
+				const snapshot = directory.snapshot;
+				if (!identity || !parentIdentity || !snapshot)
+					throw new Error("MCP temporary directory cleanup lacks exact creation authority.");
+				const parent = await fs.lstat(path.dirname(directory.path), { bigint: true });
+				if (
+					!parent.isDirectory() ||
+					parent.isSymbolicLink() ||
+					parent.dev !== parentIdentity.dev ||
+					parent.ino !== parentIdentity.ino
+				)
+					throw new Error("MCP temporary directory parent changed before cleanup.");
+				const current = await fs.lstat(directory.path, { bigint: true }).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				});
+				if (
+					current &&
+					(!current.isDirectory() ||
+						current.isSymbolicLink() ||
+						current.dev !== identity.dev ||
+						current.ino !== identity.ino)
+				)
+					throw new Error("MCP temporary directory identity changed before cleanup.");
+				const removed = exactRemoveDirectoryTree(directory.path, snapshot, parentIdentity);
+				if (removed.ok) {
+					mcpConfigDirectory = undefined;
+					return;
+				}
+				if (
+					removed.code === "cleanup_pending" &&
+					removed.payloadDurable === true &&
+					removed.detachedPath === `${directory.path}.removing`
+				) {
+					const detached = await fs.lstat(removed.detachedPath, { bigint: true }).catch(error => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+						throw error;
+					});
+					const originalAfter = await fs.lstat(directory.path, { bigint: true }).catch(error => {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+						throw error;
+					});
+					const parentAfter = await fs.lstat(path.dirname(directory.path), { bigint: true });
+					const retained = snapshotDirectoryTree(removed.detachedPath);
+					const originalEntries = new Map(snapshot.entries.map(entry => [entry.relativePath, entry]));
+					const retainedTreeIsScrubbed =
+						retained.ok &&
+						retained.snapshot !== undefined &&
+						retained.snapshot.entries.length === snapshot.entries.length &&
+						retained.snapshot.entries.every(entry => {
+							const originalEntry = originalEntries.get(entry.relativePath);
+							if (
+								!originalEntry ||
+								entry.kind !== originalEntry.kind ||
+								entry.dev !== originalEntry.dev ||
+								entry.ino !== originalEntry.ino
+							)
+								return false;
+							if (entry.kind === "directory") return true;
+							return (
+								entry.kind === "file" &&
+								entry.size === "0" &&
+								entry.sha256 === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+							);
+						});
+					if (
+						!detached ||
+						originalAfter !== undefined ||
+						!detached.isDirectory() ||
+						detached.isSymbolicLink() ||
+						detached.dev !== identity.dev ||
+						detached.ino !== identity.ino ||
+						parentAfter.dev !== parentIdentity.dev ||
+						parentAfter.ino !== parentIdentity.ino ||
+						!retained.ok ||
+						!retained.snapshot ||
+						retained.snapshot.rootDev !== identity.dev.toString() ||
+						retained.snapshot.rootIno !== identity.ino.toString() ||
+						!retainedTreeIsScrubbed
+					)
+						throw new Error("MCP temporary directory retained unresolved cleanup authority.");
+					mcpConfigDirectory = undefined;
+					return;
+				}
+				throw new Error(`MCP temporary directory cleanup could not be proven: ${removed.code ?? "unknown"}.`);
+			} catch (error) {
+				constructionCleanupComplete = false;
+				cleanupFailure = { error };
+				throw error;
+			}
+		});
+		if (!cleanupComplete) {
+			if (cleanupFailure) throw cleanupFailure.error;
+			throw new Error("Lifecycle MCP configuration cleanup did not complete.");
+		}
+	};
+	const captureMcpConfigDirectoryIdentity = async (
+		owned: OwnedMcpConfigDirectory,
+	): Promise<{ directoryIdentity: { dev: bigint; ino: bigint } }> => {
+		const [directoryStat, parentStat] = await Promise.all([
+			fs.lstat(owned.path, { bigint: true }),
+			fs.lstat(path.dirname(owned.path), { bigint: true }),
+		]);
+		if (
+			!directoryStat.isDirectory() ||
+			directoryStat.isSymbolicLink() ||
+			!parentStat.isDirectory() ||
+			parentStat.isSymbolicLink()
+		)
+			throw new Error("MCP temporary directory identity is unavailable.");
+		if (
+			(owned.directoryIdentity !== undefined &&
+				(directoryStat.dev !== owned.directoryIdentity.dev || directoryStat.ino !== owned.directoryIdentity.ino)) ||
+			(owned.parentIdentity !== undefined &&
+				(parentStat.dev !== owned.parentIdentity.dev || parentStat.ino !== owned.parentIdentity.ino))
+		)
+			throw new Error("MCP temporary directory identity changed during setup.");
+		const directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+		owned.directoryIdentity = directoryIdentity;
+		owned.parentIdentity = { dev: parentStat.dev, ino: parentStat.ino };
+		return { directoryIdentity };
+	};
+	const captureMcpConfigDirectory = async (owned: OwnedMcpConfigDirectory): Promise<void> => {
+		const { directoryIdentity } = await captureMcpConfigDirectoryIdentity(owned);
+		const captured = snapshotDirectoryTree(owned.path);
+		if (
+			!captured.ok ||
+			!captured.snapshot ||
+			captured.snapshot.rootDev !== directoryIdentity.dev.toString() ||
+			captured.snapshot.rootIno !== directoryIdentity.ino.toString()
+		)
+			throw new Error(`MCP temporary directory snapshot failed: ${captured.code ?? "identity_mismatch"}.`);
+		owned.snapshot = captured.snapshot;
+	};
+	const disposeConstructedSession = async (session: AgentSession): Promise<void> => {
+		const disposed = await runBoundedStartupCleanup(async () => {
+			try {
+				await session.dispose();
+			} catch (error) {
+				if (!isSessionDisposalIncompleteError(error)) throw error;
+				await session.awaitDisposeCompletion();
+			}
+		});
+		if (!disposed) throw new Error("Lifecycle session disposal did not complete.");
+	};
+	const cleanupConstructionResources = async (): Promise<unknown | undefined> => {
+		let cleanupError: unknown;
+		try {
+			await removeMcpConfigDirectory();
+		} catch (error) {
+			cleanupError = error;
+		}
+		if (created && "failure" in created && !created.cleanupComplete) constructionCleanupComplete = false;
+		let sessionDisposalComplete = false;
+		if (created && !("failure" in created)) {
+			try {
+				await disposeConstructedSession(created.session);
+				sessionDisposalComplete = true;
+			} catch (error) {
+				cleanupError ??= error;
+			}
+		}
+		const managerCleanupRequired =
+			!sessionManagerTransferred ||
+			(created !== undefined && "failure" in created && !created.cleanupComplete) ||
+			(created !== undefined && !("failure" in created) && !sessionDisposalComplete);
+		if (managerCleanupRequired) {
+			try {
+				await closeSessionManager(opened?.sessionManager);
+			} catch (error) {
+				cleanupError ??= error;
+			}
+		}
+		return cleanupError;
+	};
 	try {
 		let mcpConfigPath: string | undefined;
 		opened = await beforeCutoff(
-			() => openLifecycleManager(),
+			() => openLifecycleSession(request, cwd, agentDir),
 			async late => {
 				try {
-					await late.sessionManager?.close();
+					await closeSessionManager(late.sessionManager);
 				} catch (error) {
 					constructionCleanupComplete = false;
 					throw error;
 				}
 			},
 		);
+		if (!opened) throw new Error("Lifecycle session manager was not opened.");
 		openedSessionManager = opened.sessionManager;
 		throwIfStartupInterrupted();
 		if (request.mcpServers && request.mcpServers.length > 0) {
-			const temporaryDirectory = await beforeCutoff(
-				() => fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-mcp-")),
+			const temporaryRoot = await beforeCutoff(() => fs.realpath(os.tmpdir()));
+			const ownedDirectory = await beforeCutoff(
+				async () => {
+					const owned: OwnedMcpConfigDirectory = {
+						path: await fs.mkdtemp(path.join(temporaryRoot, "gjc-acp-mcp-")),
+					};
+					mcpConfigDirectory = owned;
+					await captureMcpConfigDirectoryIdentity(owned);
+					await captureMcpConfigDirectory(owned);
+					return owned;
+				},
 				async late => {
-					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
-						throw new Error("Late MCP configuration directory cleanup did not complete.");
+					mcpConfigDirectory = late;
+					await removeMcpConfigDirectory();
 				},
 			);
-			mcpConfigDirectory = temporaryDirectory;
-			const canonicalDirectory = await beforeCutoff(
-				() => fs.realpath(temporaryDirectory),
-				async late => {
-					if (!(await runBoundedStartupCleanup(() => fs.rm(late, { recursive: true, force: true }))))
-						throw new Error("Late MCP configuration path cleanup did not complete.");
+			mcpConfigDirectory = ownedDirectory;
+			const resolvedMcpConfigDirectory = await beforeCutoff(
+				async () => {
+					try {
+						return await fs.realpath(ownedDirectory.path);
+					} catch (realpathError) {
+						try {
+							await captureMcpConfigDirectory(ownedDirectory);
+						} catch (snapshotError) {
+							throw new AggregateError(
+								[realpathError, snapshotError],
+								"MCP temporary directory resolution and cleanup snapshot both failed.",
+							);
+						}
+						throw realpathError;
+					}
+				},
+				async () => {
+					mcpConfigDirectory = ownedDirectory;
+					await removeMcpConfigDirectory();
 				},
 			);
-			mcpConfigDirectory = canonicalDirectory;
-			const configPath = path.join(canonicalDirectory, "mcp.json");
+			ownedDirectory.path = resolvedMcpConfigDirectory;
+			await captureMcpConfigDirectory(ownedDirectory);
+			const configPath = path.join(ownedDirectory.path, "mcp.json");
 			mcpConfigPath = configPath;
 			const configContents = JSON.stringify({
 				mcpServers: Object.fromEntries(
@@ -814,13 +1067,34 @@ export async function runSessionHost(
 					]),
 				),
 			});
-			await beforeCutoff(
-				() => writeMcpConfig(configPath, configContents),
+			const configOutcome = await beforeCutoff(
 				async () => {
-					if (!(await runBoundedStartupCleanup(() => fs.rm(canonicalDirectory, { recursive: true, force: true }))))
-						throw new Error("Late MCP configuration write cleanup did not complete.");
+					let writeFailure: { error: unknown } | undefined;
+					try {
+						await writeMcpConfig(configPath, configContents);
+					} catch (error) {
+						writeFailure = { error };
+					}
+					let snapshotFailure: { error: unknown } | undefined;
+					try {
+						await captureMcpConfigDirectory(ownedDirectory);
+					} catch (error) {
+						snapshotFailure = { error };
+					}
+					return { writeFailure, snapshotFailure };
+				},
+				async () => {
+					mcpConfigDirectory = ownedDirectory;
+					await removeMcpConfigDirectory();
 				},
 			);
+			if (configOutcome.writeFailure && configOutcome.snapshotFailure)
+				throw new AggregateError(
+					[configOutcome.writeFailure.error, configOutcome.snapshotFailure.error],
+					"MCP configuration write and ownership snapshot both failed.",
+				);
+			if (configOutcome.snapshotFailure) throw configOutcome.snapshotFailure.error;
+			if (configOutcome.writeFailure) throw configOutcome.writeFailure.error;
 			throwIfStartupInterrupted();
 		}
 
@@ -851,7 +1125,7 @@ export async function runSessionHost(
 					{
 						cwd,
 						agentDir,
-						sessionManager: opened.sessionManager,
+						sessionManager: opened?.sessionManager,
 						...(mcpConfigPath ? { mcpConfigPath } : {}),
 						...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 						...(request.readiness ? { readiness: request.readiness } : {}),
@@ -860,71 +1134,73 @@ export async function runSessionHost(
 					},
 					startupOwner,
 				);
-				if (mcpConfigDirectory) {
-					await fs.rm(mcpConfigDirectory, { recursive: true, force: true });
-					mcpConfigDirectory = undefined;
-				}
+				if (mcpConfigDirectory) await removeMcpConfigDirectory();
 				return result;
 			},
 			async late => {
-				if ("failure" in late) return;
-				try {
-					await late.session.dispose();
-				} catch (error) {
-					if (!isSessionDisposalIncompleteError(error)) {
-						constructionCleanupComplete = false;
-						throw error;
-					}
-					await late.session.awaitDisposeCompletion();
+				if ("failure" in late) {
+					if (!late.cleanupComplete) constructionCleanupComplete = false;
+					return;
 				}
+				await disposeConstructedSession(late.session);
+				await closeSessionManager(opened?.sessionManager);
 			},
 		);
+		await removeMcpConfigDirectory();
 	} catch (error) {
-		removeStartupSignalHandlers();
-		if (!sessionManagerTransferred && openedSessionManager) {
-			const manager = openedSessionManager;
-			await runBoundedStartupCleanup(() => manager.close());
+		if (error instanceof LifecycleSessionManagerCleanupError || error instanceof LifecycleReadinessCleanupError)
+			constructionCleanupComplete = false;
+		const cleanupError = await cleanupConstructionResources();
+		const baseFailure = startupInterruption ?? constructionFailure(error);
+		const failure =
+			cleanupError === undefined
+				? baseFailure
+				: capability.normalizeFailure(baseFailure.phase, baseFailure.reason, cleanupError);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
 		}
-		if (mcpConfigDirectory) {
-			const directory = mcpConfigDirectory;
-			mcpConfigDirectory = undefined;
-			await runBoundedStartupCleanup(() => fs.rm(directory, { recursive: true, force: true }));
-		}
-		const failure = constructionFailure(error);
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(durableFailure, rollback.result);
 		throw error;
 	}
+	if (!opened || !created) throw new Error("Lifecycle construction did not produce a result.");
 	if ("failure" in created) {
-		removeStartupSignalHandlers();
-		if (created.cleanupComplete && created.rollback.generation === undefined) created.rollback.recordAbsent();
-		if (!created.cleanupComplete) constructionCleanupComplete = false;
-		if (openedSessionManager) {
-			const manager = openedSessionManager;
-			await runBoundedStartupCleanup(() => manager.close());
+		if (created.capability !== capability || created.rollback !== rollback || !created.cleanupComplete)
+			constructionCleanupComplete = false;
+		let failure = startupInterruption ?? created.failure;
+		try {
+			await closeSessionManager(opened.sessionManager);
+		} catch (error) {
+			failure = capability.normalizeFailure(failure.phase, failure.reason, error);
 		}
-		capability.settleFailure(created.failure);
-		await writeFailure(created.failure, created.rollback.result);
-		throw created.failure;
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(durableFailure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
+		}
+		throw failure;
 	}
 	if (created.capability !== capability || created.rollback !== rollback) {
-		removeStartupSignalHandlers();
+		const cleanupError = await cleanupConstructionResources();
+		const failure = cleanupError
+			? capability.normalizeFailure("registration", "failed", cleanupError)
+			: capability.normalizeFailure(
+					"registration",
+					"failed",
+					"Lifecycle startup owner changed during construction.",
+				);
 		try {
-			await created.session.dispose();
-		} catch (error) {
-			if (!isSessionDisposalIncompleteError(error)) throw error;
-			constructionCleanupComplete = false;
-			await created.session.awaitDisposeCompletion();
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
+			await writeFailure(failure, rollback.result);
+		} finally {
+			removeStartupSignalHandlers();
 		}
-		const failure = capability.normalizeFailure(
-			"registration",
-			"failed",
-			"Lifecycle startup owner changed during construction.",
-		);
-		if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
-		await writeFailure(failure, rollback.result);
 		throw failure;
 	}
 	const { parsed } = opened;
@@ -984,12 +1260,9 @@ export async function runSessionHost(
 				]);
 				if (!revoked) readinessPublicationCleanupComplete = false;
 			}
+			if (!readinessPublicationCleanupComplete) constructionCleanupComplete = false;
 			const transcript = await disposeAndCapture();
-			if (openedSessionManager) {
-				const manager = openedSessionManager;
-				await runBoundedStartupCleanup(() => manager.close()).catch(() => {});
-			}
-			if (rollback.generation === undefined && readinessPublicationCleanupComplete) rollback.recordAbsent();
+			if (rollback.generation === undefined && constructionCleanupComplete) rollback.recordAbsent();
 			await writeFailure(failure, rollback.result, transcript);
 		})();
 		return failureRollback;
@@ -1053,15 +1326,13 @@ export async function runSessionHost(
 						preferCachedDefaultProfile: true,
 					}),
 		);
-		const initializeLifecycleExt =
-			timing.initializeLifecycleExtensions ??
-			(() =>
-				initializeExtensions(session, {
-					reportSendError: () => {},
-					reportRuntimeError: () => {},
-					onShutdown: stop,
-				}));
-		await beforeCutoff(() => initializeLifecycleExt());
+		await beforeCutoff(() =>
+			initializeSessionExtensions(session, {
+				reportSendError: () => {},
+				reportRuntimeError: () => {},
+				onShutdown: stop,
+			}),
+		);
 		throwIfStartupInterrupted();
 		if (session.sessionManager.getSessionId() !== request.sessionId)
 			throw new Error(
@@ -1105,6 +1376,7 @@ export async function runSessionHost(
 				readinessPublicationCleanupComplete =
 					!outcome.published && !(outcome.error instanceof LifecycleReadinessCleanupError);
 			},
+			{ readinessPublication: true },
 		);
 		if (!readinessOutcome.published) {
 			readinessPublicationCleanupComplete = !(readinessOutcome.error instanceof LifecycleReadinessCleanupError);
@@ -1122,14 +1394,20 @@ export async function runSessionHost(
 		process.once("SIGTERM", onReadySignal);
 		process.once("SIGINT", onReadySignal);
 	} catch (error) {
-		removeStartupSignalHandlers();
+		if (error instanceof LifecycleReadinessCleanupError) constructionCleanupComplete = false;
 		const failure =
 			error && typeof error === "object" && "phase" in error && "reason" in error && "message" in error
 				? (error as SdkStartupFailure)
 				: capability.normalizeFailure("startup", "failed", error);
-		const settled = capability.settleFailure(failure);
-		const durableFailure = settled.status === "failed" ? settled.failure : failure;
-		await failAfterRollback(durableFailure);
+		try {
+			const settled = capability.settleFailure(failure);
+			const durableFailure = settled.status === "failed" ? settled.failure : failure;
+			await failAfterRollback(durableFailure);
+		} finally {
+			removeStartupSignalHandlers();
+			process.removeListener("SIGTERM", onReadySignal);
+			process.removeListener("SIGINT", onReadySignal);
+		}
 		throw error;
 	}
 	// Readiness is published; the session is live. Memory startup issues one LLM
