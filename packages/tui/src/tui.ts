@@ -2553,6 +2553,12 @@ export class TUI extends Container {
 		if (generation <= 0) return;
 		if (this.#lastRenderWriteSucceeded) this.#settleRenderCommitWaiters(true, generation);
 		else if (this.#stopped || !this.terminalAvailable) this.#settleRenderCommitWaiters(false, generation);
+		else if (this.#rasterPending > 0 || this.#rasterCleanup.size > 0) {
+			// The render write is deferred due to pending raster operations.
+			// Request a retry after raster operations complete.
+			this.#renderRequested = true;
+			this.#scheduleRender();
+		}
 	}
 
 	get terminalAvailable(): boolean {
