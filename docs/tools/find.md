@@ -21,6 +21,8 @@
 | `paths` | `string[]` | Yes | One or more globs, files, or directories. Empty strings are rejected. Multiple entries may be merged into one brace-union search when their base paths can be resolved together. |
 | `hidden` | `boolean` | No | Whether hidden files are included. Defaults to `true` (`hidden ?? true`). |
 | `limit` | `number` | No | Max returned paths. Defaults to `1000`. Must be a finite positive number; non-integers are floored. |
+| `gitignore` | `boolean` | No | Respect `.gitignore` during the scan. Defaults to `true` (`gitignore ?? true`); passed to the native glob. |
+| `timeout` | `number` | No | Glob timeout in seconds, `0.5`–`60` (schema-validated). Defaults to `5` (`DEFAULT_GLOB_TIMEOUT_MS`). On timeout the tool returns the ranked partial matches collected so far with a `find timed out after <n>s; returning <k> partial matches — increase timeout or narrow pattern` notice. |
 
 ## Outputs
 The tool returns a single text block plus structured `details`.

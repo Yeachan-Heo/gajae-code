@@ -24,6 +24,7 @@
 | `timeout` | `number` | No | Timeout in seconds. Default `300`; clamped to `1..3600` by `clampTimeout("bash", ...)`. |
 | `cwd` | `string` | No | Working directory, resolved against `session.cwd` via `resolveToCwd`. Must exist and be a directory. |
 | `pty` | `boolean` | No | Request PTY mode. Default `false`. PTY is used only when `pty: true`, `GJC_NO_PTY !== "1"`, and the tool context has a UI. |
+| `activity` | `{ kind: "browser"; provider: "aside"; mode: "repl" \| "exec" }` | No | Declares browser activity for the aside browser backend. Carried into result details as `details.activity`. |
 | `async` | `boolean` | No | Background execution request. Present only when `async.enabled` is true for the session. Returns immediately with a job id instead of waiting. |
 
 ## Outputs
