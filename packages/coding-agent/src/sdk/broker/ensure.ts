@@ -27,6 +27,30 @@ import {
 	readBrokerStartupFailureMarker,
 } from "./startup-failure";
 
+/**
+ * On Windows, spawning a detached process requires an intermediate launcher.
+ * This is because `detached: true` on Windows keeps the child in the parent's
+ * process tree (issue #6007). Using `cmd /c start` creates the broker as a
+ * descendant of cmd rather than the parent, allowing it to survive parent termination.
+ *
+ * Returns the file and arguments to spawn. On Windows, wraps the real command
+ * in `cmd /c start`. On other platforms, returns the original command and arguments.
+ */
+function resolveBrokerSpawnOptions(file: string, args: readonly string[]): { file: string; args: string[] } {
+	if (process.platform !== "win32") {
+		return { file, args: Array.from(args) };
+	}
+	// On Windows, use cmd /c start /b to spawn without a new console window
+	// and detached from the parent process. This prevents taskkill /T on the
+	// parent from killing the broker and all its children.
+	// Format: cmd /c start /b <file> <args...>
+	const cmdArgs = [file, ...args];
+	return {
+		file: "cmd",
+		args: ["/c", "start", "/b", ...cmdArgs],
+	};
+}
+
 function resolveExpectedBrokerGeneration(): string {
 	const v = (packageJson as { version?: unknown }).version;
 	return typeof v === "string" && v.length > 0 ? v : "unknown";
@@ -694,8 +718,13 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		await clearBrokerStartupExitRecord(settings.agentDir);
 		await clearBrokerStartupFailureMarker(settings.agentDir);
 		const childSpawnedAt = Date.now();
-		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
-			detached: true,
+		const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, [
+			...command.args,
+			"--agent-dir",
+			settings.agentDir,
+		]);
+		const child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
+			detached: process.platform !== "win32",
 			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
 			env: brokerSpawnEnvironment(command, settings.env),
 			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
@@ -890,9 +919,10 @@ export function startFixtureBrokerWithLeaseForTest(settings: EnsureBrokerSetting
  */
 export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBrokerCommand): StartedFixtureBrokerCommand {
 	if (!command.file || !Array.isArray(command.args)) throw new Error("Invalid fixture broker command.");
-	const child = spawn(command.file, [...command.args], {
+	const brokerSpawnOpts = resolveBrokerSpawnOptions(command.file, command.args);
+	const child = spawn(brokerSpawnOpts.file, brokerSpawnOpts.args, {
 		cwd: command.cwd,
-		detached: true,
+		detached: process.platform !== "win32",
 		stdio: ["ignore", "ignore", "ignore", "pipe"],
 		env: command.env,
 	});
@@ -964,4 +994,11 @@ export function registerBrokerOwnerForTest(
 /** Test hook: exercises the same trusted-marker reason reconstruction used by ensureBroker. */
 export function brokerStartupFailureReasonForTest(marker: BrokerStartupFailureMarker | undefined): string {
 	return brokerStartupFailureReason(marker);
+}
+/** Test hook: verifies the broker spawn-option selection for Windows vs non-Windows platforms. */
+export function resolveBrokerSpawnOptionsForTest(
+	file: string,
+	args: readonly string[],
+): { file: string; args: string[] } {
+	return resolveBrokerSpawnOptions(file, args);
 }
