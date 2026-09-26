@@ -65,7 +65,12 @@ import {
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
 import { flushWorktreeOnPromptDeadline } from "../prompt-deadline-flush";
-import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
+import {
+	PromptDeadlineManager,
+	type PromptDeadlinePublicationResult,
+	type PromptDeadlineTerminalization,
+	type PromptTerminalTransitionEvidence,
+} from "../prompt-deadline-manager";
 import {
 	assistantFailureCode,
 	failedPromptOutcome,
@@ -77,6 +82,7 @@ import {
 	sanitizePromptFailure,
 } from "../prompt-failure";
 import type { SdkPromptTerminalOutcome } from "../prompt-status";
+import { TOOL_CALL_BOUNDARY_GRACE_MS, waitForToolCallBoundary } from "../prompt-tool-boundary";
 import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type ReceiptState, reduceReceiptState } from "../receipt-state";
@@ -119,6 +125,77 @@ import type { BrokerIndexWriter, SdkFrame } from "./types";
 
 const execFileAsync = promisify(execFile);
 const sdkControlRequesterContext = new AsyncLocalStorage<string>();
+
+/**
+ * Claims correlated terminal boundaries exactly once while retaining a bounded
+ * recent history. A live publisher's key is never evicted; the history may
+ * temporarily exceed the bound when every candidate remains publishable.
+ */
+export class RetainedTerminalBoundaryRegistry {
+	static readonly #MAX_PUBLISHED = 1024;
+	#published = new Set<string>();
+	#publicationResults = new Map<string, boolean>();
+	#retained = new Map<string, number>();
+
+	get size(): number {
+		return this.#published.size;
+	}
+
+	retain(keys: readonly string[]): () => void {
+		for (const key of keys) this.#retained.set(key, (this.#retained.get(key) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			for (const key of keys) {
+				const retained = this.#retained.get(key);
+				if (retained === undefined) continue;
+				if (retained > 1) this.#retained.set(key, retained - 1);
+				else this.#retained.delete(key);
+			}
+			this.#trim();
+		};
+	}
+
+	claim(key: string): boolean {
+		if (this.#published.has(key)) return false;
+		this.#published.add(key);
+		this.#trim();
+		return true;
+	}
+
+	#trim(): void {
+		while (this.#published.size > RetainedTerminalBoundaryRegistry.#MAX_PUBLISHED) {
+			let victim: string | undefined;
+			for (const candidate of this.#published) {
+				if (this.#retained.has(candidate)) continue;
+				victim = candidate;
+				break;
+			}
+			if (victim === undefined) break;
+			this.#published.delete(victim);
+			this.#publicationResults.delete(victim);
+		}
+	}
+
+	hasClaimed(key: string): boolean {
+		return this.#published.has(key);
+	}
+
+	publicationResult(key: string): boolean | undefined {
+		return this.#publicationResults.get(key);
+	}
+
+	setPublicationResult(key: string, observed: boolean): void {
+		if (this.#published.has(key)) this.#publicationResults.set(key, observed);
+	}
+
+	releaseClaim(key: string): void {
+		this.#published.delete(key);
+		this.#publicationResults.delete(key);
+		this.#trim();
+	}
+}
 
 /**
  * Thrown from a serialized durable terminal-scope transaction when the
@@ -379,11 +456,10 @@ export interface SdkOnlyTerminalAbortSeams {
 	 * Live, SYNCHRONOUS view of the dispatched tool calls the run resource
 	 * ledger holds for an execution handle (#5637). Strictly read-only: it
 	 * never claims, reserves, seals or quarantines ledger state. Declared here
-	 * so both hosts expose ONE seam contract — the bus route consumes it for its
-	 * deadline tool-boundary wait, and this route threads it so a future boundary
-	 * wait or deadline abort reads the ledger rather than silently falling back
-	 * to the event-derived set. Optional so an older host that does not thread it
-	 * degrades to that fallback instead of failing to construct.
+	 * so both hosts expose ONE seam contract. Both deadline paths wait for the
+	 * dispatched tool boundary before aborting; an older host may omit this seam,
+	 * but this host fails deadline terminalization closed without it rather than
+	 * interrupting a tool mid-call.
 	 */
 	pendingToolExecutions?: (handle: string) => readonly string[];
 	/** Test override for the maximum durable terminal reservation rows. */
@@ -770,12 +846,21 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation;
 		acceptedAt: number;
 		deadlineMaxAt?: number;
+		pendingOutcome?: InvocationOutcome;
 	}>;
 	hydrate(): Promise<void>;
+	stagePendingTerminalOutcome(
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		outcome: InvocationOutcomeInput,
+		keepDeadlineRecoveryPending?: boolean,
+		deadlineMaxAt?: number,
+	): Promise<InvocationOutcome | undefined>;
 	claimPendingOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		outcome: InvocationOutcomeInput,
+		deadlineMaxAt?: number,
 	): Promise<InvocationOutcome>;
 	// Positional compatibility (exact-head review P1): the 4th argument is either
 	// the generation-fence isCurrent callback or the legacy recordError object;
@@ -807,6 +892,8 @@ export function createInvocationReconciliation(
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
 	const TERMINAL_CAPACITY = 512;
+	const PENDING_TERMINAL_OUTCOME_RETRIES = 3;
+	const PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS = 25;
 	const records = new Map<string, InvocationRecord>();
 	const reservations = new Map<string, InvocationKind>();
 	const reservationCounts = new Map<InvocationKind, number>([
@@ -838,6 +925,21 @@ export function createInvocationReconciliation(
 			errors: unknown[];
 		}
 	>();
+	const pendingTerminalVisibility = new Map<string, { visibleRecord: InvocationRecord; writes: number }>();
+	const retainPendingTerminalVisibility = (recordKey: string, visibleRecord: InvocationRecord): (() => void) => {
+		const existing = pendingTerminalVisibility.get(recordKey);
+		if (existing) existing.writes += 1;
+		else pendingTerminalVisibility.set(recordKey, { visibleRecord: { ...visibleRecord }, writes: 1 });
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const pending = pendingTerminalVisibility.get(recordKey);
+			if (!pending) return;
+			pending.writes -= 1;
+			if (pending.writes === 0) pendingTerminalVisibility.delete(recordKey);
+		};
+	};
 	const persist = async (): Promise<void> => {
 		const run = async (): Promise<void> => {
 			// Construct the candidate only when this serialized write starts. A
@@ -878,7 +980,10 @@ export function createInvocationReconciliation(
 	const cleanup = (): void => {
 		for (const kind of ["prompt", "skill"] as const) {
 			const terminal = [...records.entries()]
-				.filter(([, record]) => record.kind === kind && record.terminalAt !== undefined)
+				.filter(
+					([recordKey, record]) =>
+						record.kind === kind && record.terminalAt !== undefined && !pendingTerminalVisibility.has(recordKey),
+				)
 				.sort(([, left], [, right]) => (left.terminalAt as number) - (right.terminalAt as number));
 			for (const [recordKey] of terminal.slice(0, Math.max(0, terminal.length - TERMINAL_CAPACITY)))
 				records.delete(recordKey);
@@ -1263,8 +1368,14 @@ export function createInvocationReconciliation(
 				return;
 			}
 			const next = { ...record, revision: ++mutationRevision };
-			delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
-			delete (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+			const preserveDeadlineRecovery =
+				(frame.type === "agent_start" &&
+					(frame as unknown as { preserveDeadlineRecovery?: boolean }).preserveDeadlineRecovery === true) ||
+				(frame.type === "agent_failed" && record.deadlineRecoveryPending === true);
+			if (!preserveDeadlineRecovery) {
+				delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
+				delete (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+			}
 			if (frame.type === "agent_start") {
 				next.status = "in_flight";
 				next.startedAt = Date.now();
@@ -1340,17 +1451,25 @@ export function createInvocationReconciliation(
 				next.terminalAt = Date.now();
 			}
 
+			const releaseTerminalVisibility =
+				record.terminalAt === undefined && next.terminalAt !== undefined
+					? retainPendingTerminalVisibility(recordKey, record)
+					: undefined;
 			records.set(recordKey, next);
 			try {
 				await persist();
 			} catch (error) {
 				if (records.get(recordKey) === next) records.set(recordKey, record);
 				throw error;
+			} finally {
+				releaseTerminalVisibility?.();
 			}
 		},
 		lookup(kind, selector) {
-			const record = find(kind, selector);
-			if (!record) return { status: "unknown", receiptState: "unknown" };
+			const found = find(kind, selector);
+			if (!found) return { status: "unknown", receiptState: "unknown" };
+			const recordKey = key(kind, { commandId: found.commandId, turnId: found.turnId });
+			const record = pendingTerminalVisibility.get(recordKey)?.visibleRecord ?? found;
 			const identity = {
 				commandId: record.commandId,
 				turnId: record.turnId,
@@ -1383,25 +1502,115 @@ export function createInvocationReconciliation(
 						record.deadlineRecoveryPending === true &&
 						record.terminalAt === undefined,
 				)
-				.map(record => ({
-					correlation: { commandId: record.commandId, turnId: record.turnId },
-					acceptedAt: record.acceptedAt,
-					...((record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt === undefined
-						? {}
-						: { deadlineMaxAt: (record as unknown as { deadlineMaxAt: number }).deadlineMaxAt }),
-				}));
+				.map(record => {
+					const deadlineMaxAt = (record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+					const pendingOutcome = canonicalTerminalOutcome(
+						(record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+						undefined,
+						failureEvidence(record),
+					);
+					return {
+						correlation: { commandId: record.commandId, turnId: record.turnId },
+						acceptedAt: record.acceptedAt,
+						...(deadlineMaxAt === undefined ? {} : { deadlineMaxAt }),
+						...(pendingOutcome === undefined ? {} : { pendingOutcome }),
+					};
+				});
 		},
 		hydrate,
-		async claimPendingOutcome(kind, correlation, outcome) {
+		async stagePendingTerminalOutcome(
+			kind,
+			correlation,
+			outcome,
+			keepDeadlineRecoveryPending = false,
+			deadlineMaxAt,
+		) {
+			const recordKey = key(kind, correlation);
+			for (let attempt = 0; attempt < PENDING_TERMINAL_OUTCOME_RETRIES; attempt += 1) {
+				const record = records.get(recordKey);
+				if (!record || record.kind !== kind || record.terminalAt !== undefined) return undefined;
+				const requested = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record));
+				if (requested === undefined) return undefined;
+				const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+				const prior =
+					pending === undefined
+						? undefined
+						: canonicalTerminalOutcome(pending, undefined, failureEvidence(record));
+				let staged = requested;
+				if (record.error !== undefined && record.error.code !== "prompt_deadline_exceeded") {
+					staged = canonicalFailedOutcome(
+						record.error,
+						"agent_failed",
+						failureEvidence(record),
+						requested.kind === "failed" ? requested.providerCode : undefined,
+					);
+				} else if (prior !== undefined) {
+					const priorIsDeadlineFailure = prior.kind === "failed" && prior.provenance === "deadline";
+					if (!priorIsDeadlineFailure) {
+						// A real, already-staged terminal intent is stronger than this
+						// publisher's duplicate event. Provider errors were handled above.
+						staged = prior;
+						const storedDeadlineMaxAt = (record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
+						if (
+							(record.deadlineRecoveryPending === true) === keepDeadlineRecoveryPending &&
+							(deadlineMaxAt === undefined || storedDeadlineMaxAt === deadlineMaxAt)
+						)
+							return prior;
+					}
+				}
+				const next = { ...record, revision: ++mutationRevision } as InvocationRecord & {
+					pendingOutcome?: unknown;
+					deadlineRecoveryPending?: boolean;
+					deadlineMaxAt?: number;
+				};
+				next.pendingOutcome = staged;
+				if (keepDeadlineRecoveryPending) {
+					next.deadlineRecoveryPending = true;
+					if (deadlineMaxAt !== undefined) next.deadlineMaxAt = deadlineMaxAt;
+				} else if (!(staged.kind === "failed" && staged.provenance === "deadline")) {
+					delete next.deadlineRecoveryPending;
+					delete next.deadlineMaxAt;
+				}
+				records.set(recordKey, next);
+				try {
+					await persist();
+					return staged;
+				} catch (error) {
+					if (records.get(recordKey) === next) records.set(recordKey, record);
+					if (attempt + 1 >= PENDING_TERMINAL_OUTCOME_RETRIES) throw error;
+					await Bun.sleep(PENDING_TERMINAL_OUTCOME_RETRY_DELAY_MS);
+				}
+			}
+			return undefined;
+		},
+		async claimPendingOutcome(kind, correlation, outcome, deadlineMaxAt) {
 			const record = records.get(key(kind, correlation));
+			const requested = canonicalTerminalOutcome(outcome, undefined);
 			const normalized = canonicalTerminalOutcome(outcome, undefined, failureEvidence(record ?? {}));
 			if (normalized === undefined) throw new Error("Invalid terminal outcome.");
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return normalized;
+			const deadlineClaim =
+				kind === "prompt" &&
+				requested?.kind === "failed" &&
+				requested.code === "prompt_deadline_exceeded" &&
+				requested.provenance === "deadline";
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
-			if (pending !== undefined)
-				return canonicalTerminalOutcome(pending, undefined, failureEvidence(record)) ?? normalized;
-			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
-			next.pendingOutcome = normalized;
+			if (pending !== undefined) {
+				const prior = canonicalTerminalOutcome(pending, undefined, failureEvidence(record)) ?? normalized;
+				const priorIsDeadlineOutcome =
+					prior.kind === "failed" && prior.code === "prompt_deadline_exceeded" && prior.provenance === "deadline";
+				if (!deadlineClaim || !priorIsDeadlineOutcome || record.deadlineRecoveryPending) return prior;
+			}
+			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & {
+				pendingOutcome?: unknown;
+				deadlineRecoveryPending?: boolean;
+				deadlineMaxAt?: number;
+			};
+			next.pendingOutcome = pending === undefined ? normalized : pending;
+			if (deadlineClaim) {
+				next.deadlineRecoveryPending = true;
+				if (deadlineMaxAt !== undefined) next.deadlineMaxAt = deadlineMaxAt;
+			}
 			records.set(key(kind, correlation), next);
 			try {
 				await persist();
@@ -1522,6 +1731,8 @@ export function createInvocationReconciliation(
 			else finalizedRecord.outcome = resolvedOutcome;
 			delete (finalizedRecord as unknown as Record<string, unknown>).pendingOutcome;
 			delete (finalizedRecord as unknown as Record<string, unknown>).pendingReceiptState;
+			delete finalizedRecord.deadlineRecoveryPending;
+			delete (finalizedRecord as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
 			if (isCurrent !== undefined && !isCurrent()) return;
 			const commit = Promise.withResolvers<void>();
 			// This promise is an internal coordination signal for lifecycle transitions
@@ -1564,6 +1775,18 @@ export function createInvocationReconciliation(
 			const record = records.get(recordKey);
 			if (!record || record.kind !== kind) return;
 			if (record.terminalAt !== undefined && record.error?.code !== "prompt_deadline_exceeded") return;
+			const pendingOutcome = canonicalTerminalOutcome(
+				(record as unknown as { pendingOutcome?: unknown }).pendingOutcome,
+				undefined,
+				failureEvidence(record),
+			);
+			const preserveRealPendingOutcome =
+				pendingOutcome !== undefined &&
+				!(
+					pendingOutcome.kind === "failed" &&
+					pendingOutcome.code === "prompt_deadline_exceeded" &&
+					pendingOutcome.provenance === "deadline"
+				);
 			const next: InvocationRecord = {
 				...record,
 				status: record.startedAt === undefined ? "accepted" : "in_flight",
@@ -1574,9 +1797,8 @@ export function createInvocationReconciliation(
 			if (next.error?.code === "prompt_deadline_exceeded" || !isPreservedProviderFailure(next.error?.code))
 				delete next.error;
 			delete next.receiptState;
-			delete (next as unknown as { outcome?: unknown; pendingOutcome?: unknown; pendingReceiptState?: unknown })
-				.outcome;
-			delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+			delete (next as unknown as { outcome?: unknown; pendingReceiptState?: unknown }).outcome;
+			if (!preserveRealPendingOutcome) delete (next as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 			delete (next as unknown as { pendingReceiptState?: unknown }).pendingReceiptState;
 			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
 			if (deadlineMaxAt !== undefined) (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt = deadlineMaxAt;
@@ -2486,7 +2708,7 @@ function createControlSurface(
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
 	terminalPublicationCapture?: {
-		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+		waiters?: Array<{ epoch: number; correlationKey?: string; resolve: (observed: boolean) => void }>;
 	},
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string>; lifecycleEpoch?: number },
 	retirePendingOwner?: (
@@ -4444,8 +4666,54 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// reaches the stopped path awaits it; a concurrent abort for the same turn
 	// is settled by the durable marker transaction instead.
 	const terminalPublicationCapture: {
-		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+		waiters?: Array<{ epoch: number; correlationKey?: string; resolve: (observed: boolean) => void }>;
 	} = {};
+	type DeadlineTerminalizationObservation = {
+		owner: RuntimeState;
+		handle: string;
+		epoch: number;
+		lifecycleEpoch: number;
+		deadlineMaxAt: number;
+		terminalPublication: Promise<boolean>;
+		eventCaptured: boolean;
+		eventPrepared: boolean;
+		deadlineAbortStarted: boolean;
+		terminalCommitted: boolean;
+		eventCapture: Promise<void>;
+		resolveEventCapture: () => void;
+		observed?: boolean;
+		terminalContent?: TurnResultContent;
+		terminalHasActivity?: boolean;
+		terminalOutcome?: InvocationOutcome;
+		sessionId?: string;
+		clearUnrecordedFailure?: () => void;
+		releaseTerminalRetention?: () => void;
+		removeWaiter: () => void;
+	};
+	const deadlineTerminalizationObservations = new Map<string, DeadlineTerminalizationObservation>();
+	const cleanupDeadlineTerminalizationObservation = (
+		key: string,
+		observation: DeadlineTerminalizationObservation,
+	): void => {
+		observation.removeWaiter();
+		observation.releaseTerminalRetention?.();
+		observation.releaseTerminalRetention = undefined;
+		if (deadlineTerminalizationObservations.get(key) === observation) deadlineTerminalizationObservations.delete(key);
+	};
+	const deadlineOutcomeAfterAbort = (
+		correlation: InvocationCorrelation,
+		outcome: InvocationOutcome | undefined,
+		hasActivity?: boolean,
+	): InvocationOutcome | undefined => {
+		const observation = deadlineTerminalizationObservations.get(lifecycleCorrelationKey(correlation));
+		if (!observation?.deadlineAbortStarted || outcome?.kind !== "stopped" || outcome.reason !== "cancelled")
+			return outcome;
+		return failedPromptOutcome({
+			code: "prompt_deadline_exceeded",
+			provenance: "deadline",
+			evidence: hasActivity === true ? { hasActivity: true } : {},
+		});
+	};
 	// Shared with the control surface: the SDK connection owning the currently
 	// active prompt/skill turn. Cleared at every agent_end (terminal lifecycle
 	// boundary) so a stale owner never authorizes an abort against a later
@@ -4479,53 +4747,79 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	 * correlations for as long as it can still reach a claim, and a retained key is skipped
 	 * as an eviction victim.
 	 */
-	const MAX_PUBLISHED_TERMINAL_BOUNDARIES = 1024;
-	const publishedTerminalBoundaries = new Set<string>();
-	/** Correlations with at least one publisher still able to reach a claim. */
-	const retainedTerminalBoundaries = new Map<string, number>();
-	/**
-	 * Protect every correlation this publisher may still claim, and return its release.
-	 * Callers MUST release on every exit path -- published, claim lost, or threw -- so a
-	 * failure cannot leak a permanent protection.
-	 */
+	const terminalBoundaryClaims = new RetainedTerminalBoundaryRegistry();
 	const retainTerminalBoundaries = (
 		invocations: ReadonlyArray<{ correlation: InvocationCorrelation }>,
-	): (() => void) => {
-		const keys = invocations.map(({ correlation }) => lifecycleCorrelationKey(correlation));
-		for (const key of keys) retainedTerminalBoundaries.set(key, (retainedTerminalBoundaries.get(key) ?? 0) + 1);
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			for (const key of keys) {
-				const retained = retainedTerminalBoundaries.get(key);
-				if (retained === undefined) continue;
-				if (retained > 1) retainedTerminalBoundaries.set(key, retained - 1);
-				else retainedTerminalBoundaries.delete(key);
-			}
-		};
-	};
-	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean => {
-		const key = lifecycleCorrelationKey(correlation);
-		if (publishedTerminalBoundaries.has(key)) return false;
-		publishedTerminalBoundaries.add(key);
-		while (publishedTerminalBoundaries.size > MAX_PUBLISHED_TERMINAL_BOUNDARIES) {
-			let victim: string | undefined;
-			for (const candidate of publishedTerminalBoundaries) {
-				if (retainedTerminalBoundaries.has(candidate)) continue;
-				victim = candidate;
-				break;
-			}
-			// Every key is still publishable: exceed the bound rather than evict a live
-			// one. Correctness beats the bound, and the excess is bounded by the live
-			// lifecycles the session already bounds.
-			if (victim === undefined) break;
-			publishedTerminalBoundaries.delete(victim);
-		}
-		return true;
-	};
+	): (() => void) =>
+		terminalBoundaryClaims.retain(invocations.map(({ correlation }) => lifecycleCorrelationKey(correlation)));
+	const claimTerminalBoundary = (correlation: InvocationCorrelation): boolean =>
+		terminalBoundaryClaims.claim(lifecycleCorrelationKey(correlation));
 	const hasClaimedTerminalBoundary = (correlation: InvocationCorrelation): boolean =>
-		publishedTerminalBoundaries.has(lifecycleCorrelationKey(correlation));
+		terminalBoundaryClaims.hasClaimed(lifecycleCorrelationKey(correlation));
+	const resolveDeadlineTerminalPublicationWaiters = (
+		observation: DeadlineTerminalizationObservation,
+		correlation: InvocationCorrelation,
+		observed: boolean,
+	): void => {
+		const waiters = terminalPublicationCapture.waiters;
+		if (!waiters) return;
+		const key = lifecycleCorrelationKey(correlation);
+		const matched = waiters.filter(
+			waiter => waiter.epoch === observation.lifecycleEpoch && waiter.correlationKey === key,
+		);
+		const remaining = waiters.filter(waiter => !matched.includes(waiter));
+		terminalPublicationCapture.waiters = remaining.length > 0 ? remaining : undefined;
+		for (const waiter of matched) waiter.resolve(observed);
+	};
+	const publishDeadlineTerminalBoundary = (
+		observation: DeadlineTerminalizationObservation,
+		correlation: InvocationCorrelation,
+		outcome: InvocationOutcome,
+	): boolean => {
+		const owner = observation.owner;
+		const key = lifecycleCorrelationKey(correlation);
+		if (!claimTerminalBoundary(correlation)) {
+			const previouslyPublished = terminalBoundaryClaims.publicationResult(key) === true;
+			if (previouslyPublished) {
+				observation.observed = true;
+				resolveDeadlineTerminalPublicationWaiters(observation, correlation, true);
+				return true;
+			}
+			terminalBoundaryClaims.releaseClaim(key);
+			if (!claimTerminalBoundary(correlation)) return false;
+		}
+		const sequenceBefore = owner.runtime.host.events.sequence;
+		try {
+			owner.runtime.emitEvent({
+				type: "agent_end",
+				sessionId: observation.sessionId ?? owner.sessionId,
+				...correlation,
+				...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
+				...(observation.terminalHasActivity ? { hasActivity: true } : {}),
+				outcome,
+			});
+			terminalBoundaryClaims.setPublicationResult(key, true);
+			observation.observed = true;
+			resolveDeadlineTerminalPublicationWaiters(observation, correlation, true);
+			return true;
+		} catch (error) {
+			if (owner.runtime.host.events.sequence > sequenceBefore) {
+				terminalBoundaryClaims.setPublicationResult(key, true);
+				observation.observed = true;
+				logger.warn("sdk: terminal boundary broadcast failed after replay-ring append", {
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					code: brokerDiagnosticCode(error),
+				});
+				resolveDeadlineTerminalPublicationWaiters(observation, correlation, true);
+				return true;
+			}
+			terminalBoundaryClaims.releaseClaim(key);
+			observation.observed = false;
+			resolveDeadlineTerminalPublicationWaiters(observation, correlation, false);
+			return false;
+		}
+	};
 	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
 		if (!owner) return Promise.resolve();
 		let task: Promise<void>;
@@ -4690,9 +4984,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				cohort.size > 0 ? current.pending.filter(entry => cohort.has(entry.sdkRunToken)) : current.pending.slice();
 			const matchingKeys = new Set(matchingPending.map(entry => entry.sdkRunToken));
 			const pendingSnapshot = current.pending.splice(0);
-			const drained = pendingSnapshot
-				.filter(entry => matchingKeys.has(entry.sdkRunToken))
-				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
+			const drained = pendingSnapshot.filter(entry => matchingKeys.has(entry.sdkRunToken));
 			current.pending.push(...pendingSnapshot.filter(entry => !matchingKeys.has(entry.sdkRunToken)));
 			const existingTokenBatch =
 				typeof startToken === "string" && startToken.length > 0
@@ -4716,8 +5008,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					});
 				}
 				adoptLifecycleBatch(drained);
-				if (current.activeInvocation?.kind === "prompt") {
-					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
+				for (const entry of drained) {
+					if (entry.kind !== "prompt") continue;
+					if (current.deadlineManager.isExpiring(entry.correlation))
+						current.deadlineManager.captureExpiringRun(entry.correlation);
+					else current.deadlineManager.onRunStarted(entry.correlation);
 				}
 			} else if (existingTokenBatch && current.openLifecycleBatches.includes(existingTokenBatch)) {
 				// A continuation within the same SDK-owned run carries the same token
@@ -4763,13 +5058,39 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(type === "agent_failed" || type === "agent_end") && failureBatch
 				? failureBatch.epoch
 				: current.lifecycleEpoch;
-		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
+		const resolveTerminalPublicationWaiters = (
+			observed: boolean,
+			correlatedObservations: ReadonlyMap<string, boolean>,
+		): void => {
+			if (type !== "agent_end") return;
 			const waiters = terminalPublicationCapture.waiters;
 			if (!waiters) return;
-			const matched = waiters.filter(waiter => waiter.epoch === eventLifecycleEpoch);
-			const remaining = waiters.filter(waiter => waiter.epoch !== eventLifecycleEpoch);
+			const transitionsMatch = (waiter: { correlationKey?: string }): boolean =>
+				waiter.correlationKey === undefined ||
+				transitions.some(({ correlation }) => lifecycleCorrelationKey(correlation) === waiter.correlationKey);
+			const deferredFramesReady = (waiter: { correlationKey?: string }): boolean => {
+				if (waiter.correlationKey !== undefined)
+					return (
+						!deferredTerminalOutcomeRequired.has(waiter.correlationKey) ||
+						correlatedObservations.has(waiter.correlationKey)
+					);
+				return !transitions.some(({ correlation }) => {
+					const key = lifecycleCorrelationKey(correlation);
+					return deferredTerminalOutcomeRequired.has(key) && !correlatedObservations.has(key);
+				});
+			};
+			const matched = waiters.filter(
+				waiter => waiter.epoch === eventLifecycleEpoch && transitionsMatch(waiter) && deferredFramesReady(waiter),
+			);
+			const remaining = waiters.filter(waiter => !matched.includes(waiter));
 			terminalPublicationCapture.waiters = remaining.length === 0 ? undefined : remaining;
-			for (const waiter of matched) waiter.resolve(observed);
+			for (const waiter of matched) {
+				waiter.resolve(
+					waiter.correlationKey === undefined
+						? observed
+						: (correlatedObservations.get(waiter.correlationKey) ?? false),
+				);
+			}
 		};
 		const retireEndedLifecycleBatch = (): void => {
 			const ended = failureBatch ?? current.openLifecycleBatches[0];
@@ -4887,6 +5208,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// ring/broadcast (review thread P2). Reconciliation or event failure is
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
+		const terminalPublicationByCorrelation = new Map<string, boolean>();
+		const deferredTerminalOutcomeRequired = new Set<string>();
 		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		// Retained BEFORE the first durable await: from here this publisher can still
 		// reach the claim below, so no later boundary may evict its correlations while
@@ -4898,31 +5221,90 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				try {
 					const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 					const unrecorded = type === "agent_end" ? current.unrecordedFailureReasons?.get(reasonKey) : undefined;
+					const deferDeadlineTerminal =
+						type === "agent_end" &&
+						invocation.kind === "prompt" &&
+						current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation);
+					const preserveDeadlineRecovery =
+						type === "agent_start" &&
+						invocation.kind === "prompt" &&
+						current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation);
+					const observation = deferDeadlineTerminal
+						? deadlineTerminalizationObservations.get(lifecycleCorrelationKey(invocation.correlation))
+						: undefined;
+					const invocationTerminalOutcome = deadlineOutcomeAfterAbort(
+						invocation.correlation,
+						terminalOutcome,
+						terminalHasActivity,
+					);
 					if (type === "agent_end" && invocation.kind === "prompt")
 						current.deadlineManager.noteTerminalTransition(
 							invocation.correlation,
 							unrecorded,
-							terminalContent !== undefined || terminalHasActivity || terminalOutcome !== undefined
+							terminalContent !== undefined || terminalHasActivity || invocationTerminalOutcome !== undefined
 								? ({
 										content: terminalContent,
 										hasActivity: terminalHasActivity,
-										...(terminalOutcome?.kind === "stopped" ? { outcome: terminalOutcome } : {}),
+										...(invocationTerminalOutcome === undefined
+											? {}
+											: { outcome: invocationTerminalOutcome }),
 									} satisfies PromptTerminalTransitionEvidence)
 								: undefined,
+							deferDeadlineTerminal,
 						);
 					if (type === "agent_end") {
-						// Compound recovery (exact-head review P1): if this run's
-						// agent_failed write failed, re-record the sanitized reason
-						// durably BEFORE the boundary so the terminal classification is
-						// failed, never terminal_ok. A failed re-record throws into the
-						// catch below and retains recovery ownership.
-						if (unrecorded !== undefined) {
-							await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, {
-								type: "agent_failed",
-								error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
-							} as never);
-							current.unrecordedFailureReasons?.delete(reasonKey);
+						let terminalKey: string | undefined;
+						let capturedOutcome = invocationTerminalOutcome;
+						if (deferDeadlineTerminal) {
+							terminalKey = lifecycleCorrelationKey(invocation.correlation);
+							deferredTerminalOutcomeRequired.add(terminalKey);
+							if (observation) {
+								observation.owner = current;
+								observation.eventCaptured = true;
+								observation.terminalContent = terminalContent;
+								observation.terminalHasActivity = terminalHasActivity;
+								if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+								observation.sessionId = lifecycleOwner?.sessionId ?? current.sessionId;
+								observation.clearUnrecordedFailure = () => current.unrecordedFailureReasons?.delete(reasonKey);
+							}
 						}
+						let diagnosticWriteFailed = false;
+						let diagnosticWriteError: unknown;
+						if (unrecorded !== undefined) {
+							try {
+								await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, {
+									type: "agent_failed",
+									error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
+								} as never);
+								current.unrecordedFailureReasons?.delete(reasonKey);
+							} catch (error) {
+								diagnosticWriteFailed = true;
+								diagnosticWriteError = error;
+							}
+						}
+						if (deferDeadlineTerminal) {
+							if (capturedOutcome !== undefined) {
+								try {
+									const staged = await current.reconciliation.stagePendingTerminalOutcome(
+										invocation.kind,
+										invocation.correlation,
+										capturedOutcome,
+										true,
+										observation?.deadlineMaxAt,
+									);
+									if (staged !== undefined) capturedOutcome = staged;
+								} catch {
+									// The in-memory observation remains owned by the deadline
+									// retry path if durable staging is still unavailable.
+								}
+							}
+							if (observation) {
+								if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+								observation.eventPrepared = true;
+								observation.resolveEventCapture();
+							}
+						}
+						if (diagnosticWriteFailed) throw diagnosticWriteError;
 					}
 					// agent_failed is additive diagnostic state; agent_end remains the
 					// lifecycle boundary that terminalizes ownership and deadlines.
@@ -4939,13 +5321,46 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 										? { content: terminalContent }
 										: {}),
 									...(type === "agent_end" && terminalHasActivity ? { hasActivity: true } : {}),
-									...(type === "agent_end" && terminalOutcome !== undefined
-										? { outcome: terminalOutcome }
+									...(type === "agent_end" && invocationTerminalOutcome !== undefined
+										? { outcome: invocationTerminalOutcome }
 										: {}),
+									...(preserveDeadlineRecovery ? { preserveDeadlineRecovery: true } : {}),
 								};
-					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
+					// The deadline manager flushes only after the run and its tools settle;
+					// keep its durable pending marker until that flush completes.
+					if (!deferDeadlineTerminal) {
+						if (type === "agent_end" && invocation.kind === "prompt") {
+							let persisted = false;
+							let lastError: unknown;
+							for (let attempt = 0; attempt < 3; attempt += 1) {
+								try {
+									await current.reconciliation.noteTransition(
+										invocation.kind,
+										invocation.correlation,
+										frame as never,
+									);
+									persisted = true;
+									break;
+								} catch (error) {
+									lastError = error;
+									if (attempt < 2) await Bun.sleep(25);
+								}
+							}
+							if (!persisted) throw lastError;
+						} else {
+							await current.reconciliation.noteTransition(
+								invocation.kind,
+								invocation.correlation,
+								frame as never,
+							);
+						}
+					}
 					if ((type as string) === "agent_end") {
-						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+						if (
+							invocation.kind === "prompt" &&
+							!current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation)
+						)
+							current.deadlineManager.clear(invocation.correlation);
 					}
 				} catch {
 					// One broken durable transition must not strand the rest of a
@@ -4965,100 +5380,137 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 				}
 			}
-			const sessionId = lifecycleOwner?.sessionId ?? ctx.sessionManager.getSessionId();
-			if (type === "agent_failed") {
-				// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
-				// Publish one safe frame per invocation so clients can attribute a shared
-				// run's failure without receiving provider text or an uncorrelated signal.
-				const error = sanitizePromptFailure(
-					failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
-				);
-				for (const invocation of transitions) {
-					// A correlation whose terminal boundary is already published was
-					// terminalized by the deadline, which emitted its own diagnostic together
-					// with the pair; a second correlated agent_failed would duplicate it. The
-					// check is READ-ONLY: the claim is taken by would-be agent_end publishers
-					// alone, because the real path emits its agent_failed and its agent_end
-					// from two SEPARATE emitLifecycle invocations, so claiming here would make
-					// the publisher block its own boundary. In the ordinary flow this changes
-					// nothing -- agent_failed precedes agent_end and the claim is untaken.
-					if (hasClaimedTerminalBoundary(invocation.correlation)) continue;
-					try {
-						current.runtime.emitEvent({
-							type,
-							sessionId,
-							...invocation.correlation,
-							error,
-						});
-					} catch {
-						observed = false;
-					}
-				}
-			} else if (type === "agent_start" && transitions.length > 0) {
-				for (const invocation of transitions) {
-					try {
-						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation });
-					} catch {
-						observed = false;
-					}
-				}
-				// The start frames are on the wire (or definitively failed); content
-				// that the synchronous session subscription observed meanwhile must
-				// follow them, never precede them.
-				const started = current.openLifecycleBatches.find(candidate =>
-					candidate.invocations.some(entry =>
-						transitions.some(
-							({ correlation }) =>
-								correlation.commandId === entry.correlation.commandId &&
-								correlation.turnId === entry.correlation.turnId,
-						),
-					),
-				);
-				if (started) releaseHeldContent(current, started);
-			} else if (type === "agent_end" && transitions.length > 0) {
-				// An invocation-owned terminal must carry the identity it was accepted
-				// under and the normalized outcome. A client that submitted this turn
-				// matches the terminal against its own acknowledged correlation and
-				// refuses an unowned one, so the bare `{ type, sessionId }` boundary left
-				// every externally submitted prompt reporting `working` forever even
-				// though the turn had finished -- ACP dropped it as
-				// `incomplete_correlation`, and the notifications runtime has always
-				// stamped both fields for exactly this reason. One frame per invocation,
-				// matching the agent_failed shape above, also lets a shared run attribute
-				// the boundary to each owner instead of one signal nobody can claim. A
-				// continuing maintenance checkpoint never reaches this branch: it returned
-				// above with the one uncorrelated frame, so it cannot settle a live prompt.
-				const outcome = terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome);
-				for (const invocation of transitions) {
-					// Claim synchronously, immediately before the emit: the durable awaits
-					// above give the deadline expiry room to publish this correlation's
-					// boundary first. On a lost claim skip ONLY this frame -- every durable
-					// write, diagnostic cleanup, batch retirement and waiter resolution below
-					// still runs. `observed` deliberately stays true: it means "the correlated
-					// publication reached the wire", and it did, the deadline put it there.
-					// Flipping it would make a terminal abort's durable row refuse to claim
-					// terminalPublished for a boundary that IS on the wire.
-					if (!claimTerminalBoundary(invocation.correlation)) continue;
-					try {
-						current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
-					} catch {
-						observed = false;
-					}
-				}
-			} else {
-				// Host-originated runs without an invocation keep an uncorrelated frame.
+		} finally {
+			releaseTerminalRetention();
+		}
+		const sessionId = lifecycleOwner?.sessionId ?? ctx.sessionManager.getSessionId();
+		const failedTransitionKeys = new Set(failedTransitions.map(({ correlation }) => correlationKey(correlation)));
+		if (type === "agent_failed") {
+			// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
+			// Publish one safe frame per invocation so clients can attribute a shared
+			// run's failure without receiving provider text or an uncorrelated signal.
+			const error = sanitizePromptFailure(
+				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+			);
+			for (const invocation of transitions) {
+				// A correlation whose terminal boundary is already published was
+				// terminalized by the deadline, which emitted its own diagnostic together
+				// with the pair; a second correlated agent_failed would duplicate it. The
+				// check is READ-ONLY: the claim is taken by would-be agent_end publishers
+				// alone, because the real path emits its agent_failed and its agent_end
+				// from two SEPARATE emitLifecycle invocations, so claiming here would make
+				// the publisher block its own boundary. In the ordinary flow this changes
+				// nothing -- agent_failed precedes agent_end and the claim is untaken.
+				if (hasClaimedTerminalBoundary(invocation.correlation)) continue;
 				try {
-					current.runtime.emitEvent({ type, sessionId });
+					current.runtime.emitEvent({
+						type,
+						sessionId,
+						...invocation.correlation,
+						error,
+					});
 				} catch {
 					observed = false;
 				}
 			}
-		} catch {
-			observed = false;
-		} finally {
-			// Every exit path -- published, claim lost, or threw -- releases: this
-			// publisher can no longer reach a claim.
-			releaseTerminalRetention();
+		} else if (type === "agent_start" && transitions.length > 0) {
+			for (const invocation of transitions) {
+				try {
+					current.runtime.emitEvent({ type, sessionId, ...invocation.correlation });
+				} catch {
+					observed = false;
+				}
+			}
+			// The start frames are on the wire (or definitively failed); content
+			// that the synchronous session subscription observed meanwhile must
+			// follow them, never precede them.
+			const started = current.openLifecycleBatches.find(candidate =>
+				candidate.invocations.some(entry =>
+					transitions.some(
+						({ correlation }) =>
+							correlation.commandId === entry.correlation.commandId &&
+							correlation.turnId === entry.correlation.turnId,
+					),
+				),
+			);
+			if (started) releaseHeldContent(current, started);
+		} else if (type === "agent_end" && transitions.length > 0) {
+			// An invocation-owned terminal must carry the identity it was accepted
+			// under and the normalized outcome. A client that submitted this turn
+			// matches the terminal against its own acknowledged correlation and
+			// refuses an unowned one, so the bare `{ type, sessionId }` boundary left
+			// every externally submitted prompt reporting `working` forever even
+			// though the turn had finished -- ACP dropped it as
+			// `incomplete_correlation`, and the notifications runtime has always
+			// stamped both fields for exactly this reason. One frame per invocation,
+			// matching the agent_failed shape above, also lets a shared run attribute
+			// the boundary to each owner instead of one signal nobody can claim. A
+			// continuing maintenance checkpoint never reaches this branch: it returned
+			// above with the one uncorrelated frame, so it cannot settle a live prompt.
+			for (const invocation of transitions) {
+				// Claim synchronously, immediately before the emit: the durable awaits
+				// above give the deadline expiry room to publish this correlation's
+				// boundary first. On a lost claim skip ONLY this frame -- every durable
+				// write, diagnostic cleanup, batch retirement and waiter resolution below
+				// still runs. `observed` deliberately stays true: it means "the correlated
+				// publication reached the wire", and it did, the deadline put it there.
+				// Flipping it would make a terminal abort's durable row refuse to claim
+				// terminalPublished when a boundary that IS on the wire.
+				const terminalKey = correlationKey(invocation.correlation);
+				if (failedTransitionKeys.has(terminalKey)) {
+					terminalPublicationByCorrelation.set(terminalKey, false);
+					continue;
+				}
+				if (deferredTerminalOutcomeRequired.has(terminalKey)) {
+					continue;
+				}
+				const outcome = deadlineOutcomeAfterAbort(
+					invocation.correlation,
+					terminalOutcome ?? terminalStoppedOutcome(stopReason, maintenanceOutcome),
+					terminalHasActivity,
+				);
+				if (outcome === undefined) continue;
+				if (!claimTerminalBoundary(invocation.correlation)) {
+					const previouslyPublished = terminalBoundaryClaims.publicationResult(terminalKey) === true;
+					if (previouslyPublished) {
+						terminalPublicationByCorrelation.set(terminalKey, true);
+						continue;
+					}
+					terminalBoundaryClaims.releaseClaim(terminalKey);
+					if (!claimTerminalBoundary(invocation.correlation)) {
+						terminalPublicationByCorrelation.set(terminalKey, false);
+						continue;
+					}
+				}
+				const sequenceBefore = current.runtime.host.events.sequence;
+				try {
+					current.runtime.emitEvent({ type, sessionId, ...invocation.correlation, outcome });
+					terminalPublicationByCorrelation.set(terminalKey, true);
+					terminalBoundaryClaims.setPublicationResult(terminalKey, true);
+				} catch (error) {
+					if (current.runtime.host.events.sequence > sequenceBefore) {
+						// The event is replayable even though its live broadcast failed.
+						terminalPublicationByCorrelation.set(terminalKey, true);
+						terminalBoundaryClaims.setPublicationResult(terminalKey, true);
+						logger.warn("sdk: terminal boundary broadcast failed after replay-ring append", {
+							commandId: invocation.correlation.commandId,
+							turnId: invocation.correlation.turnId,
+							code: brokerDiagnosticCode(error),
+						});
+					} else {
+						terminalPublicationByCorrelation.set(terminalKey, false);
+						terminalBoundaryClaims.releaseClaim(terminalKey);
+						observed = false;
+					}
+				}
+			}
+		} else {
+			// Host-originated runs without an invocation keep an uncorrelated frame.
+			try {
+				current.runtime.emitEvent({ type, sessionId });
+			} catch {
+				observed = false;
+			}
 		}
 		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
@@ -5079,7 +5531,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
 				}
 				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
-				resolveTerminalPublicationWaiters(observed);
+				resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 				return;
 			}
 			if (failedTransitions.length > 0) {
@@ -5091,7 +5543,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.activeInvocation = failedTransitions[0];
 				current.drainedInvocations = failedTransitions;
 				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
-				resolveTerminalPublicationWaiters(observed);
+				resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 				return;
 			}
 			const ended = failureBatch ?? current.openLifecycleBatches[0];
@@ -5106,14 +5558,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
 			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
-				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+				if (
+					invocation.kind === "prompt" &&
+					!current.deadlineManager.shouldDeferTerminalTransition(invocation.correlation)
+				)
+					current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 			if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
 			// Resolve EVERY concurrent waiter for the aborted turn: the turn emits
 			// exactly one agent_end, and each admitted abort of it must observe the
-			// same publication result rather than a single latest-wins slot (review
+			// the same publication result rather than a single latest-wins slot (review
 			// thread P2).
-			resolveTerminalPublicationWaiters(observed);
+			resolveTerminalPublicationWaiters(observed, terminalPublicationByCorrelation);
 		}
 	};
 	api.on("agent_start", (event, ctx) => {
@@ -5168,36 +5624,100 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			: undefined;
 		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
-		const failure = providerFailureFromAgentEnd(event);
 		const failureCandidates = endedBatch
 			? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
 			: currentInvocation
 				? [currentInvocation]
 				: [];
+		const eventFailure = providerFailureFromAgentEnd(event);
+		const recordedFailureCode = failureCandidates
+			.map(({ correlation }) => owner?.failureDiagnosticCodes.get(lifecycleCorrelationKey(correlation)))
+			.find((code): code is string => code !== undefined);
+		const failure =
+			eventFailure ??
+			(recordedFailureCode === undefined
+				? undefined
+				: Object.assign(new Error("agent run failed"), { code: recordedFailureCode }));
 		const genericFailureKeys = failureCandidates
 			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
 			.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
 		const hasExistingFailure = failureCandidates.some(({ correlation }) =>
 			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
 		);
-		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
+		const failureAlreadyPublished =
+			eventFailure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
 		const terminalEvidence = promptTerminalEvidenceFromAgentEnd(event);
 		const terminalOutcome =
-			event.stopReason === "cancelled" ||
-			(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
-				? terminalStoppedOutcome(
-						event.stopReason,
-						event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-					)
-				: failure !== undefined
-					? canonicalFailedOutcome(failure)
+			failure !== undefined
+				? canonicalFailedOutcome(failure)
+				: event.stopReason === "cancelled" ||
+						(event.stopReason === "maintenance" && event.maintenanceOutcome === "aborted")
+					? terminalStoppedOutcome(
+							event.stopReason,
+							event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+						)
 					: terminalEvidence.content?.text.trim() || terminalEvidence.hasActivity
 						? terminalStoppedOutcome(
 								event.stopReason,
 								event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 							)
 						: canonicalFailedOutcome(EMPTY_PROMPT_FAILURE);
+		const releaseTerminalRetention = retainTerminalBoundaries(failureCandidates);
 		return trackLifecycle(async () => {
+			for (const invocation of failureCandidates) {
+				if (
+					invocation.kind !== "prompt" ||
+					!owner?.deadlineManager.shouldDeferTerminalTransition(invocation.correlation)
+				)
+					continue;
+				const key = lifecycleCorrelationKey(invocation.correlation);
+				const observation = deadlineTerminalizationObservations.get(key);
+				const failureReason =
+					owner.unrecordedFailureReasons?.get(key) ??
+					(failure !== undefined && !failureAlreadyPublished ? sanitizePromptFailure(failure) : undefined);
+				owner.deadlineManager.noteTerminalTransition(
+					invocation.correlation,
+					failureReason,
+					terminalEvidence.content !== undefined || terminalEvidence.hasActivity || terminalOutcome !== undefined
+						? {
+								content: terminalEvidence.content,
+								hasActivity: terminalEvidence.hasActivity,
+								...(terminalOutcome === undefined ? {} : { outcome: terminalOutcome }),
+							}
+						: undefined,
+					true,
+				);
+				let capturedOutcome = terminalOutcome;
+				if (observation) {
+					observation.owner = owner;
+					observation.eventCaptured = true;
+					observation.terminalContent = terminalEvidence.content;
+					observation.terminalHasActivity = terminalEvidence.hasActivity;
+					if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+					observation.sessionId = owner.sessionId;
+					observation.clearUnrecordedFailure = () => owner.unrecordedFailureReasons?.delete(key);
+				}
+				if (capturedOutcome !== undefined) {
+					try {
+						const staged = await owner.reconciliation.stagePendingTerminalOutcome(
+							"prompt",
+							invocation.correlation,
+							capturedOutcome,
+							true,
+							observation?.deadlineMaxAt,
+						);
+						if (staged !== undefined) capturedOutcome = staged;
+					} catch {
+						// Keep the exact outcome in the observation while the manager's
+						// live retry owner waits for durable storage to recover.
+					}
+				}
+				if (observation) {
+					if (capturedOutcome !== undefined) observation.terminalOutcome = capturedOutcome;
+					observation.eventPrepared = true;
+					observation.resolveEventCapture();
+				}
+			}
 			if (failure && !failureAlreadyPublished) {
 				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
 				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
@@ -5214,6 +5734,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				event.stopReason,
 			);
 		}, owner).finally(() => {
+			releaseTerminalRetention();
 			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
 				lifecycleRunOwners.delete(event.sdkRunToken);
 		});
@@ -5428,6 +5949,199 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			getLeaseMs: () => resolveSdkPromptDeadlineMs(options.settings?.get("sdk.promptDeadlineMs" as never)),
 			getMaxMs: () => resolveSdkPromptMaxRuntimeMs(options.settings?.get("sdk.promptMaxRuntimeMs" as never)),
+			onDeadlineStarted: (correlation, deadlineMaxAt) => {
+				const owner = lifecycleOwnerHolder.state;
+				if (!owner) return;
+				const key = lifecycleCorrelationKey(correlation);
+				const currentBatch = owner.openLifecycleBatches.find(batch => batch.epoch === owner.lifecycleEpoch);
+				if (
+					!currentBatch ||
+					![...currentBatch.invocations, ...currentBatch.attachedInvocations].some(
+						entry => lifecycleCorrelationKey(entry.correlation) === key,
+					)
+				)
+					return;
+				const seams = options.terminalAbortSeams;
+				const handle = seams?.getActivePromptHandle();
+				const epoch = seams?.getTerminalTurnEpoch();
+				if (!seams || !handle || epoch === undefined || !seams.pendingToolExecutions) return;
+				const existing = deadlineTerminalizationObservations.get(key);
+				if (existing) return () => cleanupDeadlineTerminalizationObservation(key, existing);
+
+				const terminalPublication = Promise.withResolvers<boolean>();
+				const eventCapture = Promise.withResolvers<void>();
+				let waiter: { epoch: number; correlationKey: string; resolve: (observed: boolean) => void } | undefined;
+				const observation: DeadlineTerminalizationObservation = {
+					owner,
+					handle,
+					epoch,
+					lifecycleEpoch: currentBatch.epoch,
+					deadlineMaxAt,
+					terminalPublication: terminalPublication.promise,
+					eventCaptured: false,
+					eventPrepared: false,
+					deadlineAbortStarted: false,
+					terminalCommitted: false,
+					eventCapture: eventCapture.promise,
+					resolveEventCapture: () => eventCapture.resolve(),
+					releaseTerminalRetention: retainTerminalBoundaries([{ correlation }]),
+					removeWaiter: () => {
+						const waiters = terminalPublicationCapture.waiters;
+						if (waiters === undefined || waiter === undefined) return;
+						const index = waiters.indexOf(waiter);
+						if (index >= 0) waiters.splice(index, 1);
+						if (waiters.length === 0) terminalPublicationCapture.waiters = undefined;
+					},
+				};
+				waiter = {
+					epoch: currentBatch.epoch,
+					correlationKey: key,
+					resolve: observed => {
+						observation.observed = observed;
+						terminalPublication.resolve(observed);
+					},
+				};
+				if (!terminalPublicationCapture.waiters) terminalPublicationCapture.waiters = [];
+				terminalPublicationCapture.waiters.push(waiter);
+				deadlineTerminalizationObservations.set(key, observation);
+				return () => cleanupDeadlineTerminalizationObservation(key, observation);
+			},
+			onDeadlineTerminalization: async (correlation, isCurrent): Promise<PromptDeadlineTerminalization> => {
+				const target = lifecycleCorrelationKey(correlation);
+				const observation = deadlineTerminalizationObservations.get(target);
+				const seams = options.terminalAbortSeams;
+				const pendingToolExecutions = seams?.pendingToolExecutions;
+				if (!observation || !seams || !pendingToolExecutions) return "uncertain";
+				const pendingTools = () => pendingToolExecutions(observation.handle);
+				const awaitEventPreparation = async (): Promise<boolean> => {
+					if (observation.eventPrepared) return true;
+					const captured = await Promise.race([
+						observation.eventCapture.then(() => true as const),
+						Bun.sleep(SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS).then(() => false as const),
+					]);
+					return captured && observation.eventPrepared;
+				};
+				if (observation.eventCaptured) {
+					const prepared = await awaitEventPreparation();
+					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+				}
+
+				if (!observation.eventCaptured) {
+					const owner = lifecycleOwnerHolder.state;
+					const currentBatch = owner?.openLifecycleBatches.find(
+						batch => batch.epoch === observation.lifecycleEpoch,
+					);
+					if (
+						!currentBatch ||
+						![...currentBatch.invocations, ...currentBatch.attachedInvocations].some(
+							entry => lifecycleCorrelationKey(entry.correlation) === target,
+						)
+					)
+						return "uncertain";
+					if (
+						!isCurrent() ||
+						seams.getActivePromptHandle() !== observation.handle ||
+						seams.getTerminalTurnEpoch() !== observation.epoch
+					)
+						return "uncertain";
+				}
+				await waitForToolCallBoundary({
+					pending: pendingTools,
+					whenIdle: () => new Promise<void>(() => {}),
+					graceMs: TOOL_CALL_BOUNDARY_GRACE_MS,
+				});
+				if (observation.eventCaptured) {
+					const prepared = await awaitEventPreparation();
+					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+				}
+				if (
+					!isCurrent() ||
+					seams.getActivePromptHandle() !== observation.handle ||
+					seams.getTerminalTurnEpoch() !== observation.epoch
+				)
+					return "uncertain";
+
+				let steeringSnapshotToken: number | undefined;
+				let proof: { status: string; terminalScope?: unknown } | undefined;
+				try {
+					steeringSnapshotToken = seams.captureTerminalAbortSteeringSnapshot?.();
+					observation.deadlineAbortStarted = true;
+					proof = await seams.abortPromptAndWaitWithTerminal(observation.handle, {
+						graceMs: 10_000,
+						terminal: {
+							scope: "owned",
+							expectedEpoch: observation.epoch,
+							...(steeringSnapshotToken === undefined ? {} : { steeringSnapshotToken }),
+						},
+					});
+					if (proof.status !== "settled") {
+						const prepared = await awaitEventPreparation();
+						return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+					}
+					const terminalScope = proof.terminalScope as
+						| { abortedAttemptEpoch?: unknown; lineageIdHash?: unknown }
+						| undefined;
+					if (
+						terminalScope?.abortedAttemptEpoch !== observation.epoch ||
+						typeof terminalScope.lineageIdHash !== "string" ||
+						isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, observation.epoch)
+					)
+						return "uncertain";
+					const exactJobs = findOwnedRegistrationsForTurn(terminalScope.lineageIdHash, observation.epoch);
+					if (exactJobs.length > 0) {
+						const endpointId = exactJobs[0]?.endpointId;
+						const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
+						if (!manager || (await settleOwnedWork(manager, exactJobs, 500)) !== "stopped") return "uncertain";
+					}
+					const prepared = await awaitEventPreparation();
+					return prepared && pendingTools().length === 0 ? "settled" : "uncertain";
+				} catch {
+					return "uncertain";
+				} finally {
+					if (steeringSnapshotToken !== undefined && proof?.status !== "settled")
+						seams.discardTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
+				}
+			},
+			onDeadlinePublishTerminal: async (correlation, isCurrent) => {
+				const key = lifecycleCorrelationKey(correlation);
+				const observation = deadlineTerminalizationObservations.get(key);
+				const terminalOutcome = observation
+					? deadlineOutcomeAfterAbort(correlation, observation.terminalOutcome, observation.terminalHasActivity)
+					: undefined;
+				if (!observation?.eventCaptured || !observation.eventPrepared || terminalOutcome === undefined)
+					return false;
+				if (!observation.terminalCommitted) {
+					const pendingTools = options.terminalAbortSeams?.pendingToolExecutions;
+					let terminalIsCurrent = false;
+					let pendingToolCount = -1;
+					try {
+						terminalIsCurrent = isCurrent();
+						if (pendingTools) pendingToolCount = pendingTools(observation.handle).length;
+					} catch {
+						return false;
+					}
+					if (!terminalIsCurrent || !pendingTools || pendingToolCount > 0) return false;
+					try {
+						if (!isCurrent() || pendingTools(observation.handle).length > 0) return false;
+						// Commit the authoritative Q26 result before exposing its terminal
+						// boundary; a crash between publication and this write would strand
+						// restart recovery with only a hidden pending claim.
+						await reconciliation.noteTransition("prompt", correlation, {
+							type: "agent_end",
+							...(observation.terminalContent === undefined ? {} : { content: observation.terminalContent }),
+							...(observation.terminalHasActivity ? { hasActivity: true } : {}),
+							outcome: terminalOutcome,
+						});
+						observation.terminalOutcome = terminalOutcome;
+						observation.terminalCommitted = true;
+						observation.clearUnrecordedFailure?.();
+					} catch {
+						return false;
+					}
+				}
+				const published = publishDeadlineTerminalBoundary(observation, correlation, terminalOutcome);
+				return { outcome: terminalOutcome, published } satisfies PromptDeadlinePublicationResult;
+			},
 			// Persist the agent's uncommitted work before the retirement below tears
 			// the session down (#5583). Best effort by contract: failures are logged
 			// inside the flush and the deadline outcome is unaffected.
@@ -5449,69 +6163,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					signal,
 				});
 			},
-			onExpired: (correlation, deadlineOutcome) => {
+			onExpired: correlation => {
 				const owner = lifecycleOwnerHolder.state;
-				if (deadlineOutcome === undefined) {
-					if (!owner) return;
-					removeLifecycleReferences(owner, correlation);
-					maybeRetireLifecycleOwner(owner);
-					return;
-				}
-				const failure = sanitizePromptFailure(
-					Object.assign(new Error("Prompt deadline exceeded."), { code: deadlineOutcome.code }),
-				);
-				// The deadline publishes a failed/end PAIR and owns it atomically, so the
-				// boundary claim is taken once, here, covering both frames. Losing it means
-				// a real agent_end already reached the wire for this correlation: emit
-				// NEITHER frame, but still run the cleanup below, and still let #expire
-				// finish its durable reconciliation. Losing the boundary must not skip
-				// cleanup.
-				//
-				// Retained for the whole publication: this path owns the correlation from
-				// here, so a concurrent boundary must not evict its key mid-flight.
-				const releaseTerminalRetention = retainTerminalBoundaries([{ correlation }]);
-				try {
-					if (claimTerminalBoundary(correlation)) {
-						// Each required frame is emitted INDEPENDENTLY (review P2): a throwing
-						// diagnostic must never suppress the boundary, which is the frame this
-						// path exists to deliver. Both failures are reported, never rethrown --
-						// the cleanup below still has to run.
-						try {
-							runtime.emitEvent({
-								type: "agent_failed",
-								sessionId,
-								...correlation,
-								error: failure,
-							});
-						} catch (error) {
-							logger.warn("sdk: deadline correlated diagnostic publication failed", {
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
-								error: sanitizePromptFailure(error),
-							});
-						}
-						try {
-							runtime.emitEvent({
-								type: "agent_end",
-								sessionId,
-								...correlation,
-								outcome: canonicalFailedOutcome(failure, "deadline"),
-							});
-						} catch (error) {
-							logger.error("sdk: deadline correlated boundary publication failed", {
-								commandId: correlation.commandId,
-								turnId: correlation.turnId,
-								error: sanitizePromptFailure(error),
-							});
-						}
-					}
-				} finally {
-					releaseTerminalRetention();
-				}
-				if (owner) {
-					removeLifecycleReferences(owner, correlation);
-					maybeRetireLifecycleOwner(owner);
-				}
+				if (!owner) return;
+				removeLifecycleReferences(owner, correlation);
+				maybeRetireLifecycleOwner(owner);
 			},
 		});
 		const pending: Array<{
@@ -5520,8 +6176,30 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			connectionId: string | undefined;
 			sdkRunToken: string;
 		}> = [];
-		for (const { correlation, acceptedAt, deadlineMaxAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
+		for (const {
+			correlation,
+			acceptedAt,
+			deadlineMaxAt,
+			pendingOutcome,
+		} of reconciliation.listDeadlineRecoveryPendingPrompts()) {
 			deadlineManager.recoverPending(correlation, acceptedAt, deadlineMaxAt);
+			if (
+				pendingOutcome !== undefined &&
+				!(
+					pendingOutcome.kind === "failed" &&
+					pendingOutcome.code === "prompt_deadline_exceeded" &&
+					pendingOutcome.provenance === "deadline"
+				)
+			)
+				deadlineManager.noteTerminalTransition(
+					correlation,
+					pendingOutcome.kind === "failed"
+						? { code: pendingOutcome.providerCode ?? pendingOutcome.code, message: pendingOutcome.message }
+						: undefined,
+					{ outcome: pendingOutcome },
+					true,
+				);
+		}
 		const openLifecycleBatches: Array<{
 			epoch: number;
 			invocations: Array<{

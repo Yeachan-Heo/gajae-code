@@ -74,6 +74,14 @@ export type PromptDeadlineOutcome = Extract<SdkPromptTerminalOutcome, { kind: "f
 	provenance: "deadline";
 };
 
+export type PromptDeadlineTerminalization = "settled" | "uncertain";
+
+/** Durable terminal state is committed before publication; an unpublished committed boundary retains its retry owner. */
+export interface PromptDeadlinePublicationResult {
+	outcome: SdkPromptTerminalOutcome;
+	published: boolean;
+}
+
 export interface PromptTerminalTransitionEvidence {
 	content?: TurnResultContent;
 	hasActivity?: boolean;
@@ -93,13 +101,30 @@ export class PromptDeadlineManager {
 	readonly #uncertaintyRetries = new Map<string, number>();
 	readonly #uncertaintyRecoveryPending = new Set<string>();
 	readonly #expiring = new Set<string>();
+	readonly #deadlineAttempts = new Set<string>();
 	readonly #pendingTerminalTransitions = new Set<string>();
+	readonly #deadlineDeferredTerminalTransitions = new Set<string>();
+	readonly #deadlineTerminalizationConfirmed = new Set<string>();
+	readonly #terminalPublicationPending = new Map<string, SdkPromptTerminalOutcome>();
+	readonly #deadlineStartCleanup = new Map<string, () => void>();
 	readonly #pendingTerminalFailureReasons = new Map<string, { code: string; message: string }>();
 	readonly #pendingTerminalEvidence = new Map<string, PromptTerminalTransitionEvidence>();
 	readonly #getLeaseMs: () => number;
 	readonly #getMaxMs: () => number;
 	readonly #now: () => number;
 	readonly #onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+	readonly #onDeadlineStarted?: (
+		correlation: InvocationCorrelation,
+		deadlineMaxAt: number,
+	) => undefined | (() => void);
+	readonly #onDeadlineTerminalization?: (
+		correlation: InvocationCorrelation,
+		isCurrent: () => boolean,
+	) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
+	readonly #onDeadlinePublishTerminal?: (
+		correlation: InvocationCorrelation,
+		isCurrent: () => boolean,
+	) => PromptDeadlinePublicationResult | false | Promise<PromptDeadlinePublicationResult | false>;
 	readonly #onDeadlineExceeded?: (
 		correlation: InvocationCorrelation,
 		signal: AbortSignal,
@@ -113,6 +138,15 @@ export class PromptDeadlineManager {
 		getMaxMs: () => number;
 		now?: () => number;
 		onExpired?: (correlation: InvocationCorrelation, outcome?: PromptDeadlineOutcome) => void;
+		onDeadlineStarted?: (correlation: InvocationCorrelation, deadlineMaxAt: number) => undefined | (() => void);
+		onDeadlineTerminalization?: (
+			correlation: InvocationCorrelation,
+			isCurrent: () => boolean,
+		) => PromptDeadlineTerminalization | Promise<PromptDeadlineTerminalization>;
+		onDeadlinePublishTerminal?: (
+			correlation: InvocationCorrelation,
+			isCurrent: () => boolean,
+		) => PromptDeadlinePublicationResult | false | Promise<PromptDeadlinePublicationResult | false>;
 		/**
 		 * Best-effort durability hook for the single path that genuinely retires a
 		 * prompt as `prompt_deadline_exceeded` (#5583). Awaited after the durable
@@ -141,16 +175,15 @@ export class PromptDeadlineManager {
 		this.#getMaxMs = options.getMaxMs;
 		this.#now = options.now ?? Date.now;
 		this.#onExpired = options.onExpired;
+		this.#onDeadlineStarted = options.onDeadlineStarted;
+		this.#onDeadlineTerminalization = options.onDeadlineTerminalization;
+		this.#onDeadlinePublishTerminal = options.onDeadlinePublishTerminal;
 		this.#onDeadlineExceeded = options.onDeadlineExceeded;
 		this.#deadlineFlushTimeoutMs = options.deadlineFlushTimeoutMs ?? DEADLINE_FLUSH_TIMEOUT_MS;
 	}
 
 	/** Run the durability hook under the shared bound; see `runBoundedDeadlineFlush`. */
-	async #runDeadlineFlush(
-		correlation: InvocationCorrelation,
-		lease: PromptDeadlineLease,
-		generation: number,
-	): Promise<void> {
+	async #runDeadlineFlush(correlation: InvocationCorrelation, lease: PromptDeadlineLease): Promise<void> {
 		const hook = this.#onDeadlineExceeded;
 		if (hook === undefined) return;
 		const key = leaseKey(correlation);
@@ -158,7 +191,7 @@ export class PromptDeadlineManager {
 			signal =>
 				hook(correlation, signal, () => {
 					const current = this.#leases.get(key);
-					return current === lease && current.generation === generation;
+					return current === lease && this.#now() >= promptDeadlineAt(current);
 				}),
 			this.#deadlineFlushTimeoutMs,
 		);
@@ -172,12 +205,27 @@ export class PromptDeadlineManager {
 		}
 	}
 
+	#captureDeadlineStart(key: string, correlation: InvocationCorrelation, deadlineMaxAt: number): void {
+		if (this.#deadlineStartCleanup.has(key)) return;
+		try {
+			const cleanup = this.#onDeadlineStarted?.(correlation, deadlineMaxAt);
+			if (cleanup !== undefined) this.#deadlineStartCleanup.set(key, cleanup);
+		} catch {
+			// The terminalization hook fails closed when it cannot observe the run.
+		}
+	}
+
 	#schedule(key: string): void {
 		const lease = this.#leases.get(key);
 		if (!lease) return;
 		this.#clearTimer(key);
 		const deadlineAt = promptDeadlineAt(lease);
-		const delayMs = Math.max(0, deadlineAt - this.#now());
+		const dueDelayMs = Math.max(0, deadlineAt - this.#now());
+		const delayMs = this.#terminalPublicationPending.has(key)
+			? UNCERTAINTY_RETRY_DELAY_MS
+			: this.#uncertaintyRecoveryPending.has(key)
+				? Math.max(dueDelayMs, UNCERTAINTY_RETRY_DELAY_MS)
+				: dueDelayMs;
 		const timer = setTimeout(() => {
 			void this.#onDeadline(key);
 		}, delayMs);
@@ -187,9 +235,23 @@ export class PromptDeadlineManager {
 	}
 
 	async #onDeadline(key: string): Promise<void> {
+		if (this.#deadlineAttempts.has(key)) return;
+		this.#deadlineAttempts.add(key);
+		try {
+			await this.#expire(key);
+		} finally {
+			this.#deadlineAttempts.delete(key);
+		}
+	}
+
+	async #expire(key: string): Promise<void> {
 		const correlation = this.#correlations.get(key);
 		const lease = this.#leases.get(key);
 		if (!correlation || !lease) return;
+		if (this.#terminalPublicationPending.has(key)) {
+			await this.#retryTerminalPublication(key, correlation, lease);
+			return;
+		}
 		// Re-check deadline still due (monotonic, but handle clock skew).
 		if (this.#now() < promptDeadlineAt(lease)) {
 			this.#schedule(key);
@@ -199,7 +261,12 @@ export class PromptDeadlineManager {
 		// A successor agent_start must not drain this correlation while its
 		// durable upgrade is still pending or being retried.
 		this.#expiring.add(key);
-		if (this.#pendingTerminalTransitions.has(key)) {
+		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
+		if (
+			this.#pendingTerminalTransitions.has(key) &&
+			((!this.#deadlineDeferredTerminalTransitions.has(key) && !this.#deadlineStartCleanup.has(key)) ||
+				this.#deadlineTerminalizationConfirmed.has(key))
+		) {
 			const failureReason = this.#pendingTerminalFailureReasons.get(key);
 			try {
 				if (failureReason !== undefined) {
@@ -241,43 +308,47 @@ export class PromptDeadlineManager {
 			this.clear(correlation);
 			return;
 		}
-		if (lookup.error !== undefined) {
-			// A real agent_failed diagnostic already won before the zero-activity
-			// deadline. Use the synthetic boundary only to close that failed run;
-			// never overwrite its authenticated classifier with
-			// prompt_deadline_exceeded, which a late real agent_end could otherwise
-			// upgrade to terminal_ok.
-			try {
-				await this.#reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
-			} catch {
-				this.#retry(key);
-				return;
-			}
-			if (this.#backOffIfSuperseded(key, lease, lease.generation)) return;
-			this.#expiryRetries.delete(key);
-			this.#onExpired?.(correlation);
-			this.clear(correlation);
-			return;
-		}
 		const generation = lease.generation;
 		const outcome: PromptDeadlineOutcome = failedPromptOutcome({
 			code: "prompt_deadline_exceeded",
 			provenance: "deadline",
 			evidence: {},
 		}) as PromptDeadlineOutcome;
-		let winner: SdkPromptTerminalOutcome = outcome;
+		const lookupFailure =
+			lookup.error !== undefined && lookup.error.code !== "prompt_deadline_exceeded"
+				? failedPromptOutcome({
+						code: "prompt_failed",
+						provenance: "agent_failed",
+						providerCode: lookup.error.code,
+						evidence: {},
+					})
+				: undefined;
+		let winner: SdkPromptTerminalOutcome = lookupFailure ?? outcome;
 		try {
-			const claimed = await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
+			const claimed =
+				"listDeadlineRecoveryPendingPrompts" in this.#reconciliation
+					? await (this.#reconciliation as InvocationReconciliation).claimPendingOutcome(
+							"prompt",
+							correlation,
+							outcome,
+							lease.acceptedAt + lease.maxMs,
+						)
+					: await this.#reconciliation.claimPendingOutcome("prompt", correlation, outcome);
 			if (claimed !== undefined) winner = claimed;
 		} catch {
 			// claim may fail if already claimed (e.g., cancellation won); ignore.
 		}
-		// A real terminal may win between lookup and this claim. Its existing
-		// pending outcome is authoritative: release this expiry fence without
-		// running the deadline-only durability hook or publishing a deadline result.
-		if (winner.kind !== "failed" || winner.code !== "prompt_deadline_exceeded" || winner.provenance !== "deadline") {
-			this.#expiring.delete(key);
-			this.#expiryRetries.delete(key);
+		// A real terminal may win between lookup and this claim. A diagnostic-only
+		// failure is not terminal evidence; preserve it privately until the host hook
+		// proves the exact run/tool settlement and captures its correlated agent_end.
+		const realDeferredTerminalWon =
+			this.#pendingTerminalTransitions.has(key) && this.#deadlineDeferredTerminalTransitions.has(key);
+		if (
+			!realDeferredTerminalWon &&
+			(winner.kind !== "failed" || winner.code !== "prompt_deadline_exceeded" || winner.provenance !== "deadline") &&
+			this.#onDeadlineTerminalization === undefined
+		) {
+			this.#recoverUncertainty(key, correlation, lease, generation);
 			return;
 		}
 		// Re-verify the captured lease is still authoritative after the claim
@@ -285,32 +356,126 @@ export class PromptDeadlineManager {
 		// claim must cancel this expiry instance instead of surfacing an exceeded
 		// outcome for a prompt that is demonstrably alive.
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
-		// Durability BEFORE the durable terminal (#5583, #5623 review round 4). The
-		// claim above is already the durable pending marker, so a process death
-		// anywhere in this window leaves the record PENDING and restart recovery
-		// retries the prompt — work that was never autosaved is never reported as
-		// finished. Running the flush after `finalizeOutcome` instead made the
-		// autosave the one step a crash could silently skip, which is the whole
-		// durability guarantee of this change. The cost is that the durable terminal
-		// is delayed by at most the flush's bound.
-		//
-		// The wait is BOUNDED, not just guarded (#5623 review round 2): a hook that
-		// never settles — a blocking git lock, a credential prompt — would leave the
-		// finalize, `#onExpired` and `clear` below unreachable, stranding the prompt
-		// with neither a terminal nor an owner. A try/catch cannot rescue a promise
-		// that never settles, so the flush is raced against a real timer and
-		// abandoned if it outruns it.
-		await this.#runDeadlineFlush(correlation, lease, generation);
-		// Fence again AFTER the flush (#5623 review round 2): the flush is an await
-		// like any other here, and up to ten seconds long, so progress can land and
-		// renew the lease while it runs. A renewed prompt must not be terminalized as
-		// deadline-exceeded by this stale pass; `#backOffIfSuperseded` reschedules on
-		// the way out, so it keeps a live deadline.
+		let terminalization: PromptDeadlineTerminalization = "settled";
+		try {
+			terminalization =
+				(await this.#onDeadlineTerminalization?.(correlation, () => {
+					const current = this.#leases.get(key);
+					return current === lease && this.#now() >= promptDeadlineAt(current);
+				})) ?? "settled";
+		} catch {
+			terminalization = "uncertain";
+		}
 		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		if (terminalization === "uncertain") {
+			try {
+				const current = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+				if (current.status === "terminal_ok" || current.status === "failed") {
+					this.clear(correlation);
+					return;
+				}
+			} catch {
+				this.#retry(key);
+				return;
+			}
+			this.#recoverUncertainty(key, correlation, lease, generation);
+			return;
+		}
+		// An active run is fenced before its worktree is flushed. Otherwise a
+		// tool can still be writing while the deadline autosave snapshots it.
+		// The claim above remains the durable pending marker throughout both
+		// bounded operations, so restart recovery never reports unsaved work as
+		// finished.
+		await this.#runDeadlineFlush(correlation, lease);
+		// Fence again AFTER the flush (#5623 review round 2): progress can land
+		// while the bounded git operation runs and renews the lease.
+		if (this.#backOffIfSuperseded(key, lease, generation)) return;
+		if (this.#pendingTerminalTransitions.has(key)) {
+			const failureReason = this.#pendingTerminalFailureReasons.get(key);
+			if (failureReason !== undefined) {
+				try {
+					await this.#reconciliation.noteTransition("prompt", correlation, {
+						type: "agent_failed",
+						error: Object.assign(new Error(failureReason.message), { code: failureReason.code }),
+					} as never);
+					this.#pendingTerminalFailureReasons.delete(key);
+				} catch {
+					this.#retry(key);
+					return;
+				}
+			}
+			let terminalCommitted = false;
+			if (
+				(this.#deadlineDeferredTerminalTransitions.has(key) || this.#deadlineStartCleanup.has(key)) &&
+				this.#onDeadlinePublishTerminal !== undefined
+			) {
+				let publication: PromptDeadlinePublicationResult | false = false;
+				try {
+					publication = await this.#onDeadlinePublishTerminal(correlation, () => {
+						const current = this.#leases.get(key);
+						return (
+							current === lease && current.generation === generation && this.#now() >= promptDeadlineAt(current)
+						);
+					});
+				} catch {}
+				if (publication === false) {
+					if (this.#backOffIfSuperseded(key, lease, generation)) return;
+					this.#recoverUncertainty(key, correlation, lease, lease.generation);
+					return;
+				}
+				if (!publication.published) {
+					this.#terminalPublicationPending.set(key, publication.outcome);
+					this.#scheduleTerminalPublicationRetry(key);
+					return;
+				}
+				terminalCommitted = true;
+				const evidence = this.#pendingTerminalEvidence.get(key);
+				if (evidence !== undefined)
+					this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publication.outcome });
+			}
+			if (!terminalCommitted) {
+				this.#deadlineTerminalizationConfirmed.add(key);
+				try {
+					await this.#reconciliation.noteTransition("prompt", correlation, {
+						type: "agent_end",
+						...this.#pendingTerminalEvidence.get(key),
+					});
+				} catch {
+					this.#retry(key);
+					return;
+				}
+			}
+			this.#expiryRetries.delete(key);
+			try {
+				this.#onExpired?.(correlation);
+			} catch {}
+			this.clear(correlation);
+			return;
+		}
+		// A real agent_end observed while the deadline was fencing its run is
+		// authoritative. Keep that stopped/failed result instead of publishing a
+		// second synthetic deadline terminal over it.
+		try {
+			const current = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+			if (current.status === "terminal_ok" || current.status === "failed") {
+				this.clear(correlation);
+				return;
+			}
+		} catch {
+			this.#retry(key);
+			return;
+		}
+		if (this.#onDeadlineTerminalization !== undefined) {
+			// This runtime only publishes a terminal deadline result after the exact
+			// run's observed agent_end has been replayed above. A settled abort proof
+			// without that lifecycle evidence is still not a publishable terminal.
+			this.#recoverUncertainty(key, correlation, lease, generation);
+			return;
+		}
 		try {
 			await this.#reconciliation.finalizeOutcome("prompt", correlation, outcome, () => {
 				const current = this.#leases.get(key);
-				return current === lease && current.generation === generation;
+				return current === lease && this.#now() >= promptDeadlineAt(current);
 			});
 		} catch {
 			// Do not infer durable confirmation from an in-memory lookup after a
@@ -343,15 +508,52 @@ export class PromptDeadlineManager {
 	 * reschedule the deadline) and report it so the caller stops. A cleared or
 	 * re-accepted lease is stale by identity too.
 	 */
-	#backOffIfSuperseded(key: string, lease: PromptDeadlineLease, generation: number): boolean {
+	#backOffIfSuperseded(key: string, lease: PromptDeadlineLease, _generation: number): boolean {
 		const current = this.#leases.get(key);
-		if (current !== lease || current.generation !== generation || this.#now() < promptDeadlineAt(current)) {
+		if (current !== lease || this.#now() < promptDeadlineAt(current)) {
 			this.#expiring.delete(key);
 			this.#expiryRetries.delete(key);
 			if (current) this.#schedule(key);
 			return true;
 		}
 		return false;
+	}
+
+	async #retryTerminalPublication(
+		key: string,
+		correlation: InvocationCorrelation,
+		lease: PromptDeadlineLease,
+	): Promise<void> {
+		if (!this.#terminalPublicationPending.has(key)) return;
+		const publish = this.#onDeadlinePublishTerminal;
+		if (publish === undefined) {
+			this.#scheduleTerminalPublicationRetry(key);
+			return;
+		}
+		let publication: PromptDeadlinePublicationResult | false = false;
+		try {
+			publication = await publish(correlation, () => this.#leases.get(key) === lease);
+		} catch {}
+		if (publication === false || !publication.published) {
+			if (publication !== false) this.#terminalPublicationPending.set(key, publication.outcome);
+			this.#scheduleTerminalPublicationRetry(key);
+			return;
+		}
+		const evidence = this.#pendingTerminalEvidence.get(key);
+		if (evidence !== undefined) this.#pendingTerminalEvidence.set(key, { ...evidence, outcome: publication.outcome });
+		this.#terminalPublicationPending.delete(key);
+		this.#expiryRetries.delete(key);
+		try {
+			this.#onExpired?.(correlation);
+		} catch {}
+		this.clear(correlation);
+	}
+
+	#scheduleTerminalPublicationRetry(key: string): void {
+		this.#clearTimer(key);
+		const timer = setTimeout(() => void this.#onDeadline(key), UNCERTAINTY_RETRY_DELAY_MS);
+		(timer as unknown as { unref?: () => void }).unref?.();
+		this.#timers.set(key, timer);
 	}
 
 	#retry(key: string): void {
@@ -379,10 +581,16 @@ export class PromptDeadlineManager {
 		if (
 			!correlation ||
 			current !== lease ||
-			current.generation !== generation ||
+			this.#now() < promptDeadlineAt(current) ||
 			typeof this.#reconciliation.markUncertain !== "function"
 		)
 			return;
+		if (this.#uncertaintyRecoveryPending.has(key)) {
+			this.#expiring.delete(key);
+			this.#expiryRetries.delete(key);
+			this.#schedule(key);
+			return;
+		}
 		const attempts = (this.#uncertaintyRetries.get(key) ?? 0) + 1;
 		this.#uncertaintyRetries.set(key, attempts);
 		void this.#reconciliation
@@ -391,12 +599,23 @@ export class PromptDeadlineManager {
 				correlation,
 				() => {
 					const current = this.#leases.get(key);
-					return current === lease && current.generation === generation;
+					return current === lease && this.#now() >= promptDeadlineAt(current);
 				},
 				lease.acceptedAt + lease.maxMs,
 			)
 			.then(() => {
 				const current = this.#leases.get(key);
+				if (current === lease && this.#now() >= lease.acceptedAt + lease.maxMs) {
+					// The acceptance-anchored hard maximum has expired. Keep the durable
+					// uncertainty owner, but retry at a bounded cadence instead of
+					// re-anchoring a one-millisecond lease and rewriting it continuously.
+					this.#uncertaintyRecoveryPending.add(key);
+					this.#expiring.delete(key);
+					this.#expiryRetries.delete(key);
+					this.#uncertaintyRetries.delete(key);
+					this.#schedule(key);
+					return;
+				}
 				if (current === lease && current.generation === generation) {
 					// The uncertainty write succeeded, so the record is durably
 					// recoverable. Re-anchor and reschedule a fresh bounded lease
@@ -410,6 +629,7 @@ export class PromptDeadlineManager {
 						leaseMs: Math.max(1, lease.leaseMs),
 						maxMs: Math.max(lease.maxMs - (this.#now() - lease.acceptedAt), 1),
 					});
+					this.#uncertaintyRecoveryPending.add(key);
 					this.#leases.set(key, reanchored);
 					this.#expiring.delete(key);
 					this.#expiryRetries.delete(key);
@@ -419,7 +639,7 @@ export class PromptDeadlineManager {
 			})
 			.catch(() => {
 				const current = this.#leases.get(key);
-				if (current !== lease || current.generation !== generation) {
+				if (current !== lease || this.#now() < promptDeadlineAt(current)) {
 					// Validate authority before applying the exhaustion branch too. A stale
 					// third rejection must not mark or reschedule a renewed/replacement
 					// lease's recovery state.
@@ -469,6 +689,21 @@ export class PromptDeadlineManager {
 		this.#schedule(key);
 	}
 
+	/** A new exact agent_start retires an uncertainty-only fence, never captured terminal intent. */
+	onRunStarted(correlation: InvocationCorrelation): void {
+		const key = leaseKey(correlation);
+		this.onAccepted(correlation);
+		if (
+			this.#uncertaintyRecoveryPending.has(key) &&
+			!this.#pendingTerminalTransitions.has(key) &&
+			!this.#deadlineDeferredTerminalTransitions.has(key)
+		) {
+			this.#uncertaintyRecoveryPending.delete(key);
+			this.#uncertaintyRetries.delete(key);
+			this.#schedule(key);
+		}
+	}
+
 	/** Re-arm a durable uncertainty-recovery record after process startup without
 	 * resetting its acceptance-anchored hard maximum runtime. */
 	recoverPending(correlation: InvocationCorrelation, acceptedAt: number, deadlineMaxAt?: number): void {
@@ -510,6 +745,7 @@ export class PromptDeadlineManager {
 		correlation: InvocationCorrelation,
 		pendingFailure?: { code: string; message: string },
 		evidence?: PromptTerminalTransitionEvidence,
+		deferUntilDeadlineSettlement = false,
 	): void {
 		const key = leaseKey(correlation);
 		if (!this.#leases.has(key)) {
@@ -520,6 +756,10 @@ export class PromptDeadlineManager {
 			this.onAccepted(correlation);
 		}
 		this.#pendingTerminalTransitions.add(key);
+		if (deferUntilDeadlineSettlement) this.#deadlineDeferredTerminalTransitions.add(key);
+		else if (!this.#deadlineDeferredTerminalTransitions.has(key)) {
+			this.#deadlineTerminalizationConfirmed.delete(key);
+		}
 		if (evidence !== undefined) this.#pendingTerminalEvidence.set(key, evidence);
 		// Compound failure-plus-terminal recovery intent (exact-head review HIGH):
 		// when expiry replays this real terminal transition after a failed write, it
@@ -531,6 +771,11 @@ export class PromptDeadlineManager {
 	clear(correlation: InvocationCorrelation): void {
 		const key = leaseKey(correlation);
 		this.#clearTimer(key);
+		const removeDeadlineObservation = this.#deadlineStartCleanup.get(key);
+		this.#deadlineStartCleanup.delete(key);
+		try {
+			removeDeadlineObservation?.();
+		} catch {}
 		this.#leases.delete(key);
 		this.#correlations.delete(key);
 		this.#expiryRetries.delete(key);
@@ -538,12 +783,21 @@ export class PromptDeadlineManager {
 		this.#uncertaintyRecoveryPending.delete(key);
 		this.#expiring.delete(key);
 		this.#pendingTerminalTransitions.delete(key);
+		this.#deadlineDeferredTerminalTransitions.delete(key);
+		this.#deadlineTerminalizationConfirmed.delete(key);
+		this.#terminalPublicationPending.delete(key);
 		this.#pendingTerminalFailureReasons.delete(key);
 		this.#pendingTerminalEvidence.delete(key);
 	}
 
 	clearAll(): void {
 		for (const key of [...this.#timers.keys()]) this.#clearTimer(key);
+		for (const cleanup of this.#deadlineStartCleanup.values()) {
+			try {
+				cleanup();
+			} catch {}
+		}
+		this.#deadlineStartCleanup.clear();
 		this.#leases.clear();
 		this.#correlations.clear();
 		this.#expiryRetries.clear();
@@ -551,6 +805,9 @@ export class PromptDeadlineManager {
 		this.#uncertaintyRecoveryPending.clear();
 		this.#expiring.clear();
 		this.#pendingTerminalTransitions.clear();
+		this.#deadlineDeferredTerminalTransitions.clear();
+		this.#deadlineTerminalizationConfirmed.clear();
+		this.#terminalPublicationPending.clear();
 		this.#pendingTerminalFailureReasons.clear();
 		this.#pendingTerminalEvidence.clear();
 	}
@@ -569,6 +826,25 @@ export class PromptDeadlineManager {
 	/** Whether expiry has fenced this correlation from late run adoption. */
 	isExpiring(correlation: InvocationCorrelation): boolean {
 		return this.#expiring.has(leaseKey(correlation));
+	}
+
+	/** Capture a run that starts for this correlation while its deadline is expiring. */
+	captureExpiringRun(correlation: InvocationCorrelation): void {
+		const key = leaseKey(correlation);
+		if (!this.#expiring.has(key)) return;
+		const lease = this.#leases.get(key);
+		if (!lease) return;
+		this.#captureDeadlineStart(key, correlation, lease.acceptedAt + lease.maxMs);
+	}
+
+	/** Whether a deadline has captured exact active-run terminal evidence for this prompt. */
+	shouldDeferTerminalTransition(correlation: InvocationCorrelation): boolean {
+		const key = leaseKey(correlation);
+		return (
+			this.#deadlineDeferredTerminalTransitions.has(key) ||
+			this.#uncertaintyRecoveryPending.has(key) ||
+			(this.#expiring.has(key) && this.#deadlineStartCleanup.has(key))
+		);
 	}
 
 	/** Whether bounded uncertainty writes exhausted with recovery ownership retained. */
