@@ -4911,7 +4911,10 @@ export class ModelRegistry {
 			// For models with endpoint reasoning efforts, if thinking is not set,
 			// reconstruct it from the endpoint-provided reasoning effort map.
 			if (restored.thinking === undefined && restored.reasoning) {
-				const reasoningEffortMap = restored.compat.reasoningEffortMap as Record<string, string> | undefined;
+				// `hasEndpointReasoningMap` narrows at runtime only; `compat` is still the
+				// provider-compat union here, and only OpenAICompat declares the map.
+				const reasoningEffortMap = (restored.compat as { reasoningEffortMap?: Record<string, string> } | undefined)
+					?.reasoningEffortMap;
 				if (reasoningEffortMap) {
 					const effortOrder = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 					const supportedEfforts = Object.keys(reasoningEffortMap)
@@ -4922,7 +4925,7 @@ export class ModelRegistry {
 						const maxLevel = supportedEfforts[supportedEfforts.length - 1] as Effort;
 						const defaultLevel = supportedEfforts.includes(Effort.Medium)
 							? Effort.Medium
-							: supportedEfforts[Math.floor(supportedEfforts.length / 2)];
+							: (supportedEfforts[Math.floor(supportedEfforts.length / 2)] as Effort);
 						return {
 							...restored,
 							thinking: {

@@ -228,9 +228,9 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 
 - Backend selection is now strictly explicit per cell: `language` must be `"py"` or `"js"`. The previous `*** Cell` header parser, the `eval.lark` constrained grammar, and the sniffer-based fallback have all been removed.
 - `EvalTool.customFormat` no longer exists. Tool calls flow through the standard JSON schema; there is no Lark-constrained sampling path.
-- `tool.<name>()` exists in JS, and in Python when the host tool bridge starts. The other Python prelude helpers work on the filesystem directly.
+- `tool.<name>()` exists in JS, and in Python when the host tool bridge starts. Python `output(...)` also goes through the bridge; the other Python prelude helpers work on the filesystem directly.
 - JS helper paths reject protocol URIs (`://`) in `resolvePath()`; the JS prelude is filesystem-only unless the code calls `tool.read(...)` or another tool explicitly.
-- Python helper `output(...)` reads `PI_ARTIFACTS_DIR`, falling back to `PI_SESSION_FILE`, and raises `No session - output artifacts unavailable` when neither is set. The `eval` Python backend (`packages/coding-agent/src/eval/py/index.ts`) currently passes neither.
+- Python helper `output(...)` reads each id through the tool bridge, as the JS helper does, with `tool.read({"path": "agent://<id>:raw"})`, so it no longer depends on `PI_ARTIFACTS_DIR` / `PI_SESSION_FILE`. `offset`/`limit`, `query`, and `format` (`raw`, `stripped`, `json`) are applied in Python to the full raw output. It raises `RuntimeError` when the tool bridge is unavailable.
 - `display()` can produce text and structured outputs from the same value; the renderer prefers markdown over `text/plain` when both exist.
 - JS static imports are rewritten only at top level. Nested imports stay invalid and surface normal JS syntax/runtime errors.
 - `EvalTool` is `concurrency = "exclusive"`, so eval calls do not overlap within a session.
