@@ -273,7 +273,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 
 	it("preserves an unknown identity-bearing saved chain and recovered runtime fallback across different-file cleanup", async () => {
 		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		const codex = getBundledModel("openai-codex", "gpt-5.6-sol")!;
+		const codex = getBundledModel("openai-codex", "gpt-6-sol")!;
 		authStorage.setRuntimeApiKey("openai-codex", "test-key");
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
