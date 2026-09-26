@@ -9,7 +9,7 @@ const isWindows = process.platform === "win32";
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const nativesEntryUrl = url.pathToFileURL(path.join(repoRoot, "packages/natives/native/index.js")).href;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9;
-const JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00002000;
+const JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200;
 const PROCESS_TERMINATE = 0x0001;
 const PROCESS_SET_QUOTA = 0x0100;
 const PROCESS_QUERY_INFORMATION = 0x0400;
