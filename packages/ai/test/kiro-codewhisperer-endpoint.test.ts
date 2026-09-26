@@ -10,7 +10,7 @@ import type { Context } from "../src/types";
 const originalFetch = globalThis.fetch;
 
 describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
-	test("uses codewhisperer.${region}.amazonaws.com hostname for OAuth bearer token", async () => {
+	test(`uses codewhisperer.\${region}.amazonaws.com hostname for OAuth bearer token`, async () => {
 		let capturedUrl: string | undefined;
 		let capturedHeaders: Record<string, string> | undefined;
 
@@ -59,7 +59,7 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 	test("respects custom region parameter", async () => {
 		let capturedUrl: string | undefined;
 
-		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		globalThis.fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
 			capturedUrl = String(input);
 			return new Response("error", { status: 500 });
 		}) as unknown as typeof fetch;
@@ -101,7 +101,7 @@ describe("Kiro CodeWhisperer OAuth endpoint #6002", () => {
 
 		let capturedUrl: string | undefined;
 
-		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		globalThis.fetch = (async (input: string | URL | Request, _init?: RequestInit) => {
 			capturedUrl = String(input);
 			return new Response("error", { status: 500 });
 		}) as unknown as typeof fetch;
