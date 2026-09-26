@@ -43,8 +43,11 @@ describe("blocking task panic rejection", () => {
 						"index.d.ts",
 						"-o",
 						outputDir,
-						"--profile",
-						"ci",
+						// No --profile: napi builds Cargo's `dev` profile into target/debug. It unwinds
+						// (no `panic = "abort"` override) like the shipped `ci`/`local` profiles, which
+						// is all catch_unwind needs, and skips LTO/optimization so a cold CI build fits
+						// the test budget. rust-cache only saves dev pushes, which never build this
+						// feature/profile combination, so the build is always cold in CI.
 						"--",
 						"--features",
 						"task-panic-test",
