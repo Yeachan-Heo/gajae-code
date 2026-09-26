@@ -1353,7 +1353,7 @@ export class TUI extends Container {
 		this.#settleRenderCommitWaiters(false);
 		this.#unsubscribeTabWidthChange?.();
 		this.#unsubscribeTabWidthChange = undefined;
-		this.#finalizeRasterLeases("terminal-loss");
+		this.#finalizeRasterLeases("dispose");
 		super.dispose();
 	}
 	#finalizeRasterLeases(cause: RasterLeaseInvalidatedNotification["cause"]): void {
@@ -2088,7 +2088,7 @@ export class TUI extends Container {
 			if (op.type.startsWith("raster-") && op.type !== "raster-probe") {
 				const lease = request?.token && this.#rasterLeases.get(request.token.ownerId);
 				if (!lease || lease.revoked || lease.token !== request?.token)
-					return { queueId: id, operation: op.type, status: lease?.revoked ? "revoked" : "stale-token" };
+					return { queueId: id, operation: op.type, status: lease?.revoked ? "revoked" : "failed" };
 			}
 			if ((op.type === "raster-multipart-batch" || op.type === "queued-output") && op.shouldWrite !== undefined) {
 				let shouldWrite: boolean;
@@ -2097,7 +2097,7 @@ export class TUI extends Container {
 				} catch {
 					return failed();
 				}
-				if (!shouldWrite) return { queueId: id, operation: op.type, status: "stale-token" };
+				if (!shouldWrite) return { queueId: id, operation: op.type, status: "failed" };
 			}
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
@@ -2113,6 +2113,15 @@ export class TUI extends Container {
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
 					if (abortSuffix || cursorVisibility)
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
+				};
+				const isLeaseInvalidatedDueToTerminalLoss = (ownerId: string) => {
+					// Check if this lease was revoked due to terminal loss
+					for (const cleanup of this.#rasterCleanup.values()) {
+						if (cleanup.token.ownerId === ownerId && cleanup.cause === "terminal-loss") {
+							return true;
+						}
+					}
+					return false;
 				};
 				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
 				// Async boundary: the terminal may have stopped while we awaited.
@@ -2136,8 +2145,8 @@ export class TUI extends Container {
 				if (!isCurrentLifecycle()) return failed();
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
 				if (!currentLease || currentLease.revoked || currentLease.token !== request.token) {
-					if (isCurrentLifecycle()) abortBarrier();
-					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "stale-token" };
+					if (isCurrentLifecycle() && !isLeaseInvalidatedDueToTerminalLoss(request.token?.ownerId ?? "")) abortBarrier();
+					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "failed" };
 				}
 				if (op.shouldWrite !== undefined) {
 					let shouldWrite: boolean;
@@ -2149,7 +2158,7 @@ export class TUI extends Container {
 					}
 					if (!shouldWrite) {
 						if (isCurrentLifecycle()) abortBarrier();
-						return { queueId: id, operation: op.type, status: "stale-token" };
+						return { queueId: id, operation: op.type, status: "failed" };
 					}
 				}
 			}
@@ -2185,9 +2194,9 @@ export class TUI extends Container {
 			const id = ++this.#rasterQueueId,
 				lease = this.#rasterLeases.get(request.token.ownerId);
 			if (!isCurrentLifecycle())
-				return { queueId: id, operation: "raster-erase" as const, status: "stale-token" as const };
+				return { queueId: id, operation: "raster-erase" as const, status: "failed" as const };
 			if (!lease || lease.token !== request.token)
-				return { queueId: id, operation: "raster-erase", status: "stale-token" as const };
+				return { queueId: id, operation: "raster-erase", status: "failed" as const };
 			lease.revoked = true;
 			this.#rasterLeases.delete(request.token.ownerId);
 			const erase = this.#cursorGuardedRasterSequence(new TextDecoder().decode(lease.erase));
