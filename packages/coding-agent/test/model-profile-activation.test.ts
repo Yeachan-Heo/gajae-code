@@ -82,6 +82,21 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.Max,
 			}),
+			model("openai-codex", "gpt-6-sol", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
+			model("openai-codex", "gpt-6-astra", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
+			model("openai-codex", "gpt-6-luna", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.Max,
+			}),
 			model("openai-codex", "gpt-5.6-terra", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
@@ -94,6 +109,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 			}),
 			model("openai-codex", "gpt-5.3-codex-spark"),
 			model("anthropic", "claude-opus-5", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
+			model("anthropic", "claude-opus-5-5", {
 				mode: "effort",
 				minLevel: ThinkingLevel.Low,
 				maxLevel: ThinkingLevel.XHigh,
@@ -234,11 +254,11 @@ describe("model profile activation", () => {
 		});
 	});
 
-	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+	test("built-in claude-opus falls back to Opus 4.6 when current Opus models are absent", async () => {
 		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
 		expect(profile).toBeDefined();
 		const baseRegistry = fakeRegistry({ profiles: [profile!] });
-		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const available = baseRegistry.getAll().filter(candidate => !candidate.id.startsWith("claude-opus-5"));
 		const session = fakeSession();
 
 		const prepared = await prepareModelProfileActivation({
@@ -254,12 +274,20 @@ describe("model profile activation", () => {
 
 		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
-		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.defaultChain).toEqual([
+			"anthropic/claude-opus-5-5:xhigh",
+			"anthropic/claude-opus-5:xhigh",
+			"anthropic/claude-opus-4-6:xhigh",
+		]);
 		expect(prepared.agentModelOverrides).toEqual({
 			executor: "anthropic/claude-sonnet-5",
-			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+			planner: ["anthropic/claude-opus-5-5:low", "anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5-5:high", "anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: [
+				"anthropic/claude-opus-5-5:xhigh",
+				"anthropic/claude-opus-5:xhigh",
+				"anthropic/claude-opus-4-6:xhigh",
+			],
 		});
 	});
 
@@ -274,7 +302,7 @@ describe("model profile activation", () => {
 			profileName: "claude-opus",
 		});
 
-		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
 	});
 
@@ -322,6 +350,12 @@ describe("model profile activation", () => {
 					.getAvailableForProfileActivation()
 					.filter(candidate => candidate.provider === "anthropic")
 					.map(candidate => candidate.id),
+			).not.toContain("claude-opus-5-5");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.filter(candidate => candidate.provider === "anthropic")
+					.map(candidate => candidate.id),
 			).not.toContain("claude-opus-5");
 			const expectedIds = new Set(["claude-opus-4-6", "claude-sonnet-5"]);
 			expect(
@@ -344,13 +378,26 @@ describe("model profile activation", () => {
 
 			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
 			expect(prepared.defaultResolutionSkips).toEqual([
+				{ selector: "anthropic/claude-opus-5-5:xhigh", reason: "unknown_model" },
 				{ selector: "anthropic/claude-opus-5:xhigh", reason: "unknown_model" },
 			]);
 			expect(prepared.agentModelOverrides).toMatchObject({
 				executor: "anthropic/claude-sonnet-5",
-				planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
-				critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
-				architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:high"],
+				planner: [
+					"anthropic/claude-opus-5-5:low",
+					"anthropic/claude-opus-5:low",
+					"anthropic/claude-opus-4-6:low",
+				],
+				critic: [
+					"anthropic/claude-opus-5-5:high",
+					"anthropic/claude-opus-5:high",
+					"anthropic/claude-opus-4-6:high",
+				],
+				architect: [
+					"anthropic/claude-opus-5-5:xhigh",
+					"anthropic/claude-opus-5:xhigh",
+					"anthropic/claude-opus-4-6:high",
+				],
 			});
 		} finally {
 			authStorage.close();
@@ -693,7 +740,7 @@ describe("model profile activation", () => {
 				profileName: "claude-opus",
 			});
 
-			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5-5" });
 			expect(prepared.defaultResolutionSkips).toEqual([]);
 		} finally {
 			authStorage.close();
@@ -1721,71 +1768,71 @@ describe("model profile activation", () => {
 		[
 			"codex-eco",
 			{
-				default: "openai-codex/gpt-5.6-terra:low",
-				executor: "openai-codex/gpt-5.6-luna:low",
-				planner: "openai-codex/gpt-5.6-luna:high",
-				critic: "openai-codex/gpt-5.6-terra:xhigh",
-				architect: "openai-codex/gpt-5.6-terra:high",
+				default: "openai-codex/gpt-6-luna:low",
+				executor: "openai-codex/gpt-6-luna:low",
+				planner: "openai-codex/gpt-6-luna:high",
+				critic: "openai-codex/gpt-6-astra:xhigh",
+				architect: "openai-codex/gpt-6-astra:high",
 			},
 		],
 		[
 			"codex-medium",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
-				executor: "openai-codex/gpt-5.6-terra:low",
-				planner: "openai-codex/gpt-5.6-terra:high",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				default: "openai-codex/gpt-6-sol:low",
+				executor: "openai-codex/gpt-6-luna:low",
+				planner: "openai-codex/gpt-6-astra:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"codex-pro",
 			{
-				default: "openai-codex/gpt-5.6-sol:medium",
-				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "openai-codex/gpt-5.6-sol:high",
-				critic: "openai-codex/gpt-5.6-sol:max",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				default: "openai-codex/gpt-6-sol:medium",
+				executor: "openai-codex/gpt-6-sol:medium",
+				planner: "openai-codex/gpt-6-sol:high",
+				critic: "openai-codex/gpt-6-sol:max",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
 			"opus-codex",
 			{
-				default: "anthropic/claude-opus-5:xhigh",
-				executor: "openai-codex/gpt-5.6-terra:low",
+				default: "anthropic/claude-opus-5-5:xhigh",
+				executor: "openai-codex/gpt-6-luna:low",
 				planner: "anthropic/claude-sonnet-5",
-				critic: "openai-codex/gpt-5.6-sol:xhigh",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				critic: "openai-codex/gpt-6-sol:xhigh",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"lunamaxxing",
 			{
-				default: "openai-codex/gpt-5.6-luna:medium",
-				executor: "openai-codex/gpt-5.6-luna:xhigh",
-				planner: "openai-codex/gpt-5.6-luna:max",
-				critic: "openai-codex/gpt-5.6-luna:max",
-				architect: "openai-codex/gpt-5.6-luna:max",
+				default: "openai-codex/gpt-6-luna:medium",
+				executor: "openai-codex/gpt-6-luna:xhigh",
+				planner: "openai-codex/gpt-6-luna:max",
+				critic: "openai-codex/gpt-6-luna:max",
+				architect: "openai-codex/gpt-6-luna:max",
 			},
 		],
 		[
 			"codex-opencodego",
 			{
-				default: "openai-codex/gpt-5.6-sol:low",
+				default: "openai-codex/gpt-6-sol:low",
 				executor: "opencode-go/deepseek-v4-pro",
 				planner: "opencode-go/kimi-k3",
 				critic: "opencode-go/mimo-v2.5-pro",
-				architect: "openai-codex/gpt-5.6-sol:high",
+				architect: "openai-codex/gpt-6-sol:high",
 			},
 		],
 		[
 			"fable-opus-codex",
 			{
 				default: "anthropic/claude-fable-5-1:high",
-				executor: "openai-codex/gpt-5.6-terra:medium",
-				planner: "anthropic/claude-opus-5:medium",
-				critic: "anthropic/claude-opus-5:high",
-				architect: "openai-codex/gpt-5.6-sol:xhigh",
+				executor: "openai-codex/gpt-6-sol:medium",
+				planner: "anthropic/claude-opus-5-5:medium",
+				critic: "anthropic/claude-opus-5-5:high",
+				architect: "openai-codex/gpt-6-sol:xhigh",
 			},
 		],
 		[
@@ -3187,12 +3234,12 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			profileName: "opus-codex",
 		});
 		expect(prepared.defaultModel?.provider).toBe("opencodex");
-		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5");
+		expect(prepared.defaultModel?.wireModelId).toBe("anthropic/claude-opus-5-5");
 		expect(prepared.agentModelOverrides).toEqual({
-			executor: "opencodex/opencodex/gpt-5.6-terra:low",
-			architect: "opencodex/opencodex/gpt-5.6-sol:high",
+			executor: "opencodex/opencodex/gpt-6-luna:low",
+			architect: "opencodex/opencodex/gpt-6-sol:high",
 			planner: "opencodex/opencodex/anthropic/claude-sonnet-5",
-			critic: "opencodex/opencodex/gpt-5.6-sol:xhigh",
+			critic: "opencodex/opencodex/gpt-6-sol:xhigh",
 		});
 	});
 

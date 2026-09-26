@@ -149,8 +149,8 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => alibabaTokenPlanModelManagerOptions(config),
 		catalog("Alibaba Token Plan", ["ALIBABA_TOKEN_PLAN_API_KEY"], { oauthProvider: "alibaba-token-plan" }),
 	),
-	descriptor("openai", "gpt-5.4", config => openaiModelManagerOptions(config)),
-	descriptor("opencodex", "gpt-5.4", () => openCodexModelManagerOptions(), { allowUnauthenticated: true }),
+	descriptor("openai", "gpt-6-astra", config => openaiModelManagerOptions(config)),
+	descriptor("opencodex", "gpt-6-sol", () => openCodexModelManagerOptions(), { allowUnauthenticated: true }),
 	descriptor("groq", "openai/gpt-oss-120b", config => groqModelManagerOptions(config)),
 	catalogDescriptor(
 		"huggingface",
@@ -394,6 +394,6 @@ export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = {
 	minimax: "MiniMax-M3",
 	"minimax-code": "MiniMax-M3",
 	"minimax-code-cn": "MiniMax-M3",
-	"openai-codex": "gpt-5.5",
+	"openai-codex": "gpt-6-sol",
 	"gitlab-duo": "duo-chat-sonnet-4-5",
 } as Record<KnownProvider, string>;

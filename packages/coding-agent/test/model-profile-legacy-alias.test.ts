@@ -31,6 +31,12 @@ const codexSolModel = {
 	contextWindow: 373_000,
 } satisfies Model<"openai-codex-responses">;
 
+const codexGpt6SolModel = {
+	...codexSolModel,
+	id: "gpt-6-sol",
+	name: "gpt-6-sol",
+} satisfies Model<"openai-codex-responses">;
+
 const codexTerraModel = {
 	...codexSolModel,
 	id: "gpt-5.6-terra",
@@ -64,7 +70,7 @@ function fakeRegistry(extraProfiles: ModelProfileDefinition[] = []) {
 		getModelProfiles: () => new Map(profiles),
 		getAvailableModelProfileNames: () => [...profiles.keys()].sort(),
 		getApiKeyForProvider: async () => "key-openai-codex",
-		getAll: () => [codexModel, codexSolModel, codexTerraModel, codexLunaModel],
+		getAll: () => [codexModel, codexSolModel, codexGpt6SolModel, codexTerraModel, codexLunaModel],
 		resolveCanonicalModel: () => undefined,
 		getCanonicalVariants: () => [],
 		getCanonicalId: () => undefined,
@@ -115,7 +121,7 @@ describe("legacy model profile aliases", () => {
 		});
 
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
-		expect(session.setModelTemporaryCalls).toEqual([{ model: codexSolModel, thinkingLevel: ThinkingLevel.Low }]);
+		expect(session.setModelTemporaryCalls).toEqual([{ model: codexGpt6SolModel, thinkingLevel: ThinkingLevel.Low }]);
 		expect(settings.get("modelProfile.default")).toBe("codex-standard");
 	});
 
