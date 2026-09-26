@@ -501,13 +501,15 @@ describe("createAgentSession credential_disabled subscription", () => {
 		expect(storage.close).toHaveBeenCalledTimes(1);
 	});
 
-	it("cleans an abandoned credential listener without closing caller-owned storage", async () => {
+	it("releases its caller-owned storage subscription when scoped settings fail", async () => {
 		const dirs = makeDirs("settings-failure");
 		const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const close = vi.spyOn(authStorage, "close");
 		const originalSubscribe = authStorage.onCredentialDisabled.bind(authStorage);
+		let subscriptions = 0;
 		let unsubscriptions = 0;
 		vi.spyOn(authStorage, "onCredentialDisabled").mockImplementation(listener => {
+			subscriptions++;
 			const unsubscribe = originalSubscribe(listener);
 			return () => {
 				unsubscriptions++;
@@ -522,6 +524,11 @@ describe("createAgentSession credential_disabled subscription", () => {
 
 		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
 
+		// The SDK listener is registered before scoped settings load so a shared-storage
+		// credential_disabled emitted while settings are pending is not lost (#5893
+		// review). A settings failure must then release exactly that one subscription
+		// and leave the caller-owned storage open.
+		expect(subscriptions).toBe(1);
 		expect(unsubscriptions).toBe(1);
 		expect(close).not.toHaveBeenCalled();
 	});
@@ -782,4 +789,49 @@ describe("createAgentSession credential_disabled subscription", () => {
 			authStorage.close();
 		}
 	});
+
+	it(
+		"receives credential_disabled events during early startup when embedder subscriber exists",
+		async () => {
+			// Regression test for issue #5886: The SDK credential listener must be
+			// registered BEFORE awaiting scoped settings. When a caller-owned AuthStorage
+			// already has an embedder subscriber, the listener set is non-empty from
+			// construction, so the no-listener buffer is disabled. The SDK listener must
+			// subscribe immediately at the top of createAgentSession so credential_disabled
+			// events during startup (e.g., during model catalog probes) reach the extension.
+			const dirs = makeDirs("embedder-startup-event");
+			const embedderEvents: CredentialDisabledEvent[] = [];
+			const authStorage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"), {
+				onCredentialDisabled: event => {
+					embedderEvents.push(event);
+				},
+			});
+			const ext = makeRecordingExtension();
+
+			// Pre-populate an expired credential to trigger disable during catalog probes
+			await authStorage.set("anthropic", [expiredOAuth()]);
+			failOAuthRefresh();
+
+			const { session } = await createAgentSession(baseOptions(dirs, authStorage, [ext.factory]));
+
+			try {
+				// The event was emitted during session startup. Initialize the runner to
+				// flush the buffered event through the extension.
+				const observed = ext.next();
+				initializeRunnerForTest(session.extensionRunner);
+				const extEvent = await observed;
+
+				// The extension MUST have received the event.
+				expect(extEvent.provider).toBe("anthropic");
+				expect(extEvent.disabledCause).toContain("invalid_grant");
+				// Both embedder and extension received the event.
+				expect(embedderEvents).toHaveLength(1);
+				expect(ext.events).toHaveLength(1);
+			} finally {
+				await session.dispose();
+				await drainCredentialDisabledDispatch();
+			}
+		},
+		SLOW_SDK_TEST_TIMEOUT_MS,
+	);
 });
