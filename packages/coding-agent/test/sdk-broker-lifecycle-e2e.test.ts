@@ -3307,6 +3307,189 @@ test.skipIf(process.platform !== "win32")(
 	},
 );
 
+test.skipIf(process.platform === "win32")(
+	"promotion fence reconciliation removes fence when final receipt matches on restart",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-fence-reconciliation-final-match-"));
+		const sessionId = "fence-reconciliation-final-match";
+		const effectMarker = "fence-reconciliation-final-match-marker";
+		const incarnation = "fence-reconciliation-final-match-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+
+		try {
+			// Write the final (promoted) receipt
+			await writeSessionLifecycleFailure(
+				root,
+				sessionId,
+				effectMarker,
+				{ phase: "startup", reason: "pending", message: "final receipt" },
+				{
+					endpointGeneration: 7,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				undefined,
+				incarnation,
+				process.pid,
+			);
+
+			// Simulate crash: write a fence with the correct digest
+			const finalReceipt = JSON.parse(await fs.readFile(failurePath, "utf8"));
+			const finalBytes = Buffer.from(JSON.stringify(finalReceipt), "utf8");
+			const fenceContent = {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+				artifactDigest: (await import("node:crypto")).createHash("sha256").update(finalBytes).digest("hex"),
+			};
+			await fs.writeFile(promotionFencePath, JSON.stringify(fenceContent));
+
+			// Fence should prevent reading without reconciliation
+			const withoutReconciliation = await readSessionLifecycleFailure(root, sessionId, {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+			});
+			expect(withoutReconciliation).toBeUndefined();
+
+			// On restart (with attemptFenceReconciliation=true), the fence should be reconciled and removed
+			const { readSessionLifecycleFailureWithReconciliation } = await import("../src/sdk/broker/lifecycle.js");
+			const readWithReconciliation = await readSessionLifecycleFailureWithReconciliation(root, sessionId, {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+			});
+			expect(readWithReconciliation).toBeDefined();
+			expect(readWithReconciliation?.phase).toBe("startup");
+
+			// Fence should be removed after reconciliation
+			expect(await Bun.file(promotionFencePath).exists()).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"promotion fence reconciliation keeps fence when only staged receipt exists",
+	async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-fence-reconciliation-staged-only-"));
+		const sessionId = "fence-reconciliation-staged-only";
+		const effectMarker = "fence-reconciliation-staged-only-marker";
+		const incarnation = "fence-reconciliation-staged-only-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+
+		try {
+			await fs.mkdir(path.dirname(failurePath), { recursive: true });
+
+			// Write only a staged receipt (incomplete rollback)
+			const stagedReceipt = {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+				phase: "startup",
+				reason: "pending",
+				message: "staged only",
+				rollback: {
+					endpointGeneration: 7,
+					fenced: true,
+					runtimeRemoved: false,
+					hostStopped: false,
+					brokerRegistrationReleased: false,
+				},
+			};
+			await fs.writeFile(failurePath, JSON.stringify(stagedReceipt));
+
+			// Write a fence pointing to the final receipt that doesn't exist
+			const fenceContent = {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+				artifactDigest: (await import("node:crypto"))
+					.createHash("sha256")
+					.update("final receipt that doesn't exist")
+					.digest("hex"),
+			};
+			await fs.writeFile(promotionFencePath, JSON.stringify(fenceContent));
+
+			// Fence should prevent reading
+			const read = await readSessionLifecycleFailure(root, sessionId, {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+			});
+			expect(read).toBeUndefined();
+
+			// Fence should remain after reconciliation attempt (fail-closed)
+			expect(await Bun.file(promotionFencePath).exists()).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test.skipIf(process.platform === "win32")(
+	"promotion fence reconciliation keeps fence when digest mismatches",
+	async () => {
+		const root = await fs.mkdtemp(
+			path.join(process.env.TMPDIR ?? "/tmp", "gjc-fence-reconciliation-digest-mismatch-"),
+		);
+		const sessionId = "fence-reconciliation-digest-mismatch";
+		const effectMarker = "fence-reconciliation-digest-mismatch-marker";
+		const incarnation = "fence-reconciliation-digest-mismatch-incarnation";
+		const failurePath = path.join(root, "sdk", `${sessionId}.lifecycle.failure.${effectMarker}.json`);
+		const promotionFencePath = `${failurePath}.promoting`;
+
+		try {
+			await fs.mkdir(path.dirname(failurePath), { recursive: true });
+
+			// Write a receipt
+			const receipt = {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+				phase: "startup",
+				reason: "pending",
+				message: "receipt",
+				rollback: {
+					endpointGeneration: 7,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+			};
+			await fs.writeFile(failurePath, JSON.stringify(receipt));
+
+			// Write a fence with wrong digest
+			const fenceContent = {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+				artifactDigest: (await import("node:crypto")).createHash("sha256").update("wrong content").digest("hex"),
+			};
+			await fs.writeFile(promotionFencePath, JSON.stringify(fenceContent));
+
+			// Fence should prevent reading
+			const read = await readSessionLifecycleFailure(root, sessionId, {
+				pid: process.pid,
+				effectMarker,
+				incarnation,
+			});
+			expect(read).toBeUndefined();
+
+			// Fence should remain after reconciliation attempt (fail-closed)
+			expect(await Bun.file(promotionFencePath).exists()).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
 test("session host opts cached default profiles into lifecycle startup only", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-cached-default-"));
 	const agentDir = path.join(root, "agent");

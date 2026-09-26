@@ -2247,6 +2247,131 @@ async function writeLifecycleFailurePromotionFence(
 	}
 }
 
+/**
+ * Reconcile a promotion fence left by a crash after fencing but before removal.
+ * Returns true if the fence was validated and removed; false if it remains (fail-closed).
+ */
+async function reconcileLifecycleFailurePromotionFence(
+	target: string,
+	expected: EffectMarker,
+	parent: { dev: bigint; ino: bigint },
+): Promise<boolean> {
+	const fencePath = lifecycleFailurePromotionPath(target);
+	const parentPath = path.dirname(target);
+	const parentIdentity = lifecycleParentIdentity(parentPath);
+
+	// If parent changed, stay fail-closed
+	if (!parentIdentity || parentIdentity.dev !== parent.dev.toString() || parentIdentity.ino !== parent.ino.toString())
+		return false;
+
+	let fenceHandle: fs.FileHandle | undefined;
+	try {
+		// Try to read the fence to get the expected artifact digest
+		fenceHandle = await fs.open(fencePath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const fenceStat = await fenceHandle.stat({ bigint: true });
+
+		if (!fenceStat.isFile() || fenceStat.nlink !== 1n || fenceStat.size > 4096n) {
+			// Invalid fence file; stay fail-closed
+			await fenceHandle.close();
+			return false;
+		}
+
+		const fenceBytes = Buffer.alloc(Number(fenceStat.size) + 1);
+		const { bytesRead } = await fenceHandle.read(fenceBytes, 0, fenceBytes.length, 0);
+		await fenceHandle.close();
+		fenceHandle = undefined;
+
+		if (bytesRead > 4096) return false;
+
+		const fenceContent: unknown = parseLifecycleJson(fenceBytes.subarray(0, bytesRead));
+		if (
+			typeof fenceContent !== "object" ||
+			fenceContent === null ||
+			typeof (fenceContent as Record<string, unknown>).pid !== "number" ||
+			typeof (fenceContent as Record<string, unknown>).effectMarker !== "string" ||
+			typeof (fenceContent as Record<string, unknown>).incarnation !== "string" ||
+			typeof (fenceContent as Record<string, unknown>).artifactDigest !== "string"
+		)
+			return false;
+
+		const fence = fenceContent as {
+			pid: number;
+			effectMarker: string;
+			incarnation: string;
+			artifactDigest: string;
+		};
+
+		// Validate fence matches expected marker
+		if (
+			fence.pid !== expected.pid ||
+			fence.effectMarker !== expected.effectMarker ||
+			fence.incarnation !== expected.incarnation
+		)
+			return false;
+
+		// Now check if the final receipt exists and matches the fence's recorded digest
+		const finalReceipt = await readLifecycleFailureArtifact(target, expected, true);
+		if (finalReceipt) {
+			// Final receipt exists; validate its digest matches
+			const finalDigest = createHash("sha256").update(finalReceipt.bytes).digest("hex");
+			if (finalDigest === fence.artifactDigest) {
+				// Validation succeeded; try to remove the fence
+				let fenceHandle: fs.FileHandle | undefined;
+				try {
+					fenceHandle = await fs.open(fencePath, fsSync.constants.O_RDONLY);
+					const fenceIdentity = await captureOpenedLifecycleFileIdentity(fenceHandle);
+					await fenceHandle.close();
+					fenceHandle = undefined;
+
+					if (removeLifecyclePublicationFile(fencePath, fenceIdentity, parent)) {
+						await syncDirectory(parentPath);
+						return true;
+					}
+					// Failed to remove fence; stay fail-closed
+					return false;
+				} catch {
+					if (fenceHandle) {
+						try {
+							await fenceHandle.close();
+						} catch {
+							// Ignore close errors
+						}
+					}
+					return false;
+				}
+			}
+		}
+
+		// Check if only staged receipt exists
+		const stagedReceipt = await readLifecycleFailureArtifact(target, expected, true);
+		if (stagedReceipt) {
+			// Staged receipt exists but final doesn't match; try to validate against it
+			const stagedDigest = createHash("sha256").update(stagedReceipt.bytes).digest("hex");
+			if (stagedDigest !== fence.artifactDigest) {
+				// Digest mismatch; stay fail-closed
+				return false;
+			}
+			// Staged matches; we could remove fence here, but since it's staged (not promoted),
+			// we should stay fail-closed to maintain the original promotion intent
+			return false;
+		}
+
+		// No receipt found matching the fence; stay fail-closed
+		return false;
+	} catch {
+		if (fenceHandle) {
+			try {
+				await fenceHandle.close();
+			} catch {
+				// Ignore close errors
+			}
+		}
+
+		// On any error, stay fail-closed
+		return false;
+	}
+}
+
 async function replaceOwnedFailureReceipt(
 	directory: string,
 	target: string,
@@ -2600,6 +2725,7 @@ async function readLifecycleFailureArtifact(
 	file: string,
 	expected: EffectMarker,
 	allowPromotionFence = false,
+	attemptFenceReconciliation = false,
 ): Promise<
 	| {
 			artifact: LifecycleFailureArtifact;
@@ -2639,10 +2765,29 @@ async function readLifecycleFailureArtifact(
 		if (
 			!parentAfterFence ||
 			parentAfterFence.dev !== parentIdentity.dev ||
-			parentAfterFence.ino !== parentIdentity.ino ||
-			(!allowPromotionFence && promotionPending)
+			parentAfterFence.ino !== parentIdentity.ino
 		)
 			return undefined;
+
+		if (!allowPromotionFence && promotionPending) {
+			// Try to reconcile the fence if this is the startup path
+			if (attemptFenceReconciliation) {
+				await handle.close();
+				handle = undefined;
+
+				const reconciled = await reconcileLifecycleFailurePromotionFence(file, expected, {
+					dev: BigInt(parentIdentity.dev),
+					ino: BigInt(parentIdentity.ino),
+				});
+
+				if (reconciled) {
+					// Fence was removed; retry the read without reconciliation to avoid recursion
+					return readLifecycleFailureArtifact(file, expected, allowPromotionFence, false);
+				}
+			}
+			// Reconciliation didn't happen or failed; stay fail-closed
+			return undefined;
+		}
 		return {
 			artifact: value,
 			bytes: raw,
@@ -2711,11 +2856,13 @@ function lifecycleCleanupPlan(
 	const directory = path.join(root, "sdk");
 	const parentIdentity = lifecycleParentIdentity(directory);
 	if (!parentIdentity) throw new Error("Lifecycle cleanup parent identity is unavailable.");
+	const failurePath = lifecycleFailurePath(root, id, expected.effectMarker);
 	const candidates = [
-		lifecycleFailurePath(root, id, expected.effectMarker),
+		failurePath,
 		path.join(directory, `${id}.json`),
 		lifecycleReadyPath(root, id),
 		lifecycleMarkerPath(root, id),
+		lifecycleFailurePromotionPath(failurePath),
 	];
 	const files: LifecycleCleanupFile[] = candidates.flatMap(file => {
 		const captured = captureLifecycleFile(
@@ -2786,7 +2933,8 @@ function isCanonicalLifecycleCleanupOriginal(root: string, id: string, original:
 		basename === `${id}.json` ||
 		basename === `${id}.lifecycle.json` ||
 		basename === `${id}.lifecycle.ready.json` ||
-		new RegExp(`^${escapeRegExp(id)}\\.lifecycle\\.failure\\.[A-Za-z0-9._-]{1,128}\\.json$`).test(basename)
+		new RegExp(`^${escapeRegExp(id)}\.lifecycle\.failure\.[A-Za-z0-9._-]{1,128}\.json$`).test(basename) ||
+		new RegExp(`^${escapeRegExp(id)}\.lifecycle\.failure\.[A-Za-z0-9._-]{1,128}\.json\.promoting$`).test(basename)
 	);
 }
 
@@ -4067,6 +4215,24 @@ export async function readSessionLifecycleFailure(
 		?.artifact;
 }
 
+/**
+ * Read a failure artifact with startup-time fence reconciliation.
+ * Called during startup/restart paths to recover from crashes during fence promotion.
+ * Exposed for testing.
+ */
+export function readSessionLifecycleFailureWithReconciliation(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+): Promise<LifecycleFailureArtifact | undefined> {
+	return readLifecycleFailureArtifact(
+		lifecycleFailurePath(root, id, expected.effectMarker),
+		expected,
+		false,
+		true,
+	).then(result => result?.artifact);
+}
+
 export async function readSessionLifecycleFailureForTest(
 	root: string,
 	id: string,
@@ -5310,7 +5476,7 @@ async function waitForReady(
 			: { kind: "child_exited" };
 	};
 	while (timing.now() < deadline) {
-		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
+		const startupFailure = await readSessionLifecycleFailureWithReconciliation(root, id, expected);
 		if (startupFailure) {
 			if (
 				observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
@@ -5326,7 +5492,7 @@ async function waitForReady(
 			processIncarnationForBroker(broker, value),
 		);
 		if (childExited || processObservation === "exited") {
-			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
+			const finalStartupFailure = await readSessionLifecycleFailureWithReconciliation(root, id, expected);
 			if (finalStartupFailure) {
 				const afterReady = await classifyExitedAfterReady();
 				if (afterReady.kind !== "child_exited") return afterReady;
